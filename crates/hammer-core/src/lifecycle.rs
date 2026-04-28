@@ -48,3 +48,12 @@ pub trait Lifecycle: Send + Sync {
     fn start(&self, stage: StartStage) -> Result<(), HammerError>;
     fn close(&self) -> Result<(), HammerError>;
 }
+
+/// `adapter.LifecycleService` — 1:1 with Lifecycle in Go but historically used
+/// to mark managers that show up in the ServiceManager / CertificateStore
+/// slots. Kept as a marker alias so trait bounds across crates can express
+/// "this is a service that participates in the start/close orchestration"
+/// without coupling to a specific manager kind.
+pub trait LifecycleService: Lifecycle {}
+
+impl<T: Lifecycle + ?Sized> LifecycleService for T {}

@@ -1,0 +1,28 @@
+[package]
+name = "hammer-ffi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+
+[dependencies]
+hammer-core = { path = "../hammer-core" }
+hammer-adapter = { path = "../hammer-adapter" }
+hammer-runtime = { path = "../hammer-runtime" }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uniffi = { workspace = true, features = ["cli"] }
+
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }
+
+[dev-dependencies]
+indoc = { workspace = true }

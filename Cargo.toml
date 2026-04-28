@@ -1,27 +1,24 @@
-[package]
-name = "hammer"
+[workspace]
+resolver = "3"
+members = [
+    "crates/hammer-core",
+    "crates/hammer-adapter",
+    "crates/hammer-runtime",
+    "crates/hammer-ffi",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+publish = false
 
-[lib]
-name = "hammer"
-crate-type = ["cdylib", "staticlib", "rlib"]
-
-[[bin]]
-name = "uniffi-bindgen"
-path = "src/bin/uniffi_bindgen.rs"
-
-[dependencies]
+[workspace.dependencies]
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time", "io-util"] }
 serde = { version = "1.0.228", features = ["derive"] }
 toml = "1.1"
 url = "2.5"
 once_cell = "1.21"
 thiserror = "2.0"
-uniffi = { version = "0.31", features = ["cli"] }
-
-[build-dependencies]
-uniffi = { version = "0.31", features = ["build"] }
-
-[dev-dependencies]
+async-trait = "0.1"
+uniffi = "0.31"
 indoc = "2.0"

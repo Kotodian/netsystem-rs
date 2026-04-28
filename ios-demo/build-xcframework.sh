@@ -25,11 +25,13 @@ rm -rf "${BUILD_DIR}"
 mkdir -p "${GENERATED_DIR}"
 
 echo "==> cargo build (release) for all Apple targets"
-cargo build --release --target aarch64-apple-ios
-cargo build --release --target aarch64-apple-ios-sim
-cargo build --release --target x86_64-apple-ios
-cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-apple-darwin
+# `-p hammer-ffi` keeps the build narrow inside the workspace so we avoid
+# compiling the uniffi-bindgen binary five times.
+cargo build -p hammer-ffi --release --target aarch64-apple-ios
+cargo build -p hammer-ffi --release --target aarch64-apple-ios-sim
+cargo build -p hammer-ffi --release --target x86_64-apple-ios
+cargo build -p hammer-ffi --release --target aarch64-apple-darwin
+cargo build -p hammer-ffi --release --target x86_64-apple-darwin
 
 echo "==> lipo simulator + macOS static libs"
 mkdir -p "${BUILD_DIR}/sim" "${BUILD_DIR}/macos"
@@ -43,7 +45,8 @@ lipo -create \
   -output "${BUILD_DIR}/macos/${LIB_NAME}"
 
 echo "==> generate Swift bindings via uniffi-bindgen"
-cargo run --release --bin uniffi-bindgen -- generate src/hammer.udl \
+cargo run -p hammer-ffi --release --bin uniffi-bindgen -- \
+  generate crates/hammer-ffi/src/hammer.udl \
   --language swift --out-dir "${GENERATED_DIR}"
 
 # uniffi emits hammer.swift, hammerFFI.h and a module map; rename to satisfy XCFramework requirements

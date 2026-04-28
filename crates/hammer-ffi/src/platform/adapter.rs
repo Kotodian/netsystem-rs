@@ -1,18 +1,16 @@
 use std::sync::Arc;
 
-use crate::log::{Level, LogWriter};
+use hammer_core::log::{Level, LogWriter};
+
 use crate::{Platform, WifiState};
 
 /// Thin facade over the Swift-implemented [`Platform`] callback interface.
-/// M1 only forwards methods that the Service / log path actually needs;
-/// later milestones (network manager, TUN open, etc.) extend this surface.
+/// M2 keeps the M1 surface intact while real Manager implementations land
+/// behind it; the methods marked `dead_code` get wired up incrementally.
 pub struct PlatformAdapter {
     platform: Arc<dyn Platform>,
 }
 
-// Methods marked `dead_code` here are wired up in M2 once the real Manager
-// implementations replace the StubManager set. Keeping them now lets us hold
-// the Go-equivalent surface in one place without scattering allow attributes.
 #[allow(dead_code)]
 impl PlatformAdapter {
     pub fn new(platform: Arc<dyn Platform>) -> Self {

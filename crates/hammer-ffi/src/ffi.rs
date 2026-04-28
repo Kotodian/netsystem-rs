@@ -1,20 +1,21 @@
 use std::sync::Arc;
 
-use crate::Platform;
-use crate::config;
+use hammer_core::config;
+
 use crate::error::HammerError;
+use crate::Platform;
 use crate::service::Service;
 
 /// `namespace.check_config` — uniffi 0.31 hands us the TOML body as an owned String.
 pub fn check_config(content: String) -> Result<(), HammerError> {
-    config::check_config(&content)
+    config::check_config(&content).map_err(HammerError::from)
 }
 
 /// `namespace.format_config` — returns the canonical TOML form. Equivalent to Go's
 /// `FormatConfig` but returns a plain `String` instead of the gomobile-friendly
 /// `StringValue` wrapper.
 pub fn format_config(content: String) -> Result<String, HammerError> {
-    config::format_config(&content)
+    config::format_config(&content).map_err(HammerError::from)
 }
 
 /// `namespace.new_service` — uniffi delivers callback interfaces as `Box<dyn Trait>`.

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use hammer::config::{
+use hammer_core::config::{
     self, DnsServerKind, InboundKind, OutboundKind, RuleActionKind,
 };
 
