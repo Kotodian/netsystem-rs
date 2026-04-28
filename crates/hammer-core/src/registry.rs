@@ -91,7 +91,10 @@ mod tests {
         let reg = RuntimeRegistry::new();
         let err = reg.require::<CountingManager>().unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("required service not registered"), "got = {msg}");
+        assert!(
+            msg.contains("required service not registered"),
+            "got = {msg}"
+        );
         assert!(msg.contains("CountingManager"), "got = {msg}");
     }
 

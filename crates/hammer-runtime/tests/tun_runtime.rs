@@ -1,0 +1,385 @@
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
+use hammer_adapter::{DnsTransport, Lifecycle, Network, RouteDecision};
+use hammer_core::config::{self, DirectOutboundOptions, Options, Outbound, OutboundKind};
+use hammer_core::error::HammerError;
+use hammer_core::lifecycle::StartStage;
+use hammer_core::log::{DiscardWriter, Factory, Logger};
+use hammer_runtime::{
+    DnsRouter, DnsTransportManager, InboundManager, OutboundManager, Router,
+    dns::{FixedResponseCode, MessageExt},
+    tun::{
+        MemoryTunDevice, SmoltcpTunStack, TunDispatch, TunInbound, TunPacket, parse_ip_packet,
+        sniff_packet, sniff_stream,
+    },
+};
+use hickory_proto::op::Message;
+use hickory_proto::rr::{RData, Record};
+use tokio::net::UdpSocket;
+
+fn logger(tag: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+}
+
+fn options() -> Options {
+    config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+sniff = true
+hijack_dns = true
+block_quic = true
+domain_strategy = "prefer_ipv4"
+udp_disable_domain_unmapping = true
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "hysteria2"
+"#,
+    )
+    .expect("parse config")
+}
+
+fn router_from_options(options: &Options) -> Arc<Router> {
+    let outbound = Arc::new(OutboundManager::from_options(
+        logger("outbound"),
+        options.route.final_.clone(),
+        &options.outbounds,
+    ));
+    Arc::new(Router::from_options(
+        logger("router"),
+        options.route.clone(),
+        outbound,
+    ))
+}
+
+fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
+    let outbounds = vec![Outbound {
+        tag: final_outbound.to_owned(),
+        kind: OutboundKind::Direct(DirectOutboundOptions::default()),
+    }];
+    let outbound = Arc::new(OutboundManager::from_options(
+        logger("outbound"),
+        final_outbound,
+        &outbounds,
+    ));
+    let route_options = hammer_core::config::RouteOptions {
+        final_: final_outbound.to_owned(),
+        ..options.route.clone()
+    };
+    let router = Arc::new(Router::from_options(
+        logger("router"),
+        route_options,
+        Arc::clone(&outbound),
+    ));
+    let dns_transport = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
+    dns_transport.insert(Arc::new(FixedDnsTransport));
+    let dns_router = Arc::new(DnsRouter::new_with_manager(
+        logger("dns-router"),
+        dns_transport,
+        hammer_core::config::DomainStrategy::AsIs,
+    ));
+    SmoltcpTunStack::new_with_runtime(
+        logger("tun"),
+        router,
+        dns_router,
+        outbound,
+        "tun".to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn memory_tun_device_round_trips_packets_and_close_wakes_recv() {
+    let device = MemoryTunDevice::new();
+
+    device.inject(vec![1, 2, 3]).await.expect("inject packet");
+    assert_eq!(device.recv().await.expect("recv packet"), vec![1, 2, 3]);
+
+    device.send(vec![4, 5, 6]).await.expect("send packet");
+    assert_eq!(device.take_output().await, Some(vec![4, 5, 6]));
+
+    device.close();
+    assert!(device.recv().await.is_err());
+}
+
+#[test]
+fn parse_ip_packet_extracts_tcp_and_udp_metadata() {
+    let tcp = ipv4_tcp_packet(
+        [10, 0, 0, 2],
+        [93, 184, 216, 34],
+        49152,
+        443,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let parsed = parse_ip_packet(&tcp).expect("parse tcp");
+    assert_eq!(parsed.network, Network::Tcp);
+    assert_eq!(parsed.source.port, 49152);
+    assert_eq!(parsed.destination.port, 443);
+
+    let udp = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [1, 1, 1, 1],
+        5353,
+        53,
+        dns_query("example.com"),
+    );
+    let parsed = parse_ip_packet(&udp).expect("parse udp");
+    assert_eq!(parsed.network, Network::Udp);
+    assert_eq!(parsed.destination.port, 53);
+}
+
+#[test]
+fn sniffers_detect_http_dns_quic_and_stun() {
+    let mut tcp = TunPacket::for_test(
+        Network::Tcp,
+        443,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    sniff_stream(&mut tcp);
+    assert_eq!(tcp.metadata.protocol, "http");
+    assert_eq!(tcp.metadata.domain.as_deref(), Some("example.com"));
+
+    let mut dns = TunPacket::for_test(Network::Udp, 53, dns_query("example.com"));
+    sniff_packet(&mut dns);
+    assert_eq!(dns.metadata.protocol, "dns");
+
+    let mut quic = TunPacket::for_test(Network::Udp, 443, quic_initial());
+    sniff_packet(&mut quic);
+    assert_eq!(quic.metadata.protocol, "quic");
+
+    let mut stun = TunPacket::for_test(Network::Udp, 3478, stun_binding());
+    sniff_packet(&mut stun);
+    assert_eq!(stun.metadata.protocol, "stun");
+}
+
+#[test]
+fn smoltcp_stack_facade_routes_packets_through_router() {
+    let options = options();
+    let router = router_from_options(&options);
+    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [1, 1, 1, 1],
+        5353,
+        53,
+        dns_query("example.com"),
+    );
+
+    let flow = stack.handle_packet(&packet).expect("handle packet");
+
+    assert_eq!(flow.decision, RouteDecision::HijackDns);
+    assert_eq!(flow.metadata.network, Network::Udp);
+    assert_eq!(flow.metadata.protocol, "dns");
+}
+
+#[tokio::test]
+async fn tun_dispatch_hijacks_dns_queries() {
+    let options = options();
+    let stack = runtime_stack(&options, "direct");
+    let packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [1, 1, 1, 1],
+        5353,
+        53,
+        dns_query("example.com"),
+    );
+
+    let dispatch = stack.dispatch_packet(&packet).await.expect("dispatch DNS");
+
+    let TunDispatch::DnsResponse { payload, metadata } = dispatch else {
+        panic!("unexpected dispatch result");
+    };
+    assert_eq!(metadata.protocol, "dns");
+    let response = <Message as MessageExt>::from_bytes(&payload).expect("decode response");
+    assert_eq!(
+        response.addresses(),
+        vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            203, 0, 113, 53
+        ))]
+    );
+}
+
+#[tokio::test]
+async fn tun_dispatch_rejects_blocked_quic() {
+    let options = options();
+    let stack = runtime_stack(&options, "direct");
+    let packet = ipv4_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 5353, 443, quic_initial());
+
+    let dispatch = stack.dispatch_packet(&packet).await.expect("dispatch QUIC");
+
+    let TunDispatch::Dropped { metadata, reason } = dispatch else {
+        panic!("unexpected dispatch result");
+    };
+    assert_eq!(metadata.protocol, "quic");
+    assert!(reason.contains("reject"));
+}
+
+#[tokio::test]
+async fn tun_dispatch_routes_udp_to_direct_outbound() {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = udp.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 64];
+        let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"payload");
+        udp.send_to(b"echo:payload", peer).await.unwrap();
+    });
+
+    let mut options = options();
+    options.route.rules.clear();
+    let stack = runtime_stack(&options, "direct");
+    let destination = match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets(),
+        std::net::IpAddr::V6(_) => panic!("test server must be ipv4"),
+    };
+    let packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        destination,
+        5353,
+        addr.port(),
+        b"payload".to_vec(),
+    );
+
+    let dispatch = stack
+        .dispatch_packet(&packet)
+        .await
+        .expect("dispatch direct UDP");
+
+    let TunDispatch::RoutedResponse { payload, metadata } = dispatch else {
+        panic!("unexpected dispatch result");
+    };
+    assert_eq!(metadata.network, Network::Udp);
+    assert_eq!(payload, b"echo:payload");
+}
+
+#[test]
+fn inbound_manager_registers_tun_inbound_from_options() {
+    let options = options();
+    let router = router_from_options(&options);
+    let manager = InboundManager::from_options(logger("inbound"), &options.inbounds, router)
+        .expect("inbound manager");
+
+    let inbound = manager.get("tun").expect("tun inbound registered");
+    assert_eq!(inbound.type_name(), "tun");
+    assert!(inbound.as_any().is::<TunInbound>());
+}
+
+struct FixedDnsTransport;
+
+impl Lifecycle for FixedDnsTransport {
+    fn name(&self) -> &str {
+        "fixed-dns"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DnsTransport for FixedDnsTransport {
+    fn type_name(&self) -> &str {
+        "mock"
+    }
+
+    fn tag(&self) -> &str {
+        "mock"
+    }
+
+    fn dependencies(&self) -> &[String] {
+        &[]
+    }
+
+    fn reset(&self) {}
+
+    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+        let query = message.queries[0].clone();
+        let mut response = message.fixed_response(FixedResponseCode::NoError);
+        response.add_answer(Record::from_rdata(
+            query.name().clone(),
+            60,
+            RData::A(std::net::Ipv4Addr::new(203, 0, 113, 53).into()),
+        ));
+        Ok(response)
+    }
+}
+
+fn ipv4_tcp_packet(
+    source: [u8; 4],
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total_len = 20 + 20 + payload.len();
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 6;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+    packet[32] = 0x50;
+    packet[40..].copy_from_slice(payload);
+    packet
+}
+
+fn ipv4_udp_packet(
+    source: [u8; 4],
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    payload: Vec<u8>,
+) -> Vec<u8> {
+    let total_len = 20 + 8 + payload.len();
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 17;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+    packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+    packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    packet[28..].copy_from_slice(&payload);
+    packet
+}
+
+fn dns_query(name: &str) -> Vec<u8> {
+    let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    for label in name.split('.') {
+        packet.push(label.len() as u8);
+        packet.extend_from_slice(label.as_bytes());
+    }
+    packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+    packet
+}
+
+fn quic_initial() -> Vec<u8> {
+    vec![
+        0xc0, 0x00, 0x00, 0x00, 0x01, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+}
+
+fn stun_binding() -> Vec<u8> {
+    vec![
+        0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+}

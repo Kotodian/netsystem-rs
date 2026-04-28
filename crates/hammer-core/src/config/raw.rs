@@ -114,7 +114,11 @@ pub struct RawHysteria2Config {
     pub bbr_profile: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub brutal_debug: bool,
-    #[serde(rename = "disable_path_mtu_discovery", default, skip_serializing_if = "is_false")]
+    #[serde(
+        rename = "disable_path_mtu_discovery",
+        default,
+        skip_serializing_if = "is_false"
+    )]
     pub disable_path_mtu: bool,
     #[serde(default, skip_serializing_if = "is_zero_u16")]
     pub initial_packet_size: u16,
@@ -177,7 +181,15 @@ impl RawRouteConfig {
     }
 }
 
-fn is_false(v: &bool) -> bool { !*v }
-fn is_zero_u16(v: &u16) -> bool { *v == 0 }
-fn is_zero_u32(v: &u32) -> bool { *v == 0 }
-fn is_zero_i64(v: &i64) -> bool { *v == 0 }
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}

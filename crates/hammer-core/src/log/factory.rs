@@ -59,11 +59,21 @@ impl Logger {
         self.factory.writer.write_message(level, line);
     }
 
-    pub fn trace(&self, msg: impl Into<String>) { self.log(Level::Trace, msg) }
-    pub fn debug(&self, msg: impl Into<String>) { self.log(Level::Debug, msg) }
-    pub fn info(&self, msg: impl Into<String>) { self.log(Level::Info, msg) }
-    pub fn warn(&self, msg: impl Into<String>) { self.log(Level::Warn, msg) }
-    pub fn error(&self, msg: impl Into<String>) { self.log(Level::Error, msg) }
+    pub fn trace(&self, msg: impl Into<String>) {
+        self.log(Level::Trace, msg)
+    }
+    pub fn debug(&self, msg: impl Into<String>) {
+        self.log(Level::Debug, msg)
+    }
+    pub fn info(&self, msg: impl Into<String>) {
+        self.log(Level::Info, msg)
+    }
+    pub fn warn(&self, msg: impl Into<String>) {
+        self.log(Level::Warn, msg)
+    }
+    pub fn error(&self, msg: impl Into<String>) {
+        self.log(Level::Error, msg)
+    }
 
     pub fn with_conn(&self, _id: ConnId) -> Self {
         // M1: ConnId is propagated via task_local::with_conn_id; this convenience helper
@@ -98,8 +108,16 @@ mod tests {
         let captured = writer.lines.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].0, Level::Info);
-        assert!(captured[0].1.starts_with("H[I] "), "got = {}", captured[0].1);
-        assert!(captured[0].1.contains(" path: started"), "got = {}", captured[0].1);
+        assert!(
+            captured[0].1.starts_with("H[I] "),
+            "got = {}",
+            captured[0].1
+        );
+        assert!(
+            captured[0].1.contains(" path: started"),
+            "got = {}",
+            captured[0].1
+        );
         assert!(captured[0].1.ends_with('\n'));
     }
 }

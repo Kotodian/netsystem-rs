@@ -1,21 +1,41 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use hammer_adapter::ConnectionManager as ConnectionManagerTrait;
+use hammer_adapter::{ConnectionHandle, ConnectionManager as ConnectionManagerTrait};
 use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
 
 pub struct ConnectionManager {
     logger: Logger,
-    count: AtomicUsize,
+    next_id: AtomicU64,
+    connections: Mutex<HashMap<u64, Arc<dyn ConnectionHandle>>>,
 }
 
 impl ConnectionManager {
     pub fn new(logger: Logger) -> Self {
         Self {
             logger,
-            count: AtomicUsize::new(0),
+            next_id: AtomicU64::new(1),
+            connections: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn track(&self, handle: Arc<dyn ConnectionHandle>) -> u64 {
+        <Self as ConnectionManagerTrait>::track(self, handle)
+    }
+
+    pub fn remove(&self, id: u64) -> bool {
+        <Self as ConnectionManagerTrait>::remove(self, id)
+    }
+
+    pub fn count(&self) -> usize {
+        <Self as ConnectionManagerTrait>::count(self)
+    }
+
+    pub fn close_all(&self) {
+        <Self as ConnectionManagerTrait>::close_all(self);
     }
 }
 
@@ -23,11 +43,40 @@ impl_logging_lifecycle!(ConnectionManager, "connection");
 
 impl ConnectionManagerTrait for ConnectionManager {
     fn count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
+        self.connections
+            .lock()
+            .expect("ConnectionManager poisoned")
+            .len()
+    }
+
+    fn track(&self, handle: Arc<dyn ConnectionHandle>) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.connections
+            .lock()
+            .expect("ConnectionManager poisoned")
+            .insert(id, handle);
+        id
+    }
+
+    fn remove(&self, id: u64) -> bool {
+        self.connections
+            .lock()
+            .expect("ConnectionManager poisoned")
+            .remove(&id)
+            .is_some()
     }
 
     fn close_all(&self) {
-        self.count.store(0, Ordering::SeqCst);
-        self.logger.debug("close_all (M2 stub)");
+        let handles = {
+            let mut connections = self.connections.lock().expect("ConnectionManager poisoned");
+            connections
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle.close();
+        }
+        self.logger.debug("close_all");
     }
 }

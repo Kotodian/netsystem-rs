@@ -49,9 +49,9 @@ pub fn parse_optional_port(field: &str, value: &str) -> Result<u16, HammerError>
     if value.is_empty() {
         return Ok(0);
     }
-    value.parse::<u16>().map_err(|err| {
-        HammerError::config_validation(format!("{field} port: {err}"))
-    })
+    value
+        .parse::<u16>()
+        .map_err(|err| HammerError::config_validation(format!("{field} port: {err}")))
 }
 
 pub fn parse_domain_strategy(field: &str, value: &str) -> Result<DomainStrategy, HammerError> {

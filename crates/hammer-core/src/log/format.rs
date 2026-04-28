@@ -168,26 +168,16 @@ mod tests {
             id: 0x123e,
             created_at: formatter.base_time,
         };
-        let got = formatter.format_platform(
-            Some(id),
-            Level::Info,
-            "inbound/tun",
-            "started at utun4",
-            ts,
-        );
+        let got =
+            formatter.format_platform(Some(id), Level::Info, "inbound/tun", "started at utun4", ts);
         assert_eq!(got, "H[I] +0.037s c#123e tun.in: started at utun4");
     }
 
     #[test]
     fn format_platform_elapsed_seconds() {
         let (formatter, ts) = fixture(Duration::from_millis(12_345));
-        let got = formatter.format_platform(
-            None,
-            Level::Debug,
-            "router",
-            "final outbound is hy2",
-            ts,
-        );
+        let got =
+            formatter.format_platform(None, Level::Debug, "router", "final outbound is hy2", ts);
         assert_eq!(got, "H[D] +12.345s path: final outbound is hy2");
     }
 
@@ -213,7 +203,10 @@ mod tests {
             ts,
         );
         assert!(!got.contains("\x1b["), "got = {got}");
-        assert!(!got.contains("INFO[") && !got.contains("ERROR["), "got = {got}");
+        assert!(
+            !got.contains("INFO[") && !got.contains("ERROR["),
+            "got = {got}"
+        );
         assert!(!got.contains("outbound/hysteria2"), "got = {got}");
         assert!(got.contains("egress.hy2:"), "got = {got}");
         assert!(got.contains("c#0042"), "got = {got}");

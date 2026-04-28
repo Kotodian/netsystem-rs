@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{Outbound, OutboundManager as OutboundManagerTrait};
+use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 
+use crate::hysteria2::Hysteria2Outbound;
 use crate::impl_logging_lifecycle;
+use crate::outbounds::{BlockOutbound, DirectOutbound, DnsOutbound};
 
 /// `out.Manager` port. M2 ships an empty registry; concrete outbounds (direct,
 /// hysteria2, block, dns) register themselves in M6/M7.
@@ -22,6 +25,39 @@ impl OutboundManager {
             items: Mutex::new(HashMap::new()),
             default_tag: default_tag.into(),
         }
+    }
+
+    pub fn from_options(
+        logger: Logger,
+        default_tag: impl Into<String>,
+        options: &[OutboundOptions],
+    ) -> Self {
+        let manager = Self::new(logger, default_tag);
+        for option in options {
+            manager.register_descriptor(option);
+        }
+        manager
+    }
+
+    pub fn register_descriptor(&self, option: &OutboundOptions) {
+        let descriptor: Arc<dyn Outbound> = match &option.kind {
+            OutboundKind::Hysteria2(o) => Arc::new(Hysteria2Outbound::new(
+                self.logger.clone(),
+                option.tag.clone(),
+                o.clone(),
+            )),
+            OutboundKind::Direct(_) => {
+                Arc::new(DirectOutbound::new(self.logger.clone(), option.tag.clone()))
+            }
+            OutboundKind::Block => {
+                Arc::new(BlockOutbound::new(self.logger.clone(), option.tag.clone()))
+            }
+            OutboundKind::Dns => Arc::new(DnsOutbound::new(option.tag.clone())),
+        };
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .insert(option.tag.clone(), descriptor);
     }
 }
 

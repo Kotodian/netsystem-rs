@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use hammer_core::config;
 
-use crate::error::HammerError;
 use crate::Platform;
+use crate::error::HammerError;
 use crate::service::Service;
 
 /// `namespace.check_config` — uniffi 0.31 hands us the TOML body as an owned String.

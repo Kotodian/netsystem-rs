@@ -120,7 +120,9 @@ fn build_hysteria_options(
         std::mem::take(&mut raw.id)
     };
     if raw.server.is_empty() {
-        return Err(HammerError::config_validation("hysteria2.server is required"));
+        return Err(HammerError::config_validation(
+            "hysteria2.server is required",
+        ));
     }
     let mut server_port = raw.server_port;
     if server_port == 0 && raw.server_ports.is_empty() {
@@ -131,10 +133,7 @@ fn build_hysteria_options(
             "hysteria2.password is required",
         ));
     }
-    if !raw.insecure
-        && raw.sni.is_empty()
-        && raw.server.parse::<std::net::IpAddr>().is_err()
-    {
+    if !raw.insecure && raw.sni.is_empty() && raw.server.parse::<std::net::IpAddr>().is_err() {
         raw.sni = raw.server.clone();
     }
     if !raw.insecure && raw.sni.is_empty() {
@@ -149,6 +148,7 @@ fn build_hysteria_options(
     let idle_timeout = parse_optional_duration("hysteria2.idle_timeout", &raw.idle_timeout)?;
     let keep_alive_period =
         parse_optional_duration("hysteria2.keep_alive_period", &raw.keep_alive_period)?;
+    let bbr_profile = normalize_bbr_profile(&raw.bbr_profile)?;
     let obfs = build_obfs(raw.obfs)?;
     Ok((
         Hysteria2OutboundOptions {
@@ -163,7 +163,7 @@ fn build_hysteria_options(
             hop_interval_max,
             idle_timeout,
             keep_alive_period,
-            bbr_profile: raw.bbr_profile,
+            bbr_profile,
             brutal_debug: raw.brutal_debug,
             disable_path_mtu_discovery: raw.disable_path_mtu,
             initial_packet_size: raw.initial_packet_size,
@@ -176,6 +176,16 @@ fn build_hysteria_options(
         },
         id,
     ))
+}
+
+fn normalize_bbr_profile(value: &str) -> Result<String, HammerError> {
+    match value {
+        "" => Ok("standard".to_owned()),
+        "standard" | "conservative" | "aggressive" => Ok(value.to_owned()),
+        _ => Err(HammerError::config_validation(format!(
+            "hysteria2.bbr_profile unsupported BBR profile: {value}",
+        ))),
+    }
 }
 
 fn build_obfs(raw: RawHysteria2Obfs) -> Result<Option<Hysteria2Obfs>, HammerError> {
@@ -222,6 +232,22 @@ pub(crate) fn dns_id(raw: &RawDnsConfig) -> &str {
 
 fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerError> {
     let id = dns_id(raw).to_owned();
+
+    match raw.server.as_str() {
+        C::DNS_TYPE_HOSTS => {
+            return Ok(DnsServer {
+                tag: id,
+                kind: DnsServerKind::Hosts,
+            });
+        }
+        C::DNS_TYPE_LOCAL => {
+            return Ok(DnsServer {
+                tag: id,
+                kind: DnsServerKind::Local,
+            });
+        }
+        _ => {}
+    }
 
     if let Ok(parsed) = Url::parse(&raw.server) {
         if !parsed.scheme().is_empty() && parsed.has_host() {

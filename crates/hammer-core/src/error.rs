@@ -22,19 +22,28 @@ pub enum CoreError {
 
 impl CoreError {
     pub fn config_parse(message: impl Into<String>) -> Self {
-        Self::ConfigParse { message: message.into() }
+        Self::ConfigParse {
+            message: message.into(),
+        }
     }
 
     pub fn config_validation(message: impl Into<String>) -> Self {
-        Self::ConfigValidation { message: message.into() }
+        Self::ConfigValidation {
+            message: message.into(),
+        }
     }
 
     pub fn lifecycle(stage: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Lifecycle { stage: stage.into(), message: message.into() }
+        Self::Lifecycle {
+            stage: stage.into(),
+            message: message.into(),
+        }
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal { message: message.into() }
+        Self::Internal {
+            message: message.into(),
+        }
     }
 }
 

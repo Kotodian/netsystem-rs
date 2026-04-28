@@ -56,9 +56,9 @@ impl<Output> Registry<Output> {
         options: Box<dyn Any + Send>,
     ) -> Result<Output, CoreError> {
         let guard = self.constructors.read().expect("Registry lock poisoned");
-        let ctor = guard.get(type_name).ok_or_else(|| {
-            CoreError::config_validation(format!("unknown type: {type_name}"))
-        })?;
+        let ctor = guard
+            .get(type_name)
+            .ok_or_else(|| CoreError::config_validation(format!("unknown type: {type_name}")))?;
         ctor.create(ctx, tag, options)
     }
 }

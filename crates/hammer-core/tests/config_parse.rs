@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use hammer_core::config::{
-    self, DnsServerKind, InboundKind, OutboundKind, RuleActionKind,
-};
+use hammer_core::config::{self, DnsServerKind, InboundKind, OutboundKind, RuleActionKind};
 
 const MINIMAL_CONFIG: &str = r#"
 [log]
@@ -61,10 +59,7 @@ fn parse_config_builds_hysteria_tun_options() {
         vec!["tun".to_owned()]
     );
 
-    assert_rule_action(
-        &options.route.rules[1].default_options.action,
-        "hijack-dns",
-    );
+    assert_rule_action(&options.route.rules[1].default_options.action, "hijack-dns");
     assert_eq!(
         options.route.rules[1].default_options.protocol,
         vec!["dns".to_owned()]
@@ -86,10 +81,7 @@ fn parse_config_builds_hysteria_tun_options() {
         RuleActionKind::Resolve(o) => o,
         _ => panic!("rule[3] not Resolve"),
     };
-    assert_eq!(
-        resolve.strategy,
-        config::DomainStrategy::PreferIpv4
-    );
+    assert_eq!(resolve.strategy, config::DomainStrategy::PreferIpv4);
 
     assert_rule_action(
         &options.route.rules[4].default_options.action,
@@ -118,10 +110,8 @@ fn parse_config_builds_hysteria_tun_options() {
 
 #[test]
 fn check_config_rejects_unsupported_config_keys() {
-    let err = config::check_config(&format!(
-        "{MINIMAL_CONFIG}\n[profile]\nenabled = true\n"
-    ))
-    .expect_err("CheckConfig accepted an unsupported section");
+    let err = config::check_config(&format!("{MINIMAL_CONFIG}\n[profile]\nenabled = true\n"))
+        .expect_err("CheckConfig accepted an unsupported section");
     let msg = err.to_string();
     assert!(
         msg.contains("unsupported config key: profile"),
@@ -167,14 +157,22 @@ fn parse_config_propagates_dns_strategy() {
 
 #[test]
 fn parse_config_rejects_unknown_dns_strategy() {
-    let cfg = MINIMAL_CONFIG.replacen(
-        "[dns]\n",
-        "[dns]\nstrategy = \"prefer_quantum\"\n",
-        1,
-    );
+    let cfg = MINIMAL_CONFIG.replacen("[dns]\n", "[dns]\nstrategy = \"prefer_quantum\"\n", 1);
     let err = config::parse_config(&cfg).expect_err("accepted unknown dns.strategy");
     let msg = err.to_string();
     assert!(msg.contains("dns.strategy"), "error = {msg:?}");
+}
+
+#[test]
+fn parse_config_rejects_unknown_hysteria2_bbr_profile() {
+    let cfg = MINIMAL_CONFIG.replacen(
+        "[hysteria2]\n",
+        "[hysteria2]\nbbr_profile = \"reckless\"\n",
+        1,
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted unknown hysteria2.bbr_profile");
+    let msg = err.to_string();
+    assert!(msg.contains("hysteria2.bbr_profile"), "error = {msg:?}");
 }
 
 #[test]

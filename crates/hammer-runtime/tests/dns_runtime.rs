@@ -1,0 +1,331 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
+use async_trait::async_trait;
+use hammer_adapter::{DnsQueryOptions, DnsTransport, Lifecycle, StartStage};
+use hammer_core::config::{self, DomainStrategy};
+use hammer_core::error::HammerError;
+use hammer_core::log::{DiscardWriter, Factory, Logger};
+use hammer_runtime::{
+    DnsClient, DnsRouter, DnsTransportManager,
+    dns::{FixedResponseCode, HostsTransport, MessageExt, TcpDnsTransport, UdpDnsTransport},
+};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, UdpSocket};
+
+fn logger(tag: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+}
+
+fn query(name: &str, record_type: RecordType) -> Message {
+    let mut msg = Message::new(42, MessageType::Query, OpCode::Query);
+    msg.add_query({
+        let mut q = Query::query(Name::from_ascii(name).unwrap(), record_type);
+        q.set_query_class(DNSClass::IN);
+        q
+    });
+    msg.metadata.recursion_desired = true;
+    msg
+}
+
+fn response_for(request: &Message, ttl: u32, addr: IpAddr) -> Message {
+    let question = request.queries[0].clone();
+    let mut response = request.fixed_response(FixedResponseCode::NoError);
+    let rdata = match addr {
+        IpAddr::V4(ip) => RData::A(ip.into()),
+        IpAddr::V6(ip) => RData::AAAA(ip.into()),
+    };
+    response.add_answer(Record::from_rdata(question.name().clone(), ttl, rdata));
+    response
+}
+
+#[derive(Debug)]
+struct CountingTransport {
+    calls: AtomicUsize,
+    ttl: u32,
+    addr: IpAddr,
+}
+
+impl CountingTransport {
+    fn new(ttl: u32, addr: IpAddr) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            ttl,
+            addr,
+        }
+    }
+}
+
+impl Lifecycle for CountingTransport {
+    fn name(&self) -> &str {
+        "counting"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DnsTransport for CountingTransport {
+    fn type_name(&self) -> &str {
+        "mock"
+    }
+
+    fn tag(&self) -> &str {
+        "mock"
+    }
+
+    fn dependencies(&self) -> &[String] {
+        &[]
+    }
+
+    fn reset(&self) {}
+
+    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(response_for(&message, self.ttl, self.addr))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hosts_transport_returns_fixed_a_and_aaaa_records() {
+    let hosts = HostsTransport::from_predefined(
+        "hosts",
+        [
+            ("example.test", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))),
+            ("example.test", IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ],
+    );
+
+    let a = hosts
+        .exchange(query("example.test.", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(a.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(a.addresses(), vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))]);
+
+    let aaaa = hosts
+        .exchange(query("example.test.", RecordType::AAAA))
+        .await
+        .unwrap();
+    assert_eq!(aaaa.addresses(), vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+
+    let missing = hosts
+        .exchange(query("missing.test.", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(missing.metadata.response_code, ResponseCode::NXDomain);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
+    let transport = Arc::new(CountingTransport::new(
+        60,
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
+    ));
+    let client = DnsClient::new(logger("dns"));
+
+    let first = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "cached.test",
+            DnsQueryOptions {
+                lookup_strategy: DomainStrategy::Ipv4Only,
+                ..DnsQueryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    let second = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "cached.test",
+            DnsQueryOptions {
+                lookup_strategy: DomainStrategy::Ipv4Only,
+                ..DnsQueryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+
+    client.clear_cache();
+    let _ = client
+        .lookup(
+            transport.clone() as Arc<dyn DnsTransport>,
+            "cached.test",
+            DnsQueryOptions {
+                lookup_strategy: DomainStrategy::Ipv4Only,
+                ..DnsQueryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_client_applies_lookup_strategy_ordering() {
+    let transport = Arc::new(CountingTransport::new(
+        60,
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+    ));
+    let client = DnsClient::new(logger("dns"));
+
+    let ipv4_only = client
+        .lookup(
+            transport.clone() as Arc<dyn DnsTransport>,
+            "strategy.test",
+            DnsQueryOptions {
+                lookup_strategy: DomainStrategy::Ipv4Only,
+                ..DnsQueryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ipv4_only, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))]);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn udp_transport_retries_truncated_response_over_tcp() {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let tcp = TcpListener::bind(udp.local_addr().unwrap()).await.unwrap();
+    let addr = udp.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 512];
+        let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+        let request = <Message as MessageExt>::from_bytes(&buf[..len]).unwrap();
+        let mut truncated = request.fixed_response(FixedResponseCode::NoError);
+        truncated.metadata.truncation = true;
+        udp.send_to(&MessageExt::to_bytes(&truncated).unwrap(), peer)
+            .await
+            .unwrap();
+    });
+
+    tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let mut len_buf = [0_u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0_u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        let request = <Message as MessageExt>::from_bytes(&payload).unwrap();
+        let response = response_for(&request, 60, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
+        let bytes = MessageExt::to_bytes(&response).unwrap();
+        stream
+            .write_all(&(bytes.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+
+    let transport = UdpDnsTransport::new(
+        "default",
+        addr.ip().to_string(),
+        addr.port(),
+        logger("dns/transport/udp"),
+    );
+    let response = transport
+        .exchange(query("fallback.test.", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.addresses(),
+        vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_transport_uses_dns_length_prefixed_framing() {
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let mut len_buf = [0_u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let len = u16::from_be_bytes(len_buf) as usize;
+        let mut payload = vec![0_u8; len];
+        stream.read_exact(&mut payload).await.unwrap();
+        let request = <Message as MessageExt>::from_bytes(&payload).unwrap();
+        let response = response_for(&request, 60, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)));
+        let bytes = MessageExt::to_bytes(&response).unwrap();
+        stream
+            .write_all(&(bytes.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    });
+
+    let transport = TcpDnsTransport::new(
+        "default",
+        addr.ip().to_string(),
+        addr.port(),
+        logger("dns/transport/tcp"),
+    );
+    let response = transport
+        .exchange(query("tcp.test.", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.addresses(),
+        vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_manager_builds_current_schema_default_server() {
+    let options = config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+[hysteria2]
+server = "example.com"
+password = "x"
+sni = "example.com"
+[dns]
+server = "hosts"
+"#,
+    )
+    .unwrap();
+    let manager = DnsTransportManager::from_options(logger("dns-transport"), &options.dns).unwrap();
+    manager.start(StartStage::Start).unwrap();
+
+    let default = manager.default().expect("default transport");
+    assert_eq!(default.type_name(), "hosts");
+    assert_eq!(default.tag(), "default");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_lookup_uses_default_transport_and_tracks_reverse_mapping() {
+    let manager = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
+    manager.insert(Arc::new(CountingTransport::new(
+        60,
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22)),
+    )));
+    let router = DnsRouter::new_with_manager(logger("dns"), manager, DomainStrategy::AsIs);
+
+    let addrs = router
+        .lookup("router.test", DnsQueryOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(addrs, vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22))]);
+    assert_eq!(
+        router.lookup_reverse_mapping(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22))),
+        Some("router.test".to_owned())
+    );
+}

@@ -41,11 +41,15 @@ impl HammerError {
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal { message: message.into() }
+        Self::Internal {
+            message: message.into(),
+        }
     }
 
     pub fn platform(message: impl Into<String>) -> Self {
-        Self::Platform { message: message.into() }
+        Self::Platform {
+            message: message.into(),
+        }
     }
 }
 

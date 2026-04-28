@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 
 use hammer_core::error::CoreError;
@@ -9,6 +10,7 @@ use hammer_core::lifecycle::Lifecycle;
 pub trait Inbound: Lifecycle {
     fn type_name(&self) -> &str;
     fn tag(&self) -> &str;
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// `adapter.InboundManager` — owns the live set of inbounds.

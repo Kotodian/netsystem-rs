@@ -132,6 +132,7 @@ impl DnsServer {
             DnsServerKind::Udp(o) => &o.via,
             DnsServerKind::Tcp(o) => &o.via,
             DnsServerKind::Https(o) => &o.via,
+            DnsServerKind::Hosts | DnsServerKind::Local => "",
         }
     }
 }
@@ -141,6 +142,8 @@ pub enum DnsServerKind {
     Udp(RemoteDnsServer),
     Tcp(RemoteDnsServer),
     Https(RemoteHttpsDnsServer),
+    Hosts,
+    Local,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -278,4 +281,6 @@ pub mod constants {
     pub const DEFAULT_TUN_MTU: u32 = 9000;
     pub const DEFAULT_DNS_PATH: &str = "/dns-query";
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
+    pub const DNS_TYPE_HOSTS: &str = "hosts";
+    pub const DNS_TYPE_LOCAL: &str = "local";
 }

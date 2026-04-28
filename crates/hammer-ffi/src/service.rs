@@ -1,15 +1,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hammer_adapter::{Lifecycle, NetworkManager as _};
+use hammer_adapter::{Lifecycle, NetworkManager as _, PlatformInterface};
 use hammer_core::config::{self, Options};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{Factory, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{
-    CertificateProviderManager, CertificateStore, ConnectionManager, DnsRouter, DnsTransportManager,
-    EndpointManager, HttpClientManager, InboundManager, NetworkManager, OutboundManager,
-    PauseManager, Router, ServiceManager,
+    CertificateProviderManager, CertificateStore, ConnectionManager, DnsRouter,
+    DnsTransportManager, EndpointManager, HttpClientManager, InboundManager, NetworkManager,
+    OutboundManager, PauseManager, Router, ServiceManager,
 };
 
 use crate::Platform;
@@ -75,23 +75,44 @@ impl Service {
             "certificate-provider",
         )));
         let endpoint = Arc::new(EndpointManager::new(new_logger(&log_factory, "endpoint")));
-        let network = Arc::new(NetworkManager::new(
+        let connection = Arc::new(ConnectionManager::new(new_logger(
+            &log_factory,
+            "connection",
+        )));
+        let network = NetworkManager::with_platform(
             new_logger(&log_factory, "network"),
             options.route.auto_detect_interface,
-        ));
-        let dns_transport = Arc::new(DnsTransportManager::new(
+            Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
+            Arc::clone(&pause),
+            Arc::clone(&connection),
+        );
+        let dns_transport = Arc::new(DnsTransportManager::from_options(
             new_logger(&log_factory, "dns-transport"),
-            options.dns.final_.clone(),
-        ));
-        let outbound = Arc::new(OutboundManager::new(
+            &options.dns,
+        )?);
+        let outbound = Arc::new(OutboundManager::from_options(
             new_logger(&log_factory, "outbound"),
             options.route.final_.clone(),
+            &options.outbounds,
         ));
-        let dns_router = Arc::new(DnsRouter::new(new_logger(&log_factory, "dns-router")));
-        let router = Arc::new(Router::new(new_logger(&log_factory, "router")));
-        let inbound = Arc::new(InboundManager::new(new_logger(&log_factory, "inbound")));
+        let dns_router = Arc::new(DnsRouter::new_with_manager(
+            new_logger(&log_factory, "dns-router"),
+            Arc::clone(&dns_transport),
+            options.dns.strategy,
+        ));
+        let router = Arc::new(Router::from_options(
+            new_logger(&log_factory, "router"),
+            options.route.clone(),
+            Arc::clone(&outbound),
+        ));
+        let inbound = Arc::new(InboundManager::from_options_with_runtime(
+            new_logger(&log_factory, "inbound"),
+            &options.inbounds,
+            Arc::clone(&router),
+            Arc::clone(&dns_router),
+            Arc::clone(&outbound),
+        )?);
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
-        let connection = Arc::new(ConnectionManager::new(new_logger(&log_factory, "connection")));
         let http_client = Arc::new(HttpClientManager::new(new_logger(
             &log_factory,
             "http-client",
@@ -128,10 +149,7 @@ impl Service {
         ];
 
         debug_assert_eq!(
-            lifecycles
-                .iter()
-                .map(|lc| lc.name())
-                .collect::<Vec<_>>(),
+            lifecycles.iter().map(|lc| lc.name()).collect::<Vec<_>>(),
             LIFECYCLE_ORDER.to_vec(),
             "Service lifecycles must match LIFECYCLE_ORDER",
         );

@@ -1,8 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use hammer::{
-    HammerError, NetworkInterface, Platform, Service, TunOptions, WifiState,
-};
+use hammer::{HammerError, NetworkInterface, Platform, Service, TunOptions, WifiState};
 
 const MIN_TOML: &str = r#"
 [tun]

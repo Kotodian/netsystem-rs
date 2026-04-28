@@ -45,9 +45,6 @@ dictionary WifiState {
   string bssid;
 };
 
-// M1 omits the default-interface monitor callbacks; they will be reintroduced in
-// M4 alongside the real NetworkManager. The remaining surface is everything
-// Service / log path needs today.
 callback interface Platform {
   [Throws=HammerError]
   i32 open_tun(TunOptions options);
