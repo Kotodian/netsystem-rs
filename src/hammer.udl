@@ -1,0 +1,83 @@
+namespace hammer {
+  [Throws=HammerError]
+  void check_config(string content);
+
+  [Throws=HammerError]
+  string format_config(string content);
+
+  [Throws=HammerError]
+  Service new_service(string config_content, Platform platform);
+};
+
+[Error]
+interface HammerError {
+  ConfigParse(string message);
+  ConfigValidation(string message);
+  PlatformMissing();
+  ServiceClosed();
+  ServiceAlreadyStarted();
+  Lifecycle(string stage, string message);
+  Platform(string message);
+  Internal(string message);
+};
+
+dictionary TunOptions {
+  string name;
+  i32 mtu;
+  sequence<string> address;
+  sequence<string> route;
+};
+
+dictionary NetworkInterface {
+  i32 index;
+  i32 mtu;
+  string name;
+  i32 type_;
+  i32 flags;
+  boolean expensive;
+  boolean constrained;
+  sequence<string> addresses;
+  sequence<string> dns_servers;
+};
+
+dictionary WifiState {
+  string ssid;
+  string bssid;
+};
+
+// M1 omits the default-interface monitor callbacks; they will be reintroduced in
+// M4 alongside the real NetworkManager. The remaining surface is everything
+// Service / log path needs today.
+callback interface Platform {
+  [Throws=HammerError]
+  i32 open_tun(TunOptions options);
+
+  boolean use_platform_auto_detect_interface_control();
+
+  [Throws=HammerError]
+  void auto_detect_interface_control(i32 fd);
+
+  [Throws=HammerError]
+  sequence<NetworkInterface> get_interfaces();
+
+  boolean under_network_extension();
+  boolean include_all_networks();
+  WifiState? read_wifi_state();
+  sequence<string> system_certificates();
+  void clear_dns_cache();
+  void write_log(i32 level, string message);
+};
+
+interface Service {
+  [Throws=HammerError]
+  void start();
+
+  [Throws=HammerError]
+  void close();
+
+  void pause();
+  void wake();
+  void reset_network();
+  boolean need_wifi_state();
+  void update_wifi_state();
+};
