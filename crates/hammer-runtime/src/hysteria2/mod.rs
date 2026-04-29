@@ -34,6 +34,15 @@ use obfs::Salamander;
 
 use crate::socket_protector::SocketProtector;
 
+// Match sing-quic's hysteria2 client defaults
+// (quic/hysteria/protocol.go DefaultStreamReceiveWindow / DefaultConnReceiveWindow):
+//   stream window = 8 MiB, connection window = stream * 5 / 2.
+// quinn's send_window default is also 8 MiB; bumping it slightly keeps the
+// in-flight ceiling above one stream's BDP at typical BBR steady state.
+const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
+const CONNECTION_RECEIVE_WINDOW: u32 = STREAM_RECEIVE_WINDOW / 2 * 5;
+const SEND_WINDOW: u64 = CONNECTION_RECEIVE_WINDOW as u64;
+
 #[derive(Clone)]
 pub struct ClientOptions {
     pub server: String,
@@ -499,6 +508,11 @@ fn client_config(
             .map_err(|err| HammerError::internal(format!("quic tls config: {err}")))?,
     ));
     let mut transport = quinn::TransportConfig::default();
+    // Match the sing-quic / hysteria2 official defaults — quinn's defaults are
+    // far below the BDP we typically need for cross-region transfers.
+    transport.stream_receive_window(quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW));
+    transport.receive_window(quinn::VarInt::from_u32(CONNECTION_RECEIVE_WINDOW));
+    transport.send_window(SEND_WINDOW);
     transport.keep_alive_interval(Some(
         options.keep_alive_period.unwrap_or(Duration::from_secs(10)),
     ));
@@ -507,6 +521,12 @@ fn client_config(
             .try_into()
             .map_err(|err| HammerError::internal(format!("invalid QUIC idle timeout: {err}")))?;
         transport.max_idle_timeout(Some(timeout));
+    } else {
+        transport.max_idle_timeout(Some(
+            Duration::from_secs(30)
+                .try_into()
+                .expect("30s fits in QUIC idle timeout"),
+        ));
     }
     apply_transport_config_with_handle(
         &mut config,
