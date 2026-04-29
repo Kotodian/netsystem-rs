@@ -8,8 +8,8 @@ use hammer_core::log::{Factory, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{
     CertificateProviderManager, CertificateStore, ConnectionManager, DnsRouter,
-    DnsTransportManager, EndpointManager, HttpClientManager, InboundManager, NetworkManager,
-    OutboundManager, PauseManager, Router, ServiceManager,
+    DnsTransportManager, EndpointManager, InboundManager, NetworkManager, OutboundManager,
+    PauseManager, Router, ServiceManager,
 };
 
 use crate::Platform;
@@ -118,10 +118,6 @@ impl Service {
             Arc::clone(&outbound),
         )?);
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
-        let http_client = Arc::new(HttpClientManager::new(new_logger(
-            &log_factory,
-            "http-client",
-        )));
 
         registry.set::<CertificateStore>(Arc::clone(&cert_store));
         registry.set::<CertificateProviderManager>(Arc::clone(&cert_provider));
@@ -134,7 +130,6 @@ impl Service {
         registry.set::<InboundManager>(Arc::clone(&inbound));
         registry.set::<ServiceManager>(Arc::clone(&service_mgr));
         registry.set::<ConnectionManager>(Arc::clone(&connection));
-        registry.set::<HttpClientManager>(Arc::clone(&http_client));
         registry.set::<PauseManager>(Arc::clone(&pause));
 
         // Order in `lifecycles` MUST match LIFECYCLE_ORDER — Service::start /
