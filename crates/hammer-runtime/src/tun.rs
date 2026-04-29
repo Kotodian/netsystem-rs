@@ -315,6 +315,7 @@ pub struct SystemTunStack {
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<Mutex<SystemTcpNat>>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
+    tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
 }
@@ -329,6 +330,28 @@ impl SystemTunStack {
         options: hammer_core::config::TunInboundOptions,
         device: Arc<dyn TunDevice>,
     ) -> Self {
+        Self::new_with_interface_index(
+            logger,
+            router,
+            dns_router,
+            outbound,
+            inbound_tag,
+            options,
+            device,
+            None,
+        )
+    }
+
+    pub fn new_with_interface_index(
+        logger: Logger,
+        router: Arc<Router>,
+        dns_router: Arc<DnsRouter>,
+        outbound: Arc<OutboundManager>,
+        inbound_tag: String,
+        options: hammer_core::config::TunInboundOptions,
+        device: Arc<dyn TunDevice>,
+        tun_interface_index: Option<u32>,
+    ) -> Self {
         let udp_timeout = options.udp_timeout.unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
         Self {
             logger,
@@ -340,6 +363,7 @@ impl SystemTunStack {
             device,
             tcp_nat: Arc::new(Mutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
             udp_flows: Arc::new(Mutex::new(HashMap::new())),
+            tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
             started: AtomicBool::new(false),
         }
@@ -353,9 +377,10 @@ impl SystemTunStack {
         let mut handles = Vec::new();
         let mut routes = SystemStackRoutes::default();
         if let Some(v4) = addresses.v4 {
-            let listener = bind_system_listener(IpAddr::V4(v4.listener)).map_err(|err| {
-                HammerError::internal(format!("bind IPv4 system TCP listener: {err}"))
-            })?;
+            let listener =
+                bind_system_listener(IpAddr::V4(v4.listener), self.tun_interface_index).map_err(
+                    |err| HammerError::internal(format!("bind IPv4 system TCP listener: {err}")),
+                )?;
             let port = listener
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv4 listener addr: {err}")))?
@@ -377,9 +402,10 @@ impl SystemTunStack {
             });
         }
         if let Some(v6) = addresses.v6 {
-            let listener = bind_system_listener(IpAddr::V6(v6.listener)).map_err(|err| {
-                HammerError::internal(format!("bind IPv6 system TCP listener: {err}"))
-            })?;
+            let listener =
+                bind_system_listener(IpAddr::V6(v6.listener), self.tun_interface_index).map_err(
+                    |err| HammerError::internal(format!("bind IPv6 system TCP listener: {err}")),
+                )?;
             let port = listener
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv6 listener addr: {err}")))?
@@ -463,14 +489,86 @@ impl SystemStackRoutes {
     }
 }
 
-fn bind_system_listener(addr: IpAddr) -> Result<TcpListener, HammerError> {
+fn bind_system_listener(
+    addr: IpAddr,
+    interface_index: Option<u32>,
+) -> Result<TcpListener, HammerError> {
     let listener = StdTcpListener::bind(SocketAddr::new(addr, 0))
         .map_err(|err| HammerError::internal(format!("bind {addr}: {err}")))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| HammerError::internal(format!("set {addr} listener nonblocking: {err}")))?;
+    if let Some(index) = interface_index {
+        bind_listener_to_tun_interface(&listener, addr, index)?;
+    }
     TcpListener::from_std(listener)
         .map_err(|err| HammerError::internal(format!("register {addr} listener: {err}")))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+fn bind_listener_to_tun_interface(
+    listener: &StdTcpListener,
+    addr: IpAddr,
+    index: u32,
+) -> Result<(), HammerError> {
+    use std::os::fd::AsRawFd;
+    let (level, name) = match addr {
+        IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
+        IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
+    };
+    let value = index as libc::c_int;
+    let ret = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            level,
+            name,
+            (&value as *const libc::c_int).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(HammerError::internal(format!(
+            "bind {addr} listener to TUN ifindex {index}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+fn bind_listener_to_tun_interface(
+    _listener: &StdTcpListener,
+    _addr: IpAddr,
+    _index: u32,
+) -> Result<(), HammerError> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub fn tun_interface_index_from_fd(fd: RawFd) -> Option<u32> {
+    use std::ffi::CStr;
+    unsafe {
+        let mut name = [0u8; libc::IFNAMSIZ];
+        let mut len = name.len() as libc::socklen_t;
+        let ret = libc::getsockopt(
+            fd,
+            libc::SYSPROTO_CONTROL,
+            libc::UTUN_OPT_IFNAME,
+            name.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+        );
+        if ret != 0 || len == 0 {
+            return None;
+        }
+        let cname = CStr::from_bytes_with_nul(&name[..len as usize]).ok()?;
+        let idx = libc::if_nametoindex(cname.as_ptr());
+        if idx == 0 { None } else { Some(idx) }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+pub fn tun_interface_index_from_fd(_fd: RawFd) -> Option<u32> {
+    None
 }
 
 struct StackAddresses {

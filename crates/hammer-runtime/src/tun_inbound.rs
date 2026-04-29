@@ -8,7 +8,7 @@ use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::tun::{AsyncTunDevice, SmoltcpTunStack, SystemTunStack};
+use crate::tun::{AsyncTunDevice, SmoltcpTunStack, SystemTunStack, tun_interface_index_from_fd};
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
@@ -128,8 +128,15 @@ impl TunInbound {
         let dup_fd = duplicate_fd(fd)?;
         let mtu = usize::try_from(self.options.mtu)
             .map_err(|_| HammerError::internal("TUN MTU does not fit in usize"))?;
+        let tun_interface_index = tun_interface_index_from_fd(fd);
+        if let Some(index) = tun_interface_index {
+            self.logger.info(format!("TUN interface index {index}"));
+        } else {
+            self.logger
+                .debug("TUN interface index unavailable; listener will not bind to TUN");
+        }
         let device = unsafe { AsyncTunDevice::from_fd(dup_fd, mtu)? };
-        Ok(Some(Arc::new(SystemTunStack::new(
+        Ok(Some(Arc::new(SystemTunStack::new_with_interface_index(
             self.logger.clone(),
             Arc::clone(&self.router),
             Arc::clone(dns_router),
@@ -137,6 +144,7 @@ impl TunInbound {
             self.tag.clone(),
             self.options.clone(),
             device,
+            tun_interface_index,
         ))))
     }
 
