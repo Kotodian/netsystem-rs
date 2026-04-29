@@ -13,8 +13,8 @@ use hammer_runtime::{
     dns::{FixedResponseCode, MessageExt},
     tun::{
         MemoryTunDevice, SmoltcpTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
-        parse_ip_packet, process_system_tcp_packet, sniff_packet, sniff_stream,
-        udp_response_packet,
+        parse_ip_packet, process_system_tcp_packet, sniff_packet, sniff_stream, tcp_reset_packet,
+        udp_response_packet, udp_unreachable_packet,
     },
 };
 use hickory_proto::op::Message;
@@ -339,6 +339,39 @@ fn system_stack_builds_full_udp_response_packet() {
         response.len()
     );
     assert_ne!(u16::from_be_bytes([response[26], response[27]]), 0);
+}
+
+#[test]
+fn system_stack_builds_udp_reject_unreachable_packet() {
+    let request = ipv4_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 5353, 443, quic_initial());
+    let response = udp_unreachable_packet(&request).expect("build unreachable");
+
+    assert_eq!(response[0] >> 4, 4);
+    assert_eq!(response[9], 1, "IPv4 reject must be ICMP");
+    assert_eq!(response[20], 3, "ICMP destination unreachable");
+    assert_eq!(response[21], 3, "ICMP port unreachable");
+    assert_eq!(&response[12..16], &[1, 1, 1, 1]);
+    assert_eq!(&response[16..20], &[10, 0, 0, 2]);
+}
+
+#[test]
+fn system_stack_builds_tcp_reject_reset_packet() {
+    let request = ipv4_tcp_packet([10, 0, 0, 2], [93, 184, 216, 34], 49152, 443, b"");
+    let response = tcp_reset_packet(&request).expect("build tcp reset");
+    let parsed = parse_ip_packet(&response).expect("parse tcp reset");
+
+    assert_eq!(parsed.network, Network::Tcp);
+    assert_eq!(
+        parsed.source.host,
+        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+    );
+    assert_eq!(parsed.source.port, 443);
+    assert_eq!(
+        parsed.destination.host,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+    );
+    assert_eq!(parsed.destination.port, 49152);
+    assert_eq!(response[33] & 0x14, 0x14, "RST+ACK flags expected");
 }
 
 #[test]

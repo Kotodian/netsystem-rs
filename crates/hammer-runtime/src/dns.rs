@@ -4,9 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use hammer_adapter::{
     DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
-    DnsTransportManager as DnsTransportManagerTrait, Lifecycle, StartStage,
+    DnsTransportManager as DnsTransportManagerTrait, Lifecycle, Network,
+    OutboundManager as OutboundManagerTrait, PlatformInterface, ProxyStream, SocksAddr, StartStage,
 };
 use hammer_core::config::{
     DnsOptions, DnsServer, DnsServerKind, DomainStrategy, RemoteDnsServer, RemoteHttpsDnsServer,
@@ -16,8 +18,16 @@ use hammer_core::log::Logger;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
+use http::Request;
+use http_body_util::{BodyExt, Full};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio_rustls::TlsConnector;
+
+use crate::OutboundManager;
+use crate::socket_protector::SocketProtector;
+use crate::tls_support::root_cert_store;
 
 const DEFAULT_DNS_TTL: u32 = 600;
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -505,8 +515,11 @@ pub struct UdpDnsTransport {
     tag: String,
     server: String,
     port: u16,
+    via: String,
     logger: Logger,
     dependencies: Vec<String>,
+    outbound: Option<Arc<OutboundManager>>,
+    protector: SocketProtector,
 }
 
 impl UdpDnsTransport {
@@ -515,8 +528,30 @@ impl UdpDnsTransport {
             tag: tag.into(),
             server,
             port,
+            via: String::new(),
             logger,
             dependencies: Vec::new(),
+            outbound: None,
+            protector: SocketProtector::default(),
+        }
+    }
+
+    fn new_with_runtime(
+        tag: impl Into<String>,
+        options: &RemoteDnsServer,
+        logger: Logger,
+        outbound: Option<Arc<OutboundManager>>,
+        protector: SocketProtector,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            server: options.server.clone(),
+            port: options.server_port,
+            via: options.via.clone(),
+            logger,
+            dependencies: dependency(&options.via),
+            outbound,
+            protector,
         }
     }
 }
@@ -548,14 +583,37 @@ impl DnsTransport for UdpDnsTransport {
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
         let server = resolve_first(&self.server, self.port).await?;
+        if !self.via.is_empty() {
+            let response = udp_exchange_via(
+                self.outbound.as_ref(),
+                &self.via,
+                socket_addr_to_socks(server),
+                &MessageExt::to_bytes(&message)?,
+            )
+            .await?;
+            let response = <Message as MessageExt>::from_bytes(&response)?;
+            if response.metadata.truncation {
+                self.logger.info("response truncated, retrying with TCP");
+                return tcp_exchange_via_or_direct(
+                    self.outbound.as_ref(),
+                    &self.via,
+                    server,
+                    message,
+                    &self.protector,
+                )
+                .await;
+            }
+            return Ok(response);
+        }
         let bind = if server.is_ipv6() {
-            "[::]:0"
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         } else {
-            "0.0.0.0:0"
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         };
         let socket = UdpSocket::bind(bind)
             .await
             .map_err(|e| HammerError::internal(format!("bind UDP DNS socket: {e}")))?;
+        self.protector.protect(&socket)?;
         socket
             .connect(server)
             .await
@@ -572,7 +630,7 @@ impl DnsTransport for UdpDnsTransport {
         let response = <Message as MessageExt>::from_bytes(&buf[..len])?;
         if response.metadata.truncation {
             self.logger.info("response truncated, retrying with TCP");
-            return tcp_exchange(&server, message).await;
+            return tcp_exchange_direct(&server, message, &self.protector).await;
         }
         Ok(response)
     }
@@ -582,7 +640,10 @@ pub struct TcpDnsTransport {
     tag: String,
     server: String,
     port: u16,
+    via: String,
     dependencies: Vec<String>,
+    outbound: Option<Arc<OutboundManager>>,
+    protector: SocketProtector,
 }
 
 impl TcpDnsTransport {
@@ -591,7 +652,27 @@ impl TcpDnsTransport {
             tag: tag.into(),
             server,
             port,
+            via: String::new(),
             dependencies: Vec::new(),
+            outbound: None,
+            protector: SocketProtector::default(),
+        }
+    }
+
+    fn new_with_runtime(
+        tag: impl Into<String>,
+        options: &RemoteDnsServer,
+        outbound: Option<Arc<OutboundManager>>,
+        protector: SocketProtector,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            server: options.server.clone(),
+            port: options.server_port,
+            via: options.via.clone(),
+            dependencies: dependency(&options.via),
+            outbound,
+            protector,
         }
     }
 }
@@ -623,14 +704,49 @@ impl DnsTransport for TcpDnsTransport {
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
         let server = resolve_first(&self.server, self.port).await?;
-        tcp_exchange(&server, message).await
+        tcp_exchange_via_or_direct(
+            self.outbound.as_ref(),
+            &self.via,
+            server,
+            message,
+            &self.protector,
+        )
+        .await
     }
 }
 
-async fn tcp_exchange(server: &SocketAddr, message: Message) -> Result<Message, HammerError> {
-    let mut stream = TcpStream::connect(server)
+async fn tcp_exchange_direct(
+    server: &SocketAddr,
+    message: Message,
+    protector: &SocketProtector,
+) -> Result<Message, HammerError> {
+    let mut stream = direct_tcp_connect(*server, protector)
         .await
         .map_err(|e| HammerError::internal(format!("connect TCP DNS socket: {e}")))?;
+    tcp_exchange_over_stream(&mut stream, message).await
+}
+
+async fn tcp_exchange_via_or_direct(
+    outbound: Option<&Arc<OutboundManager>>,
+    via: &str,
+    server: SocketAddr,
+    message: Message,
+    protector: &SocketProtector,
+) -> Result<Message, HammerError> {
+    if via.is_empty() {
+        return tcp_exchange_direct(&server, message, protector).await;
+    }
+    let frame = encode_tcp_dns_query(&message)?;
+    let mut stream = outbound_by_tag(outbound, via)?
+        .dial(Network::Tcp, socket_addr_to_socks(server), &frame)
+        .await?;
+    read_tcp_dns_response(&mut stream).await
+}
+
+async fn tcp_exchange_over_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    message: Message,
+) -> Result<Message, HammerError> {
     let bytes = MessageExt::to_bytes(&message)?;
     let len = u16::try_from(bytes.len())
         .map_err(|_| HammerError::internal("DNS message exceeds TCP frame limit"))?;
@@ -658,13 +774,28 @@ async fn tcp_exchange(server: &SocketAddr, message: Message) -> Result<Message, 
 
 pub struct HttpsDnsTransport {
     tag: String,
+    server: String,
+    port: u16,
+    path: String,
+    via: String,
     url: String,
-    client: reqwest::Client,
     dependencies: Vec<String>,
+    outbound: Option<Arc<OutboundManager>>,
+    protector: SocketProtector,
+    platform: Option<Arc<dyn PlatformInterface>>,
 }
 
 impl HttpsDnsTransport {
     pub fn new(tag: impl Into<String>, options: &RemoteHttpsDnsServer) -> Self {
+        Self::new_with_runtime(tag, options, None, SocketProtector::default())
+    }
+
+    fn new_with_runtime(
+        tag: impl Into<String>,
+        options: &RemoteHttpsDnsServer,
+        outbound: Option<Arc<OutboundManager>>,
+        protector: SocketProtector,
+    ) -> Self {
         let host = if options.server_port == 443 {
             options.server.clone()
         } else {
@@ -677,9 +808,15 @@ impl HttpsDnsTransport {
         };
         Self {
             tag: tag.into(),
+            server: options.server.clone(),
+            port: options.server_port,
+            path: path.to_owned(),
+            via: options.via.clone(),
             url: format!("https://{host}{path}"),
-            client: reqwest::Client::new(),
-            dependencies: Vec::new(),
+            dependencies: dependency(&options.via),
+            platform: protector.platform(),
+            outbound,
+            protector,
         }
     }
 }
@@ -710,27 +847,87 @@ impl DnsTransport for HttpsDnsTransport {
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let response = self
-            .client
-            .post(&self.url)
-            .header(reqwest::header::CONTENT_TYPE, DOH_MIME_TYPE)
-            .header(reqwest::header::ACCEPT, DOH_MIME_TYPE)
-            .body(MessageExt::to_bytes(&message)?)
-            .send()
-            .await
-            .map_err(|e| HammerError::internal(format!("send HTTPS DNS request: {e}")))?;
-        if !response.status().is_success() {
-            return Err(HammerError::internal(format!(
-                "unexpected DNS HTTPS status: {}",
-                response.status()
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| HammerError::internal(format!("read HTTPS DNS response: {e}")))?;
+        let server = resolve_first(&self.server, self.port).await?;
+        let payload = MessageExt::to_bytes(&message)?;
+        let bytes = doh_exchange_http2(
+            self.outbound.as_ref(),
+            &self.via,
+            server,
+            &self.server,
+            &self.path,
+            &self.url,
+            payload,
+            &self.protector,
+            self.platform.clone(),
+        )
+        .await?;
         <Message as MessageExt>::from_bytes(&bytes)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn doh_exchange_http2(
+    outbound: Option<&Arc<OutboundManager>>,
+    via: &str,
+    server: SocketAddr,
+    server_name: &str,
+    path: &str,
+    url: &str,
+    payload: Vec<u8>,
+    protector: &SocketProtector,
+    platform: Option<Arc<dyn PlatformInterface>>,
+) -> Result<Bytes, HammerError> {
+    let host_name = server_name.to_owned();
+    let stream: Box<dyn ProxyStream> = if via.is_empty() {
+        Box::new(direct_tcp_connect(server, protector).await?)
+    } else {
+        outbound_by_tag(outbound, via)?
+            .dial(Network::Tcp, socket_addr_to_socks(server), &[])
+            .await?
+    };
+    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|err| HammerError::internal(format!("dns tls versions: {err}")))?
+    .with_root_certificates(root_cert_store(platform))
+    .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from(host_name.clone())
+        .map_err(|err| HammerError::internal(format!("invalid DNS TLS server name: {err}")))?;
+    let tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|err| HammerError::internal(format!("connect HTTPS DNS TLS: {err}")))?;
+    let io = TokioIo::new(tls);
+    let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+        .await
+        .map_err(|err| HammerError::internal(format!("start HTTPS DNS h2: {err}")))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let request = Request::post(path)
+        .header(http::header::HOST, host_header(&host_name, server.port()))
+        .header(http::header::CONTENT_TYPE, DOH_MIME_TYPE)
+        .header(http::header::ACCEPT, DOH_MIME_TYPE)
+        .body(Full::new(Bytes::from(payload)))
+        .map_err(|err| HammerError::internal(format!("build HTTPS DNS request {url}: {err}")))?;
+    let response = sender
+        .send_request(request)
+        .await
+        .map_err(|err| HammerError::internal(format!("send HTTPS DNS request {url}: {err}")))?;
+    if !response.status().is_success() {
+        return Err(HammerError::internal(format!(
+            "unexpected DNS HTTPS status: {}",
+            response.status()
+        )));
+    }
+    response
+        .into_body()
+        .collect()
+        .await
+        .map(|body| body.to_bytes())
+        .map_err(|e| HammerError::internal(format!("read HTTPS DNS response: {e}")))
 }
 
 async fn resolve_first(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
@@ -743,6 +940,98 @@ async fn resolve_first(server: &str, port: u16) -> Result<SocketAddr, HammerErro
     addrs
         .next()
         .ok_or_else(|| HammerError::internal(format!("resolve DNS server {server}: empty result")))
+}
+
+fn dependency(via: &str) -> Vec<String> {
+    if via.is_empty() {
+        Vec::new()
+    } else {
+        vec![via.to_owned()]
+    }
+}
+
+fn socket_addr_to_socks(addr: SocketAddr) -> SocksAddr {
+    SocksAddr {
+        host: addr.ip(),
+        port: addr.port(),
+    }
+}
+
+fn outbound_by_tag(
+    outbound: Option<&Arc<OutboundManager>>,
+    via: &str,
+) -> Result<Arc<dyn hammer_adapter::Outbound>, HammerError> {
+    let Some(manager) = outbound else {
+        return Err(HammerError::internal(format!(
+            "outbound via not configured: {via}"
+        )));
+    };
+    manager
+        .get(via)
+        .ok_or_else(|| HammerError::internal(format!("outbound via not found: {via}")))
+}
+
+async fn direct_tcp_connect(
+    server: SocketAddr,
+    protector: &SocketProtector,
+) -> Result<TcpStream, HammerError> {
+    let socket = if server.is_ipv6() {
+        TcpSocket::new_v6()
+    } else {
+        TcpSocket::new_v4()
+    }
+    .map_err(|e| HammerError::internal(format!("create TCP DNS socket: {e}")))?;
+    protector.protect(&socket)?;
+    socket
+        .connect(server)
+        .await
+        .map_err(|e| HammerError::internal(format!("connect TCP DNS socket: {e}")))
+}
+
+async fn udp_exchange_via(
+    outbound: Option<&Arc<OutboundManager>>,
+    via: &str,
+    destination: SocksAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    let mut conn = outbound_by_tag(outbound, via)?.listen_packet().await?;
+    conn.send_to(destination, payload).await?;
+    Ok(conn.recv_from().await?.payload)
+}
+
+fn encode_tcp_dns_query(message: &Message) -> Result<Vec<u8>, HammerError> {
+    let bytes = MessageExt::to_bytes(message)?;
+    let len = u16::try_from(bytes.len())
+        .map_err(|_| HammerError::internal("DNS message exceeds TCP frame limit"))?;
+    let mut frame = Vec::with_capacity(bytes.len() + 2);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&bytes);
+    Ok(frame)
+}
+
+async fn read_tcp_dns_response<S: tokio::io::AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<Message, HammerError> {
+    let mut len_buf = [0_u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| HammerError::internal(format!("read TCP DNS length: {e}")))?;
+    let len = usize::from(u16::from_be_bytes(len_buf));
+    let mut payload = vec![0_u8; len];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|e| HammerError::internal(format!("read TCP DNS response: {e}")))?;
+    <Message as MessageExt>::from_bytes(&payload)
+}
+
+fn host_header(server: &str, port: u16) -> String {
+    if port == 443 {
+        server.to_owned()
+    } else {
+        format!("{server}:{port}")
+    }
 }
 
 fn fixed_address_response(
@@ -792,7 +1081,31 @@ impl DnsTransportManager {
     pub fn from_options(logger: Logger, options: &DnsOptions) -> Result<Self, HammerError> {
         let manager = Self::new(logger.clone(), options.final_.clone());
         for server in &options.servers {
-            manager.insert(build_transport(server, &logger)?);
+            manager.insert(build_transport(
+                server,
+                &logger,
+                None,
+                SocketProtector::default(),
+            )?);
+        }
+        Ok(manager)
+    }
+
+    pub fn from_options_with_runtime(
+        logger: Logger,
+        options: &DnsOptions,
+        outbound: Arc<OutboundManager>,
+        platform: Arc<dyn PlatformInterface>,
+    ) -> Result<Self, HammerError> {
+        let manager = Self::new(logger.clone(), options.final_.clone());
+        let protector = SocketProtector::new(platform);
+        for server in &options.servers {
+            manager.insert(build_transport(
+                server,
+                &logger,
+                Some(Arc::clone(&outbound)),
+                protector.clone(),
+            )?);
         }
         Ok(manager)
     }
@@ -829,31 +1142,29 @@ impl DnsTransportManager {
 fn build_transport(
     server: &DnsServer,
     logger: &Logger,
+    outbound: Option<Arc<OutboundManager>>,
+    protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     let transport: Arc<dyn DnsTransport> = match &server.kind {
-        DnsServerKind::Udp(RemoteDnsServer {
-            server: host,
-            server_port,
-            ..
-        }) => Arc::new(UdpDnsTransport::new(
+        DnsServerKind::Udp(options) => Arc::new(UdpDnsTransport::new_with_runtime(
             server.tag.clone(),
-            host.clone(),
-            *server_port,
+            options,
             logger.clone(),
+            outbound,
+            protector,
         )),
-        DnsServerKind::Tcp(RemoteDnsServer {
-            server: host,
-            server_port,
-            ..
-        }) => Arc::new(TcpDnsTransport::new(
+        DnsServerKind::Tcp(options) => Arc::new(TcpDnsTransport::new_with_runtime(
             server.tag.clone(),
-            host.clone(),
-            *server_port,
-            logger.clone(),
+            options,
+            outbound,
+            protector,
         )),
-        DnsServerKind::Https(options) => {
-            Arc::new(HttpsDnsTransport::new(server.tag.clone(), options))
-        }
+        DnsServerKind::Https(options) => Arc::new(HttpsDnsTransport::new_with_runtime(
+            server.tag.clone(),
+            options,
+            outbound,
+            protector,
+        )),
         DnsServerKind::Hosts => Arc::new(HostsTransport::system(server.tag.clone())),
         DnsServerKind::Local => Arc::new(LocalDnsTransport::new(server.tag.clone())),
     };

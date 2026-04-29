@@ -135,6 +135,19 @@ fn build_hysteria_options(
             "hysteria2.password is required",
         ));
     }
+    if !raw.server_ports.is_empty()
+        || !raw.hop_interval.is_empty()
+        || !raw.hop_interval_max.is_empty()
+    {
+        return Err(HammerError::config_validation(
+            "hysteria2 port hopping is not supported yet",
+        ));
+    }
+    if raw.up_mbps < 0 || raw.down_mbps < 0 {
+        return Err(HammerError::config_validation(
+            "hysteria2.up_mbps and hysteria2.down_mbps must be non-negative",
+        ));
+    }
     if !raw.insecure && raw.sni.is_empty() && raw.server.parse::<std::net::IpAddr>().is_err() {
         raw.sni = raw.server.clone();
     }

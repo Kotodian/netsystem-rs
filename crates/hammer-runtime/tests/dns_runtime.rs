@@ -4,12 +4,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use hammer_adapter::{DnsQueryOptions, DnsTransport, Lifecycle, StartStage};
+use hammer_adapter::{
+    DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport, Lifecycle, NetworkInterface,
+    PlatformInterface, StartStage, TunOptions, WifiState,
+};
 use hammer_core::config::{self, DomainStrategy};
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{
-    DnsClient, DnsRouter, DnsTransportManager,
+    DnsClient, DnsRouter, DnsTransportManager, OutboundManager,
     dns::{FixedResponseCode, HostsTransport, MessageExt, TcpDnsTransport, UdpDnsTransport},
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -48,6 +51,54 @@ struct CountingTransport {
     calls: AtomicUsize,
     ttl: u32,
     addr: IpAddr,
+}
+
+#[derive(Default)]
+struct ProtectPlatform {
+    calls: AtomicUsize,
+}
+
+impl ProtectPlatform {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl PlatformInterface for ProtectPlatform {
+    fn open_tun(&self, _options: TunOptions) -> Result<i32, HammerError> {
+        Ok(42)
+    }
+
+    fn use_platform_auto_detect_interface_control(&self) -> bool {
+        true
+    }
+
+    fn auto_detect_interface_control(&self, _fd: i32) -> Result<(), HammerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn start_default_interface_monitor(
+        &self,
+        _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close_default_interface_monitor(
+        &self,
+        _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn get_interfaces(&self) -> Result<Vec<NetworkInterface>, HammerError> {
+        Ok(Vec::new())
+    }
+
+    fn read_wifi_state(&self) -> Option<WifiState> {
+        None
+    }
 }
 
 impl CountingTransport {
@@ -284,6 +335,67 @@ async fn tcp_transport_uses_dns_length_prefixed_framing() {
         response.addresses(),
         vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11))]
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_transport_uses_via_outbound_and_protects_socket() {
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = udp.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 512];
+        let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+        let request = <Message as MessageExt>::from_bytes(&buf[..len]).unwrap();
+        let response = response_for(&request, 60, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 21)));
+        udp.send_to(&MessageExt::to_bytes(&response).unwrap(), peer)
+            .await
+            .unwrap();
+    });
+
+    let options = config::parse_config(&format!(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+[hysteria2]
+server = "example.com"
+password = "x"
+sni = "example.com"
+[dns]
+server = "udp://{}:{}"
+via = "direct"
+[route]
+final = "direct"
+"#,
+        addr.ip(),
+        addr.port()
+    ))
+    .unwrap();
+    let platform = Arc::new(ProtectPlatform::default());
+    let outbound = Arc::new(OutboundManager::from_options_with_platform(
+        logger("outbound"),
+        options.route.final_.clone(),
+        &options.outbounds,
+        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+    ));
+    let manager = DnsTransportManager::from_options_with_runtime(
+        logger("dns-transport"),
+        &options.dns,
+        outbound,
+        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+    )
+    .expect("dns manager");
+
+    let response = manager
+        .default()
+        .expect("default dns")
+        .exchange(query("via.test.", RecordType::A))
+        .await
+        .expect("dns via exchange");
+
+    assert_eq!(
+        response.addresses(),
+        vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 21))]
+    );
+    assert!(platform.calls() >= 1, "DNS socket was not protected");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

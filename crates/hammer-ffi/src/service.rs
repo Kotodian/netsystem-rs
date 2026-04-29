@@ -92,15 +92,18 @@ impl HammerService {
             Arc::clone(&pause),
             Arc::clone(&connection),
         );
-        let dns_transport = Arc::new(DnsTransportManager::from_options(
-            new_logger(&log_factory, "dns-transport"),
-            &options.dns,
-        )?);
-        let outbound = Arc::new(OutboundManager::from_options(
+        let outbound = Arc::new(OutboundManager::from_options_with_platform(
             new_logger(&log_factory, "outbound"),
             options.route.final_.clone(),
             &options.outbounds,
+            Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
         ));
+        let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(
+            new_logger(&log_factory, "dns-transport"),
+            &options.dns,
+            Arc::clone(&outbound),
+            Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
+        )?);
         let dns_router = Arc::new(DnsRouter::new_with_manager(
             new_logger(&log_factory, "dns-router"),
             Arc::clone(&dns_transport),

@@ -53,4 +53,7 @@ pub trait PlatformInterface: Send + Sync + 'static {
     ) -> Result<(), CoreError>;
     fn get_interfaces(&self) -> Result<Vec<NetworkInterface>, CoreError>;
     fn read_wifi_state(&self) -> Option<WifiState>;
+    fn system_certificates(&self) -> Vec<String> {
+        Vec::new()
+    }
 }

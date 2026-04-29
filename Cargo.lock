@@ -881,6 +881,7 @@ name = "hammer-runtime"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "blake2",
  "bytes",
  "etherparse",
@@ -891,6 +892,9 @@ dependencies = [
  "hammer-core",
  "hickory-proto",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "indoc",
  "ipnet",
  "libc",
@@ -903,6 +907,7 @@ dependencies = [
  "rustls-native-certs",
  "smoltcp",
  "tokio",
+ "tokio-rustls",
  "tun-rs",
 ]
 

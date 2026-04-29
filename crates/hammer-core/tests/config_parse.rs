@@ -143,6 +143,31 @@ fn parse_config_honors_explicit_dns_via() {
 }
 
 #[test]
+fn parse_config_rejects_hysteria2_port_hopping() {
+    let cfg = MINIMAL_CONFIG.replacen(
+        "server_port = 443\n",
+        "server_port = 443\nserver_ports = [\"443\", \"8443\"]\n",
+        1,
+    );
+    let err = config::parse_config(&cfg).expect_err("port hopping must be rejected");
+    assert!(
+        err.to_string().contains("port hopping is not supported"),
+        "error = {err:?}"
+    );
+
+    let cfg = MINIMAL_CONFIG.replacen(
+        "server_port = 443\n",
+        "server_port = 443\nhop_interval = \"30s\"\n",
+        1,
+    );
+    let err = config::parse_config(&cfg).expect_err("hop interval must be rejected");
+    assert!(
+        err.to_string().contains("port hopping is not supported"),
+        "error = {err:?}"
+    );
+}
+
+#[test]
 fn parse_config_defaults_dns_strategy_to_as_is() {
     let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
     assert_eq!(options.dns.strategy, config::DomainStrategy::AsIs);

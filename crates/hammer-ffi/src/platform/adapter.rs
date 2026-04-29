@@ -79,6 +79,17 @@ impl PlatformInterface for PlatformAdapter {
     fn read_wifi_state(&self) -> Option<AdapterWifiState> {
         self.platform.read_wifi_state().map(Into::into)
     }
+
+    fn system_certificates(&self) -> Vec<String> {
+        let Some(iter) = self.platform.system_certificates() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while iter.has_next() {
+            out.push(iter.next());
+        }
+        out
+    }
 }
 
 impl From<AdapterTunOptions> for HammerTunOptions {

@@ -29,7 +29,7 @@ pub mod obfs;
 pub mod protocol;
 pub mod testing;
 
-use bbr::{BbrProfile, apply_transport_config};
+use bbr::{BbrProfile, CongestionControlHandle, apply_transport_config_with_handle};
 use obfs::Salamander;
 
 use crate::socket_protector::SocketProtector;
@@ -47,6 +47,9 @@ pub struct ClientOptions {
     pub initial_packet_size: u16,
     pub idle_timeout: Option<Duration>,
     pub keep_alive_period: Option<Duration>,
+    pub send_bps: u64,
+    pub receive_bps: u64,
+    pub brutal_debug: bool,
     pub obfs: Option<Hysteria2Obfs>,
     pub platform: Option<Arc<dyn PlatformInterface>>,
 }
@@ -63,7 +66,8 @@ pub struct Hysteria2Client {
 impl Hysteria2Client {
     pub async fn connect(options: ClientOptions, logger: Logger) -> Result<Arc<Self>, HammerError> {
         let address = resolve_server(&options.server, options.server_port)?;
-        let endpoint = client_endpoint(&options, address)?;
+        let congestion = CongestionControlHandle::default();
+        let endpoint = client_endpoint(&options, address, congestion.clone())?;
         let server_name = if options.server_name.is_empty() {
             options.server.as_str()
         } else {
@@ -74,7 +78,11 @@ impl Hysteria2Client {
             .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?
             .await
             .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?;
-        let h3_sender = authenticate(&connection, &options).await?;
+        let (h3_sender, auth_response) = authenticate(&connection, &options).await?;
+        let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
+        if !auth_response.rx_auto && actual_tx > 0 {
+            congestion.use_brutal(actual_tx);
+        }
         let client = Arc::new(Self {
             connection,
             _endpoint: endpoint,
@@ -283,6 +291,9 @@ impl Hysteria2Outbound {
             initial_packet_size: self.options.initial_packet_size,
             idle_timeout: self.options.idle_timeout,
             keep_alive_period: self.options.keep_alive_period,
+            send_bps: mbps_to_bps(self.options.up_mbps)?,
+            receive_bps: mbps_to_bps(self.options.down_mbps)?,
+            brutal_debug: self.options.brutal_debug,
             obfs: self.options.obfs.clone(),
             platform: self.protector.platform(),
         };
@@ -347,7 +358,13 @@ impl Outbound for Hysteria2Outbound {
 async fn authenticate(
     connection: &quinn::Connection,
     options: &ClientOptions,
-) -> Result<client::SendRequest<h3_quinn::OpenStreams, Bytes>, HammerError> {
+) -> Result<
+    (
+        client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+        protocol::AuthResponse,
+    ),
+    HammerError,
+> {
     let h3_conn = h3_quinn::Connection::new(connection.clone());
     let (mut driver, mut sender) = client::new(h3_conn)
         .await
@@ -366,7 +383,7 @@ async fn authenticate(
         request.headers_mut(),
         &protocol::AuthRequest {
             auth: options.password.clone(),
-            rx: 0,
+            rx: options.receive_bps,
         },
     );
     let mut stream = sender
@@ -387,8 +404,8 @@ async fn authenticate(
             response.status()
         )));
     }
-    let _ = protocol::auth_response_from_headers(response.headers());
-    Ok(sender)
+    let auth = protocol::auth_response_from_headers(response.headers());
+    Ok((sender, auth))
 }
 
 fn spawn_datagram_loop(client: Arc<Hysteria2Client>) {
@@ -433,6 +450,7 @@ async fn handle_datagram(client: &Hysteria2Client, data: &[u8]) -> Result<(), Ha
 fn client_endpoint(
     options: &ClientOptions,
     server_addr: SocketAddr,
+    congestion: CongestionControlHandle,
 ) -> Result<quinn::Endpoint, HammerError> {
     let bind_addr = if server_addr.is_ipv6() {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
@@ -454,11 +472,14 @@ fn client_endpoint(
         runtime,
     )
     .map_err(|err| HammerError::internal(format!("create QUIC endpoint: {err}")))?;
-    endpoint.set_default_client_config(client_config(options)?);
+    endpoint.set_default_client_config(client_config(options, congestion)?);
     Ok(endpoint)
 }
 
-fn client_config(options: &ClientOptions) -> Result<quinn::ClientConfig, HammerError> {
+fn client_config(
+    options: &ClientOptions,
+    congestion: CongestionControlHandle,
+) -> Result<quinn::ClientConfig, HammerError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -469,10 +490,7 @@ fn client_config(options: &ClientOptions) -> Result<quinn::ClientConfig, HammerE
             .with_custom_certificate_verifier(SkipServerVerification::new(provider))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
-        }
+        let roots = crate::tls_support::root_cert_store(options.platform.clone());
         builder.with_root_certificates(roots).with_no_client_auth()
     };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
@@ -490,12 +508,14 @@ fn client_config(options: &ClientOptions) -> Result<quinn::ClientConfig, HammerE
             .map_err(|err| HammerError::internal(format!("invalid QUIC idle timeout: {err}")))?;
         transport.max_idle_timeout(Some(timeout));
     }
-    apply_transport_config(
+    apply_transport_config_with_handle(
         &mut config,
         transport,
         options.bbr_profile,
         options.initial_packet_size,
         options.disable_path_mtu_discovery,
+        congestion,
+        options.brutal_debug,
     );
     Ok(config)
 }
@@ -590,6 +610,23 @@ fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
         .map_err(|err| HammerError::internal(format!("resolve hysteria2 server: {err}")))?
         .next()
         .ok_or_else(|| HammerError::internal("empty hysteria2 server resolution"))
+}
+
+fn mbps_to_bps(mbps: i64) -> Result<u64, HammerError> {
+    if mbps < 0 {
+        return Err(HammerError::internal(
+            "hysteria2 bandwidth must be non-negative",
+        ));
+    }
+    Ok((mbps as u64).saturating_mul(125_000))
+}
+
+fn actual_tx_bps(send_bps: u64, server_rx: u64) -> u64 {
+    if server_rx == 0 || server_rx > send_bps {
+        send_bps
+    } else {
+        server_rx
+    }
 }
 
 fn parse_networks(value: &str) -> Vec<Network> {

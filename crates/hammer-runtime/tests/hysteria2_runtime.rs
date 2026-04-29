@@ -11,7 +11,7 @@ use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::OutboundManager;
-use hammer_runtime::hysteria2::bbr::{BbrProfile, HysteriaBbrConfig};
+use hammer_runtime::hysteria2::bbr::{BbrProfile, CongestionControlHandle, HysteriaBbrConfig};
 use hammer_runtime::hysteria2::{
     ClientOptions, Hysteria2Client, obfs::Salamander, protocol, testing::EchoServer,
 };
@@ -149,6 +149,9 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
             initial_packet_size: 1200,
             idle_timeout: None,
             keep_alive_period: None,
+            send_bps: 0,
+            receive_bps: 0,
+            brutal_debug: false,
             obfs: None,
             platform: None,
         },
@@ -197,6 +200,9 @@ async fn hysteria2_client_protects_quic_socket_before_connecting() {
             initial_packet_size: 1200,
             idle_timeout: None,
             keep_alive_period: None,
+            send_bps: 0,
+            receive_bps: 0,
+            brutal_debug: false,
             obfs: None,
             platform: Some(Arc::clone(&platform) as Arc<dyn PlatformInterface>),
         },
@@ -273,4 +279,25 @@ fn hysteria2_bbr_factory_builds_hysteria_controller() {
             .into_any()
             .is::<hammer_runtime::hysteria2::bbr::HysteriaBbr>()
     );
+}
+
+#[test]
+fn hysteria2_congestion_handle_switches_to_brutal_after_auth() {
+    let handle = CongestionControlHandle::default();
+    let factory = Arc::new(HysteriaBbrConfig::new_with_handle(
+        BbrProfile::Standard,
+        1200,
+        handle.clone(),
+        false,
+    ));
+    let before = quinn::congestion::ControllerFactory::build(factory.clone(), Instant::now(), 1200);
+    assert!(
+        before
+            .into_any()
+            .is::<hammer_runtime::hysteria2::bbr::DynamicHysteriaController>()
+    );
+
+    handle.use_brutal(2_000_000);
+    let after = quinn::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
+    assert_eq!(after.metrics().pacing_rate, Some(16_000_000));
 }
