@@ -181,6 +181,59 @@ fn need_wifi_state_starts_false_and_update_does_not_panic() {
     svc.close().expect("close");
 }
 
+/// Booting a config with a `[[endpoints]]` block must walk the same eleven
+/// lifecycles. Until commit 4 the endpoint is a placeholder, so we just need
+/// it to participate in start/close without throwing — proves the EndpointManager
+/// from_options wiring + service plumbing are correct.
+#[test]
+fn service_starts_with_wireguard_endpoint_scaffold() {
+    const PLACEHOLDER_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const PLACEHOLDER_PEER: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    let toml = format!(
+        r#"
+[log]
+level = "debug"
+
+[tun]
+interface_name = "utun"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+mtu = 1400
+stack = "disabled"
+[hysteria2]
+server = "example.com"
+password = "x"
+sni = "example.com"
+[dns]
+server = "https://1.1.1.1/dns-query"
+[route]
+final = "hysteria2"
+
+[[endpoints]]
+type = "wireguard"
+id = "wg-out"
+private_key = "{PLACEHOLDER_PRIVATE}"
+address = ["10.66.0.2/32"]
+
+[[endpoints.peers]]
+public_key = "{PLACEHOLDER_PEER}"
+address = "1.2.3.4"
+port = 51820
+allowed_ips = ["0.0.0.0/0"]
+"#,
+    );
+    let platform = Arc::new(CapturePlatform::default());
+    let svc = HammerService::new(&toml, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("config with wireguard endpoint must build");
+    svc.start().expect("start should still walk all stages");
+    svc.close().expect("close should still walk all stages");
+
+    let lines = platform.lines.lock().unwrap();
+    assert_eq!(count(&lines, "stage initialize"), 11, "lines = {lines:?}");
+    assert_eq!(count(&lines, "stage post-start"), 11);
+    assert_eq!(count(&lines, "stage started"), 11);
+}
+
 #[test]
 fn close_is_idempotent() {
     let (_platform, svc) = make_service();
