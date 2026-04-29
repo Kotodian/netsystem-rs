@@ -1,0 +1,16 @@
+[package]
+name = "hammer-uniffi-bindgen"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Standalone host binary for the uniffi bindgen entrypoint. Kept in its own
+# crate so the `cli` feature of `uniffi` does not bleed into the hammer-ffi
+# library build via cargo's feature unification — keeping the iOS staticlib
+# free of clap, askama, weedle, etc.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { workspace = true, features = ["cli"] }

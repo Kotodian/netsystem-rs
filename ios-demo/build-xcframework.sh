@@ -1,65 +1,79 @@
 #!/usr/bin/env bash
-# Build an xcframework + Swift bindings for the hammer crate.
+# Build an xcframework + Swift bindings for the hammer crate (iOS device only).
+#
+# We ship a dynamic framework (cdylib wrapped as `.framework`) instead of a
+# static library so the cargo link step performs `-dead_strip`. That collapses
+# the ~50 MB unstripped staticlib down to ~3 MB, comparable to gomobile output.
 #
 # Output layout:
-#   build/Hammer.xcframework
+#   build/Hammer.xcframework/ios-arm64/hammerFFI.framework
 #   build/Sources/Hammer/hammer.swift
 #
 # Required toolchain:
 #   - Xcode 15+
-#   - Rust targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios,
-#                   aarch64-apple-darwin, x86_64-apple-darwin
-#     Install with `rustup target add ...`.
+#   - Rust target: aarch64-apple-ios   (`rustup target add aarch64-apple-ios`)
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CRATE_NAME="hammer"
-LIB_NAME="libhammer.a"
+# Match the deployment target wired into the C deps (aws-lc-sys, ring) so the
+# linker doesn't trip on `___chkstk_darwin` (introduced in iOS 13).
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
+
 BUILD_DIR="ios-demo/build"
 GENERATED_DIR="${BUILD_DIR}/generated"
 XCFRAMEWORK="${BUILD_DIR}/Hammer.xcframework"
+FRAMEWORK="${BUILD_DIR}/ios/hammerFFI.framework"
+DYLIB_SRC="target/aarch64-apple-ios/release/libhammer.dylib"
 
 rm -rf "${BUILD_DIR}"
-mkdir -p "${GENERATED_DIR}"
+mkdir -p "${GENERATED_DIR}" "${FRAMEWORK}/Headers" "${FRAMEWORK}/Modules"
 
-echo "==> cargo build (release) for all Apple targets"
-# `-p hammer-ffi` keeps the build narrow inside the workspace so we avoid
-# compiling the uniffi-bindgen binary five times.
+echo "==> cargo build cdylib (release, aarch64-apple-ios)"
 cargo build -p hammer-ffi --release --target aarch64-apple-ios
-cargo build -p hammer-ffi --release --target aarch64-apple-ios-sim
-cargo build -p hammer-ffi --release --target x86_64-apple-ios
-cargo build -p hammer-ffi --release --target aarch64-apple-darwin
-cargo build -p hammer-ffi --release --target x86_64-apple-darwin
 
-echo "==> lipo simulator + macOS static libs"
-mkdir -p "${BUILD_DIR}/sim" "${BUILD_DIR}/macos"
-lipo -create \
-  "target/aarch64-apple-ios-sim/release/${LIB_NAME}" \
-  "target/x86_64-apple-ios/release/${LIB_NAME}" \
-  -output "${BUILD_DIR}/sim/${LIB_NAME}"
-lipo -create \
-  "target/aarch64-apple-darwin/release/${LIB_NAME}" \
-  "target/x86_64-apple-darwin/release/${LIB_NAME}" \
-  -output "${BUILD_DIR}/macos/${LIB_NAME}"
+echo "==> assemble hammerFFI.framework"
+cp "${DYLIB_SRC}" "${FRAMEWORK}/hammerFFI"
+strip -S -x "${FRAMEWORK}/hammerFFI"
+# Frameworks must use an @rpath install_name so the host app can embed them.
+install_name_tool -id @rpath/hammerFFI.framework/hammerFFI "${FRAMEWORK}/hammerFFI"
 
 echo "==> generate Swift bindings via uniffi-bindgen"
-cargo run -p hammer-ffi --release --bin uniffi-bindgen -- \
+cargo run -p hammer-uniffi-bindgen --release -- \
   generate crates/hammer-ffi/src/hammer.udl \
   --language swift --out-dir "${GENERATED_DIR}"
+cp "${GENERATED_DIR}/hammerFFI.h" "${FRAMEWORK}/Headers/hammerFFI.h"
 
-# uniffi emits hammer.swift, hammerFFI.h and a module map; rename to satisfy XCFramework requirements
-HEADERS_DIR="${BUILD_DIR}/headers"
-mkdir -p "${HEADERS_DIR}"
-mv "${GENERATED_DIR}/hammerFFI.h" "${HEADERS_DIR}/hammerFFI.h"
-mv "${GENERATED_DIR}/hammerFFI.modulemap" "${HEADERS_DIR}/module.modulemap"
+# `framework module` (not plain `module`) is required for `import hammerFFI`
+# to resolve against a binary framework target.
+cat > "${FRAMEWORK}/Modules/module.modulemap" <<'EOM'
+framework module hammerFFI {
+    header "hammerFFI.h"
+    export *
+}
+EOM
+
+cat > "${FRAMEWORK}/Info.plist" <<'EOM'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.kotodian.hammerFFI</string>
+  <key>CFBundleName</key><string>hammerFFI</string>
+  <key>CFBundleExecutable</key><string>hammerFFI</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundlePackageType</key><string>FMWK</string>
+  <key>MinimumOSVersion</key><string>15.0</string>
+  <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
+</dict>
+</plist>
+EOM
 
 echo "==> assemble xcframework"
 xcodebuild -create-xcframework \
-  -library "target/aarch64-apple-ios/release/${LIB_NAME}" -headers "${HEADERS_DIR}" \
-  -library "${BUILD_DIR}/sim/${LIB_NAME}" -headers "${HEADERS_DIR}" \
-  -library "${BUILD_DIR}/macos/${LIB_NAME}" -headers "${HEADERS_DIR}" \
+  -framework "${FRAMEWORK}" \
   -output "${XCFRAMEWORK}"
 
 echo "==> publish Swift glue"
@@ -68,5 +82,6 @@ mv "${GENERATED_DIR}/hammer.swift" "${BUILD_DIR}/Sources/Hammer/hammer.swift"
 
 echo
 echo "Done."
+du -sh "${XCFRAMEWORK}"
 echo "  XCFramework: ${XCFRAMEWORK}"
 echo "  Swift glue:  ${BUILD_DIR}/Sources/Hammer/hammer.swift"

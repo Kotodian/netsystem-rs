@@ -8,9 +8,8 @@ publish.workspace = true
 name = "hammer"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
-[[bin]]
-name = "uniffi-bindgen"
-path = "src/bin/uniffi_bindgen.rs"
+# The uniffi-bindgen entrypoint lives in `crates/hammer-uniffi-bindgen` so the
+# `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
@@ -19,7 +18,7 @@ hammer-runtime = { path = "../hammer-runtime" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
-uniffi = { workspace = true, features = ["cli"] }
+uniffi = { workspace = true }
 
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }

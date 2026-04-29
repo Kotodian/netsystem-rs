@@ -46,6 +46,11 @@ impl Service {
         config_content: &str,
         platform: Arc<dyn Platform>,
     ) -> Result<Arc<Self>, HammerError> {
+        // reqwest ships without a bundled crypto provider (we trim aws-lc-rs
+        // out at the workspace level), so DoH and any other TLS path needs the
+        // ring provider installed before the first request.
+        hammer_runtime::install_default_crypto_provider();
+
         let options = config::parse_config(config_content)?;
         let adapter = Arc::new(PlatformAdapter::new(platform));
         let writer = Arc::new(PlatformLogWriter::new(Arc::clone(&adapter)));
