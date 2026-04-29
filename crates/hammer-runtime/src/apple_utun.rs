@@ -96,46 +96,48 @@ pub struct AppleTunDevice {
     closed: AtomicBool,
     rx: Mutex<RxState>,
     tx: Mutex<TxState>,
+    /// Free MTU-sized Vec<u8> buffers shared between recv and send. recvmsg_x
+    /// writes packet payload directly into a pool buffer (zero-copy), the
+    /// rewritten packet flows through packet_loop and back into send_batch,
+    /// and after sendmsg_x the buffer is recycled here for the next refill.
+    pool: Mutex<Vec<Vec<u8>>>,
 }
 
 struct RxState {
     /// Each slot owns a 4-byte AF prefix buffer that the kernel writes into.
     headers: Vec<[u8; PACKET_HEADER_LEN]>,
-    /// Each slot owns an MTU-sized payload buffer.
-    payloads: Vec<Vec<u8>>,
-    /// Two iovecs per slot: header + payload.
+    /// Two iovecs per slot: header (stable, owned by this state) + payload
+    /// (rewritten per refill_rx call to point at a pool-borrowed buffer).
     iovecs: Vec<[iovec; 2]>,
     msgs: Vec<MsgHdrX>,
-    /// Packets ready to hand to `recv()` callers.
+    /// Packets ready to hand to `recv()` / `recv_batch()` callers. Each Vec
+    /// here is a former pool buffer with its length truncated to the actual
+    /// payload size.
     pending: VecDeque<Vec<u8>>,
 }
 
 // SAFETY: the iovec / MsgHdrX raw pointers we store reference buffers owned
-// by this same struct. Access is serialized through the parent Mutex, so
-// moving the struct between threads is sound.
+// by this same struct or by Mutex-protected pool entries. Access is
+// serialized through the parent Mutex, so moving the struct between threads
+// is sound.
 unsafe impl Send for RxState {}
 unsafe impl Send for TxState {}
 
 impl RxState {
-    fn new(batch_size: usize, mtu: usize) -> Self {
+    fn new(batch_size: usize) -> Self {
         let mut state = Self {
             headers: vec![[0u8; PACKET_HEADER_LEN]; batch_size],
-            payloads: (0..batch_size).map(|_| vec![0u8; mtu]).collect(),
             iovecs: vec![[empty_iovec(); 2]; batch_size],
             msgs: vec![empty_msghdr_x(); batch_size],
             pending: VecDeque::new(),
         };
-        // Buffer pointers and the msg_iov / msg_iovlen fields are stable for
-        // the lifetime of this state — the kernel only mutates msg_datalen +
-        // msg_flags. Set them up once instead of rebuilding per recvmsg_x.
+        // Header iovec, msg_iov, msg_iovlen are stable across calls — set
+        // them up once. The payload iovec[1] is rebound per refill_rx to a
+        // fresh pool-borrowed buffer.
         for i in 0..batch_size {
             state.iovecs[i][0] = iovec {
                 iov_base: state.headers[i].as_mut_ptr().cast::<c_void>(),
                 iov_len: PACKET_HEADER_LEN,
-            };
-            state.iovecs[i][1] = iovec {
-                iov_base: state.payloads[i].as_mut_ptr().cast::<c_void>(),
-                iov_len: mtu,
             };
             state.msgs[i].msg_iov = state.iovecs[i].as_mut_ptr();
             state.msgs[i].msg_iovlen = 2;
@@ -221,20 +223,45 @@ impl AppleTunDevice {
         let async_fd = AsyncFd::with_interest(owned, Interest::READABLE | Interest::WRITABLE)
             .map_err(|err| HammerError::internal(format!("register apple utun fd: {err}")))?;
 
+        // Pre-warm the buffer pool with `batch_size` MTU-sized Vecs so the
+        // first refill_rx doesn't have to allocate.
+        let mut pool: Vec<Vec<u8>> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            pool.push(Vec::with_capacity(mtu));
+        }
         Ok(Arc::new(Self {
             fd: async_fd,
             mtu,
             batch_size,
             closed: AtomicBool::new(false),
-            rx: Mutex::new(RxState::new(batch_size, mtu)),
+            rx: Mutex::new(RxState::new(batch_size)),
             tx: Mutex::new(TxState::new(batch_size)),
+            pool: Mutex::new(pool),
         }))
     }
 
     fn refill_rx(&self, state: &mut RxState) -> io::Result<usize> {
-        // The iovec / msghdr scaffolding is stable for the lifetime of
-        // RxState — only msg_datalen + msg_flags get clobbered by the
-        // kernel, and we read them out below. Skip per-call resets.
+        // Borrow batch_size buffers from the recycle pool (or allocate if
+        // empty). recvmsg_x writes packet payload directly into these — no
+        // intermediate fixed buffer, no extra copy.
+        let mut bufs: Vec<Vec<u8>> = self.take_pool_buffers(self.batch_size);
+        for (i, buf) in bufs.iter_mut().enumerate() {
+            if buf.capacity() < self.mtu {
+                buf.reserve_exact(self.mtu - buf.capacity());
+            }
+            // SAFETY: capacity is at least mtu; the next syscall will
+            // overwrite the bytes we expose here, and on success we truncate
+            // to the actual payload length. Until then the slice content is
+            // logically uninitialized but readable as u8.
+            unsafe {
+                buf.set_len(self.mtu);
+            }
+            state.iovecs[i][1] = iovec {
+                iov_base: buf.as_mut_ptr().cast::<c_void>(),
+                iov_len: self.mtu,
+            };
+        }
+
         let n = unsafe {
             libc::syscall(
                 SYS_RECVMSG_X,
@@ -245,23 +272,65 @@ impl AppleTunDevice {
             )
         };
         if n < 0 {
+            // Push every borrowed buffer back to the pool unchanged.
+            for buf in bufs.iter_mut() {
+                unsafe {
+                    buf.set_len(0);
+                }
+            }
+            self.return_pool_buffers(bufs);
             return Err(io::Error::last_os_error());
         }
         let n = n as usize;
-        for i in 0..n {
-            let total = state.msgs[i].msg_datalen;
-            if total <= PACKET_HEADER_LEN {
-                continue;
+
+        // First n slots got data; truncate to actual length and push to
+        // pending. Remaining slots — and any with invalid sizes — go back
+        // to the pool.
+        let mut to_pool: Vec<Vec<u8>> = Vec::with_capacity(self.batch_size);
+        for (i, mut buf) in bufs.into_iter().enumerate() {
+            if i < n {
+                let total = state.msgs[i].msg_datalen;
+                if total > PACKET_HEADER_LEN && total - PACKET_HEADER_LEN <= self.mtu {
+                    let payload_len = total - PACKET_HEADER_LEN;
+                    buf.truncate(payload_len);
+                    state.pending.push_back(buf);
+                    continue;
+                }
             }
-            let payload_len = total - PACKET_HEADER_LEN;
-            if payload_len > self.mtu {
-                continue;
+            unsafe {
+                buf.set_len(0);
             }
-            let mut packet = Vec::with_capacity(payload_len);
-            packet.extend_from_slice(&state.payloads[i][..payload_len]);
-            state.pending.push_back(packet);
+            to_pool.push(buf);
+        }
+        if !to_pool.is_empty() {
+            self.return_pool_buffers(to_pool);
         }
         Ok(n)
+    }
+
+    fn take_pool_buffers(&self, count: usize) -> Vec<Vec<u8>> {
+        let mut bufs = {
+            let mut pool = self.pool.lock().expect("apple TUN pool poisoned");
+            let take = count.min(pool.len());
+            let start = pool.len() - take;
+            pool.drain(start..).collect::<Vec<_>>()
+        };
+        while bufs.len() < count {
+            bufs.push(Vec::with_capacity(self.mtu));
+        }
+        bufs
+    }
+
+    fn return_pool_buffers(&self, mut bufs: Vec<Vec<u8>>) {
+        let mut pool = self.pool.lock().expect("apple TUN pool poisoned");
+        for mut buf in bufs.drain(..) {
+            if buf.capacity() >= self.mtu {
+                unsafe {
+                    buf.set_len(0);
+                }
+                pool.push(buf);
+            }
+        }
     }
 
     /// Issue one `sendmsg_x` for `chunk_len` packets starting at index 0 of
@@ -418,41 +487,49 @@ impl TunDevice for AppleTunDevice {
         }
 
         let mut offset = 0;
-        while offset < valid.len() {
-            loop {
-                if self.closed.load(Ordering::SeqCst) {
-                    return Err(HammerError::internal("apple TUN closed"));
+        let send_result = loop {
+            if offset >= valid.len() {
+                break Ok::<(), HammerError>(());
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                break Err(HammerError::internal("apple TUN closed"));
+            }
+            let mut guard = match self.fd.writable().await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    break Err(HammerError::internal(format!(
+                        "apple TUN writable: {err}"
+                    )));
                 }
-                let mut guard = self
-                    .fd
-                    .writable()
-                    .await
-                    .map_err(|err| HammerError::internal(format!("apple TUN writable: {err}")))?;
-                let result = {
-                    let mut state = self.tx.lock().expect("apple TUN tx poisoned");
-                    let staged = Self::stage_send_chunk(&mut state, &valid, offset);
-                    self.try_send_chunk(&mut state, staged).map(|n| (n, staged))
-                };
-                match result {
-                    Ok((n_sent, _staged)) => {
-                        if n_sent == 0 {
-                            // Nothing was consumed — re-arm and try again.
-                            guard.clear_ready();
-                            continue;
-                        }
-                        offset += n_sent;
-                        break;
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        guard.clear_ready();
-                    }
-                    Err(err) => {
-                        return Err(HammerError::internal(format!("sendmsg_x: {err}")));
-                    }
+            };
+            let result = {
+                let mut state = self.tx.lock().expect("apple TUN tx poisoned");
+                let staged = Self::stage_send_chunk(&mut state, &valid, offset);
+                self.try_send_chunk(&mut state, staged).map(|n| (n, staged))
+            };
+            match result {
+                Ok((0, _)) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                Ok((n_sent, _)) => {
+                    offset += n_sent;
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    guard.clear_ready();
+                }
+                Err(err) => {
+                    break Err(HammerError::internal(format!("sendmsg_x: {err}")));
                 }
             }
-        }
-        Ok(())
+        };
+        // Recycle every buffer we accepted into `valid` regardless of send
+        // outcome — the data is already gone from the kernel's perspective
+        // for the slots that succeeded, and partial-write retries above
+        // covered the rest. Returning the allocations to the pool lets the
+        // next refill_rx reuse them instead of allocating fresh ones.
+        self.return_pool_buffers(valid);
+        send_result
     }
 
     fn close(&self) {
