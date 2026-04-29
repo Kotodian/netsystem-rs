@@ -313,7 +313,7 @@ pub struct SystemTunStack {
     inbound_tag: String,
     options: hammer_core::config::TunInboundOptions,
     device: Arc<dyn TunDevice>,
-    tcp_nat: Arc<Mutex<SystemTcpNat>>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
@@ -361,7 +361,7 @@ impl SystemTunStack {
             inbound_tag,
             options,
             device,
-            tcp_nat: Arc::new(Mutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
+            tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
             udp_flows: Arc::new(Mutex::new(HashMap::new())),
             tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
@@ -1456,7 +1456,7 @@ async fn accept_tcp_loop(
     logger: Logger,
     router: Arc<Router>,
     outbound: Arc<OutboundManager>,
-    tcp_nat: Arc<Mutex<SystemTcpNat>>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     inbound_tag: String,
     listener: TcpListener,
 ) {
@@ -1469,7 +1469,7 @@ async fn accept_tcp_loop(
             }
         };
         let session = {
-            let mut nat = tcp_nat.lock().await;
+            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
             nat.lookup_back(peer.port())
         };
         let Some(session) = session else {
@@ -1534,7 +1534,7 @@ async fn packet_loop(
     outbound: Arc<OutboundManager>,
     inbound_tag: String,
     device: Arc<dyn TunDevice>,
-    tcp_nat: Arc<Mutex<SystemTcpNat>>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     udp_timeout: Duration,
@@ -1569,7 +1569,7 @@ async fn packet_loop(
                     continue;
                 };
                 let rewrite_result = {
-                    let mut nat = tcp_nat.lock().await;
+                    let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
                     process_system_tcp_packet(
                         &mut packet,
                         &mut *nat,
