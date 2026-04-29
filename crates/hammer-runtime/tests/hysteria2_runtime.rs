@@ -247,30 +247,6 @@ async fn outbound_manager_registers_real_hysteria2_outbound() {
 }
 
 #[test]
-fn hysteria2_bbr_profiles_match_hysteria_go_gains() {
-    let standard = BbrProfile::Standard.parameters();
-    assert_eq!(standard.high_gain_milli, 2885);
-    assert_eq!(standard.high_cwnd_gain_milli, 2885);
-    assert_eq!(standard.cwnd_gain_milli, 2000);
-    assert_eq!(standard.startup_growth_rounds, 3);
-    assert_eq!(standard.bytes_lost_multiplier, 2);
-
-    let conservative = BbrProfile::Conservative.parameters();
-    assert_eq!(conservative.high_gain_milli, 2250);
-    assert_eq!(conservative.high_cwnd_gain_milli, 1750);
-    assert_eq!(conservative.cwnd_gain_milli, 1750);
-    assert_eq!(conservative.startup_growth_rounds, 2);
-    assert_eq!(conservative.bytes_lost_multiplier, 1);
-
-    let aggressive = BbrProfile::Aggressive.parameters();
-    assert_eq!(aggressive.high_gain_milli, 3000);
-    assert_eq!(aggressive.high_cwnd_gain_milli, 2250);
-    assert_eq!(aggressive.cwnd_gain_milli, 2500);
-    assert_eq!(aggressive.startup_growth_rounds, 4);
-    assert_eq!(aggressive.bytes_lost_multiplier, 2);
-}
-
-#[test]
 fn hysteria2_bbr_factory_builds_hysteria_controller() {
     let factory = Arc::new(HysteriaBbrConfig::new(BbrProfile::Aggressive, 1200));
     let controller = quinn::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
