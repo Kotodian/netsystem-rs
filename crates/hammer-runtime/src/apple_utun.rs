@@ -46,8 +46,9 @@ const BATCH_TARGET_BYTES: usize = 512 * 1024;
 
 /// `setsockopt` option to hint the kernel about our batch size. Mirrors the
 /// `UTUN_OPT_MAX_PENDING_PACKETS` constant exposed in `<net/if_utun.h>` —
-/// libc does not currently re-export it.
-const UTUN_OPT_MAX_PENDING_PACKETS: c_int = 13;
+/// libc does not currently re-export it. The Go reference build uses the
+/// same value (`tun_ios.go::configure`).
+const UTUN_OPT_MAX_PENDING_PACKETS: c_int = 16;
 
 /// Equivalent of macOS `struct msghdr_x` from `<sys/socket.h>`.
 ///
@@ -117,13 +118,29 @@ unsafe impl Send for TxState {}
 
 impl RxState {
     fn new(batch_size: usize, mtu: usize) -> Self {
-        Self {
+        let mut state = Self {
             headers: vec![[0u8; PACKET_HEADER_LEN]; batch_size],
             payloads: (0..batch_size).map(|_| vec![0u8; mtu]).collect(),
             iovecs: vec![[empty_iovec(); 2]; batch_size],
             msgs: vec![empty_msghdr_x(); batch_size],
             pending: VecDeque::new(),
+        };
+        // Buffer pointers and the msg_iov / msg_iovlen fields are stable for
+        // the lifetime of this state — the kernel only mutates msg_datalen +
+        // msg_flags. Set them up once instead of rebuilding per recvmsg_x.
+        for i in 0..batch_size {
+            state.iovecs[i][0] = iovec {
+                iov_base: state.headers[i].as_mut_ptr().cast::<c_void>(),
+                iov_len: PACKET_HEADER_LEN,
+            };
+            state.iovecs[i][1] = iovec {
+                iov_base: state.payloads[i].as_mut_ptr().cast::<c_void>(),
+                iov_len: mtu,
+            };
+            state.msgs[i].msg_iov = state.iovecs[i].as_mut_ptr();
+            state.msgs[i].msg_iovlen = 2;
         }
+        state
     }
 }
 
@@ -204,29 +221,9 @@ impl AppleTunDevice {
     }
 
     fn refill_rx(&self, state: &mut RxState) -> io::Result<usize> {
-        // Re-bind iovec pointers each time — the underlying buffer addresses
-        // are stable for the device's lifetime, but the kernel mutates these
-        // between calls so we keep the bookkeeping idempotent.
-        for i in 0..self.batch_size {
-            state.iovecs[i][0] = iovec {
-                iov_base: state.headers[i].as_mut_ptr().cast::<c_void>(),
-                iov_len: PACKET_HEADER_LEN,
-            };
-            state.iovecs[i][1] = iovec {
-                iov_base: state.payloads[i].as_mut_ptr().cast::<c_void>(),
-                iov_len: self.mtu,
-            };
-            state.msgs[i] = MsgHdrX {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: state.iovecs[i].as_mut_ptr(),
-                msg_iovlen: 2,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-                msg_datalen: 0,
-            };
-        }
+        // The iovec / msghdr scaffolding is stable for the lifetime of
+        // RxState — only msg_datalen + msg_flags get clobbered by the
+        // kernel, and we read them out below. Skip per-call resets.
         let n = unsafe {
             libc::syscall(
                 SYS_RECVMSG_X,
