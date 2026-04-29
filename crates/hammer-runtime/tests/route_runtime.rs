@@ -451,3 +451,36 @@ fn network_manager_tracks_platform_default_interface_and_pause_state() {
     network.close().expect("close monitor");
     assert!(platform.closed.load(Ordering::SeqCst));
 }
+
+#[test]
+fn network_manager_ignores_duplicate_default_interface_updates() {
+    let platform = Arc::new(MockPlatform::default());
+    let pause = Arc::new(PauseManager::new());
+    let connection = Arc::new(ConnectionManager::new(logger("connection")));
+    let first = Arc::new(FakeHandle::default());
+    connection.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
+    let network = NetworkManager::with_platform(
+        logger("network"),
+        true,
+        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        Arc::clone(&pause),
+        Arc::clone(&connection),
+    );
+
+    network
+        .start(StartStage::Initialize)
+        .expect("start monitor");
+    network.start(StartStage::Started).expect("mark started");
+
+    platform.emit("en0", 7, true, false);
+    assert!(first.closed.load(Ordering::SeqCst));
+
+    let duplicate_guard = Arc::new(FakeHandle::default());
+    connection.track(Arc::clone(&duplicate_guard) as Arc<dyn ConnectionHandle>);
+    platform.emit("en0", 7, true, false);
+
+    assert!(
+        !duplicate_guard.closed.load(Ordering::SeqCst),
+        "duplicate interface updates should not reset live connections"
+    );
+}

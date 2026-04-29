@@ -4,7 +4,7 @@ use std::time::Instant;
 use hammer_adapter::{Lifecycle, NetworkManager as _, PlatformInterface};
 use hammer_core::config::{self, Options};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
-use hammer_core::log::{Factory, Logger};
+use hammer_core::log::{DiscardWriter, Factory, Level, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{
     CertificateProviderManager, CertificateStore, ConnectionManager, DnsRouter,
@@ -53,8 +53,16 @@ impl HammerService {
 
         let options = config::parse_config(config_content)?;
         let adapter = Arc::new(PlatformAdapter::new(platform));
-        let writer = Arc::new(PlatformLogWriter::new(Arc::clone(&adapter)));
-        let log_factory = Factory::new(Instant::now(), writer);
+        let writer: Arc<dyn LogWriter> = if options.log.disabled {
+            Arc::new(DiscardWriter)
+        } else {
+            Arc::new(PlatformLogWriter::new(Arc::clone(&adapter)))
+        };
+        let log_factory = Factory::new_with_min_level(
+            Instant::now(),
+            writer,
+            parse_log_level(&options.log.level),
+        );
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -257,6 +265,18 @@ impl HammerService {
     pub fn update_wifi_state(&self) {
         let inner = self.inner.lock().expect("service mutex poisoned");
         inner.network.update_wifi_state();
+    }
+}
+
+fn parse_log_level(level: &str) -> Level {
+    match level.to_ascii_lowercase().as_str() {
+        "panic" => Level::Panic,
+        "fatal" => Level::Fatal,
+        "error" => Level::Error,
+        "warn" | "warning" => Level::Warn,
+        "debug" => Level::Debug,
+        "trace" => Level::Trace,
+        _ => Level::Info,
     }
 }
 

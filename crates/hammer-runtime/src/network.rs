@@ -216,10 +216,15 @@ impl NetworkManager {
         is_constrained: bool,
     ) {
         if interface_index < 0 || interface_name.is_empty() {
-            *self
+            let mut current = self
                 .default_interface
                 .lock()
-                .expect("NetworkManager default interface poisoned") = None;
+                .expect("NetworkManager default interface poisoned");
+            if current.is_none() {
+                self.logger.trace("default interface is still missing");
+                return;
+            }
+            *current = None;
             if let Some(pause) = &self.pause {
                 pause.network_pause();
             }
@@ -247,10 +252,20 @@ impl NetworkManager {
             });
         default.expensive |= is_expensive;
         default.constrained |= is_constrained;
-        *self
-            .default_interface
-            .lock()
-            .expect("NetworkManager default interface poisoned") = Some(default.clone());
+        {
+            let mut current = self
+                .default_interface
+                .lock()
+                .expect("NetworkManager default interface poisoned");
+            if current.as_ref() == Some(&default) {
+                self.logger.trace(format!(
+                    "default interface unchanged {}, index {}",
+                    default.name, default.index
+                ));
+                return;
+            }
+            *current = Some(default.clone());
+        }
         if let Some(pause) = &self.pause {
             pause.network_wake();
         }

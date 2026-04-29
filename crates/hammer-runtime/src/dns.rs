@@ -136,6 +136,36 @@ fn first_query(message: &Message) -> Result<&Query, HammerError> {
         .ok_or_else(|| HammerError::internal("bad question size: 0"))
 }
 
+fn dns_query_log_summary(message: &Message) -> String {
+    match message.queries.first() {
+        Some(query) => format!(
+            "{} {:?}",
+            domain_from_name(query.name()),
+            query.query_type()
+        ),
+        None => "empty-query".to_owned(),
+    }
+}
+
+fn dns_response_log_summary(message: &Message) -> String {
+    let addresses = message
+        .addresses()
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect::<Vec<_>>();
+    let addresses = if addresses.is_empty() {
+        "-".to_owned()
+    } else {
+        addresses.join(",")
+    };
+    format!(
+        "rcode={:?} answers={} addresses={}",
+        message.metadata.response_code,
+        message.answers.len(),
+        addresses
+    )
+}
+
 fn response_ttl(response: &Message) -> u32 {
     response
         .answers
@@ -585,6 +615,7 @@ impl DnsTransport for UdpDnsTransport {
         let server = resolve_first(&self.server, self.port).await?;
         if !self.via.is_empty() {
             let response = udp_exchange_via(
+                &self.logger,
                 self.outbound.as_ref(),
                 &self.via,
                 socket_addr_to_socks(server),
@@ -989,11 +1020,15 @@ async fn direct_tcp_connect(
 }
 
 async fn udp_exchange_via(
+    logger: &Logger,
     outbound: Option<&Arc<OutboundManager>>,
     via: &str,
     destination: SocksAddr,
     payload: &[u8],
 ) -> Result<Vec<u8>, HammerError> {
+    logger.debug(format!(
+        "dns udp via outbound={via} dest={destination}"
+    ));
     let mut conn = outbound_by_tag(outbound, via)?.listen_packet().await?;
     conn.send_to(destination, payload).await?;
     Ok(conn.recv_from().await?.payload)
@@ -1262,12 +1297,30 @@ impl DnsRouter {
         message: Message,
         mut options: DnsQueryOptions,
     ) -> Result<Message, HammerError> {
-        self.logger.debug("exchange");
+        let query_summary = dns_query_log_summary(&message);
         let transport = self.resolve_transport(&options)?;
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        let response = self.client.exchange(transport, message, options).await?;
+        self.logger.info(format!(
+            "exchange query={} server={} strategy={:?}",
+            query_summary,
+            transport.tag(),
+            options.strategy
+        ));
+        let response = match self.client.exchange(transport, message, options).await {
+            Ok(response) => response,
+            Err(err) => {
+                self.logger
+                    .warn(format!("exchange failed query={query_summary}: {err}"));
+                return Err(err);
+            }
+        };
+        self.logger.info(format!(
+            "exchange response query={} {}",
+            query_summary,
+            dns_response_log_summary(&response)
+        ));
         self.save_reverse_mapping(&response);
         Ok(response)
     }
@@ -1397,5 +1450,33 @@ impl DnsRouterTrait for DnsRouter {
 
     fn reset_network(&self) {
         self.reset_network();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_log_summary_includes_question_and_answers() {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query({
+            let mut q = Query::query(Name::from_ascii("Example.COM.").unwrap(), RecordType::A);
+            q.set_query_class(DNSClass::IN);
+            q
+        });
+
+        let mut response = query.fixed_response(FixedResponseCode::NoError);
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("example.com.").unwrap(),
+            60,
+            RData::A(Ipv4Addr::new(203, 0, 113, 9).into()),
+        ));
+
+        assert_eq!(dns_query_log_summary(&query), "example.com A");
+        assert_eq!(
+            dns_response_log_summary(&response),
+            "rcode=NoError answers=1 addresses=203.0.113.9"
+        );
     }
 }

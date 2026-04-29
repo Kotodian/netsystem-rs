@@ -1457,7 +1457,7 @@ async fn packet_loop(
         let parsed = match parse_ip_packet(&packet) {
             Ok(parsed) => parsed,
             Err(err) => {
-                logger.debug(format!("parse TUN packet: {err}"));
+                logger.trace(format!("ignore unsupported TUN packet: {err}"));
                 continue;
             }
         };
@@ -1546,7 +1546,15 @@ async fn handle_system_udp_packet(
             device.send(response_packet).await?;
         }
         RouteDecision::Reject { method } => {
-            logger.debug(format!("drop UDP packet by reject rule: {method}"));
+            let message = format!(
+                "drop UDP packet by reject rule: method={}, destination={}, protocol={}",
+                method, parsed.destination, tun_packet.metadata.protocol
+            );
+            if tun_packet.metadata.protocol == "quic" {
+                logger.trace(message);
+            } else {
+                logger.debug(message);
+            }
             if let Ok(response) = udp_unreachable_packet(&packet) {
                 device.send(response).await?;
             }

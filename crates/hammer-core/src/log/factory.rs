@@ -19,13 +19,23 @@ impl LogWriter for DiscardWriter {
 pub struct Factory {
     formatter: Formatter,
     writer: Arc<dyn LogWriter>,
+    min_level: Level,
 }
 
 impl Factory {
     pub fn new(base_time: Instant, writer: Arc<dyn LogWriter>) -> Arc<Self> {
+        Self::new_with_min_level(base_time, writer, Level::Trace)
+    }
+
+    pub fn new_with_min_level(
+        base_time: Instant,
+        writer: Arc<dyn LogWriter>,
+        min_level: Level,
+    ) -> Arc<Self> {
         Arc::new(Self {
             formatter: Formatter::new(base_time),
             writer,
+            min_level,
         })
     }
 
@@ -51,6 +61,9 @@ impl Logger {
     }
 
     pub fn log_at(&self, level: Level, message: impl Into<String>, ts: Instant) {
+        if level as i32 > self.factory.min_level as i32 {
+            return;
+        }
         let ctx = id::current();
         let line = self
             .factory
@@ -119,5 +132,23 @@ mod tests {
             captured[0].1
         );
         assert!(captured[0].1.ends_with('\n'));
+    }
+
+    #[test]
+    fn logger_filters_messages_below_min_level() {
+        let writer = Arc::new(CaptureWriter {
+            lines: Mutex::new(Vec::new()),
+        });
+        let factory = Factory::new_with_min_level(Instant::now(), writer.clone(), Level::Info);
+        let logger = factory.new_logger("router");
+
+        logger.debug("hidden");
+        logger.info("visible");
+        logger.error("also visible");
+
+        let captured = writer.lines.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].0, Level::Info);
+        assert_eq!(captured[1].0, Level::Error);
     }
 }

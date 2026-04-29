@@ -7,6 +7,9 @@ use hammer::{
 };
 
 const MIN_TOML: &str = r#"
+[log]
+level = "debug"
+
 [tun]
 interface_name = "utun"
 address = ["172.19.0.1/30"]
