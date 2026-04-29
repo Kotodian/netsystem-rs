@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use hammer_core::config::{self, DnsServerKind, InboundKind, OutboundKind, RuleActionKind};
+use hammer_core::config::{
+    self, DnsServerKind, EndpointKind, InboundKind, OutboundKind, RuleActionKind,
+};
 
 const MINIMAL_CONFIG: &str = r#"
 [log]
@@ -296,6 +298,184 @@ fn format_config_round_trips_and_strips_unknown() {
 
 fn assert_rule_action(action: &RuleActionKind, want: &'static str) {
     assert_eq!(action.name(), want, "rule action mismatch");
+}
+
+// `BASE64(0x01 * 32)` — placeholder Curve25519 private key for parser tests.
+const TEST_WG_PRIVATE_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+// `BASE64(0x02 * 32)` — placeholder peer public key.
+const TEST_WG_PEER_PUBLIC_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+// `BASE64(0x03 * 32)` — placeholder pre-shared key.
+const TEST_WG_PSK: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=";
+
+// `extra` is appended after the built-in peer so that callers can tack on
+// further `[[endpoints.peers]]` blocks without violating TOML's "table headers
+// terminate the previous table" rule.
+fn wg_endpoint_block(extra: &str) -> String {
+    format!(
+        r#"
+[[endpoints]]
+type = "wireguard"
+id = "wg-out"
+private_key = "{TEST_WG_PRIVATE_KEY}"
+mtu = 1408
+address = ["10.66.0.2/32"]
+
+[[endpoints.peers]]
+public_key = "{TEST_WG_PEER_PUBLIC_KEY}"
+address = "1.2.3.4"
+port = 51820
+allowed_ips = ["0.0.0.0/0"]
+persistent_keepalive_interval = 25
+{extra}
+"#
+    )
+}
+
+#[test]
+fn parse_config_accepts_wireguard_endpoint() {
+    let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
+    let options = config::parse_config(&cfg).expect("parse");
+    assert_eq!(options.endpoints.len(), 1);
+    let endpoint = &options.endpoints[0];
+    assert_eq!(endpoint.tag, "wg-out");
+    assert_eq!(endpoint.type_name(), "wireguard");
+    let wg = match &endpoint.kind {
+        EndpointKind::Wireguard(opts) => opts,
+    };
+    assert_eq!(wg.private_key, [1u8; 32]);
+    assert_eq!(wg.mtu, 1408);
+    assert_eq!(wg.listen_port, 0);
+    assert_eq!(wg.address.len(), 1);
+    assert_eq!(wg.address[0].to_string(), "10.66.0.2/32");
+    assert_eq!(wg.peers.len(), 1);
+    let peer = &wg.peers[0];
+    assert_eq!(peer.public_key, [2u8; 32]);
+    assert!(peer.pre_shared_key.is_none());
+    assert_eq!(peer.endpoint.to_string(), "1.2.3.4:51820");
+    assert_eq!(peer.allowed_ips.len(), 1);
+    assert_eq!(peer.allowed_ips[0].to_string(), "0.0.0.0/0");
+    assert_eq!(peer.persistent_keepalive, Some(Duration::from_secs(25)));
+    assert_eq!(peer.reserved, [0, 0, 0]);
+}
+
+#[test]
+fn parse_config_supports_multi_peer_wireguard() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n{}",
+        wg_endpoint_block(&format!(
+            r#"
+[[endpoints.peers]]
+public_key = "{TEST_WG_PSK}"
+address = "5.6.7.8"
+port = 51821
+allowed_ips = ["192.168.0.0/16", "fd00::/8"]
+"#
+        ))
+    );
+    let options = config::parse_config(&cfg).expect("parse");
+    let wg = match &options.endpoints[0].kind {
+        EndpointKind::Wireguard(opts) => opts,
+    };
+    assert_eq!(wg.peers.len(), 2);
+    assert_eq!(wg.peers[1].endpoint.to_string(), "5.6.7.8:51821");
+    assert_eq!(wg.peers[1].allowed_ips.len(), 2);
+    assert!(wg.peers[1].persistent_keepalive.is_none());
+}
+
+#[test]
+fn parse_config_round_trips_wireguard_pre_shared_key_and_reserved() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n{}",
+        format!(
+            r#"
+[[endpoints]]
+type = "wireguard"
+id = "wg-out"
+private_key = "{TEST_WG_PRIVATE_KEY}"
+address = ["10.66.0.2/32"]
+listen_port = 12345
+
+[[endpoints.peers]]
+public_key = "{TEST_WG_PEER_PUBLIC_KEY}"
+pre_shared_key = "{TEST_WG_PSK}"
+address = "1.2.3.4"
+port = 51820
+allowed_ips = ["0.0.0.0/0"]
+reserved = [255, 0, 128]
+"#
+        )
+    );
+    let options = config::parse_config(&cfg).expect("parse");
+    let wg = match &options.endpoints[0].kind {
+        EndpointKind::Wireguard(opts) => opts,
+    };
+    assert_eq!(wg.listen_port, 12345);
+    assert_eq!(wg.mtu, 1408, "mtu defaults to sing-box's 1408 when omitted");
+    assert_eq!(wg.peers[0].pre_shared_key, Some([3u8; 32]));
+    assert_eq!(wg.peers[0].reserved, [255, 0, 128]);
+}
+
+#[test]
+fn parse_config_rejects_wireguard_without_id() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nprivate_key = \"{TEST_WG_PRIVATE_KEY}\"\naddress = [\"10.66.0.2/32\"]\n[[endpoints.peers]]\npublic_key = \"{TEST_WG_PEER_PUBLIC_KEY}\"\naddress = \"1.2.3.4\"\nport = 51820\nallowed_ips = [\"0.0.0.0/0\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("must require id");
+    assert!(err.to_string().contains("endpoints[0].id"), "got {err:?}");
+}
+
+#[test]
+fn parse_config_rejects_wireguard_without_peers() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nid = \"wg-out\"\nprivate_key = \"{TEST_WG_PRIVATE_KEY}\"\naddress = [\"10.66.0.2/32\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("must require peers");
+    assert!(
+        err.to_string().contains("must contain at least one peer"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn parse_config_rejects_wireguard_invalid_base64_key() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nid = \"wg-out\"\nprivate_key = \"not-base64!!\"\naddress = [\"10.66.0.2/32\"]\n[[endpoints.peers]]\npublic_key = \"{TEST_WG_PEER_PUBLIC_KEY}\"\naddress = \"1.2.3.4\"\nport = 51820\nallowed_ips = [\"0.0.0.0/0\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("must reject bad base64");
+    assert!(
+        err.to_string().contains("endpoints[0].private_key"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn parse_config_rejects_wireguard_peer_with_hostname_endpoint() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nid = \"wg-out\"\nprivate_key = \"{TEST_WG_PRIVATE_KEY}\"\naddress = [\"10.66.0.2/32\"]\n[[endpoints.peers]]\npublic_key = \"{TEST_WG_PEER_PUBLIC_KEY}\"\naddress = \"vpn.example.com\"\nport = 51820\nallowed_ips = [\"0.0.0.0/0\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("peer hostnames are not yet supported");
+    assert!(err.to_string().contains("IP literal"), "got {err:?}");
+}
+
+#[test]
+fn parse_config_rejects_wireguard_peer_with_zero_port() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nid = \"wg-out\"\nprivate_key = \"{TEST_WG_PRIVATE_KEY}\"\naddress = [\"10.66.0.2/32\"]\n[[endpoints.peers]]\npublic_key = \"{TEST_WG_PEER_PUBLIC_KEY}\"\naddress = \"1.2.3.4\"\nport = 0\nallowed_ips = [\"0.0.0.0/0\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("zero port must be rejected");
+    assert!(
+        err.to_string().contains("port must be non-zero"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn parse_config_default_endpoints_is_empty() {
+    let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
+    assert!(
+        options.endpoints.is_empty(),
+        "endpoints default must be empty"
+    );
 }
 
 mod matches {

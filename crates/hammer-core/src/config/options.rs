@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -8,6 +9,7 @@ pub struct Options {
     pub dns: DnsOptions,
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
+    pub endpoints: Vec<Endpoint>,
     pub route: RouteOptions,
 }
 
@@ -74,6 +76,59 @@ pub enum OutboundKind {
     Direct(DirectOutboundOptions),
     Block,
     Dns,
+}
+
+/// `[[endpoints]]` element — protocols that maintain long-lived state and
+/// participate in the lifecycle alongside outbounds. Mirrors the sing-box
+/// 1.11+ endpoint concept: `Endpoint = Outbound + Lifecycle` (see
+/// `crates/hammer-adapter/src/endpoint.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoint {
+    pub tag: String,
+    pub kind: EndpointKind,
+}
+
+impl Endpoint {
+    pub fn type_name(&self) -> &'static str {
+        match &self.kind {
+            EndpointKind::Wireguard(_) => constants::TYPE_WIREGUARD,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EndpointKind {
+    Wireguard(WireguardEndpointOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardEndpointOptions {
+    /// Static private key (Curve25519, 32 bytes).
+    pub private_key: [u8; 32],
+    /// Local UDP listen port; `0` lets the OS pick.
+    pub listen_port: u16,
+    /// Tunnel MTU advertised to the inner stack. sing-box default is 1408.
+    pub mtu: u32,
+    /// Local addresses inside the tunnel (CIDR form).
+    pub address: Vec<IpNet>,
+    pub peers: Vec<WireguardPeerOptions>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardPeerOptions {
+    /// Peer static public key (Curve25519, 32 bytes).
+    pub public_key: [u8; 32],
+    /// Optional pre-shared key (32 bytes) for additional symmetric mixing.
+    pub pre_shared_key: Option<[u8; 32]>,
+    /// Resolved peer endpoint. Hostname-only entries are resolved during
+    /// endpoint lifecycle Start, not at config parse time.
+    pub endpoint: SocketAddr,
+    pub allowed_ips: Vec<IpNet>,
+    /// `None` disables persistent keepalive.
+    pub persistent_keepalive: Option<Duration>,
+    /// First three reserved bytes of every WireGuard packet — non-zero values
+    /// are how Cloudflare WARP demuxes traffic per-connection.
+    pub reserved: [u8; 3],
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -278,6 +333,7 @@ pub mod constants {
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
+    pub const TYPE_WIREGUARD: &str = "wireguard";
 
     pub const PROTOCOL_DNS: &str = "dns";
     pub const PROTOCOL_QUIC: &str = "quic";
@@ -294,6 +350,8 @@ pub mod constants {
     pub const DEFAULT_TUN_MTU: u32 = 9000;
     pub const DEFAULT_DNS_PATH: &str = "/dns-query";
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
+    /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
+    pub const DEFAULT_WIREGUARD_MTU: u32 = 1408;
     pub const DNS_TYPE_HOSTS: &str = "hosts";
     pub const DNS_TYPE_LOCAL: &str = "local";
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use ipnet::IpNet;
 use url::Url;
 
@@ -6,8 +8,8 @@ use crate::error::HammerError;
 use super::options::constants as C;
 use super::options::*;
 use super::parse::{
-    build_network_list, parse_domain_strategy, parse_optional_duration, parse_optional_port,
-    parse_prefix_list,
+    build_network_list, parse_base64_key, parse_domain_strategy, parse_ipnet_list,
+    parse_optional_duration, parse_optional_port, parse_prefix_list, parse_socket_addr,
 };
 use super::raw::*;
 
@@ -16,6 +18,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         log: raw_log,
         tun: raw_tun,
         hysteria2: raw_hysteria,
+        endpoints: raw_endpoints,
         dns: raw_dns,
         route: raw_route,
     } = raw;
@@ -30,6 +33,8 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     rules.extend(build_user_rules(&raw_route.rules)?);
 
     let (hysteria_options, hysteria_id) = build_hysteria_options(raw_hysteria)?;
+
+    let endpoints = build_endpoints(raw_endpoints)?;
 
     let route_final = if raw_route.final_.is_empty() {
         hysteria_id.clone()
@@ -61,6 +66,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             kind: InboundKind::Tun(tun_options),
         }],
         outbounds: build_outbounds(hysteria_options, hysteria_id),
+        endpoints,
         route: route_options,
     })
 }
@@ -420,6 +426,101 @@ fn build_user_rules(raw: &[RawRouteRule]) -> Result<Vec<Rule>, HammerError> {
         .enumerate()
         .map(|(idx, raw)| build_user_rule(idx, raw))
         .collect()
+}
+
+fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, HammerError> {
+    raw.into_iter()
+        .enumerate()
+        .map(|(idx, item)| match item {
+            RawEndpoint::Wireguard(wg) => build_wireguard_endpoint(idx, wg),
+        })
+        .collect()
+}
+
+fn build_wireguard_endpoint(
+    idx: usize,
+    mut raw: RawWireguardEndpoint,
+) -> Result<Endpoint, HammerError> {
+    let tag = if raw.id.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "endpoints[{idx}].id is required"
+        )));
+    } else {
+        std::mem::take(&mut raw.id)
+    };
+    let private_key = parse_base64_key(
+        &format!("endpoints[{idx}].private_key"),
+        raw.private_key.trim(),
+    )?;
+    let listen_port = raw.listen_port.unwrap_or(0);
+    let mtu = raw.mtu.unwrap_or(C::DEFAULT_WIREGUARD_MTU);
+    let address = parse_ipnet_list(&format!("endpoints[{idx}].address"), &raw.address)?;
+    if address.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "endpoints[{idx}].address is required"
+        )));
+    }
+    if raw.peers.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "endpoints[{idx}].peers must contain at least one peer"
+        )));
+    }
+    let peers = raw
+        .peers
+        .into_iter()
+        .enumerate()
+        .map(|(peer_idx, peer)| build_wireguard_peer(idx, peer_idx, peer))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Endpoint {
+        tag,
+        kind: EndpointKind::Wireguard(WireguardEndpointOptions {
+            private_key,
+            listen_port,
+            mtu,
+            address,
+            peers,
+        }),
+    })
+}
+
+fn build_wireguard_peer(
+    endpoint_idx: usize,
+    peer_idx: usize,
+    raw: RawWireguardPeer,
+) -> Result<WireguardPeerOptions, HammerError> {
+    let prefix = format!("endpoints[{endpoint_idx}].peers[{peer_idx}]");
+    let public_key = parse_base64_key(&format!("{prefix}.public_key"), raw.public_key.trim())?;
+    let pre_shared_key = match raw.pre_shared_key.as_deref().map(str::trim) {
+        Some(value) if !value.is_empty() => {
+            Some(parse_base64_key(&format!("{prefix}.pre_shared_key"), value)?)
+        }
+        _ => None,
+    };
+    if raw.address.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.address is required"
+        )));
+    }
+    let endpoint = parse_socket_addr(&format!("{prefix}.address"), &raw.address, raw.port)?;
+    let allowed_ips = parse_ipnet_list(&format!("{prefix}.allowed_ips"), &raw.allowed_ips)?;
+    if allowed_ips.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.allowed_ips is required"
+        )));
+    }
+    let persistent_keepalive = raw
+        .persistent_keepalive_interval
+        .filter(|secs| *secs > 0)
+        .map(|secs| Duration::from_secs(u64::from(secs)));
+    let reserved = raw.reserved.unwrap_or([0u8; 3]);
+    Ok(WireguardPeerOptions {
+        public_key,
+        pre_shared_key,
+        endpoint,
+        allowed_ips,
+        persistent_keepalive,
+        reserved,
+    })
 }
 
 fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> {

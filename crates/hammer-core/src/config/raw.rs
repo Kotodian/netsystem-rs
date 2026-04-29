@@ -9,6 +9,8 @@ pub struct RawConfig {
     pub tun: RawTunConfig,
     #[serde(default, skip_serializing_if = "RawHysteria2Config::is_default")]
     pub hysteria2: RawHysteria2Config,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<RawEndpoint>,
     #[serde(default, skip_serializing_if = "RawDnsConfig::is_default")]
     pub dns: RawDnsConfig,
     #[serde(default, skip_serializing_if = "RawRouteConfig::is_default")]
@@ -145,6 +147,51 @@ impl RawHysteria2Obfs {
     fn is_default(&self) -> bool {
         *self == RawHysteria2Obfs::default()
     }
+}
+
+/// Outer endpoint variant — sing-box style `[[endpoints]]` entries with a
+/// `type` discriminator. Adding a new endpoint protocol (e.g. tailscale) means
+/// adding a new variant here without breaking existing TOML files.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
+pub enum RawEndpoint {
+    Wireguard(RawWireguardEndpoint),
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawWireguardEndpoint {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub private_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub address: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<RawWireguardPeer>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawWireguardPeer {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_shared_key: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub address: String,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_keepalive_interval: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved: Option<[u8; 3]>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]

@@ -1,4 +1,9 @@
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use ipnet::IpNet;
 
 use crate::error::HammerError;
 
@@ -145,6 +150,57 @@ fn parse_duration_go_style(input: &str) -> Result<Duration, String> {
     Ok(total)
 }
 
+/// Decode a base64-encoded 32-byte key (Curve25519 public/private/PSK).
+pub fn parse_base64_key(field: &str, value: &str) -> Result<[u8; 32], HammerError> {
+    let bytes = BASE64_STANDARD
+        .decode(value)
+        .map_err(|err| HammerError::config_validation(format!("{field}: invalid base64: {err}")))?;
+    if bytes.len() != 32 {
+        return Err(HammerError::config_validation(format!(
+            "{field}: expected 32 decoded bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Parse a CIDR-form prefix into `ipnet::IpNet`. Bare IPs without a prefix are
+/// treated as host routes (`/32` or `/128`).
+pub fn parse_ipnet(field: &str, value: &str) -> Result<IpNet, HammerError> {
+    if let Ok(net) = value.parse::<IpNet>() {
+        return Ok(net);
+    }
+    let ip: IpAddr = value.parse().map_err(|_| {
+        HammerError::config_validation(format!("{field}: invalid CIDR or IP {value:?}"))
+    })?;
+    let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
+    IpNet::new(ip, host_prefix)
+        .map_err(|err| HammerError::config_validation(format!("{field}: {err}")))
+}
+
+pub fn parse_ipnet_list(field: &str, values: &[String]) -> Result<Vec<IpNet>, HammerError> {
+    values.iter().map(|v| parse_ipnet(field, v)).collect()
+}
+
+/// Parse a `host:port`-style endpoint. The host must be an IP literal — DNS
+/// names are deferred to the endpoint's lifecycle Start so we don't block the
+/// config parser on a resolver.
+pub fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
+    if port == 0 {
+        return Err(HammerError::config_validation(format!(
+            "{field}: port must be non-zero"
+        )));
+    }
+    let ip: IpAddr = host.parse().map_err(|_| {
+        HammerError::config_validation(format!(
+            "{field}: peer address must be an IP literal (got {host:?}); hostnames are not supported yet"
+        ))
+    })?;
+    Ok(SocketAddr::new(ip, port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +253,49 @@ mod tests {
         );
         let err = parse_domain_strategy("dns.strategy", "prefer_quantum").unwrap_err();
         assert!(err.to_string().contains("dns.strategy"));
+    }
+
+    #[test]
+    fn base64_key_round_trips_32_bytes() {
+        let raw = [7u8; 32];
+        let encoded = BASE64_STANDARD.encode(raw);
+        let decoded = parse_base64_key("wg.private_key", &encoded).unwrap();
+        assert_eq!(decoded, raw);
+    }
+
+    #[test]
+    fn base64_key_rejects_wrong_length() {
+        let encoded = BASE64_STANDARD.encode([1u8; 16]);
+        let err = parse_base64_key("wg.private_key", &encoded).unwrap_err();
+        assert!(err.to_string().contains("32 decoded bytes"));
+    }
+
+    #[test]
+    fn base64_key_rejects_invalid_base64() {
+        let err = parse_base64_key("wg.private_key", "not!base64!!").unwrap_err();
+        assert!(err.to_string().contains("invalid base64"));
+    }
+
+    #[test]
+    fn ipnet_accepts_cidr_and_promotes_bare_ip_to_host_prefix() {
+        let v4 = parse_ipnet("wg.address", "10.0.0.1").unwrap();
+        assert_eq!(v4.prefix_len(), 32);
+        let v6 = parse_ipnet("wg.address", "fd00::1").unwrap();
+        assert_eq!(v6.prefix_len(), 128);
+        let cidr = parse_ipnet("wg.address", "10.0.0.0/24").unwrap();
+        assert_eq!(cidr.prefix_len(), 24);
+    }
+
+    #[test]
+    fn ipnet_rejects_garbage() {
+        assert!(parse_ipnet("wg.address", "not-an-ip").is_err());
+    }
+
+    #[test]
+    fn socket_addr_requires_ip_literal_and_nonzero_port() {
+        let addr = parse_socket_addr("wg.peer", "1.2.3.4", 51820).unwrap();
+        assert_eq!(addr.to_string(), "1.2.3.4:51820");
+        assert!(parse_socket_addr("wg.peer", "example.com", 51820).is_err());
+        assert!(parse_socket_addr("wg.peer", "1.2.3.4", 0).is_err());
     }
 }
