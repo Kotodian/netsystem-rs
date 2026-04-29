@@ -11,12 +11,13 @@ name = "hammer_runtime"
 default = []
 # Enables the WireGuard endpoint module. Pulls in the matching feature in
 # hammer-core. Off by default to keep the iOS xcframework slim.
-wireguard = ["hammer-core/wireguard"]
+wireguard = ["hammer-core/wireguard", "dep:boringtun"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
 async-trait = { workspace = true }
+boringtun = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
 reqwest = { workspace = true }
 bytes = { workspace = true }
