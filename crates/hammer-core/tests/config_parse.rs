@@ -216,12 +216,28 @@ fn parse_config_appends_user_route_rules_after_tun_rules() {
     );
     let user = &options.route.rules[5].default_options;
     assert_eq!(user.domain_suffix, vec!["google.com".to_owned()]);
-    assert_eq!(user.ip_cidr, vec!["8.8.8.8/32".to_owned()]);
+    assert_eq!(
+        user.ip_cidr,
+        vec!["8.8.8.8/32".parse::<ipnet::IpNet>().unwrap()]
+    );
     let route = match &user.action {
         RuleActionKind::Route(o) => o,
         _ => panic!("user rule action is not Route"),
     };
     assert_eq!(route.outbound, "hysteria2");
+}
+
+#[test]
+fn parse_config_rejects_invalid_ip_cidr() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\nip_cidr = [\"not-a-cidr\"]\noutbound = \"hysteria2\"\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted invalid CIDR");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("route.rules[0].ip_cidr"),
+        "error should pin user-visible rule index: {msg:?}"
+    );
 }
 
 #[test]

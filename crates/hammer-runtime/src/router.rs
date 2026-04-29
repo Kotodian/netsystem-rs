@@ -39,12 +39,21 @@ impl Router {
         options: RouteOptions,
         outbound: Arc<OutboundManager>,
     ) -> Result<Self, HammerError> {
-        let rules = options
+        let rules: Vec<RuntimeRule> = options
             .rules
             .into_iter()
-            .enumerate()
-            .map(|(idx, opt)| RuntimeRule::from_options(idx, opt))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(RuntimeRule::from_options)
+            .collect();
+        for rule in &rules {
+            if let RuleActionKind::Route(action) = &rule.action {
+                if outbound.get(&action.outbound).is_none() {
+                    return Err(HammerError::config_validation(format!(
+                        "route.rules outbound {:?} is not declared",
+                        action.outbound,
+                    )));
+                }
+            }
+        }
         Ok(Self {
             logger,
             rules,
@@ -64,6 +73,26 @@ impl Router {
             }
         }
         self.route_to_default(metadata.network)
+    }
+
+    fn route_to_default(&self, network: Network) -> Result<RouteDecision, HammerError> {
+        let Some(outbound) = &self.outbound else {
+            return Ok(RouteDecision::Route {
+                outbound: self.default_outbound.clone(),
+            });
+        };
+        let Some(default) = outbound.default() else {
+            return Err(HammerError::internal("default outbound not found"));
+        };
+        if !default.networks().contains(&network) {
+            return Err(HammerError::internal(format!(
+                "{network} is not supported by default outbound: {}",
+                default.tag()
+            )));
+        }
+        Ok(RouteDecision::Route {
+            outbound: default.tag().to_owned(),
+        })
     }
 }
 
@@ -88,28 +117,17 @@ struct RuntimeRule {
 }
 
 impl RuntimeRule {
-    fn from_options(idx: usize, options: RuleOptions) -> Result<Self, HammerError> {
+    fn from_options(options: RuleOptions) -> Self {
         let default = options.default_options;
-        let ip_cidr = default
-            .ip_cidr
-            .iter()
-            .map(|raw| {
-                raw.parse::<IpNet>().map_err(|err| {
-                    HammerError::config_validation(format!(
-                        "route.rules[{idx}].ip_cidr {raw:?}: {err}",
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
+        Self {
             inbound: default.inbound,
             protocol: default.protocol,
             domain: default.domain,
             domain_suffix: default.domain_suffix,
             domain_keyword: default.domain_keyword,
-            ip_cidr,
+            ip_cidr: default.ip_cidr,
             action: default.action,
-        })
+        }
     }
 
     fn matches(&self, metadata: &RouteMetadata) -> bool {
@@ -192,28 +210,6 @@ fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
 enum RuleApply {
     Continue,
     Decision(RouteDecision),
-}
-
-impl Router {
-    fn route_to_default(&self, network: Network) -> Result<RouteDecision, HammerError> {
-        let Some(outbound) = &self.outbound else {
-            return Ok(RouteDecision::Route {
-                outbound: self.default_outbound.clone(),
-            });
-        };
-        let Some(default) = outbound.default() else {
-            return Err(HammerError::internal("default outbound not found"));
-        };
-        if !default.networks().contains(&network) {
-            return Err(HammerError::internal(format!(
-                "{network} is not supported by default outbound: {}",
-                default.tag()
-            )));
-        }
-        Ok(RouteDecision::Route {
-            outbound: default.tag().to_owned(),
-        })
-    }
 }
 
 fn match_list(values: &[String], actual: &str) -> bool {

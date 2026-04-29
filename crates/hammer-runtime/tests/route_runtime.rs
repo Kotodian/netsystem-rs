@@ -210,6 +210,16 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
             outbound: "hysteria2".to_owned()
         }
     );
+
+    let mut miss = metadata_with_destination(IpAddr::V6(
+        "2001:dead::1".parse::<Ipv6Addr>().unwrap(),
+    ));
+    assert_eq!(
+        router.match_route(&mut miss).expect("match"),
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
 }
 
 #[test]
@@ -258,9 +268,9 @@ fn router_combines_domain_and_ip_cidr_with_and_semantics() {
 }
 
 #[test]
-fn router_rejects_invalid_ip_cidr_at_construction() {
+fn router_rejects_unknown_outbound_at_construction() {
     let opts = options_with_user_rules(
-        "[[route.rules]]\nip_cidr = [\"not-a-cidr\"]\noutbound = \"hysteria2\"\n",
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"typo\"\n",
     );
     let outbound = Arc::new(OutboundManager::from_options(
         logger("outbound"),
@@ -268,10 +278,13 @@ fn router_rejects_invalid_ip_cidr_at_construction() {
         &opts.outbounds,
     ));
     let err = match Router::from_options(logger("router"), opts.route.clone(), outbound) {
-        Ok(_) => panic!("invalid CIDR should fail router construction"),
+        Ok(_) => panic!("unknown outbound should fail router construction"),
         Err(err) => err,
     };
-    assert!(err.to_string().contains("ip_cidr"), "error = {err}");
+    assert!(
+        err.to_string().contains("\"typo\""),
+        "error should mention the unknown outbound tag: {err}"
+    );
 }
 
 #[test]

@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use url::Url;
 
 use crate::error::HammerError;
@@ -425,6 +426,17 @@ fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> 
             "route.rules[{idx}] requires at least one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
         )));
     }
+    let ip_cidr = raw
+        .ip_cidr
+        .iter()
+        .map(|raw_cidr| {
+            raw_cidr.parse::<IpNet>().map_err(|err| {
+                HammerError::config_validation(format!(
+                    "route.rules[{idx}].ip_cidr {raw_cidr:?}: {err}",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Rule {
         default_options: DefaultRule {
             inbound: raw.inbound.clone(),
@@ -432,7 +444,7 @@ fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> 
             domain: raw.domain.clone(),
             domain_suffix: raw.domain_suffix.clone(),
             domain_keyword: raw.domain_keyword.clone(),
-            ip_cidr: raw.ip_cidr.clone(),
+            ip_cidr,
             action: RuleActionKind::Route(RouteActionOptions {
                 outbound: raw.outbound.clone(),
             }),

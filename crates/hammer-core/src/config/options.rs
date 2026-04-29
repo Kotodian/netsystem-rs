@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use ipnet::IpNet;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub log: LogOptions,
@@ -186,7 +188,7 @@ pub struct DefaultRule {
     pub domain: Vec<String>,
     pub domain_suffix: Vec<String>,
     pub domain_keyword: Vec<String>,
-    pub ip_cidr: Vec<String>,
+    pub ip_cidr: Vec<IpNet>,
     pub action: RuleActionKind,
 }
 

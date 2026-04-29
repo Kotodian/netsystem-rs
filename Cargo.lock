@@ -853,6 +853,7 @@ name = "hammer-core"
 version = "0.1.0"
 dependencies = [
  "indoc",
+ "ipnet",
  "once_cell",
  "serde",
  "thiserror",
