@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{Inbound, InboundManager as InboundManagerTrait};
+use hammer_adapter::{Inbound, InboundManager as InboundManagerTrait, PlatformInterface};
 use hammer_core::config::{Inbound as InboundOptions, InboundKind};
 use hammer_core::error::HammerError;
+use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::impl_logging_lifecycle;
 use crate::{DnsRouter, OutboundManager, Router, TunInbound};
 
 pub struct InboundManager {
@@ -49,6 +49,7 @@ impl InboundManager {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
+        platform: Arc<dyn PlatformInterface>,
     ) -> Result<Self, HammerError> {
         let manager = Self::new(logger.clone());
         for option in options {
@@ -61,6 +62,7 @@ impl InboundManager {
                         Arc::clone(&router),
                         Arc::clone(&dns_router),
                         Arc::clone(&outbound),
+                        Arc::clone(&platform),
                     )));
                 }
             }
@@ -80,7 +82,34 @@ impl InboundManager {
     }
 }
 
-impl_logging_lifecycle!(InboundManager, "inbound");
+impl Lifecycle for InboundManager {
+    fn name(&self) -> &str {
+        "inbound"
+    }
+
+    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+        self.logger.debug(format!("stage {}", stage.name()));
+        for inbound in self.list() {
+            inbound.start(stage)?;
+        }
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        let mut errors = Vec::new();
+        for inbound in self.list() {
+            if let Err(err) = inbound.close() {
+                errors.push(format!("{}: {}", inbound.tag(), err));
+            }
+        }
+        self.logger.debug("close");
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(HammerError::internal(errors.join("; ")))
+        }
+    }
+}
 
 impl InboundManagerTrait for InboundManager {
     fn list(&self) -> Vec<Arc<dyn Inbound>> {

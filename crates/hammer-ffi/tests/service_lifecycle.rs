@@ -8,7 +8,11 @@ use hammer::{
 
 const MIN_TOML: &str = r#"
 [tun]
+interface_name = "utun"
 address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+mtu = 1400
+stack = "disabled"
 [hysteria2]
 server = "example.com"
 password = "x"
@@ -22,11 +26,16 @@ final = "hysteria2"
 #[derive(Default)]
 struct CapturePlatform {
     lines: Mutex<Vec<String>>,
+    open_tun_calls: Mutex<Vec<HammerTunOptions>>,
 }
 
 impl HammerPlatform for CapturePlatform {
-    fn open_tun(&self, _options: HammerTunOptions) -> Result<i32, HammerError> {
-        Err(HammerError::internal("open_tun is not available in tests"))
+    fn open_tun(&self, options: HammerTunOptions) -> Result<i32, HammerError> {
+        self.open_tun_calls
+            .lock()
+            .expect("CapturePlatform poisoned")
+            .push(options);
+        Ok(42)
     }
     fn use_platform_auto_detect_interface_control(&self) -> bool {
         false
@@ -90,6 +99,21 @@ fn make_service() -> (Arc<CapturePlatform>, Arc<HammerService>) {
 
 fn count(lines: &[String], needle: &str) -> usize {
     lines.iter().filter(|l| l.contains(needle)).count()
+}
+
+#[test]
+fn service_start_opens_tun_with_configured_options() {
+    let (platform, svc) = make_service();
+    svc.start().expect("start should open TUN");
+    svc.close().expect("close should succeed");
+
+    let calls = platform.open_tun_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "open_tun calls = {calls:?}");
+    let options = &calls[0];
+    assert_eq!(options.name, "utun");
+    assert_eq!(options.mtu, 1400);
+    assert_eq!(options.address, vec!["172.19.0.1/30"]);
+    assert_eq!(options.route, vec!["0.0.0.0/0"]);
 }
 
 #[test]

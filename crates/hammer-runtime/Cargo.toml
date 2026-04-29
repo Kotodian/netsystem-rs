@@ -30,6 +30,7 @@ smoltcp = { workspace = true }
 tun-rs = { workspace = true }
 etherparse = { workspace = true }
 ipnet = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

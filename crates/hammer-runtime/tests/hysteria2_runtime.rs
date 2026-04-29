@@ -1,18 +1,72 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
+use hammer_adapter::{
+    DefaultInterfaceUpdateListener, Network, NetworkInterface, OutboundManager as _,
+    PlatformInterface, SocksAddr, TunOptions, WifiState,
+};
 use hammer_core::config::{self, Options};
+use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::OutboundManager;
 use hammer_runtime::hysteria2::bbr::{BbrProfile, HysteriaBbrConfig};
 use hammer_runtime::hysteria2::{
     ClientOptions, Hysteria2Client, obfs::Salamander, protocol, testing::EchoServer,
 };
+use tokio::io::AsyncWriteExt;
 
 fn logger(tag: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+}
+
+#[derive(Default)]
+struct ProtectPlatform {
+    calls: AtomicUsize,
+}
+
+impl ProtectPlatform {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl PlatformInterface for ProtectPlatform {
+    fn open_tun(&self, _options: TunOptions) -> Result<i32, HammerError> {
+        Ok(42)
+    }
+
+    fn use_platform_auto_detect_interface_control(&self) -> bool {
+        true
+    }
+
+    fn auto_detect_interface_control(&self, _fd: i32) -> Result<(), HammerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn start_default_interface_monitor(
+        &self,
+        _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close_default_interface_monitor(
+        &self,
+        _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn get_interfaces(&self) -> Result<Vec<NetworkInterface>, HammerError> {
+        Ok(Vec::new())
+    }
+
+    fn read_wifi_state(&self) -> Option<WifiState> {
+        None
+    }
 }
 
 fn options(server: String, port: u16) -> Options {
@@ -93,6 +147,10 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
             bbr_profile: BbrProfile::Standard,
             disable_path_mtu_discovery: false,
             initial_packet_size: 1200,
+            idle_timeout: None,
+            keep_alive_period: None,
+            obfs: None,
+            platform: None,
         },
         logger("outbound/hysteria2"),
     )
@@ -108,6 +166,7 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
         .dial_tcp(destination.clone(), b"ping")
         .await
         .expect("dial tcp");
+    stream.shutdown().await.expect("finish tcp request");
     assert_eq!(stream.read_to_end().await.expect("read tcp"), b"echo:ping");
 
     let mut packet = client.listen_udp().await.expect("listen udp");
@@ -117,6 +176,36 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
         .expect("send udp");
     let received = packet.recv_from().await.expect("recv udp");
     assert_eq!(received.payload, b"echo:dns-query");
+}
+
+#[tokio::test]
+async fn hysteria2_client_protects_quic_socket_before_connecting() {
+    let server = EchoServer::start("secret")
+        .await
+        .expect("start echo server");
+    let platform = Arc::new(ProtectPlatform::default());
+    let _client = Hysteria2Client::connect(
+        ClientOptions {
+            server: "127.0.0.1".to_owned(),
+            server_port: server.port(),
+            password: "secret".to_owned(),
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            udp_enabled: true,
+            bbr_profile: BbrProfile::Standard,
+            disable_path_mtu_discovery: false,
+            initial_packet_size: 1200,
+            idle_timeout: None,
+            keep_alive_period: None,
+            obfs: None,
+            platform: Some(Arc::clone(&platform) as Arc<dyn PlatformInterface>),
+        },
+        logger("outbound/hysteria2"),
+    )
+    .await
+    .expect("connect client");
+
+    assert_eq!(platform.calls(), 1);
 }
 
 #[tokio::test]
@@ -143,10 +232,12 @@ async fn outbound_manager_registers_real_hysteria2_outbound() {
         .dial(Network::Tcp, destination, b"hello")
         .await
         .expect("dial through outbound");
-    assert_eq!(
-        stream.read_to_end().await.expect("read outbound"),
-        b"echo:hello"
-    );
+    stream.shutdown().await.expect("finish outbound request");
+    let mut payload = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut payload)
+        .await
+        .expect("read outbound");
+    assert_eq!(payload, b"echo:hello");
 }
 
 #[test]

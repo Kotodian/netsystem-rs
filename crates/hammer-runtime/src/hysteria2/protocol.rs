@@ -3,6 +3,7 @@ use std::io::{Cursor, Read};
 use hammer_core::error::HammerError;
 use http::HeaderMap;
 use rand::{Rng, distributions::Alphanumeric};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const URL_HOST: &str = "hysteria";
 pub const URL_PATH: &str = "/auth";
@@ -42,6 +43,17 @@ pub struct TcpResponse {
     pub ok: bool,
     pub message: String,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpRequestHeader {
+    pub destination: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpResponseHeader {
+    pub ok: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +204,36 @@ pub fn decode_tcp_response(input: &[u8]) -> Result<TcpResponse, HammerError> {
     })
 }
 
+pub async fn read_tcp_request_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<TcpRequestHeader, HammerError> {
+    let frame_type = read_varint_async(reader).await?;
+    if frame_type != FRAME_TYPE_TCP_REQUEST {
+        return Err(HammerError::internal(format!(
+            "unsupported TCP frame type: {frame_type}"
+        )));
+    }
+    let destination = read_vstring_async(reader, MAX_ADDRESS_LENGTH, false).await?;
+    skip_padding_async(reader).await?;
+    Ok(TcpRequestHeader { destination })
+}
+
+pub async fn read_tcp_response_header<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<TcpResponseHeader, HammerError> {
+    let mut status = [0; 1];
+    reader
+        .read_exact(&mut status)
+        .await
+        .map_err(|err| HammerError::internal(format!("read tcp response status: {err}")))?;
+    let message = read_vstring_async(reader, MAX_MESSAGE_LENGTH, true).await?;
+    skip_padding_async(reader).await?;
+    Ok(TcpResponseHeader {
+        ok: status[0] == 0,
+        message,
+    })
+}
+
 fn read_vstring(reader: &mut Cursor<&[u8]>) -> Result<String, HammerError> {
     read_vstring_with_limit(reader, MAX_ADDRESS_LENGTH, false)
 }
@@ -206,8 +248,7 @@ fn read_vstring_with_limit(
         return Err(HammerError::internal("invalid string length"));
     }
     let mut buf = vec![0; len as usize];
-    reader
-        .read_exact(&mut buf)
+    Read::read_exact(reader, &mut buf)
         .map_err(|err| HammerError::internal(format!("read string: {err}")))?;
     String::from_utf8(buf).map_err(|err| HammerError::internal(format!("utf8 string: {err}")))
 }
@@ -215,6 +256,23 @@ fn read_vstring_with_limit(
 fn write_vstring(out: &mut Vec<u8>, value: &str) {
     write_varint(out, value.len() as u64);
     out.extend_from_slice(value.as_bytes());
+}
+
+async fn read_vstring_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: u64,
+    allow_empty: bool,
+) -> Result<String, HammerError> {
+    let len = read_varint_async(reader).await?;
+    if (!allow_empty && len == 0) || len > max {
+        return Err(HammerError::internal("invalid string length"));
+    }
+    let mut buf = vec![0; len as usize];
+    reader
+        .read_exact(&mut buf)
+        .await
+        .map_err(|err| HammerError::internal(format!("read string: {err}")))?;
+    String::from_utf8(buf).map_err(|err| HammerError::internal(format!("utf8 string: {err}")))
 }
 
 fn skip_padding(reader: &mut Cursor<&[u8]>) -> Result<(), HammerError> {
@@ -230,10 +288,39 @@ fn skip_padding(reader: &mut Cursor<&[u8]>) -> Result<(), HammerError> {
     Ok(())
 }
 
+async fn skip_padding_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), HammerError> {
+    let len = read_varint_async(reader).await?;
+    if len > MAX_PADDING_LENGTH {
+        return Err(HammerError::internal("invalid padding length"));
+    }
+    let mut padding = vec![0; len as usize];
+    reader
+        .read_exact(&mut padding)
+        .await
+        .map_err(|err| HammerError::internal(format!("read padding: {err}")))?;
+    Ok(())
+}
+
 fn read_varint(reader: &mut Cursor<&[u8]>) -> Result<u64, HammerError> {
+    let mut first = [0; 1];
+    Read::read_exact(reader, &mut first)
+        .map_err(|err| HammerError::internal(format!("read varint: {err}")))?;
+    let prefix = first[0] >> 6;
+    let len = 1usize << prefix;
+    let mut bytes = [0; 8];
+    bytes[0] = first[0] & 0x3f;
+    if len > 1 {
+        Read::read_exact(reader, &mut bytes[1..len])
+            .map_err(|err| HammerError::internal(format!("read varint: {err}")))?;
+    }
+    Ok(u64::from_be_bytes(bytes) >> ((8 - len) * 8))
+}
+
+async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64, HammerError> {
     let mut first = [0; 1];
     reader
         .read_exact(&mut first)
+        .await
         .map_err(|err| HammerError::internal(format!("read varint: {err}")))?;
     let prefix = first[0] >> 6;
     let len = 1usize << prefix;
@@ -242,6 +329,7 @@ fn read_varint(reader: &mut Cursor<&[u8]>) -> Result<u64, HammerError> {
     if len > 1 {
         reader
             .read_exact(&mut bytes[1..len])
+            .await
             .map_err(|err| HammerError::internal(format!("read varint: {err}")))?;
     }
     Ok(u64::from_be_bytes(bytes) >> ((8 - len) * 8))

@@ -21,6 +21,14 @@ pub struct WifiState {
     pub bssid: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunOptions {
+    pub name: String,
+    pub mtu: i32,
+    pub address: Vec<String>,
+    pub route: Vec<String>,
+}
+
 pub trait DefaultInterfaceUpdateListener: Send + Sync + 'static {
     fn update_default_interface(
         &self,
@@ -32,6 +40,7 @@ pub trait DefaultInterfaceUpdateListener: Send + Sync + 'static {
 }
 
 pub trait PlatformInterface: Send + Sync + 'static {
+    fn open_tun(&self, options: TunOptions) -> Result<i32, CoreError>;
     fn use_platform_auto_detect_interface_control(&self) -> bool;
     fn auto_detect_interface_control(&self, fd: i32) -> Result<(), CoreError>;
     fn start_default_interface_monitor(

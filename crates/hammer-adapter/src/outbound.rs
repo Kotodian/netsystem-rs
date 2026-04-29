@@ -3,14 +3,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hammer_core::error::CoreError;
 use hammer_core::lifecycle::Lifecycle;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
 
-#[async_trait]
-pub trait ProxyStream: Send + Sync + 'static {
-    async fn read_to_end(&mut self) -> Result<Vec<u8>, CoreError>;
-}
+pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+
+impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyDatagram {

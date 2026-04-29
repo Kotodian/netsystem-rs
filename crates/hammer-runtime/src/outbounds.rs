@@ -4,16 +4,17 @@ use async_trait::async_trait;
 use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpSocket, UdpSocket};
 
-const TCP_READ_LIMIT: usize = 16 * 1024 * 1024;
+use crate::socket_protector::SocketProtector;
 
 pub struct DirectOutbound {
     logger: Logger,
     tag: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
+    protector: SocketProtector,
 }
 
 impl DirectOutbound {
@@ -23,6 +24,21 @@ impl DirectOutbound {
             tag: tag.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
+            protector: SocketProtector::default(),
+        }
+    }
+
+    pub(crate) fn new_with_protector(
+        logger: Logger,
+        tag: impl Into<String>,
+        protector: SocketProtector,
+    ) -> Self {
+        Self {
+            logger,
+            tag: tag.into(),
+            networks: vec![Network::Tcp, Network::Udp],
+            dependencies: Vec::new(),
+            protector,
         }
     }
 }
@@ -56,7 +72,15 @@ impl Outbound for DirectOutbound {
         }
         self.logger
             .info(format!("outbound connection to {destination}"));
-        let mut stream = TcpStream::connect(socket_addr(&destination))
+        let socket = if destination.host.is_ipv6() {
+            TcpSocket::new_v6()
+        } else {
+            TcpSocket::new_v4()
+        }
+        .map_err(|err| HammerError::internal(format!("create direct tcp socket: {err}")))?;
+        self.protector.protect(&socket)?;
+        let mut stream = socket
+            .connect(socket_addr(&destination))
             .await
             .map_err(|err| HammerError::internal(format!("direct tcp connect: {err}")))?;
         if !initial_payload.is_empty() {
@@ -65,11 +89,7 @@ impl Outbound for DirectOutbound {
                 .await
                 .map_err(|err| HammerError::internal(format!("direct tcp write: {err}")))?;
         }
-        stream
-            .shutdown()
-            .await
-            .map_err(|err| HammerError::internal(format!("direct tcp shutdown: {err}")))?;
-        Ok(Box::new(DirectStream { stream }))
+        Ok(Box::new(stream))
     }
 
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
@@ -77,26 +97,8 @@ impl Outbound for DirectOutbound {
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .await
             .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
+        self.protector.protect(&socket)?;
         Ok(Box::new(DirectPacketConn { socket }))
-    }
-}
-
-struct DirectStream {
-    stream: TcpStream,
-}
-
-#[async_trait]
-impl ProxyStream for DirectStream {
-    async fn read_to_end(&mut self) -> Result<Vec<u8>, HammerError> {
-        let mut bytes = Vec::new();
-        self.stream
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(|err| HammerError::internal(format!("direct tcp read: {err}")))?;
-        if bytes.len() > TCP_READ_LIMIT {
-            return Err(HammerError::internal("direct tcp response too large"));
-        }
-        Ok(bytes)
     }
 }
 

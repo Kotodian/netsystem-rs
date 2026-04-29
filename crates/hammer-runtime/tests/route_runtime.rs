@@ -201,9 +201,8 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
     );
     let router = router_from_options(&opts);
 
-    let mut hit = metadata_with_destination(IpAddr::V6(
-        "2001:db8:1234::1".parse::<Ipv6Addr>().unwrap(),
-    ));
+    let mut hit =
+        metadata_with_destination(IpAddr::V6("2001:db8:1234::1".parse::<Ipv6Addr>().unwrap()));
     assert_eq!(
         router.match_route(&mut hit).expect("match"),
         RouteDecision::Route {
@@ -211,9 +210,8 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
         }
     );
 
-    let mut miss = metadata_with_destination(IpAddr::V6(
-        "2001:dead::1".parse::<Ipv6Addr>().unwrap(),
-    ));
+    let mut miss =
+        metadata_with_destination(IpAddr::V6("2001:dead::1".parse::<Ipv6Addr>().unwrap()));
     assert_eq!(
         router.match_route(&mut miss).expect("match"),
         RouteDecision::Route {
@@ -363,6 +361,10 @@ impl MockPlatform {
 }
 
 impl PlatformInterface for MockPlatform {
+    fn open_tun(&self, _options: hammer_adapter::TunOptions) -> Result<i32, HammerError> {
+        Ok(42)
+    }
+
     fn use_platform_auto_detect_interface_control(&self) -> bool {
         false
     }

@@ -242,9 +242,7 @@ fn parse_config_rejects_invalid_ip_cidr() {
 
 #[test]
 fn parse_config_rejects_user_rule_without_outbound() {
-    let cfg = format!(
-        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\n"
-    );
+    let cfg = format!("{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\n");
     let err = config::parse_config(&cfg).expect_err("accepted rule without outbound");
     let msg = err.to_string();
     assert!(msg.contains("outbound is required"), "error = {msg:?}");
@@ -255,7 +253,10 @@ fn parse_config_rejects_user_rule_without_any_matcher() {
     let cfg = format!("{MINIMAL_CONFIG}\n[[route.rules]]\noutbound = \"hysteria2\"\n");
     let err = config::parse_config(&cfg).expect_err("accepted rule without matcher");
     let msg = err.to_string();
-    assert!(msg.contains("requires at least one matcher"), "error = {msg:?}");
+    assert!(
+        msg.contains("requires at least one matcher"),
+        "error = {msg:?}"
+    );
 }
 
 #[test]

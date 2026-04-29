@@ -1,14 +1,19 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::io::{self, IoSliceMut};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::future;
 use h3::client;
-use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr};
+use hammer_adapter::{
+    Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
+};
 use hammer_core::config::{Hysteria2Obfs, Hysteria2OutboundOptions};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
@@ -16,6 +21,7 @@ use http::Request;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 
 pub mod bbr;
@@ -24,8 +30,11 @@ pub mod protocol;
 pub mod testing;
 
 use bbr::{BbrProfile, apply_transport_config};
+use obfs::Salamander;
 
-#[derive(Debug, Clone)]
+use crate::socket_protector::SocketProtector;
+
+#[derive(Clone)]
 pub struct ClientOptions {
     pub server: String,
     pub server_port: u16,
@@ -36,6 +45,10 @@ pub struct ClientOptions {
     pub bbr_profile: BbrProfile,
     pub disable_path_mtu_discovery: bool,
     pub initial_packet_size: u16,
+    pub idle_timeout: Option<Duration>,
+    pub keep_alive_period: Option<Duration>,
+    pub obfs: Option<Hysteria2Obfs>,
+    pub platform: Option<Arc<dyn PlatformInterface>>,
 }
 
 pub struct Hysteria2Client {
@@ -49,8 +62,8 @@ pub struct Hysteria2Client {
 
 impl Hysteria2Client {
     pub async fn connect(options: ClientOptions, logger: Logger) -> Result<Arc<Self>, HammerError> {
-        let endpoint = client_endpoint(&options)?;
         let address = resolve_server(&options.server, options.server_port)?;
+        let endpoint = client_endpoint(&options, address)?;
         let server_name = if options.server_name.is_empty() {
             options.server.as_str()
         } else {
@@ -81,7 +94,7 @@ impl Hysteria2Client {
         destination: SocksAddr,
         initial_payload: &[u8],
     ) -> Result<Hysteria2Stream, HammerError> {
-        let (mut send, recv) = self
+        let (mut send, mut recv) = self
             .connection
             .open_bi()
             .await
@@ -90,11 +103,16 @@ impl Hysteria2Client {
         send.write_all(&request)
             .await
             .map_err(|err| HammerError::internal(format!("write hysteria2 stream: {err}")))?;
-        send.finish()
-            .map_err(|err| HammerError::internal(format!("finish hysteria2 stream: {err}")))?;
+        let response = protocol::read_tcp_response_header(&mut recv).await?;
+        if !response.ok {
+            return Err(HammerError::internal(format!(
+                "remote error: {}",
+                response.message
+            )));
+        }
         self.logger
             .debug(format!("outbound connection to {destination}"));
-        Ok(Hysteria2Stream { recv })
+        Ok(Hysteria2Stream { send, recv })
     }
 
     pub async fn listen_udp(&self) -> Result<Hysteria2PacketConn, HammerError> {
@@ -112,32 +130,45 @@ impl Hysteria2Client {
 }
 
 pub struct Hysteria2Stream {
+    send: quinn::SendStream,
     recv: quinn::RecvStream,
 }
 
 impl Hysteria2Stream {
     pub async fn read_to_end(&mut self) -> Result<Vec<u8>, HammerError> {
-        <Self as ProxyStream>::read_to_end(self).await
+        let mut bytes = Vec::new();
+        AsyncReadExt::read_to_end(self, &mut bytes)
+            .await
+            .map_err(|err| HammerError::internal(format!("read hysteria2 stream: {err}")))?;
+        Ok(bytes)
     }
 }
 
-#[async_trait]
-impl ProxyStream for Hysteria2Stream {
-    async fn read_to_end(&mut self) -> Result<Vec<u8>, HammerError> {
-        let bytes = self
-            .recv
-            .read_to_end(usize::MAX)
-            .await
-            .map_err(|err| HammerError::internal(format!("read hysteria2 stream: {err}")))?;
-        let response = protocol::decode_tcp_response(&bytes)?;
-        if response.ok {
-            Ok(response.payload)
-        } else {
-            Err(HammerError::internal(format!(
-                "remote error: {}",
-                response.message
-            )))
-        }
+impl AsyncRead for Hysteria2Stream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Hysteria2Stream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        <quinn::SendStream as AsyncWrite>::poll_write(Pin::new(&mut self.send), cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        <quinn::SendStream as AsyncWrite>::poll_flush(Pin::new(&mut self.send), cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        <quinn::SendStream as AsyncWrite>::poll_shutdown(Pin::new(&mut self.send), cx)
     }
 }
 
@@ -208,10 +239,20 @@ pub struct Hysteria2Outbound {
     networks: Vec<Network>,
     dependencies: Vec<String>,
     client: Mutex<Option<Arc<Hysteria2Client>>>,
+    protector: SocketProtector,
 }
 
 impl Hysteria2Outbound {
     pub fn new(logger: Logger, tag: String, options: Hysteria2OutboundOptions) -> Self {
+        Self::new_with_protector(logger, tag, options, SocketProtector::default())
+    }
+
+    pub(crate) fn new_with_protector(
+        logger: Logger,
+        tag: String,
+        options: Hysteria2OutboundOptions,
+        protector: SocketProtector,
+    ) -> Self {
         let networks = parse_networks(&options.network);
         Self {
             logger,
@@ -220,6 +261,7 @@ impl Hysteria2Outbound {
             networks,
             dependencies: Vec::new(),
             client: Mutex::new(None),
+            protector,
         }
     }
 
@@ -239,6 +281,10 @@ impl Hysteria2Outbound {
                 .map_err(HammerError::internal)?,
             disable_path_mtu_discovery: self.options.disable_path_mtu_discovery,
             initial_packet_size: self.options.initial_packet_size,
+            idle_timeout: self.options.idle_timeout,
+            keep_alive_period: self.options.keep_alive_period,
+            obfs: self.options.obfs.clone(),
+            platform: self.protector.platform(),
         };
         let client = Hysteria2Client::connect(options, self.logger.clone()).await?;
         *guard = Some(Arc::clone(&client));
@@ -384,9 +430,30 @@ async fn handle_datagram(client: &Hysteria2Client, data: &[u8]) -> Result<(), Ha
     Ok(())
 }
 
-fn client_endpoint(options: &ClientOptions) -> Result<quinn::Endpoint, HammerError> {
-    let mut endpoint = quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-        .map_err(|err| HammerError::internal(format!("create QUIC endpoint: {err}")))?;
+fn client_endpoint(
+    options: &ClientOptions,
+    server_addr: SocketAddr,
+) -> Result<quinn::Endpoint, HammerError> {
+    let bind_addr = if server_addr.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let socket = std::net::UdpSocket::bind(bind_addr)
+        .map_err(|err| HammerError::internal(format!("bind QUIC UDP socket: {err}")))?;
+    SocketProtector::from(options.platform.clone()).protect(&socket)?;
+    let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
+    let socket = runtime
+        .wrap_udp_socket(socket)
+        .map_err(|err| HammerError::internal(format!("wrap QUIC UDP socket: {err}")))?;
+    let socket = wrap_obfs_socket(socket, options.obfs.as_ref())?;
+    let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        runtime,
+    )
+    .map_err(|err| HammerError::internal(format!("create QUIC endpoint: {err}")))?;
     endpoint.set_default_client_config(client_config(options)?);
     Ok(endpoint)
 }
@@ -414,7 +481,15 @@ fn client_config(options: &ClientOptions) -> Result<quinn::ClientConfig, HammerE
             .map_err(|err| HammerError::internal(format!("quic tls config: {err}")))?,
     ));
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    transport.keep_alive_interval(Some(
+        options.keep_alive_period.unwrap_or(Duration::from_secs(10)),
+    ));
+    if let Some(timeout) = options.idle_timeout {
+        let timeout = timeout
+            .try_into()
+            .map_err(|err| HammerError::internal(format!("invalid QUIC idle timeout: {err}")))?;
+        transport.max_idle_timeout(Some(timeout));
+    }
     apply_transport_config(
         &mut config,
         transport,
@@ -423,6 +498,89 @@ fn client_config(options: &ClientOptions) -> Result<quinn::ClientConfig, HammerE
         options.disable_path_mtu_discovery,
     );
     Ok(config)
+}
+
+fn wrap_obfs_socket(
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    obfs: Option<&Hysteria2Obfs>,
+) -> Result<Arc<dyn quinn::AsyncUdpSocket>, HammerError> {
+    let Some(obfs) = obfs else {
+        return Ok(socket);
+    };
+    if obfs.type_ != "salamander" {
+        return Err(HammerError::internal(format!(
+            "unknown obfs type: {}",
+            obfs.type_
+        )));
+    }
+    Ok(Arc::new(SalamanderUdpSocket {
+        inner: socket,
+        obfs: Salamander::new(obfs.password.as_bytes().to_vec()),
+    }))
+}
+
+#[derive(Debug)]
+struct SalamanderUdpSocket {
+    inner: Arc<dyn quinn::AsyncUdpSocket>,
+    obfs: Salamander,
+}
+
+impl quinn::AsyncUdpSocket for SalamanderUdpSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Arc::clone(&self.inner).create_io_poller()
+    }
+
+    fn try_send(&self, transmit: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        let sealed = self.obfs.seal(transmit.contents);
+        let transmit = quinn::udp::Transmit {
+            destination: transmit.destination,
+            ecn: transmit.ecn,
+            contents: &sealed,
+            segment_size: None,
+            src_ip: transmit.src_ip,
+        };
+        self.inner.try_send(&transmit)
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let count = match self.inner.poll_recv(cx, bufs, meta) {
+            Poll::Ready(Ok(count)) => count,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Pending => return Poll::Pending,
+        };
+        for index in 0..count {
+            let len = meta[index].len;
+            let plain = self
+                .obfs
+                .open(&bufs[index][..len])
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            bufs[index][..plain.len()].copy_from_slice(&plain);
+            meta[index].len = plain.len();
+            meta[index].stride = plain.len();
+        }
+        Poll::Ready(Ok(count))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.inner.local_addr()
+    }
+
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    fn may_fragment(&self) -> bool {
+        self.inner.may_fragment()
+    }
 }
 
 fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {

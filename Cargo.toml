@@ -55,6 +55,7 @@ smoltcp = "0.13"
 tun-rs = { version = "2.8.3", features = ["async"] }
 etherparse = "0.20.1"
 ipnet = "2"
+libc = "0.2"
 uniffi = "0.31"
 indoc = "2.0"
 rcgen = "0.14"

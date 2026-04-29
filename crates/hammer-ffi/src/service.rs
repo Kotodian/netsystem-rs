@@ -59,6 +59,7 @@ impl HammerService {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_stack_size(512 * 1024)
+            .max_blocking_threads(4)
             .enable_all()
             .build()
             .map_err(|e| HammerError::internal(format!("init tokio runtime: {e}")))?;
@@ -116,6 +117,7 @@ impl HammerService {
             Arc::clone(&router),
             Arc::clone(&dns_router),
             Arc::clone(&outbound),
+            Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
         )?);
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
 
@@ -170,7 +172,7 @@ impl HammerService {
     }
 
     pub fn start(&self) -> Result<(), HammerError> {
-        let (lifecycles, log_factory) = {
+        let (lifecycles, log_factory, runtime_handle) = {
             let mut inner = self.inner.lock().expect("service mutex poisoned");
             match inner.state {
                 ServiceState::Closed => return Err(HammerError::ServiceClosed),
@@ -178,10 +180,15 @@ impl HammerService {
                 ServiceState::NotStarted => {}
             }
             inner.state = ServiceState::Running;
-            (inner.lifecycles.clone(), Arc::clone(&inner.log_factory))
+            (
+                inner.lifecycles.clone(),
+                Arc::clone(&inner.log_factory),
+                inner._runtime.handle().clone(),
+            )
         };
 
         log_factory.close();
+        let _runtime_guard = runtime_handle.enter();
 
         for stage in ALL_STAGES {
             for lc in &lifecycles {

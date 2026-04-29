@@ -1,8 +1,9 @@
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use hammer_adapter::{DnsTransport, Lifecycle, Network, RouteDecision};
+use hammer_adapter::{DnsTransport, Lifecycle, Network, RouteDecision, SocksAddr};
 use hammer_core::config::{self, DirectOutboundOptions, Options, Outbound, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
@@ -11,8 +12,9 @@ use hammer_runtime::{
     DnsRouter, DnsTransportManager, InboundManager, OutboundManager, Router,
     dns::{FixedResponseCode, MessageExt},
     tun::{
-        MemoryTunDevice, SmoltcpTunStack, TunDispatch, TunInbound, TunPacket, parse_ip_packet,
-        sniff_packet, sniff_stream,
+        MemoryTunDevice, SmoltcpTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
+        parse_ip_packet, process_system_tcp_packet, sniff_packet, sniff_stream,
+        udp_response_packet,
     },
 };
 use hickory_proto::op::Message;
@@ -57,8 +59,7 @@ fn router_from_options(options: &Options) -> Arc<Router> {
         &options.outbounds,
     ));
     Arc::new(
-        Router::from_options(logger("router"), options.route.clone(), outbound)
-            .expect("router"),
+        Router::from_options(logger("router"), options.route.clone(), outbound).expect("router"),
     )
 }
 
@@ -258,6 +259,86 @@ async fn tun_dispatch_routes_udp_to_direct_outbound() {
     };
     assert_eq!(metadata.network, Network::Udp);
     assert_eq!(payload, b"echo:payload");
+}
+
+#[test]
+fn system_stack_rewrites_tcp_packets_to_local_listener_and_back() {
+    let mut nat = SystemTcpNat::new();
+    let mut packet = ipv4_tcp_packet([10, 0, 0, 2], [93, 184, 216, 34], 49152, 443, b"");
+
+    process_system_tcp_packet(
+        &mut packet,
+        &mut nat,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+        23456,
+    )
+    .expect("rewrite forward packet");
+
+    let forward = parse_ip_packet(&packet).expect("parse rewritten forward");
+    assert_eq!(
+        forward.source.host,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2))
+    );
+    assert_eq!(
+        forward.destination.host,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1))
+    );
+    assert_eq!(forward.destination.port, 23456);
+    let nat_port = forward.source.port;
+    assert_ne!(nat_port, 49152);
+
+    let mut reply = ipv4_tcp_packet([172, 19, 0, 1], [172, 19, 0, 2], 23456, nat_port, b"");
+    process_system_tcp_packet(
+        &mut reply,
+        &mut nat,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+        23456,
+    )
+    .expect("rewrite reverse packet");
+
+    let reverse = parse_ip_packet(&reply).expect("parse rewritten reverse");
+    assert_eq!(
+        reverse.source.host,
+        IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+    );
+    assert_eq!(reverse.source.port, 443);
+    assert_eq!(
+        reverse.destination.host,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+    );
+    assert_eq!(reverse.destination.port, 49152);
+}
+
+#[test]
+fn system_stack_builds_full_udp_response_packet() {
+    let request = ipv4_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 5353, 53, b"query".to_vec());
+    let response = udp_response_packet(
+        &request,
+        SocksAddr {
+            host: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            port: 53,
+        },
+        b"answer",
+    )
+    .expect("build udp response packet");
+
+    let parsed = parse_ip_packet(&response).expect("parse response");
+    assert_eq!(parsed.network, Network::Udp);
+    assert_eq!(parsed.source.host, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    assert_eq!(parsed.source.port, 53);
+    assert_eq!(
+        parsed.destination.host,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
+    );
+    assert_eq!(parsed.destination.port, 5353);
+    assert_eq!(parsed.payload, b"answer");
+    assert_eq!(
+        u16::from_be_bytes([response[2], response[3]]) as usize,
+        response.len()
+    );
+    assert_ne!(u16::from_be_bytes([response[26], response[27]]), 0);
 }
 
 #[test]

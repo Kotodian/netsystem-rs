@@ -1,13 +1,14 @@
 use std::any::Any;
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex};
 
-use hammer_adapter::Inbound;
+use hammer_adapter::{Inbound, PlatformInterface, TunOptions};
 use hammer_core::config::TunInboundOptions;
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::tun::SmoltcpTunStack;
+use crate::tun::{AsyncTunDevice, SmoltcpTunStack, SystemTunStack};
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
@@ -17,6 +18,9 @@ pub struct TunInbound {
     router: Arc<Router>,
     dns_router: Option<Arc<DnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
+    platform: Option<Arc<dyn PlatformInterface>>,
+    tun_fd: Mutex<Option<i32>>,
+    system_stack: Mutex<Option<Arc<SystemTunStack>>>,
 }
 
 impl TunInbound {
@@ -33,6 +37,9 @@ impl TunInbound {
             router,
             dns_router: None,
             outbound: None,
+            platform: None,
+            tun_fd: Mutex::new(None),
+            system_stack: Mutex::new(None),
         }
     }
 
@@ -43,6 +50,7 @@ impl TunInbound {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
+        platform: Arc<dyn PlatformInterface>,
     ) -> Self {
         Self {
             tag: tag.into(),
@@ -51,6 +59,9 @@ impl TunInbound {
             router,
             dns_router: Some(dns_router),
             outbound: Some(outbound),
+            platform: Some(platform),
+            tun_fd: Mutex::new(None),
+            system_stack: Mutex::new(None),
         }
     }
 
@@ -74,6 +85,93 @@ impl TunInbound {
     pub fn mtu(&self) -> u32 {
         self.options.mtu
     }
+
+    fn open_tun(&self) -> Result<(), HammerError> {
+        if self
+            .tun_fd
+            .lock()
+            .expect("TunInbound fd poisoned")
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let Some(platform) = &self.platform else {
+            return Ok(());
+        };
+
+        let options = self.platform_options()?;
+        self.logger
+            .info(format!("opening TUN {}, mtu {}", options.name, options.mtu));
+        let fd = platform.open_tun(options)?;
+        let stack = self.build_system_stack(fd)?;
+        *self.tun_fd.lock().expect("TunInbound fd poisoned") = Some(fd);
+        *self.system_stack.lock().expect("TunInbound stack poisoned") = stack;
+        self.logger.info(format!("opened TUN fd {fd}"));
+        Ok(())
+    }
+
+    fn build_system_stack(&self, fd: i32) -> Result<Option<Arc<SystemTunStack>>, HammerError> {
+        if self.options.stack == "disabled" {
+            self.logger.debug("skip disabled TUN data path");
+            return Ok(None);
+        }
+        if self.options.stack != "system" {
+            return Err(HammerError::internal(format!(
+                "unsupported TUN stack: {}",
+                self.options.stack
+            )));
+        }
+        let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
+            return Ok(None);
+        };
+        let dup_fd = duplicate_fd(fd)?;
+        let mtu = usize::try_from(self.options.mtu)
+            .map_err(|_| HammerError::internal("TUN MTU does not fit in usize"))?;
+        let device = unsafe { AsyncTunDevice::from_fd(dup_fd, mtu)? };
+        Ok(Some(Arc::new(SystemTunStack::new(
+            self.logger.clone(),
+            Arc::clone(&self.router),
+            Arc::clone(dns_router),
+            Arc::clone(outbound),
+            self.tag.clone(),
+            self.options.clone(),
+            device,
+        ))))
+    }
+
+    fn start_system_stack(&self) -> Result<(), HammerError> {
+        let stack = self
+            .system_stack
+            .lock()
+            .expect("TunInbound stack poisoned")
+            .clone();
+        if let Some(stack) = stack {
+            stack.start()?;
+        }
+        Ok(())
+    }
+
+    fn platform_options(&self) -> Result<TunOptions, HammerError> {
+        let mtu = i32::try_from(self.options.mtu)
+            .map_err(|_| HammerError::internal("TUN MTU does not fit in i32"))?;
+        let name = if self.options.interface_name.is_empty() {
+            self.tag.clone()
+        } else {
+            self.options.interface_name.clone()
+        };
+        Ok(TunOptions {
+            name,
+            mtu,
+            address: self.options.address.iter().map(|p| p.0.clone()).collect(),
+            route: self
+                .options
+                .route_address
+                .iter()
+                .map(|p| p.0.clone())
+                .collect(),
+        })
+    }
 }
 
 impl Lifecycle for TunInbound {
@@ -82,14 +180,39 @@ impl Lifecycle for TunInbound {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        if matches!(stage, StartStage::Start) {
+            self.open_tun()?;
+        }
+        if matches!(stage, StartStage::PostStart) {
+            self.start_system_stack()?;
+        }
         Ok(())
     }
 
     fn close(&self) -> Result<(), HammerError> {
+        if let Some(stack) = self
+            .system_stack
+            .lock()
+            .expect("TunInbound stack poisoned")
+            .take()
+        {
+            stack.close();
+        }
+        *self.tun_fd.lock().expect("TunInbound fd poisoned") = None;
         self.logger.debug("close");
         Ok(())
     }
+}
+
+fn duplicate_fd(fd: i32) -> Result<i32, HammerError> {
+    let dup_fd = unsafe { libc::dup(fd) };
+    if dup_fd < 0 {
+        return Err(HammerError::internal(format!(
+            "duplicate TUN fd: {}",
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(dup_fd)
 }
 
 impl Inbound for TunInbound {

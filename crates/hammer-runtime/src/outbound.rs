@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{Outbound, OutboundManager as OutboundManagerTrait};
+use hammer_adapter::{Outbound, OutboundManager as OutboundManagerTrait, PlatformInterface};
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
@@ -9,6 +9,7 @@ use hammer_core::log::Logger;
 use crate::hysteria2::Hysteria2Outbound;
 use crate::impl_logging_lifecycle;
 use crate::outbounds::{BlockOutbound, DirectOutbound, DnsOutbound};
+use crate::socket_protector::SocketProtector;
 
 /// `out.Manager` port. M2 ships an empty registry; concrete outbounds (direct,
 /// hysteria2, block, dns) register themselves in M6/M7.
@@ -32,23 +33,57 @@ impl OutboundManager {
         default_tag: impl Into<String>,
         options: &[OutboundOptions],
     ) -> Self {
+        Self::from_options_with_protector(logger, default_tag, options, SocketProtector::default())
+    }
+
+    pub fn from_options_with_platform(
+        logger: Logger,
+        default_tag: impl Into<String>,
+        options: &[OutboundOptions],
+        platform: Arc<dyn PlatformInterface>,
+    ) -> Self {
+        Self::from_options_with_protector(
+            logger,
+            default_tag,
+            options,
+            SocketProtector::new(platform),
+        )
+    }
+
+    pub(crate) fn from_options_with_protector(
+        logger: Logger,
+        default_tag: impl Into<String>,
+        options: &[OutboundOptions],
+        protector: SocketProtector,
+    ) -> Self {
         let manager = Self::new(logger, default_tag);
         for option in options {
-            manager.register_descriptor(option);
+            manager.register_descriptor_with_protector(option, protector.clone());
         }
         manager
     }
 
     pub fn register_descriptor(&self, option: &OutboundOptions) {
+        self.register_descriptor_with_protector(option, SocketProtector::default());
+    }
+
+    fn register_descriptor_with_protector(
+        &self,
+        option: &OutboundOptions,
+        protector: SocketProtector,
+    ) {
         let descriptor: Arc<dyn Outbound> = match &option.kind {
-            OutboundKind::Hysteria2(o) => Arc::new(Hysteria2Outbound::new(
+            OutboundKind::Hysteria2(o) => Arc::new(Hysteria2Outbound::new_with_protector(
                 self.logger.clone(),
                 option.tag.clone(),
                 o.clone(),
+                protector.clone(),
             )),
-            OutboundKind::Direct(_) => {
-                Arc::new(DirectOutbound::new(self.logger.clone(), option.tag.clone()))
-            }
+            OutboundKind::Direct(_) => Arc::new(DirectOutbound::new_with_protector(
+                self.logger.clone(),
+                option.tag.clone(),
+                protector,
+            )),
             OutboundKind::Block => {
                 Arc::new(BlockOutbound::new(self.logger.clone(), option.tag.clone()))
             }

@@ -29,7 +29,7 @@ pub use inbound::{Inbound, InboundManager};
 pub use network::NetworkManager;
 pub use outbound::{Outbound, OutboundManager, ProxyDatagram, ProxyPacketConn, ProxyStream};
 pub use platform::{
-    DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, WifiState,
+    DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
 pub use registry::{Constructor, Registry, RegistryContext};
 pub use router::Router;

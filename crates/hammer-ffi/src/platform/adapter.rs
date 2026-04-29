@@ -1,14 +1,15 @@
 use std::sync::Arc;
 
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener as AdapterListener,
-    NetworkInterface as AdapterNetworkInterface, PlatformInterface, WifiState as AdapterWifiState,
+    DefaultInterfaceUpdateListener as AdapterListener, NetworkInterface as AdapterNetworkInterface,
+    PlatformInterface, TunOptions as AdapterTunOptions, WifiState as AdapterWifiState,
 };
 use hammer_core::error::CoreError;
 use hammer_core::log::{Level, LogWriter};
 
 use crate::platform::types::{
-    HammerDefaultInterfaceUpdateListener, HammerNetworkInterface, HammerPlatform, HammerWIFIState,
+    HammerDefaultInterfaceUpdateListener, HammerNetworkInterface, HammerPlatform, HammerTunOptions,
+    HammerWIFIState,
 };
 
 /// Thin facade over the Swift-implemented [`HammerPlatform`] callback interface,
@@ -28,6 +29,12 @@ impl PlatformAdapter {
 }
 
 impl PlatformInterface for PlatformAdapter {
+    fn open_tun(&self, options: AdapterTunOptions) -> Result<i32, CoreError> {
+        self.platform
+            .open_tun(options.into())
+            .map_err(into_core_error)
+    }
+
     fn use_platform_auto_detect_interface_control(&self) -> bool {
         self.platform.use_platform_auto_detect_interface_control()
     }
@@ -59,10 +66,7 @@ impl PlatformInterface for PlatformAdapter {
     }
 
     fn get_interfaces(&self) -> Result<Vec<AdapterNetworkInterface>, CoreError> {
-        let iter = self
-            .platform
-            .get_interfaces()
-            .map_err(into_core_error)?;
+        let iter = self.platform.get_interfaces().map_err(into_core_error)?;
         let mut out = Vec::new();
         while iter.has_next() {
             if let Some(item) = iter.next() {
@@ -74,6 +78,17 @@ impl PlatformInterface for PlatformAdapter {
 
     fn read_wifi_state(&self) -> Option<AdapterWifiState> {
         self.platform.read_wifi_state().map(Into::into)
+    }
+}
+
+impl From<AdapterTunOptions> for HammerTunOptions {
+    fn from(value: AdapterTunOptions) -> Self {
+        Self {
+            name: value.name,
+            mtu: value.mtu,
+            address: value.address,
+            route: value.route,
+        }
     }
 }
 

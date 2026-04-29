@@ -4,6 +4,7 @@ use bytes::Bytes;
 use h3::server;
 use hammer_core::error::HammerError;
 use http::Response;
+use tokio::io::AsyncReadExt;
 
 use super::{parse_destination, protocol, server_config};
 
@@ -108,25 +109,32 @@ fn spawn_tcp_echo(connection: quinn::Connection) {
     tokio::spawn(async move {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
             tokio::spawn(async move {
-                let mut data = Vec::new();
-                if recv
-                    .read_to_end(usize::MAX)
-                    .await
-                    .map(|v| data = v)
-                    .is_err()
-                {
+                if protocol::read_tcp_request_header(&mut recv).await.is_err() {
                     return;
                 }
-                let request = match protocol::decode_tcp_request(&data) {
-                    Ok(request) => request,
-                    Err(_) => return,
-                };
-                let mut payload = b"echo:".to_vec();
-                payload.extend_from_slice(&request.payload);
-                let response = protocol::encode_tcp_response(true, "", &payload);
-                if send.write_all(&response).await.is_ok() {
-                    let _ = send.finish();
+                let response = protocol::encode_tcp_response(true, "", b"");
+                if send.write_all(&response).await.is_err() {
+                    return;
                 }
+                let mut prefixed = false;
+                let mut buf = [0_u8; 4096];
+                loop {
+                    let len = match AsyncReadExt::read(&mut recv, &mut buf).await {
+                        Ok(0) => break,
+                        Ok(len) => len,
+                        Err(_) => return,
+                    };
+                    if !prefixed {
+                        prefixed = true;
+                        if send.write_all(b"echo:").await.is_err() {
+                            return;
+                        }
+                    }
+                    if send.write_all(&buf[..len]).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = send.finish();
             });
         }
     });

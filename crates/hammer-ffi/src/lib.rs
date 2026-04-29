@@ -10,9 +10,8 @@ pub use ffi::{
 };
 pub use hammer_core::config::parse_config;
 pub use platform::{
-    HammerDefaultInterfaceUpdateListener, HammerNetworkInterface,
-    HammerNetworkInterfaceIterator, HammerPlatform, HammerSetupOptions, HammerStringIterator,
-    HammerTunOptions, HammerWIFIState,
+    HammerDefaultInterfaceUpdateListener, HammerNetworkInterface, HammerNetworkInterfaceIterator,
+    HammerPlatform, HammerSetupOptions, HammerStringIterator, HammerTunOptions, HammerWIFIState,
 };
 pub use service::HammerService;
 
