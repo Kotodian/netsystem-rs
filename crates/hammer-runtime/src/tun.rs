@@ -34,6 +34,23 @@ const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 pub trait TunDevice: Send + Sync + 'static {
     async fn recv(&self) -> Result<Vec<u8>, HammerError>;
     async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError>;
+    /// Drain up to `max` packets from the device in one go. The default impl
+    /// just calls `recv` once; Apple's batched driver overrides this to
+    /// amortize the recvmsg_x syscall over many packets.
+    async fn recv_batch(&self, max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
+        let _ = max;
+        let packet = self.recv().await?;
+        Ok(vec![packet])
+    }
+    /// Send a batch of packets back to the kernel. Apple's batched driver
+    /// overrides this to coalesce them into one sendmsg_x syscall; everywhere
+    /// else we fall back to a sequential `send` loop.
+    async fn send_batch(&self, packets: Vec<Vec<u8>>) -> Result<(), HammerError> {
+        for packet in packets {
+            self.send(packet).await?;
+        }
+        Ok(())
+    }
     fn close(&self);
 }
 
@@ -1540,69 +1557,99 @@ async fn packet_loop(
     udp_timeout: Duration,
 ) {
     logger.info("system packet loop started");
+    // Pull packets in batches when the underlying device supports it (Apple's
+    // utun driver, currently). On platforms where recv_batch falls back to
+    // single-packet recv() the batch is just `vec![pkt]` and the loop body
+    // degrades to the previous behaviour.
+    const RECV_BATCH_HINT: usize = 256;
+    let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
     loop {
-        let mut packet = match device.recv().await {
-            Ok(packet) => packet,
+        let packets = match device.recv_batch(RECV_BATCH_HINT).await {
+            Ok(packets) => packets,
             Err(err) => {
                 logger.debug(format!("read TUN packet loop stopped: {err}"));
                 return;
             }
         };
-        if packet.is_empty() {
+        if packets.is_empty() {
             tokio::task::yield_now().await;
             continue;
         }
-        let parsed = match parse_ip_packet(&packet) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                logger.trace(format!("ignore unsupported TUN packet: {err}"));
-                continue;
+        tcp_writeback.clear();
+        let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
+        // Pass 1: under one NAT mutex acquisition, rewrite every TCP packet
+        // in the batch and stash UDP packets for sequential post-processing.
+        // The guard is released at the end of this scope before any I/O
+        // await — std::sync::MutexGuard is !Send so this matters for the
+        // tokio multi-thread scheduler.
+        {
+            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
+            for mut packet in packets {
+                if packet.is_empty() {
+                    continue;
+                }
+                let parsed = match parse_ip_packet(&packet) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        logger.trace(format!("ignore unsupported TUN packet: {err}"));
+                        continue;
+                    }
+                };
+                if !is_global_unicast(parsed.destination.host) {
+                    continue;
+                }
+                match parsed.network {
+                    Network::Tcp => {
+                        let Some(route) = routes.for_packet(&packet) else {
+                            logger.debug("missing system TCP route for packet family");
+                            continue;
+                        };
+                        let rewrite_result = process_system_tcp_packet(
+                            &mut packet,
+                            &mut *nat,
+                            route.listener_addr,
+                            route.nat_addr,
+                            route.listener_port,
+                        );
+                        if let Err(err) = rewrite_result {
+                            logger.debug(format!("rewrite system TCP packet: {err}"));
+                            continue;
+                        }
+                        tcp_writeback.push(packet);
+                    }
+                    Network::Udp => {
+                        udp_pending.push((packet, parsed));
+                    }
+                }
             }
-        };
-        if !is_global_unicast(parsed.destination.host) {
-            continue;
         }
-        match parsed.network {
-            Network::Tcp => {
-                let Some(route) = routes.for_packet(&packet) else {
-                    logger.debug("missing system TCP route for packet family");
-                    continue;
-                };
-                let rewrite_result = {
-                    let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
-                    process_system_tcp_packet(
-                        &mut packet,
-                        &mut *nat,
-                        route.listener_addr,
-                        route.nat_addr,
-                        route.listener_port,
-                    )
-                };
-                if let Err(err) = rewrite_result {
-                    logger.debug(format!("rewrite system TCP packet: {err}"));
-                    continue;
-                }
-                if let Err(err) = device.send(packet).await {
-                    logger.debug(format!("write system TCP packet: {err}"));
-                }
+        // Pass 2: send the rewritten TCP batch in one syscall (Apple) or
+        // sequentially (other targets, via the default send_batch impl).
+        if !tcp_writeback.is_empty() {
+            let staged = std::mem::take(&mut tcp_writeback);
+            if let Err(err) = device.send_batch(staged).await {
+                logger.debug(format!("write system TCP packets: {err}"));
             }
-            Network::Udp => {
-                if let Err(err) = handle_system_udp_packet(
-                    logger.clone(),
-                    Arc::clone(&router),
-                    Arc::clone(&dns_router),
-                    Arc::clone(&outbound),
-                    inbound_tag.clone(),
-                    Arc::clone(&device),
-                    Arc::clone(&udp_flows),
-                    udp_timeout,
-                    packet,
-                    parsed,
-                )
-                .await
-                {
-                    logger.debug(format!("handle system UDP packet: {err}"));
-                }
+        }
+        // Pass 3: UDP / DNS handling stays sequential — these awaits would
+        // serialise the loop anyway, and the volume is low enough that
+        // batching them would not pay for itself.
+        for (packet, parsed) in udp_pending {
+            if let Err(err) = handle_system_udp_packet(
+                logger.clone(),
+                Arc::clone(&router),
+                Arc::clone(&dns_router),
+                Arc::clone(&outbound),
+                inbound_tag.clone(),
+                Arc::clone(&device),
+                Arc::clone(&udp_flows),
+                udp_timeout,
+                packet,
+                parsed,
+            )
+            .await
+            {
+                logger.debug(format!("handle system UDP packet: {err}"));
             }
         }
     }

@@ -145,21 +145,32 @@ impl RxState {
 }
 
 struct TxState {
-    /// Reusable AF prefix scratch (one slot only — sends are still 1:1 here;
-    /// batching the write side adds latency without helping throughput when
-    /// each packet has already been freshly NAT-rewritten).
-    header: [u8; PACKET_HEADER_LEN],
-    iov: [iovec; 2],
-    msg: MsgHdrX,
+    /// One AF prefix per slot (rewritten per call to match the IP family).
+    headers: Vec<[u8; PACKET_HEADER_LEN]>,
+    /// Two iovecs per slot: header + caller-supplied packet payload.
+    iovecs: Vec<[iovec; 2]>,
+    msgs: Vec<MsgHdrX>,
 }
 
 impl TxState {
-    fn new() -> Self {
-        Self {
-            header: [0u8; PACKET_HEADER_LEN],
-            iov: [empty_iovec(); 2],
-            msg: empty_msghdr_x(),
+    fn new(batch_size: usize) -> Self {
+        let mut state = Self {
+            headers: vec![[0u8; PACKET_HEADER_LEN]; batch_size],
+            iovecs: vec![[empty_iovec(); 2]; batch_size],
+            msgs: vec![empty_msghdr_x(); batch_size],
+        };
+        // Header iovec slots point at our owned `headers[i]` for the lifetime
+        // of TxState; the payload iovec is rewritten per call. msg_iov /
+        // msg_iovlen are stable so we set them up once.
+        for i in 0..batch_size {
+            state.iovecs[i][0] = iovec {
+                iov_base: state.headers[i].as_mut_ptr().cast::<c_void>(),
+                iov_len: PACKET_HEADER_LEN,
+            };
+            state.msgs[i].msg_iov = state.iovecs[i].as_mut_ptr();
+            state.msgs[i].msg_iovlen = 2;
         }
+        state
     }
 }
 
@@ -216,7 +227,7 @@ impl AppleTunDevice {
             batch_size,
             closed: AtomicBool::new(false),
             rx: Mutex::new(RxState::new(batch_size, mtu)),
-            tx: Mutex::new(TxState::new()),
+            tx: Mutex::new(TxState::new(batch_size)),
         }))
     }
 
@@ -253,51 +264,50 @@ impl AppleTunDevice {
         Ok(n)
     }
 
-    fn try_send(&self, state: &mut TxState, packet: &[u8]) -> io::Result<()> {
-        let header = match packet.first().map(|b| b >> 4) {
-            Some(4) => PF_INET_HEADER,
-            Some(6) => PF_INET6_HEADER,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "unsupported IP version for utun write",
-                ));
-            }
-        };
-        state.header = header;
-        state.iov[0] = iovec {
-            iov_base: state.header.as_mut_ptr().cast::<c_void>(),
-            iov_len: PACKET_HEADER_LEN,
-        };
-        // sendmsg_x reads from this buffer; the cast through *mut c_void is
-        // required by libc::iovec, but the kernel will not mutate it.
-        state.iov[1] = iovec {
-            iov_base: packet.as_ptr() as *mut c_void,
-            iov_len: packet.len(),
-        };
-        state.msg = MsgHdrX {
-            msg_name: std::ptr::null_mut(),
-            msg_namelen: 0,
-            msg_iov: state.iov.as_mut_ptr(),
-            msg_iovlen: 2,
-            msg_control: std::ptr::null_mut(),
-            msg_controllen: 0,
-            msg_flags: 0,
-            msg_datalen: 0,
-        };
+    /// Issue one `sendmsg_x` for `chunk_len` packets starting at index 0 of
+    /// `state`. Returns the number of mmsghdrs the kernel actually consumed
+    /// (may be < chunk_len on partial sends).
+    fn try_send_chunk(&self, state: &mut TxState, chunk_len: usize) -> io::Result<usize> {
+        if chunk_len == 0 {
+            return Ok(0);
+        }
         let n = unsafe {
             libc::syscall(
                 SYS_SENDMSG_X,
                 self.fd.get_ref().as_raw_fd(),
-                (&mut state.msg as *mut MsgHdrX).cast::<c_void>(),
-                1 as c_int,
+                state.msgs.as_mut_ptr(),
+                chunk_len as c_int,
                 libc::MSG_DONTWAIT,
             )
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(n as usize)
+    }
+
+    /// Populate `chunk_len` slots in `state` from `packets[start..]`. Skips
+    /// packets whose IP version we cannot identify, returning how many were
+    /// actually staged.
+    fn stage_send_chunk(state: &mut TxState, packets: &[Vec<u8>], start: usize) -> usize {
+        let mut staged = 0;
+        for packet in packets.iter().skip(start) {
+            if staged == state.headers.len() {
+                break;
+            }
+            let header = match packet.first().map(|b| b >> 4) {
+                Some(4) => PF_INET_HEADER,
+                Some(6) => PF_INET6_HEADER,
+                _ => continue,
+            };
+            state.headers[staged] = header;
+            state.iovecs[staged][1] = iovec {
+                iov_base: packet.as_ptr() as *mut c_void,
+                iov_len: packet.len(),
+            };
+            staged += 1;
+        }
+        staged
     }
 }
 
@@ -349,29 +359,100 @@ impl TunDevice for AppleTunDevice {
     }
 
     async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+        self.send_batch(vec![packet]).await
+    }
+
+    async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(HammerError::internal("apple TUN closed"));
             }
+            // Drain whatever the previous syscall buffered.
+            {
+                let mut state = self.rx.lock().expect("apple TUN rx poisoned");
+                if !state.pending.is_empty() {
+                    return Ok(state.pending.drain(..).collect());
+                }
+            }
             let mut guard = self
                 .fd
-                .writable()
+                .readable()
                 .await
-                .map_err(|err| HammerError::internal(format!("apple TUN writable: {err}")))?;
+                .map_err(|err| HammerError::internal(format!("apple TUN readable: {err}")))?;
             let result = {
-                let mut state = self.tx.lock().expect("apple TUN tx poisoned");
-                self.try_send(&mut state, &packet)
+                let mut state = self.rx.lock().expect("apple TUN rx poisoned");
+                self.refill_rx(&mut state)
             };
             match result {
-                Ok(()) => return Ok(()),
+                Ok(_) => {
+                    let mut state = self.rx.lock().expect("apple TUN rx poisoned");
+                    if state.pending.is_empty() {
+                        guard.clear_ready();
+                    } else {
+                        return Ok(state.pending.drain(..).collect());
+                    }
+                }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     guard.clear_ready();
                 }
                 Err(err) => {
-                    return Err(HammerError::internal(format!("sendmsg_x: {err}")));
+                    return Err(HammerError::internal(format!("recvmsg_x: {err}")));
                 }
             }
         }
+    }
+
+    async fn send_batch(&self, packets: Vec<Vec<u8>>) -> Result<(), HammerError> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        // Filter out anything we can't tag with an IP family up front so the
+        // chunk loop below can skip past completed slots without skipping
+        // around invalid entries.
+        let valid: Vec<Vec<u8>> = packets
+            .into_iter()
+            .filter(|p| matches!(p.first().map(|b| b >> 4), Some(4) | Some(6)))
+            .collect();
+        if valid.is_empty() {
+            return Ok(());
+        }
+
+        let mut offset = 0;
+        while offset < valid.len() {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(HammerError::internal("apple TUN closed"));
+                }
+                let mut guard = self
+                    .fd
+                    .writable()
+                    .await
+                    .map_err(|err| HammerError::internal(format!("apple TUN writable: {err}")))?;
+                let result = {
+                    let mut state = self.tx.lock().expect("apple TUN tx poisoned");
+                    let staged = Self::stage_send_chunk(&mut state, &valid, offset);
+                    self.try_send_chunk(&mut state, staged).map(|n| (n, staged))
+                };
+                match result {
+                    Ok((n_sent, _staged)) => {
+                        if n_sent == 0 {
+                            // Nothing was consumed — re-arm and try again.
+                            guard.clear_ready();
+                            continue;
+                        }
+                        offset += n_sent;
+                        break;
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        guard.clear_ready();
+                    }
+                    Err(err) => {
+                        return Err(HammerError::internal(format!("sendmsg_x: {err}")));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn close(&self) {
