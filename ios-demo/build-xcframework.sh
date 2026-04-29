@@ -78,9 +78,15 @@ xcodebuild -create-xcframework \
 
 echo "==> publish Swift glue"
 mkdir -p "${BUILD_DIR}/Sources/Hammer"
-# uniffi emits `import hammerFFI` based on the udl namespace; rewrite to match
-# the framework module name we ship (Hammer).
-sed -i.bak 's/import hammerFFI/import Hammer/g' "${GENERATED_DIR}/hammer.swift"
+# uniffi emits `import hammerFFI` (and `canImport(hammerFFI)`) based on the udl
+# namespace; rewrite both to the framework module name we ship (Hammer). Using
+# word boundaries leaves the ffi_hammer_* C symbol names alone.
+#   - `[[:<:]]hammerFFI[[:>:]]` works on BSD sed (macOS), `\bhammerFFI\b` on GNU.
+#   - We branch on uname so the script runs on both build hosts.
+case "$(uname -s)" in
+  Darwin) sed -i.bak -E 's/[[:<:]]hammerFFI[[:>:]]/Hammer/g' "${GENERATED_DIR}/hammer.swift" ;;
+  *)      sed -i.bak -E 's/\bhammerFFI\b/Hammer/g'         "${GENERATED_DIR}/hammer.swift" ;;
+esac
 rm "${GENERATED_DIR}/hammer.swift.bak"
 mv "${GENERATED_DIR}/hammer.swift" "${BUILD_DIR}/Sources/Hammer/hammer.swift"
 
