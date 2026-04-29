@@ -274,10 +274,13 @@ fn hysteria2_bbr_profiles_match_hysteria_go_gains() {
 fn hysteria2_bbr_factory_builds_hysteria_controller() {
     let factory = Arc::new(HysteriaBbrConfig::new(BbrProfile::Aggressive, 1200));
     let controller = quinn::congestion::ControllerFactory::build(factory, Instant::now(), 1200);
+    // Without a CongestionControlHandle we hand the connection straight to
+    // quinn's stock BBR controller — never the dynamic wrapper that would
+    // otherwise fall through to the brutal CC path.
     assert!(
-        controller
+        !controller
             .into_any()
-            .is::<hammer_runtime::hysteria2::bbr::HysteriaBbr>()
+            .is::<hammer_runtime::hysteria2::bbr::DynamicHysteriaController>()
     );
 }
 

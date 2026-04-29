@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use quinn::congestion::{
-    AckedPacketInfo, Controller, ControllerFactory, ControllerMetrics, LostPacketInfo,
+    AckedPacketInfo, BbrConfig, Controller, ControllerFactory, ControllerMetrics, LostPacketInfo,
 };
 use quinn::{ClientConfig, TransportConfig};
 
@@ -112,19 +112,18 @@ impl HysteriaBbrConfig {
 }
 
 impl ControllerFactory for HysteriaBbrConfig {
-    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let mtu = current_mtu.max(self.initial_mtu).max(1200);
         if let Some((handle, brutal_debug)) = &self.dynamic {
             return Box::new(DynamicHysteriaController::new(
                 self.profile,
-                current_mtu.max(self.initial_mtu).max(1200),
+                mtu,
                 handle.clone(),
                 *brutal_debug,
             ));
         }
-        Box::new(HysteriaBbr::new(
-            self.profile,
-            current_mtu.max(self.initial_mtu).max(1200),
-        ))
+        let bbr_config: Arc<BbrConfig> = Arc::new(BbrConfig::default());
+        bbr_config.build(now, mtu)
     }
 }
 
@@ -147,11 +146,15 @@ impl CongestionControlHandle {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct DynamicHysteriaController {
-    bbr: HysteriaBbr,
+    /// Heap-allocated controller for the BBR side. Was the in-tree
+    /// `HysteriaBbr`; we switched to quinn's stock BBR after measuring our
+    /// simplified estimator pin cwnd at the initial window (single-packet
+    /// `bytes/rtt` bandwidth samples never let target_cwnd exceed one MTU).
+    bbr: Box<dyn Controller>,
     brutal: BrutalController,
     handle: CongestionControlHandle,
+    profile: BbrProfile,
 }
 
 impl DynamicHysteriaController {
@@ -162,15 +165,21 @@ impl DynamicHysteriaController {
         brutal_debug: bool,
     ) -> Self {
         Self {
-            bbr: HysteriaBbr::new(profile, mtu),
+            bbr: build_quinn_bbr(mtu),
             brutal: BrutalController::new(mtu, brutal_debug),
             handle,
+            profile,
         }
     }
 
     fn using_brutal(&self) -> bool {
         self.handle.brutal_bps() > 0
     }
+}
+
+fn build_quinn_bbr(mtu: u16) -> Box<dyn Controller> {
+    let config: Arc<BbrConfig> = Arc::new(BbrConfig::default());
+    config.build(Instant::now(), mtu)
 }
 
 impl Controller for DynamicHysteriaController {
@@ -289,7 +298,12 @@ impl Controller for DynamicHysteriaController {
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(self.clone())
+        Box::new(Self {
+            bbr: self.bbr.clone_box(),
+            brutal: self.brutal.clone(),
+            handle: self.handle.clone(),
+            profile: self.profile,
+        })
     }
 
     fn initial_window(&self) -> u64 {
