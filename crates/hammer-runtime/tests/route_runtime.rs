@@ -1,8 +1,11 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use hammer_adapter::{ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata};
+use hammer_adapter::{
+    ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata, SocksAddr,
+};
 use hammer_core::config::{self, DomainStrategy, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
@@ -45,7 +48,7 @@ fn router_from_options(options: &Options) -> Router {
         options.route.final_.clone(),
         &options.outbounds,
     ));
-    Router::from_options(logger("router"), options.route.clone(), outbound)
+    Router::from_options(logger("router"), options.route.clone(), outbound).expect("router")
 }
 
 #[test]
@@ -81,6 +84,194 @@ fn router_rejects_quic_with_default_method() {
             method: "default".to_owned()
         }
     );
+}
+
+fn options_with_user_rules(rules_block: &str) -> Options {
+    let cfg = format!(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+sniff = true
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "direct"
+{rules_block}
+"#
+    );
+    config::parse_config(&cfg).expect("parse config")
+}
+
+fn metadata_with_domain(domain: &str) -> RouteMetadata {
+    RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        protocol: "https".to_owned(),
+        domain: Some(domain.to_owned()),
+        ..Default::default()
+    }
+}
+
+fn metadata_with_destination(host: IpAddr) -> RouteMetadata {
+    RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        protocol: "https".to_owned(),
+        destination: Some(SocksAddr { host, port: 443 }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn router_routes_domain_suffix_match_to_named_outbound() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut hit = metadata_with_domain("www.google.com");
+    assert_eq!(
+        router.match_route(&mut hit).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+
+    let mut miss = metadata_with_domain("baidu.com");
+    assert_eq!(
+        router.match_route(&mut miss).expect("match"),
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_domain_suffix_does_not_match_partial_label() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    // "evilgoogle.com" must not be treated as a subdomain of "google.com".
+    let mut metadata = metadata_with_domain("evilgoogle.com");
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_routes_ipv4_cidr_match_to_named_outbound() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\nip_cidr = [\"10.0.0.0/8\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut hit = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)));
+    assert_eq!(
+        router.match_route(&mut hit).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+
+    let mut miss = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
+    assert_eq!(
+        router.match_route(&mut miss).expect("match"),
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_routes_ipv6_cidr_match_to_named_outbound() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\nip_cidr = [\"2001:db8::/32\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut hit = metadata_with_destination(IpAddr::V6(
+        "2001:db8:1234::1".parse::<Ipv6Addr>().unwrap(),
+    ));
+    assert_eq!(
+        router.match_route(&mut hit).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_combines_domain_and_ip_cidr_with_and_semantics() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\nip_cidr = [\"8.8.8.8/32\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut both = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        protocol: "https".to_owned(),
+        domain: Some("dns.google.com".to_owned()),
+        destination: Some(SocksAddr {
+            host: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            port: 443,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        router.match_route(&mut both).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+
+    // Domain matches but IP doesn't → AND fails, falls through to default.
+    let mut domain_only = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        protocol: "https".to_owned(),
+        domain: Some("dns.google.com".to_owned()),
+        destination: Some(SocksAddr {
+            host: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            port: 443,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        router.match_route(&mut domain_only).expect("match"),
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_rejects_invalid_ip_cidr_at_construction() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\nip_cidr = [\"not-a-cidr\"]\noutbound = \"hysteria2\"\n",
+    );
+    let outbound = Arc::new(OutboundManager::from_options(
+        logger("outbound"),
+        opts.route.final_.clone(),
+        &opts.outbounds,
+    ));
+    let err = match Router::from_options(logger("router"), opts.route.clone(), outbound) {
+        Ok(_) => panic!("invalid CIDR should fail router construction"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("ip_cidr"), "error = {err}");
 }
 
 #[test]

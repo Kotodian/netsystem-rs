@@ -204,6 +204,45 @@ fn parse_config_rejects_block_quic_without_sniff() {
 }
 
 #[test]
+fn parse_config_appends_user_route_rules_after_tun_rules() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\nip_cidr = [\"8.8.8.8/32\"]\noutbound = \"hysteria2\"\n"
+    );
+    let options = config::parse_config(&cfg).expect("parse");
+    assert_eq!(
+        options.route.rules.len(),
+        6,
+        "expected 5 tun rules + 1 user rule"
+    );
+    let user = &options.route.rules[5].default_options;
+    assert_eq!(user.domain_suffix, vec!["google.com".to_owned()]);
+    assert_eq!(user.ip_cidr, vec!["8.8.8.8/32".to_owned()]);
+    let route = match &user.action {
+        RuleActionKind::Route(o) => o,
+        _ => panic!("user rule action is not Route"),
+    };
+    assert_eq!(route.outbound, "hysteria2");
+}
+
+#[test]
+fn parse_config_rejects_user_rule_without_outbound() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted rule without outbound");
+    let msg = err.to_string();
+    assert!(msg.contains("outbound is required"), "error = {msg:?}");
+}
+
+#[test]
+fn parse_config_rejects_user_rule_without_any_matcher() {
+    let cfg = format!("{MINIMAL_CONFIG}\n[[route.rules]]\noutbound = \"hysteria2\"\n");
+    let err = config::parse_config(&cfg).expect_err("accepted rule without matcher");
+    let msg = err.to_string();
+    assert!(msg.contains("requires at least one matcher"), "error = {msg:?}");
+}
+
+#[test]
 fn format_config_round_trips_and_strips_unknown() {
     let formatted = config::format_config(MINIMAL_CONFIG).expect("format");
     assert!(!formatted.is_empty());

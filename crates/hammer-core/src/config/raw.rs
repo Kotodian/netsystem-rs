@@ -173,12 +173,33 @@ pub struct RawRouteConfig {
     pub final_: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_detect_interface: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RawRouteRule>,
 }
 
 impl RawRouteConfig {
     fn is_default(&self) -> bool {
         *self == RawRouteConfig::default()
     }
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RawRouteRule {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_suffix: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_keyword: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ip_cidr: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outbound: String,
 }
 
 fn is_false(v: &bool) -> bool {

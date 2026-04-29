@@ -56,11 +56,10 @@ fn router_from_options(options: &Options) -> Arc<Router> {
         options.route.final_.clone(),
         &options.outbounds,
     ));
-    Arc::new(Router::from_options(
-        logger("router"),
-        options.route.clone(),
-        outbound,
-    ))
+    Arc::new(
+        Router::from_options(logger("router"), options.route.clone(), outbound)
+            .expect("router"),
+    )
 }
 
 fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
@@ -77,11 +76,10 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
         final_: final_outbound.to_owned(),
         ..options.route.clone()
     };
-    let router = Arc::new(Router::from_options(
-        logger("router"),
-        route_options,
-        Arc::clone(&outbound),
-    ));
+    let router = Arc::new(
+        Router::from_options(logger("router"), route_options, Arc::clone(&outbound))
+            .expect("router"),
+    );
     let dns_transport = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
     dns_transport.insert(Arc::new(FixedDnsTransport));
     let dns_router = Arc::new(DnsRouter::new_with_manager(

@@ -109,7 +109,7 @@ impl Service {
             new_logger(&log_factory, "router"),
             options.route.clone(),
             Arc::clone(&outbound),
-        ));
+        )?);
         let inbound = Arc::new(InboundManager::from_options_with_runtime(
             new_logger(&log_factory, "inbound"),
             &options.inbounds,

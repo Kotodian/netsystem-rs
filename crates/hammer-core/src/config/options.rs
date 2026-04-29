@@ -183,6 +183,10 @@ pub struct Rule {
 pub struct DefaultRule {
     pub inbound: Vec<String>,
     pub protocol: Vec<String>,
+    pub domain: Vec<String>,
+    pub domain_suffix: Vec<String>,
+    pub domain_keyword: Vec<String>,
+    pub ip_cidr: Vec<String>,
     pub action: RuleActionKind,
 }
 
@@ -193,6 +197,7 @@ pub enum RuleActionKind {
     Reject(RejectActionOptions),
     Resolve(ResolveActionOptions),
     RouteOptions(RouteOptionsActionOptions),
+    Route(RouteActionOptions),
 }
 
 impl Default for RuleActionKind {
@@ -209,8 +214,14 @@ impl RuleActionKind {
             RuleActionKind::Reject(_) => "reject",
             RuleActionKind::Resolve(_) => "resolve",
             RuleActionKind::RouteOptions(_) => "route-options",
+            RuleActionKind::Route(_) => "route",
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteActionOptions {
+    pub outbound: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

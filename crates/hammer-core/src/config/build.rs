@@ -25,7 +25,8 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         raw_tun.id.clone()
     };
     let tun_options = build_tun_options(&raw_tun)?;
-    let tun_rules = derive_tun_route_rules(&raw_tun, &tun_id)?;
+    let mut rules = derive_tun_route_rules(&raw_tun, &tun_id)?;
+    rules.extend(build_user_rules(&raw_route.rules)?);
 
     let (hysteria_options, hysteria_id) = build_hysteria_options(raw_hysteria)?;
 
@@ -40,7 +41,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     let route_options = RouteOptions {
         final_: route_final,
         auto_detect_interface: auto_detect,
-        rules: tun_rules,
+        rules,
         default_domain_resolver: Some(DomainResolveOptions {
             server: dns_id(&raw_dns).to_owned(),
         }),
@@ -384,8 +385,8 @@ fn tun_rule(tun_tag: &str, action: RuleActionKind) -> Rule {
     Rule {
         default_options: DefaultRule {
             inbound: vec![tun_tag.to_owned()],
-            protocol: Vec::new(),
             action,
+            ..Default::default()
         },
     }
 }
@@ -393,9 +394,48 @@ fn tun_rule(tun_tag: &str, action: RuleActionKind) -> Rule {
 fn protocol_rule(protocol: &str, action: RuleActionKind) -> Rule {
     Rule {
         default_options: DefaultRule {
-            inbound: Vec::new(),
             protocol: vec![protocol.to_owned()],
             action,
+            ..Default::default()
         },
     }
+}
+
+fn build_user_rules(raw: &[RawRouteRule]) -> Result<Vec<Rule>, HammerError> {
+    raw.iter()
+        .enumerate()
+        .map(|(idx, raw)| build_user_rule(idx, raw))
+        .collect()
+}
+
+fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> {
+    if raw.outbound.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "route.rules[{idx}].outbound is required",
+        )));
+    }
+    let has_filter = !raw.inbound.is_empty()
+        || !raw.protocol.is_empty()
+        || !raw.domain.is_empty()
+        || !raw.domain_suffix.is_empty()
+        || !raw.domain_keyword.is_empty()
+        || !raw.ip_cidr.is_empty();
+    if !has_filter {
+        return Err(HammerError::config_validation(format!(
+            "route.rules[{idx}] requires at least one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
+        )));
+    }
+    Ok(Rule {
+        default_options: DefaultRule {
+            inbound: raw.inbound.clone(),
+            protocol: raw.protocol.clone(),
+            domain: raw.domain.clone(),
+            domain_suffix: raw.domain_suffix.clone(),
+            domain_keyword: raw.domain_keyword.clone(),
+            ip_cidr: raw.ip_cidr.clone(),
+            action: RuleActionKind::Route(RouteActionOptions {
+                outbound: raw.outbound.clone(),
+            }),
+        },
+    })
 }
