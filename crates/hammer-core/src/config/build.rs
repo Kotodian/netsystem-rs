@@ -1,3 +1,4 @@
+#[cfg(feature = "wireguard")]
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -7,18 +8,29 @@ use crate::error::HammerError;
 
 use super::options::constants as C;
 use super::options::*;
+#[cfg(feature = "wireguard")]
+use super::parse::{parse_base64_key, parse_ipnet_list, parse_socket_addr};
 use super::parse::{
-    build_network_list, parse_base64_key, parse_domain_strategy, parse_ipnet_list,
-    parse_optional_duration, parse_optional_port, parse_prefix_list, parse_socket_addr,
+    build_network_list, parse_domain_strategy, parse_optional_duration, parse_optional_port,
+    parse_prefix_list,
 };
 use super::raw::*;
 
 pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
+    #[cfg(feature = "wireguard")]
     let RawConfig {
         log: raw_log,
         tun: raw_tun,
         hysteria2: raw_hysteria,
         endpoints: raw_endpoints,
+        dns: raw_dns,
+        route: raw_route,
+    } = raw;
+    #[cfg(not(feature = "wireguard"))]
+    let RawConfig {
+        log: raw_log,
+        tun: raw_tun,
+        hysteria2: raw_hysteria,
         dns: raw_dns,
         route: raw_route,
     } = raw;
@@ -34,6 +46,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
 
     let (hysteria_options, hysteria_id) = build_hysteria_options(raw_hysteria)?;
 
+    #[cfg(feature = "wireguard")]
     let endpoints = build_endpoints(raw_endpoints)?;
 
     let route_final = if raw_route.final_.is_empty() {
@@ -66,6 +79,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             kind: InboundKind::Tun(tun_options),
         }],
         outbounds: build_outbounds(hysteria_options, hysteria_id),
+        #[cfg(feature = "wireguard")]
         endpoints,
         route: route_options,
     })
@@ -428,6 +442,7 @@ fn build_user_rules(raw: &[RawRouteRule]) -> Result<Vec<Rule>, HammerError> {
         .collect()
 }
 
+#[cfg(feature = "wireguard")]
 fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, HammerError> {
     raw.into_iter()
         .enumerate()
@@ -437,6 +452,7 @@ fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, HammerError> 
         .collect()
 }
 
+#[cfg(feature = "wireguard")]
 fn build_wireguard_endpoint(
     idx: usize,
     mut raw: RawWireguardEndpoint,
@@ -483,6 +499,7 @@ fn build_wireguard_endpoint(
     })
 }
 
+#[cfg(feature = "wireguard")]
 fn build_wireguard_peer(
     endpoint_idx: usize,
     peer_idx: usize,

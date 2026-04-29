@@ -185,6 +185,7 @@ fn need_wifi_state_starts_false_and_update_does_not_panic() {
 /// lifecycles. Until commit 4 the endpoint is a placeholder, so we just need
 /// it to participate in start/close without throwing — proves the EndpointManager
 /// from_options wiring + service plumbing are correct.
+#[cfg(feature = "wireguard")]
 #[test]
 fn service_starts_with_wireguard_endpoint_scaffold() {
     const PLACEHOLDER_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";

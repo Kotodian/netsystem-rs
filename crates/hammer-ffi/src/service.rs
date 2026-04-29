@@ -88,11 +88,20 @@ impl HammerService {
             &log_factory,
             "certificate-provider",
         )));
-        let endpoint = Arc::new(EndpointManager::from_options_with_platform(
-            new_logger(&log_factory, "endpoint"),
-            &options.endpoints,
-            Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
-        )?);
+        let endpoint = {
+            #[cfg(feature = "wireguard")]
+            {
+                Arc::new(EndpointManager::from_options_with_platform(
+                    new_logger(&log_factory, "endpoint"),
+                    &options.endpoints,
+                    Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
+                )?)
+            }
+            #[cfg(not(feature = "wireguard"))]
+            {
+                Arc::new(EndpointManager::new(new_logger(&log_factory, "endpoint")))
+            }
+        };
         let connection = Arc::new(ConnectionManager::new(new_logger(
             &log_factory,
             "connection",

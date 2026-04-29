@@ -1,3 +1,4 @@
+#[cfg(feature = "wireguard")]
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ pub struct Options {
     pub dns: DnsOptions,
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
+    #[cfg(feature = "wireguard")]
     pub endpoints: Vec<Endpoint>,
     pub route: RouteOptions,
 }
@@ -82,12 +84,14 @@ pub enum OutboundKind {
 /// participate in the lifecycle alongside outbounds. Mirrors the sing-box
 /// 1.11+ endpoint concept: `Endpoint = Outbound + Lifecycle` (see
 /// `crates/hammer-adapter/src/endpoint.rs`).
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub tag: String,
     pub kind: EndpointKind,
 }
 
+#[cfg(feature = "wireguard")]
 impl Endpoint {
     pub fn type_name(&self) -> &'static str {
         match &self.kind {
@@ -96,11 +100,13 @@ impl Endpoint {
     }
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointKind {
     Wireguard(WireguardEndpointOptions),
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardEndpointOptions {
     /// Static private key (Curve25519, 32 bytes).
@@ -114,6 +120,7 @@ pub struct WireguardEndpointOptions {
     pub peers: Vec<WireguardPeerOptions>,
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardPeerOptions {
     /// Peer static public key (Curve25519, 32 bytes).
@@ -333,6 +340,7 @@ pub mod constants {
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
+    #[cfg(feature = "wireguard")]
     pub const TYPE_WIREGUARD: &str = "wireguard";
 
     pub const PROTOCOL_DNS: &str = "dns";
@@ -351,6 +359,7 @@ pub mod constants {
     pub const DEFAULT_DNS_PATH: &str = "/dns-query";
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
     /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
+    #[cfg(feature = "wireguard")]
     pub const DEFAULT_WIREGUARD_MTU: u32 = 1408;
     pub const DNS_TYPE_HOSTS: &str = "hosts";
     pub const DNS_TYPE_LOCAL: &str = "local";

@@ -7,6 +7,12 @@ publish.workspace = true
 [lib]
 name = "hammer_runtime"
 
+[features]
+default = []
+# Enables the WireGuard endpoint module. Pulls in the matching feature in
+# hammer-core. Off by default to keep the iOS xcframework slim.
+wireguard = ["hammer-core/wireguard"]
+
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }

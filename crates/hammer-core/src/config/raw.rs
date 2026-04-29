@@ -9,6 +9,7 @@ pub struct RawConfig {
     pub tun: RawTunConfig,
     #[serde(default, skip_serializing_if = "RawHysteria2Config::is_default")]
     pub hysteria2: RawHysteria2Config,
+    #[cfg(feature = "wireguard")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<RawEndpoint>,
     #[serde(default, skip_serializing_if = "RawDnsConfig::is_default")]
@@ -152,12 +153,14 @@ impl RawHysteria2Obfs {
 /// Outer endpoint variant — sing-box style `[[endpoints]]` entries with a
 /// `type` discriminator. Adding a new endpoint protocol (e.g. tailscale) means
 /// adding a new variant here without breaking existing TOML files.
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
 pub enum RawEndpoint {
     Wireguard(RawWireguardEndpoint),
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RawWireguardEndpoint {
@@ -175,6 +178,7 @@ pub struct RawWireguardEndpoint {
     pub peers: Vec<RawWireguardPeer>,
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RawWireguardPeer {

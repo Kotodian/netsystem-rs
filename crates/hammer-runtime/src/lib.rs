@@ -37,6 +37,7 @@ mod socket_protector;
 mod tls_support;
 pub mod tun;
 mod tun_inbound;
+#[cfg(feature = "wireguard")]
 mod wireguard;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]

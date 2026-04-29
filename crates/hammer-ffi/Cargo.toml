@@ -11,6 +11,12 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # The uniffi-bindgen entrypoint lives in `crates/hammer-uniffi-bindgen` so the
 # `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
+[features]
+default = []
+# Enables the WireGuard endpoint stack across hammer-core + hammer-runtime.
+# Off by default; opt in at xcframework build time with `--features wireguard`.
+wireguard = ["hammer-core/wireguard", "hammer-runtime/wireguard"]
+
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }

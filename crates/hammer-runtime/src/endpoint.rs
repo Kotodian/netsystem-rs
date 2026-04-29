@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{Endpoint, EndpointManager as EndpointManagerTrait, PlatformInterface};
+#[cfg(feature = "wireguard")]
+use hammer_adapter::PlatformInterface;
+use hammer_adapter::{Endpoint, EndpointManager as EndpointManagerTrait};
+#[cfg(feature = "wireguard")]
 use hammer_core::config::{Endpoint as EndpointOptions, EndpointKind};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
+#[cfg(feature = "wireguard")]
 use crate::wireguard::WireguardEndpoint;
 
 pub struct EndpointManager {
@@ -22,6 +26,7 @@ impl EndpointManager {
         }
     }
 
+    #[cfg(feature = "wireguard")]
     pub fn from_options(
         logger: Logger,
         options: &[EndpointOptions],
@@ -29,6 +34,7 @@ impl EndpointManager {
         Self::build(logger, options, None)
     }
 
+    #[cfg(feature = "wireguard")]
     pub fn from_options_with_platform(
         logger: Logger,
         options: &[EndpointOptions],
@@ -37,6 +43,7 @@ impl EndpointManager {
         Self::build(logger, options, Some(platform))
     }
 
+    #[cfg(feature = "wireguard")]
     fn build(
         logger: Logger,
         options: &[EndpointOptions],
