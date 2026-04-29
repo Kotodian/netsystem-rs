@@ -1,9 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hammer_core::error::HammerError;
-use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_core::log::Logger;
 use tokio::sync::Notify;
 
 /// `runtime/service/pause` PauseManager port. Two independent pause sources
@@ -92,36 +89,6 @@ impl PauseManager {
 impl Default for PauseManager {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Stand-in lifecycle from M1 — kept temporarily so Service still has 11
-/// participants while real managers are introduced one-by-one. Will be deleted
-/// in the same commit that finishes wiring the real OutboundManager etc.
-pub struct StubManager {
-    name: &'static str,
-    logger: Logger,
-}
-
-impl StubManager {
-    pub fn new(name: &'static str, logger: Logger) -> Self {
-        Self { name, logger }
-    }
-}
-
-impl Lifecycle for StubManager {
-    fn name(&self) -> &str {
-        self.name
-    }
-
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
-        Ok(())
-    }
-
-    fn close(&self) -> Result<(), HammerError> {
-        self.logger.debug("close");
-        Ok(())
     }
 }
 

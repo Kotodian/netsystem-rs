@@ -45,7 +45,7 @@ pub use http::HttpClientManager;
 pub use inbound::InboundManager;
 pub use network::NetworkManager;
 pub use outbound::OutboundManager;
-pub use pause::{PauseManager, StubManager};
+pub use pause::PauseManager;
 pub use router::Router;
 pub use service_mgr::ServiceManager;
 pub use tun_inbound::TunInbound;
