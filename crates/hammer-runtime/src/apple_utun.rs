@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use libc::{c_int, c_long, c_void, iovec, size_t, socklen_t};
+use libc::{c_int, c_void, iovec, size_t, socklen_t};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
@@ -27,9 +27,11 @@ use hammer_core::error::HammerError;
 
 use crate::tun::TunDevice;
 
-/// macOS/iOS private syscall numbers (`<sys/syscall.h>`).
-const SYS_RECVMSG_X: c_long = 480;
-const SYS_SENDMSG_X: c_long = 481;
+/// macOS/iOS private syscall numbers (`<sys/syscall.h>`). On Apple targets
+/// `libc::syscall` is variadic with the first arg typed as `c_int`, so these
+/// must be `c_int` rather than the `c_long` you see on Linux.
+const SYS_RECVMSG_X: c_int = 480;
+const SYS_SENDMSG_X: c_int = 481;
 
 /// utun prepends a 4-byte protocol family on each IP packet.
 const PACKET_HEADER_LEN: usize = 4;
@@ -106,6 +108,12 @@ struct RxState {
     /// Packets ready to hand to `recv()` callers.
     pending: VecDeque<Vec<u8>>,
 }
+
+// SAFETY: the iovec / MsgHdrX raw pointers we store reference buffers owned
+// by this same struct. Access is serialized through the parent Mutex, so
+// moving the struct between threads is sound.
+unsafe impl Send for RxState {}
+unsafe impl Send for TxState {}
 
 impl RxState {
     fn new(batch_size: usize, mtu: usize) -> Self {
@@ -285,7 +293,7 @@ impl AppleTunDevice {
                 SYS_SENDMSG_X,
                 self.fd.get_ref().as_raw_fd(),
                 (&mut state.msg as *mut MsgHdrX).cast::<c_void>(),
-                1_c_int,
+                1 as c_int,
                 libc::MSG_DONTWAIT,
             )
         };

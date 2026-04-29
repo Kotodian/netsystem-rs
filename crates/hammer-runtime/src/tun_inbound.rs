@@ -8,7 +8,9 @@ use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::tun::{AsyncTunDevice, SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index_from_fd};
+use crate::tun::{SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index_from_fd};
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+use crate::tun::AsyncTunDevice;
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
