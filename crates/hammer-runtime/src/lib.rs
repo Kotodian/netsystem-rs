@@ -38,6 +38,9 @@ mod tls_support;
 pub mod tun;
 mod tun_inbound;
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+mod apple_utun;
+
 pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use connection::ConnectionManager;
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
