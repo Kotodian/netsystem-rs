@@ -1,12 +1,23 @@
 namespace hammer {
+  // Mirrors the gomobile-generated `HammerSetup(opts, &err)` global. Rust runtime
+  // does not need basePath/tempPath, so the call is a no-op aside from accepting
+  // the options dictionary; kept for drop-in compatibility with the legacy SDK.
   [Throws=HammerError]
-  void check_config(string content);
+  void hammer_setup(HammerSetupOptions options);
 
   [Throws=HammerError]
-  string format_config(string content);
+  void hammer_check_config(string content);
 
   [Throws=HammerError]
-  Service new_service(string config_content, Platform platform);
+  string hammer_format_config(string content);
+
+  [Throws=HammerError]
+  HammerService hammer_new_service(string config_content, HammerPlatform platform);
+
+  // gomobile shipped a global helper that scanned the process for a utun fd.
+  // Rust services obtain the fd via `HammerPlatform.openTun`; this returns -1
+  // and the host should fall back to its own discovery (the legacy demo did).
+  i32 hammer_get_tunnel_file_descriptor();
 };
 
 [Error]
@@ -21,14 +32,20 @@ interface HammerError {
   Internal(string message);
 };
 
-dictionary TunOptions {
+dictionary HammerSetupOptions {
+  string base_path;
+  string temp_path;
+  boolean debug;
+};
+
+dictionary HammerTunOptions {
   string name;
   i32 mtu;
   sequence<string> address;
   sequence<string> route;
 };
 
-dictionary NetworkInterface {
+dictionary HammerNetworkInterface {
   i32 index;
   i32 mtu;
   string name;
@@ -40,14 +57,28 @@ dictionary NetworkInterface {
   sequence<string> dns_servers;
 };
 
-dictionary WifiState {
+dictionary HammerWIFIState {
   string ssid;
   string bssid;
 };
 
-callback interface Platform {
+callback interface HammerStringIterator {
+  boolean has_next();
+  string next();
+};
+
+callback interface HammerNetworkInterfaceIterator {
+  boolean has_next();
+  HammerNetworkInterface? next();
+};
+
+interface HammerDefaultInterfaceUpdateListener {
+  void update_default_interface(string name, i32 interface_index, boolean is_expensive, boolean is_constrained);
+};
+
+callback interface HammerPlatform {
   [Throws=HammerError]
-  i32 open_tun(TunOptions options);
+  i32 open_tun(HammerTunOptions options);
 
   boolean use_platform_auto_detect_interface_control();
 
@@ -55,17 +86,23 @@ callback interface Platform {
   void auto_detect_interface_control(i32 fd);
 
   [Throws=HammerError]
-  sequence<NetworkInterface> get_interfaces();
+  void start_default_interface_monitor(HammerDefaultInterfaceUpdateListener listener);
+
+  [Throws=HammerError]
+  void close_default_interface_monitor(HammerDefaultInterfaceUpdateListener listener);
+
+  [Throws=HammerError]
+  HammerNetworkInterfaceIterator get_interfaces();
 
   boolean under_network_extension();
   boolean include_all_networks();
-  WifiState? read_wifi_state();
-  sequence<string> system_certificates();
+  HammerWIFIState? read_wifi_state();
+  HammerStringIterator? system_certificates();
   void clear_dns_cache();
   void write_log(i32 level, string message);
 };
 
-interface Service {
+interface HammerService {
   [Throws=HammerError]
   void start();
 

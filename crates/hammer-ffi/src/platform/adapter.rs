@@ -1,53 +1,29 @@
 use std::sync::Arc;
 
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener as AdapterDefaultInterfaceUpdateListener,
+    DefaultInterfaceUpdateListener as AdapterListener,
     NetworkInterface as AdapterNetworkInterface, PlatformInterface, WifiState as AdapterWifiState,
 };
 use hammer_core::error::CoreError;
 use hammer_core::log::{Level, LogWriter};
 
-use crate::{NetworkInterface, Platform, WifiState};
+use crate::platform::types::{
+    HammerDefaultInterfaceUpdateListener, HammerNetworkInterface, HammerPlatform, HammerWIFIState,
+};
 
-/// Thin facade over the Swift-implemented [`Platform`] callback interface.
-/// M2 keeps the M1 surface intact while real Manager implementations land
-/// behind it; the methods marked `dead_code` get wired up incrementally.
+/// Thin facade over the Swift-implemented [`HammerPlatform`] callback interface,
+/// adapting it to the workspace-internal [`PlatformInterface`] trait.
 pub struct PlatformAdapter {
-    platform: Arc<dyn Platform>,
+    platform: Arc<dyn HammerPlatform>,
 }
 
-#[allow(dead_code)]
 impl PlatformAdapter {
-    pub fn new(platform: Arc<dyn Platform>) -> Self {
+    pub fn new(platform: Arc<dyn HammerPlatform>) -> Self {
         Self { platform }
     }
 
     pub fn write_log(&self, level: Level, message: String) {
         self.platform.write_log(level as i32, message);
-    }
-
-    pub fn read_wifi_state(&self) -> Option<WifiState> {
-        self.platform.read_wifi_state()
-    }
-
-    pub fn get_interfaces(&self) -> Result<Vec<NetworkInterface>, crate::HammerError> {
-        self.platform.get_interfaces()
-    }
-
-    pub fn under_network_extension(&self) -> bool {
-        self.platform.under_network_extension()
-    }
-
-    pub fn include_all_networks(&self) -> bool {
-        self.platform.include_all_networks()
-    }
-
-    pub fn system_certificates(&self) -> Vec<String> {
-        self.platform.system_certificates()
-    }
-
-    pub fn clear_dns_cache(&self) {
-        self.platform.clear_dns_cache()
     }
 }
 
@@ -59,28 +35,41 @@ impl PlatformInterface for PlatformAdapter {
     fn auto_detect_interface_control(&self, fd: i32) -> Result<(), CoreError> {
         self.platform
             .auto_detect_interface_control(fd)
-            .map_err(platform_error)
+            .map_err(into_core_error)
     }
 
     fn start_default_interface_monitor(
         &self,
-        _listener: Arc<dyn AdapterDefaultInterfaceUpdateListener>,
+        listener: Arc<dyn AdapterListener>,
     ) -> Result<(), CoreError> {
-        Ok(())
+        let bridge = HammerDefaultInterfaceUpdateListener::from_adapter(listener);
+        self.platform
+            .start_default_interface_monitor(bridge)
+            .map_err(into_core_error)
     }
 
     fn close_default_interface_monitor(
         &self,
-        _listener: Arc<dyn AdapterDefaultInterfaceUpdateListener>,
+        listener: Arc<dyn AdapterListener>,
     ) -> Result<(), CoreError> {
-        Ok(())
+        let bridge = HammerDefaultInterfaceUpdateListener::from_adapter(listener);
+        self.platform
+            .close_default_interface_monitor(bridge)
+            .map_err(into_core_error)
     }
 
     fn get_interfaces(&self) -> Result<Vec<AdapterNetworkInterface>, CoreError> {
-        self.platform
+        let iter = self
+            .platform
             .get_interfaces()
-            .map(|interfaces| interfaces.into_iter().map(Into::into).collect())
-            .map_err(platform_error)
+            .map_err(into_core_error)?;
+        let mut out = Vec::new();
+        while iter.has_next() {
+            if let Some(item) = iter.next() {
+                out.push(item.into());
+            }
+        }
+        Ok(out)
     }
 
     fn read_wifi_state(&self) -> Option<AdapterWifiState> {
@@ -88,8 +77,8 @@ impl PlatformInterface for PlatformAdapter {
     }
 }
 
-impl From<NetworkInterface> for AdapterNetworkInterface {
-    fn from(value: NetworkInterface) -> Self {
+impl From<HammerNetworkInterface> for AdapterNetworkInterface {
+    fn from(value: HammerNetworkInterface) -> Self {
         Self {
             index: value.index,
             mtu: value.mtu,
@@ -104,8 +93,8 @@ impl From<NetworkInterface> for AdapterNetworkInterface {
     }
 }
 
-impl From<WifiState> for AdapterWifiState {
-    fn from(value: WifiState) -> Self {
+impl From<HammerWIFIState> for AdapterWifiState {
+    fn from(value: HammerWIFIState) -> Self {
         Self {
             ssid: value.ssid,
             bssid: value.bssid,
@@ -113,11 +102,11 @@ impl From<WifiState> for AdapterWifiState {
     }
 }
 
-fn platform_error(err: crate::HammerError) -> CoreError {
+fn into_core_error(err: crate::HammerError) -> CoreError {
     CoreError::internal(err.to_string())
 }
 
-/// Bridges the in-memory log pipeline to Swift via `Platform.writeLog(level, message)`.
+/// Bridges the in-memory log pipeline to Swift via `HammerPlatform.writeLog(level, message)`.
 pub struct PlatformLogWriter {
     adapter: Arc<PlatformAdapter>,
 }

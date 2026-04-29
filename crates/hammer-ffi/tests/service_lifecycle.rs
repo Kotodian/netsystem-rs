@@ -1,6 +1,10 @@
 use std::sync::{Arc, Mutex};
 
-use hammer::{HammerError, NetworkInterface, Platform, Service, TunOptions, WifiState};
+use hammer::{
+    HammerDefaultInterfaceUpdateListener, HammerError, HammerNetworkInterface,
+    HammerNetworkInterfaceIterator, HammerPlatform, HammerService, HammerStringIterator,
+    HammerTunOptions, HammerWIFIState,
+};
 
 const MIN_TOML: &str = r#"
 [tun]
@@ -20,8 +24,8 @@ struct CapturePlatform {
     lines: Mutex<Vec<String>>,
 }
 
-impl Platform for CapturePlatform {
-    fn open_tun(&self, _options: TunOptions) -> Result<i32, HammerError> {
+impl HammerPlatform for CapturePlatform {
+    fn open_tun(&self, _options: HammerTunOptions) -> Result<i32, HammerError> {
         Err(HammerError::internal("open_tun is not available in tests"))
     }
     fn use_platform_auto_detect_interface_control(&self) -> bool {
@@ -30,8 +34,20 @@ impl Platform for CapturePlatform {
     fn auto_detect_interface_control(&self, _fd: i32) -> Result<(), HammerError> {
         Ok(())
     }
-    fn get_interfaces(&self) -> Result<Vec<NetworkInterface>, HammerError> {
-        Ok(Vec::new())
+    fn start_default_interface_monitor(
+        &self,
+        _listener: Arc<HammerDefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+    fn close_default_interface_monitor(
+        &self,
+        _listener: Arc<HammerDefaultInterfaceUpdateListener>,
+    ) -> Result<(), HammerError> {
+        Ok(())
+    }
+    fn get_interfaces(&self) -> Result<Box<dyn HammerNetworkInterfaceIterator>, HammerError> {
+        Ok(Box::new(EmptyInterfaceIterator))
     }
     fn under_network_extension(&self) -> bool {
         false
@@ -39,11 +55,11 @@ impl Platform for CapturePlatform {
     fn include_all_networks(&self) -> bool {
         false
     }
-    fn read_wifi_state(&self) -> Option<WifiState> {
+    fn read_wifi_state(&self) -> Option<HammerWIFIState> {
         None
     }
-    fn system_certificates(&self) -> Vec<String> {
-        Vec::new()
+    fn system_certificates(&self) -> Option<Box<dyn HammerStringIterator>> {
+        None
     }
     fn clear_dns_cache(&self) {}
     fn write_log(&self, _level: i32, message: String) {
@@ -54,10 +70,21 @@ impl Platform for CapturePlatform {
     }
 }
 
-fn make_service() -> (Arc<CapturePlatform>, Arc<Service>) {
+struct EmptyInterfaceIterator;
+
+impl HammerNetworkInterfaceIterator for EmptyInterfaceIterator {
+    fn has_next(&self) -> bool {
+        false
+    }
+    fn next(&self) -> Option<HammerNetworkInterface> {
+        None
+    }
+}
+
+fn make_service() -> (Arc<CapturePlatform>, Arc<HammerService>) {
     let platform = Arc::new(CapturePlatform::default());
-    let svc = Service::new(MIN_TOML, Arc::clone(&platform) as Arc<dyn Platform>)
-        .expect("Service::new should accept the minimal config");
+    let svc = HammerService::new(MIN_TOML, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("HammerService::new should accept the minimal config");
     (platform, svc)
 }
 
@@ -82,10 +109,6 @@ fn service_walks_all_stages_and_managers() {
     let started = count(&lines, "stage started");
     assert_eq!(raw_start - started, 11);
 
-    // 11 close lines (one per manager) plus possibly extra close-related debug
-    // chatter from individual managers (e.g. ConnectionManager.close_all).
-    // We assert the *minimum* — the per-manager Lifecycle.close is the
-    // contract; extras are noise we accept.
     assert!(count(&lines, ": close") >= 11, "lines = {lines:?}");
 }
 
@@ -96,8 +119,6 @@ fn double_start_is_idempotent() {
     svc.start().expect("second start should be a no-op");
     svc.close().expect("close");
 
-    // Each stage must have been logged exactly once per manager — the second
-    // start MUST NOT walk the lifecycles a second time.
     let lines = platform.lines.lock().unwrap();
     assert_eq!(count(&lines, "stage initialize"), 11);
     assert_eq!(count(&lines, "stage post-start"), 11);

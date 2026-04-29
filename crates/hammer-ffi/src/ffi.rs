@@ -2,29 +2,36 @@ use std::sync::Arc;
 
 use hammer_core::config;
 
-use crate::Platform;
 use crate::error::HammerError;
-use crate::service::Service;
+use crate::platform::{HammerPlatform, HammerSetupOptions};
+use crate::service::HammerService;
 
-/// `namespace.check_config` — uniffi 0.31 hands us the TOML body as an owned String.
-pub fn check_config(content: String) -> Result<(), HammerError> {
+/// Mirrors `HammerSetup(opts, &err)` from the gomobile SDK. Rust runtime needs
+/// no basePath/tempPath/debug — the call exists so existing hosts can keep
+/// invoking it during startup.
+pub fn hammer_setup(_options: HammerSetupOptions) -> Result<(), HammerError> {
+    Ok(())
+}
+
+pub fn hammer_check_config(content: String) -> Result<(), HammerError> {
     config::check_config(&content).map_err(HammerError::from)
 }
 
-/// `namespace.format_config` — returns the canonical TOML form. Equivalent to Go's
-/// `FormatConfig` but returns a plain `String` instead of the gomobile-friendly
-/// `StringValue` wrapper.
-pub fn format_config(content: String) -> Result<String, HammerError> {
+pub fn hammer_format_config(content: String) -> Result<String, HammerError> {
     config::format_config(&content).map_err(HammerError::from)
 }
 
-/// `namespace.new_service` — uniffi delivers callback interfaces as `Box<dyn Trait>`.
-/// We immediately promote it to `Arc<dyn Platform>` so the Service can clone the
-/// handle into the log writer and (later milestones) the network manager.
-pub fn new_service(
+pub fn hammer_new_service(
     config_content: String,
-    platform: Box<dyn Platform>,
-) -> Result<Arc<Service>, HammerError> {
-    let platform: Arc<dyn Platform> = Arc::from(platform);
-    Service::new(&config_content, platform)
+    platform: Box<dyn HammerPlatform>,
+) -> Result<Arc<HammerService>, HammerError> {
+    let platform: Arc<dyn HammerPlatform> = Arc::from(platform);
+    HammerService::new(&config_content, platform)
+}
+
+/// gomobile shipped a global utun-fd lookup; the Rust SDK takes the fd directly
+/// from `HammerPlatform.openTun`, so this returns -1 and the host should fall
+/// back to its own discovery path.
+pub fn hammer_get_tunnel_file_descriptor() -> i32 {
+    -1
 }

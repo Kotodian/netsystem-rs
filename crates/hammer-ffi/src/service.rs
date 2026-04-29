@@ -12,7 +12,7 @@ use hammer_runtime::{
     PauseManager, Router, ServiceManager,
 };
 
-use crate::Platform;
+use crate::HammerPlatform;
 use crate::error::HammerError;
 use crate::platform::{PlatformAdapter, PlatformLogWriter};
 
@@ -23,7 +23,7 @@ enum ServiceState {
     Closed,
 }
 
-pub struct Service {
+pub struct HammerService {
     inner: Mutex<ServiceInner>,
 }
 
@@ -41,10 +41,10 @@ struct ServiceInner {
     _options: Options,
 }
 
-impl Service {
+impl HammerService {
     pub fn new(
         config_content: &str,
-        platform: Arc<dyn Platform>,
+        platform: Arc<dyn HammerPlatform>,
     ) -> Result<Arc<Self>, HammerError> {
         // reqwest ships without a bundled crypto provider (we trim aws-lc-rs
         // out at the workspace level), so DoH and any other TLS path needs the

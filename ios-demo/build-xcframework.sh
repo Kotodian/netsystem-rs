@@ -24,7 +24,7 @@ export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
 BUILD_DIR="ios-demo/build"
 GENERATED_DIR="${BUILD_DIR}/generated"
 XCFRAMEWORK="${BUILD_DIR}/Hammer.xcframework"
-FRAMEWORK="${BUILD_DIR}/ios/hammerFFI.framework"
+FRAMEWORK="${BUILD_DIR}/ios/Hammer.framework"
 DYLIB_SRC="target/aarch64-apple-ios/release/libhammer.dylib"
 
 rm -rf "${BUILD_DIR}"
@@ -34,22 +34,22 @@ echo "==> cargo build cdylib (release, aarch64-apple-ios)"
 cargo build -p hammer-ffi --release --target aarch64-apple-ios
 
 echo "==> assemble hammerFFI.framework"
-cp "${DYLIB_SRC}" "${FRAMEWORK}/hammerFFI"
-strip -S -x "${FRAMEWORK}/hammerFFI"
+cp "${DYLIB_SRC}" "${FRAMEWORK}/Hammer"
+strip -S -x "${FRAMEWORK}/Hammer"
 # Frameworks must use an @rpath install_name so the host app can embed them.
-install_name_tool -id @rpath/hammerFFI.framework/hammerFFI "${FRAMEWORK}/hammerFFI"
+install_name_tool -id @rpath/Hammer.framework/Hammer "${FRAMEWORK}/Hammer"
 
 echo "==> generate Swift bindings via uniffi-bindgen"
 cargo run -p hammer-uniffi-bindgen --release -- \
   generate crates/hammer-ffi/src/hammer.udl \
   --language swift --out-dir "${GENERATED_DIR}"
-cp "${GENERATED_DIR}/hammerFFI.h" "${FRAMEWORK}/Headers/hammerFFI.h"
+cp "${GENERATED_DIR}/hammerFFI.h" "${FRAMEWORK}/Headers/Hammer.h"
 
-# `framework module` (not plain `module`) is required for `import hammerFFI`
+# `framework module` (not plain `module`) is required for `import Hammer`
 # to resolve against a binary framework target.
 cat > "${FRAMEWORK}/Modules/module.modulemap" <<'EOM'
-framework module hammerFFI {
-    header "hammerFFI.h"
+framework module Hammer {
+    header "Hammer.h"
     export *
 }
 EOM
@@ -59,9 +59,9 @@ cat > "${FRAMEWORK}/Info.plist" <<'EOM'
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleIdentifier</key><string>com.kotodian.hammerFFI</string>
-  <key>CFBundleName</key><string>hammerFFI</string>
-  <key>CFBundleExecutable</key><string>hammerFFI</string>
+  <key>CFBundleIdentifier</key><string>com.kotodian.Hammer</string>
+  <key>CFBundleName</key><string>Hammer</string>
+  <key>CFBundleExecutable</key><string>Hammer</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundlePackageType</key><string>FMWK</string>
@@ -78,6 +78,10 @@ xcodebuild -create-xcframework \
 
 echo "==> publish Swift glue"
 mkdir -p "${BUILD_DIR}/Sources/Hammer"
+# uniffi emits `import hammerFFI` based on the udl namespace; rewrite to match
+# the framework module name we ship (Hammer).
+sed -i.bak 's/import hammerFFI/import Hammer/g' "${GENERATED_DIR}/hammer.swift"
+rm "${GENERATED_DIR}/hammer.swift.bak"
 mv "${GENERATED_DIR}/hammer.swift" "${BUILD_DIR}/Sources/Hammer/hammer.swift"
 
 echo
