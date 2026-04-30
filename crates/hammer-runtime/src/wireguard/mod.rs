@@ -3,18 +3,25 @@
 //! Mirrors sing-box's split between an outer `protocol/wireguard.Endpoint` (which
 //! the router dials into via `DialContext`) and an inner `transport/wireguard`
 //! device that owns the gVisor stack + wireguard-go runtime. Hammer lands this
-//! in three pieces:
+//! in stages:
 //!
 //!   commit 2: scaffold the public type + manager wiring with the dial/listen
 //!     surface returning `unimplemented`.
-//!   commit 3 (this one): real boringtun `Tunn` per peer with LPM routing —
-//!     two `WireguardEndpoint`s can already complete a handshake and
-//!     encapsulate IP packets, the only missing piece is the UDP socket
-//!     and the smoltcp surface that turns dial(TCP/UDP) into IP packets.
-//!   commit 4: external UDP socket via `PlatformInterface::protect` plus the
-//!     smoltcp netstack that closes the dial(TCP/UDP) loop.
+//!   commit 3: real boringtun `Tunn` per peer with LPM routing.
+//!   commit 4a (this one): UDP transport actor that drives boringtun handshakes
+//!     and shuttles encapsulated frames over a real socket. Endpoint integration
+//!     and dial(TCP/UDP) land in 4b.
+//!   commit 4b: smoltcp netstack inside the endpoint, lifecycle Start spawns the
+//!     transport actor, and dial(TCP/UDP) closes the loop.
+//!
+//! Plenty of items here are reachable only from `#[cfg(test)]` modules or from
+//! commit 4b's not-yet-written endpoint wiring. Suppressing the dead-code
+//! warnings keeps the build clean during the staged rollout; the lint goes
+//! away as 4b connects everything to a live `lifecycle::start`.
+#![allow(dead_code)]
 
 mod peer;
+mod transport;
 
 use std::net::IpAddr;
 
