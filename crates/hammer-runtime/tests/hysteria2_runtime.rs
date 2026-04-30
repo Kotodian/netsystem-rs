@@ -3,6 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+mod support;
+
+use bytes::Bytes;
 use hammer_adapter::{
     DefaultInterfaceUpdateListener, Network, NetworkInterface, OutboundManager as _,
     PlatformInterface, SocksAddr, TunOptions, WifiState,
@@ -12,9 +15,8 @@ use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::OutboundManager;
 use hammer_runtime::hysteria2::bbr::{BbrProfile, CongestionControlHandle, HysteriaBbrConfig};
-use hammer_runtime::hysteria2::{
-    ClientOptions, Hysteria2Client, obfs::Salamander, protocol, testing::EchoServer,
-};
+use hammer_runtime::hysteria2::{ClientOptions, Hysteria2Client, obfs::Salamander, protocol};
+use support::hysteria2_echo::EchoServer;
 use tokio::io::AsyncWriteExt;
 
 fn logger(id: &str) -> Logger {
@@ -96,15 +98,15 @@ final = "hysteria2"
 #[test]
 fn protocol_encodes_tcp_and_udp_wire_frames() {
     let tcp = protocol::encode_tcp_request("example.com:443", b"hello");
-    let decoded = protocol::decode_tcp_request(&tcp).expect("decode tcp request");
+    let decoded = protocol::decode_tcp_request(tcp).expect("decode tcp request");
     assert_eq!(decoded.destination, "example.com:443");
-    assert_eq!(decoded.payload, b"hello");
+    assert_eq!(decoded.payload.as_ref(), b"hello");
 
     let response = protocol::encode_tcp_response(true, "", b"world");
-    let decoded = protocol::decode_tcp_response(&response).expect("decode tcp response");
+    let decoded = protocol::decode_tcp_response(response).expect("decode tcp response");
     assert!(decoded.ok);
     assert_eq!(decoded.message, "");
-    assert_eq!(decoded.payload, b"world");
+    assert_eq!(decoded.payload.as_ref(), b"world");
 
     let udp = protocol::UdpMessage {
         session_id: 7,
@@ -112,10 +114,29 @@ fn protocol_encodes_tcp_and_udp_wire_frames() {
         fragment_id: 0,
         fragment_total: 1,
         destination: "1.1.1.1:53".to_owned(),
-        payload: b"dns".to_vec(),
+        payload: Bytes::from_static(b"dns"),
     };
-    let decoded = protocol::UdpMessage::decode(&udp.encode()).expect("decode udp message");
+    let decoded = protocol::UdpMessage::decode(udp.encode()).expect("decode udp message");
     assert_eq!(decoded, udp);
+}
+
+#[test]
+fn protocol_udp_decode_keeps_payload_as_bytes_slice() {
+    let udp = protocol::UdpMessage {
+        session_id: 7,
+        packet_id: 9,
+        fragment_id: 0,
+        fragment_total: 1,
+        destination: "1.1.1.1:53".to_owned(),
+        payload: Bytes::from_static(b"dns"),
+    };
+    let encoded = udp.encode();
+    let decoded = protocol::UdpMessage::decode(encoded.clone()).expect("decode udp message");
+    assert_eq!(decoded.payload, Bytes::from_static(b"dns"));
+    assert_eq!(
+        decoded.payload.as_ptr(),
+        &encoded[encoded.len() - 3] as *const u8
+    );
 }
 
 #[test]
@@ -178,7 +199,7 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
         .await
         .expect("send udp");
     let received = packet.recv_from().await.expect("recv udp");
-    assert_eq!(received.payload, b"echo:dns-query");
+    assert_eq!(received.payload.as_ref(), b"echo:dns-query");
 }
 
 #[tokio::test]
@@ -224,7 +245,8 @@ async fn outbound_manager_registers_real_hysteria2_outbound() {
         logger("outbound"),
         options.route.final_.clone(),
         &options.outbounds,
-    );
+    )
+    .expect("outbound manager");
 
     let outbound = manager.get("hysteria2").expect("hysteria2 outbound");
     assert_eq!(outbound.type_name(), "hysteria2");

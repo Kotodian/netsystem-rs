@@ -2,16 +2,62 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
-#[cfg(feature = "wireguard")]
 use hammer_adapter::PlatformInterface;
 use hammer_adapter::{Endpoint, EndpointManager as EndpointManagerTrait, Lifecycle, Outbound};
+#[cfg(feature = "endpoint")]
+use hammer_core::config::Endpoint as EndpointOptions;
 #[cfg(feature = "wireguard")]
-use hammer_core::config::{Endpoint as EndpointOptions, EndpointKind};
+use hammer_core::config::EndpointKind;
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
+#[cfg(feature = "wireguard")]
+type EndpointViews = (Arc<dyn Endpoint>, Arc<dyn Outbound>);
+
+#[cfg(feature = "wireguard")]
+type EndpointBuilder = fn(
+    Logger,
+    String,
+    &EndpointKind,
+    Option<Arc<dyn PlatformInterface>>,
+) -> Result<EndpointViews, HammerError>;
+
+#[cfg(feature = "wireguard")]
+#[derive(Clone)]
+struct EndpointFactorySet {
+    builders: Arc<HashMap<&'static str, EndpointBuilder>>,
+}
+
+#[cfg(feature = "wireguard")]
+impl EndpointFactorySet {
+    fn standard() -> Self {
+        let mut builders = HashMap::new();
+        builders.insert(
+            "wireguard",
+            crate::protocol::wireguard::build_endpoint_views as EndpointBuilder,
+        );
+        Self {
+            builders: Arc::new(builders),
+        }
+    }
+
+    fn build(
+        &self,
+        logger: Logger,
+        option: &EndpointOptions,
+        platform: Option<Arc<dyn PlatformInterface>>,
+    ) -> Result<EndpointViews, HammerError> {
+        let type_name = option.type_name();
+        let builder = self.builders.get(type_name).ok_or_else(|| {
+            HammerError::config_validation(format!("unknown endpoint type: {type_name}"))
+        })?;
+        builder(logger, option.id.clone(), &option.kind, platform)
+    }
+}
+
 pub struct EndpointManager {
+    #[cfg_attr(not(feature = "wireguard"), allow(dead_code))]
     logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn Endpoint>>>,
     /// Same set of endpoints as `items`, but viewed through their `Outbound`
@@ -19,6 +65,8 @@ pub struct EndpointManager {
     /// `Outbound` registration so the router can resolve the id through
     /// `OutboundManager::get` exactly like any other outbound.
     outbound_view: Mutex<Vec<(String, Arc<dyn Outbound>)>>,
+    #[cfg(feature = "wireguard")]
+    factories: EndpointFactorySet,
 }
 
 impl EndpointManager {
@@ -27,15 +75,17 @@ impl EndpointManager {
             logger,
             items: Mutex::new(HashMap::new()),
             outbound_view: Mutex::new(Vec::new()),
+            #[cfg(feature = "wireguard")]
+            factories: EndpointFactorySet::standard(),
         }
     }
 
-    #[cfg(feature = "wireguard")]
+    #[cfg(feature = "endpoint")]
     pub fn from_options(logger: Logger, options: &[EndpointOptions]) -> Result<Self, HammerError> {
         Self::build(logger, options, None)
     }
 
-    #[cfg(feature = "wireguard")]
+    #[cfg(feature = "endpoint")]
     pub fn from_options_with_platform(
         logger: Logger,
         options: &[EndpointOptions],
@@ -44,30 +94,26 @@ impl EndpointManager {
         Self::build(logger, options, Some(platform))
     }
 
-    #[cfg(feature = "wireguard")]
+    #[cfg(feature = "endpoint")]
     fn build(
         logger: Logger,
         options: &[EndpointOptions],
         platform: Option<Arc<dyn PlatformInterface>>,
     ) -> Result<Self, HammerError> {
         let manager = Self::new(logger);
+        #[cfg(not(feature = "wireguard"))]
+        for _ in options {
+            return Err(HammerError::config_validation(
+                "no endpoint protocols are enabled",
+            ));
+        }
+        #[cfg(feature = "wireguard")]
         for option in options {
-            let (endpoint_view, outbound_view) = match &option.kind {
-                EndpointKind::Wireguard(opts) => {
-                    // One concrete Arc, two trait-object views. The unsizing
-                    // coercion `Arc<WireguardEndpoint> → Arc<dyn Trait>` is
-                    // standard Rust — no need for a manual upcast helper.
-                    let arc = Arc::new(crate::wireguard::build_with_platform(
-                        manager.logger.clone(),
-                        option.id.clone(),
-                        opts.clone(),
-                        platform.clone(),
-                    ));
-                    let ep: Arc<dyn Endpoint> = arc.clone();
-                    let ob: Arc<dyn Outbound> = arc;
-                    (ep, ob)
-                }
-            };
+            let (endpoint_view, outbound_view) = manager.factories.build(
+                manager.logger.clone(),
+                option,
+                platform.as_ref().map(Arc::clone),
+            )?;
             let mut items = manager.items.lock().expect("EndpointManager poisoned");
             if items.contains_key(&option.id) {
                 return Err(HammerError::config_validation(format!(
@@ -83,6 +129,8 @@ impl EndpointManager {
                 .expect("EndpointManager poisoned")
                 .push((option.id.clone(), outbound_view));
         }
+        #[cfg(not(feature = "wireguard"))]
+        let _ = platform;
         Ok(manager)
     }
 
@@ -104,10 +152,6 @@ impl Lifecycle for EndpointManager {
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
         debug!("stage {}", stage.name());
-        // Forward the stage to every concrete endpoint so that protocols
-        // wanting to spin up actor tasks (e.g. wg's transport + smoltcp stack)
-        // can latch onto the right phase. We snapshot the Arc list to avoid
-        // holding the lock across the recursive `start` calls.
         let items: Vec<Arc<dyn Endpoint>> = self
             .items
             .lock()

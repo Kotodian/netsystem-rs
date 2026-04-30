@@ -10,8 +10,8 @@ use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
 
-/// `common/certificate.Store` placeholder. M3+ wires the real rustls-backed
-/// certificate pool + system trust roots ingestion.
+/// Certificate store facade. Platform system roots are loaded by the TLS
+/// support layer when TLS-capable protocols are enabled.
 pub struct CertificateStore {
     exclusive_anchors: bool,
 }

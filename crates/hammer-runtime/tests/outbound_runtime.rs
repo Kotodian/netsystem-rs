@@ -94,7 +94,8 @@ async fn direct_outbound_dials_tcp_with_initial_payload() {
             id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
-    );
+    )
+    .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     assert_eq!(outbound.type_name(), "direct");
 
@@ -131,7 +132,8 @@ async fn direct_outbound_keeps_tcp_stream_full_duplex_after_dial() {
             id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
-    );
+    )
+    .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     let mut stream = outbound
         .dial(Network::Tcp, destination(addr), b"")
@@ -167,7 +169,8 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
             id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
-    );
+    )
+    .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     let mut packet = outbound.listen_packet().await.expect("listen direct udp");
     packet
@@ -177,7 +180,7 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
 
     let got = packet.recv_from().await.expect("recv direct udp");
     assert_eq!(got.destination, destination(addr));
-    assert_eq!(got.payload, b"echo:dns");
+    assert_eq!(got.payload.as_ref(), b"echo:dns");
 }
 
 #[tokio::test]
@@ -205,7 +208,8 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
         Arc::clone(&platform) as Arc<dyn PlatformInterface>,
-    );
+    )
+    .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     let mut stream = outbound
         .dial(Network::Tcp, destination(tcp_addr), b"")
@@ -223,26 +227,21 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
         .send_to(destination(udp_addr), b"x")
         .await
         .expect("send protected udp");
-    assert_eq!(packet.recv_from().await.unwrap().payload, b"x");
+    assert_eq!(packet.recv_from().await.unwrap().payload.as_ref(), b"x");
     assert_eq!(platform.calls(), 2);
 }
 
 #[tokio::test]
-async fn block_and_dns_outbounds_return_protocol_errors() {
+async fn block_outbound_returns_protocol_errors() {
     let manager = OutboundManager::from_options(
         logger("outbound"),
         "block",
-        &[
-            Outbound {
-                id: "block".to_owned(),
-                kind: OutboundKind::Block,
-            },
-            Outbound {
-                id: "dns-out".to_owned(),
-                kind: OutboundKind::Dns,
-            },
-        ],
-    );
+        &[Outbound {
+            id: "block".to_owned(),
+            kind: OutboundKind::Block,
+        }],
+    )
+    .expect("outbound manager");
     let destination = SocksAddr {
         host: IpAddr::V4(Ipv4Addr::LOCALHOST),
         port: 9,
@@ -260,19 +259,6 @@ async fn block_and_dns_outbounds_return_protocol_errors() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("blocked"));
-
-    let dns = manager.get("dns-out").expect("dns outbound");
-    assert_eq!(dns.type_name(), "dns");
-    let err = match dns.dial(Network::Tcp, destination, b"").await {
-        Ok(_) => panic!("dns accepted dial"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("invalid"));
-    let err = match dns.listen_packet().await {
-        Ok(_) => panic!("dns accepted udp"),
-        Err(err) => err,
-    };
-    assert!(err.to_string().contains("invalid"));
 }
 
 #[test]
@@ -293,16 +279,12 @@ fn outbound_manager_registers_concrete_m7_outbounds() {
                 id: "block".to_owned(),
                 kind: OutboundKind::Block,
             },
-            Outbound {
-                id: "dns-out".to_owned(),
-                kind: OutboundKind::Dns,
-            },
         ],
-    );
+    )
+    .expect("outbound manager");
 
     assert_eq!(manager.get("hysteria2").unwrap().type_name(), "hysteria2");
     assert_eq!(manager.get("direct").unwrap().type_name(), "direct");
     assert_eq!(manager.get("block").unwrap().type_name(), "block");
-    assert_eq!(manager.get("dns-out").unwrap().type_name(), "dns");
     assert_eq!(manager.default().unwrap().id(), "direct");
 }

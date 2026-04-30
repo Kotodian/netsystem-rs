@@ -1,19 +1,19 @@
 //! `[hysteria2]` and direct/block outbound config sections.
 //!
 //! Hysteria2 is the only outbound protocol with its own TOML section
-//! (top-level `[hysteria2]`); direct/block/dns are synthesized at runtime
-//! by `build_outbounds`. `Outbound` / `OutboundKind` sit at this layer so
-//! adding a new outbound protocol means dropping a new variant here.
+//! (top-level `[hysteria2]`); direct is synthesized by `build_outbounds`.
+//! DNS is handled by `DnsRouter`/`DnsTransport`, not as a dialable outbound.
+//! `Outbound` / `OutboundKind` sit at this layer so adding a new outbound
+//! protocol means dropping a new variant here.
 
 use std::time::Duration;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Serialize};
 
 use crate::error::HammerError;
 
 use super::constants as C;
-use super::parse::{self, deserialize_duration_option, is_false, is_zero_i64, is_zero_u16};
-use super::raw_struct_with_default_check;
+use super::{raw_struct, raw_struct_with_default_check};
 
 raw_struct_with_default_check! {
     pub struct RawHysteria2Config {
@@ -22,56 +22,42 @@ raw_struct_with_default_check! {
         /// Hysteria2 server host or IP.
         pub server: String => "String::is_empty",
         /// Single Hysteria2 server port.
-        pub server_port: u16 => "is_zero_u16",
+        pub server_port: Option<u16> => "Option::is_none",
         /// Port-hopping range strings from the raw config.
         pub server_ports: Vec<String> => "Vec::is_empty",
         /// Hysteria2 password.
         pub password: String => "String::is_empty",
         /// Upload bandwidth hint in Mbps.
-        pub up_mbps: i64 => "is_zero_i64",
+        pub up_mbps: Option<i64> => "Option::is_none",
         /// Download bandwidth hint in Mbps.
-        pub down_mbps: i64 => "is_zero_i64",
+        pub down_mbps: Option<i64> => "Option::is_none",
         /// TLS SNI override.
         pub sni: String => "String::is_empty",
         /// Whether invalid TLS certificates are accepted.
-        pub insecure: bool => "is_false",
+        pub insecure: Option<bool> => "Option::is_none",
         /// Enabled network list from the raw config.
-        #[serde(deserialize_with = "deserialize_hysteria2_networks")]
         pub network: Vec<Hysteria2Network> => "Vec::is_empty",
         /// Port-hopping interval.
-        #[serde(
-            deserialize_with = "deserialize_hysteria2_hop_interval",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub hop_interval: Option<Duration> => "Option::is_none",
         /// Maximum port-hopping interval.
-        #[serde(
-            deserialize_with = "deserialize_hysteria2_hop_interval_max",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub hop_interval_max: Option<Duration> => "Option::is_none",
         /// QUIC idle timeout.
-        #[serde(
-            deserialize_with = "deserialize_hysteria2_idle_timeout",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub idle_timeout: Option<Duration> => "Option::is_none",
         /// QUIC keep-alive period.
-        #[serde(
-            deserialize_with = "deserialize_hysteria2_keep_alive_period",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub keep_alive_period: Option<Duration> => "Option::is_none",
         /// Hysteria2 BBR profile.
-        #[serde(deserialize_with = "deserialize_hysteria2_bbr_profile")]
         pub bbr_profile: Option<Hysteria2BbrProfile> => "Option::is_none",
         /// Whether Brutal congestion-control debug output is enabled.
-        pub brutal_debug: bool => "is_false",
+        pub brutal_debug: Option<bool> => "Option::is_none",
         /// Whether QUIC path MTU discovery is disabled.
         #[serde(rename = "disable_path_mtu_discovery")]
-        pub disable_path_mtu: bool => "is_false",
+        pub disable_path_mtu: Option<bool> => "Option::is_none",
         /// Initial QUIC datagram size.
-        pub initial_packet_size: u16 => "is_zero_u16",
+        pub initial_packet_size: Option<u16> => "Option::is_none",
         /// Optional Hysteria2 obfuscation section.
         pub obfs: RawHysteria2Obfs => "RawHysteria2Obfs::is_default",
     }
@@ -81,11 +67,35 @@ raw_struct_with_default_check! {
     pub struct RawHysteria2Obfs {
         /// Obfuscation type.
         #[serde(rename = "type")]
-        #[serde(deserialize_with = "deserialize_hysteria2_obfs_type")]
         pub type_: Option<Hysteria2ObfsType> => "Option::is_none",
         /// Obfuscation password.
         pub password: String => "String::is_empty",
     }
+}
+
+raw_struct! {
+    pub struct RawDirectOutboundConfig {
+        /// Outbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// Network strategy placeholder for sing-box compatibility.
+        pub network_strategy: String => "String::is_empty",
+    }
+}
+
+raw_struct! {
+    pub struct RawBlockOutboundConfig {
+        /// Outbound id used by route rules.
+        pub id: String => "String::is_empty",
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+#[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
+pub enum RawOutbound {
+    Hysteria2(RawHysteria2Config),
+    Direct(RawDirectOutboundConfig),
+    Block(RawBlockOutboundConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,17 +110,16 @@ impl Outbound {
             OutboundKind::Hysteria2(_) => C::TYPE_HYSTERIA2,
             OutboundKind::Direct(_) => C::TYPE_DIRECT,
             OutboundKind::Block => C::TYPE_BLOCK,
-            OutboundKind::Dns => "dns",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum OutboundKind {
     Hysteria2(Hysteria2OutboundOptions),
     Direct(DirectOutboundOptions),
     Block,
-    Dns,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -223,6 +232,69 @@ pub(super) fn build_outbounds(
     ]
 }
 
+pub(super) fn build_declared_outbounds(
+    raw: Vec<RawOutbound>,
+) -> Result<Vec<Outbound>, HammerError> {
+    let mut outbounds = Vec::new();
+    for (idx, raw) in raw.into_iter().enumerate() {
+        let outbound = match raw {
+            RawOutbound::Hysteria2(raw) => {
+                let (options, id) = build_hysteria_options(raw)?;
+                Outbound {
+                    id,
+                    kind: OutboundKind::Hysteria2(options),
+                }
+            }
+            RawOutbound::Direct(raw) => {
+                let id = if raw.id.is_empty() {
+                    C::DEFAULT_DIRECT_ID.to_owned()
+                } else {
+                    raw.id
+                };
+                Outbound {
+                    id,
+                    kind: OutboundKind::Direct(DirectOutboundOptions {
+                        network_strategy: if raw.network_strategy.is_empty() {
+                            C::NETWORK_STRATEGY_DEFAULT.to_owned()
+                        } else {
+                            raw.network_strategy
+                        },
+                    }),
+                }
+            }
+            RawOutbound::Block(raw) => {
+                if raw.id.is_empty() {
+                    return Err(HammerError::config_validation(format!(
+                        "outbounds[{idx}].id is required"
+                    )));
+                }
+                Outbound {
+                    id: raw.id,
+                    kind: OutboundKind::Block,
+                }
+            }
+        };
+        outbounds.push(outbound);
+    }
+    ensure_direct_outbound(&mut outbounds);
+    Ok(outbounds)
+}
+
+pub(super) fn ensure_direct_outbound(outbounds: &mut Vec<Outbound>) {
+    if outbounds
+        .iter()
+        .any(|outbound| outbound.id == C::DEFAULT_DIRECT_ID)
+    {
+        return;
+    }
+    outbounds.push(Outbound {
+        id: C::DEFAULT_DIRECT_ID.to_owned(),
+        kind: OutboundKind::Direct(DirectOutboundOptions {
+            network_strategy: C::NETWORK_STRATEGY_DEFAULT.to_owned(),
+        }),
+    });
+}
+
 pub(super) fn build_hysteria_options(
     mut raw: RawHysteria2Config,
 ) -> Result<(Hysteria2OutboundOptions, String), HammerError> {
@@ -236,10 +308,7 @@ pub(super) fn build_hysteria_options(
             "hysteria2.server is required",
         ));
     }
-    let mut server_port = raw.server_port;
-    if server_port == 0 && raw.server_ports.is_empty() {
-        server_port = C::DEFAULT_HYSTERIA_PORT;
-    }
+    let server_port = raw.server_port.unwrap_or(C::DEFAULT_HYSTERIA_PORT);
     if raw.password.is_empty() {
         return Err(HammerError::config_validation(
             "hysteria2.password is required",
@@ -251,15 +320,18 @@ pub(super) fn build_hysteria_options(
             "hysteria2 port hopping is not supported yet",
         ));
     }
-    if raw.up_mbps < 0 || raw.down_mbps < 0 {
+    let up_mbps = raw.up_mbps.unwrap_or(0);
+    let down_mbps = raw.down_mbps.unwrap_or(0);
+    if up_mbps < 0 || down_mbps < 0 {
         return Err(HammerError::config_validation(
             "hysteria2.up_mbps and hysteria2.down_mbps must be non-negative",
         ));
     }
-    if !raw.insecure && raw.sni.is_empty() && raw.server.parse::<std::net::IpAddr>().is_err() {
+    let insecure = raw.insecure.unwrap_or(false);
+    if !insecure && raw.sni.is_empty() && raw.server.parse::<std::net::IpAddr>().is_err() {
         raw.sni = raw.server.clone();
     }
-    if !raw.insecure && raw.sni.is_empty() {
+    if !insecure && raw.sni.is_empty() {
         return Err(HammerError::config_validation(
             "hysteria2.sni is required unless insecure=true",
         ));
@@ -277,21 +349,21 @@ pub(super) fn build_hysteria_options(
             server_port,
             server_ports: raw.server_ports,
             password: raw.password,
-            up_mbps: raw.up_mbps,
-            down_mbps: raw.down_mbps,
+            up_mbps,
+            down_mbps,
             network,
             hop_interval: raw.hop_interval,
             hop_interval_max: raw.hop_interval_max,
             idle_timeout: raw.idle_timeout,
             keep_alive_period: raw.keep_alive_period,
             bbr_profile,
-            brutal_debug: raw.brutal_debug,
-            disable_path_mtu_discovery: raw.disable_path_mtu,
-            initial_packet_size: raw.initial_packet_size,
+            brutal_debug: raw.brutal_debug.unwrap_or(false),
+            disable_path_mtu_discovery: raw.disable_path_mtu.unwrap_or(false),
+            initial_packet_size: raw.initial_packet_size.unwrap_or(0),
             tls: OutboundTlsOptions {
                 enabled: true,
                 server_name: raw.sni,
-                insecure: raw.insecure,
+                insecure,
             },
             obfs,
         },
@@ -317,95 +389,4 @@ fn build_obfs(raw: RawHysteria2Obfs) -> Result<Option<Hysteria2Obfs>, HammerErro
         type_,
         password: raw.password,
     }))
-}
-
-fn deserialize_hysteria2_networks<'de, D>(
-    deserializer: D,
-) -> Result<Vec<Hysteria2Network>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Vec::<String>::deserialize(deserializer)?
-        .into_iter()
-        .map(|value| match value.as_str() {
-            "tcp" => Ok(Hysteria2Network::Tcp),
-            "udp" => Ok(Hysteria2Network::Udp),
-            other => Err(de::Error::custom(format!(
-                "hysteria2.network: unknown network {other:?}"
-            ))),
-        })
-        .collect()
-}
-
-fn deserialize_hysteria2_hop_interval<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("hysteria2.hop_interval", deserializer)
-}
-
-fn deserialize_hysteria2_hop_interval_max<'de, D>(
-    deserializer: D,
-) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("hysteria2.hop_interval_max", deserializer)
-}
-
-fn deserialize_hysteria2_idle_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("hysteria2.idle_timeout", deserializer)
-}
-
-fn deserialize_hysteria2_keep_alive_period<'de, D>(
-    deserializer: D,
-) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("hysteria2.keep_alive_period", deserializer)
-}
-
-fn deserialize_hysteria2_bbr_profile<'de, D>(
-    deserializer: D,
-) -> Result<Option<Hysteria2BbrProfile>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "" => Ok(None),
-        "standard" => Ok(Some(Hysteria2BbrProfile::Standard)),
-        "conservative" => Ok(Some(Hysteria2BbrProfile::Conservative)),
-        "aggressive" => Ok(Some(Hysteria2BbrProfile::Aggressive)),
-        other => Err(de::Error::custom(format!(
-            "hysteria2.bbr_profile unsupported BBR profile: {other}"
-        ))),
-    }
-}
-
-fn deserialize_hysteria2_obfs_type<'de, D>(
-    deserializer: D,
-) -> Result<Option<Hysteria2ObfsType>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "" => Ok(None),
-        "salamander" => Ok(Some(Hysteria2ObfsType::Salamander)),
-        other => Err(de::Error::custom(format!(
-            "hysteria2.obfs.type: unknown obfs type {other:?}"
-        ))),
-    }
-}
-
-fn serialize_duration_option<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    parse::serialize_duration_option(value, serializer)
 }

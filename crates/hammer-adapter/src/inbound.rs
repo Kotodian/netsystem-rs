@@ -4,9 +4,8 @@ use std::sync::Arc;
 use hammer_core::error::CoreError;
 use hammer_core::lifecycle::Lifecycle;
 
-/// `adapter.Inbound` in Go — Lifecycle-managed entity that accepts user traffic
-/// (TUN, mixed, http, socks, …). M2 surfaces only what Service / Manager
-/// orchestration needs; protocol-specific methods land in M5/M7.
+/// Lifecycle-managed entity that accepts user traffic (TUN, mixed, HTTP,
+/// SOCKS, ...).
 pub trait Inbound: Lifecycle {
     fn type_name(&self) -> &str;
     fn id(&self) -> &str;

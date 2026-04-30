@@ -1,240 +1,187 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use tracing::info;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr};
+use hammer_adapter::{Outbound, OutboundManager as OutboundManagerTrait, PlatformInterface};
+use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpSocket, UdpSocket};
 
+use crate::impl_logging_lifecycle;
 use crate::socket_protector::SocketProtector;
 
-pub struct DirectOutbound {
-    id: String,
-    networks: Vec<Network>,
-    dependencies: Vec<String>,
-    protector: SocketProtector,
+#[cfg(feature = "outbound-block")]
+pub use crate::protocol::block::BlockOutbound;
+#[cfg(feature = "outbound-direct")]
+pub use crate::protocol::direct::DirectOutbound;
+
+type OutboundBuilder =
+    fn(Logger, String, &OutboundKind, SocketProtector) -> Result<Arc<dyn Outbound>, HammerError>;
+
+#[derive(Clone)]
+struct OutboundFactorySet {
+    builders: Arc<HashMap<&'static str, OutboundBuilder>>,
 }
 
-impl DirectOutbound {
-    pub fn new(_logger: Logger, id: impl Into<String>) -> Self {
+impl OutboundFactorySet {
+    fn standard() -> Self {
+        let mut builders = HashMap::new();
+        register_standard_outbound_builders(&mut builders);
         Self {
-            id: id.into(),
-            networks: vec![Network::Tcp, Network::Udp],
-            dependencies: Vec::new(),
-            protector: SocketProtector::default(),
+            builders: Arc::new(builders),
         }
     }
 
-    pub(crate) fn new_with_protector(
-        _logger: Logger,
-        id: impl Into<String>,
-        protector: SocketProtector,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            networks: vec![Network::Tcp, Network::Udp],
-            dependencies: Vec::new(),
-            protector,
-        }
-    }
-}
-
-#[async_trait]
-impl Outbound for DirectOutbound {
-    fn type_name(&self) -> &str {
-        "direct"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
-    async fn dial(
+    fn build(
         &self,
-        network: Network,
-        destination: SocksAddr,
-        initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
-        if network != Network::Tcp {
-            return Err(HammerError::internal("direct dial only supports tcp"));
-        }
-        info!("outbound connection to {destination}");
-        let socket = if destination.host.is_ipv6() {
-            TcpSocket::new_v6()
-        } else {
-            TcpSocket::new_v4()
-        }
-        .map_err(|err| HammerError::internal(format!("create direct tcp socket: {err}")))?;
-        self.protector.protect(&socket)?;
-        let mut stream = socket
-            .connect(socket_addr(&destination))
-            .await
-            .map_err(|err| HammerError::internal(format!("direct tcp connect: {err}")))?;
-        if !initial_payload.is_empty() {
-            stream
-                .write_all(initial_payload)
-                .await
-                .map_err(|err| HammerError::internal(format!("direct tcp write: {err}")))?;
-        }
-        Ok(Box::new(stream))
-    }
-
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        info!("outbound packet connection");
-        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-            .await
-            .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
-        self.protector.protect(&socket)?;
-        Ok(Box::new(DirectPacketConn { socket }))
+        logger: Logger,
+        option: &OutboundOptions,
+        protector: SocketProtector,
+    ) -> Result<Arc<dyn Outbound>, HammerError> {
+        let type_name = option.type_name();
+        let builder = self.builders.get(type_name).ok_or_else(|| {
+            HammerError::config_validation(format!("unknown outbound type: {type_name}"))
+        })?;
+        builder(logger, option.id.clone(), &option.kind, protector)
     }
 }
 
-struct DirectPacketConn {
-    socket: UdpSocket,
+#[allow(unused_variables)]
+fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, OutboundBuilder>) {
+    #[cfg(feature = "outbound-hysteria2")]
+    builders.insert(
+        "hysteria2",
+        crate::protocol::hysteria2::build_outbound as OutboundBuilder,
+    );
+    #[cfg(feature = "outbound-direct")]
+    builders.insert(
+        "direct",
+        crate::protocol::direct::build_outbound as OutboundBuilder,
+    );
+    #[cfg(feature = "outbound-block")]
+    builders.insert(
+        "block",
+        crate::protocol::block::build_outbound as OutboundBuilder,
+    );
 }
 
-#[async_trait]
-impl ProxyPacketConn for DirectPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
-        self.socket
-            .send_to(payload, socket_addr(&destination))
-            .await
-            .map_err(|err| HammerError::internal(format!("direct udp send: {err}")))?;
+/// `out.Manager` port. DNS is routed through DnsRouter/DnsTransport instead of
+/// a dialable outbound.
+pub struct OutboundManager {
+    logger: Logger,
+    items: Mutex<HashMap<String, Arc<dyn Outbound>>>,
+    default_id: String,
+    factories: OutboundFactorySet,
+}
+
+impl OutboundManager {
+    pub fn new(logger: Logger, default_id: impl Into<String>) -> Self {
+        Self {
+            logger,
+            items: Mutex::new(HashMap::new()),
+            default_id: default_id.into(),
+            factories: OutboundFactorySet::standard(),
+        }
+    }
+
+    pub fn from_options(
+        logger: Logger,
+        default_id: impl Into<String>,
+        options: &[OutboundOptions],
+    ) -> Result<Self, HammerError> {
+        Self::from_options_with_protector(logger, default_id, options, SocketProtector::default())
+    }
+
+    pub fn from_options_with_platform(
+        logger: Logger,
+        default_id: impl Into<String>,
+        options: &[OutboundOptions],
+        platform: Arc<dyn PlatformInterface>,
+    ) -> Result<Self, HammerError> {
+        Self::from_options_with_protector(
+            logger,
+            default_id,
+            options,
+            SocketProtector::new(platform),
+        )
+    }
+
+    pub(crate) fn from_options_with_protector(
+        logger: Logger,
+        default_id: impl Into<String>,
+        options: &[OutboundOptions],
+        protector: SocketProtector,
+    ) -> Result<Self, HammerError> {
+        let manager = Self::new(logger, default_id);
+        for option in options {
+            manager.register_descriptor_with_protector(option, protector.clone())?;
+        }
+        Ok(manager)
+    }
+
+    pub fn register_descriptor(&self, option: &OutboundOptions) -> Result<(), HammerError> {
+        self.register_descriptor_with_protector(option, SocketProtector::default())
+    }
+
+    /// Register an already-constructed outbound (e.g. an endpoint that lives
+    /// in `EndpointManager`) so the router can resolve its id through the
+    /// usual `OutboundManager::get` path. Mirrors sing-box, where every
+    /// endpoint shows up as both an Endpoint *and* an Outbound — same Arc,
+    /// two views.
+    pub fn register_outbound(&self, id: String, descriptor: Arc<dyn Outbound>) {
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .insert(id, descriptor);
+    }
+
+    fn register_descriptor_with_protector(
+        &self,
+        option: &OutboundOptions,
+        protector: SocketProtector,
+    ) -> Result<(), HammerError> {
+        let descriptor = self
+            .factories
+            .build(self.logger.clone(), option, protector)?;
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .insert(option.id.clone(), descriptor);
         Ok(())
     }
+}
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
-        let mut buf = vec![0_u8; 64 * 1024];
-        let (len, source) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|err| HammerError::internal(format!("direct udp recv: {err}")))?;
-        buf.truncate(len);
-        Ok(ProxyDatagram {
-            destination: SocksAddr {
-                host: source.ip(),
-                port: source.port(),
-            },
-            payload: buf,
-        })
+impl_logging_lifecycle!(OutboundManager, "outbound");
+
+impl OutboundManagerTrait for OutboundManager {
+    fn list(&self) -> Vec<Arc<dyn Outbound>> {
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
-}
 
-pub struct BlockOutbound {
-    id: String,
-    networks: Vec<Network>,
-    dependencies: Vec<String>,
-}
+    fn get(&self, id: &str) -> Option<Arc<dyn Outbound>> {
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .get(id)
+            .cloned()
+    }
 
-impl BlockOutbound {
-    pub fn new(_logger: Logger, id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            networks: vec![Network::Tcp, Network::Udp],
-            dependencies: Vec::new(),
+    fn default(&self) -> Option<Arc<dyn Outbound>> {
+        if self.default_id.is_empty() {
+            return None;
         }
-    }
-}
-
-#[async_trait]
-impl Outbound for BlockOutbound {
-    fn type_name(&self) -> &str {
-        "block"
+        self.get(&self.default_id)
     }
 
-    fn id(&self) -> &str {
-        &self.id
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .remove(id);
+        Ok(())
     }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
-    async fn dial(
-        &self,
-        _network: Network,
-        destination: SocksAddr,
-        _initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
-        info!("blocked connection to {destination}");
-        Err(HammerError::internal(format!(
-            "blocked connection to {destination}"
-        )))
-    }
-
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        info!("blocked packet connection");
-        Err(HammerError::internal("blocked packet connection"))
-    }
-}
-
-pub struct DnsOutbound {
-    id: String,
-    networks: Vec<Network>,
-    dependencies: Vec<String>,
-}
-
-impl DnsOutbound {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self {
-            id: id.into(),
-            networks: vec![Network::Tcp, Network::Udp],
-            dependencies: Vec::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl Outbound for DnsOutbound {
-    fn type_name(&self) -> &str {
-        "dns"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
-    async fn dial(
-        &self,
-        _network: Network,
-        _destination: SocksAddr,
-        _initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
-        Err(HammerError::internal(
-            "invalid operation: dns outbound cannot dial directly",
-        ))
-    }
-
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        Err(HammerError::internal(
-            "invalid operation: dns outbound cannot listen directly",
-        ))
-    }
-}
-
-fn socket_addr(destination: &SocksAddr) -> SocketAddr {
-    SocketAddr::new(destination.host, destination.port)
 }

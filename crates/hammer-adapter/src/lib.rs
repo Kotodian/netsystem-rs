@@ -8,7 +8,6 @@ pub mod inbound;
 pub mod network;
 pub mod outbound;
 pub mod platform;
-pub mod registry;
 pub mod router;
 pub mod rule;
 pub mod service;
@@ -31,7 +30,6 @@ pub use outbound::{Outbound, OutboundManager, ProxyDatagram, ProxyPacketConn, Pr
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
-pub use registry::{Constructor, Registry, RegistryContext};
 pub use router::Router;
 pub use rule::{HeadlessRule, RouteDecision, RouteMetadata, Rule, SocksAddr};
 pub use service::ServiceManager;

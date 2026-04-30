@@ -4,14 +4,15 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 use hammer_adapter::{Inbound, PlatformInterface, TunOptions};
-use hammer_core::config::{TunInboundOptions, TunStack};
+use hammer_core::config::{InboundKind, TunInboundOptions, TunStack};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-use crate::tun::AsyncTunDevice;
-use crate::tun::{SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index_from_fd};
+pub mod stack;
+
+pub use stack::*;
+
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
@@ -182,6 +183,36 @@ impl TunInbound {
                 .map(ToString::to_string)
                 .collect(),
         })
+    }
+}
+
+pub(crate) fn build_inbound(
+    id: String,
+    logger: Logger,
+    kind: &InboundKind,
+    router: Arc<Router>,
+    dns_router: Option<Arc<DnsRouter>>,
+    outbound: Option<Arc<OutboundManager>>,
+    platform: Option<Arc<dyn PlatformInterface>>,
+) -> Result<Arc<dyn Inbound>, HammerError> {
+    match kind {
+        InboundKind::Tun(options) => {
+            let inbound: Arc<dyn Inbound> = match (dns_router, outbound, platform) {
+                (Some(dns_router), Some(outbound), Some(platform)) => {
+                    Arc::new(TunInbound::new_with_runtime(
+                        id,
+                        logger,
+                        options.clone(),
+                        router,
+                        dns_router,
+                        outbound,
+                        platform,
+                    ))
+                }
+                _ => Arc::new(TunInbound::new(id, logger, options.clone(), router)),
+            };
+            Ok(inbound)
+        }
     }
 }
 

@@ -59,6 +59,7 @@ impl From<CoreError> for HammerError {
             CoreError::ConfigParse { message } => HammerError::ConfigParse { message },
             CoreError::ConfigValidation { message } => HammerError::ConfigValidation { message },
             CoreError::Lifecycle { stage, message } => HammerError::Lifecycle { stage, message },
+            CoreError::ServiceClosed => HammerError::ServiceClosed,
             CoreError::Internal { message } => HammerError::Internal { message },
         }
     }

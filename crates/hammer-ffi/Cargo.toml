@@ -12,15 +12,17 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
 [features]
-default = []
+default = ["hammer-runtime/default"]
+# Enables generic endpoint config/service wiring.
+endpoint = ["hammer-core/endpoint", "hammer-runtime/endpoint"]
 # Enables the WireGuard endpoint stack across hammer-core + hammer-runtime.
 # Off by default; opt in at xcframework build time with `--features wireguard`.
-wireguard = ["hammer-core/wireguard", "hammer-runtime/wireguard"]
+wireguard = ["endpoint", "hammer-core/wireguard", "hammer-runtime/wireguard"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
-hammer-runtime = { path = "../hammer-runtime" }
+hammer-runtime = { path = "../hammer-runtime", default-features = false }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

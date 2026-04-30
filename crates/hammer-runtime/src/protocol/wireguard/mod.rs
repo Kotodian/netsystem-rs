@@ -31,7 +31,7 @@ use hammer_adapter::{
     Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyPacketConn, ProxyStream,
     SocksAddr,
 };
-use hammer_core::config::WireguardEndpointOptions;
+use hammer_core::config::{EndpointKind, WireguardEndpointOptions};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
@@ -41,6 +41,8 @@ use crate::socket_protector::SocketProtector;
 use peer::Peer;
 use stack::StackHandles;
 use transport::TransportHandles;
+
+type EndpointViews = (Arc<dyn Endpoint>, Arc<dyn Outbound>);
 
 /// Tunnel-side overhead added to every IP packet by WireGuard's data frame
 /// (16 byte poly1305 tag + 16 byte header). Buffers passed to `Tunn::encapsulate`
@@ -75,7 +77,7 @@ enum EndpointState {
 }
 
 impl WireguardEndpoint {
-    pub fn new(
+    fn new(
         logger: Logger,
         id: String,
         options: WireguardEndpointOptions,
@@ -164,7 +166,7 @@ impl WireguardEndpoint {
                 // inbound_rx; replace with a sentinel closed channel so the type
                 // stays the same.
                 inbound_rx: tokio::sync::mpsc::channel(1).1,
-                local_addr: "0.0.0.0:0".parse().expect("placeholder addr"),
+                local_addr: "0.0.0.0:0".parse().expect("sentinel addr"),
                 shutdown,
                 join,
             },
@@ -299,6 +301,22 @@ pub(crate) fn build_with_platform(
     WireguardEndpoint::new(logger, id, options, protector)
 }
 
+pub(crate) fn build_endpoint_views(
+    logger: Logger,
+    id: String,
+    kind: &EndpointKind,
+    platform: Option<Arc<dyn PlatformInterface>>,
+) -> Result<EndpointViews, HammerError> {
+    match kind {
+        EndpointKind::Wireguard(options) => {
+            let arc = Arc::new(build_with_platform(logger, id, options.clone(), platform));
+            let endpoint: Arc<dyn Endpoint> = arc.clone();
+            let outbound: Arc<dyn Outbound> = arc;
+            Ok((endpoint, outbound))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,7 +361,7 @@ mod tests {
     /// Two `WireguardEndpoint`s configured as each other's peer must complete
     /// the noise handshake, after which an IP packet sent through one comes
     /// out byte-for-byte at the other. This is the smoke test that proves the
-    /// boringtun + Peer wiring is correct before commit 4 layers smoltcp on top.
+    /// boringtun + Peer wiring is correct independently of the smoltcp actor.
     #[test]
     fn boringtun_round_trip_recovers_ip_packet() {
         let a_priv = [1u8; 32];
@@ -570,7 +588,7 @@ mod tests {
             .await
             .expect("timed out waiting for tunnel UDP")
             .expect("udp_b.recv_from");
-        assert_eq!(datagram.payload, payload);
+        assert_eq!(datagram.payload.as_ref(), payload.as_slice());
         assert_eq!(
             datagram.destination.host,
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),

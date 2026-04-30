@@ -17,21 +17,20 @@ use hammer_adapter::{
 };
 use hammer_core::config::{
     Hysteria2BbrProfile, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
-    Hysteria2OutboundOptions,
+    Hysteria2OutboundOptions, OutboundKind,
 };
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use http::Request;
-use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, OnceCell, mpsc};
 
 pub mod bbr;
 pub mod obfs;
 pub mod protocol;
-pub mod testing;
 
 use bbr::{BbrProfile, CongestionControlHandle, apply_transport_config_with_handle};
 use obfs::Salamander;
@@ -228,10 +227,10 @@ impl ProxyPacketConn for Hysteria2PacketConn {
             fragment_id: 0,
             fragment_total: 1,
             destination: destination.to_string(),
-            payload: payload.to_vec(),
+            payload: Bytes::copy_from_slice(payload),
         };
         self.connection
-            .send_datagram(Bytes::from(message.encode()))
+            .send_datagram(message.encode())
             .map_err(|err| HammerError::internal(format!("send hysteria2 datagram: {err}")))
     }
 
@@ -315,6 +314,25 @@ impl Hysteria2Outbound {
             obfs: self.options.obfs.clone(),
             platform: self.protector.platform(),
         })
+    }
+}
+
+pub(crate) fn build_outbound(
+    logger: Logger,
+    id: String,
+    kind: &OutboundKind,
+    protector: SocketProtector,
+) -> Result<Arc<dyn Outbound>, HammerError> {
+    match kind {
+        OutboundKind::Hysteria2(options) => Ok(Arc::new(Hysteria2Outbound::new_with_protector(
+            logger,
+            id,
+            options.clone(),
+            protector,
+        ))),
+        _ => Err(HammerError::internal(
+            "hysteria2 factory received wrong options",
+        )),
     }
 }
 
@@ -433,14 +451,14 @@ fn spawn_datagram_loop(client: Arc<Hysteria2Client>) {
                     return;
                 }
             };
-            if let Err(err) = handle_datagram(&client, &datagram).await {
+            if let Err(err) = handle_datagram(&client, datagram).await {
                 error!("handle datagram: {err}");
             }
         }
     });
 }
 
-async fn handle_datagram(client: &Hysteria2Client, data: &[u8]) -> Result<(), HammerError> {
+async fn handle_datagram(client: &Hysteria2Client, data: Bytes) -> Result<(), HammerError> {
     let message = protocol::UdpMessage::decode(data)?;
     let destination = parse_destination(&message.destination);
     let sender = {
@@ -741,29 +759,6 @@ impl ServerCertVerifier for SkipServerVerification {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
     }
-}
-
-fn server_config() -> Result<quinn::ServerConfig, HammerError> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
-    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?
-    .with_no_client_auth()
-    .with_single_cert(
-        vec![cert.cert.into()],
-        PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
-    )
-    .map_err(|err| HammerError::internal(format!("server certificate: {err}")))?;
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
-        QuicServerConfig::try_from(crypto)
-            .map_err(|err| HammerError::internal(format!("server quic tls: {err}")))?,
-    ));
-    config.transport = Arc::new(quinn::TransportConfig::default());
-    Ok(config)
 }
 
 fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {

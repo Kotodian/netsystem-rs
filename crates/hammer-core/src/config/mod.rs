@@ -1,26 +1,25 @@
-mod build;
-mod options;
-mod parse;
-mod raw;
-
-// Per-domain submodules (each owns its own Raw*, Options*, build_*).
-// Created incrementally as the legacy raw/options/build umbrellas are
-// drained — see /home/lqk/.claude/plans/cosmic-popping-wall.md.
-#[cfg(feature = "wireguard")]
+// Per-domain config submodules: each owns its own Raw* / Options* / build_*.
+// The previous `raw.rs` / `options.rs` / `build.rs` umbrellas are gone — see
+// /home/lqk/.claude/plans/cosmic-popping-wall.md for the migration plan.
+mod dns;
+#[cfg(feature = "endpoint")]
 mod endpoint;
 mod inbound;
 mod log;
 mod outbound;
+mod route;
 
-#[cfg(feature = "wireguard")]
+pub use dns::*;
+#[cfg(feature = "endpoint")]
 pub use endpoint::*;
 pub use inbound::*;
 pub use log::*;
-pub use options::*;
 pub use outbound::*;
+pub use route::*;
+
+use std::collections::HashSet;
 
 use crate::error::HammerError;
-use raw::RawConfig;
 
 /// Per-domain submodules share the same `default + skip_serializing_if`
 /// pattern. The macros own the repetitive attributes/derives; submodules
@@ -82,8 +81,7 @@ pub(crate) use raw_struct;
 pub(crate) use raw_struct_with_default_check;
 
 /// String constants and integer defaults shared across the config layer
-/// and the runtime. Hoisted out of `options::` so submodules can `use
-/// super::constants as C;` without going through the legacy umbrella.
+/// and the runtime. Submodules `use super::constants as C;` to access these.
 pub mod constants {
     pub const TYPE_TUN: &str = "tun";
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
@@ -114,6 +112,53 @@ pub mod constants {
     pub const DNS_TYPE_LOCAL: &str = "local";
 }
 
+/// The full TOML schema. Each section delegates serde mechanics and
+/// `Raw* → Options*` conversion to its own per-domain submodule; this
+/// struct just glues the sections together.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawConfig {
+    /// Optional logging section.
+    #[serde(default, skip_serializing_if = "log::RawLogConfig::is_default")]
+    pub log: log::RawLogConfig,
+    /// Optional TUN inbound section.
+    #[serde(default, skip_serializing_if = "inbound::RawTunConfig::is_default")]
+    pub tun: inbound::RawTunConfig,
+    /// Explicit inbound list. When present, it supersedes the legacy `[tun]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbounds: Vec<inbound::RawInbound>,
+    /// Optional top-level Hysteria2 outbound section.
+    #[serde(
+        default,
+        skip_serializing_if = "outbound::RawHysteria2Config::is_default"
+    )]
+    pub hysteria2: outbound::RawHysteria2Config,
+    /// Explicit outbound list. When present, it supersedes legacy `[hysteria2]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbounds: Vec<outbound::RawOutbound>,
+    /// Optional sing-box style endpoint list.
+    #[cfg(feature = "endpoint")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<endpoint::RawEndpoint>,
+    /// Optional DNS transport section.
+    #[serde(default, skip_serializing_if = "dns::RawDnsConfig::is_default")]
+    pub dns: dns::RawDnsConfig,
+    /// Optional route section.
+    #[serde(default, skip_serializing_if = "route::RawRouteConfig::is_default")]
+    pub route: route::RawRouteConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    pub log: log::LogOptions,
+    pub dns: dns::DnsOptions,
+    pub inbounds: Vec<inbound::Inbound>,
+    pub outbounds: Vec<outbound::Outbound>,
+    #[cfg(feature = "endpoint")]
+    pub endpoints: Vec<endpoint::Endpoint>,
+    pub route: route::RouteOptions,
+}
+
 pub fn check_config(content: &str) -> Result<(), HammerError> {
     parse_config(content).map(|_| ())
 }
@@ -125,19 +170,42 @@ pub fn format_config(content: &str) -> Result<String, HammerError> {
 
 pub fn parse_config(content: &str) -> Result<Options, HammerError> {
     let raw = decode_raw(content)?;
-    build::build_options(raw)
+    build_options(raw)
 }
 
 fn decode_raw(content: &str) -> Result<RawConfig, HammerError> {
-    toml::from_str::<RawConfig>(content).map_err(translate_toml_error)
+    let deserializer = toml::Deserializer::parse(content).map_err(translate_toml_error)?;
+    serde_path_to_error::deserialize(deserializer).map_err(translate_toml_path_error)
+}
+
+fn translate_toml_path_error(err: serde_path_to_error::Error<toml::de::Error>) -> HammerError {
+    let path = err.path().to_string();
+    let inner = err.into_inner();
+    if let Some(field) = extract_unknown_field(inner.message()) {
+        return HammerError::config_validation(format!("unsupported config key: {field}"));
+    }
+    if path.is_empty() || path == "." {
+        translate_toml_error(inner)
+    } else {
+        HammerError::config_parse(format!(
+            "parse TOML: {path}: {}",
+            toml_error_message(&inner)
+        ))
+    }
 }
 
 fn translate_toml_error(err: toml::de::Error) -> HammerError {
-    let msg = err.message();
+    let msg = toml_error_message(&err);
     if let Some(field) = extract_unknown_field(msg) {
         return HammerError::config_validation(format!("unsupported config key: {field}"));
     }
     HammerError::config_parse(format!("parse TOML: {msg}"))
+}
+
+fn toml_error_message(err: &toml::de::Error) -> &str {
+    err.message()
+        .strip_prefix("parse TOML: ")
+        .unwrap_or_else(|| err.message())
 }
 
 fn extract_unknown_field(msg: &str) -> Option<String> {
@@ -152,6 +220,143 @@ fn extract_unknown_field(msg: &str) -> Option<String> {
     let inner = &rest[opener.len_utf8()..];
     let close = inner.find(opener)?;
     Some(inner[..close].to_owned())
+}
+
+/// Top-level orchestrator: glue each domain's `build_*` together and
+/// resolve the cross-domain pieces (route final defaulting to the
+/// hysteria id, default_domain_resolver pointing at the dns id, etc.).
+fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
+    #[cfg(feature = "endpoint")]
+    let RawConfig {
+        log: raw_log,
+        tun: raw_tun,
+        inbounds: raw_inbounds,
+        hysteria2: raw_hysteria,
+        outbounds: raw_outbounds,
+        endpoints: raw_endpoints,
+        dns: raw_dns,
+        route: raw_route,
+    } = raw;
+    #[cfg(not(feature = "endpoint"))]
+    let RawConfig {
+        log: raw_log,
+        tun: raw_tun,
+        inbounds: raw_inbounds,
+        hysteria2: raw_hysteria,
+        outbounds: raw_outbounds,
+        dns: raw_dns,
+        route: raw_route,
+    } = raw;
+
+    let (inbounds, mut rules) = if raw_inbounds.is_empty() {
+        let (tun_inbound, tun_id) = inbound::build_tun_inbound(&raw_tun)?;
+        (
+            vec![tun_inbound],
+            route::derive_tun_route_rules(&raw_tun, &tun_id)?,
+        )
+    } else {
+        let mut inbounds = Vec::new();
+        let mut rules = Vec::new();
+        for raw_inbound in &raw_inbounds {
+            let (inbound, id) = inbound::build_inbound(raw_inbound)?;
+            rules.extend(route::derive_tun_route_rules(raw_inbound.tun(), &id)?);
+            inbounds.push(inbound);
+        }
+        (inbounds, rules)
+    };
+    validate_unique_ids("inbounds", inbounds.iter().map(|item| item.id.as_str()))?;
+    rules.extend(route::build_user_rules(&raw_route.rules)?);
+
+    let (outbounds, default_route_final) = if raw_outbounds.is_empty() {
+        let (hysteria_options, hysteria_id) = outbound::build_hysteria_options(raw_hysteria)?;
+        (
+            outbound::build_outbounds(hysteria_options, hysteria_id.clone()),
+            hysteria_id,
+        )
+    } else {
+        let outbounds = outbound::build_declared_outbounds(raw_outbounds)?;
+        let default = default_outbound_id(&outbounds)?;
+        (outbounds, default)
+    };
+    validate_unique_ids("outbounds", outbounds.iter().map(|item| item.id.as_str()))?;
+
+    #[cfg(feature = "endpoint")]
+    let endpoints = endpoint::build_endpoints(raw_endpoints)?;
+    #[cfg(feature = "endpoint")]
+    validate_unique_ids("endpoints", endpoints.iter().map(|item| item.id.as_str()))?;
+
+    let route_final = if raw_route.final_.is_empty() {
+        default_route_final
+    } else {
+        raw_route.final_.clone()
+    };
+    let auto_detect = raw_route.auto_detect_interface.unwrap_or(true);
+
+    let dns_options = dns::build_dns_options(&raw_dns, constants::DEFAULT_DIRECT_ID)?;
+    validate_unique_ids(
+        "dns.servers",
+        dns_options.servers.iter().map(|item| item.id.as_str()),
+    )?;
+    validate_known_id(
+        "dns.final",
+        &dns_options.final_,
+        dns_options.servers.iter().map(|item| item.id.as_str()),
+    )?;
+    let route_options = route::RouteOptions {
+        final_: route_final,
+        auto_detect_interface: auto_detect,
+        rules,
+        default_domain_resolver: Some(dns::DomainResolveOptions {
+            server: dns_options.final_.clone(),
+        }),
+    };
+
+    Ok(Options {
+        log: log::build_log_options(raw_log),
+        dns: dns_options,
+        inbounds,
+        outbounds,
+        #[cfg(feature = "endpoint")]
+        endpoints,
+        route: route_options,
+    })
+}
+
+fn default_outbound_id(outbounds: &[outbound::Outbound]) -> Result<String, HammerError> {
+    outbounds
+        .iter()
+        .find(|outbound| outbound.id != constants::DEFAULT_DIRECT_ID)
+        .or_else(|| outbounds.first())
+        .map(|outbound| outbound.id.clone())
+        .ok_or_else(|| HammerError::config_validation("at least one outbound is required"))
+}
+
+fn validate_unique_ids<'a>(
+    scope: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
+    let mut seen = HashSet::new();
+    for id in ids {
+        if !seen.insert(id) {
+            return Err(HammerError::config_validation(format!(
+                "duplicate {scope} id: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_known_id<'a>(
+    field: &str,
+    id: &str,
+    known: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
+    if known.into_iter().any(|candidate| candidate == id) {
+        return Ok(());
+    }
+    Err(HammerError::config_validation(format!(
+        "{field} references unknown server id: {id}"
+    )))
 }
 
 #[cfg(test)]

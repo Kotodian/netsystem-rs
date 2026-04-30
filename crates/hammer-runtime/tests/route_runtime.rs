@@ -43,11 +43,14 @@ final = "hysteria2"
 }
 
 fn router_from_options(options: &Options) -> Router {
-    let outbound = Arc::new(OutboundManager::from_options(
-        logger("outbound"),
-        options.route.final_.clone(),
-        &options.outbounds,
-    ));
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            options.route.final_.clone(),
+            &options.outbounds,
+        )
+        .expect("outbound manager"),
+    );
     Router::from_options(logger("router"), options.route.clone(), outbound).expect("router")
 }
 
@@ -225,11 +228,14 @@ fn router_rejects_unknown_outbound_at_construction() {
     let opts = options_with_user_rules(
         "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"typo\"\n",
     );
-    let outbound = Arc::new(OutboundManager::from_options(
-        logger("outbound"),
-        opts.route.final_.clone(),
-        &opts.outbounds,
-    ));
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
     let err = match Router::from_options(logger("router"), opts.route.clone(), outbound) {
         Ok(_) => panic!("unknown outbound should fail router construction"),
         Err(err) => err,

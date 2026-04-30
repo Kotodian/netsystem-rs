@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use hammer_core::error::CoreError;
 use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -15,7 +16,7 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'stat
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyDatagram {
     pub destination: SocksAddr,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 #[async_trait]
@@ -24,10 +25,9 @@ pub trait ProxyPacketConn: Send + Sync + 'static {
     async fn recv_from(&mut self) -> Result<ProxyDatagram, CoreError>;
 }
 
-/// `adapter.Outbound` in Go — represents a single egress (hysteria2, direct,
-/// block, dns, …). Async dial/listen methods are deferred to M6 when the
-/// Hysteria2 outbound brings real I/O. The shape stays stable so adding those
-/// later is an extension, not a refactor.
+/// `adapter.Outbound` in Go — represents a single dialable egress
+/// (hysteria2, direct, block, …). DNS queries use DnsRouter/DnsTransport
+/// instead of pretending to be a normal outbound.
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     fn type_name(&self) -> &str;

@@ -25,7 +25,7 @@ use tokio::io::unix::AsyncFd;
 
 use hammer_core::error::HammerError;
 
-use crate::tun::TunDevice;
+use crate::protocol::tun::TunDevice;
 
 /// macOS/iOS private syscall numbers (`<sys/syscall.h>`). On Apple targets
 /// `libc::syscall` is variadic with the first arg typed as `c_int`, so these
@@ -497,9 +497,7 @@ impl TunDevice for AppleTunDevice {
             let mut guard = match self.fd.writable().await {
                 Ok(guard) => guard,
                 Err(err) => {
-                    break Err(HammerError::internal(format!(
-                        "apple TUN writable: {err}"
-                    )));
+                    break Err(HammerError::internal(format!("apple TUN writable: {err}")));
                 }
             };
             let result = {

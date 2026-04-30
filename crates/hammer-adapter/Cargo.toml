@@ -10,5 +10,6 @@ name = "hammer_adapter"
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 hickory-proto = { workspace = true }
 tokio = { workspace = true }

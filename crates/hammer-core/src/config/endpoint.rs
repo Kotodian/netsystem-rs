@@ -1,23 +1,28 @@
-//! `[[endpoints]]` config sections (currently only WireGuard).
+//! `[[endpoints]]` config sections.
 //!
 //! Mirrors sing-box 1.11+'s endpoint concept: an outbound that also has
 //! Lifecycle state. Adding a new endpoint protocol drops in another
-//! `RawEndpoint::*` variant without breaking existing TOML files. The
-//! whole module is gated on `feature = "wireguard"` from mod.rs, so this
-//! file does not need per-item `#[cfg]` annotations.
+//! `RawEndpoint::*` variant behind its own sub-feature without breaking
+//! existing TOML files. The generic endpoint domain is gated on
+//! `feature = "endpoint"` from mod.rs; concrete endpoint protocols add their
+//! own item-level `#[cfg]` annotations.
 
+#[cfg(feature = "wireguard")]
 use std::net::{IpAddr, SocketAddr};
+#[cfg(feature = "wireguard")]
 use std::time::Duration;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(feature = "wireguard")]
 use ipnet::IpNet;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "wireguard")]
+use serde_with::{As, base64::Base64};
 
 use crate::error::HammerError;
 
+#[cfg(feature = "wireguard")]
 use super::constants as C;
-use super::parse::{self, deserialize_ipnet_vec};
+#[cfg(feature = "wireguard")]
 use super::raw_struct;
 
 /// Outer endpoint variant — sing-box style `[[endpoints]]` entries with a
@@ -27,45 +32,40 @@ use super::raw_struct;
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
 pub enum RawEndpoint {
     /// WireGuard endpoint entry.
+    #[cfg(feature = "wireguard")]
     Wireguard(RawWireguardEndpoint),
 }
 
+#[cfg(feature = "wireguard")]
 raw_struct! {
     pub struct RawWireguardEndpoint {
         /// Endpoint id used by route rules and lifecycle managers.
         pub id: String => "String::is_empty",
         /// Base64-encoded WireGuard private key.
-        pub private_key: RawBase64Key => "RawBase64Key::is_empty",
+        pub private_key: Option<RawWireguardKey> => "Option::is_none",
         /// Optional UDP listen port.
         pub listen_port: Option<u16> => "Option::is_none",
         /// Optional WireGuard interface MTU.
         pub mtu: Option<u32> => "Option::is_none",
         /// Local WireGuard interface addresses in CIDR form.
-        #[serde(
-            deserialize_with = "deserialize_wireguard_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
         pub address: Vec<IpNet> => "Vec::is_empty",
         /// WireGuard peer list.
         pub peers: Vec<RawWireguardPeer> => "Vec::is_empty",
     }
 }
 
+#[cfg(feature = "wireguard")]
 raw_struct! {
     pub struct RawWireguardPeer {
         /// Base64-encoded peer public key.
-        pub public_key: RawBase64Key => "RawBase64Key::is_empty",
+        pub public_key: Option<RawWireguardKey> => "Option::is_none",
         /// Optional base64-encoded pre-shared key.
-        pub pre_shared_key: Option<RawBase64Key> => "Option::is_none",
+        pub pre_shared_key: Option<RawWireguardKey> => "Option::is_none",
         /// Peer endpoint address; currently must be an IP literal.
         pub address: String => "String::is_empty",
         /// Peer endpoint UDP port.
-        pub port: u16 => "is_zero_u16",
+        pub port: Option<u16> => "Option::is_none",
         /// Allowed IP prefixes routed to this peer.
-        #[serde(
-            deserialize_with = "deserialize_wireguard_allowed_ips",
-            serialize_with = "serialize_ipnet_vec"
-        )]
         pub allowed_ips: Vec<IpNet> => "Vec::is_empty",
         /// Optional persistent keepalive interval in seconds.
         pub persistent_keepalive_interval: Option<u32> => "Option::is_none",
@@ -74,17 +74,15 @@ raw_struct! {
     }
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
-pub struct RawBase64Key(String);
+pub struct RawWireguardKey(#[serde(with = "As::<Base64>")] [u8; 32]);
 
-impl RawBase64Key {
-    pub fn is_empty(&self) -> bool {
-        self.0.trim().is_empty()
-    }
-
-    pub fn decode_32(&self, field: &str) -> Result<[u8; 32], HammerError> {
-        parse_base64_key(field, self.0.trim())
+#[cfg(feature = "wireguard")]
+impl RawWireguardKey {
+    fn into_bytes(self) -> [u8; 32] {
+        self.0
     }
 }
 
@@ -100,17 +98,24 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn type_name(&self) -> &'static str {
+        #[cfg(feature = "wireguard")]
         match &self.kind {
             EndpointKind::Wireguard(_) => C::TYPE_WIREGUARD,
+        }
+        #[cfg(not(feature = "wireguard"))]
+        match &self.kind {
+            _ => unreachable!("endpoint feature has no enabled endpoint protocols"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointKind {
+    #[cfg(feature = "wireguard")]
     Wireguard(WireguardEndpointOptions),
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardEndpointOptions {
     /// Static private key (Curve25519, 32 bytes).
@@ -124,6 +129,7 @@ pub struct WireguardEndpointOptions {
     pub peers: Vec<WireguardPeerOptions>,
 }
 
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardPeerOptions {
     /// Peer static public key (Curve25519, 32 bytes).
@@ -144,12 +150,23 @@ pub struct WireguardPeerOptions {
 pub(super) fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, HammerError> {
     raw.into_iter()
         .enumerate()
-        .map(|(idx, item)| match item {
-            RawEndpoint::Wireguard(wg) => build_wireguard_endpoint(idx, wg),
+        .map(|(idx, item)| {
+            #[cfg(feature = "wireguard")]
+            {
+                match item {
+                    RawEndpoint::Wireguard(wg) => build_wireguard_endpoint(idx, wg),
+                }
+            }
+            #[cfg(not(feature = "wireguard"))]
+            {
+                let _ = idx;
+                match item {}
+            }
         })
         .collect()
 }
 
+#[cfg(feature = "wireguard")]
 fn build_wireguard_endpoint(
     idx: usize,
     mut raw: RawWireguardEndpoint,
@@ -161,9 +178,9 @@ fn build_wireguard_endpoint(
     } else {
         std::mem::take(&mut raw.id)
     };
-    let private_key = raw
-        .private_key
-        .decode_32(&format!("endpoints[{idx}].private_key"))?;
+    let private_key = raw.private_key.ok_or_else(|| {
+        HammerError::config_validation(format!("endpoints[{idx}].private_key is required"))
+    })?;
     let listen_port = raw.listen_port.unwrap_or(0);
     let mtu = raw.mtu.unwrap_or(C::DEFAULT_WIREGUARD_MTU);
     let address = raw.address;
@@ -186,7 +203,7 @@ fn build_wireguard_endpoint(
     Ok(Endpoint {
         id,
         kind: EndpointKind::Wireguard(WireguardEndpointOptions {
-            private_key,
+            private_key: private_key.into_bytes(),
             listen_port,
             mtu,
             address,
@@ -195,25 +212,27 @@ fn build_wireguard_endpoint(
     })
 }
 
+#[cfg(feature = "wireguard")]
 fn build_wireguard_peer(
     endpoint_idx: usize,
     peer_idx: usize,
     raw: RawWireguardPeer,
 ) -> Result<WireguardPeerOptions, HammerError> {
     let prefix = format!("endpoints[{endpoint_idx}].peers[{peer_idx}]");
-    let public_key = raw.public_key.decode_32(&format!("{prefix}.public_key"))?;
-    let pre_shared_key = match raw.pre_shared_key.as_ref() {
-        Some(value) if !value.is_empty() => {
-            Some(value.decode_32(&format!("{prefix}.pre_shared_key"))?)
-        }
-        _ => None,
-    };
+    let public_key = raw.public_key.ok_or_else(|| {
+        HammerError::config_validation(format!("{prefix}.public_key is required"))
+    })?;
+    let pre_shared_key = raw.pre_shared_key.map(RawWireguardKey::into_bytes);
     if raw.address.is_empty() {
         return Err(HammerError::config_validation(format!(
             "{prefix}.address is required"
         )));
     }
-    let endpoint = parse_socket_addr(&format!("{prefix}.address"), &raw.address, raw.port)?;
+    let endpoint = parse_socket_addr(
+        &format!("{prefix}.address"),
+        &raw.address,
+        raw.port.unwrap_or(0),
+    )?;
     let allowed_ips = raw.allowed_ips;
     if allowed_ips.is_empty() {
         return Err(HammerError::config_validation(format!(
@@ -226,7 +245,7 @@ fn build_wireguard_peer(
         .map(|secs| Duration::from_secs(u64::from(secs)));
     let reserved = raw.reserved.unwrap_or([0u8; 3]);
     Ok(WireguardPeerOptions {
-        public_key,
+        public_key: public_key.into_bytes(),
         pre_shared_key,
         endpoint,
         allowed_ips,
@@ -235,25 +254,10 @@ fn build_wireguard_peer(
     })
 }
 
-/// Decode a base64-encoded 32-byte key (Curve25519 public/private/PSK).
-fn parse_base64_key(field: &str, value: &str) -> Result<[u8; 32], HammerError> {
-    let bytes = BASE64_STANDARD
-        .decode(value)
-        .map_err(|err| HammerError::config_validation(format!("{field}: invalid base64: {err}")))?;
-    if bytes.len() != 32 {
-        return Err(HammerError::config_validation(format!(
-            "{field}: expected 32 decoded bytes, got {}",
-            bytes.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
 /// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
 /// literal; hostname endpoints would need lifecycle-time DNS resolution
 /// which is not wired up yet.
+#[cfg(feature = "wireguard")]
 fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
     if port == 0 {
         return Err(HammerError::config_validation(format!(
@@ -268,56 +272,9 @@ fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, H
     Ok(SocketAddr::new(ip, port))
 }
 
-fn deserialize_wireguard_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("endpoints.address", deserializer)
-}
-
-fn deserialize_wireguard_allowed_ips<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("endpoints.peers.allowed_ips", deserializer)
-}
-
-fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    parse::serialize_ipnet_vec(value, serializer)
-}
-
-// Re-export `is_zero_u16` so the `raw_struct!` macro for `RawWireguardPeer`
-// can resolve the literal `"is_zero_u16"` skip path within this module's
-// scope.
-use super::parse::is_zero_u16;
-
-#[cfg(test)]
+#[cfg(all(test, feature = "wireguard"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_key_round_trips_32_bytes() {
-        let raw = [7u8; 32];
-        let encoded = BASE64_STANDARD.encode(raw);
-        let decoded = parse_base64_key("wg.private_key", &encoded).unwrap();
-        assert_eq!(decoded, raw);
-    }
-
-    #[test]
-    fn base64_key_rejects_wrong_length() {
-        let encoded = BASE64_STANDARD.encode([1u8; 16]);
-        let err = parse_base64_key("wg.private_key", &encoded).unwrap_err();
-        assert!(err.to_string().contains("32 decoded bytes"));
-    }
-
-    #[test]
-    fn base64_key_rejects_invalid_base64() {
-        let err = parse_base64_key("wg.private_key", "not!base64!!").unwrap_err();
-        assert!(err.to_string().contains("invalid base64"));
-    }
 
     #[test]
     fn socket_addr_requires_ip_literal_and_nonzero_port() {

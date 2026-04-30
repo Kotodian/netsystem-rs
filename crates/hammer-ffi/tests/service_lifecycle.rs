@@ -5,6 +5,7 @@ use hammer::{
     HammerNetworkInterfaceIterator, HammerPlatform, HammerService, HammerStringIterator,
     HammerTunOptions, HammerWIFIState,
 };
+use hammer_core::lifecycle::LIFECYCLE_ORDER;
 
 const MIN_TOML: &str = r#"
 [log]
@@ -21,7 +22,7 @@ server = "example.com"
 password = "x"
 sni = "example.com"
 [dns]
-server = "https://1.1.1.1/dns-query"
+server = "udp://1.1.1.1"
 [route]
 final = "hysteria2"
 "#;
@@ -127,16 +128,23 @@ fn service_walks_all_stages_and_managers() {
 
     let lines = platform.lines.lock().unwrap();
 
-    // 11 lifecycles × (Initialize, Start, PostStart, Started) = 44 stage lines.
-    assert_eq!(count(&lines, "stage initialize"), 11, "lines = {lines:?}");
-    assert_eq!(count(&lines, "stage post-start"), 11);
-    assert_eq!(count(&lines, "stage started"), 11);
+    let lifecycle_count = LIFECYCLE_ORDER.len();
+    assert_eq!(
+        count(&lines, "stage initialize"),
+        lifecycle_count,
+        "lines = {lines:?}"
+    );
+    assert_eq!(count(&lines, "stage post-start"), lifecycle_count);
+    assert_eq!(count(&lines, "stage started"), lifecycle_count);
     // "stage start" matches "stage started" too — subtract.
     let raw_start = count(&lines, "stage start");
     let started = count(&lines, "stage started");
-    assert_eq!(raw_start - started, 11);
+    assert_eq!(raw_start - started, lifecycle_count);
 
-    assert!(count(&lines, ": close") >= 11, "lines = {lines:?}");
+    assert!(
+        count(&lines, ": close") >= lifecycle_count,
+        "lines = {lines:?}"
+    );
 }
 
 #[test]
@@ -147,8 +155,9 @@ fn double_start_is_idempotent() {
     svc.close().expect("close");
 
     let lines = platform.lines.lock().unwrap();
-    assert_eq!(count(&lines, "stage initialize"), 11);
-    assert_eq!(count(&lines, "stage post-start"), 11);
+    let lifecycle_count = LIFECYCLE_ORDER.len();
+    assert_eq!(count(&lines, "stage initialize"), lifecycle_count);
+    assert_eq!(count(&lines, "stage post-start"), lifecycle_count);
 }
 
 #[test]
@@ -181,13 +190,11 @@ fn need_wifi_state_starts_false_and_update_does_not_panic() {
     svc.close().expect("close");
 }
 
-/// Booting a config with a `[[endpoints]]` block must walk the same eleven
-/// lifecycles. Until commit 4 the endpoint is a placeholder, so we just need
-/// it to participate in start/close without throwing — proves the EndpointManager
-/// from_options wiring + service plumbing are correct.
+/// Booting a config with a `[[endpoints]]` block must walk the configured
+/// lifecycle graph and register the endpoint's outbound view.
 #[cfg(feature = "wireguard")]
 #[test]
-fn service_starts_with_wireguard_endpoint_scaffold() {
+fn service_starts_with_wireguard_endpoint() {
     const PLACEHOLDER_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     const PLACEHOLDER_PEER: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
     let toml = format!(
@@ -206,7 +213,7 @@ server = "example.com"
 password = "x"
 sni = "example.com"
 [dns]
-server = "https://1.1.1.1/dns-query"
+server = "udp://1.1.1.1"
 [route]
 final = "hysteria2"
 
@@ -230,9 +237,14 @@ allowed_ips = ["0.0.0.0/0"]
     svc.close().expect("close should still walk all stages");
 
     let lines = platform.lines.lock().unwrap();
-    assert_eq!(count(&lines, "stage initialize"), 11, "lines = {lines:?}");
-    assert_eq!(count(&lines, "stage post-start"), 11);
-    assert_eq!(count(&lines, "stage started"), 11);
+    let lifecycle_count = LIFECYCLE_ORDER.len();
+    assert_eq!(
+        count(&lines, "stage initialize"),
+        lifecycle_count,
+        "lines = {lines:?}"
+    );
+    assert_eq!(count(&lines, "stage post-start"), lifecycle_count);
+    assert_eq!(count(&lines, "stage started"), lifecycle_count);
 }
 
 #[test]

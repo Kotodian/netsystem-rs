@@ -4,11 +4,13 @@ use std::sync::Arc;
 use hammer_adapter::PlatformInterface;
 use hammer_core::error::HammerError;
 
+#[allow(dead_code)]
 #[derive(Clone, Default)]
 pub(crate) struct SocketProtector {
     platform: Option<Arc<dyn PlatformInterface>>,
 }
 
+#[allow(dead_code)]
 impl SocketProtector {
     pub(crate) fn new(platform: Arc<dyn PlatformInterface>) -> Self {
         Self {

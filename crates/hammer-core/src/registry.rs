@@ -9,10 +9,8 @@ use crate::error::HammerError;
 /// struct type; consumers `require::<T>()` to fetch a clone-able `Arc<T>`.
 ///
 /// We deliberately key by *concrete* `TypeId` rather than by `dyn Trait`
-/// because `TypeId::of::<T>` requires `T: Sized`. M2 has a single canonical
-/// implementation per manager so this restriction is fine; mock-friendly
-/// trait abstractions (if ever needed) can wrap the concrete type at a higher
-/// layer.
+/// because `TypeId::of::<T>` requires `T: Sized`; trait abstractions can wrap
+/// the concrete type at a higher layer when tests need them.
 pub struct RuntimeRegistry {
     inner: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }

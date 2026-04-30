@@ -7,15 +7,13 @@
 //!     → boringtun `decapsulate` → forward decrypted IP packets to the inner
 //!     stack via `inbound_tx`. Boringtun-driven control packets (handshake
 //!     responses, cookie replies) are sent straight back to the peer.
-//!   * outbound IP packets from `encrypt_rx` (commit 4b's smoltcp Interface
-//!     will sit on the other end) → LPM-route to a peer → boringtun
-//!     `encapsulate` → UDP `send_to` the peer's endpoint.
+//!   * outbound IP packets from `encrypt_rx` → LPM-route to a peer →
+//!     boringtun `encapsulate` → UDP `send_to` the peer's endpoint.
 //!   * a 250 ms tick that calls `Tunn::update_timers` per peer so handshakes,
 //!     keepalives, and rekeys make progress without external prodding.
 //!
-//! The actor is purely a message pump — there is no smoltcp here yet. Commit 4b
-//! plugs `inbound_tx` / `encrypt_rx` into the smoltcp `phy::Device` so dial(TCP/UDP)
-//! starts to flow.
+//! The smoltcp actor owns the inner IP stack; this actor only moves encrypted
+//! UDP frames between peers and the stack-facing queues.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;

@@ -1,39 +1,35 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use hammer_adapter::{
     DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
-    DnsTransportManager as DnsTransportManagerTrait, Lifecycle, Network,
-    OutboundManager as OutboundManagerTrait, PlatformInterface, ProxyStream, SocksAddr, StartStage,
+    DnsTransportManager as DnsTransportManagerTrait, Lifecycle, PlatformInterface, StartStage,
 };
-use hammer_core::config::{
-    DnsOptions, DnsServer, DnsServerKind, DomainStrategy, RemoteDnsServer, RemoteHttpsDnsServer,
-};
+use hammer_core::config::{DnsOptions, DnsServer, DnsServerKind, DomainStrategy};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
-use http::Request;
-use http_body_util::{BodyExt, Full};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use tokio_rustls::TlsConnector;
 
 use crate::OutboundManager;
 use crate::socket_protector::SocketProtector;
-use crate::tls_support::root_cert_store;
+
+mod transport;
+#[cfg(feature = "dns-https")]
+pub use transport::HttpsDnsTransport;
+#[cfg(feature = "dns-tcp")]
+pub use transport::TcpDnsTransport;
+#[cfg(feature = "dns-udp")]
+pub use transport::UdpDnsTransport;
 
 const DEFAULT_DNS_TTL: u32 = 600;
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
-const DOH_MIME_TYPE: &str = "application/dns-message";
 const DNS_CLIENT_CACHE_MAX_ENTRIES: usize = 1024;
 const DNS_REVERSE_CACHE_MAX_ENTRIES: usize = 2048;
 
@@ -411,12 +407,14 @@ fn strategy_rejects(record_type: RecordType, strategy: DomainStrategy) -> bool {
     )
 }
 
+#[cfg(feature = "dns-hosts")]
 pub struct HostsTransport {
     id: String,
     dependencies: Vec<String>,
     predefined: HashMap<String, Vec<IpAddr>>,
 }
 
+#[cfg(feature = "dns-hosts")]
 impl HostsTransport {
     pub fn from_predefined<I, S>(id: impl Into<String>, entries: I) -> Self
     where
@@ -444,6 +442,7 @@ impl HostsTransport {
     }
 }
 
+#[cfg(feature = "dns-hosts")]
 fn parse_hosts(content: &str) -> Vec<(String, IpAddr)> {
     let mut entries = Vec::new();
     for line in content.lines() {
@@ -462,6 +461,7 @@ fn parse_hosts(content: &str) -> Vec<(String, IpAddr)> {
     entries
 }
 
+#[cfg(feature = "dns-hosts")]
 impl Lifecycle for HostsTransport {
     fn name(&self) -> &str {
         "dns/transport/hosts"
@@ -475,6 +475,7 @@ impl Lifecycle for HostsTransport {
 }
 
 #[async_trait]
+#[cfg(feature = "dns-hosts")]
 impl DnsTransport for HostsTransport {
     fn type_name(&self) -> &str {
         "hosts"
@@ -503,11 +504,13 @@ impl DnsTransport for HostsTransport {
     }
 }
 
+#[cfg(feature = "dns-local")]
 pub struct LocalDnsTransport {
     id: String,
     dependencies: Vec<String>,
 }
 
+#[cfg(feature = "dns-local")]
 impl LocalDnsTransport {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
@@ -517,6 +520,7 @@ impl LocalDnsTransport {
     }
 }
 
+#[cfg(feature = "dns-local")]
 impl Lifecycle for LocalDnsTransport {
     fn name(&self) -> &str {
         "dns/transport/local"
@@ -530,6 +534,7 @@ impl Lifecycle for LocalDnsTransport {
 }
 
 #[async_trait]
+#[cfg(feature = "dns-local")]
 impl DnsTransport for LocalDnsTransport {
     fn type_name(&self) -> &str {
         "local"
@@ -571,527 +576,7 @@ impl DnsTransport for LocalDnsTransport {
     }
 }
 
-pub struct UdpDnsTransport {
-    id: String,
-    server: String,
-    port: u16,
-    via: String,
-    dependencies: Vec<String>,
-    outbound: Option<Arc<OutboundManager>>,
-    protector: SocketProtector,
-}
-
-impl UdpDnsTransport {
-    pub fn new(id: impl Into<String>, server: String, port: u16, _logger: Logger) -> Self {
-        Self {
-            id: id.into(),
-            server,
-            port,
-            via: String::new(),
-            dependencies: Vec::new(),
-            outbound: None,
-            protector: SocketProtector::default(),
-        }
-    }
-
-    fn new_with_runtime(
-        id: impl Into<String>,
-        options: &RemoteDnsServer,
-        _logger: Logger,
-        outbound: Option<Arc<OutboundManager>>,
-        protector: SocketProtector,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            server: options.server.clone(),
-            port: options.server_port,
-            via: options.via.clone(),
-            dependencies: dependency(&options.via),
-            outbound,
-            protector,
-        }
-    }
-}
-
-impl Lifecycle for UdpDnsTransport {
-    fn name(&self) -> &str {
-        "dns/transport/udp"
-    }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
-        Ok(())
-    }
-    fn close(&self) -> Result<(), HammerError> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl DnsTransport for UdpDnsTransport {
-    fn type_name(&self) -> &str {
-        "udp"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-    fn reset(&self) {}
-
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
-        if !self.via.is_empty() {
-            let response = udp_exchange_via(
-                self.outbound.as_ref(),
-                &self.via,
-                socket_addr_to_socks(server),
-                &MessageExt::to_bytes(&message)?,
-            )
-            .await?;
-            let response = <Message as MessageExt>::from_bytes(&response)?;
-            if response.metadata.truncation {
-                info!("response truncated, retrying with TCP");
-                return tcp_exchange_via_or_direct(
-                    self.outbound.as_ref(),
-                    &self.via,
-                    server,
-                    message,
-                    &self.protector,
-                )
-                .await;
-            }
-            return Ok(response);
-        }
-        let bind = if server.is_ipv6() {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        };
-        let socket = UdpSocket::bind(bind)
-            .await
-            .map_err(|e| HammerError::internal(format!("bind UDP DNS socket: {e}")))?;
-        self.protector.protect(&socket)?;
-        socket
-            .connect(server)
-            .await
-            .map_err(|e| HammerError::internal(format!("connect UDP DNS socket: {e}")))?;
-        socket
-            .send(&MessageExt::to_bytes(&message)?)
-            .await
-            .map_err(|e| HammerError::internal(format!("write UDP DNS request: {e}")))?;
-        let mut buf = vec![0_u8; 4096];
-        let len = socket
-            .recv(&mut buf)
-            .await
-            .map_err(|e| HammerError::internal(format!("read UDP DNS response: {e}")))?;
-        let response = <Message as MessageExt>::from_bytes(&buf[..len])?;
-        if response.metadata.truncation {
-            info!("response truncated, retrying with TCP");
-            return tcp_exchange_direct(&server, message, &self.protector).await;
-        }
-        Ok(response)
-    }
-}
-
-pub struct TcpDnsTransport {
-    id: String,
-    server: String,
-    port: u16,
-    via: String,
-    dependencies: Vec<String>,
-    outbound: Option<Arc<OutboundManager>>,
-    protector: SocketProtector,
-}
-
-impl TcpDnsTransport {
-    pub fn new(id: impl Into<String>, server: String, port: u16, _logger: Logger) -> Self {
-        Self {
-            id: id.into(),
-            server,
-            port,
-            via: String::new(),
-            dependencies: Vec::new(),
-            outbound: None,
-            protector: SocketProtector::default(),
-        }
-    }
-
-    fn new_with_runtime(
-        id: impl Into<String>,
-        options: &RemoteDnsServer,
-        outbound: Option<Arc<OutboundManager>>,
-        protector: SocketProtector,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            server: options.server.clone(),
-            port: options.server_port,
-            via: options.via.clone(),
-            dependencies: dependency(&options.via),
-            outbound,
-            protector,
-        }
-    }
-}
-
-impl Lifecycle for TcpDnsTransport {
-    fn name(&self) -> &str {
-        "dns/transport/tcp"
-    }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
-        Ok(())
-    }
-    fn close(&self) -> Result<(), HammerError> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl DnsTransport for TcpDnsTransport {
-    fn type_name(&self) -> &str {
-        "tcp"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-    fn reset(&self) {}
-
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
-        tcp_exchange_via_or_direct(
-            self.outbound.as_ref(),
-            &self.via,
-            server,
-            message,
-            &self.protector,
-        )
-        .await
-    }
-}
-
-async fn tcp_exchange_direct(
-    server: &SocketAddr,
-    message: Message,
-    protector: &SocketProtector,
-) -> Result<Message, HammerError> {
-    let mut stream = direct_tcp_connect(*server, protector)
-        .await
-        .map_err(|e| HammerError::internal(format!("connect TCP DNS socket: {e}")))?;
-    tcp_exchange_over_stream(&mut stream, message).await
-}
-
-async fn tcp_exchange_via_or_direct(
-    outbound: Option<&Arc<OutboundManager>>,
-    via: &str,
-    server: SocketAddr,
-    message: Message,
-    protector: &SocketProtector,
-) -> Result<Message, HammerError> {
-    if via.is_empty() {
-        return tcp_exchange_direct(&server, message, protector).await;
-    }
-    let frame = encode_tcp_dns_query(&message)?;
-    let mut stream = outbound_by_id(outbound, via)?
-        .dial(Network::Tcp, socket_addr_to_socks(server), &frame)
-        .await?;
-    read_tcp_dns_response(&mut stream).await
-}
-
-async fn tcp_exchange_over_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    stream: &mut S,
-    message: Message,
-) -> Result<Message, HammerError> {
-    let bytes = MessageExt::to_bytes(&message)?;
-    let len = u16::try_from(bytes.len())
-        .map_err(|_| HammerError::internal("DNS message exceeds TCP frame limit"))?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .await
-        .map_err(|e| HammerError::internal(format!("write TCP DNS length: {e}")))?;
-    stream
-        .write_all(&bytes)
-        .await
-        .map_err(|e| HammerError::internal(format!("write TCP DNS request: {e}")))?;
-    let mut len_buf = [0_u8; 2];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS length: {e}")))?;
-    let len = usize::from(u16::from_be_bytes(len_buf));
-    let mut payload = vec![0_u8; len];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS response: {e}")))?;
-    <Message as MessageExt>::from_bytes(&payload)
-}
-
-pub struct HttpsDnsTransport {
-    id: String,
-    server: String,
-    port: u16,
-    path: String,
-    via: String,
-    url: String,
-    dependencies: Vec<String>,
-    outbound: Option<Arc<OutboundManager>>,
-    protector: SocketProtector,
-    platform: Option<Arc<dyn PlatformInterface>>,
-}
-
-impl HttpsDnsTransport {
-    pub fn new(id: impl Into<String>, options: &RemoteHttpsDnsServer) -> Self {
-        Self::new_with_runtime(id, options, None, SocketProtector::default())
-    }
-
-    fn new_with_runtime(
-        id: impl Into<String>,
-        options: &RemoteHttpsDnsServer,
-        outbound: Option<Arc<OutboundManager>>,
-        protector: SocketProtector,
-    ) -> Self {
-        let host = if options.server_port == 443 {
-            options.server.clone()
-        } else {
-            format!("{}:{}", options.server, options.server_port)
-        };
-        let path = if options.path.is_empty() {
-            "/dns-query"
-        } else {
-            &options.path
-        };
-        Self {
-            id: id.into(),
-            server: options.server.clone(),
-            port: options.server_port,
-            path: path.to_owned(),
-            via: options.via.clone(),
-            url: format!("https://{host}{path}"),
-            dependencies: dependency(&options.via),
-            platform: protector.platform(),
-            outbound,
-            protector,
-        }
-    }
-}
-
-impl Lifecycle for HttpsDnsTransport {
-    fn name(&self) -> &str {
-        "dns/transport/https"
-    }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
-        Ok(())
-    }
-    fn close(&self) -> Result<(), HammerError> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl DnsTransport for HttpsDnsTransport {
-    fn type_name(&self) -> &str {
-        "https"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-    fn reset(&self) {}
-
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
-        let payload = MessageExt::to_bytes(&message)?;
-        let bytes = doh_exchange_http2(
-            self.outbound.as_ref(),
-            &self.via,
-            server,
-            &self.server,
-            &self.path,
-            &self.url,
-            payload,
-            &self.protector,
-            self.platform.clone(),
-        )
-        .await?;
-        <Message as MessageExt>::from_bytes(&bytes)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn doh_exchange_http2(
-    outbound: Option<&Arc<OutboundManager>>,
-    via: &str,
-    server: SocketAddr,
-    server_name: &str,
-    path: &str,
-    url: &str,
-    payload: Vec<u8>,
-    protector: &SocketProtector,
-    platform: Option<Arc<dyn PlatformInterface>>,
-) -> Result<Bytes, HammerError> {
-    let host_name = server_name.to_owned();
-    let stream: Box<dyn ProxyStream> = if via.is_empty() {
-        Box::new(direct_tcp_connect(server, protector).await?)
-    } else {
-        outbound_by_id(outbound, via)?
-            .dial(Network::Tcp, socket_addr_to_socks(server), &[])
-            .await?
-    };
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|err| HammerError::internal(format!("dns tls versions: {err}")))?
-    .with_root_certificates(root_cert_store(platform))
-    .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from(host_name.clone())
-        .map_err(|err| HammerError::internal(format!("invalid DNS TLS server name: {err}")))?;
-    let tls = connector
-        .connect(server_name, stream)
-        .await
-        .map_err(|err| HammerError::internal(format!("connect HTTPS DNS TLS: {err}")))?;
-    let io = TokioIo::new(tls);
-    let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
-        .await
-        .map_err(|err| HammerError::internal(format!("start HTTPS DNS h2: {err}")))?;
-    crate::spawn::spawn(async move {
-        let _ = connection.await;
-    });
-    let request = Request::post(path)
-        .header(http::header::HOST, host_header(&host_name, server.port()))
-        .header(http::header::CONTENT_TYPE, DOH_MIME_TYPE)
-        .header(http::header::ACCEPT, DOH_MIME_TYPE)
-        .body(Full::new(Bytes::from(payload)))
-        .map_err(|err| HammerError::internal(format!("build HTTPS DNS request {url}: {err}")))?;
-    let response = sender
-        .send_request(request)
-        .await
-        .map_err(|err| HammerError::internal(format!("send HTTPS DNS request {url}: {err}")))?;
-    if !response.status().is_success() {
-        return Err(HammerError::internal(format!(
-            "unexpected DNS HTTPS status: {}",
-            response.status()
-        )));
-    }
-    response
-        .into_body()
-        .collect()
-        .await
-        .map(|body| body.to_bytes())
-        .map_err(|e| HammerError::internal(format!("read HTTPS DNS response: {e}")))
-}
-
-async fn resolve_first(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
-    if let Ok(ip) = server.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    let mut addrs = tokio::net::lookup_host((server, port))
-        .await
-        .map_err(|e| HammerError::internal(format!("resolve DNS server {server}: {e}")))?;
-    addrs
-        .next()
-        .ok_or_else(|| HammerError::internal(format!("resolve DNS server {server}: empty result")))
-}
-
-fn dependency(via: &str) -> Vec<String> {
-    if via.is_empty() {
-        Vec::new()
-    } else {
-        vec![via.to_owned()]
-    }
-}
-
-fn socket_addr_to_socks(addr: SocketAddr) -> SocksAddr {
-    SocksAddr {
-        host: addr.ip(),
-        port: addr.port(),
-    }
-}
-
-fn outbound_by_id(
-    outbound: Option<&Arc<OutboundManager>>,
-    via: &str,
-) -> Result<Arc<dyn hammer_adapter::Outbound>, HammerError> {
-    let Some(manager) = outbound else {
-        return Err(HammerError::internal(format!(
-            "outbound via not configured: {via}"
-        )));
-    };
-    manager
-        .get(via)
-        .ok_or_else(|| HammerError::internal(format!("outbound via not found: {via}")))
-}
-
-async fn direct_tcp_connect(
-    server: SocketAddr,
-    protector: &SocketProtector,
-) -> Result<TcpStream, HammerError> {
-    let socket = if server.is_ipv6() {
-        TcpSocket::new_v6()
-    } else {
-        TcpSocket::new_v4()
-    }
-    .map_err(|e| HammerError::internal(format!("create TCP DNS socket: {e}")))?;
-    protector.protect(&socket)?;
-    socket
-        .connect(server)
-        .await
-        .map_err(|e| HammerError::internal(format!("connect TCP DNS socket: {e}")))
-}
-
-async fn udp_exchange_via(
-    outbound: Option<&Arc<OutboundManager>>,
-    via: &str,
-    destination: SocksAddr,
-    payload: &[u8],
-) -> Result<Vec<u8>, HammerError> {
-    debug!("dns udp via outbound={via} dest={destination}");
-    let mut conn = outbound_by_id(outbound, via)?.listen_packet().await?;
-    conn.send_to(destination, payload).await?;
-    Ok(conn.recv_from().await?.payload)
-}
-
-fn encode_tcp_dns_query(message: &Message) -> Result<Vec<u8>, HammerError> {
-    let bytes = MessageExt::to_bytes(message)?;
-    let len = u16::try_from(bytes.len())
-        .map_err(|_| HammerError::internal("DNS message exceeds TCP frame limit"))?;
-    let mut frame = Vec::with_capacity(bytes.len() + 2);
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(&bytes);
-    Ok(frame)
-}
-
-async fn read_tcp_dns_response<S: tokio::io::AsyncRead + Unpin>(
-    stream: &mut S,
-) -> Result<Message, HammerError> {
-    let mut len_buf = [0_u8; 2];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS length: {e}")))?;
-    let len = usize::from(u16::from_be_bytes(len_buf));
-    let mut payload = vec![0_u8; len];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS response: {e}")))?;
-    <Message as MessageExt>::from_bytes(&payload)
-}
-
-fn host_header(server: &str, port: u16) -> String {
-    if port == 443 {
-        server.to_owned()
-    } else {
-        format!("{server}:{port}")
-    }
-}
-
+#[cfg(any(feature = "dns-hosts", feature = "dns-local"))]
 fn fixed_address_response(
     request: &Message,
     query: &Query,
@@ -1124,6 +609,75 @@ fn fixed_address_response(
 pub struct DnsTransportManager {
     items: Mutex<HashMap<String, Arc<dyn DnsTransport>>>,
     default_id: String,
+    factories: DnsTransportFactorySet,
+}
+
+type DnsTransportBuilder = fn(
+    String,
+    &DnsServerKind,
+    Logger,
+    Option<Arc<OutboundManager>>,
+    SocketProtector,
+) -> Result<Arc<dyn DnsTransport>, HammerError>;
+
+#[derive(Clone)]
+struct DnsTransportFactorySet {
+    builders: Arc<HashMap<&'static str, DnsTransportBuilder>>,
+}
+
+impl DnsTransportFactorySet {
+    fn standard() -> Self {
+        let mut builders = HashMap::new();
+        register_standard_dns_transport_builders(&mut builders);
+        Self {
+            builders: Arc::new(builders),
+        }
+    }
+
+    fn build(
+        &self,
+        server: &DnsServer,
+        logger: &Logger,
+        outbound: Option<Arc<OutboundManager>>,
+        protector: SocketProtector,
+    ) -> Result<Arc<dyn DnsTransport>, HammerError> {
+        let type_name = server.type_name();
+        let builder = self.builders.get(type_name).ok_or_else(|| {
+            HammerError::config_validation(format!("unknown DNS transport type: {type_name}"))
+        })?;
+        builder(
+            server.id.clone(),
+            &server.kind,
+            logger.clone(),
+            outbound,
+            protector,
+        )
+    }
+}
+
+#[allow(unused_variables)]
+fn register_standard_dns_transport_builders(
+    builders: &mut HashMap<&'static str, DnsTransportBuilder>,
+) {
+    #[cfg(feature = "dns-udp")]
+    builders.insert(
+        "udp",
+        transport::udp::build_transport as DnsTransportBuilder,
+    );
+    #[cfg(feature = "dns-tcp")]
+    builders.insert(
+        "tcp",
+        transport::tcp::build_transport as DnsTransportBuilder,
+    );
+    #[cfg(feature = "dns-https")]
+    builders.insert(
+        "https",
+        transport::doh::build_transport as DnsTransportBuilder,
+    );
+    #[cfg(feature = "dns-hosts")]
+    builders.insert("hosts", build_hosts_transport as DnsTransportBuilder);
+    #[cfg(feature = "dns-local")]
+    builders.insert("local", build_local_transport as DnsTransportBuilder);
 }
 
 impl DnsTransportManager {
@@ -1131,13 +685,14 @@ impl DnsTransportManager {
         Self {
             items: Mutex::new(HashMap::new()),
             default_id: default_id.into(),
+            factories: DnsTransportFactorySet::standard(),
         }
     }
 
     pub fn from_options(logger: Logger, options: &DnsOptions) -> Result<Self, HammerError> {
         let manager = Self::new(logger.clone(), options.final_.clone());
         for server in &options.servers {
-            manager.insert(build_transport(
+            manager.insert(manager.factories.build(
                 server,
                 &logger,
                 None,
@@ -1156,7 +711,7 @@ impl DnsTransportManager {
         let manager = Self::new(logger.clone(), options.final_.clone());
         let protector = SocketProtector::new(platform);
         for server in &options.servers {
-            manager.insert(build_transport(
+            manager.insert(manager.factories.build(
                 server,
                 &logger,
                 Some(Arc::clone(&outbound)),
@@ -1195,36 +750,36 @@ impl DnsTransportManager {
     }
 }
 
-fn build_transport(
-    server: &DnsServer,
-    logger: &Logger,
-    outbound: Option<Arc<OutboundManager>>,
-    protector: SocketProtector,
+#[cfg(feature = "dns-hosts")]
+fn build_hosts_transport(
+    id: String,
+    kind: &DnsServerKind,
+    _logger: Logger,
+    _outbound: Option<Arc<OutboundManager>>,
+    _protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
-    let transport: Arc<dyn DnsTransport> = match &server.kind {
-        DnsServerKind::Udp(options) => Arc::new(UdpDnsTransport::new_with_runtime(
-            server.id.clone(),
-            options,
-            logger.clone(),
-            outbound,
-            protector,
+    match kind {
+        DnsServerKind::Hosts => Ok(Arc::new(HostsTransport::system(id))),
+        _ => Err(HammerError::internal(
+            "hosts DNS factory received wrong options",
         )),
-        DnsServerKind::Tcp(options) => Arc::new(TcpDnsTransport::new_with_runtime(
-            server.id.clone(),
-            options,
-            outbound,
-            protector,
+    }
+}
+
+#[cfg(feature = "dns-local")]
+fn build_local_transport(
+    id: String,
+    kind: &DnsServerKind,
+    _logger: Logger,
+    _outbound: Option<Arc<OutboundManager>>,
+    _protector: SocketProtector,
+) -> Result<Arc<dyn DnsTransport>, HammerError> {
+    match kind {
+        DnsServerKind::Local => Ok(Arc::new(LocalDnsTransport::new(id))),
+        _ => Err(HammerError::internal(
+            "local DNS factory received wrong options",
         )),
-        DnsServerKind::Https(options) => Arc::new(HttpsDnsTransport::new_with_runtime(
-            server.id.clone(),
-            options,
-            outbound,
-            protector,
-        )),
-        DnsServerKind::Hosts => Arc::new(HostsTransport::system(server.id.clone())),
-        DnsServerKind::Local => Arc::new(LocalDnsTransport::new(server.id.clone())),
-    };
-    Ok(transport)
+    }
 }
 
 impl Lifecycle for DnsTransportManager {

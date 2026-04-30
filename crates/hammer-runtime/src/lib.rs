@@ -12,6 +12,7 @@ pub use hammer_core::error::HammerError;
 /// Some rustls code paths may use the process-wide provider instead of an
 /// explicit builder provider. Idempotent — subsequent calls are no-ops when a
 /// provider is already installed.
+#[cfg(any(feature = "outbound-hysteria2", feature = "dns-https"))]
 pub fn install_default_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -19,38 +20,60 @@ pub fn install_default_crypto_provider() {
     });
 }
 
+#[cfg(not(any(feature = "outbound-hysteria2", feature = "dns-https")))]
+pub fn install_default_crypto_provider() {}
+
 mod certificate;
 mod connection;
 pub mod dns;
-mod endpoint;
-pub mod hysteria2;
-mod inbound;
+#[cfg(feature = "endpoint")]
+pub mod endpoints;
+pub mod inbounds;
 mod macros;
 mod network;
-mod outbound;
 pub mod outbounds;
 pub mod pause;
-mod router;
+pub mod protocol;
+pub mod route;
+mod runtime_service;
 mod service_mgr;
 mod socket_protector;
 pub mod spawn;
+#[cfg(any(feature = "outbound-hysteria2", feature = "dns-https"))]
 mod tls_support;
-pub mod tun;
-mod tun_inbound;
-#[cfg(feature = "wireguard")]
-mod wireguard;
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+#[cfg(feature = "outbound-hysteria2")]
+pub mod hysteria2 {
+    pub use crate::protocol::hysteria2::*;
+}
+
+#[cfg(feature = "inbound-tun")]
+pub mod tun {
+    pub use crate::protocol::tun::*;
+}
+
+#[cfg(feature = "wireguard")]
+pub mod wireguard {
+    pub use crate::protocol::wireguard::*;
+}
+
+#[cfg(all(
+    feature = "inbound-tun",
+    any(target_os = "macos", target_os = "ios", target_os = "tvos")
+))]
 mod apple_utun;
 
 pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use connection::ConnectionManager;
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
-pub use endpoint::EndpointManager;
-pub use inbound::InboundManager;
+#[cfg(feature = "endpoint")]
+pub use endpoints::EndpointManager;
+pub use inbounds::InboundManager;
 pub use network::NetworkManager;
-pub use outbound::OutboundManager;
+pub use outbounds::OutboundManager;
 pub use pause::PauseManager;
-pub use router::Router;
+#[cfg(feature = "inbound-tun")]
+pub use protocol::tun::TunInbound;
+pub use route::Router;
+pub use runtime_service::RuntimeService;
 pub use service_mgr::ServiceManager;
-pub use tun_inbound::TunInbound;

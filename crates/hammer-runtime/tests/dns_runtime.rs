@@ -408,12 +408,15 @@ final = "direct"
     ))
     .unwrap();
     let platform = Arc::new(ProtectPlatform::default());
-    let outbound = Arc::new(OutboundManager::from_options_with_platform(
-        logger("outbound"),
-        options.route.final_.clone(),
-        &options.outbounds,
-        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
-    ));
+    let outbound = Arc::new(
+        OutboundManager::from_options_with_platform(
+            logger("outbound"),
+            options.route.final_.clone(),
+            &options.outbounds,
+            Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        )
+        .expect("outbound manager"),
+    );
     let manager = DnsTransportManager::from_options_with_runtime(
         logger("dns-transport"),
         &options.dns,

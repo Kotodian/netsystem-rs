@@ -16,6 +16,9 @@ pub enum CoreError {
     #[error("{stage}: {message}")]
     Lifecycle { stage: String, message: String },
 
+    #[error("service closed")]
+    ServiceClosed,
+
     #[error("{message}")]
     Internal { message: String },
 }
@@ -38,6 +41,10 @@ impl CoreError {
             stage: stage.into(),
             message: message.into(),
         }
+    }
+
+    pub fn service_closed() -> Self {
+        Self::ServiceClosed
     }
 
     pub fn internal(message: impl Into<String>) -> Self {

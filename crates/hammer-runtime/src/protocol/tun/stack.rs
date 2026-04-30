@@ -7,6 +7,7 @@ use std::time::Instant as StdInstant;
 use tracing::{debug, error, info, trace};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use hammer_adapter::{
     DnsQueryOptions, Network, OutboundManager as _, RouteDecision, RouteMetadata, SocksAddr,
 };
@@ -14,14 +15,12 @@ use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use ipnet::IpNet;
-use smoltcp::wire::IpProtocol;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant, timeout};
 
-pub use crate::TunInbound;
 use crate::dns::MessageExt;
 use crate::{DnsRouter, OutboundManager, Router};
 
@@ -353,6 +352,7 @@ impl SystemTunStack {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_interface_index(
         logger: Logger,
         router: Arc<Router>,
@@ -626,11 +626,11 @@ impl StackAddresses {
 pub enum TunDispatch {
     DnsResponse {
         metadata: RouteMetadata,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
     RoutedResponse {
         metadata: RouteMetadata,
-        payload: Vec<u8>,
+        payload: Bytes,
     },
     Dropped {
         metadata: RouteMetadata,
@@ -913,7 +913,7 @@ impl SmoltcpTunStack {
             .await?;
         Ok(TunDispatch::DnsResponse {
             metadata: tun_packet.metadata,
-            payload: MessageExt::to_bytes(&response)?,
+            payload: Bytes::from(MessageExt::to_bytes(&response)?),
         })
     }
 
@@ -946,7 +946,7 @@ impl SmoltcpTunStack {
                     .map_err(|err| HammerError::internal(format!("TUN routed TCP read: {err}")))?;
                 Ok(TunDispatch::RoutedResponse {
                     metadata: tun_packet.metadata,
-                    payload,
+                    payload: Bytes::from(payload),
                 })
             }
             Network::Udp => {
@@ -1015,7 +1015,6 @@ fn parse_tcp(
     destination: IpAddr,
     transport: &[u8],
 ) -> Result<ParsedIpPacket, HammerError> {
-    let _protocol = IpProtocol::Tcp;
     if transport.len() < 20 {
         return Err(HammerError::internal("short TCP segment"));
     }
@@ -1044,7 +1043,6 @@ fn parse_udp(
     destination: IpAddr,
     transport: &[u8],
 ) -> Result<ParsedIpPacket, HammerError> {
-    let _protocol = IpProtocol::Udp;
     if transport.len() < 8 {
         return Err(HammerError::internal("short UDP datagram"));
     }
@@ -1750,6 +1748,7 @@ async fn handle_system_udp_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn system_udp_flow_loop(
     device: Arc<dyn TunDevice>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,

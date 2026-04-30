@@ -1,14 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use h3::server;
 use hammer_core::error::HammerError;
+use hammer_runtime::hysteria2::protocol;
 use http::Response;
+use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::PrivateKeyDer;
 use tokio::io::AsyncReadExt;
 
-use super::{parse_destination, protocol, server_config};
-
-#[doc(hidden)]
 pub struct EchoServer {
     endpoint: quinn::Endpoint,
     port: u16,
@@ -36,10 +37,10 @@ impl EchoServer {
 }
 
 fn spawn_accept(endpoint: quinn::Endpoint, password: String) {
-    crate::spawn::spawn(async move {
+    hammer_runtime::spawn::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let password = password.clone();
-            crate::spawn::spawn(async move {
+            hammer_runtime::spawn::spawn(async move {
                 if let Ok(connection) = incoming.await {
                     let _ = handle_connection(connection, password).await;
                 }
@@ -98,7 +99,7 @@ async fn handle_auth(connection: quinn::Connection, password: String) -> Result<
         .finish()
         .await
         .map_err(|err| HammerError::internal(format!("finish auth response: {err}")))?;
-    crate::spawn::spawn(async move {
+    hammer_runtime::spawn::spawn(async move {
         let _incoming = incoming;
         std::future::pending::<()>().await;
     });
@@ -106,9 +107,9 @@ async fn handle_auth(connection: quinn::Connection, password: String) -> Result<
 }
 
 fn spawn_tcp_echo(connection: quinn::Connection) {
-    crate::spawn::spawn(async move {
+    hammer_runtime::spawn::spawn(async move {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            crate::spawn::spawn(async move {
+            hammer_runtime::spawn::spawn(async move {
                 if protocol::read_tcp_request_header(&mut recv).await.is_err() {
                     return;
                 }
@@ -141,11 +142,10 @@ fn spawn_tcp_echo(connection: quinn::Connection) {
 }
 
 fn spawn_udp_echo(connection: quinn::Connection) {
-    crate::spawn::spawn(async move {
+    hammer_runtime::spawn::spawn(async move {
         while let Ok(datagram) = connection.read_datagram().await {
-            if let Ok(request) = protocol::UdpMessage::decode(&datagram) {
-                let _ = parse_destination(&request.destination);
-                let mut payload = b"echo:".to_vec();
+            if let Ok(request) = protocol::UdpMessage::decode(datagram) {
+                let mut payload = bytes::BytesMut::from(&b"echo:"[..]);
                 payload.extend_from_slice(&request.payload);
                 let response = protocol::UdpMessage {
                     session_id: request.session_id,
@@ -153,10 +153,33 @@ fn spawn_udp_echo(connection: quinn::Connection) {
                     fragment_id: 0,
                     fragment_total: 1,
                     destination: request.destination,
-                    payload,
+                    payload: payload.freeze(),
                 };
-                let _ = connection.send_datagram(Bytes::from(response.encode()));
+                let _ = connection.send_datagram(response.encode());
             }
         }
     });
+}
+
+fn server_config() -> Result<quinn::ServerConfig, HammerError> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
+    let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.cert.into()],
+        PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+    )
+    .map_err(|err| HammerError::internal(format!("server certificate: {err}")))?;
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(
+        QuicServerConfig::try_from(crypto)
+            .map_err(|err| HammerError::internal(format!("server quic tls: {err}")))?,
+    ));
+    config.transport = Arc::new(quinn::TransportConfig::default());
+    Ok(config)
 }

@@ -8,16 +8,12 @@
 use std::time::Duration;
 
 use ipnet::IpNet;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Serialize};
 
 use crate::error::HammerError;
 
 use super::constants as C;
-use super::options::DomainStrategy;
-use super::parse::{
-    self, deserialize_duration_option, deserialize_ipnet_vec, is_false, is_zero_u32,
-    parse_domain_strategy,
-};
+use super::dns::DomainStrategy;
 use super::raw_struct_with_default_check;
 
 raw_struct_with_default_check! {
@@ -27,64 +23,58 @@ raw_struct_with_default_check! {
         /// Requested TUN interface name.
         pub interface_name: String => "String::is_empty",
         /// TUN MTU.
-        pub mtu: u32 => "is_zero_u32",
+        pub mtu: Option<u32> => "Option::is_none",
         /// Packet stack mode, for example `system` or `disabled`.
-        #[serde(deserialize_with = "deserialize_tun_stack")]
         pub stack: Option<TunStack> => "Option::is_none",
         /// Local interface addresses in CIDR form.
-        #[serde(
-            deserialize_with = "deserialize_tun_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
         pub address: Vec<IpNet> => "Vec::is_empty",
         /// Routes included through the tunnel.
-        #[serde(
-            deserialize_with = "deserialize_tun_route_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
         pub route_address: Vec<IpNet> => "Vec::is_empty",
         /// Routes excluded from the tunnel.
-        #[serde(
-            deserialize_with = "deserialize_tun_route_exclude_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
         pub route_exclude_address: Vec<IpNet> => "Vec::is_empty",
         /// Whether the platform should install routes automatically.
         pub auto_route: Option<bool> => "Option::is_none",
         /// Whether route installation should use strict routing semantics.
-        pub strict_route: bool => "is_false",
+        pub strict_route: Option<bool> => "Option::is_none",
         /// UDP idle timeout.
-        #[serde(
-            deserialize_with = "deserialize_tun_udp_timeout",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub udp_timeout: Option<Duration> => "Option::is_none",
         /// Whether protocol/domain sniffing is enabled.
-        pub sniff: bool => "is_false",
+        pub sniff: Option<bool> => "Option::is_none",
         /// Whether DNS packets should be intercepted by the DNS router.
-        pub hijack_dns: bool => "is_false",
+        pub hijack_dns: Option<bool> => "Option::is_none",
         /// Whether sniffed destinations replace the original destination.
-        pub sniff_override_destination: bool => "is_false",
+        pub sniff_override_destination: Option<bool> => "Option::is_none",
         /// Sniffing timeout.
-        #[serde(
-            deserialize_with = "deserialize_tun_sniff_timeout",
-            serialize_with = "serialize_duration_option"
-        )]
+        #[serde(with = "humantime_serde::option")]
         pub sniff_timeout: Option<Duration> => "Option::is_none",
         /// Domain resolution strategy for sniffed/routed traffic.
-        #[serde(deserialize_with = "deserialize_tun_domain_strategy")]
         pub domain_strategy: DomainStrategy => "DomainStrategy::is_default",
         /// Whether UDP domain unmapping is disabled for this inbound.
-        pub udp_disable_domain_unmapping: bool => "is_false",
+        pub udp_disable_domain_unmapping: Option<bool> => "Option::is_none",
         /// Whether detected QUIC traffic should be rejected.
-        pub block_quic: bool => "is_false",
+        pub block_quic: Option<bool> => "Option::is_none",
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
+pub enum RawInbound {
+    Tun(RawTunConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inbound {
     pub id: String,
     pub kind: InboundKind,
+}
+
+impl RawInbound {
+    pub(super) fn tun(&self) -> &RawTunConfig {
+        match self {
+            RawInbound::Tun(raw) => raw,
+        }
+    }
 }
 
 impl Inbound {
@@ -148,12 +138,14 @@ pub(super) fn build_tun_inbound(raw: &RawTunConfig) -> Result<(Inbound, String),
     ))
 }
 
+pub(super) fn build_inbound(raw: &RawInbound) -> Result<(Inbound, String), HammerError> {
+    match raw {
+        RawInbound::Tun(tun) => build_tun_inbound(tun),
+    }
+}
+
 fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerError> {
-    let mtu = if raw.mtu == 0 {
-        C::DEFAULT_TUN_MTU
-    } else {
-        raw.mtu
-    };
+    let mtu = raw.mtu.unwrap_or(C::DEFAULT_TUN_MTU);
     let stack = raw.stack.unwrap_or_default();
     let address = raw.address.clone();
     if address.is_empty() {
@@ -169,81 +161,8 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         route_address,
         route_exclude_address,
         auto_route,
-        strict_route: raw.strict_route,
+        strict_route: raw.strict_route.unwrap_or(false),
         stack,
         udp_timeout: raw.udp_timeout,
     })
 }
-
-fn deserialize_tun_stack<'de, D>(deserializer: D) -> Result<Option<TunStack>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "" => Ok(None),
-        "system" => Ok(Some(TunStack::System)),
-        "disabled" => Ok(Some(TunStack::Disabled)),
-        other => Err(de::Error::custom(format!(
-            "tun.stack: unknown stack {other:?}"
-        ))),
-    }
-}
-
-fn deserialize_tun_domain_strategy<'de, D>(deserializer: D) -> Result<DomainStrategy, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    parse_domain_strategy("tun.domain_strategy", &value).map_err(de::Error::custom)
-}
-
-fn deserialize_tun_udp_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("tun.udp_timeout", deserializer)
-}
-
-fn deserialize_tun_sniff_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("tun.sniff_timeout", deserializer)
-}
-
-fn deserialize_tun_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.address", deserializer)
-}
-
-fn deserialize_tun_route_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.route_address", deserializer)
-}
-
-fn deserialize_tun_route_exclude_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.route_exclude_address", deserializer)
-}
-
-fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    parse::serialize_ipnet_vec(value, serializer)
-}
-
-fn serialize_duration_option<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    parse::serialize_duration_option(value, serializer)
-}
-

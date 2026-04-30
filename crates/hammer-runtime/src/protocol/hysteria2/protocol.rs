@@ -1,5 +1,6 @@
 use std::io::{Cursor, Read};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use hammer_core::error::HammerError;
 use http::HeaderMap;
 use rand::{Rng, distributions::Alphanumeric};
@@ -35,14 +36,14 @@ pub struct AuthResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpRequest {
     pub destination: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpResponse {
     pub ok: bool,
     pub message: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,31 +64,32 @@ pub struct UdpMessage {
     pub fragment_id: u8,
     pub fragment_total: u8,
     pub destination: String,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
 }
 
 impl UdpMessage {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.header_size() + self.payload.len());
-        out.extend_from_slice(&self.session_id.to_be_bytes());
-        out.extend_from_slice(&self.packet_id.to_be_bytes());
-        out.push(self.fragment_id);
-        out.push(self.fragment_total);
+    pub fn encode(&self) -> Bytes {
+        let mut out = BytesMut::with_capacity(self.header_size() + self.payload.len());
+        out.put_slice(&self.session_id.to_be_bytes());
+        out.put_slice(&self.packet_id.to_be_bytes());
+        out.put_u8(self.fragment_id);
+        out.put_u8(self.fragment_total);
         write_varint(&mut out, self.destination.len() as u64);
-        out.extend_from_slice(self.destination.as_bytes());
-        out.extend_from_slice(&self.payload);
-        out
+        out.put_slice(self.destination.as_bytes());
+        out.put_slice(&self.payload);
+        out.freeze()
     }
 
-    pub fn decode(input: &[u8]) -> Result<Self, HammerError> {
-        if input.len() < 8 {
+    pub fn decode(input: Bytes) -> Result<Self, HammerError> {
+        let bytes = input.as_ref();
+        if bytes.len() < 8 {
             return Err(HammerError::internal("short UDP message"));
         }
-        let session_id = u32::from_be_bytes(input[0..4].try_into().unwrap());
-        let packet_id = u16::from_be_bytes(input[4..6].try_into().unwrap());
-        let fragment_id = input[6];
-        let fragment_total = input[7];
-        let mut cursor = Cursor::new(&input[8..]);
+        let session_id = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let packet_id = u16::from_be_bytes(bytes[4..6].try_into().unwrap());
+        let fragment_id = bytes[6];
+        let fragment_total = bytes[7];
+        let mut cursor = Cursor::new(&bytes[8..]);
         let destination = read_vstring(&mut cursor)?;
         let offset = 8 + cursor.position() as usize;
         Ok(Self {
@@ -96,7 +98,7 @@ impl UdpMessage {
             fragment_id,
             fragment_total,
             destination,
-            payload: input[offset..].to_vec(),
+            payload: input.slice(offset..),
         })
     }
 
@@ -146,19 +148,25 @@ pub fn auth_response_from_headers(headers: &HeaderMap) -> AuthResponse {
     }
 }
 
-pub fn encode_tcp_request(destination: &str, payload: &[u8]) -> Vec<u8> {
+pub fn encode_tcp_request(destination: &str, payload: &[u8]) -> Bytes {
     let padding = padding(64, 512);
-    let mut out = Vec::new();
+    let capacity = varint_len(FRAME_TYPE_TCP_REQUEST)
+        + varint_len(destination.len() as u64)
+        + destination.len()
+        + varint_len(padding.len() as u64)
+        + padding.len()
+        + payload.len();
+    let mut out = BytesMut::with_capacity(capacity);
     write_varint(&mut out, FRAME_TYPE_TCP_REQUEST);
     write_vstring(&mut out, destination);
     write_varint(&mut out, padding.len() as u64);
-    out.extend_from_slice(padding.as_bytes());
-    out.extend_from_slice(payload);
-    out
+    out.put_slice(padding.as_bytes());
+    out.put_slice(payload);
+    out.freeze()
 }
 
-pub fn decode_tcp_request(input: &[u8]) -> Result<TcpRequest, HammerError> {
-    let mut cursor = Cursor::new(input);
+pub fn decode_tcp_request(input: Bytes) -> Result<TcpRequest, HammerError> {
+    let mut cursor = Cursor::new(input.as_ref());
     let frame_type = read_varint(&mut cursor)?;
     if frame_type != FRAME_TYPE_TCP_REQUEST {
         return Err(HammerError::internal(format!(
@@ -170,38 +178,44 @@ pub fn decode_tcp_request(input: &[u8]) -> Result<TcpRequest, HammerError> {
     let offset = cursor.position() as usize;
     Ok(TcpRequest {
         destination,
-        payload: input[offset..].to_vec(),
+        payload: input.slice(offset..),
     })
 }
 
-pub fn encode_tcp_response(ok: bool, message: &str, payload: &[u8]) -> Vec<u8> {
+pub fn encode_tcp_response(ok: bool, message: &str, payload: &[u8]) -> Bytes {
     let padding = padding(128, 1024);
     let msg = if message.len() > MAX_MESSAGE_LENGTH as usize {
         &message[..MAX_MESSAGE_LENGTH as usize]
     } else {
         message
     };
-    let mut out = Vec::new();
-    out.push(if ok { 0 } else { 1 });
+    let capacity = 1
+        + varint_len(msg.len() as u64)
+        + msg.len()
+        + varint_len(padding.len() as u64)
+        + padding.len()
+        + payload.len();
+    let mut out = BytesMut::with_capacity(capacity);
+    out.put_u8(if ok { 0 } else { 1 });
     write_vstring(&mut out, msg);
     write_varint(&mut out, padding.len() as u64);
-    out.extend_from_slice(padding.as_bytes());
-    out.extend_from_slice(payload);
-    out
+    out.put_slice(padding.as_bytes());
+    out.put_slice(payload);
+    out.freeze()
 }
 
-pub fn decode_tcp_response(input: &[u8]) -> Result<TcpResponse, HammerError> {
+pub fn decode_tcp_response(input: Bytes) -> Result<TcpResponse, HammerError> {
     if input.is_empty() {
         return Err(HammerError::internal("short TCP response"));
     }
-    let mut cursor = Cursor::new(&input[1..]);
+    let mut cursor = Cursor::new(&input.as_ref()[1..]);
     let message = read_vstring_with_limit(&mut cursor, MAX_MESSAGE_LENGTH, true)?;
     skip_padding(&mut cursor)?;
     let offset = 1 + cursor.position() as usize;
     Ok(TcpResponse {
         ok: input[0] == 0,
         message,
-        payload: input[offset..].to_vec(),
+        payload: input.slice(offset..),
     })
 }
 
@@ -254,9 +268,9 @@ fn read_vstring_with_limit(
     String::from_utf8(buf).map_err(|err| HammerError::internal(format!("utf8 string: {err}")))
 }
 
-fn write_vstring(out: &mut Vec<u8>, value: &str) {
+fn write_vstring(out: &mut BytesMut, value: &str) {
     write_varint(out, value.len() as u64);
-    out.extend_from_slice(value.as_bytes());
+    out.put_slice(value.as_bytes());
 }
 
 async fn read_vstring_async<R: AsyncRead + Unpin>(
@@ -337,28 +351,28 @@ async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64, 
 }
 
 #[inline]
-fn write_varint(out: &mut Vec<u8>, value: u64) {
+fn write_varint(out: &mut BytesMut, value: u64) {
     match value {
-        0..=63 => out.push(value as u8),
+        0..=63 => out.put_u8(value as u8),
         64..=16_383 => {
-            out.push(((value >> 8) as u8) | 0x40);
-            out.push(value as u8);
+            out.put_u8(((value >> 8) as u8) | 0x40);
+            out.put_u8(value as u8);
         }
         16_384..=1_073_741_823 => {
-            out.push(((value >> 24) as u8) | 0x80);
-            out.push((value >> 16) as u8);
-            out.push((value >> 8) as u8);
-            out.push(value as u8);
+            out.put_u8(((value >> 24) as u8) | 0x80);
+            out.put_u8((value >> 16) as u8);
+            out.put_u8((value >> 8) as u8);
+            out.put_u8(value as u8);
         }
         _ => {
-            out.push(((value >> 56) as u8) | 0xc0);
-            out.push((value >> 48) as u8);
-            out.push((value >> 40) as u8);
-            out.push((value >> 32) as u8);
-            out.push((value >> 24) as u8);
-            out.push((value >> 16) as u8);
-            out.push((value >> 8) as u8);
-            out.push(value as u8);
+            out.put_u8(((value >> 56) as u8) | 0xc0);
+            out.put_u8((value >> 48) as u8);
+            out.put_u8((value >> 40) as u8);
+            out.put_u8((value >> 32) as u8);
+            out.put_u8((value >> 24) as u8);
+            out.put_u8((value >> 16) as u8);
+            out.put_u8((value >> 8) as u8);
+            out.put_u8(value as u8);
         }
     }
 }

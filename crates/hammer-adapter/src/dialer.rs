@@ -17,8 +17,5 @@ impl fmt::Display for Network {
     }
 }
 
-/// `runtime/common/network/dialer.go` Dialer interface — concrete async
-/// methods (DialContext / ListenPacket) come online with M6's quinn-based
-/// Hysteria2 outbound. The trait exists today so M2 can wire up dialer slots
-/// in the OutboundManager without a placeholder type.
+/// Marker for dial-capable runtime components.
 pub trait Dialer: Send + Sync + 'static {}

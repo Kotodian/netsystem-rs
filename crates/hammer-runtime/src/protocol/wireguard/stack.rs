@@ -26,6 +26,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
+use bytes::Bytes;
 use hammer_adapter::{ProxyDatagram, ProxyPacketConn, SocksAddr};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
@@ -193,7 +194,7 @@ impl ProxyPacketConn for UdpHandle {
                 host: src.ip(),
                 port: src.port(),
             },
-            payload,
+            payload: Bytes::from(payload),
         })
     }
 }

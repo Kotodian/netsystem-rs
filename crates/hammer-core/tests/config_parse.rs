@@ -209,6 +209,22 @@ fn parse_config_rejects_unknown_dns_strategy() {
 }
 
 #[test]
+fn parse_config_rejects_empty_dns_strategy() {
+    let cfg = MINIMAL_CONFIG.replacen("[dns]\n", "[dns]\nstrategy = \"\"\n", 1);
+    let err = config::parse_config(&cfg).expect_err("accepted empty dns.strategy");
+    let msg = err.to_string();
+    assert!(msg.contains("dns.strategy"), "error = {msg:?}");
+}
+
+#[test]
+fn parse_config_rejects_empty_duration() {
+    let cfg = MINIMAL_CONFIG.replacen("sniff_timeout = \"300ms\"\n", "sniff_timeout = \"\"\n", 1);
+    let err = config::parse_config(&cfg).expect_err("accepted empty duration");
+    let msg = err.to_string();
+    assert!(msg.contains("sniff_timeout"), "error = {msg:?}");
+}
+
+#[test]
 fn parse_config_rejects_unknown_log_level() {
     let cfg = MINIMAL_CONFIG.replacen("level = \"info\"\n", "level = \"verbose\"\n", 1);
     let err = config::parse_config(&cfg).expect_err("accepted unknown log.level");
@@ -300,8 +316,21 @@ fn parse_config_rejects_invalid_ip_cidr() {
     let err = config::parse_config(&cfg).expect_err("accepted invalid CIDR");
     let msg = err.to_string();
     assert!(
-        msg.contains("route.rules.ip_cidr"),
+        msg.contains("route.rules") && msg.contains("ip_cidr"),
         "error should pin user-visible rule index: {msg:?}"
+    );
+}
+
+#[test]
+fn parse_config_rejects_bare_ip_cidr() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\nip_cidr = [\"8.8.8.8\"]\noutbound = \"hysteria2\"\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted bare IP as CIDR");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("route.rules") && msg.contains("ip_cidr"),
+        "error = {msg:?}"
     );
 }
 
@@ -321,6 +350,179 @@ fn parse_config_rejects_user_rule_without_any_matcher() {
     assert!(
         msg.contains("requires exactly one matcher"),
         "error = {msg:?}"
+    );
+}
+
+#[test]
+fn parse_config_accepts_declared_inbounds_outbounds_and_dns_servers() {
+    let cfg = r#"
+[log]
+level = "info"
+
+[[inbounds]]
+type = "tun"
+id = "tun-a"
+mtu = 1400
+stack = "system"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+sniff = true
+hijack_dns = true
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "hysteria2"
+id = "hy-a"
+server = "example.com"
+server_port = 443
+password = "secret"
+sni = "example.com"
+
+[dns]
+strategy = "prefer_ipv4"
+final = "cf"
+
+[[dns.servers]]
+type = "udp"
+id = "cf"
+server = "1.1.1.1"
+via = "hy-a"
+
+[[dns.servers]]
+type = "local"
+id = "local"
+
+[route]
+auto_detect_interface = true
+"#;
+    let options = config::parse_config(cfg).expect("parse declared config");
+
+    assert_eq!(options.inbounds.len(), 1);
+    assert_eq!(options.inbounds[0].id, "tun-a");
+    assert_eq!(options.route.rules.len(), 2, "sniff + hijack-dns");
+    assert_eq!(
+        options.route.rules[0].default_options.matcher,
+        RuleMatcher::Inbound(vec!["tun-a".to_owned()])
+    );
+
+    assert_eq!(
+        options
+            .outbounds
+            .iter()
+            .filter(|outbound| outbound.id == "direct")
+            .count(),
+        1,
+        "explicit direct outbound must not be duplicated"
+    );
+    assert_eq!(
+        options.route.final_, "hy-a",
+        "default final should pick the first non-direct outbound"
+    );
+
+    assert_eq!(options.dns.servers.len(), 2);
+    assert_eq!(options.dns.final_, "cf");
+    assert_eq!(options.dns.strategy, config::DomainStrategy::PreferIpv4);
+    let resolver = options
+        .route
+        .default_domain_resolver
+        .as_ref()
+        .expect("resolver");
+    assert_eq!(
+        resolver.server, "cf",
+        "route resolver must follow dns.final for [[dns.servers]]"
+    );
+    let udp = match &options.dns.servers[0].kind {
+        DnsServerKind::Udp(o) => o,
+        _ => panic!("dns server[0] is not UDP"),
+    };
+    assert_eq!(udp.via, "hy-a");
+}
+
+#[test]
+fn parse_config_rejects_duplicate_declared_ids() {
+    let duplicate_inbound = MINIMAL_CONFIG.replace(
+        "[tun]\n",
+        r#"[[inbounds]]
+type = "tun"
+id = "dup"
+address = ["172.19.0.1/30"]
+
+[[inbounds]]
+type = "tun"
+id = "dup"
+address = ["172.19.0.2/30"]
+
+[tun]
+"#,
+    );
+    let err = config::parse_config(&duplicate_inbound).expect_err("duplicate inbound ids");
+    assert!(err.to_string().contains("duplicate inbounds id: dup"));
+
+    let duplicate_outbound = MINIMAL_CONFIG.replace(
+        "[hysteria2]\n",
+        r#"[[outbounds]]
+type = "block"
+id = "dup"
+
+[[outbounds]]
+type = "direct"
+id = "dup"
+
+[hysteria2]
+"#,
+    );
+    let err = config::parse_config(&duplicate_outbound).expect_err("duplicate outbound ids");
+    assert!(err.to_string().contains("duplicate outbounds id: dup"));
+
+    let duplicate_dns = r#"
+[log]
+level = "info"
+
+[[inbounds]]
+type = "tun"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "hysteria2"
+server = "example.com"
+server_port = 443
+password = "secret"
+sni = "example.com"
+
+[dns]
+[[dns.servers]]
+type = "local"
+id = "dup"
+
+[[dns.servers]]
+type = "hosts"
+id = "dup"
+"#;
+    let err = config::parse_config(duplicate_dns).expect_err("duplicate dns ids");
+    assert!(err.to_string().contains("duplicate dns.servers id: dup"));
+}
+
+#[test]
+fn parse_config_rejects_unknown_dns_final() {
+    let cfg = MINIMAL_CONFIG.replace(
+        "[dns]\nserver = \"https://1.1.1.1/dns-query\"\n",
+        r#"[dns]
+final = "missing"
+
+[[dns.servers]]
+type = "udp"
+id = "cf"
+server = "1.1.1.1"
+"#,
+    );
+    let err = config::parse_config(&cfg).expect_err("unknown dns final");
+    assert!(
+        err.to_string()
+            .contains("dns.final references unknown server id: missing"),
+        "error = {err:?}"
     );
 }
 
@@ -382,9 +584,7 @@ fn parse_config_accepts_wireguard_endpoint() {
     let endpoint = &options.endpoints[0];
     assert_eq!(endpoint.id, "wg-out");
     assert_eq!(endpoint.type_name(), "wireguard");
-    let wg = match &endpoint.kind {
-        EndpointKind::Wireguard(opts) => opts,
-    };
+    let EndpointKind::Wireguard(wg) = &endpoint.kind;
     assert_eq!(wg.private_key, [1u8; 32]);
     assert_eq!(wg.mtu, 1408);
     assert_eq!(wg.listen_port, 0);
@@ -417,9 +617,7 @@ allowed_ips = ["192.168.0.0/16", "fd00::/8"]
         ))
     );
     let options = config::parse_config(&cfg).expect("parse");
-    let wg = match &options.endpoints[0].kind {
-        EndpointKind::Wireguard(opts) => opts,
-    };
+    let EndpointKind::Wireguard(wg) = &options.endpoints[0].kind;
     assert_eq!(wg.peers.len(), 2);
     assert_eq!(wg.peers[1].endpoint.to_string(), "5.6.7.8:51821");
     assert_eq!(wg.peers[1].allowed_ips.len(), 2);
@@ -430,9 +628,8 @@ allowed_ips = ["192.168.0.0/16", "fd00::/8"]
 #[test]
 fn parse_config_round_trips_wireguard_pre_shared_key_and_reserved() {
     let cfg = format!(
-        "{MINIMAL_CONFIG}\n{}",
-        format!(
-            r#"
+        r#"{MINIMAL_CONFIG}
+
 [[endpoints]]
 type = "wireguard"
 id = "wg-out"
@@ -448,12 +645,9 @@ port = 51820
 allowed_ips = ["0.0.0.0/0"]
 reserved = [255, 0, 128]
 "#
-        )
     );
     let options = config::parse_config(&cfg).expect("parse");
-    let wg = match &options.endpoints[0].kind {
-        EndpointKind::Wireguard(opts) => opts,
-    };
+    let EndpointKind::Wireguard(wg) = &options.endpoints[0].kind;
     assert_eq!(wg.listen_port, 12345);
     assert_eq!(wg.mtu, 1408, "mtu defaults to sing-box's 1408 when omitted");
     assert_eq!(wg.peers[0].pre_shared_key, Some([3u8; 32]));
@@ -490,10 +684,7 @@ fn parse_config_rejects_wireguard_invalid_base64_key() {
         "{MINIMAL_CONFIG}\n[[endpoints]]\ntype = \"wireguard\"\nid = \"wg-out\"\nprivate_key = \"not-base64!!\"\naddress = [\"10.66.0.2/32\"]\n[[endpoints.peers]]\npublic_key = \"{TEST_WG_PEER_PUBLIC_KEY}\"\naddress = \"1.2.3.4\"\nport = 51820\nallowed_ips = [\"0.0.0.0/0\"]\n"
     );
     let err = config::parse_config(&cfg).expect_err("must reject bad base64");
-    assert!(
-        err.to_string().contains("endpoints[0].private_key"),
-        "got {err:?}"
-    );
+    assert!(err.to_string().contains("endpoints[0]"), "got {err:?}");
 }
 
 #[cfg(feature = "wireguard")]
@@ -519,7 +710,7 @@ fn parse_config_rejects_wireguard_peer_with_zero_port() {
     );
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint")]
 #[test]
 fn parse_config_default_endpoints_is_empty() {
     let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
@@ -544,7 +735,6 @@ mod matches {
             OutboundKind::Hysteria2(_) => "hysteria2",
             OutboundKind::Direct(_) => "direct",
             OutboundKind::Block => "block",
-            OutboundKind::Dns => "dns",
         }
     }
 }

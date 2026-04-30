@@ -1,7 +1,6 @@
-/// Stage-only Lifecycle impl helper. Most M2 managers do nothing in the
-/// individual stages beyond logging; this macro keeps the duplication out of
-/// each manager file. Manager implementations that need real per-stage logic
-/// should implement `Lifecycle` by hand.
+/// Stage-only Lifecycle impl helper. Managers that only need lifecycle log
+/// lines use this macro; managers with real per-stage work implement
+/// `Lifecycle` by hand.
 #[macro_export]
 macro_rules! impl_logging_lifecycle {
     ($ty:ty, $name:expr) => {

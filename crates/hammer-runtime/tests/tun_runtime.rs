@@ -3,7 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use hammer_adapter::{DnsTransport, Lifecycle, Network, RouteDecision, SocksAddr};
+use hammer_adapter::{
+    DnsTransport, InboundManager as _, Lifecycle, Network, RouteDecision, SocksAddr,
+};
 use hammer_core::config::{self, DirectOutboundOptions, Options, Outbound, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
@@ -53,11 +55,14 @@ final = "hysteria2"
 }
 
 fn router_from_options(options: &Options) -> Arc<Router> {
-    let outbound = Arc::new(OutboundManager::from_options(
-        logger("outbound"),
-        options.route.final_.clone(),
-        &options.outbounds,
-    ));
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            options.route.final_.clone(),
+            &options.outbounds,
+        )
+        .expect("outbound manager"),
+    );
     Arc::new(
         Router::from_options(logger("router"), options.route.clone(), outbound).expect("router"),
     )
@@ -68,11 +73,10 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
         id: final_outbound.to_owned(),
         kind: OutboundKind::Direct(DirectOutboundOptions::default()),
     }];
-    let outbound = Arc::new(OutboundManager::from_options(
-        logger("outbound"),
-        final_outbound,
-        &outbounds,
-    ));
+    let outbound = Arc::new(
+        OutboundManager::from_options(logger("outbound"), final_outbound, &outbounds)
+            .expect("outbound manager"),
+    );
     let route_options = hammer_core::config::RouteOptions {
         final_: final_outbound.to_owned(),
         ..options.route.clone()
@@ -258,7 +262,7 @@ async fn tun_dispatch_routes_udp_to_direct_outbound() {
         panic!("unexpected dispatch result");
     };
     assert_eq!(metadata.network, Network::Udp);
-    assert_eq!(payload, b"echo:payload");
+    assert_eq!(payload.as_ref(), b"echo:payload");
 }
 
 #[test]
