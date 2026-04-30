@@ -389,8 +389,8 @@ mod tests {
     use hammer_core::config::WireguardPeerOptions;
     use hammer_core::log::{DiscardWriter, Factory};
 
-    fn logger(tag: &'static str) -> Logger {
-        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+    fn logger(id: &'static str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
     fn x25519_public(secret: [u8; 32]) -> [u8; 32] {

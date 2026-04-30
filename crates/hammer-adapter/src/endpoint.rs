@@ -14,6 +14,6 @@ pub trait Endpoint: Outbound + Lifecycle {}
 
 pub trait EndpointManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn Endpoint>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn Endpoint>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn get(&self, id: &str) -> Option<Arc<dyn Endpoint>>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }

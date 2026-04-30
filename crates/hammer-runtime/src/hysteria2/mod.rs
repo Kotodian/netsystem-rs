@@ -254,7 +254,7 @@ impl Drop for Hysteria2PacketConn {
 
 pub struct Hysteria2Outbound {
     logger: Logger,
-    tag: String,
+    id: String,
     options: Hysteria2OutboundOptions,
     networks: Vec<Network>,
     dependencies: Vec<String>,
@@ -263,20 +263,20 @@ pub struct Hysteria2Outbound {
 }
 
 impl Hysteria2Outbound {
-    pub fn new(logger: Logger, tag: String, options: Hysteria2OutboundOptions) -> Self {
-        Self::new_with_protector(logger, tag, options, SocketProtector::default())
+    pub fn new(logger: Logger, id: String, options: Hysteria2OutboundOptions) -> Self {
+        Self::new_with_protector(logger, id, options, SocketProtector::default())
     }
 
     pub(crate) fn new_with_protector(
         logger: Logger,
-        tag: String,
+        id: String,
         options: Hysteria2OutboundOptions,
         protector: SocketProtector,
     ) -> Self {
         let networks = adapter_networks(&options.network);
         Self {
             logger,
-            tag,
+            id,
             options,
             networks,
             dependencies: Vec::new(),
@@ -323,8 +323,8 @@ impl Outbound for Hysteria2Outbound {
         "hysteria2"
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn networks(&self) -> &[Network] {
@@ -344,7 +344,7 @@ impl Outbound for Hysteria2Outbound {
         if !self.networks.contains(&network) {
             return Err(HammerError::internal(format!(
                 "{network} is not supported by outbound: {}",
-                self.tag
+                self.id
             )));
         }
         match network {
@@ -362,7 +362,7 @@ impl Outbound for Hysteria2Outbound {
         if !self.networks.contains(&Network::Udp) {
             return Err(HammerError::internal(format!(
                 "udp is not supported by outbound: {}",
-                self.tag
+                self.id
             )));
         }
         Ok(Box::new(self.client().await?.listen_udp().await?))

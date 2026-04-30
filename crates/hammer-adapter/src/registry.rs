@@ -11,14 +11,14 @@ use hammer_core::error::CoreError;
 ///   - `Options` — owned options struct deserialized from TOML
 ///   - `Output` — produced trait object (e.g. `Arc<dyn Outbound>`)
 ///   - `register::<O: Into<Options>>(name, ctor)` — wires a concrete protocol
-/// then the manager calls `create(ctx, tag, type_name, options)` at config
+/// then the manager calls `create(ctx, id, type_name, options)` at config
 /// time. M2 ships the framework + signatures; concrete protocol registrations
 /// land alongside their implementations in M3-M7.
 pub trait Constructor<Output>: Send + Sync + 'static {
     fn create(
         &self,
         ctx: &RegistryContext,
-        tag: &str,
+        id: &str,
         options: Box<dyn Any + Send>,
     ) -> Result<Output, CoreError>;
 }
@@ -51,7 +51,7 @@ impl<Output> Registry<Output> {
     pub fn create(
         &self,
         ctx: &RegistryContext,
-        tag: &str,
+        id: &str,
         type_name: &str,
         options: Box<dyn Any + Send>,
     ) -> Result<Output, CoreError> {
@@ -59,7 +59,7 @@ impl<Output> Registry<Output> {
         let ctor = guard
             .get(type_name)
             .ok_or_else(|| CoreError::config_validation(format!("unknown type: {type_name}")))?;
-        ctor.create(ctx, tag, options)
+        ctor.create(ctx, id, options)
     }
 }
 

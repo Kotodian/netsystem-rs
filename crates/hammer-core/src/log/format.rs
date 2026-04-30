@@ -17,18 +17,18 @@ impl Formatter {
         }
     }
 
-    /// Equivalent to Go's `Format(ctx, level, tag, message, timestamp)`.
+    /// Equivalent to Go's `Format(ctx, level, id, message, timestamp)`.
     /// Adds a trailing `\n` unless `disable_line_break` is set or one is already present.
     pub fn format(
         &self,
         ctx: Option<ConnId>,
         level: Level,
-        tag: &str,
+        id: &str,
         message: &str,
         timestamp: Instant,
     ) -> String {
         let elapsed = timestamp.saturating_duration_since(self.base_time);
-        let line = build_hammer_line(ctx, level, tag, message, elapsed);
+        let line = build_hammer_line(ctx, level, id, message, elapsed);
         apply_line_break(line, self.disable_line_break)
     }
 
@@ -37,18 +37,18 @@ impl Formatter {
         &self,
         ctx: Option<ConnId>,
         level: Level,
-        tag: &str,
+        id: &str,
         message: &str,
         timestamp: Instant,
     ) -> String {
-        self.format(ctx, level, tag, message, timestamp)
+        self.format(ctx, level, id, message, timestamp)
     }
 }
 
 fn build_hammer_line(
     ctx: Option<ConnId>,
     level: Level,
-    tag: &str,
+    id: &str,
     message: &str,
     elapsed: Duration,
 ) -> String {
@@ -61,9 +61,9 @@ fn build_hammer_line(
         s.push_str(" c#");
         push_hex(&mut s, id.short(), 4);
     }
-    if !tag.is_empty() {
+    if !id.is_empty() {
         s.push(' ');
-        s.push_str(&display_tag(tag));
+        s.push_str(&display_id(id));
         s.push(':');
     }
     s.push(' ');
@@ -89,34 +89,34 @@ fn apply_line_break(message: String, strip: bool) -> String {
     }
 }
 
-pub fn display_tag(tag: &str) -> String {
-    match tag {
+pub fn display_id(id: &str) -> String {
+    match id {
         "dns" => return "resolve".into(),
         "dns-transport" => return "resolve.transport".into(),
         "router" => return "path".into(),
         _ => {}
     }
-    if let Some(rest) = tag.strip_prefix("outbound/") {
+    if let Some(rest) = id.strip_prefix("outbound/") {
         return match rest {
             "direct" => "egress.direct".into(),
             "hysteria2" => "egress.hy2".into(),
             other => format!("egress.{other}"),
         };
     }
-    if let Some(rest) = tag.strip_prefix("inbound/") {
+    if let Some(rest) = id.strip_prefix("inbound/") {
         return if rest == "tun" {
             "tun.in".into()
         } else {
             format!("ingress.{rest}")
         };
     }
-    if let Some(rest) = tag.strip_prefix("dns/transport/") {
+    if let Some(rest) = id.strip_prefix("dns/transport/") {
         return format!("resolve.transport.{rest}");
     }
-    if let Some(rest) = tag.strip_prefix("dns/") {
+    if let Some(rest) = id.strip_prefix("dns/") {
         return format!("resolve.{rest}");
     }
-    tag.to_owned()
+    id.to_owned()
 }
 
 fn push_elapsed(out: &mut String, duration: Duration) {
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn format_platform_without_tag() {
+    fn format_platform_without_id() {
         let (formatter, ts) = fixture(Duration::from_millis(1));
         let got = formatter.format_platform(None, Level::Warn, "", "started", ts);
         assert_eq!(got, "H[W] +0.001s started");
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn display_tag_table() {
+    fn display_id_table() {
         let cases = [
             ("dns", "resolve"),
             ("dns-transport", "resolve.transport"),
@@ -228,7 +228,7 @@ mod tests {
             ("certificate-provider", "certificate-provider"),
         ];
         for (input, want) in cases {
-            assert_eq!(display_tag(input), want, "input = {input}");
+            assert_eq!(display_id(input), want, "input = {input}");
         }
     }
 

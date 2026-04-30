@@ -872,7 +872,7 @@ async fn tcp_bridge_task(
     let mut buf = vec![0u8; TCP_BUF];
     loop {
         tokio::select! {
-            // User wrote -> we read from the actor side and forward to socket.
+            // User wrote -> we read from the actor stage and forward to socket.
             res = duplex.read(&mut buf) => {
                 match res {
                     Ok(0) | Err(_) => break,

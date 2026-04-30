@@ -9,13 +9,13 @@ use hammer_core::lifecycle::Lifecycle;
 /// orchestration needs; protocol-specific methods land in M5/M7.
 pub trait Inbound: Lifecycle {
     fn type_name(&self) -> &str;
-    fn tag(&self) -> &str;
+    fn id(&self) -> &str;
     fn as_any(&self) -> &dyn Any;
 }
 
 /// `adapter.InboundManager` — owns the live set of inbounds.
 pub trait InboundManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn Inbound>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn Inbound>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn get(&self, id: &str) -> Option<Arc<dyn Inbound>>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }

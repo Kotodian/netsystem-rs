@@ -28,7 +28,7 @@ pub struct LogOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inbound {
-    pub tag: String,
+    pub id: String,
     pub kind: InboundKind,
 }
 
@@ -49,9 +49,9 @@ pub enum InboundKind {
 pub struct TunInboundOptions {
     pub interface_name: String,
     pub mtu: u32,
-    pub address: Vec<Prefix>,
-    pub route_address: Vec<Prefix>,
-    pub route_exclude_address: Vec<Prefix>,
+    pub address: Vec<IpNet>,
+    pub route_address: Vec<IpNet>,
+    pub route_exclude_address: Vec<IpNet>,
     pub auto_route: bool,
     pub strict_route: bool,
     pub stack: TunStack,
@@ -77,7 +77,7 @@ impl TunStack {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outbound {
-    pub tag: String,
+    pub id: String,
     pub kind: OutboundKind,
 }
 
@@ -107,7 +107,7 @@ pub enum OutboundKind {
 #[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
-    pub tag: String,
+    pub id: String,
     pub kind: EndpointKind,
 }
 
@@ -256,7 +256,7 @@ pub struct DnsOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsServer {
-    pub tag: String,
+    pub id: String,
     pub kind: DnsServerKind,
 }
 
@@ -315,13 +315,20 @@ pub struct Rule {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DefaultRule {
-    pub inbound: Vec<String>,
-    pub protocol: Vec<String>,
-    pub domain: Vec<String>,
-    pub domain_suffix: Vec<String>,
-    pub domain_keyword: Vec<String>,
-    pub ip_cidr: Vec<IpNet>,
+    pub matcher: RuleMatcher,
     pub action: RuleActionKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum RuleMatcher {
+    #[default]
+    Any,
+    Inbound(Vec<String>),
+    Protocol(Vec<String>),
+    Domain(Vec<String>),
+    DomainSuffix(Vec<String>),
+    DomainKeyword(Vec<String>),
+    IpCidr(Vec<IpNet>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,10 +412,6 @@ impl DomainStrategy {
         }
     }
 }
-
-/// Thin wrapper preserving the original textual prefix until M5 promotes it to `ipnet::IpNet`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prefix(pub String);
 
 pub mod constants {
     pub const TYPE_TUN: &str = "tun";

@@ -8,6 +8,6 @@ use hammer_core::lifecycle::{Lifecycle, LifecycleService};
 /// list; the trait exists so the manager set in `service.go` matches one-to-one.
 pub trait ServiceManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn LifecycleService>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn LifecycleService>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn get(&self, id: &str) -> Option<Arc<dyn LifecycleService>>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }

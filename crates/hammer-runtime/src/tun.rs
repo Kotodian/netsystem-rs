@@ -327,7 +327,7 @@ pub struct SystemTunStack {
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
-    inbound_tag: String,
+    inbound_id: String,
     options: hammer_core::config::TunInboundOptions,
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
@@ -343,19 +343,12 @@ impl SystemTunStack {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
-        inbound_tag: String,
+        inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
         device: Arc<dyn TunDevice>,
     ) -> Self {
         Self::new_with_interface_index(
-            logger,
-            router,
-            dns_router,
-            outbound,
-            inbound_tag,
-            options,
-            device,
-            None,
+            logger, router, dns_router, outbound, inbound_id, options, device, None,
         )
     }
 
@@ -364,7 +357,7 @@ impl SystemTunStack {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
-        inbound_tag: String,
+        inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
         device: Arc<dyn TunDevice>,
         tun_interface_index: Option<u32>,
@@ -375,7 +368,7 @@ impl SystemTunStack {
             router,
             dns_router,
             outbound,
-            inbound_tag,
+            inbound_id,
             options,
             device,
             tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
@@ -394,10 +387,10 @@ impl SystemTunStack {
         let mut handles = Vec::new();
         let mut routes = SystemStackRoutes::default();
         if let Some(v4) = addresses.v4 {
-            let listener =
-                bind_system_listener(IpAddr::V4(v4.listener), self.tun_interface_index).map_err(
-                    |err| HammerError::internal(format!("bind IPv4 system TCP listener: {err}")),
-                )?;
+            let listener = bind_system_listener(IpAddr::V4(v4.listener), self.tun_interface_index)
+                .map_err(|err| {
+                    HammerError::internal(format!("bind IPv4 system TCP listener: {err}"))
+                })?;
             let port = listener
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv4 listener addr: {err}")))?
@@ -409,7 +402,7 @@ impl SystemTunStack {
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
-                self.inbound_tag.clone(),
+                self.inbound_id.clone(),
                 listener,
             )));
             routes.v4 = Some(SystemStackRoute {
@@ -419,10 +412,10 @@ impl SystemTunStack {
             });
         }
         if let Some(v6) = addresses.v6 {
-            let listener =
-                bind_system_listener(IpAddr::V6(v6.listener), self.tun_interface_index).map_err(
-                    |err| HammerError::internal(format!("bind IPv6 system TCP listener: {err}")),
-                )?;
+            let listener = bind_system_listener(IpAddr::V6(v6.listener), self.tun_interface_index)
+                .map_err(|err| {
+                    HammerError::internal(format!("bind IPv6 system TCP listener: {err}"))
+                })?;
             let port = listener
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv6 listener addr: {err}")))?
@@ -436,7 +429,7 @@ impl SystemTunStack {
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
-                self.inbound_tag.clone(),
+                self.inbound_id.clone(),
                 listener,
             )));
             routes.v6 = Some(SystemStackRoute {
@@ -450,7 +443,7 @@ impl SystemTunStack {
             Arc::clone(&self.router),
             Arc::clone(&self.dns_router),
             Arc::clone(&self.outbound),
-            self.inbound_tag.clone(),
+            self.inbound_id.clone(),
             Arc::clone(&self.device),
             Arc::clone(&self.tcp_nat),
             Arc::clone(&self.udp_flows),
@@ -602,11 +595,7 @@ impl StackAddresses {
     fn from_options(options: &hammer_core::config::TunInboundOptions) -> Result<Self, HammerError> {
         let mut v4 = None;
         let mut v6 = None;
-        for prefix in &options.address {
-            let net: IpNet = prefix
-                .0
-                .parse()
-                .map_err(|err| HammerError::internal(format!("parse TUN address: {err}")))?;
+        for net in &options.address {
             match net {
                 IpNet::V4(net) if v4.is_none() => {
                     let listener = net.addr();
@@ -847,17 +836,17 @@ pub struct SmoltcpTunStack {
     router: Arc<Router>,
     dns_router: Option<Arc<DnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
-    inbound_tag: String,
+    inbound_id: String,
 }
 
 impl SmoltcpTunStack {
-    pub fn new(logger: Logger, router: Arc<Router>, inbound_tag: String) -> Self {
+    pub fn new(logger: Logger, router: Arc<Router>, inbound_id: String) -> Self {
         Self {
             logger,
             router,
             dns_router: None,
             outbound: None,
-            inbound_tag,
+            inbound_id,
         }
     }
 
@@ -866,14 +855,14 @@ impl SmoltcpTunStack {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
-        inbound_tag: String,
+        inbound_id: String,
     ) -> Self {
         Self {
             logger,
             router,
             dns_router: Some(dns_router),
             outbound: Some(outbound),
-            inbound_tag,
+            inbound_id,
         }
     }
 
@@ -907,7 +896,7 @@ impl SmoltcpTunStack {
         let parsed = parse_ip_packet(packet)?;
         let mut tun_packet = TunPacket {
             metadata: RouteMetadata {
-                inbound: self.inbound_tag.clone(),
+                inbound: self.inbound_id.clone(),
                 network: parsed.network,
                 source: Some(parsed.source),
                 destination: Some(parsed.destination),
@@ -940,15 +929,15 @@ impl SmoltcpTunStack {
     async fn dispatch_route(
         &self,
         tun_packet: TunPacket,
-        outbound_tag: &str,
+        outbound_id: &str,
     ) -> Result<TunDispatch, HammerError> {
         let outbound_manager = self
             .outbound
             .as_ref()
             .ok_or_else(|| HammerError::internal("TUN outbound manager is not configured"))?;
         let outbound = outbound_manager
-            .get(outbound_tag)
-            .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_tag}")))?;
+            .get(outbound_id)
+            .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
         let destination = tun_packet
             .metadata
             .destination
@@ -1481,7 +1470,7 @@ async fn accept_tcp_loop(
     router: Arc<Router>,
     outbound: Arc<OutboundManager>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    inbound_tag: String,
+    inbound_id: String,
     listener: TcpListener,
 ) {
     loop {
@@ -1503,10 +1492,10 @@ async fn accept_tcp_loop(
         let router = Arc::clone(&router);
         let outbound = Arc::clone(&outbound);
         let logger = logger.clone();
-        let inbound_tag = inbound_tag.clone();
+        let inbound_id = inbound_id.clone();
         tokio::spawn(async move {
             let mut metadata = RouteMetadata {
-                inbound: inbound_tag,
+                inbound: inbound_id,
                 network: Network::Tcp,
                 source: Some(session.source.clone()),
                 destination: Some(session.destination.clone()),
@@ -1520,14 +1509,14 @@ async fn accept_tcp_loop(
                 }
             };
             let RouteDecision::Route {
-                outbound: outbound_tag,
+                outbound: outbound_id,
             } = decision
             else {
                 logger.debug("system TCP connection rejected");
                 return;
             };
-            let Some(outbound) = outbound.get(&outbound_tag) else {
-                logger.error(format!("outbound not found: {outbound_tag}"));
+            let Some(outbound) = outbound.get(&outbound_id) else {
+                logger.error(format!("outbound not found: {outbound_id}"));
                 return;
             };
             let mut outbound_stream = match outbound
@@ -1556,7 +1545,7 @@ async fn packet_loop(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
-    inbound_tag: String,
+    inbound_id: String,
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
@@ -1647,7 +1636,7 @@ async fn packet_loop(
                 Arc::clone(&router),
                 Arc::clone(&dns_router),
                 Arc::clone(&outbound),
-                inbound_tag.clone(),
+                inbound_id.clone(),
                 Arc::clone(&device),
                 Arc::clone(&udp_flows),
                 udp_timeout,
@@ -1668,7 +1657,7 @@ async fn handle_system_udp_packet(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
-    inbound_tag: String,
+    inbound_id: String,
     device: Arc<dyn TunDevice>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     udp_timeout: Duration,
@@ -1677,7 +1666,7 @@ async fn handle_system_udp_packet(
 ) -> Result<(), HammerError> {
     let mut tun_packet = TunPacket {
         metadata: RouteMetadata {
-            inbound: inbound_tag,
+            inbound: inbound_id,
             network: Network::Udp,
             source: Some(parsed.source.clone()),
             destination: Some(parsed.destination.clone()),
@@ -1712,10 +1701,10 @@ async fn handle_system_udp_packet(
             }
         }
         RouteDecision::Route {
-            outbound: outbound_tag,
+            outbound: outbound_id,
         } => {
             let key = UdpFlowKey {
-                outbound: outbound_tag.clone(),
+                outbound: outbound_id.clone(),
                 source: (parsed.source.host, parsed.source.port),
                 destination: (parsed.destination.host, parsed.destination.port),
             };
@@ -1730,9 +1719,9 @@ async fn handle_system_udp_packet(
             } {
                 sender
             } else {
-                let Some(outbound_item) = outbound.get(&outbound_tag) else {
+                let Some(outbound_item) = outbound.get(&outbound_id) else {
                     return Err(HammerError::internal(format!(
-                        "outbound not found: {outbound_tag}"
+                        "outbound not found: {outbound_id}"
                     )));
                 };
                 let packet_conn = outbound_item.listen_packet().await?;

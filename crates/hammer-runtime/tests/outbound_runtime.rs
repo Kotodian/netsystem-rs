@@ -16,8 +16,8 @@ use hammer_runtime::OutboundManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-fn logger(tag: &str) -> Logger {
-    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+fn logger(id: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
 
 fn destination(addr: std::net::SocketAddr) -> SocksAddr {
@@ -91,7 +91,7 @@ async fn direct_outbound_dials_tcp_with_initial_payload() {
         logger("outbound"),
         "direct",
         &[Outbound {
-            tag: "direct".to_owned(),
+            id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
     );
@@ -128,7 +128,7 @@ async fn direct_outbound_keeps_tcp_stream_full_duplex_after_dial() {
         logger("outbound"),
         "direct",
         &[Outbound {
-            tag: "direct".to_owned(),
+            id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
     );
@@ -164,7 +164,7 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
         logger("outbound"),
         "direct",
         &[Outbound {
-            tag: "direct".to_owned(),
+            id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
     );
@@ -201,7 +201,7 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
         logger("outbound"),
         "direct",
         &[Outbound {
-            tag: "direct".to_owned(),
+            id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
         Arc::clone(&platform) as Arc<dyn PlatformInterface>,
@@ -234,11 +234,11 @@ async fn block_and_dns_outbounds_return_protocol_errors() {
         "block",
         &[
             Outbound {
-                tag: "block".to_owned(),
+                id: "block".to_owned(),
                 kind: OutboundKind::Block,
             },
             Outbound {
-                tag: "dns-out".to_owned(),
+                id: "dns-out".to_owned(),
                 kind: OutboundKind::Dns,
             },
         ],
@@ -282,19 +282,19 @@ fn outbound_manager_registers_concrete_m7_outbounds() {
         "direct",
         &[
             Outbound {
-                tag: "hysteria2".to_owned(),
+                id: "hysteria2".to_owned(),
                 kind: OutboundKind::Hysteria2(Hysteria2OutboundOptions::default()),
             },
             Outbound {
-                tag: "direct".to_owned(),
+                id: "direct".to_owned(),
                 kind: OutboundKind::Direct(DirectOutboundOptions::default()),
             },
             Outbound {
-                tag: "block".to_owned(),
+                id: "block".to_owned(),
                 kind: OutboundKind::Block,
             },
             Outbound {
-                tag: "dns-out".to_owned(),
+                id: "dns-out".to_owned(),
                 kind: OutboundKind::Dns,
             },
         ],
@@ -304,5 +304,5 @@ fn outbound_manager_registers_concrete_m7_outbounds() {
     assert_eq!(manager.get("direct").unwrap().type_name(), "direct");
     assert_eq!(manager.get("block").unwrap().type_name(), "block");
     assert_eq!(manager.get("dns-out").unwrap().type_name(), "dns");
-    assert_eq!(manager.default().unwrap().tag(), "direct");
+    assert_eq!(manager.default().unwrap().id(), "direct");
 }

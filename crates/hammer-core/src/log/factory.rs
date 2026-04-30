@@ -39,9 +39,9 @@ impl Factory {
         })
     }
 
-    pub fn new_logger(self: &Arc<Self>, tag: impl Into<String>) -> Logger {
+    pub fn new_logger(self: &Arc<Self>, id: impl Into<String>) -> Logger {
         Logger {
-            tag: Arc::from(tag.into()),
+            id: Arc::from(id.into()),
             factory: Arc::clone(self),
         }
     }
@@ -51,7 +51,7 @@ impl Factory {
 
 #[derive(Clone)]
 pub struct Logger {
-    tag: Arc<str>,
+    id: Arc<str>,
     factory: Arc<Factory>,
 }
 
@@ -68,7 +68,7 @@ impl Logger {
         let line = self
             .factory
             .formatter
-            .format(ctx, level, &self.tag, &message.into(), ts);
+            .format(ctx, level, &self.id, &message.into(), ts);
         self.factory.writer.write_message(level, line);
     }
 

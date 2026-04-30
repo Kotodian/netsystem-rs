@@ -31,7 +31,7 @@ pub trait ProxyPacketConn: Send + Sync + 'static {
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     fn type_name(&self) -> &str;
-    fn tag(&self) -> &str;
+    fn id(&self) -> &str;
     fn networks(&self) -> &[Network];
     fn dependencies(&self) -> &[String];
 
@@ -49,7 +49,7 @@ pub trait Outbound: Send + Sync + 'static {
 /// fallback (used when a route rule has no explicit outbound match).
 pub trait OutboundManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn Outbound>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>>;
+    fn get(&self, id: &str) -> Option<Arc<dyn Outbound>>;
     fn default(&self) -> Option<Arc<dyn Outbound>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }

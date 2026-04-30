@@ -16,35 +16,35 @@ use crate::socket_protector::SocketProtector;
 pub struct OutboundManager {
     logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn Outbound>>>,
-    default_tag: String,
+    default_id: String,
 }
 
 impl OutboundManager {
-    pub fn new(logger: Logger, default_tag: impl Into<String>) -> Self {
+    pub fn new(logger: Logger, default_id: impl Into<String>) -> Self {
         Self {
             logger,
             items: Mutex::new(HashMap::new()),
-            default_tag: default_tag.into(),
+            default_id: default_id.into(),
         }
     }
 
     pub fn from_options(
         logger: Logger,
-        default_tag: impl Into<String>,
+        default_id: impl Into<String>,
         options: &[OutboundOptions],
     ) -> Self {
-        Self::from_options_with_protector(logger, default_tag, options, SocketProtector::default())
+        Self::from_options_with_protector(logger, default_id, options, SocketProtector::default())
     }
 
     pub fn from_options_with_platform(
         logger: Logger,
-        default_tag: impl Into<String>,
+        default_id: impl Into<String>,
         options: &[OutboundOptions],
         platform: Arc<dyn PlatformInterface>,
     ) -> Self {
         Self::from_options_with_protector(
             logger,
-            default_tag,
+            default_id,
             options,
             SocketProtector::new(platform),
         )
@@ -52,11 +52,11 @@ impl OutboundManager {
 
     pub(crate) fn from_options_with_protector(
         logger: Logger,
-        default_tag: impl Into<String>,
+        default_id: impl Into<String>,
         options: &[OutboundOptions],
         protector: SocketProtector,
     ) -> Self {
-        let manager = Self::new(logger, default_tag);
+        let manager = Self::new(logger, default_id);
         for option in options {
             manager.register_descriptor_with_protector(option, protector.clone());
         }
@@ -68,15 +68,15 @@ impl OutboundManager {
     }
 
     /// Register an already-constructed outbound (e.g. an endpoint that lives
-    /// in `EndpointManager`) so the router can resolve its tag through the
+    /// in `EndpointManager`) so the router can resolve its id through the
     /// usual `OutboundManager::get` path. Mirrors sing-box, where every
     /// endpoint shows up as both an Endpoint *and* an Outbound — same Arc,
     /// two views.
-    pub fn register_outbound(&self, tag: String, descriptor: Arc<dyn Outbound>) {
+    pub fn register_outbound(&self, id: String, descriptor: Arc<dyn Outbound>) {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
-            .insert(tag, descriptor);
+            .insert(id, descriptor);
     }
 
     fn register_descriptor_with_protector(
@@ -87,24 +87,24 @@ impl OutboundManager {
         let descriptor: Arc<dyn Outbound> = match &option.kind {
             OutboundKind::Hysteria2(o) => Arc::new(Hysteria2Outbound::new_with_protector(
                 self.logger.clone(),
-                option.tag.clone(),
+                option.id.clone(),
                 o.clone(),
                 protector.clone(),
             )),
             OutboundKind::Direct(_) => Arc::new(DirectOutbound::new_with_protector(
                 self.logger.clone(),
-                option.tag.clone(),
+                option.id.clone(),
                 protector,
             )),
             OutboundKind::Block => {
-                Arc::new(BlockOutbound::new(self.logger.clone(), option.tag.clone()))
+                Arc::new(BlockOutbound::new(self.logger.clone(), option.id.clone()))
             }
-            OutboundKind::Dns => Arc::new(DnsOutbound::new(option.tag.clone())),
+            OutboundKind::Dns => Arc::new(DnsOutbound::new(option.id.clone())),
         };
         self.items
             .lock()
             .expect("OutboundManager poisoned")
-            .insert(option.tag.clone(), descriptor);
+            .insert(option.id.clone(), descriptor);
     }
 }
 
@@ -120,26 +120,26 @@ impl OutboundManagerTrait for OutboundManager {
             .collect()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
+    fn get(&self, id: &str) -> Option<Arc<dyn Outbound>> {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
     fn default(&self) -> Option<Arc<dyn Outbound>> {
-        if self.default_tag.is_empty() {
+        if self.default_id.is_empty() {
             return None;
         }
-        self.get(&self.default_tag)
+        self.get(&self.default_id)
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }

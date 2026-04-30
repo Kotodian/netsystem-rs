@@ -33,19 +33,19 @@ impl ServiceManagerTrait for ServiceManager {
             .collect()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn LifecycleService>> {
+    fn get(&self, id: &str) -> Option<Arc<dyn LifecycleService>> {
         self.items
             .lock()
             .expect("ServiceManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("ServiceManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }

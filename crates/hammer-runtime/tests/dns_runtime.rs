@@ -20,8 +20,8 @@ use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-fn logger(tag: &str) -> Logger {
-    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+fn logger(id: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
 
 fn query(name: &str, record_type: RecordType) -> Message {
@@ -131,7 +131,7 @@ impl DnsTransport for CountingTransport {
         "mock"
     }
 
-    fn tag(&self) -> &str {
+    fn id(&self) -> &str {
         "mock"
     }
 
@@ -456,7 +456,7 @@ server = "hosts"
 
     let default = manager.default().expect("default transport");
     assert_eq!(default.type_name(), "hosts");
-    assert_eq!(default.tag(), "default");
+    assert_eq!(default.id(), "default");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

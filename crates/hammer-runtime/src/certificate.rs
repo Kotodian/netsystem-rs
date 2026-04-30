@@ -60,19 +60,19 @@ impl CertificateProviderManagerTrait for CertificateProviderManager {
             .collect()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn CertificateProviderService>> {
+    fn get(&self, id: &str) -> Option<Arc<dyn CertificateProviderService>> {
         self.items
             .lock()
             .expect("CertificateProviderManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("CertificateProviderManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }

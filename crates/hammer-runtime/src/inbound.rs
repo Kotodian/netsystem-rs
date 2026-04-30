@@ -32,7 +32,7 @@ impl InboundManager {
             match &option.kind {
                 InboundKind::Tun(tun) => {
                     manager.register(Arc::new(TunInbound::new(
-                        option.tag.clone(),
+                        option.id.clone(),
                         logger.clone(),
                         tun.clone(),
                         Arc::clone(&router),
@@ -56,7 +56,7 @@ impl InboundManager {
             match &option.kind {
                 InboundKind::Tun(tun) => {
                     manager.register(Arc::new(TunInbound::new_with_runtime(
-                        option.tag.clone(),
+                        option.id.clone(),
                         logger.clone(),
                         tun.clone(),
                         Arc::clone(&router),
@@ -74,11 +74,11 @@ impl InboundManager {
         self.items
             .lock()
             .expect("InboundManager poisoned")
-            .insert(inbound.tag().to_owned(), inbound);
+            .insert(inbound.id().to_owned(), inbound);
     }
 
-    pub fn get(&self, tag: &str) -> Option<Arc<dyn Inbound>> {
-        <Self as InboundManagerTrait>::get(self, tag)
+    pub fn get(&self, id: &str) -> Option<Arc<dyn Inbound>> {
+        <Self as InboundManagerTrait>::get(self, id)
     }
 }
 
@@ -99,7 +99,7 @@ impl Lifecycle for InboundManager {
         let mut errors = Vec::new();
         for inbound in self.list() {
             if let Err(err) = inbound.close() {
-                errors.push(format!("{}: {}", inbound.tag(), err));
+                errors.push(format!("{}: {}", inbound.id(), err));
             }
         }
         self.logger.debug("close");
@@ -121,19 +121,19 @@ impl InboundManagerTrait for InboundManager {
             .collect()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn Inbound>> {
+    fn get(&self, id: &str) -> Option<Arc<dyn Inbound>> {
         self.items
             .lock()
             .expect("InboundManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("InboundManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }

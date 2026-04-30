@@ -1,47 +1,17 @@
+use std::net::IpAddr;
 #[cfg(feature = "wireguard")]
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 #[cfg(feature = "wireguard")]
 use base64::Engine as _;
 #[cfg(feature = "wireguard")]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-#[cfg(feature = "wireguard")]
 use ipnet::IpNet;
 
 use crate::error::HammerError;
 
-use super::options::{DomainStrategy, Prefix};
-
-/// Validate that `value` parses as either an IP address (with optional `/prefix`)
-/// or returns the raw text wrapped in `Prefix`. We keep the original textual form
-/// because M1 does not consume prefixes operationally — they are persisted
-/// verbatim and re-validated at use-time in M5.
-pub fn parse_prefix(field: &str, value: &str) -> Result<Prefix, HammerError> {
-    let (host, prefix_part) = match value.split_once('/') {
-        Some((h, p)) => (h, Some(p)),
-        None => (value, None),
-    };
-    let ip: std::net::IpAddr = host.parse().map_err(|_| {
-        HammerError::config_validation(format!("{field}: invalid IP address {host:?}"))
-    })?;
-    if let Some(p) = prefix_part {
-        let bits: u8 = p.parse().map_err(|_| {
-            HammerError::config_validation(format!("{field}: invalid prefix length {p:?}"))
-        })?;
-        let max = if ip.is_ipv4() { 32 } else { 128 };
-        if bits > max {
-            return Err(HammerError::config_validation(format!(
-                "{field}: prefix length {bits} exceeds {max}"
-            )));
-        }
-    }
-    Ok(Prefix(value.to_owned()))
-}
-
-pub fn parse_prefix_list(field: &str, values: &[String]) -> Result<Vec<Prefix>, HammerError> {
-    values.iter().map(|v| parse_prefix(field, v)).collect()
-}
+use super::options::DomainStrategy;
 
 /// Parse Go-style duration strings like "300ms", "1.5s", "2m30s", "1h".
 /// Empty input yields `None`.
@@ -159,7 +129,6 @@ pub fn parse_base64_key(field: &str, value: &str) -> Result<[u8; 32], HammerErro
 
 /// Parse a CIDR-form prefix into `ipnet::IpNet`. Bare IPs without a prefix are
 /// treated as host routes (`/32` or `/128`).
-#[cfg(feature = "wireguard")]
 pub fn parse_ipnet(field: &str, value: &str) -> Result<IpNet, HammerError> {
     if let Ok(net) = value.parse::<IpNet>() {
         return Ok(net);
@@ -170,11 +139,6 @@ pub fn parse_ipnet(field: &str, value: &str) -> Result<IpNet, HammerError> {
     let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
     IpNet::new(ip, host_prefix)
         .map_err(|err| HammerError::config_validation(format!("{field}: {err}")))
-}
-
-#[cfg(feature = "wireguard")]
-pub fn parse_ipnet_list(field: &str, values: &[String]) -> Result<Vec<IpNet>, HammerError> {
-    values.iter().map(|v| parse_ipnet(field, v)).collect()
 }
 
 /// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
@@ -197,20 +161,6 @@ pub fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAdd
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_prefix_accepts_v4_v6_and_bare_ip() {
-        assert!(parse_prefix("tun.address", "172.19.0.1/30").is_ok());
-        assert!(parse_prefix("tun.address", "::1/128").is_ok());
-        assert!(parse_prefix("tun.address", "10.0.0.1").is_ok());
-    }
-
-    #[test]
-    fn parse_prefix_rejects_invalid() {
-        assert!(parse_prefix("tun.address", "not-an-ip").is_err());
-        assert!(parse_prefix("tun.address", "10.0.0.1/40").is_err());
-        assert!(parse_prefix("tun.address", "::1/200").is_err());
-    }
 
     #[test]
     fn duration_parses_go_style() {
@@ -272,7 +222,6 @@ mod tests {
         assert!(err.to_string().contains("invalid base64"));
     }
 
-    #[cfg(feature = "wireguard")]
     #[test]
     fn ipnet_accepts_cidr_and_promotes_bare_ip_to_host_prefix() {
         let v4 = parse_ipnet("wg.address", "10.0.0.1").unwrap();
@@ -283,7 +232,6 @@ mod tests {
         assert_eq!(cidr.prefix_len(), 24);
     }
 
-    #[cfg(feature = "wireguard")]
     #[test]
     fn ipnet_rejects_garbage() {
         assert!(parse_ipnet("wg.address", "not-an-ip").is_err());

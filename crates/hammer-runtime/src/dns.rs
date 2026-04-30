@@ -251,7 +251,7 @@ impl DnsClient {
             return Ok(message.fixed_response(FixedResponseCode::NoError));
         }
         let key = CacheKey {
-            transport: transport.tag().to_owned(),
+            transport: transport.id().to_owned(),
             name: query.name().to_ascii().to_ascii_lowercase(),
             record_type: query.query_type(),
         };
@@ -414,13 +414,13 @@ fn strategy_rejects(record_type: RecordType, strategy: DomainStrategy) -> bool {
 }
 
 pub struct HostsTransport {
-    tag: String,
+    id: String,
     dependencies: Vec<String>,
     predefined: HashMap<String, Vec<IpAddr>>,
 }
 
 impl HostsTransport {
-    pub fn from_predefined<I, S>(tag: impl Into<String>, entries: I) -> Self
+    pub fn from_predefined<I, S>(id: impl Into<String>, entries: I) -> Self
     where
         I: IntoIterator<Item = (S, IpAddr)>,
         S: AsRef<str>,
@@ -433,16 +433,16 @@ impl HostsTransport {
                 .push(addr);
         }
         Self {
-            tag: tag.into(),
+            id: id.into(),
             dependencies: Vec::new(),
             predefined,
         }
     }
 
-    pub fn system(tag: impl Into<String>) -> Self {
+    pub fn system(id: impl Into<String>) -> Self {
         let content = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
         let entries = parse_hosts(&content);
-        Self::from_predefined(tag, entries)
+        Self::from_predefined(id, entries)
     }
 }
 
@@ -481,8 +481,8 @@ impl DnsTransport for HostsTransport {
     fn type_name(&self) -> &str {
         "hosts"
     }
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
     fn dependencies(&self) -> &[String] {
         &self.dependencies
@@ -506,14 +506,14 @@ impl DnsTransport for HostsTransport {
 }
 
 pub struct LocalDnsTransport {
-    tag: String,
+    id: String,
     dependencies: Vec<String>,
 }
 
 impl LocalDnsTransport {
-    pub fn new(tag: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             dependencies: Vec::new(),
         }
     }
@@ -536,8 +536,8 @@ impl DnsTransport for LocalDnsTransport {
     fn type_name(&self) -> &str {
         "local"
     }
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
     fn dependencies(&self) -> &[String] {
         &self.dependencies
@@ -574,7 +574,7 @@ impl DnsTransport for LocalDnsTransport {
 }
 
 pub struct UdpDnsTransport {
-    tag: String,
+    id: String,
     server: String,
     port: u16,
     via: String,
@@ -585,9 +585,9 @@ pub struct UdpDnsTransport {
 }
 
 impl UdpDnsTransport {
-    pub fn new(tag: impl Into<String>, server: String, port: u16, logger: Logger) -> Self {
+    pub fn new(id: impl Into<String>, server: String, port: u16, logger: Logger) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             server,
             port,
             via: String::new(),
@@ -599,14 +599,14 @@ impl UdpDnsTransport {
     }
 
     fn new_with_runtime(
-        tag: impl Into<String>,
+        id: impl Into<String>,
         options: &RemoteDnsServer,
         logger: Logger,
         outbound: Option<Arc<OutboundManager>>,
         protector: SocketProtector,
     ) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             server: options.server.clone(),
             port: options.server_port,
             via: options.via.clone(),
@@ -635,8 +635,8 @@ impl DnsTransport for UdpDnsTransport {
     fn type_name(&self) -> &str {
         "udp"
     }
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
     fn dependencies(&self) -> &[String] {
         &self.dependencies
@@ -700,7 +700,7 @@ impl DnsTransport for UdpDnsTransport {
 }
 
 pub struct TcpDnsTransport {
-    tag: String,
+    id: String,
     server: String,
     port: u16,
     via: String,
@@ -710,9 +710,9 @@ pub struct TcpDnsTransport {
 }
 
 impl TcpDnsTransport {
-    pub fn new(tag: impl Into<String>, server: String, port: u16, _logger: Logger) -> Self {
+    pub fn new(id: impl Into<String>, server: String, port: u16, _logger: Logger) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             server,
             port,
             via: String::new(),
@@ -723,13 +723,13 @@ impl TcpDnsTransport {
     }
 
     fn new_with_runtime(
-        tag: impl Into<String>,
+        id: impl Into<String>,
         options: &RemoteDnsServer,
         outbound: Option<Arc<OutboundManager>>,
         protector: SocketProtector,
     ) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             server: options.server.clone(),
             port: options.server_port,
             via: options.via.clone(),
@@ -757,8 +757,8 @@ impl DnsTransport for TcpDnsTransport {
     fn type_name(&self) -> &str {
         "tcp"
     }
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
     fn dependencies(&self) -> &[String] {
         &self.dependencies
@@ -800,7 +800,7 @@ async fn tcp_exchange_via_or_direct(
         return tcp_exchange_direct(&server, message, protector).await;
     }
     let frame = encode_tcp_dns_query(&message)?;
-    let mut stream = outbound_by_tag(outbound, via)?
+    let mut stream = outbound_by_id(outbound, via)?
         .dial(Network::Tcp, socket_addr_to_socks(server), &frame)
         .await?;
     read_tcp_dns_response(&mut stream).await
@@ -836,7 +836,7 @@ async fn tcp_exchange_over_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
 }
 
 pub struct HttpsDnsTransport {
-    tag: String,
+    id: String,
     server: String,
     port: u16,
     path: String,
@@ -849,12 +849,12 @@ pub struct HttpsDnsTransport {
 }
 
 impl HttpsDnsTransport {
-    pub fn new(tag: impl Into<String>, options: &RemoteHttpsDnsServer) -> Self {
-        Self::new_with_runtime(tag, options, None, SocketProtector::default())
+    pub fn new(id: impl Into<String>, options: &RemoteHttpsDnsServer) -> Self {
+        Self::new_with_runtime(id, options, None, SocketProtector::default())
     }
 
     fn new_with_runtime(
-        tag: impl Into<String>,
+        id: impl Into<String>,
         options: &RemoteHttpsDnsServer,
         outbound: Option<Arc<OutboundManager>>,
         protector: SocketProtector,
@@ -870,7 +870,7 @@ impl HttpsDnsTransport {
             &options.path
         };
         Self {
-            tag: tag.into(),
+            id: id.into(),
             server: options.server.clone(),
             port: options.server_port,
             path: path.to_owned(),
@@ -901,8 +901,8 @@ impl DnsTransport for HttpsDnsTransport {
     fn type_name(&self) -> &str {
         "https"
     }
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
     fn dependencies(&self) -> &[String] {
         &self.dependencies
@@ -944,7 +944,7 @@ async fn doh_exchange_http2(
     let stream: Box<dyn ProxyStream> = if via.is_empty() {
         Box::new(direct_tcp_connect(server, protector).await?)
     } else {
-        outbound_by_tag(outbound, via)?
+        outbound_by_id(outbound, via)?
             .dial(Network::Tcp, socket_addr_to_socks(server), &[])
             .await?
     };
@@ -1020,7 +1020,7 @@ fn socket_addr_to_socks(addr: SocketAddr) -> SocksAddr {
     }
 }
 
-fn outbound_by_tag(
+fn outbound_by_id(
     outbound: Option<&Arc<OutboundManager>>,
     via: &str,
 ) -> Result<Arc<dyn hammer_adapter::Outbound>, HammerError> {
@@ -1059,7 +1059,7 @@ async fn udp_exchange_via(
     payload: &[u8],
 ) -> Result<Vec<u8>, HammerError> {
     logger.debug(format!("dns udp via outbound={via} dest={destination}"));
-    let mut conn = outbound_by_tag(outbound, via)?.listen_packet().await?;
+    let mut conn = outbound_by_id(outbound, via)?.listen_packet().await?;
     conn.send_to(destination, payload).await?;
     Ok(conn.recv_from().await?.payload)
 }
@@ -1131,15 +1131,15 @@ fn fixed_address_response(
 pub struct DnsTransportManager {
     logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn DnsTransport>>>,
-    default_tag: String,
+    default_id: String,
 }
 
 impl DnsTransportManager {
-    pub fn new(logger: Logger, default_tag: impl Into<String>) -> Self {
+    pub fn new(logger: Logger, default_id: impl Into<String>) -> Self {
         Self {
             logger,
             items: Mutex::new(HashMap::new()),
-            default_tag: default_tag.into(),
+            default_id: default_id.into(),
         }
     }
 
@@ -1179,7 +1179,7 @@ impl DnsTransportManager {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
-            .insert(transport.tag().to_owned(), transport);
+            .insert(transport.id().to_owned(), transport);
     }
 
     pub fn list(&self) -> Vec<Arc<dyn DnsTransport>> {
@@ -1191,16 +1191,16 @@ impl DnsTransportManager {
             .collect()
     }
 
-    pub fn get(&self, tag: &str) -> Option<Arc<dyn DnsTransport>> {
+    pub fn get(&self, id: &str) -> Option<Arc<dyn DnsTransport>> {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
     pub fn default(&self) -> Option<Arc<dyn DnsTransport>> {
-        self.get(&self.default_tag)
+        self.get(&self.default_id)
     }
 }
 
@@ -1212,26 +1212,26 @@ fn build_transport(
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     let transport: Arc<dyn DnsTransport> = match &server.kind {
         DnsServerKind::Udp(options) => Arc::new(UdpDnsTransport::new_with_runtime(
-            server.tag.clone(),
+            server.id.clone(),
             options,
             logger.clone(),
             outbound,
             protector,
         )),
         DnsServerKind::Tcp(options) => Arc::new(TcpDnsTransport::new_with_runtime(
-            server.tag.clone(),
+            server.id.clone(),
             options,
             outbound,
             protector,
         )),
         DnsServerKind::Https(options) => Arc::new(HttpsDnsTransport::new_with_runtime(
-            server.tag.clone(),
+            server.id.clone(),
             options,
             outbound,
             protector,
         )),
-        DnsServerKind::Hosts => Arc::new(HostsTransport::system(server.tag.clone())),
-        DnsServerKind::Local => Arc::new(LocalDnsTransport::new(server.tag.clone())),
+        DnsServerKind::Hosts => Arc::new(HostsTransport::system(server.id.clone())),
+        DnsServerKind::Local => Arc::new(LocalDnsTransport::new(server.id.clone())),
     };
     Ok(transport)
 }
@@ -1249,7 +1249,7 @@ impl Lifecycle for DnsTransportManager {
         if self.default().is_none() {
             return Err(HammerError::internal(format!(
                 "default DNS server not found: {}",
-                self.default_tag
+                self.default_id
             )));
         }
         for transport in self.list() {
@@ -1272,19 +1272,19 @@ impl DnsTransportManagerTrait for DnsTransportManager {
         self.list()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn DnsTransport>> {
-        self.get(tag)
+    fn get(&self, id: &str) -> Option<Arc<dyn DnsTransport>> {
+        self.get(id)
     }
 
     fn default(&self) -> Option<Arc<dyn DnsTransport>> {
         self.default()
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }
@@ -1338,7 +1338,7 @@ impl DnsRouter {
         self.logger.info(format!(
             "exchange query={} server={} strategy={:?}",
             query_summary,
-            transport.tag(),
+            transport.id(),
             options.strategy
         ));
         let response = match self.client.exchange(transport, message, options).await {

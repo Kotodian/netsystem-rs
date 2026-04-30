@@ -21,8 +21,8 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record};
 use tokio::net::UdpSocket;
 
-fn logger(tag: &str) -> Logger {
-    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+fn logger(id: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
 
 fn options() -> Options {
@@ -65,7 +65,7 @@ fn router_from_options(options: &Options) -> Arc<Router> {
 
 fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
     let outbounds = vec![Outbound {
-        tag: final_outbound.to_owned(),
+        id: final_outbound.to_owned(),
         kind: OutboundKind::Direct(DirectOutboundOptions::default()),
     }];
     let outbound = Arc::new(OutboundManager::from_options(
@@ -408,7 +408,7 @@ impl DnsTransport for FixedDnsTransport {
         "mock"
     }
 
-    fn tag(&self) -> &str {
+    fn id(&self) -> &str {
         "mock"
     }
 

@@ -12,9 +12,9 @@ use hammer_runtime::{
     PauseManager, Router, ServiceManager,
 };
 
+use crate::HammerPlatform;
 use crate::error::HammerError;
 use crate::platform::{PlatformAdapter, PlatformLogWriter};
-use crate::HammerPlatform;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceState {
@@ -115,12 +115,12 @@ impl HammerService {
             Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
         ));
         // Endpoints are also outbounds — register their Outbound view with
-        // OutboundManager so the router can resolve their tag through the
+        // OutboundManager so the router can resolve their id through the
         // standard `OutboundManager::get` path. sing-box does the same;
         // ownership stays with EndpointManager (lifecycle Start/Close fire
         // there), this is purely a second view of the same Arc.
-        for (tag, view) in endpoint.outbound_view() {
-            outbound.register_outbound(tag, view);
+        for (id, view) in endpoint.outbound_view() {
+            outbound.register_outbound(id, view);
         }
         let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(
             new_logger(&log_factory, "dns-transport"),
@@ -284,6 +284,6 @@ impl HammerService {
     }
 }
 
-fn new_logger(factory: &Arc<Factory>, tag: &str) -> Logger {
-    factory.new_logger(tag.to_owned())
+fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
+    factory.new_logger(id.to_owned())
 }

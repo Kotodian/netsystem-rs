@@ -1,18 +1,18 @@
 use std::time::Duration;
 
 use ipnet::IpNet;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[cfg(feature = "wireguard")]
 use crate::error::HammerError;
 use crate::log::Level;
 
 use super::options::{
-    DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, TunStack,
+    DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, RuleMatcher, TunStack,
 };
 #[cfg(feature = "wireguard")]
 use super::parse::parse_base64_key;
-use super::parse::{parse_domain_strategy, parse_optional_duration};
+use super::parse::{parse_domain_strategy, parse_ipnet, parse_optional_duration};
 
 // Raw config structs are mostly serde field declarations with the same
 // `default + skip_serializing_if` pattern. Keep the actual field list explicit,
@@ -110,7 +110,7 @@ raw_struct_with_default_check! {
 
 raw_struct_with_default_check! {
     pub struct RawTunConfig {
-        /// Inbound tag used by route rules.
+        /// Inbound id used by route rules.
         pub id: String => "String::is_empty",
         /// Requested TUN interface name.
         pub interface_name: String => "String::is_empty",
@@ -120,11 +120,23 @@ raw_struct_with_default_check! {
         #[serde(deserialize_with = "deserialize_tun_stack")]
         pub stack: Option<TunStack> => "Option::is_none",
         /// Local interface addresses in CIDR form.
-        pub address: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_tun_addresses",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub address: Vec<IpNet> => "Vec::is_empty",
         /// Routes included through the tunnel.
-        pub route_address: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_tun_route_addresses",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub route_address: Vec<IpNet> => "Vec::is_empty",
         /// Routes excluded from the tunnel.
-        pub route_exclude_address: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_tun_route_exclude_addresses",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub route_exclude_address: Vec<IpNet> => "Vec::is_empty",
         /// Whether the platform should install routes automatically.
         pub auto_route: Option<bool> => "Option::is_none",
         /// Whether route installation should use strict routing semantics.
@@ -159,7 +171,7 @@ raw_struct_with_default_check! {
 
 raw_struct_with_default_check! {
     pub struct RawHysteria2Config {
-        /// Outbound tag used by route rules.
+        /// Outbound id used by route rules.
         pub id: String => "String::is_empty",
         /// Hysteria2 server host or IP.
         pub server: String => "String::is_empty",
@@ -244,7 +256,7 @@ pub enum RawEndpoint {
 raw_struct! {
     #[cfg(feature = "wireguard")]
     pub struct RawWireguardEndpoint {
-        /// Endpoint tag used by route rules and lifecycle managers.
+        /// Endpoint id used by route rules and lifecycle managers.
         pub id: String => "String::is_empty",
         /// Base64-encoded WireGuard private key.
         pub private_key: RawBase64Key => "RawBase64Key::is_empty",
@@ -253,7 +265,11 @@ raw_struct! {
         /// Optional WireGuard interface MTU.
         pub mtu: Option<u32> => "Option::is_none",
         /// Local WireGuard interface addresses in CIDR form.
-        pub address: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_wireguard_addresses",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub address: Vec<IpNet> => "Vec::is_empty",
         /// WireGuard peer list.
         pub peers: Vec<RawWireguardPeer> => "Vec::is_empty",
     }
@@ -271,7 +287,11 @@ raw_struct! {
         /// Peer endpoint UDP port.
         pub port: u16 => "is_zero_u16",
         /// Allowed IP prefixes routed to this peer.
-        pub allowed_ips: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_wireguard_allowed_ips",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub allowed_ips: Vec<IpNet> => "Vec::is_empty",
         /// Optional persistent keepalive interval in seconds.
         pub persistent_keepalive_interval: Option<u32> => "Option::is_none",
         /// Optional reserved WARP-style header bytes.
@@ -297,21 +317,21 @@ impl RawBase64Key {
 
 raw_struct_with_default_check! {
     pub struct RawDnsConfig {
-        /// DNS transport tag.
+        /// DNS transport id.
         pub id: String => "String::is_empty",
         /// Upstream DNS server URL or address.
         pub server: String => "String::is_empty",
         /// DNS answer selection strategy.
         #[serde(deserialize_with = "deserialize_dns_strategy")]
         pub strategy: DomainStrategy => "DomainStrategy::is_default",
-        /// Outbound tag used to reach the upstream DNS server.
+        /// Outbound id used to reach the upstream DNS server.
         pub via: String => "String::is_empty",
     }
 }
 
 raw_struct_with_default_check! {
     pub struct RawRouteConfig {
-        /// Final outbound tag.
+        /// Final outbound id.
         #[serde(rename = "final")]
         pub final_: String => "String::is_empty",
         /// Whether to let the runtime detect the platform default interface.
@@ -325,45 +345,35 @@ raw_struct_with_default_check! {
     }
 }
 
-raw_struct! {
-    pub struct RawRouteRule {
-        /// Inbound tag matchers.
-        pub inbound: Vec<String> => "Vec::is_empty",
-        /// Protocol matchers, for example `dns`, `quic`, or `http`.
-        pub protocol: Vec<String> => "Vec::is_empty",
-        /// Exact domain matchers.
-        pub domain: Vec<String> => "Vec::is_empty",
-        /// Domain suffix matchers.
-        pub domain_suffix: Vec<String> => "Vec::is_empty",
-        /// Domain keyword matchers.
-        pub domain_keyword: Vec<String> => "Vec::is_empty",
-        /// IP CIDR matchers.
-        #[serde(
-            deserialize_with = "deserialize_route_ip_cidrs",
-            serialize_with = "serialize_ipnet_vec"
-        )]
-        pub ip_cidr: Vec<IpNet> => "Vec::is_empty",
-        /// Route target outbound tag.
-        pub outbound: String => "String::is_empty",
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRouteRule {
+    /// Single matcher for this route rule.
+    pub matcher: RuleMatcher,
+    /// Route target outbound id.
+    pub outbound: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawRouteRuleText {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     inbound: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     protocol: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     domain: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     domain_suffix: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     domain_keyword: Vec<String>,
-    #[serde(default)]
-    ip_cidr: Vec<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_route_ip_cidrs",
+        serialize_with = "serialize_ipnet_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    ip_cidr: Vec<IpNet>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     outbound: String,
 }
 
@@ -518,34 +528,41 @@ where
     parse_domain_strategy("dns.strategy", &value).map_err(de::Error::custom)
 }
 
-fn deserialize_route_rules<'de, D>(deserializer: D) -> Result<Vec<RawRouteRule>, D::Error>
+fn deserialize_tun_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Vec::<RawRouteRuleText>::deserialize(deserializer)?
-        .into_iter()
-        .enumerate()
-        .map(|(idx, raw)| {
-            let ip_cidr = raw
-                .ip_cidr
-                .into_iter()
-                .map(|value| {
-                    value.parse::<IpNet>().map_err(|err| {
-                        de::Error::custom(format!("route.rules[{idx}].ip_cidr {value:?}: {err}"))
-                    })
-                })
-                .collect::<Result<Vec<_>, D::Error>>()?;
-            Ok(RawRouteRule {
-                inbound: raw.inbound,
-                protocol: raw.protocol,
-                domain: raw.domain,
-                domain_suffix: raw.domain_suffix,
-                domain_keyword: raw.domain_keyword,
-                ip_cidr,
-                outbound: raw.outbound,
-            })
-        })
-        .collect()
+    deserialize_ipnet_vec("tun.address", deserializer)
+}
+
+fn deserialize_tun_route_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ipnet_vec("tun.route_address", deserializer)
+}
+
+fn deserialize_tun_route_exclude_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ipnet_vec("tun.route_exclude_address", deserializer)
+}
+
+#[cfg(feature = "wireguard")]
+fn deserialize_wireguard_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ipnet_vec("endpoints.address", deserializer)
+}
+
+#[cfg(feature = "wireguard")]
+fn deserialize_wireguard_allowed_ips<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ipnet_vec("endpoints.peers.allowed_ips", deserializer)
 }
 
 fn deserialize_route_ip_cidrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
@@ -561,19 +578,8 @@ where
 {
     Vec::<String>::deserialize(deserializer)?
         .into_iter()
-        .map(|value| {
-            value
-                .parse::<IpNet>()
-                .map_err(|err| de::Error::custom(format!("{field} {value:?}: {err}")))
-        })
+        .map(|value| parse_ipnet(field, &value).map_err(de::Error::custom))
         .collect()
-}
-
-fn serialize_route_rules<S>(value: &[RawRouteRule], serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    value.serialize(serializer)
 }
 
 fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Error>
@@ -583,6 +589,92 @@ where
     value
         .iter()
         .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn deserialize_route_rules<'de, D>(deserializer: D) -> Result<Vec<RawRouteRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RawRouteRuleText>::deserialize(deserializer)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, raw)| route_rule_from_text(idx, raw).map_err(de::Error::custom))
+        .collect()
+}
+
+fn route_rule_from_text(idx: usize, raw: RawRouteRuleText) -> Result<RawRouteRule, String> {
+    let RawRouteRuleText {
+        inbound,
+        protocol,
+        domain,
+        domain_suffix,
+        domain_keyword,
+        ip_cidr,
+        outbound,
+    } = raw;
+    let mut count = 0;
+    let mut matcher = RuleMatcher::Any;
+    if !inbound.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::Inbound(inbound);
+    }
+    if !protocol.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::Protocol(protocol);
+    }
+    if !domain.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::Domain(domain);
+    }
+    if !domain_suffix.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::DomainSuffix(domain_suffix);
+    }
+    if !domain_keyword.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::DomainKeyword(domain_keyword);
+    }
+    if !ip_cidr.is_empty() {
+        count += 1;
+        matcher = RuleMatcher::IpCidr(ip_cidr);
+    }
+    match count {
+        1 => Ok(RawRouteRule { matcher, outbound }),
+        0 => Err(format!(
+            "route.rules[{idx}] requires exactly one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
+        )),
+        _ => Err(format!(
+            "route.rules[{idx}] must contain exactly one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
+        )),
+    }
+}
+
+fn route_rule_to_text(raw: &RawRouteRule) -> RawRouteRuleText {
+    let mut text = RawRouteRuleText {
+        outbound: raw.outbound.clone(),
+        ..Default::default()
+    };
+    match &raw.matcher {
+        RuleMatcher::Any => {}
+        RuleMatcher::Inbound(values) => text.inbound = values.clone(),
+        RuleMatcher::Protocol(values) => text.protocol = values.clone(),
+        RuleMatcher::Domain(values) => text.domain = values.clone(),
+        RuleMatcher::DomainSuffix(values) => text.domain_suffix = values.clone(),
+        RuleMatcher::DomainKeyword(values) => text.domain_keyword = values.clone(),
+        RuleMatcher::IpCidr(values) => text.ip_cidr = values.clone(),
+    }
+    text
+}
+
+fn serialize_route_rules<S>(value: &[RawRouteRule], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .iter()
+        .map(route_rule_to_text)
         .collect::<Vec<_>>()
         .serialize(serializer)
 }

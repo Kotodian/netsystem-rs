@@ -14,7 +14,7 @@ use crate::tun::{SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
-    tag: String,
+    id: String,
     logger: Logger,
     options: TunInboundOptions,
     router: Arc<Router>,
@@ -27,13 +27,13 @@ pub struct TunInbound {
 
 impl TunInbound {
     pub fn new(
-        tag: impl Into<String>,
+        id: impl Into<String>,
         logger: Logger,
         options: TunInboundOptions,
         router: Arc<Router>,
     ) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             logger,
             options,
             router,
@@ -46,7 +46,7 @@ impl TunInbound {
     }
 
     pub fn new_with_runtime(
-        tag: impl Into<String>,
+        id: impl Into<String>,
         logger: Logger,
         options: TunInboundOptions,
         router: Arc<Router>,
@@ -55,7 +55,7 @@ impl TunInbound {
         platform: Arc<dyn PlatformInterface>,
     ) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             logger,
             options,
             router,
@@ -74,12 +74,12 @@ impl TunInbound {
                 Arc::clone(&self.router),
                 Arc::clone(dns_router),
                 Arc::clone(outbound),
-                self.tag.clone(),
+                self.id.clone(),
             ),
             _ => SmoltcpTunStack::new(
                 self.logger.clone(),
                 Arc::clone(&self.router),
-                self.tag.clone(),
+                self.id.clone(),
             ),
         }
     }
@@ -140,7 +140,7 @@ impl TunInbound {
             Arc::clone(&self.router),
             Arc::clone(dns_router),
             Arc::clone(outbound),
-            self.tag.clone(),
+            self.id.clone(),
             self.options.clone(),
             device,
             tun_interface_index,
@@ -163,19 +163,24 @@ impl TunInbound {
         let mtu = i32::try_from(self.options.mtu)
             .map_err(|_| HammerError::internal("TUN MTU does not fit in i32"))?;
         let name = if self.options.interface_name.is_empty() {
-            self.tag.clone()
+            self.id.clone()
         } else {
             self.options.interface_name.clone()
         };
         Ok(TunOptions {
             name,
             mtu,
-            address: self.options.address.iter().map(|p| p.0.clone()).collect(),
+            address: self
+                .options
+                .address
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             route: self
                 .options
                 .route_address
                 .iter()
-                .map(|p| p.0.clone())
+                .map(ToString::to_string)
                 .collect(),
         })
     }
@@ -245,8 +250,8 @@ impl Inbound for TunInbound {
         "tun"
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn as_any(&self) -> &dyn Any {

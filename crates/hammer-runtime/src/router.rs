@@ -4,7 +4,7 @@ use hammer_adapter::{
     Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata,
     Router as RouterTrait, SocksAddr,
 };
-use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind};
+use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, RuleMatcher};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use ipnet::IpNet;
@@ -13,10 +13,10 @@ use crate::OutboundManager;
 use crate::impl_logging_lifecycle;
 
 /// `route.Router` — matches each connection against the configured rule set and
-/// returns a [`RouteDecision`]. Rule fields within a single rule are AND'd;
-/// values inside a single field (e.g. multiple `domain_suffix` entries) are
-/// OR'd. The first rule that produces a terminal decision wins; non-terminal
-/// rules (sniff/resolve/route_options) mutate metadata and fall through.
+/// returns a [`RouteDecision`]. Each rule has exactly one matcher; values inside
+/// that matcher are OR'd. The first rule that produces a terminal decision wins;
+/// non-terminal rules (sniff/resolve/route_options) mutate metadata and fall
+/// through.
 pub struct Router {
     logger: Logger,
     rules: Vec<RuntimeRule>,
@@ -45,13 +45,13 @@ impl Router {
             .map(RuntimeRule::from_options)
             .collect();
         for rule in &rules {
-            if let RuleActionKind::Route(action) = &rule.action {
-                if outbound.get(&action.outbound).is_none() {
-                    return Err(HammerError::config_validation(format!(
-                        "route.rules outbound {:?} is not declared",
-                        action.outbound,
-                    )));
-                }
+            if let RuleActionKind::Route(action) = &rule.action
+                && outbound.get(&action.outbound).is_none()
+            {
+                return Err(HammerError::config_validation(format!(
+                    "route.rules outbound {:?} is not declared",
+                    action.outbound,
+                )));
             }
         }
         Ok(Self {
@@ -87,11 +87,11 @@ impl Router {
         if !default.networks().contains(&network) {
             return Err(HammerError::internal(format!(
                 "{network} is not supported by default outbound: {}",
-                default.tag()
+                default.id()
             )));
         }
         Ok(RouteDecision::Route {
-            outbound: default.tag().to_owned(),
+            outbound: default.id().to_owned(),
         })
     }
 }
@@ -105,14 +105,8 @@ impl RouterTrait for Router {
     }
 }
 
-#[derive(Clone)]
 struct RuntimeRule {
-    inbound: Vec<String>,
-    protocol: Vec<String>,
-    domain: Vec<String>,
-    domain_suffix: Vec<String>,
-    domain_keyword: Vec<String>,
-    ip_cidr: Vec<IpNet>,
+    matcher: Box<dyn Matcher>,
     action: RuleActionKind,
 }
 
@@ -120,55 +114,13 @@ impl RuntimeRule {
     fn from_options(options: RuleOptions) -> Self {
         let default = options.default_options;
         Self {
-            inbound: default.inbound,
-            protocol: default.protocol,
-            domain: default.domain,
-            domain_suffix: default.domain_suffix,
-            domain_keyword: default.domain_keyword,
-            ip_cidr: default.ip_cidr,
+            matcher: matcher_from_options(default.matcher),
             action: default.action,
         }
     }
 
     fn matches(&self, metadata: &RouteMetadata) -> bool {
-        match_list(&self.inbound, &metadata.inbound)
-            && match_list(&self.protocol, &metadata.protocol)
-            && self.matches_domain(metadata.domain.as_deref())
-            && self.matches_ip_cidr(metadata.destination.as_ref())
-    }
-
-    fn matches_domain(&self, domain: Option<&str>) -> bool {
-        if self.domain.is_empty() && self.domain_suffix.is_empty() && self.domain_keyword.is_empty()
-        {
-            return true;
-        }
-        let Some(d) = domain else {
-            return false;
-        };
-        if self.domain.iter().any(|x| x == d) {
-            return true;
-        }
-        if self
-            .domain_suffix
-            .iter()
-            .any(|suffix| domain_suffix_matches(d, suffix))
-        {
-            return true;
-        }
-        if self.domain_keyword.iter().any(|kw| d.contains(kw)) {
-            return true;
-        }
-        false
-    }
-
-    fn matches_ip_cidr(&self, dest: Option<&SocksAddr>) -> bool {
-        if self.ip_cidr.is_empty() {
-            return true;
-        }
-        let Some(addr) = dest else {
-            return false;
-        };
-        self.ip_cidr.iter().any(|net| net.contains(&addr.host))
+        self.matcher.matches(metadata)
     }
 
     fn apply(&self, metadata: &mut RouteMetadata) -> Result<RuleApply, HammerError> {
@@ -211,6 +163,92 @@ fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
 enum RuleApply {
     Continue,
     Decision(RouteDecision),
+}
+
+trait Matcher: Send + Sync {
+    fn matches(&self, metadata: &RouteMetadata) -> bool;
+}
+
+fn matcher_from_options(matcher: RuleMatcher) -> Box<dyn Matcher> {
+    match matcher {
+        RuleMatcher::Any => Box::new(AnyMatcher),
+        RuleMatcher::Inbound(values) => Box::new(InboundMatcher(values)),
+        RuleMatcher::Protocol(values) => Box::new(ProtocolMatcher(values)),
+        RuleMatcher::Domain(values) => Box::new(DomainMatcher(values)),
+        RuleMatcher::DomainSuffix(values) => Box::new(DomainSuffixMatcher(values)),
+        RuleMatcher::DomainKeyword(values) => Box::new(DomainKeywordMatcher(values)),
+        RuleMatcher::IpCidr(values) => Box::new(IpCidrMatcher(values)),
+    }
+}
+
+struct AnyMatcher;
+
+impl Matcher for AnyMatcher {
+    fn matches(&self, _metadata: &RouteMetadata) -> bool {
+        true
+    }
+}
+
+struct InboundMatcher(Vec<String>);
+
+impl Matcher for InboundMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match_list(&self.0, &metadata.inbound)
+    }
+}
+
+struct ProtocolMatcher(Vec<String>);
+
+impl Matcher for ProtocolMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match_list(&self.0, &metadata.protocol)
+    }
+}
+
+struct DomainMatcher(Vec<String>);
+
+impl Matcher for DomainMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        let Some(domain) = metadata.domain.as_deref() else {
+            return false;
+        };
+        self.0.iter().any(|value| value == domain)
+    }
+}
+
+struct DomainSuffixMatcher(Vec<String>);
+
+impl Matcher for DomainSuffixMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        let Some(domain) = metadata.domain.as_deref() else {
+            return false;
+        };
+        self.0
+            .iter()
+            .any(|suffix| domain_suffix_matches(domain, suffix))
+    }
+}
+
+struct DomainKeywordMatcher(Vec<String>);
+
+impl Matcher for DomainKeywordMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        let Some(domain) = metadata.domain.as_deref() else {
+            return false;
+        };
+        self.0.iter().any(|keyword| domain.contains(keyword))
+    }
+}
+
+struct IpCidrMatcher(Vec<IpNet>);
+
+impl Matcher for IpCidrMatcher {
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        let Some(SocksAddr { host, .. }) = metadata.destination.as_ref() else {
+            return false;
+        };
+        self.0.iter().any(|net| net.contains(host))
+    }
 }
 
 #[inline]

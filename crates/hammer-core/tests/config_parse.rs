@@ -4,7 +4,7 @@ use std::time::Duration;
 use hammer_core::config::EndpointKind;
 use hammer_core::config::{
     self, DnsServerKind, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, InboundKind,
-    OutboundKind, RuleActionKind, TunStack,
+    OutboundKind, RuleActionKind, RuleMatcher, TunStack,
 };
 use hammer_core::log::Level;
 
@@ -64,20 +64,20 @@ fn parse_config_builds_hysteria_tun_options() {
     assert_eq!(sniff.timeout, Some(Duration::from_millis(300)));
     assert!(sniff.override_destination, "sniff override expected true");
     assert_eq!(
-        options.route.rules[0].default_options.inbound,
-        vec!["tun".to_owned()]
+        options.route.rules[0].default_options.matcher,
+        RuleMatcher::Inbound(vec!["tun".to_owned()])
     );
 
     assert_rule_action(&options.route.rules[1].default_options.action, "hijack-dns");
     assert_eq!(
-        options.route.rules[1].default_options.protocol,
-        vec!["dns".to_owned()]
+        options.route.rules[1].default_options.matcher,
+        RuleMatcher::Protocol(vec!["dns".to_owned()])
     );
 
     assert_rule_action(&options.route.rules[2].default_options.action, "reject");
     assert_eq!(
-        options.route.rules[2].default_options.protocol,
-        vec!["quic".to_owned()]
+        options.route.rules[2].default_options.matcher,
+        RuleMatcher::Protocol(vec!["quic".to_owned()])
     );
     let reject = match &options.route.rules[2].default_options.action {
         RuleActionKind::Reject(o) => o,
@@ -116,7 +116,7 @@ fn parse_config_builds_hysteria_tun_options() {
     let obfs = hysteria.obfs.as_ref().expect("obfs should be parsed");
     assert_eq!(obfs.type_, Hysteria2ObfsType::Salamander);
     assert_eq!(options.outbounds[1].type_name(), "direct");
-    assert_eq!(options.outbounds[1].tag, "direct");
+    assert_eq!(options.outbounds[1].id, "direct");
 
     assert_eq!(options.route.final_, "hysteria2");
 
@@ -259,7 +259,7 @@ fn parse_config_rejects_block_quic_without_sniff() {
 #[test]
 fn parse_config_appends_user_route_rules_after_tun_rules() {
     let cfg = format!(
-        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\nip_cidr = [\"8.8.8.8/32\"]\noutbound = \"hysteria2\"\n"
+        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n"
     );
     let options = config::parse_config(&cfg).expect("parse");
     assert_eq!(
@@ -268,16 +268,28 @@ fn parse_config_appends_user_route_rules_after_tun_rules() {
         "expected 5 tun rules + 1 user rule"
     );
     let user = &options.route.rules[5].default_options;
-    assert_eq!(user.domain_suffix, vec!["google.com".to_owned()]);
     assert_eq!(
-        user.ip_cidr,
-        vec!["8.8.8.8/32".parse::<ipnet::IpNet>().unwrap()]
+        user.matcher,
+        RuleMatcher::DomainSuffix(vec!["google.com".to_owned()])
     );
     let route = match &user.action {
         RuleActionKind::Route(o) => o,
         _ => panic!("user rule action is not Route"),
     };
     assert_eq!(route.outbound, "hysteria2");
+}
+
+#[test]
+fn parse_config_rejects_user_rule_with_multiple_matchers() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"google.com\"]\nip_cidr = [\"8.8.8.8/32\"]\noutbound = \"hysteria2\"\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted rule with multiple matchers");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exactly one matcher"),
+        "error should explain single matcher rule: {msg:?}"
+    );
 }
 
 #[test]
@@ -288,7 +300,7 @@ fn parse_config_rejects_invalid_ip_cidr() {
     let err = config::parse_config(&cfg).expect_err("accepted invalid CIDR");
     let msg = err.to_string();
     assert!(
-        msg.contains("route.rules[0].ip_cidr"),
+        msg.contains("route.rules.ip_cidr"),
         "error should pin user-visible rule index: {msg:?}"
     );
 }
@@ -307,7 +319,7 @@ fn parse_config_rejects_user_rule_without_any_matcher() {
     let err = config::parse_config(&cfg).expect_err("accepted rule without matcher");
     let msg = err.to_string();
     assert!(
-        msg.contains("requires at least one matcher"),
+        msg.contains("requires exactly one matcher"),
         "error = {msg:?}"
     );
 }
@@ -368,7 +380,7 @@ fn parse_config_accepts_wireguard_endpoint() {
     let options = config::parse_config(&cfg).expect("parse");
     assert_eq!(options.endpoints.len(), 1);
     let endpoint = &options.endpoints[0];
-    assert_eq!(endpoint.tag, "wg-out");
+    assert_eq!(endpoint.id, "wg-out");
     assert_eq!(endpoint.type_name(), "wireguard");
     let wg = match &endpoint.kind {
         EndpointKind::Wireguard(opts) => opts,

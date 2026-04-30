@@ -14,11 +14,11 @@ pub trait CertificateStore: LifecycleService {
 /// etc.) implement; full method set lands when M5+ needs server-side TLS.
 pub trait CertificateProviderService: Lifecycle {
     fn type_name(&self) -> &str;
-    fn tag(&self) -> &str;
+    fn id(&self) -> &str;
 }
 
 pub trait CertificateProviderManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn CertificateProviderService>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn CertificateProviderService>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn get(&self, id: &str) -> Option<Arc<dyn CertificateProviderService>>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }

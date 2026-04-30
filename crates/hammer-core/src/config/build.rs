@@ -7,9 +7,9 @@ use crate::error::HammerError;
 
 use super::options::constants as C;
 use super::options::*;
+use super::parse::parse_optional_port;
 #[cfg(feature = "wireguard")]
-use super::parse::{parse_ipnet_list, parse_socket_addr};
-use super::parse::{parse_optional_port, parse_prefix_list};
+use super::parse::parse_socket_addr;
 use super::raw::*;
 
 pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
@@ -71,7 +71,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         },
         dns: dns_options,
         inbounds: vec![Inbound {
-            tag: tun_id,
+            id: tun_id,
             kind: InboundKind::Tun(tun_options),
         }],
         outbounds: build_outbounds(hysteria_options, hysteria_id),
@@ -84,11 +84,11 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
 fn build_outbounds(hysteria: Hysteria2OutboundOptions, hysteria_id: String) -> Vec<Outbound> {
     vec![
         Outbound {
-            tag: hysteria_id,
+            id: hysteria_id,
             kind: OutboundKind::Hysteria2(hysteria),
         },
         Outbound {
-            tag: C::DEFAULT_DIRECT_ID.to_owned(),
+            id: C::DEFAULT_DIRECT_ID.to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions {
                 network_strategy: C::NETWORK_STRATEGY_DEFAULT.to_owned(),
             }),
@@ -103,13 +103,12 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         raw.mtu
     };
     let stack = raw.stack.unwrap_or_default();
-    let address = parse_prefix_list("tun.address", &raw.address)?;
+    let address = raw.address.clone();
     if address.is_empty() {
         return Err(HammerError::config_validation("tun.address is required"));
     }
-    let route_address = parse_prefix_list("tun.route_address", &raw.route_address)?;
-    let route_exclude_address =
-        parse_prefix_list("tun.route_exclude_address", &raw.route_exclude_address)?;
+    let route_address = raw.route_address.clone();
+    let route_exclude_address = raw.route_exclude_address.clone();
     let auto_route = raw.auto_route.unwrap_or(true);
     Ok(TunInboundOptions {
         interface_name: raw.interface_name.clone(),
@@ -230,10 +229,10 @@ fn build_dns_options(raw: &RawDnsConfig, default_via: &str) -> Result<DnsOptions
         raw.via.clone()
     };
     let server = build_dns_server(raw, &via)?;
-    let final_tag = server.tag.clone();
+    let final_id = server.id.clone();
     Ok(DnsOptions {
         servers: vec![server],
-        final_: final_tag,
+        final_: final_id,
         strategy: raw.strategy,
     })
 }
@@ -252,23 +251,24 @@ fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerEr
     match raw.server.as_str() {
         C::DNS_TYPE_HOSTS => {
             return Ok(DnsServer {
-                tag: id,
+                id,
                 kind: DnsServerKind::Hosts,
             });
         }
         C::DNS_TYPE_LOCAL => {
             return Ok(DnsServer {
-                tag: id,
+                id,
                 kind: DnsServerKind::Local,
             });
         }
         _ => {}
     }
 
-    if let Ok(parsed) = Url::parse(&raw.server) {
-        if !parsed.scheme().is_empty() && parsed.has_host() {
-            return build_dns_server_from_url(parsed, id, via);
-        }
+    if let Ok(parsed) = Url::parse(&raw.server)
+        && !parsed.scheme().is_empty()
+        && parsed.has_host()
+    {
+        return build_dns_server_from_url(parsed, id, via);
     }
 
     let (host, port_str) = match raw.server.rsplit_once(':') {
@@ -279,7 +279,7 @@ fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerEr
     };
     let port = parse_optional_port("dns.server", &port_str)?;
     Ok(DnsServer {
-        tag: id,
+        id,
         kind: DnsServerKind::Udp(RemoteDnsServer {
             server: host,
             server_port: if port == 0 { 53 } else { port },
@@ -304,7 +304,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
                 parsed.path().to_owned()
             };
             Ok(DnsServer {
-                tag: id,
+                id,
                 kind: DnsServerKind::Https(RemoteHttpsDnsServer {
                     server: host,
                     server_port: port,
@@ -314,7 +314,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
             })
         }
         "udp" => Ok(DnsServer {
-            tag: id,
+            id,
             kind: DnsServerKind::Udp(RemoteDnsServer {
                 server: host,
                 server_port: if port == 0 { 53 } else { port },
@@ -322,7 +322,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
             }),
         }),
         "tcp" => Ok(DnsServer {
-            tag: id,
+            id,
             kind: DnsServerKind::Tcp(RemoteDnsServer {
                 server: host,
                 server_port: if port == 0 { 53 } else { port },
@@ -337,7 +337,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
 
 pub(crate) fn derive_tun_route_rules(
     raw_tun: &RawTunConfig,
-    tun_tag: &str,
+    tun_id: &str,
 ) -> Result<Vec<Rule>, HammerError> {
     let sniff_timeout = raw_tun.sniff_timeout;
     let domain_strategy = raw_tun.domain_strategy;
@@ -359,7 +359,7 @@ pub(crate) fn derive_tun_route_rules(
     let mut rules = Vec::new();
     if raw_tun.sniff {
         rules.push(tun_rule(
-            tun_tag,
+            tun_id,
             RuleActionKind::Sniff(SniffActionOptions {
                 timeout: sniff_timeout,
                 override_destination: raw_tun.sniff_override_destination,
@@ -379,7 +379,7 @@ pub(crate) fn derive_tun_route_rules(
     }
     if domain_strategy != DomainStrategy::AsIs {
         rules.push(tun_rule(
-            tun_tag,
+            tun_id,
             RuleActionKind::Resolve(ResolveActionOptions {
                 strategy: domain_strategy,
             }),
@@ -387,7 +387,7 @@ pub(crate) fn derive_tun_route_rules(
     }
     if raw_tun.udp_disable_domain_unmapping {
         rules.push(tun_rule(
-            tun_tag,
+            tun_id,
             RuleActionKind::RouteOptions(RouteOptionsActionOptions {
                 udp_disable_domain_unmapping: true,
             }),
@@ -396,12 +396,11 @@ pub(crate) fn derive_tun_route_rules(
     Ok(rules)
 }
 
-fn tun_rule(tun_tag: &str, action: RuleActionKind) -> Rule {
+fn tun_rule(tun_id: &str, action: RuleActionKind) -> Rule {
     Rule {
         default_options: DefaultRule {
-            inbound: vec![tun_tag.to_owned()],
+            matcher: RuleMatcher::Inbound(vec![tun_id.to_owned()]),
             action,
-            ..Default::default()
         },
     }
 }
@@ -409,9 +408,8 @@ fn tun_rule(tun_tag: &str, action: RuleActionKind) -> Rule {
 fn protocol_rule(protocol: &str, action: RuleActionKind) -> Rule {
     Rule {
         default_options: DefaultRule {
-            protocol: vec![protocol.to_owned()],
+            matcher: RuleMatcher::Protocol(vec![protocol.to_owned()]),
             action,
-            ..Default::default()
         },
     }
 }
@@ -438,7 +436,7 @@ fn build_wireguard_endpoint(
     idx: usize,
     mut raw: RawWireguardEndpoint,
 ) -> Result<Endpoint, HammerError> {
-    let tag = if raw.id.is_empty() {
+    let id = if raw.id.is_empty() {
         return Err(HammerError::config_validation(format!(
             "endpoints[{idx}].id is required"
         )));
@@ -450,7 +448,7 @@ fn build_wireguard_endpoint(
         .decode_32(&format!("endpoints[{idx}].private_key"))?;
     let listen_port = raw.listen_port.unwrap_or(0);
     let mtu = raw.mtu.unwrap_or(C::DEFAULT_WIREGUARD_MTU);
-    let address = parse_ipnet_list(&format!("endpoints[{idx}].address"), &raw.address)?;
+    let address = raw.address;
     if address.is_empty() {
         return Err(HammerError::config_validation(format!(
             "endpoints[{idx}].address is required"
@@ -468,7 +466,7 @@ fn build_wireguard_endpoint(
         .map(|(peer_idx, peer)| build_wireguard_peer(idx, peer_idx, peer))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Endpoint {
-        tag,
+        id,
         kind: EndpointKind::Wireguard(WireguardEndpointOptions {
             private_key,
             listen_port,
@@ -499,7 +497,7 @@ fn build_wireguard_peer(
         )));
     }
     let endpoint = parse_socket_addr(&format!("{prefix}.address"), &raw.address, raw.port)?;
-    let allowed_ips = parse_ipnet_list(&format!("{prefix}.allowed_ips"), &raw.allowed_ips)?;
+    let allowed_ips = raw.allowed_ips;
     if allowed_ips.is_empty() {
         return Err(HammerError::config_validation(format!(
             "{prefix}.allowed_ips is required"
@@ -526,25 +524,9 @@ fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> 
             "route.rules[{idx}].outbound is required",
         )));
     }
-    let has_filter = !raw.inbound.is_empty()
-        || !raw.protocol.is_empty()
-        || !raw.domain.is_empty()
-        || !raw.domain_suffix.is_empty()
-        || !raw.domain_keyword.is_empty()
-        || !raw.ip_cidr.is_empty();
-    if !has_filter {
-        return Err(HammerError::config_validation(format!(
-            "route.rules[{idx}] requires at least one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
-        )));
-    }
     Ok(Rule {
         default_options: DefaultRule {
-            inbound: raw.inbound.clone(),
-            protocol: raw.protocol.clone(),
-            domain: raw.domain.clone(),
-            domain_suffix: raw.domain_suffix.clone(),
-            domain_keyword: raw.domain_keyword.clone(),
-            ip_cidr: raw.ip_cidr.clone(),
+            matcher: raw.matcher.clone(),
             action: RuleActionKind::Route(RouteActionOptions {
                 outbound: raw.outbound.clone(),
             }),

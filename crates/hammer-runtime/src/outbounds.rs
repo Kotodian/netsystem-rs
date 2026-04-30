@@ -11,17 +11,17 @@ use crate::socket_protector::SocketProtector;
 
 pub struct DirectOutbound {
     logger: Logger,
-    tag: String,
+    id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
     protector: SocketProtector,
 }
 
 impl DirectOutbound {
-    pub fn new(logger: Logger, tag: impl Into<String>) -> Self {
+    pub fn new(logger: Logger, id: impl Into<String>) -> Self {
         Self {
             logger,
-            tag: tag.into(),
+            id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
             protector: SocketProtector::default(),
@@ -30,12 +30,12 @@ impl DirectOutbound {
 
     pub(crate) fn new_with_protector(
         logger: Logger,
-        tag: impl Into<String>,
+        id: impl Into<String>,
         protector: SocketProtector,
     ) -> Self {
         Self {
             logger,
-            tag: tag.into(),
+            id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
             protector,
@@ -49,8 +49,8 @@ impl Outbound for DirectOutbound {
         "direct"
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn networks(&self) -> &[Network] {
@@ -136,16 +136,16 @@ impl ProxyPacketConn for DirectPacketConn {
 
 pub struct BlockOutbound {
     logger: Logger,
-    tag: String,
+    id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
 }
 
 impl BlockOutbound {
-    pub fn new(logger: Logger, tag: impl Into<String>) -> Self {
+    pub fn new(logger: Logger, id: impl Into<String>) -> Self {
         Self {
             logger,
-            tag: tag.into(),
+            id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
         }
@@ -158,8 +158,8 @@ impl Outbound for BlockOutbound {
         "block"
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn networks(&self) -> &[Network] {
@@ -190,15 +190,15 @@ impl Outbound for BlockOutbound {
 }
 
 pub struct DnsOutbound {
-    tag: String,
+    id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
 }
 
 impl DnsOutbound {
-    pub fn new(tag: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<String>) -> Self {
         Self {
-            tag: tag.into(),
+            id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
         }
@@ -211,8 +211,8 @@ impl Outbound for DnsOutbound {
         "dns"
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn networks(&self) -> &[Network] {

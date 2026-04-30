@@ -51,7 +51,7 @@ const WIREGUARD_OVERHEAD: usize = 32;
 /// `dial`/`listen_packet` fail with a clear error.
 pub struct WireguardEndpoint {
     logger: Logger,
-    tag: String,
+    id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
     mtu: u32,
@@ -76,7 +76,7 @@ enum EndpointState {
 impl WireguardEndpoint {
     pub fn new(
         logger: Logger,
-        tag: String,
+        id: String,
         options: WireguardEndpointOptions,
         protector: SocketProtector,
     ) -> Self {
@@ -89,7 +89,7 @@ impl WireguardEndpoint {
             .collect();
         Self {
             logger,
-            tag,
+            id,
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
             mtu: options.mtu,
@@ -170,8 +170,7 @@ impl WireguardEndpoint {
             stack: Arc::new(stack),
         };
 
-        *self.inner.lock().expect("WireguardEndpoint poisoned") =
-            EndpointState::Running(runtime);
+        *self.inner.lock().expect("WireguardEndpoint poisoned") = EndpointState::Running(runtime);
         Ok(())
     }
 
@@ -199,12 +198,8 @@ impl WireguardEndpoint {
         let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         match &*inner {
             EndpointState::Running(rt) => Ok(Arc::clone(&rt.stack)),
-            EndpointState::Idle => Err(HammerError::internal(
-                "wireguard endpoint not started yet",
-            )),
-            EndpointState::Closed => Err(HammerError::internal(
-                "wireguard endpoint is closed",
-            )),
+            EndpointState::Idle => Err(HammerError::internal("wireguard endpoint not started yet")),
+            EndpointState::Closed => Err(HammerError::internal("wireguard endpoint is closed")),
         }
     }
 }
@@ -235,8 +230,8 @@ impl Outbound for WireguardEndpoint {
         hammer_core::config::constants::TYPE_WIREGUARD
     }
 
-    fn tag(&self) -> &str {
-        &self.tag
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn networks(&self) -> &[Network] {
@@ -260,8 +255,7 @@ impl Outbound for WireguardEndpoint {
         }
         let stack = self.stack_handle()?;
         let dst = SocketAddr::new(destination.host, destination.port);
-        self.logger
-            .info(format!("wireguard dial -> {dst}"));
+        self.logger.info(format!("wireguard dial -> {dst}"));
         let mut stream = stack.dial_tcp(dst).await?;
         if !initial_payload.is_empty() {
             stream
@@ -287,23 +281,21 @@ impl Endpoint for WireguardEndpoint {}
 #[cfg(test)]
 fn endpoint_for_test(
     logger: Logger,
-    tag: String,
+    id: String,
     options: WireguardEndpointOptions,
 ) -> WireguardEndpoint {
-    WireguardEndpoint::new(logger, tag, options, SocketProtector::default())
+    WireguardEndpoint::new(logger, id, options, SocketProtector::default())
 }
 
 /// Convenience constructor used by `EndpointManager::from_options_with_platform`.
 pub(crate) fn build_with_platform(
     logger: Logger,
-    tag: String,
+    id: String,
     options: WireguardEndpointOptions,
     platform: Option<Arc<dyn PlatformInterface>>,
 ) -> WireguardEndpoint {
-    let protector = platform
-        .map(SocketProtector::new)
-        .unwrap_or_default();
-    WireguardEndpoint::new(logger, tag, options, protector)
+    let protector = platform.map(SocketProtector::new).unwrap_or_default();
+    WireguardEndpoint::new(logger, id, options, protector)
 }
 
 #[cfg(test)]
@@ -317,8 +309,8 @@ mod tests {
     use hammer_core::config::{WireguardEndpointOptions, WireguardPeerOptions};
     use hammer_core::log::{DiscardWriter, Factory};
 
-    fn logger(tag: &str) -> Logger {
-        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+    fn logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
     fn x25519_public(secret: [u8; 32]) -> [u8; 32] {
@@ -378,7 +370,7 @@ mod tests {
         };
 
         // A consumes handshake_response. boringtun queues a keepalive packet
-        // back onto the network at this stage, so we accept either Done or
+        // back onto the network at this side, so we accept either Done or
         // WriteToNetwork.
         let mut buf3 = vec![0u8; 2048];
         match a_peer.lock_tunn().decapsulate(None, &response, &mut buf3) {
@@ -398,7 +390,10 @@ mod tests {
         };
 
         let mut dec_buf = vec![0u8; 2048];
-        match b_peer.lock_tunn().decapsulate(None, &encrypted, &mut dec_buf) {
+        match b_peer
+            .lock_tunn()
+            .decapsulate(None, &encrypted, &mut dec_buf)
+        {
             TunnResult::WriteToTunnelV4(out, _src) => assert_eq!(out, ip_packet),
             other => panic!("B: decapsulate {other:?}"),
         }
@@ -566,10 +561,7 @@ mod tests {
             port: port_b_inside,
         };
         let payload = b"hello over wireguard".to_vec();
-        udp_a
-            .send_to(dst, &payload)
-            .await
-            .expect("udp_a.send_to");
+        udp_a.send_to(dst, &payload).await.expect("udp_a.send_to");
 
         // 5s is plenty: the boringtun handshake completes in <50 ms over
         // localhost even with the 250 ms timer driving retransmits.
@@ -659,7 +651,7 @@ mod tests {
 
         const PORT: u16 = 8080;
         let listener = stack_b.listen_tcp(PORT);
-        // Park the accept side first so the listening socket is in SocketSet
+        // Park the accept stage first so the listening socket is in SocketSet
         // before A's SYN arrives — otherwise smoltcp would RST it.
         let accept_task = tokio::spawn(async move { listener.accept().await });
 
@@ -677,10 +669,7 @@ mod tests {
             .expect("accept");
 
         // A → B
-        stream_a
-            .write_all(b"ping from A")
-            .await
-            .expect("write A");
+        stream_a.write_all(b"ping from A").await.expect("write A");
         stream_a.flush().await.expect("flush A");
         let mut buf = [0u8; 11];
         timeout(Duration::from_secs(5), stream_b.read_exact(&mut buf))
@@ -690,10 +679,7 @@ mod tests {
         assert_eq!(&buf, b"ping from A");
 
         // B → A
-        stream_b
-            .write_all(b"pong from B")
-            .await
-            .expect("write B");
+        stream_b.write_all(b"pong from B").await.expect("write B");
         stream_b.flush().await.expect("flush B");
         let mut buf = [0u8; 11];
         timeout(Duration::from_secs(5), stream_a.read_exact(&mut buf))

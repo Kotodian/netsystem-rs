@@ -15,7 +15,7 @@ pub struct EndpointManager {
     items: Mutex<HashMap<String, Arc<dyn Endpoint>>>,
     /// Same set of endpoints as `items`, but viewed through their `Outbound`
     /// trait — sing-box keeps a single object behind both a `Endpoint` and an
-    /// `Outbound` registration so the router can resolve the tag through
+    /// `Outbound` registration so the router can resolve the id through
     /// `OutboundManager::get` exactly like any other outbound.
     outbound_view: Mutex<Vec<(String, Arc<dyn Outbound>)>>,
 }
@@ -30,10 +30,7 @@ impl EndpointManager {
     }
 
     #[cfg(feature = "wireguard")]
-    pub fn from_options(
-        logger: Logger,
-        options: &[EndpointOptions],
-    ) -> Result<Self, HammerError> {
+    pub fn from_options(logger: Logger, options: &[EndpointOptions]) -> Result<Self, HammerError> {
         Self::build(logger, options, None)
     }
 
@@ -61,7 +58,7 @@ impl EndpointManager {
                     // standard Rust — no need for a manual upcast helper.
                     let arc = Arc::new(crate::wireguard::build_with_platform(
                         manager.logger.clone(),
-                        option.tag.clone(),
+                        option.id.clone(),
                         opts.clone(),
                         platform.clone(),
                     ));
@@ -71,24 +68,24 @@ impl EndpointManager {
                 }
             };
             let mut items = manager.items.lock().expect("EndpointManager poisoned");
-            if items.contains_key(&option.tag) {
+            if items.contains_key(&option.id) {
                 return Err(HammerError::config_validation(format!(
-                    "duplicate endpoint tag: {}",
-                    option.tag
+                    "duplicate endpoint id: {}",
+                    option.id
                 )));
             }
-            items.insert(option.tag.clone(), endpoint_view);
+            items.insert(option.id.clone(), endpoint_view);
             drop(items);
             manager
                 .outbound_view
                 .lock()
                 .expect("EndpointManager poisoned")
-                .push((option.tag.clone(), outbound_view));
+                .push((option.id.clone(), outbound_view));
         }
         Ok(manager)
     }
 
-    /// Snapshot of the (tag, outbound-view) pairs so the assembler can register
+    /// Snapshot of the (id, outbound-view) pairs so the assembler can register
     /// them with `OutboundManager` after both managers exist. Cloning the Arcs
     /// is cheap and the slice is only walked once at boot.
     pub fn outbound_view(&self) -> Vec<(String, Arc<dyn Outbound>)> {
@@ -135,7 +132,7 @@ impl Lifecycle for EndpointManager {
         let mut errors = Vec::new();
         for ep in items {
             if let Err(err) = ep.close() {
-                errors.push(format!("{}: {}", ep.tag(), err));
+                errors.push(format!("{}: {}", ep.id(), err));
             }
         }
         if errors.is_empty() {
@@ -159,19 +156,19 @@ impl EndpointManagerTrait for EndpointManager {
             .collect()
     }
 
-    fn get(&self, tag: &str) -> Option<Arc<dyn Endpoint>> {
+    fn get(&self, id: &str) -> Option<Arc<dyn Endpoint>> {
         self.items
             .lock()
             .expect("EndpointManager poisoned")
-            .get(tag)
+            .get(id)
             .cloned()
     }
 
-    fn remove(&self, tag: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> Result<(), HammerError> {
         self.items
             .lock()
             .expect("EndpointManager poisoned")
-            .remove(tag);
+            .remove(id);
         Ok(())
     }
 }

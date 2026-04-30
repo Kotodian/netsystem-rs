@@ -17,8 +17,8 @@ use hammer_runtime::hysteria2::{
 };
 use tokio::io::AsyncWriteExt;
 
-fn logger(tag: &str) -> Logger {
-    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+fn logger(id: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
 
 #[derive(Default)]

@@ -31,7 +31,7 @@ pub trait DnsRouter: Lifecycle {
 #[async_trait]
 pub trait DnsTransport: Lifecycle {
     fn type_name(&self) -> &str;
-    fn tag(&self) -> &str;
+    fn id(&self) -> &str;
     fn dependencies(&self) -> &[String];
     fn reset(&self);
     async fn exchange(&self, message: Message) -> Result<Message, CoreError>;
@@ -39,9 +39,9 @@ pub trait DnsTransport: Lifecycle {
 
 pub trait DnsTransportManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn DnsTransport>>;
-    fn get(&self, tag: &str) -> Option<Arc<dyn DnsTransport>>;
+    fn get(&self, id: &str) -> Option<Arc<dyn DnsTransport>>;
     fn default(&self) -> Option<Arc<dyn DnsTransport>>;
-    fn remove(&self, tag: &str) -> Result<(), CoreError>;
+    fn remove(&self, id: &str) -> Result<(), CoreError>;
 }
 
 #[derive(Clone, Default)]

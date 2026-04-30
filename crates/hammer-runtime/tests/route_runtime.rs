@@ -12,8 +12,8 @@ use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{ConnectionManager, NetworkManager, OutboundManager, PauseManager, Router};
 
-fn logger(tag: &str) -> Logger {
-    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(tag)
+fn logger(id: &str) -> Logger {
+    Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
 
 fn options() -> Options {
@@ -221,51 +221,6 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
 }
 
 #[test]
-fn router_combines_domain_and_ip_cidr_with_and_semantics() {
-    let opts = options_with_user_rules(
-        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\nip_cidr = [\"8.8.8.8/32\"]\noutbound = \"hysteria2\"\n",
-    );
-    let router = router_from_options(&opts);
-
-    let mut both = RouteMetadata {
-        inbound: "tun".to_owned(),
-        network: Network::Tcp,
-        protocol: "https".to_owned(),
-        domain: Some("dns.google.com".to_owned()),
-        destination: Some(SocksAddr {
-            host: IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
-            port: 443,
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        router.match_route(&mut both).expect("match"),
-        RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
-        }
-    );
-
-    // Domain matches but IP doesn't → AND fails, falls through to default.
-    let mut domain_only = RouteMetadata {
-        inbound: "tun".to_owned(),
-        network: Network::Tcp,
-        protocol: "https".to_owned(),
-        domain: Some("dns.google.com".to_owned()),
-        destination: Some(SocksAddr {
-            host: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            port: 443,
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        router.match_route(&mut domain_only).expect("match"),
-        RouteDecision::Route {
-            outbound: "direct".to_owned()
-        }
-    );
-}
-
-#[test]
 fn router_rejects_unknown_outbound_at_construction() {
     let opts = options_with_user_rules(
         "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"typo\"\n",
@@ -281,7 +236,7 @@ fn router_rejects_unknown_outbound_at_construction() {
     };
     assert!(
         err.to_string().contains("\"typo\""),
-        "error should mention the unknown outbound tag: {err}"
+        "error should mention the unknown outbound id: {err}"
     );
 }
 
