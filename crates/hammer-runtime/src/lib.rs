@@ -9,10 +9,9 @@ pub use hammer_core::error::HammerError;
 
 /// Install the ring CryptoProvider as the rustls process-wide default.
 ///
-/// reqwest is configured with `rustls-no-provider`, so any TLS work performed
-/// through `reqwest::Client::new()` (e.g. DoH) needs a default provider in
-/// place before the first connection. Idempotent — subsequent calls are no-ops
-/// when a provider is already installed.
+/// Some rustls code paths may use the process-wide provider instead of an
+/// explicit builder provider. Idempotent — subsequent calls are no-ops when a
+/// provider is already installed.
 pub fn install_default_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

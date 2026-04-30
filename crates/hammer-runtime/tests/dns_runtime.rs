@@ -227,6 +227,44 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_client_bounds_cache_and_evicts_least_recently_used_entry() {
+    let transport = Arc::new(CountingTransport::new(
+        60,
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
+    ));
+    let client = DnsClient::new(logger("dns"));
+    let options = DnsQueryOptions {
+        lookup_strategy: DomainStrategy::Ipv4Only,
+        ..DnsQueryOptions::default()
+    };
+
+    for index in 0..1025 {
+        let domain = format!("bounded-{index}.test");
+        let _ = client
+            .lookup(
+                Arc::clone(&transport) as Arc<dyn DnsTransport>,
+                &domain,
+                options.clone(),
+            )
+            .await
+            .unwrap();
+    }
+    let calls_after_fill = transport.calls.load(Ordering::SeqCst);
+
+    let _ = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "bounded-0.test",
+            options,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(calls_after_fill, 1025);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dns_client_applies_lookup_strategy_ordering() {
     let transport = Arc::new(CountingTransport::new(
         60,

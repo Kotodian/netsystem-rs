@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,8 @@ use crate::tls_support::root_cert_store;
 const DEFAULT_DNS_TTL: u32 = 600;
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const DOH_MIME_TYPE: &str = "application/dns-message";
+const DNS_CLIENT_CACHE_MAX_ENTRIES: usize = 1024;
+const DNS_REVERSE_CACHE_MAX_ENTRIES: usize = 2048;
 
 pub type QueryType = RecordType;
 
@@ -204,7 +207,7 @@ fn sort_addresses(
     }
 }
 
-#[derive(Hash, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
     transport: String,
     name: String,
@@ -214,11 +217,13 @@ struct CacheKey {
 struct CacheValue {
     response: Message,
     expires_at: Instant,
+    last_used: u64,
 }
 
 pub struct DnsClient {
     logger: Logger,
     cache: Mutex<HashMap<CacheKey, CacheValue>>,
+    cache_tick: AtomicU64,
 }
 
 impl DnsClient {
@@ -226,6 +231,7 @@ impl DnsClient {
         Self {
             logger,
             cache: Mutex::new(HashMap::new()),
+            cache_tick: AtomicU64::new(0),
         }
     }
 
@@ -249,11 +255,11 @@ impl DnsClient {
             name: query.name().to_ascii().to_ascii_lowercase(),
             record_type: query.query_type(),
         };
-        if !options.disable_cache {
-            if let Some(mut cached) = self.load_cache(&key) {
-                cached.metadata.id = message.metadata.id;
-                return Ok(cached);
-            }
+        if !options.disable_cache
+            && let Some(mut cached) = self.load_cache(&key)
+        {
+            cached.metadata.id = message.metadata.id;
+            return Ok(cached);
         }
         let mut response = tokio::time::timeout(DNS_TIMEOUT, transport.exchange(message))
             .await
@@ -357,6 +363,7 @@ impl DnsClient {
             cache.remove(key);
             return None;
         }
+        value.last_used = self.next_cache_tick();
         let ttl = value.expires_at.saturating_duration_since(now).as_secs() as u32;
         let mut response = value.response.clone();
         normalize_ttl(&mut response, ttl);
@@ -364,13 +371,38 @@ impl DnsClient {
     }
 
     fn store_cache(&self, key: CacheKey, response: &Message, ttl: u32) {
-        self.cache.lock().expect("DnsClient cache poisoned").insert(
+        let now = Instant::now();
+        let mut cache = self.cache.lock().expect("DnsClient cache poisoned");
+        prune_cache(&mut cache, now);
+        if !cache.contains_key(&key) && cache.len() >= DNS_CLIENT_CACHE_MAX_ENTRIES {
+            evict_lru_cache_entry(&mut cache);
+        }
+        cache.insert(
             key,
             CacheValue {
                 response: response.clone(),
-                expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
+                expires_at: now + Duration::from_secs(u64::from(ttl)),
+                last_used: self.next_cache_tick(),
             },
         );
+    }
+
+    fn next_cache_tick(&self) -> u64 {
+        self.cache_tick.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+fn prune_cache(cache: &mut HashMap<CacheKey, CacheValue>, now: Instant) {
+    cache.retain(|_, value| now < value.expires_at);
+}
+
+fn evict_lru_cache_entry(cache: &mut HashMap<CacheKey, CacheValue>) {
+    if let Some(key) = cache
+        .iter()
+        .min_by_key(|(_, value)| value.last_used)
+        .map(|(key, _)| key.clone())
+    {
+        cache.remove(&key);
     }
 }
 
@@ -1026,9 +1058,7 @@ async fn udp_exchange_via(
     destination: SocksAddr,
     payload: &[u8],
 ) -> Result<Vec<u8>, HammerError> {
-    logger.debug(format!(
-        "dns udp via outbound={via} dest={destination}"
-    ));
+    logger.debug(format!("dns udp via outbound={via} dest={destination}"));
     let mut conn = outbound_by_tag(outbound, via)?.listen_packet().await?;
     conn.send_to(destination, payload).await?;
     Ok(conn.recv_from().await?.payload)
@@ -1262,6 +1292,7 @@ impl DnsTransportManagerTrait for DnsTransportManager {
 struct ReverseValue {
     domain: String,
     expires_at: Instant,
+    last_used: u64,
 }
 
 pub struct DnsRouter {
@@ -1270,6 +1301,7 @@ pub struct DnsRouter {
     client: DnsClient,
     default_strategy: DomainStrategy,
     reverse: Mutex<HashMap<IpAddr, ReverseValue>>,
+    reverse_tick: AtomicU64,
 }
 
 impl DnsRouter {
@@ -1289,6 +1321,7 @@ impl DnsRouter {
             transport,
             default_strategy,
             reverse: Mutex::new(HashMap::new()),
+            reverse_tick: AtomicU64::new(0),
         }
     }
 
@@ -1340,14 +1373,9 @@ impl DnsRouter {
         let expires_at = Instant::now() + Duration::from_secs(u64::from(DEFAULT_DNS_TTL));
         let domain = normalize_domain(domain);
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
+        prune_reverse_cache(&mut reverse, Instant::now());
         for addr in &addresses {
-            reverse.insert(
-                *addr,
-                ReverseValue {
-                    domain: domain.clone(),
-                    expires_at,
-                },
-            );
+            self.store_reverse_mapping_locked(&mut reverse, *addr, domain.clone(), expires_at);
         }
         Ok(addresses)
     }
@@ -1362,11 +1390,12 @@ impl DnsRouter {
 
     pub fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String> {
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
-        let value = reverse.get(&ip)?;
+        let value = reverse.get_mut(&ip)?;
         if Instant::now() >= value.expires_at {
             reverse.remove(&ip);
             return None;
         }
+        value.last_used = self.next_reverse_tick();
         Some(value.domain.clone())
     }
 
@@ -1391,17 +1420,58 @@ impl DnsRouter {
 
     fn save_reverse_mapping(&self, response: &Message) {
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
+        prune_reverse_cache(&mut reverse, Instant::now());
         for record in &response.answers {
             if let Some(addr) = record_addr(record) {
-                reverse.insert(
+                if record.ttl == 0 {
+                    continue;
+                }
+                self.store_reverse_mapping_locked(
+                    &mut reverse,
                     addr,
-                    ReverseValue {
-                        domain: domain_from_name(&record.name),
-                        expires_at: Instant::now() + Duration::from_secs(u64::from(record.ttl)),
-                    },
+                    domain_from_name(&record.name),
+                    Instant::now() + Duration::from_secs(u64::from(record.ttl)),
                 );
             }
         }
+    }
+
+    fn store_reverse_mapping_locked(
+        &self,
+        reverse: &mut HashMap<IpAddr, ReverseValue>,
+        addr: IpAddr,
+        domain: String,
+        expires_at: Instant,
+    ) {
+        if !reverse.contains_key(&addr) && reverse.len() >= DNS_REVERSE_CACHE_MAX_ENTRIES {
+            evict_lru_reverse_entry(reverse);
+        }
+        reverse.insert(
+            addr,
+            ReverseValue {
+                domain,
+                expires_at,
+                last_used: self.next_reverse_tick(),
+            },
+        );
+    }
+
+    fn next_reverse_tick(&self) -> u64 {
+        self.reverse_tick.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+fn prune_reverse_cache(reverse: &mut HashMap<IpAddr, ReverseValue>, now: Instant) {
+    reverse.retain(|_, value| now < value.expires_at);
+}
+
+fn evict_lru_reverse_entry(reverse: &mut HashMap<IpAddr, ReverseValue>) {
+    if let Some(addr) = reverse
+        .iter()
+        .min_by_key(|(_, value)| value.last_used)
+        .map(|(addr, _)| *addr)
+    {
+        reverse.remove(&addr);
     }
 }
 

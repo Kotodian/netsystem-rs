@@ -32,7 +32,6 @@ impl BbrProfile {
             Self::Aggressive => "aggressive",
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +268,7 @@ struct BrutalController {
     mtu: u64,
     ack_rate_milli: u64,
     rtt: Duration,
+    start: Instant,
     slots: [PacketSlot; 5],
     debug: bool,
 }
@@ -286,13 +286,14 @@ impl BrutalController {
             mtu: u64::from(mtu.max(1200)),
             ack_rate_milli: 1000,
             rtt: Duration::from_millis(100),
+            start: Instant::now(),
             slots: [PacketSlot::default(); 5],
             debug,
         }
     }
 
     fn record_packets(&mut self, now: Instant, acked: usize, lost: usize) {
-        let second = now.elapsed().as_secs();
+        let second = now.saturating_duration_since(self.start).as_secs();
         let slot = (second % self.slots.len() as u64) as usize;
         if self.slots[slot].second != second {
             self.slots[slot] = PacketSlot {
@@ -448,4 +449,21 @@ fn apply_transport_config_with_factory(
     }
     transport.congestion_controller_factory(factory);
     config.transport_config(Arc::new(transport));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brutal_controller_uses_sliding_window_relative_to_first_sample() {
+        let mut controller = BrutalController::new(1200, false);
+        let start = controller.start;
+
+        controller.record_packets(start, 25, 25);
+        assert_eq!(controller.ack_rate_milli, 800);
+
+        controller.record_packets(start + Duration::from_secs(6), 50, 0);
+        assert_eq!(controller.ack_rate_milli, 1000);
+    }
 }

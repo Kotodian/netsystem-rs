@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
@@ -22,7 +22,7 @@ use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 
 pub mod bbr;
 pub mod obfs;
@@ -74,7 +74,7 @@ pub struct Hysteria2Client {
 
 impl Hysteria2Client {
     pub async fn connect(options: ClientOptions, logger: Logger) -> Result<Arc<Self>, HammerError> {
-        let address = resolve_server(&options.server, options.server_port)?;
+        let address = resolve_server(&options.server, options.server_port).await?;
         let congestion = CongestionControlHandle::default();
         let endpoint = client_endpoint(&options, address, congestion.clone())?;
         let server_name = if options.server_name.is_empty() {
@@ -255,7 +255,7 @@ pub struct Hysteria2Outbound {
     options: Hysteria2OutboundOptions,
     networks: Vec<Network>,
     dependencies: Vec<String>,
-    client: Mutex<Option<Arc<Hysteria2Client>>>,
+    client: OnceCell<Arc<Hysteria2Client>>,
     protector: SocketProtector,
 }
 
@@ -277,17 +277,23 @@ impl Hysteria2Outbound {
             options,
             networks,
             dependencies: Vec::new(),
-            client: Mutex::new(None),
+            client: OnceCell::new(),
             protector,
         }
     }
 
     async fn client(&self) -> Result<Arc<Hysteria2Client>, HammerError> {
-        let mut guard = self.client.lock().await;
-        if let Some(client) = guard.as_ref() {
-            return Ok(Arc::clone(client));
-        }
-        let options = ClientOptions {
+        self.client
+            .get_or_try_init(|| async {
+                let options = self.client_options()?;
+                Hysteria2Client::connect(options, self.logger.clone()).await
+            })
+            .await
+            .map(Arc::clone)
+    }
+
+    fn client_options(&self) -> Result<ClientOptions, HammerError> {
+        Ok(ClientOptions {
             server: self.options.server.clone(),
             server_port: self.options.server_port,
             password: self.options.password.clone(),
@@ -305,10 +311,7 @@ impl Hysteria2Outbound {
             brutal_debug: self.options.brutal_debug,
             obfs: self.options.obfs.clone(),
             platform: self.protector.platform(),
-        };
-        let client = Hysteria2Client::connect(options, self.logger.clone()).await?;
-        *guard = Some(Arc::clone(&client));
-        Ok(client)
+        })
     }
 }
 
@@ -623,10 +626,13 @@ impl quinn::AsyncUdpSocket for SalamanderUdpSocket {
     }
 }
 
-fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
+async fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
     let port = if port == 0 { 443 } else { port };
-    (server, port)
-        .to_socket_addrs()
+    if let Ok(ip) = server.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    tokio::net::lookup_host((server, port))
+        .await
         .map_err(|err| HammerError::internal(format!("resolve hysteria2 server: {err}")))?
         .next()
         .ok_or_else(|| HammerError::internal("empty hysteria2 server resolution"))
@@ -756,13 +762,13 @@ fn server_config() -> Result<quinn::ServerConfig, HammerError> {
 }
 
 fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
-    if let Some(obfs) = obfs {
-        if obfs.type_ != "salamander" {
-            return Err(HammerError::internal(format!(
-                "unknown obfs type: {}",
-                obfs.type_
-            )));
-        }
+    if let Some(obfs) = obfs
+        && obfs.type_ != "salamander"
+    {
+        return Err(HammerError::internal(format!(
+            "unknown obfs type: {}",
+            obfs.type_
+        )));
     }
     Ok(())
 }

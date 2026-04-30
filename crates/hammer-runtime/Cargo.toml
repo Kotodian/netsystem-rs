@@ -19,7 +19,6 @@ hammer-adapter = { path = "../hammer-adapter" }
 async-trait = { workspace = true }
 boringtun = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
-reqwest = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 hyper = { workspace = true }
@@ -37,10 +36,8 @@ base64 = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true }
-once_cell = { workspace = true }
 smoltcp = { workspace = true }
 tun-rs = { workspace = true }
-etherparse = { workspace = true }
 ipnet = { workspace = true }
 libc = { workspace = true }
 

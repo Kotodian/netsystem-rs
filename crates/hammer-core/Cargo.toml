@@ -18,7 +18,6 @@ wireguard = ["dep:base64"]
 serde = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
-once_cell = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 ipnet = { workspace = true }
