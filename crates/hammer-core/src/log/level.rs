@@ -1,12 +1,16 @@
+use serde::{Deserialize, Serialize};
+
 // Numeric values intentionally match `sing/log` Level so that the i32 transmitted
 // to Swift over uniffi stays compatible with the Go reference implementation.
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Panic = 0,
     Fatal = 1,
     Error = 2,
     Warn = 3,
+    #[default]
     Info = 4,
     Debug = 5,
     Trace = 6,
@@ -34,6 +38,19 @@ impl Level {
             4 => Some(Level::Info),
             5 => Some(Level::Debug),
             6 => Some(Level::Trace),
+            _ => None,
+        }
+    }
+
+    pub fn from_name(value: &str) -> Option<Level> {
+        match value {
+            "panic" => Some(Level::Panic),
+            "fatal" => Some(Level::Fatal),
+            "error" => Some(Level::Error),
+            "warn" | "warning" => Some(Level::Warn),
+            "info" => Some(Level::Info),
+            "debug" => Some(Level::Debug),
+            "trace" => Some(Level::Trace),
             _ => None,
         }
     }

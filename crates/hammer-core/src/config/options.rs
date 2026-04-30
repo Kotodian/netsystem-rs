@@ -5,6 +5,8 @@ use std::time::Duration;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::log::Level;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     pub log: LogOptions,
@@ -19,7 +21,7 @@ pub struct Options {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogOptions {
     pub disabled: bool,
-    pub level: String,
+    pub level: Level,
     pub output: String,
     pub timestamp: bool,
 }

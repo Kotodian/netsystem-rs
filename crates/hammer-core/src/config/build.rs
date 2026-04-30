@@ -1,7 +1,6 @@
 #[cfg(feature = "wireguard")]
 use std::time::Duration;
 
-use ipnet::IpNet;
 use url::Url;
 
 use crate::error::HammerError;
@@ -9,8 +8,8 @@ use crate::error::HammerError;
 use super::options::constants as C;
 use super::options::*;
 #[cfg(feature = "wireguard")]
-use super::parse::{parse_base64_key, parse_ipnet_list, parse_socket_addr};
-use super::parse::{parse_optional_duration, parse_optional_port, parse_prefix_list};
+use super::parse::{parse_ipnet_list, parse_socket_addr};
+use super::parse::{parse_optional_port, parse_prefix_list};
 use super::raw::*;
 
 pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
@@ -66,7 +65,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     Ok(Options {
         log: LogOptions {
             disabled: raw_log.disabled,
-            level: raw_log.level,
+            level: raw_log.level.unwrap_or_default(),
             output: raw_log.output,
             timestamp: raw_log.timestamp,
         },
@@ -112,7 +111,6 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
     let route_exclude_address =
         parse_prefix_list("tun.route_exclude_address", &raw.route_exclude_address)?;
     let auto_route = raw.auto_route.unwrap_or(true);
-    let udp_timeout = parse_optional_duration("tun.udp_timeout", &raw.udp_timeout)?;
     Ok(TunInboundOptions {
         interface_name: raw.interface_name.clone(),
         mtu,
@@ -122,7 +120,7 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         auto_route,
         strict_route: raw.strict_route,
         stack,
-        udp_timeout,
+        udp_timeout: raw.udp_timeout,
     })
 }
 
@@ -148,9 +146,7 @@ fn build_hysteria_options(
             "hysteria2.password is required",
         ));
     }
-    if !raw.server_ports.is_empty()
-        || !raw.hop_interval.is_empty()
-        || !raw.hop_interval_max.is_empty()
+    if !raw.server_ports.is_empty() || raw.hop_interval.is_some() || raw.hop_interval_max.is_some()
     {
         return Err(HammerError::config_validation(
             "hysteria2 port hopping is not supported yet",
@@ -174,12 +170,6 @@ fn build_hysteria_options(
     } else {
         raw.network
     };
-    let hop_interval = parse_optional_duration("hysteria2.hop_interval", &raw.hop_interval)?;
-    let hop_interval_max =
-        parse_optional_duration("hysteria2.hop_interval_max", &raw.hop_interval_max)?;
-    let idle_timeout = parse_optional_duration("hysteria2.idle_timeout", &raw.idle_timeout)?;
-    let keep_alive_period =
-        parse_optional_duration("hysteria2.keep_alive_period", &raw.keep_alive_period)?;
     let bbr_profile = raw.bbr_profile.unwrap_or_default();
     let obfs = build_obfs(raw.obfs)?;
     Ok((
@@ -191,10 +181,10 @@ fn build_hysteria_options(
             up_mbps: raw.up_mbps,
             down_mbps: raw.down_mbps,
             network,
-            hop_interval,
-            hop_interval_max,
-            idle_timeout,
-            keep_alive_period,
+            hop_interval: raw.hop_interval,
+            hop_interval_max: raw.hop_interval_max,
+            idle_timeout: raw.idle_timeout,
+            keep_alive_period: raw.keep_alive_period,
             bbr_profile,
             brutal_debug: raw.brutal_debug,
             disable_path_mtu_discovery: raw.disable_path_mtu,
@@ -349,7 +339,7 @@ pub(crate) fn derive_tun_route_rules(
     raw_tun: &RawTunConfig,
     tun_tag: &str,
 ) -> Result<Vec<Rule>, HammerError> {
-    let sniff_timeout = parse_optional_duration("tun.sniff_timeout", &raw_tun.sniff_timeout)?;
+    let sniff_timeout = raw_tun.sniff_timeout;
     let domain_strategy = raw_tun.domain_strategy;
     if raw_tun.sniff_override_destination && !raw_tun.sniff {
         return Err(HammerError::config_validation(
@@ -455,10 +445,9 @@ fn build_wireguard_endpoint(
     } else {
         std::mem::take(&mut raw.id)
     };
-    let private_key = parse_base64_key(
-        &format!("endpoints[{idx}].private_key"),
-        raw.private_key.trim(),
-    )?;
+    let private_key = raw
+        .private_key
+        .decode_32(&format!("endpoints[{idx}].private_key"))?;
     let listen_port = raw.listen_port.unwrap_or(0);
     let mtu = raw.mtu.unwrap_or(C::DEFAULT_WIREGUARD_MTU);
     let address = parse_ipnet_list(&format!("endpoints[{idx}].address"), &raw.address)?;
@@ -497,12 +486,11 @@ fn build_wireguard_peer(
     raw: RawWireguardPeer,
 ) -> Result<WireguardPeerOptions, HammerError> {
     let prefix = format!("endpoints[{endpoint_idx}].peers[{peer_idx}]");
-    let public_key = parse_base64_key(&format!("{prefix}.public_key"), raw.public_key.trim())?;
-    let pre_shared_key = match raw.pre_shared_key.as_deref().map(str::trim) {
-        Some(value) if !value.is_empty() => Some(parse_base64_key(
-            &format!("{prefix}.pre_shared_key"),
-            value,
-        )?),
+    let public_key = raw.public_key.decode_32(&format!("{prefix}.public_key"))?;
+    let pre_shared_key = match raw.pre_shared_key.as_ref() {
+        Some(value) if !value.is_empty() => {
+            Some(value.decode_32(&format!("{prefix}.pre_shared_key"))?)
+        }
         _ => None,
     };
     if raw.address.is_empty() {
@@ -549,17 +537,6 @@ fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> 
             "route.rules[{idx}] requires at least one matcher (inbound/protocol/domain/domain_suffix/domain_keyword/ip_cidr)",
         )));
     }
-    let ip_cidr = raw
-        .ip_cidr
-        .iter()
-        .map(|raw_cidr| {
-            raw_cidr.parse::<IpNet>().map_err(|err| {
-                HammerError::config_validation(format!(
-                    "route.rules[{idx}].ip_cidr {raw_cidr:?}: {err}",
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(Rule {
         default_options: DefaultRule {
             inbound: raw.inbound.clone(),
@@ -567,7 +544,7 @@ fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> 
             domain: raw.domain.clone(),
             domain_suffix: raw.domain_suffix.clone(),
             domain_keyword: raw.domain_keyword.clone(),
-            ip_cidr,
+            ip_cidr: raw.ip_cidr.clone(),
             action: RuleActionKind::Route(RouteActionOptions {
                 outbound: raw.outbound.clone(),
             }),

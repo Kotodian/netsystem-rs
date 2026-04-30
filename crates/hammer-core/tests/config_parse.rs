@@ -6,6 +6,7 @@ use hammer_core::config::{
     self, DnsServerKind, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, InboundKind,
     OutboundKind, RuleActionKind, TunStack,
 };
+use hammer_core::log::Level;
 
 const MINIMAL_CONFIG: &str = r#"
 [log]
@@ -47,6 +48,7 @@ final = "hysteria2"
 #[test]
 fn parse_config_builds_hysteria_tun_options() {
     let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
+    assert_eq!(options.log.level, Level::Info);
     assert_eq!(options.inbounds.len(), 1);
     assert_eq!(options.inbounds[0].type_name(), "tun");
     matches::assert_inbound_tun(&options.inbounds[0].kind);
@@ -204,6 +206,14 @@ fn parse_config_rejects_unknown_dns_strategy() {
     let err = config::parse_config(&cfg).expect_err("accepted unknown dns.strategy");
     let msg = err.to_string();
     assert!(msg.contains("dns.strategy"), "error = {msg:?}");
+}
+
+#[test]
+fn parse_config_rejects_unknown_log_level() {
+    let cfg = MINIMAL_CONFIG.replacen("level = \"info\"\n", "level = \"verbose\"\n", 1);
+    let err = config::parse_config(&cfg).expect_err("accepted unknown log.level");
+    let msg = err.to_string();
+    assert!(msg.contains("log.level"), "error = {msg:?}");
 }
 
 #[test]

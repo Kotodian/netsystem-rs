@@ -1,9 +1,18 @@
-use serde::{Deserialize, Deserializer, Serialize, de};
+use std::time::Duration;
+
+use ipnet::IpNet;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+
+#[cfg(feature = "wireguard")]
+use crate::error::HammerError;
+use crate::log::Level;
 
 use super::options::{
     DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, TunStack,
 };
-use super::parse::parse_domain_strategy;
+#[cfg(feature = "wireguard")]
+use super::parse::parse_base64_key;
+use super::parse::{parse_domain_strategy, parse_optional_duration};
 
 // Raw config structs are mostly serde field declarations with the same
 // `default + skip_serializing_if` pattern. Keep the actual field list explicit,
@@ -88,7 +97,8 @@ pub struct RawConfig {
 raw_struct_with_default_check! {
     pub struct RawLogConfig {
         /// Minimum log level, for example `debug`, `info`, or `warn`.
-        pub level: String => "String::is_empty",
+        #[serde(deserialize_with = "deserialize_log_level")]
+        pub level: Option<Level> => "Option::is_none",
         /// Log output target from the user config.
         pub output: String => "String::is_empty",
         /// Whether log lines should include timestamps.
@@ -119,16 +129,24 @@ raw_struct_with_default_check! {
         pub auto_route: Option<bool> => "Option::is_none",
         /// Whether route installation should use strict routing semantics.
         pub strict_route: bool => "is_false",
-        /// UDP idle timeout string.
-        pub udp_timeout: String => "String::is_empty",
+        /// UDP idle timeout.
+        #[serde(
+            deserialize_with = "deserialize_tun_udp_timeout",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub udp_timeout: Option<Duration> => "Option::is_none",
         /// Whether protocol/domain sniffing is enabled.
         pub sniff: bool => "is_false",
         /// Whether DNS packets should be intercepted by the DNS router.
         pub hijack_dns: bool => "is_false",
         /// Whether sniffed destinations replace the original destination.
         pub sniff_override_destination: bool => "is_false",
-        /// Sniffing timeout string.
-        pub sniff_timeout: String => "String::is_empty",
+        /// Sniffing timeout.
+        #[serde(
+            deserialize_with = "deserialize_tun_sniff_timeout",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub sniff_timeout: Option<Duration> => "Option::is_none",
         /// Domain resolution strategy for sniffed/routed traffic.
         #[serde(deserialize_with = "deserialize_tun_domain_strategy")]
         pub domain_strategy: DomainStrategy => "DomainStrategy::is_default",
@@ -162,14 +180,30 @@ raw_struct_with_default_check! {
         /// Enabled network list from the raw config.
         #[serde(deserialize_with = "deserialize_hysteria2_networks")]
         pub network: Vec<Hysteria2Network> => "Vec::is_empty",
-        /// Port-hopping interval string.
-        pub hop_interval: String => "String::is_empty",
-        /// Maximum port-hopping interval string.
-        pub hop_interval_max: String => "String::is_empty",
-        /// QUIC idle timeout string.
-        pub idle_timeout: String => "String::is_empty",
-        /// QUIC keep-alive period string.
-        pub keep_alive_period: String => "String::is_empty",
+        /// Port-hopping interval.
+        #[serde(
+            deserialize_with = "deserialize_hysteria2_hop_interval",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub hop_interval: Option<Duration> => "Option::is_none",
+        /// Maximum port-hopping interval.
+        #[serde(
+            deserialize_with = "deserialize_hysteria2_hop_interval_max",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub hop_interval_max: Option<Duration> => "Option::is_none",
+        /// QUIC idle timeout.
+        #[serde(
+            deserialize_with = "deserialize_hysteria2_idle_timeout",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub idle_timeout: Option<Duration> => "Option::is_none",
+        /// QUIC keep-alive period.
+        #[serde(
+            deserialize_with = "deserialize_hysteria2_keep_alive_period",
+            serialize_with = "serialize_duration_option"
+        )]
+        pub keep_alive_period: Option<Duration> => "Option::is_none",
         /// Hysteria2 BBR profile.
         #[serde(deserialize_with = "deserialize_hysteria2_bbr_profile")]
         pub bbr_profile: Option<Hysteria2BbrProfile> => "Option::is_none",
@@ -213,7 +247,7 @@ raw_struct! {
         /// Endpoint tag used by route rules and lifecycle managers.
         pub id: String => "String::is_empty",
         /// Base64-encoded WireGuard private key.
-        pub private_key: String => "String::is_empty",
+        pub private_key: RawBase64Key => "RawBase64Key::is_empty",
         /// Optional UDP listen port.
         pub listen_port: Option<u16> => "Option::is_none",
         /// Optional WireGuard interface MTU.
@@ -229,9 +263,9 @@ raw_struct! {
     #[cfg(feature = "wireguard")]
     pub struct RawWireguardPeer {
         /// Base64-encoded peer public key.
-        pub public_key: String => "String::is_empty",
+        pub public_key: RawBase64Key => "RawBase64Key::is_empty",
         /// Optional base64-encoded pre-shared key.
-        pub pre_shared_key: Option<String> => "Option::is_none",
+        pub pre_shared_key: Option<RawBase64Key> => "Option::is_none",
         /// Peer endpoint address; currently must be an IP literal.
         pub address: String => "String::is_empty",
         /// Peer endpoint UDP port.
@@ -242,6 +276,22 @@ raw_struct! {
         pub persistent_keepalive_interval: Option<u32> => "Option::is_none",
         /// Optional reserved WARP-style header bytes.
         pub reserved: Option<[u8; 3]> => "Option::is_none",
+    }
+}
+
+#[cfg(feature = "wireguard")]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RawBase64Key(String);
+
+#[cfg(feature = "wireguard")]
+impl RawBase64Key {
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+
+    pub fn decode_32(&self, field: &str) -> Result<[u8; 32], HammerError> {
+        parse_base64_key(field, self.0.trim())
     }
 }
 
@@ -267,6 +317,10 @@ raw_struct_with_default_check! {
         /// Whether to let the runtime detect the platform default interface.
         pub auto_detect_interface: Option<bool> => "Option::is_none",
         /// Ordered user route rules.
+        #[serde(
+            deserialize_with = "deserialize_route_rules",
+            serialize_with = "serialize_route_rules"
+        )]
         pub rules: Vec<RawRouteRule> => "Vec::is_empty",
     }
 }
@@ -284,10 +338,33 @@ raw_struct! {
         /// Domain keyword matchers.
         pub domain_keyword: Vec<String> => "Vec::is_empty",
         /// IP CIDR matchers.
-        pub ip_cidr: Vec<String> => "Vec::is_empty",
+        #[serde(
+            deserialize_with = "deserialize_route_ip_cidrs",
+            serialize_with = "serialize_ipnet_vec"
+        )]
+        pub ip_cidr: Vec<IpNet> => "Vec::is_empty",
         /// Route target outbound tag.
         pub outbound: String => "String::is_empty",
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRouteRuleText {
+    #[serde(default)]
+    inbound: Vec<String>,
+    #[serde(default)]
+    protocol: Vec<String>,
+    #[serde(default)]
+    domain: Vec<String>,
+    #[serde(default)]
+    domain_suffix: Vec<String>,
+    #[serde(default)]
+    domain_keyword: Vec<String>,
+    #[serde(default)]
+    ip_cidr: Vec<String>,
+    #[serde(default)]
+    outbound: String,
 }
 
 fn is_false(v: &bool) -> bool {
@@ -301,6 +378,113 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+
+fn deserialize_log_level<'de, D>(deserializer: D) -> Result<Option<Level>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Level::from_name(value.to_ascii_lowercase().as_str())
+        .map(Some)
+        .ok_or_else(|| de::Error::custom(format!("log.level: unknown log level {value:?}")))
+}
+
+fn deserialize_tun_udp_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("tun.udp_timeout", deserializer)
+}
+
+fn deserialize_tun_sniff_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("tun.sniff_timeout", deserializer)
+}
+
+fn deserialize_hysteria2_hop_interval<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("hysteria2.hop_interval", deserializer)
+}
+
+fn deserialize_hysteria2_hop_interval_max<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("hysteria2.hop_interval_max", deserializer)
+}
+
+fn deserialize_hysteria2_idle_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("hysteria2.idle_timeout", deserializer)
+}
+
+fn deserialize_hysteria2_keep_alive_period<'de, D>(
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_duration_option("hysteria2.keep_alive_period", deserializer)
+}
+
+fn deserialize_duration_option<'de, D>(
+    field: &str,
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_optional_duration(field, &value).map_err(de::Error::custom)
+}
+
+fn serialize_duration_option<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_str(&format_duration_go_style(*value)),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn format_duration_go_style(value: Duration) -> String {
+    const NS: u128 = 1;
+    const US: u128 = 1_000 * NS;
+    const MS: u128 = 1_000 * US;
+    const S: u128 = 1_000 * MS;
+    const M: u128 = 60 * S;
+    const H: u128 = 60 * M;
+
+    let nanos = value.as_nanos();
+    if nanos == 0 {
+        return "0s".to_owned();
+    }
+    for (unit, scale) in [
+        ("h", H),
+        ("m", M),
+        ("s", S),
+        ("ms", MS),
+        ("us", US),
+        ("ns", NS),
+    ] {
+        if nanos.is_multiple_of(scale) {
+            return format!("{}{}", nanos / scale, unit);
+        }
+    }
+    format!("{nanos}ns")
 }
 
 fn deserialize_tun_stack<'de, D>(deserializer: D) -> Result<Option<TunStack>, D::Error>
@@ -332,6 +516,75 @@ where
 {
     let value = String::deserialize(deserializer)?;
     parse_domain_strategy("dns.strategy", &value).map_err(de::Error::custom)
+}
+
+fn deserialize_route_rules<'de, D>(deserializer: D) -> Result<Vec<RawRouteRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RawRouteRuleText>::deserialize(deserializer)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, raw)| {
+            let ip_cidr = raw
+                .ip_cidr
+                .into_iter()
+                .map(|value| {
+                    value.parse::<IpNet>().map_err(|err| {
+                        de::Error::custom(format!("route.rules[{idx}].ip_cidr {value:?}: {err}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, D::Error>>()?;
+            Ok(RawRouteRule {
+                inbound: raw.inbound,
+                protocol: raw.protocol,
+                domain: raw.domain,
+                domain_suffix: raw.domain_suffix,
+                domain_keyword: raw.domain_keyword,
+                ip_cidr,
+                outbound: raw.outbound,
+            })
+        })
+        .collect()
+}
+
+fn deserialize_route_ip_cidrs<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_ipnet_vec("route.rules.ip_cidr", deserializer)
+}
+
+fn deserialize_ipnet_vec<'de, D>(field: &str, deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| {
+            value
+                .parse::<IpNet>()
+                .map_err(|err| de::Error::custom(format!("{field} {value:?}: {err}")))
+        })
+        .collect()
+}
+
+fn serialize_route_rules<S>(value: &[RawRouteRule], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.serialize(serializer)
+}
+
+fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
 }
 
 fn deserialize_hysteria2_networks<'de, D>(
