@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, de};
 
 use crate::log::Level;
 
+use super::parse::is_false;
 use super::raw_struct_with_default_check;
 
 raw_struct_with_default_check! {
@@ -51,6 +52,3 @@ where
         .ok_or_else(|| de::Error::custom(format!("log.level: unknown log level {value:?}")))
 }
 
-fn is_false(v: &bool) -> bool {
-    !*v
-}

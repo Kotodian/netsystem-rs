@@ -6,12 +6,18 @@ mod raw;
 // Per-domain submodules (each owns its own Raw*, Options*, build_*).
 // Created incrementally as the legacy raw/options/build umbrellas are
 // drained — see /home/lqk/.claude/plans/cosmic-popping-wall.md.
+#[cfg(feature = "wireguard")]
+mod endpoint;
 mod inbound;
 mod log;
+mod outbound;
 
+#[cfg(feature = "wireguard")]
+pub use endpoint::*;
 pub use inbound::*;
 pub use log::*;
 pub use options::*;
+pub use outbound::*;
 
 use crate::error::HammerError;
 use raw::RawConfig;

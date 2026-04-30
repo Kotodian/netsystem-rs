@@ -1,12 +1,6 @@
 use std::net::IpAddr;
-#[cfg(feature = "wireguard")]
-use std::net::SocketAddr;
 use std::time::Duration;
 
-#[cfg(feature = "wireguard")]
-use base64::Engine as _;
-#[cfg(feature = "wireguard")]
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
@@ -101,6 +95,31 @@ where
 {
     let value = String::deserialize(deserializer)?;
     parse_optional_duration(field, &value).map_err(de::Error::custom)
+}
+
+// `skip_serializing_if` callbacks shared across every domain. Each Raw* field
+// that carries an unset-equals-default sentinel (the sing-box `omitempty`
+// idiom) reaches one of these via `use super::parse::is_false;` etc., keeping
+// the macro-generated serde attributes literal "is_false" / "is_zero_u32"
+// strings while still resolving to a single definition.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn is_false(v: &bool) -> bool {
+    !*v
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 /// Parse Go-style duration strings like "300ms", "1.5s", "2m30s", "1h".
@@ -200,23 +219,6 @@ fn parse_duration_go_style(input: &str) -> Result<Duration, String> {
     Ok(total)
 }
 
-/// Decode a base64-encoded 32-byte key (Curve25519 public/private/PSK).
-#[cfg(feature = "wireguard")]
-pub fn parse_base64_key(field: &str, value: &str) -> Result<[u8; 32], HammerError> {
-    let bytes = BASE64_STANDARD
-        .decode(value)
-        .map_err(|err| HammerError::config_validation(format!("{field}: invalid base64: {err}")))?;
-    if bytes.len() != 32 {
-        return Err(HammerError::config_validation(format!(
-            "{field}: expected 32 decoded bytes, got {}",
-            bytes.len()
-        )));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
 /// Parse a CIDR-form prefix into `ipnet::IpNet`. Bare IPs without a prefix are
 /// treated as host routes (`/32` or `/128`).
 pub fn parse_ipnet(field: &str, value: &str) -> Result<IpNet, HammerError> {
@@ -229,23 +231,6 @@ pub fn parse_ipnet(field: &str, value: &str) -> Result<IpNet, HammerError> {
     let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
     IpNet::new(ip, host_prefix)
         .map_err(|err| HammerError::config_validation(format!("{field}: {err}")))
-}
-
-/// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
-/// literal; hostname endpoints need lifecycle DNS resolution before enabling.
-#[cfg(feature = "wireguard")]
-pub fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
-    if port == 0 {
-        return Err(HammerError::config_validation(format!(
-            "{field}: port must be non-zero"
-        )));
-    }
-    let ip: IpAddr = host.parse().map_err(|_| {
-        HammerError::config_validation(format!(
-            "{field}: peer address must be an IP literal (got {host:?}); hostnames are not supported yet"
-        ))
-    })?;
-    Ok(SocketAddr::new(ip, port))
 }
 
 #[cfg(test)]
@@ -288,30 +273,6 @@ mod tests {
         assert!(err.to_string().contains("dns.strategy"));
     }
 
-    #[cfg(feature = "wireguard")]
-    #[test]
-    fn base64_key_round_trips_32_bytes() {
-        let raw = [7u8; 32];
-        let encoded = BASE64_STANDARD.encode(raw);
-        let decoded = parse_base64_key("wg.private_key", &encoded).unwrap();
-        assert_eq!(decoded, raw);
-    }
-
-    #[cfg(feature = "wireguard")]
-    #[test]
-    fn base64_key_rejects_wrong_length() {
-        let encoded = BASE64_STANDARD.encode([1u8; 16]);
-        let err = parse_base64_key("wg.private_key", &encoded).unwrap_err();
-        assert!(err.to_string().contains("32 decoded bytes"));
-    }
-
-    #[cfg(feature = "wireguard")]
-    #[test]
-    fn base64_key_rejects_invalid_base64() {
-        let err = parse_base64_key("wg.private_key", "not!base64!!").unwrap_err();
-        assert!(err.to_string().contains("invalid base64"));
-    }
-
     #[test]
     fn ipnet_accepts_cidr_and_promotes_bare_ip_to_host_prefix() {
         let v4 = parse_ipnet("wg.address", "10.0.0.1").unwrap();
@@ -327,12 +288,4 @@ mod tests {
         assert!(parse_ipnet("wg.address", "not-an-ip").is_err());
     }
 
-    #[cfg(feature = "wireguard")]
-    #[test]
-    fn socket_addr_requires_ip_literal_and_nonzero_port() {
-        let addr = parse_socket_addr("wg.peer", "1.2.3.4", 51820).unwrap();
-        assert_eq!(addr.to_string(), "1.2.3.4:51820");
-        assert!(parse_socket_addr("wg.peer", "example.com", 51820).is_err());
-        assert!(parse_socket_addr("wg.peer", "1.2.3.4", 0).is_err());
-    }
 }

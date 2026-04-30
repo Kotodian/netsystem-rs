@@ -1,14 +1,13 @@
-#[cfg(feature = "wireguard")]
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "wireguard")]
-use super::constants;
+use super::endpoint::Endpoint;
 use super::inbound::Inbound;
 use super::log::LogOptions;
+use super::outbound::Outbound;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -19,178 +18,6 @@ pub struct Options {
     #[cfg(feature = "wireguard")]
     pub endpoints: Vec<Endpoint>,
     pub route: RouteOptions,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Outbound {
-    pub id: String,
-    pub kind: OutboundKind,
-}
-
-impl Outbound {
-    pub fn type_name(&self) -> &'static str {
-        match &self.kind {
-            OutboundKind::Hysteria2(_) => "hysteria2",
-            OutboundKind::Direct(_) => "direct",
-            OutboundKind::Block => "block",
-            OutboundKind::Dns => "dns",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboundKind {
-    Hysteria2(Hysteria2OutboundOptions),
-    Direct(DirectOutboundOptions),
-    Block,
-    Dns,
-}
-
-/// `[[endpoints]]` element — protocols that maintain long-lived state and
-/// participate in the lifecycle alongside outbounds. Mirrors the sing-box
-/// 1.11+ endpoint concept: `Endpoint = Outbound + Lifecycle` (see
-/// `crates/hammer-adapter/src/endpoint.rs`).
-#[cfg(feature = "wireguard")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Endpoint {
-    pub id: String,
-    pub kind: EndpointKind,
-}
-
-#[cfg(feature = "wireguard")]
-impl Endpoint {
-    pub fn type_name(&self) -> &'static str {
-        match &self.kind {
-            EndpointKind::Wireguard(_) => constants::TYPE_WIREGUARD,
-        }
-    }
-}
-
-#[cfg(feature = "wireguard")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EndpointKind {
-    Wireguard(WireguardEndpointOptions),
-}
-
-#[cfg(feature = "wireguard")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireguardEndpointOptions {
-    /// Static private key (Curve25519, 32 bytes).
-    pub private_key: [u8; 32],
-    /// Local UDP listen port; `0` lets the OS pick.
-    pub listen_port: u16,
-    /// Tunnel MTU advertised to the inner stack. sing-box default is 1408.
-    pub mtu: u32,
-    /// Local addresses inside the tunnel (CIDR form).
-    pub address: Vec<IpNet>,
-    pub peers: Vec<WireguardPeerOptions>,
-}
-
-#[cfg(feature = "wireguard")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WireguardPeerOptions {
-    /// Peer static public key (Curve25519, 32 bytes).
-    pub public_key: [u8; 32],
-    /// Optional pre-shared key (32 bytes) for additional symmetric mixing.
-    pub pre_shared_key: Option<[u8; 32]>,
-    /// Resolved peer endpoint. Hostname-only entries are resolved during
-    /// endpoint lifecycle Start, not at config parse time.
-    pub endpoint: SocketAddr,
-    pub allowed_ips: Vec<IpNet>,
-    /// `None` disables persistent keepalive.
-    pub persistent_keepalive: Option<Duration>,
-    /// First three reserved bytes of every WireGuard packet — non-zero values
-    /// are how Cloudflare WARP demuxes traffic per-connection.
-    pub reserved: [u8; 3],
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Hysteria2OutboundOptions {
-    pub server: String,
-    pub server_port: u16,
-    pub server_ports: Vec<String>,
-    pub password: String,
-    pub up_mbps: i64,
-    pub down_mbps: i64,
-    pub network: Vec<Hysteria2Network>,
-    pub hop_interval: Option<Duration>,
-    pub hop_interval_max: Option<Duration>,
-    pub idle_timeout: Option<Duration>,
-    pub keep_alive_period: Option<Duration>,
-    pub bbr_profile: Hysteria2BbrProfile,
-    pub brutal_debug: bool,
-    pub disable_path_mtu_discovery: bool,
-    pub initial_packet_size: u16,
-    pub tls: OutboundTlsOptions,
-    pub obfs: Option<Hysteria2Obfs>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Hysteria2Network {
-    Tcp,
-    Udp,
-}
-
-impl Hysteria2Network {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Hysteria2BbrProfile {
-    #[default]
-    Standard,
-    Conservative,
-    Aggressive,
-}
-
-impl Hysteria2BbrProfile {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Conservative => "conservative",
-            Self::Aggressive => "aggressive",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OutboundTlsOptions {
-    pub enabled: bool,
-    pub server_name: String,
-    pub insecure: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Hysteria2Obfs {
-    pub type_: Hysteria2ObfsType,
-    pub password: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Hysteria2ObfsType {
-    #[default]
-    Salamander,
-}
-
-impl Hysteria2ObfsType {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Salamander => "salamander",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DirectOutboundOptions {
-    pub network_strategy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,4 +185,3 @@ impl DomainStrategy {
         }
     }
 }
-

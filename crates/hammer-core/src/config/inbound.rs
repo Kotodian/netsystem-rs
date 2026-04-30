@@ -15,7 +15,8 @@ use crate::error::HammerError;
 use super::constants as C;
 use super::options::DomainStrategy;
 use super::parse::{
-    self, deserialize_duration_option, deserialize_ipnet_vec, parse_domain_strategy,
+    self, deserialize_duration_option, deserialize_ipnet_vec, is_false, is_zero_u32,
+    parse_domain_strategy,
 };
 use super::raw_struct_with_default_check;
 
@@ -246,10 +247,3 @@ where
     parse::serialize_duration_option(value, serializer)
 }
 
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}

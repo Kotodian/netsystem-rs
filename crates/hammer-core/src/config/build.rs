@@ -1,17 +1,15 @@
-#[cfg(feature = "wireguard")]
-use std::time::Duration;
-
 use url::Url;
 
 use crate::error::HammerError;
 
 use super::constants as C;
+#[cfg(feature = "wireguard")]
+use super::endpoint::build_endpoints;
 use super::inbound::{RawTunConfig, build_tun_inbound};
 use super::log::build_log_options;
 use super::options::*;
+use super::outbound::{build_hysteria_options, build_outbounds};
 use super::parse::parse_optional_port;
-#[cfg(feature = "wireguard")]
-use super::parse::parse_socket_addr;
 use super::raw::*;
 
 pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
@@ -68,117 +66,6 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         endpoints,
         route: route_options,
     })
-}
-
-fn build_outbounds(hysteria: Hysteria2OutboundOptions, hysteria_id: String) -> Vec<Outbound> {
-    vec![
-        Outbound {
-            id: hysteria_id,
-            kind: OutboundKind::Hysteria2(hysteria),
-        },
-        Outbound {
-            id: C::DEFAULT_DIRECT_ID.to_owned(),
-            kind: OutboundKind::Direct(DirectOutboundOptions {
-                network_strategy: C::NETWORK_STRATEGY_DEFAULT.to_owned(),
-            }),
-        },
-    ]
-}
-
-fn build_hysteria_options(
-    mut raw: RawHysteria2Config,
-) -> Result<(Hysteria2OutboundOptions, String), HammerError> {
-    let id = if raw.id.is_empty() {
-        C::DEFAULT_HYSTERIA_ID.to_owned()
-    } else {
-        std::mem::take(&mut raw.id)
-    };
-    if raw.server.is_empty() {
-        return Err(HammerError::config_validation(
-            "hysteria2.server is required",
-        ));
-    }
-    let mut server_port = raw.server_port;
-    if server_port == 0 && raw.server_ports.is_empty() {
-        server_port = C::DEFAULT_HYSTERIA_PORT;
-    }
-    if raw.password.is_empty() {
-        return Err(HammerError::config_validation(
-            "hysteria2.password is required",
-        ));
-    }
-    if !raw.server_ports.is_empty() || raw.hop_interval.is_some() || raw.hop_interval_max.is_some()
-    {
-        return Err(HammerError::config_validation(
-            "hysteria2 port hopping is not supported yet",
-        ));
-    }
-    if raw.up_mbps < 0 || raw.down_mbps < 0 {
-        return Err(HammerError::config_validation(
-            "hysteria2.up_mbps and hysteria2.down_mbps must be non-negative",
-        ));
-    }
-    if !raw.insecure && raw.sni.is_empty() && raw.server.parse::<std::net::IpAddr>().is_err() {
-        raw.sni = raw.server.clone();
-    }
-    if !raw.insecure && raw.sni.is_empty() {
-        return Err(HammerError::config_validation(
-            "hysteria2.sni is required unless insecure=true",
-        ));
-    }
-    let network = if raw.network.is_empty() {
-        vec![Hysteria2Network::Tcp, Hysteria2Network::Udp]
-    } else {
-        raw.network
-    };
-    let bbr_profile = raw.bbr_profile.unwrap_or_default();
-    let obfs = build_obfs(raw.obfs)?;
-    Ok((
-        Hysteria2OutboundOptions {
-            server: raw.server,
-            server_port,
-            server_ports: raw.server_ports,
-            password: raw.password,
-            up_mbps: raw.up_mbps,
-            down_mbps: raw.down_mbps,
-            network,
-            hop_interval: raw.hop_interval,
-            hop_interval_max: raw.hop_interval_max,
-            idle_timeout: raw.idle_timeout,
-            keep_alive_period: raw.keep_alive_period,
-            bbr_profile,
-            brutal_debug: raw.brutal_debug,
-            disable_path_mtu_discovery: raw.disable_path_mtu,
-            initial_packet_size: raw.initial_packet_size,
-            tls: OutboundTlsOptions {
-                enabled: true,
-                server_name: raw.sni,
-                insecure: raw.insecure,
-            },
-            obfs,
-        },
-        id,
-    ))
-}
-
-fn build_obfs(raw: RawHysteria2Obfs) -> Result<Option<Hysteria2Obfs>, HammerError> {
-    if raw.type_.is_none() && raw.password.is_empty() {
-        return Ok(None);
-    }
-    let Some(type_) = raw.type_ else {
-        return Err(HammerError::config_validation(
-            "hysteria2.obfs.type and hysteria2.obfs.password must be set together",
-        ));
-    };
-    if raw.password.is_empty() {
-        return Err(HammerError::config_validation(
-            "hysteria2.obfs.type and hysteria2.obfs.password must be set together",
-        ));
-    }
-    Ok(Some(Hysteria2Obfs {
-        type_,
-        password: raw.password,
-    }))
 }
 
 fn build_dns_options(raw: &RawDnsConfig, default_via: &str) -> Result<DnsOptions, HammerError> {
@@ -381,103 +268,6 @@ fn build_user_rules(raw: &[RawRouteRule]) -> Result<Vec<Rule>, HammerError> {
         .enumerate()
         .map(|(idx, raw)| build_user_rule(idx, raw))
         .collect()
-}
-
-#[cfg(feature = "wireguard")]
-fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, HammerError> {
-    raw.into_iter()
-        .enumerate()
-        .map(|(idx, item)| match item {
-            RawEndpoint::Wireguard(wg) => build_wireguard_endpoint(idx, wg),
-        })
-        .collect()
-}
-
-#[cfg(feature = "wireguard")]
-fn build_wireguard_endpoint(
-    idx: usize,
-    mut raw: RawWireguardEndpoint,
-) -> Result<Endpoint, HammerError> {
-    let id = if raw.id.is_empty() {
-        return Err(HammerError::config_validation(format!(
-            "endpoints[{idx}].id is required"
-        )));
-    } else {
-        std::mem::take(&mut raw.id)
-    };
-    let private_key = raw
-        .private_key
-        .decode_32(&format!("endpoints[{idx}].private_key"))?;
-    let listen_port = raw.listen_port.unwrap_or(0);
-    let mtu = raw.mtu.unwrap_or(C::DEFAULT_WIREGUARD_MTU);
-    let address = raw.address;
-    if address.is_empty() {
-        return Err(HammerError::config_validation(format!(
-            "endpoints[{idx}].address is required"
-        )));
-    }
-    if raw.peers.is_empty() {
-        return Err(HammerError::config_validation(format!(
-            "endpoints[{idx}].peers must contain at least one peer"
-        )));
-    }
-    let peers = raw
-        .peers
-        .into_iter()
-        .enumerate()
-        .map(|(peer_idx, peer)| build_wireguard_peer(idx, peer_idx, peer))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Endpoint {
-        id,
-        kind: EndpointKind::Wireguard(WireguardEndpointOptions {
-            private_key,
-            listen_port,
-            mtu,
-            address,
-            peers,
-        }),
-    })
-}
-
-#[cfg(feature = "wireguard")]
-fn build_wireguard_peer(
-    endpoint_idx: usize,
-    peer_idx: usize,
-    raw: RawWireguardPeer,
-) -> Result<WireguardPeerOptions, HammerError> {
-    let prefix = format!("endpoints[{endpoint_idx}].peers[{peer_idx}]");
-    let public_key = raw.public_key.decode_32(&format!("{prefix}.public_key"))?;
-    let pre_shared_key = match raw.pre_shared_key.as_ref() {
-        Some(value) if !value.is_empty() => {
-            Some(value.decode_32(&format!("{prefix}.pre_shared_key"))?)
-        }
-        _ => None,
-    };
-    if raw.address.is_empty() {
-        return Err(HammerError::config_validation(format!(
-            "{prefix}.address is required"
-        )));
-    }
-    let endpoint = parse_socket_addr(&format!("{prefix}.address"), &raw.address, raw.port)?;
-    let allowed_ips = raw.allowed_ips;
-    if allowed_ips.is_empty() {
-        return Err(HammerError::config_validation(format!(
-            "{prefix}.allowed_ips is required"
-        )));
-    }
-    let persistent_keepalive = raw
-        .persistent_keepalive_interval
-        .filter(|secs| *secs > 0)
-        .map(|secs| Duration::from_secs(u64::from(secs)));
-    let reserved = raw.reserved.unwrap_or([0u8; 3]);
-    Ok(WireguardPeerOptions {
-        public_key,
-        pre_shared_key,
-        endpoint,
-        allowed_ips,
-        persistent_keepalive,
-        reserved,
-    })
 }
 
 fn build_user_rule(idx: usize, raw: &RawRouteRule) -> Result<Rule, HammerError> {
