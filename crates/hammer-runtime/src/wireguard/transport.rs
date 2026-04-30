@@ -17,7 +17,7 @@
 //! plugs `inbound_tx` / `encrypt_rx` into the smoltcp `phy::Device` so dial(TCP/UDP)
 //! starts to flow.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,9 +88,7 @@ pub(crate) fn spawn_transport(
     mtu: u32,
     protector: SocketProtector,
 ) -> Result<TransportHandles, HammerError> {
-    // Always bind v4 unspecified — hammer-ios-rs is an outbound-only client
-    // for now, so we don't need to receive on v6 too.
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
+    let bind = bind_addr_for_peers(&peers, listen_port);
     let std_socket = std::net::UdpSocket::bind(bind)
         .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
     std_socket
@@ -125,6 +123,15 @@ pub(crate) fn spawn_transport(
         shutdown: shutdown_tx,
         join,
     })
+}
+
+fn bind_addr_for_peers(peers: &[Peer], listen_port: u16) -> SocketAddr {
+    let needs_ipv6 = peers.iter().any(|peer| peer.endpoint().is_ipv6());
+    if needs_ipv6 {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port)
+    }
 }
 
 /// The actor body. Each branch is a single `select!` arm to keep the loop
@@ -372,7 +379,7 @@ fn first_hop_destination(packet: &[u8]) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Instant;
 
     use boringtun::x25519;
@@ -482,5 +489,35 @@ mod tests {
 
         // Dropping the handles closes both mpsc channels and the oneshot;
         // the actor's select! loop notices and exits cleanly.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_binds_ipv6_socket_for_ipv6_peer_endpoint() {
+        let a_priv = [77u8; 32];
+        let b_priv = [88u8; 32];
+        let b_pub = x25519_public(b_priv);
+        let peer = make_peer(
+            b_pub,
+            a_priv,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),
+            0,
+        );
+
+        let handles = spawn_transport(
+            logger("transport-v6"),
+            Arc::new(vec![peer]),
+            0,
+            1408,
+            SocketProtector::default(),
+        )
+        .expect("spawn v6 transport");
+
+        assert!(
+            handles.local_addr.is_ipv6(),
+            "IPv6 peer endpoints need an IPv6 UDP socket, got {}",
+            handles.local_addr
+        );
+
+        let _ = handles.shutdown.send(());
     }
 }

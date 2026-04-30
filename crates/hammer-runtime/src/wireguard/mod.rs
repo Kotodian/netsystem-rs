@@ -707,4 +707,180 @@ mod tests {
         a.shutdown();
         b.shutdown();
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnel_tcp_preserves_large_backpressured_stream() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::time::{sleep, timeout};
+
+        fn ephemeral_port() -> u16 {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        let a_priv = [77u8; 32];
+        let b_priv = [88u8; 32];
+        let a_pub = x25519_public(a_priv);
+        let b_pub = x25519_public(b_priv);
+
+        let port_a = ephemeral_port();
+        let port_b = ephemeral_port();
+        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+
+        let a_options = WireguardEndpointOptions {
+            private_key: a_priv,
+            listen_port: port_a,
+            mtu: 1408,
+            address: vec!["10.0.1.1/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: b_pub,
+                pre_shared_key: None,
+                endpoint: outer_b,
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+        let b_options = WireguardEndpointOptions {
+            private_key: b_priv,
+            listen_port: port_b,
+            mtu: 1408,
+            address: vec!["10.0.1.2/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: a_pub,
+                pre_shared_key: None,
+                endpoint: outer_a,
+                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+
+        let a = endpoint_for_test(logger("wg-big-a"), "wg-a".to_owned(), a_options);
+        let b = endpoint_for_test(logger("wg-big-b"), "wg-b".to_owned(), b_options);
+        a.boot().expect("boot a");
+        b.boot().expect("boot b");
+
+        let stack_a = a.stack_handle().expect("stack a ready");
+        let stack_b = b.stack_handle().expect("stack b ready");
+
+        const PORT: u16 = 8081;
+        let listener = stack_b.listen_tcp(PORT);
+        let accept_task = tokio::spawn(async move { listener.accept().await });
+
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)), PORT);
+        let mut stream_a = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
+            .await
+            .expect("dial timed out")
+            .expect("dial_tcp");
+        let mut stream_b = timeout(Duration::from_secs(5), accept_task)
+            .await
+            .expect("accept timed out")
+            .expect("accept join")
+            .expect("accept");
+
+        let payload = (0..(512 * 1024))
+            .map(|idx| (idx % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            for chunk in payload.chunks(4096) {
+                stream_a.write_all(chunk).await.expect("write payload");
+            }
+            stream_a.shutdown().await.expect("shutdown stream");
+        });
+
+        // Let B's user-side reader lag so the actor-to-bridge channel and
+        // DuplexStream hit backpressure before we drain them.
+        sleep(Duration::from_millis(200)).await;
+
+        let mut received = vec![0u8; expected.len()];
+        timeout(Duration::from_secs(10), stream_b.read_exact(&mut received))
+            .await
+            .expect("read timed out")
+            .expect("read_exact");
+        writer.await.expect("writer join");
+
+        assert_eq!(received, expected);
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnel_tcp_dial_fails_when_remote_port_is_closed() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        fn ephemeral_port() -> u16 {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        let a_priv = [99u8; 32];
+        let b_priv = [111u8; 32];
+        let a_pub = x25519_public(a_priv);
+        let b_pub = x25519_public(b_priv);
+
+        let port_a = ephemeral_port();
+        let port_b = ephemeral_port();
+        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+
+        let a_options = WireguardEndpointOptions {
+            private_key: a_priv,
+            listen_port: port_a,
+            mtu: 1408,
+            address: vec!["10.0.2.1/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: b_pub,
+                pre_shared_key: None,
+                endpoint: outer_b,
+                allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+        let b_options = WireguardEndpointOptions {
+            private_key: b_priv,
+            listen_port: port_b,
+            mtu: 1408,
+            address: vec!["10.0.2.2/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: a_pub,
+                pre_shared_key: None,
+                endpoint: outer_a,
+                allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+
+        let a = endpoint_for_test(logger("wg-closed-a"), "wg-a".to_owned(), a_options);
+        let b = endpoint_for_test(logger("wg-closed-b"), "wg-b".to_owned(), b_options);
+        a.boot().expect("boot a");
+        b.boot().expect("boot b");
+
+        let stack_a = a.stack_handle().expect("stack a ready");
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2)), 9099);
+        let err = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
+            .await
+            .expect("dial should resolve")
+            .expect_err("dial to closed remote port must fail");
+        assert!(
+            err.to_string().contains("wireguard tcp connect failed"),
+            "unexpected error: {err}"
+        );
+
+        a.shutdown();
+        b.shutdown();
+    }
 }

@@ -10,7 +10,7 @@
 //! `ProxyPacketConn` wrappers that bridge tokio AsyncRead/AsyncWrite into
 //! smoltcp's synchronous socket API.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -55,6 +55,10 @@ const EPHEMERAL_FLOOR: u16 = 49_152;
 /// Far-future poll wake-up when smoltcp has nothing pending. 1 hour is overkill
 /// but cheap — it just gates how often we recompute poll_at when truly idle.
 const IDLE_WAKEUP: Duration = Duration::from_secs(3600);
+/// Upper bound for waiting on the in-tunnel TCP three-way handshake. A closed
+/// peer normally fails much faster via RST; this keeps blackholed connects from
+/// parking an outbound dial forever.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct StackHandles {
     cmd_tx: mpsc::Sender<StackCommand>,
@@ -245,6 +249,7 @@ pub(crate) fn spawn_stack(
         tcp_bridges: HashMap::new(),
         udp_bridges: HashMap::new(),
         pending_accepts: Vec::new(),
+        pending_dials: Vec::new(),
         next_port: EPHEMERAL_FLOOR,
         started,
     };
@@ -281,6 +286,14 @@ struct PendingAccept {
     reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
 }
 
+/// One outbound TCP connect waiting for smoltcp to reach ESTABLISHED (or fail).
+struct PendingDial {
+    handle: SocketHandle,
+    dst: SocketAddr,
+    reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    deadline: TokioInstant,
+}
+
 /// Messages that the per-socket bridge tasks send back to the actor. Each
 /// carries the `SocketHandle` so the actor's single mpsc receiver can demux
 /// without a fan-in struct per socket.
@@ -288,6 +301,7 @@ enum SocketEvent {
     TcpWrite {
         handle: SocketHandle,
         data: Vec<u8>,
+        ack: oneshot::Sender<Result<(), HammerError>>,
     },
     TcpClose {
         handle: SocketHandle,
@@ -307,7 +321,13 @@ struct TcpBridge {
     data_tx: mpsc::Sender<Vec<u8>>,
     /// Bytes the actor is still trying to push into the smoltcp tx buffer
     /// (didn't fit in a single send_slice call).
-    pending_tx: Vec<u8>,
+    pending_tx: VecDeque<PendingTcpWrite>,
+}
+
+struct PendingTcpWrite {
+    data: Vec<u8>,
+    offset: usize,
+    ack: Option<oneshot::Sender<Result<(), HammerError>>>,
 }
 
 struct UdpBridge {
@@ -330,6 +350,7 @@ struct StackInner {
     tcp_bridges: HashMap<SocketHandle, TcpBridge>,
     udp_bridges: HashMap<SocketHandle, UdpBridge>,
     pending_accepts: Vec<PendingAccept>,
+    pending_dials: Vec<PendingDial>,
     next_port: u16,
     started: TokioInstant,
 }
@@ -345,6 +366,13 @@ impl StackInner {
                 .poll_at(now_smol, &self.sockets)
                 .map(|inst| self.tokio_from_smol(inst))
                 .unwrap_or_else(|| TokioInstant::now() + IDLE_WAKEUP);
+            let next_at = self
+                .pending_dials
+                .iter()
+                .map(|dial| dial.deadline)
+                .min()
+                .map(|deadline| next_at.min(deadline))
+                .unwrap_or(next_at);
 
             tokio::select! {
                 biased;
@@ -384,6 +412,7 @@ impl StackInner {
         }
 
         self.check_pending_accepts();
+        self.check_pending_dials();
         self.drain_tcp_recv();
         self.retry_pending_tcp_writes();
         self.drain_udp_recv();
@@ -415,22 +444,7 @@ impl StackInner {
                 | State::LastAck => {
                     // Connection is up (or already half-closing — let the
                     // bridge surface that to the caller).
-                    let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
-                    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(TCP_DATA_QUEUE);
-                    let event_tx = self.event_tx.clone();
-                    tokio::spawn(tcp_bridge_task(
-                        accept.handle,
-                        actor_side,
-                        data_rx,
-                        event_tx,
-                    ));
-                    self.tcp_bridges.insert(
-                        accept.handle,
-                        TcpBridge {
-                            data_tx,
-                            pending_tx: Vec::new(),
-                        },
-                    );
+                    let user_side = self.start_tcp_bridge(accept.handle);
                     let _ = accept.reply.send(Ok(user_side));
                 }
                 State::Closed | State::TimeWait => {
@@ -446,31 +460,59 @@ impl StackInner {
         }
     }
 
+    /// Resolve outbound dials only after smoltcp reports the TCP handshake is
+    /// established. This keeps `Outbound::dial` from succeeding for a remote
+    /// port that already rejected the SYN.
+    fn check_pending_dials(&mut self) {
+        use smoltcp::socket::tcp::State;
+        if self.pending_dials.is_empty() {
+            return;
+        }
+
+        let now = TokioInstant::now();
+        let drained = std::mem::take(&mut self.pending_dials);
+        for dial in drained {
+            let state = self.sockets.get::<tcp::Socket>(dial.handle).state();
+            match state {
+                State::SynSent | State::SynReceived => {
+                    if now >= dial.deadline {
+                        self.sockets.remove(dial.handle);
+                        let _ = dial.reply.send(Err(HammerError::internal(format!(
+                            "wireguard tcp connect failed to {}: timeout",
+                            dial.dst
+                        ))));
+                    } else {
+                        self.pending_dials.push(dial);
+                    }
+                }
+                State::Established
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck => {
+                    let user_side = self.start_tcp_bridge(dial.handle);
+                    let _ = dial.reply.send(Ok(user_side));
+                }
+                State::Closed | State::TimeWait | State::Listen => {
+                    self.sockets.remove(dial.handle);
+                    let _ = dial.reply.send(Err(HammerError::internal(format!(
+                        "wireguard tcp connect failed to {}: {:?}",
+                        dial.dst, state
+                    ))));
+                }
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: SocketEvent) {
         match event {
-            SocketEvent::TcpWrite { handle, data } => {
-                let bridge = match self.tcp_bridges.get_mut(&handle) {
-                    Some(b) => b,
-                    None => return,
-                };
-                let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                if socket.may_send() {
-                    match socket.send_slice(&data) {
-                        Ok(n) if n == data.len() => {}
-                        Ok(n) => {
-                            bridge.pending_tx.extend_from_slice(&data[n..]);
-                        }
-                        Err(err) => {
-                            self.logger
-                                .warn(format!("wireguard tcp send_slice: {err:?}"));
-                        }
-                    }
-                } else {
-                    bridge.pending_tx.extend_from_slice(&data);
-                }
+            SocketEvent::TcpWrite { handle, data, ack } => {
+                self.handle_tcp_write(handle, data, ack);
             }
             SocketEvent::TcpClose { handle } => {
                 if self.tcp_bridges.contains_key(&handle) {
+                    self.fail_pending_tcp_writes(handle, "wireguard tcp: user stream closed");
                     let socket = self.sockets.get_mut::<tcp::Socket>(handle);
                     socket.close();
                 }
@@ -501,7 +543,7 @@ impl StackInner {
     async fn handle_command(&mut self, cmd: StackCommand) {
         match cmd {
             StackCommand::DialTcp { dst, reply } => {
-                let _ = reply.send(self.dial_tcp(dst));
+                self.queue_dial(dst, reply);
             }
             StackCommand::BindUdp { reply } => {
                 let _ = reply.send(self.bind_udp());
@@ -533,7 +575,11 @@ impl StackInner {
         self.pending_accepts.push(PendingAccept { handle, reply });
     }
 
-    fn dial_tcp(&mut self, dst: SocketAddr) -> Result<DuplexStream, HammerError> {
+    fn queue_dial(
+        &mut self,
+        dst: SocketAddr,
+        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    ) {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -542,31 +588,107 @@ impl StackInner {
         let remote = match socket_endpoint_for(dst) {
             Some(ep) => ep,
             None => {
-                return Err(HammerError::internal(format!(
+                let _ = reply.send(Err(HammerError::internal(format!(
                     "wireguard dial: unsupported destination {dst}"
-                )));
+                ))));
+                return;
             }
         };
-        socket
-            .connect(self.iface.context(), remote, local_port)
-            .map_err(|err| HammerError::internal(format!("wireguard tcp connect: {err:?}")))?;
+        if let Err(err) = socket.connect(self.iface.context(), remote, local_port) {
+            let _ = reply.send(Err(HammerError::internal(format!(
+                "wireguard tcp connect: {err:?}"
+            ))));
+            return;
+        }
 
         let handle = self.sockets.add(socket);
+        self.pending_dials.push(PendingDial {
+            handle,
+            dst,
+            reply,
+            deadline: TokioInstant::now() + TCP_CONNECT_TIMEOUT,
+        });
+    }
 
+    fn start_tcp_bridge(&mut self, handle: SocketHandle) -> DuplexStream {
         let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(TCP_DATA_QUEUE);
         let event_tx = self.event_tx.clone();
         tokio::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
-
         self.tcp_bridges.insert(
             handle,
             TcpBridge {
                 data_tx,
-                pending_tx: Vec::new(),
+                pending_tx: VecDeque::new(),
             },
         );
+        user_side
+    }
 
-        Ok(user_side)
+    fn handle_tcp_write(
+        &mut self,
+        handle: SocketHandle,
+        data: Vec<u8>,
+        ack: oneshot::Sender<Result<(), HammerError>>,
+    ) {
+        let Some(bridge) = self.tcp_bridges.get_mut(&handle) else {
+            let _ = ack.send(Err(HammerError::internal("wireguard tcp: socket closed")));
+            return;
+        };
+
+        if !bridge.pending_tx.is_empty() {
+            bridge.pending_tx.push_back(PendingTcpWrite {
+                data,
+                offset: 0,
+                ack: Some(ack),
+            });
+            return;
+        }
+
+        let written = self.write_tcp_slice(handle, &data);
+        if written >= data.len() {
+            let _ = ack.send(Ok(()));
+            return;
+        }
+
+        if let Some(bridge) = self.tcp_bridges.get_mut(&handle) {
+            bridge.pending_tx.push_back(PendingTcpWrite {
+                data,
+                offset: written,
+                ack: Some(ack),
+            });
+        } else {
+            let _ = ack.send(Err(HammerError::internal("wireguard tcp: socket closed")));
+        }
+    }
+
+    fn write_tcp_slice(&mut self, handle: SocketHandle, data: &[u8]) -> usize {
+        if data.is_empty() {
+            return 0;
+        }
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if !socket.may_send() {
+            return 0;
+        }
+        match socket.send_slice(data) {
+            Ok(n) => n,
+            Err(err) => {
+                self.logger
+                    .debug(format!("wireguard tcp send_slice deferred: {err:?}"));
+                0
+            }
+        }
+    }
+
+    fn fail_pending_tcp_writes(&mut self, handle: SocketHandle, reason: &'static str) {
+        let Some(bridge) = self.tcp_bridges.get_mut(&handle) else {
+            return;
+        };
+        while let Some(mut pending) = bridge.pending_tx.pop_front() {
+            if let Some(ack) = pending.ack.take() {
+                let _ = ack.send(Err(HammerError::internal(reason)));
+            }
+        }
     }
 
     fn bind_udp(&mut self) -> Result<UdpHandle, HammerError> {
@@ -612,18 +734,19 @@ impl StackInner {
         for handle in handles {
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             while socket.can_recv() {
+                let data_tx = match self.tcp_bridges.get(&handle) {
+                    Some(b) => b.data_tx.clone(),
+                    None => break,
+                };
+                let permit = match data_tx.try_reserve_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
                 let mut buf = vec![0u8; TCP_BUF];
                 match socket.recv_slice(&mut buf) {
                     Ok(n) if n > 0 => {
                         buf.truncate(n);
-                        let bridge = match self.tcp_bridges.get(&handle) {
-                            Some(b) => b,
-                            None => break,
-                        };
-                        if bridge.data_tx.try_send(buf).is_err() {
-                            // bridge channel full or closed — wait for next poll
-                            break;
-                        }
+                        permit.send(buf);
                     }
                     _ => break,
                 }
@@ -645,11 +768,31 @@ impl StackInner {
             if !socket.may_send() {
                 continue;
             }
-            match socket.send_slice(&bridge.pending_tx) {
-                Ok(n) if n > 0 => {
-                    bridge.pending_tx.drain(..n);
+            loop {
+                let Some(pending) = bridge.pending_tx.front_mut() else {
+                    break;
+                };
+                if !socket.may_send() {
+                    break;
                 }
-                _ => {}
+                match socket.send_slice(&pending.data[pending.offset..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        pending.offset += n;
+                        if pending.offset < pending.data.len() {
+                            break;
+                        }
+                        let mut done = bridge.pending_tx.pop_front().expect("front exists");
+                        if let Some(ack) = done.ack.take() {
+                            let _ = ack.send(Ok(()));
+                        }
+                    }
+                    Err(err) => {
+                        self.logger
+                            .debug(format!("wireguard tcp retry deferred: {err:?}"));
+                        break;
+                    }
+                }
             }
         }
     }
@@ -691,6 +834,7 @@ impl StackInner {
             })
             .collect();
         for handle in stale_tcp {
+            self.fail_pending_tcp_writes(handle, "wireguard tcp: socket closed");
             self.sockets.remove(handle);
             self.tcp_bridges.remove(&handle);
         }
@@ -733,15 +877,21 @@ async fn tcp_bridge_task(
                 match res {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        let (ack_tx, ack_rx) = oneshot::channel();
                         if event_tx
                             .send(SocketEvent::TcpWrite {
                                 handle,
                                 data: buf[..n].to_vec(),
+                                ack: ack_tx,
                             })
                             .await
                             .is_err()
                         {
                             break;
+                        }
+                        match ack_rx.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) | Err(_) => break,
                         }
                     }
                 }

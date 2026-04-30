@@ -191,9 +191,8 @@ pub fn parse_ipnet_list(field: &str, values: &[String]) -> Result<Vec<IpNet>, Ha
     values.iter().map(|v| parse_ipnet(field, v)).collect()
 }
 
-/// Parse a `host:port`-style endpoint. The host must be an IP literal — DNS
-/// names are deferred to the endpoint's lifecycle Start so we don't block the
-/// config parser on a resolver.
+/// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
+/// literal; hostname endpoints need lifecycle DNS resolution before enabling.
 #[cfg(feature = "wireguard")]
 pub fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
     if port == 0 {
