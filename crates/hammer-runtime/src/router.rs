@@ -195,6 +195,7 @@ impl RuntimeRule {
     }
 }
 
+#[inline]
 fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
     if suffix.is_empty() {
         return false;
@@ -212,6 +213,7 @@ enum RuleApply {
     Decision(RouteDecision),
 }
 
+#[inline]
 fn match_list(values: &[String], actual: &str) -> bool {
     values.is_empty() || values.iter().any(|value| value == actual)
 }

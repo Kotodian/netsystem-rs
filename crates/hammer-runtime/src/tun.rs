@@ -652,6 +652,7 @@ pub enum TunDispatch {
     },
 }
 
+#[inline]
 pub fn parse_ip_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
     if packet.is_empty() {
         return Err(HammerError::internal("empty IP packet"));
@@ -1013,6 +1014,7 @@ fn parse_ipv6_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
     parse_transport(packet[6], source, destination, &packet[40..])
 }
 
+#[inline]
 fn parse_transport(
     protocol: u8,
     source: IpAddr,
@@ -1410,10 +1412,12 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[inline(always)]
 fn read_u16(packet: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([packet[offset], packet[offset + 1]])
 }
 
+#[inline(always)]
 fn read_u32(packet: &[u8], offset: usize) -> u32 {
     u32::from_be_bytes([
         packet[offset],
@@ -1423,10 +1427,12 @@ fn read_u32(packet: &[u8], offset: usize) -> u32 {
     ])
 }
 
+#[inline(always)]
 fn write_u16(packet: &mut [u8], offset: usize, value: u16) {
     packet[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
 }
 
+#[inline(always)]
 fn write_u32(packet: &mut [u8], offset: usize, value: u32) {
     packet[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
@@ -1451,6 +1457,7 @@ fn write_ip_addr(packet: &mut [u8], offset: usize, addr: IpAddr) -> Result<(), H
     Ok(())
 }
 
+#[inline]
 fn is_global_unicast(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(addr) => {

@@ -97,6 +97,7 @@ impl CongestionControlHandle {
         self.brutal_bps.store(0, Ordering::SeqCst);
     }
 
+    #[inline]
     fn brutal_bps(&self) -> u64 {
         self.brutal_bps.load(Ordering::SeqCst)
     }
@@ -121,6 +122,7 @@ impl DynamicHysteriaController {
         }
     }
 
+    #[inline]
     fn using_brutal(&self) -> bool {
         self.handle.brutal_bps() > 0
     }

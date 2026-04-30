@@ -100,6 +100,7 @@ impl UdpMessage {
         })
     }
 
+    #[inline]
     pub fn header_size(&self) -> usize {
         8 + varint_len(self.destination.len() as u64) + self.destination.len()
     }
@@ -335,6 +336,7 @@ async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64, 
     Ok(u64::from_be_bytes(bytes) >> ((8 - len) * 8))
 }
 
+#[inline]
 fn write_varint(out: &mut Vec<u8>, value: u64) {
     match value {
         0..=63 => out.push(value as u8),
@@ -361,6 +363,7 @@ fn write_varint(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+#[inline]
 fn varint_len(value: u64) -> usize {
     match value {
         0..=63 => 1,
