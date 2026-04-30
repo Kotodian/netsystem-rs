@@ -77,10 +77,11 @@ impl TransportHandles {
     }
 }
 
-/// Spin up the UDP transport actor. Binds the socket so the caller knows
-/// `local_addr` immediately, protects it through the platform's bypass hook,
-/// then hands ownership of the socket + peers to a detached tokio task.
-pub(crate) async fn spawn_transport(
+/// Spin up the UDP transport actor. Binds the socket synchronously (cheap —
+/// it's just a `socket()` + `bind()` syscall) so this works inside the
+/// blocking `Lifecycle::start` path; the resulting tokio `UdpSocket` is then
+/// handed to a detached task.
+pub(crate) fn spawn_transport(
     logger: Logger,
     peers: Arc<Vec<Peer>>,
     listen_port: u16,
@@ -90,9 +91,13 @@ pub(crate) async fn spawn_transport(
     // Always bind v4 unspecified — hammer-ios-rs is an outbound-only client
     // for now, so we don't need to receive on v6 too.
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port);
-    let socket = UdpSocket::bind(bind)
-        .await
+    let std_socket = std::net::UdpSocket::bind(bind)
         .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
+    std_socket
+        .set_nonblocking(true)
+        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
+    let socket = UdpSocket::from_std(std_socket)
+        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
     protector.protect(&socket)?;
     let local_addr = socket
         .local_addr()
@@ -448,7 +453,6 @@ mod tests {
             1408,
             SocketProtector::default(),
         )
-        .await
         .expect("spawn A");
         let mut handles_b = spawn_transport(
             logger("transport-b"),
@@ -457,7 +461,6 @@ mod tests {
             1408,
             SocketProtector::default(),
         )
-        .await
         .expect("spawn B");
         assert_eq!(handles_a.local_addr.port(), port_a);
         assert_eq!(handles_b.local_addr.port(), port_b);

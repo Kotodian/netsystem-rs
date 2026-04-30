@@ -10,8 +10,6 @@ use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
-#[cfg(feature = "wireguard")]
-use crate::wireguard::WireguardEndpoint;
 
 pub struct EndpointManager {
     logger: Logger,
@@ -47,18 +45,16 @@ impl EndpointManager {
     fn build(
         logger: Logger,
         options: &[EndpointOptions],
-        // Held for symmetry with OutboundManager::from_options_with_platform.
-        // The wg endpoint will route its outer UDP socket through this once
-        // the boringtun transport lands; the placeholder ignores it.
-        _platform: Option<Arc<dyn PlatformInterface>>,
+        platform: Option<Arc<dyn PlatformInterface>>,
     ) -> Result<Self, HammerError> {
         let manager = Self::new(logger);
         for option in options {
             let endpoint: Arc<dyn Endpoint> = match &option.kind {
-                EndpointKind::Wireguard(opts) => Arc::new(WireguardEndpoint::new(
+                EndpointKind::Wireguard(opts) => Arc::new(crate::wireguard::build_with_platform(
                     manager.logger.clone(),
                     option.tag.clone(),
                     opts.clone(),
+                    platform.clone(),
                 )),
             };
             let mut items = manager.items.lock().expect("EndpointManager poisoned");

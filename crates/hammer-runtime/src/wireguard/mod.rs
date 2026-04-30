@@ -1,85 +1,112 @@
 //! WireGuard endpoint.
 //!
-//! Mirrors sing-box's split between an outer `protocol/wireguard.Endpoint` (which
-//! the router dials into via `DialContext`) and an inner `transport/wireguard`
-//! device that owns the gVisor stack + wireguard-go runtime. Hammer lands this
-//! in stages:
+//! Mirrors sing-box's split between an outer `protocol/wireguard.Endpoint`
+//! (which the router dials into via `DialContext`) and an inner
+//! `transport/wireguard` device that owns the gVisor stack + wireguard-go
+//! runtime. Hammer's stack equivalent is `wireguard::stack` (smoltcp) +
+//! `wireguard::transport` (boringtun + UDP); this module ties them together
+//! into the public `Outbound`/`Endpoint` surface and the lifecycle.
 //!
-//!   commit 2: scaffold the public type + manager wiring with the dial/listen
-//!     surface returning `unimplemented`.
-//!   commit 3: real boringtun `Tunn` per peer with LPM routing.
-//!   commit 4a (this one): UDP transport actor that drives boringtun handshakes
-//!     and shuttles encapsulated frames over a real socket. Endpoint integration
-//!     and dial(TCP/UDP) land in 4b.
-//!   commit 4b: smoltcp netstack inside the endpoint, lifecycle Start spawns the
-//!     transport actor, and dial(TCP/UDP) closes the loop.
-//!
-//! Plenty of items here are reachable only from `#[cfg(test)]` modules or from
-//! commit 4b's not-yet-written endpoint wiring. Suppressing the dead-code
-//! warnings keeps the build clean during the staged rollout; the lint goes
-//! away as 4b connects everything to a live `lifecycle::start`.
+//! A handful of helpers (mtu/peers/route_outbound/encapsulate_buffer) are only
+//! reachable from `#[cfg(test)]` until commit 5 wires the endpoint into
+//! `OutboundManager` and the router can actually invoke `dial`. The mod-level
+//! `allow(dead_code)` suppresses the warnings during the staged rollout.
 #![allow(dead_code)]
 
+mod device;
 mod peer;
+mod stack;
 mod transport;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use boringtun::x25519;
-use hammer_adapter::{Endpoint, Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr};
+use ipnet::IpNet;
+use tokio::io::AsyncWriteExt;
+
+use hammer_adapter::{
+    Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyPacketConn, ProxyStream,
+    SocksAddr,
+};
 use hammer_core::config::WireguardEndpointOptions;
 use hammer_core::error::HammerError;
+use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
-use crate::impl_logging_lifecycle;
+use crate::socket_protector::SocketProtector;
 
 use peer::Peer;
+use stack::StackHandles;
+use transport::TransportHandles;
 
 /// Tunnel-side overhead added to every IP packet by WireGuard's data frame
 /// (16 byte poly1305 tag + 16 byte header). Buffers passed to `Tunn::encapsulate`
 /// must be at least `src.len() + 32` bytes.
 const WIREGUARD_OVERHEAD: usize = 32;
 
-/// Endpoint backed by WireGuard. The `Tunn` state machines for every peer are
-/// alive as soon as `new` returns; commit 4 will wrap them with the smoltcp
-/// stack + UDP transport so dial / listen_packet stop returning `unimplemented`.
+/// Endpoint backed by WireGuard. Its `Tunn` state machines and smoltcp stack
+/// are inert until the lifecycle reaches `Start`; before that, calls to
+/// `dial`/`listen_packet` fail with a clear error.
 pub struct WireguardEndpoint {
     logger: Logger,
     tag: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
     mtu: u32,
-    peers: Vec<Peer>,
+    listen_port: u16,
+    addresses: Vec<IpNet>,
+    peers: Arc<Vec<Peer>>,
+    protector: SocketProtector,
+    inner: Mutex<EndpointState>,
+}
+
+struct EndpointRuntime {
+    transport: TransportHandles,
+    stack: Arc<StackHandles>,
+}
+
+enum EndpointState {
+    Idle,
+    Running(EndpointRuntime),
+    Closed,
 }
 
 impl WireguardEndpoint {
-    pub fn new(logger: Logger, tag: String, options: WireguardEndpointOptions) -> Self {
+    pub fn new(
+        logger: Logger,
+        tag: String,
+        options: WireguardEndpointOptions,
+        protector: SocketProtector,
+    ) -> Self {
         let private_key = x25519::StaticSecret::from(options.private_key);
-        let peers = options
+        let peers: Vec<Peer> = options
             .peers
             .into_iter()
             .enumerate()
             .map(|(idx, peer_opts)| Peer::new(peer_opts, &private_key, idx as u32))
-            .collect::<Vec<_>>();
+            .collect();
         Self {
             logger,
             tag,
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
             mtu: options.mtu,
-            peers,
+            listen_port: options.listen_port,
+            addresses: options.address,
+            peers: Arc::new(peers),
+            protector,
+            inner: Mutex::new(EndpointState::Idle),
         }
     }
 
-    /// Largest IP packet the inner stack should hand to `encapsulate`. Anything
-    /// bigger has to be fragmented before the WG layer.
+    /// Largest IP packet the inner stack should hand to `encapsulate`.
     pub(crate) fn mtu(&self) -> u32 {
         self.mtu
     }
 
     /// Pick the peer that owns `dst` according to longest-prefix `allowed_ips`.
-    /// Lifted into a method so commit 4's smoltcp tx loop can route per packet.
     pub(crate) fn route_outbound(&self, dst: IpAddr) -> Option<&Peer> {
         peer::route_outbound(&self.peers, dst).map(|idx| &self.peers[idx])
     }
@@ -88,14 +115,119 @@ impl WireguardEndpoint {
         &self.peers
     }
 
-    /// Scratch buffer sized for the largest packet `Tunn::encapsulate` can emit
-    /// for this endpoint's MTU.
     pub(crate) fn encapsulate_buffer(&self) -> Vec<u8> {
         vec![0u8; self.mtu as usize + WIREGUARD_OVERHEAD]
     }
+
+    /// Bring up the transport + stack actors. Idempotent within a single
+    /// lifecycle Start sequence (the runtime guarantees `Start` only fires
+    /// once per stage anyway, but defensively no-op on re-entry).
+    fn boot(&self) -> Result<(), HammerError> {
+        {
+            let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+            if matches!(*inner, EndpointState::Running(_) | EndpointState::Closed) {
+                return Ok(());
+            }
+        }
+
+        let transport = transport::spawn_transport(
+            self.logger.clone(),
+            Arc::clone(&self.peers),
+            self.listen_port,
+            self.mtu,
+            self.protector.clone(),
+        )?;
+
+        // The transport's `inbound_rx` is only useful to the stack actor, so we
+        // destructure here and hand it straight over.
+        let TransportHandles {
+            encrypt_tx,
+            inbound_rx,
+            local_addr: _,
+            shutdown,
+            join,
+        } = transport;
+
+        let stack = stack::spawn_stack(
+            self.logger.clone(),
+            self.addresses.clone(),
+            self.mtu,
+            inbound_rx,
+            encrypt_tx.clone(),
+        )?;
+
+        let runtime = EndpointRuntime {
+            transport: TransportHandles {
+                encrypt_tx,
+                // After hand-off the transport handle no longer needs to expose
+                // inbound_rx; replace with a sentinel closed channel so the type
+                // stays the same.
+                inbound_rx: tokio::sync::mpsc::channel(1).1,
+                local_addr: "0.0.0.0:0".parse().expect("placeholder addr"),
+                shutdown,
+                join,
+            },
+            stack: Arc::new(stack),
+        };
+
+        *self.inner.lock().expect("WireguardEndpoint poisoned") =
+            EndpointState::Running(runtime);
+        Ok(())
+    }
+
+    /// Cancel the actors. Safe to call multiple times.
+    fn shutdown(&self) {
+        let runtime = {
+            let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+            match std::mem::replace(&mut *inner, EndpointState::Closed) {
+                EndpointState::Running(rt) => Some(rt),
+                _ => None,
+            }
+        };
+        if let Some(rt) = runtime {
+            // Transport: send shutdown signal then abort to be sure.
+            let _ = rt.transport.shutdown.send(());
+            rt.transport.join.abort();
+            // Stack: same — Arc may have other refs (in-flight dial calls),
+            // signal_shutdown is safe under shared ownership.
+            rt.stack.signal_shutdown();
+            rt.stack.abort();
+        }
+    }
+
+    fn stack_handle(&self) -> Result<Arc<StackHandles>, HammerError> {
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        match &*inner {
+            EndpointState::Running(rt) => Ok(Arc::clone(&rt.stack)),
+            EndpointState::Idle => Err(HammerError::internal(
+                "wireguard endpoint not started yet",
+            )),
+            EndpointState::Closed => Err(HammerError::internal(
+                "wireguard endpoint is closed",
+            )),
+        }
+    }
 }
 
-impl_logging_lifecycle!(WireguardEndpoint, "wireguard-endpoint");
+impl Lifecycle for WireguardEndpoint {
+    fn name(&self) -> &str {
+        "wireguard-endpoint"
+    }
+
+    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+        // The actor needs to exist by the time the router/inbounds touch us,
+        // and our dependencies (the platform protector) are ready by `Start`.
+        if matches!(stage, StartStage::Start) {
+            self.boot()?;
+        }
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        self.shutdown();
+        Ok(())
+    }
+}
 
 #[async_trait]
 impl Outbound for WireguardEndpoint {
@@ -117,26 +249,62 @@ impl Outbound for WireguardEndpoint {
 
     async fn dial(
         &self,
-        _network: Network,
+        network: Network,
         destination: SocksAddr,
-        _initial_payload: &[u8],
+        initial_payload: &[u8],
     ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        if network != Network::Tcp {
+            return Err(HammerError::internal(
+                "wireguard endpoint dial only supports TCP — UDP goes through listen_packet",
+            ));
+        }
+        let stack = self.stack_handle()?;
+        let dst = SocketAddr::new(destination.host, destination.port);
         self.logger
-            .warn(format!("wireguard dial scaffold hit: {destination}"));
-        Err(HammerError::internal(
-            "wireguard endpoint dial is not implemented yet (commit 4)",
-        ))
+            .info(format!("wireguard dial -> {dst}"));
+        let mut stream = stack.dial_tcp(dst).await?;
+        if !initial_payload.is_empty() {
+            stream
+                .write_all(initial_payload)
+                .await
+                .map_err(|err| HammerError::internal(format!("wireguard initial write: {err}")))?;
+        }
+        Ok(Box::new(stream))
     }
 
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        self.logger.warn("wireguard listen_packet scaffold hit");
-        Err(HammerError::internal(
-            "wireguard endpoint listen_packet is not implemented yet (commit 4)",
-        ))
+        let stack = self.stack_handle()?;
+        let handle = stack.bind_udp().await?;
+        Ok(Box::new(handle))
     }
 }
 
 impl Endpoint for WireguardEndpoint {}
+
+/// Helper used by tests + EndpointManager: build an endpoint with a
+/// no-platform protector. Production callers go through
+/// `WireguardEndpoint::new` with a real protector.
+#[cfg(test)]
+fn endpoint_for_test(
+    logger: Logger,
+    tag: String,
+    options: WireguardEndpointOptions,
+) -> WireguardEndpoint {
+    WireguardEndpoint::new(logger, tag, options, SocketProtector::default())
+}
+
+/// Convenience constructor used by `EndpointManager::from_options_with_platform`.
+pub(crate) fn build_with_platform(
+    logger: Logger,
+    tag: String,
+    options: WireguardEndpointOptions,
+    platform: Option<Arc<dyn PlatformInterface>>,
+) -> WireguardEndpoint {
+    let protector = platform
+        .map(SocketProtector::new)
+        .unwrap_or_default();
+    WireguardEndpoint::new(logger, tag, options, protector)
+}
 
 #[cfg(test)]
 mod tests {
@@ -176,7 +344,7 @@ mod tests {
                 reserved: [0; 3],
             }],
         };
-        WireguardEndpoint::new(logger(name), name.to_owned(), options)
+        endpoint_for_test(logger(name), name.to_owned(), options)
     }
 
     /// Two `WireguardEndpoint`s configured as each other's peer must complete
@@ -268,7 +436,7 @@ mod tests {
                 },
             ],
         };
-        let ep = WireguardEndpoint::new(logger("multi"), "multi".to_owned(), opts);
+        let ep = endpoint_for_test(logger("multi"), "multi".to_owned(), opts);
 
         let chosen = ep
             .route_outbound(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 5)))
@@ -305,7 +473,7 @@ mod tests {
                 reserved: [1, 2, 3],
             }],
         };
-        let ep = WireguardEndpoint::new(logger("buf"), "buf".to_owned(), opts);
+        let ep = endpoint_for_test(logger("buf"), "buf".to_owned(), opts);
         assert_eq!(
             ep.encapsulate_buffer().len(),
             ep.mtu() as usize + WIREGUARD_OVERHEAD
