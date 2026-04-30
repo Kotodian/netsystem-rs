@@ -5,70 +5,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 #[cfg(feature = "wireguard")]
 use crate::error::HammerError;
-use crate::log::Level;
 
+use super::inbound::RawTunConfig;
+use super::log::RawLogConfig;
 use super::options::{
-    DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, RuleMatcher, TunStack,
+    DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, RuleMatcher,
 };
 #[cfg(feature = "wireguard")]
 use super::parse::parse_base64_key;
-use super::parse::{parse_domain_strategy, parse_ipnet, parse_optional_duration};
-
-// Raw config structs are mostly serde field declarations with the same
-// `default + skip_serializing_if` pattern. Keep the actual field list explicit,
-// but let the macro own the repetitive attributes and derives.
-macro_rules! raw_struct {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident {
-            $(
-                $(#[$field_meta:meta])*
-                $field_vis:vis $field:ident : $ty:ty => $skip:literal
-            ),* $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        #[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-        #[serde(deny_unknown_fields)]
-        $vis struct $name {
-            $(
-                $(#[$field_meta])*
-                #[serde(default, skip_serializing_if = $skip)]
-                $field_vis $field: $ty,
-            )*
-        }
-    };
-}
-
-// Top-level sections are skipped when they are exactly default. This wraps
-// `raw_struct!` and adds the small helper serde calls from `RawConfig`.
-macro_rules! raw_struct_with_default_check {
-    (
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident {
-            $(
-                $(#[$field_meta:meta])*
-                $field_vis:vis $field:ident : $ty:ty => $skip:literal
-            ),* $(,)?
-        }
-    ) => {
-        raw_struct! {
-            $(#[$meta])*
-            $vis struct $name {
-                $(
-                    $(#[$field_meta])*
-                    $field_vis $field: $ty => $skip,
-                )*
-            }
-        }
-
-        impl $name {
-            fn is_default(&self) -> bool {
-                *self == $name::default()
-            }
-        }
-    };
-}
+use super::parse::{parse_ipnet, parse_optional_duration};
+#[cfg(feature = "wireguard")]
+use super::raw_struct;
+use super::raw_struct_with_default_check;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -92,81 +40,6 @@ pub struct RawConfig {
     /// Optional route section.
     #[serde(default, skip_serializing_if = "RawRouteConfig::is_default")]
     pub route: RawRouteConfig,
-}
-
-raw_struct_with_default_check! {
-    pub struct RawLogConfig {
-        /// Minimum log level, for example `debug`, `info`, or `warn`.
-        #[serde(deserialize_with = "deserialize_log_level")]
-        pub level: Option<Level> => "Option::is_none",
-        /// Log output target from the user config.
-        pub output: String => "String::is_empty",
-        /// Whether log lines should include timestamps.
-        pub timestamp: bool => "is_false",
-        /// Whether logging is disabled entirely.
-        pub disabled: bool => "is_false",
-    }
-}
-
-raw_struct_with_default_check! {
-    pub struct RawTunConfig {
-        /// Inbound id used by route rules.
-        pub id: String => "String::is_empty",
-        /// Requested TUN interface name.
-        pub interface_name: String => "String::is_empty",
-        /// TUN MTU.
-        pub mtu: u32 => "is_zero_u32",
-        /// Packet stack mode, for example `system` or `disabled`.
-        #[serde(deserialize_with = "deserialize_tun_stack")]
-        pub stack: Option<TunStack> => "Option::is_none",
-        /// Local interface addresses in CIDR form.
-        #[serde(
-            deserialize_with = "deserialize_tun_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
-        pub address: Vec<IpNet> => "Vec::is_empty",
-        /// Routes included through the tunnel.
-        #[serde(
-            deserialize_with = "deserialize_tun_route_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
-        pub route_address: Vec<IpNet> => "Vec::is_empty",
-        /// Routes excluded from the tunnel.
-        #[serde(
-            deserialize_with = "deserialize_tun_route_exclude_addresses",
-            serialize_with = "serialize_ipnet_vec"
-        )]
-        pub route_exclude_address: Vec<IpNet> => "Vec::is_empty",
-        /// Whether the platform should install routes automatically.
-        pub auto_route: Option<bool> => "Option::is_none",
-        /// Whether route installation should use strict routing semantics.
-        pub strict_route: bool => "is_false",
-        /// UDP idle timeout.
-        #[serde(
-            deserialize_with = "deserialize_tun_udp_timeout",
-            serialize_with = "serialize_duration_option"
-        )]
-        pub udp_timeout: Option<Duration> => "Option::is_none",
-        /// Whether protocol/domain sniffing is enabled.
-        pub sniff: bool => "is_false",
-        /// Whether DNS packets should be intercepted by the DNS router.
-        pub hijack_dns: bool => "is_false",
-        /// Whether sniffed destinations replace the original destination.
-        pub sniff_override_destination: bool => "is_false",
-        /// Sniffing timeout.
-        #[serde(
-            deserialize_with = "deserialize_tun_sniff_timeout",
-            serialize_with = "serialize_duration_option"
-        )]
-        pub sniff_timeout: Option<Duration> => "Option::is_none",
-        /// Domain resolution strategy for sniffed/routed traffic.
-        #[serde(deserialize_with = "deserialize_tun_domain_strategy")]
-        pub domain_strategy: DomainStrategy => "DomainStrategy::is_default",
-        /// Whether UDP domain unmapping is disabled for this inbound.
-        pub udp_disable_domain_unmapping: bool => "is_false",
-        /// Whether detected QUIC traffic should be rejected.
-        pub block_quic: bool => "is_false",
-    }
 }
 
 raw_struct_with_default_check! {
@@ -383,38 +256,8 @@ fn is_false(v: &bool) -> bool {
 fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
-}
-
-fn deserialize_log_level<'de, D>(deserializer: D) -> Result<Option<Level>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    if value.is_empty() {
-        return Ok(None);
-    }
-    Level::from_name(value.to_ascii_lowercase().as_str())
-        .map(Some)
-        .ok_or_else(|| de::Error::custom(format!("log.level: unknown log level {value:?}")))
-}
-
-fn deserialize_tun_udp_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("tun.udp_timeout", deserializer)
-}
-
-fn deserialize_tun_sniff_timeout<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_duration_option("tun.sniff_timeout", deserializer)
 }
 
 fn deserialize_hysteria2_hop_interval<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
@@ -464,60 +307,7 @@ fn serialize_duration_option<S>(value: &Option<Duration>, serializer: S) -> Resu
 where
     S: Serializer,
 {
-    match value {
-        Some(value) => serializer.serialize_str(&format_duration_go_style(*value)),
-        None => serializer.serialize_none(),
-    }
-}
-
-fn format_duration_go_style(value: Duration) -> String {
-    const NS: u128 = 1;
-    const US: u128 = 1_000 * NS;
-    const MS: u128 = 1_000 * US;
-    const S: u128 = 1_000 * MS;
-    const M: u128 = 60 * S;
-    const H: u128 = 60 * M;
-
-    let nanos = value.as_nanos();
-    if nanos == 0 {
-        return "0s".to_owned();
-    }
-    for (unit, scale) in [
-        ("h", H),
-        ("m", M),
-        ("s", S),
-        ("ms", MS),
-        ("us", US),
-        ("ns", NS),
-    ] {
-        if nanos.is_multiple_of(scale) {
-            return format!("{}{}", nanos / scale, unit);
-        }
-    }
-    format!("{nanos}ns")
-}
-
-fn deserialize_tun_stack<'de, D>(deserializer: D) -> Result<Option<TunStack>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    match value.as_str() {
-        "" => Ok(None),
-        "system" => Ok(Some(TunStack::System)),
-        "disabled" => Ok(Some(TunStack::Disabled)),
-        other => Err(de::Error::custom(format!(
-            "tun.stack: unknown stack {other:?}"
-        ))),
-    }
-}
-
-fn deserialize_tun_domain_strategy<'de, D>(deserializer: D) -> Result<DomainStrategy, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    parse_domain_strategy("tun.domain_strategy", &value).map_err(de::Error::custom)
+    super::parse::serialize_duration_option(value, serializer)
 }
 
 fn deserialize_dns_strategy<'de, D>(deserializer: D) -> Result<DomainStrategy, D::Error>
@@ -525,28 +315,7 @@ where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    parse_domain_strategy("dns.strategy", &value).map_err(de::Error::custom)
-}
-
-fn deserialize_tun_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.address", deserializer)
-}
-
-fn deserialize_tun_route_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.route_address", deserializer)
-}
-
-fn deserialize_tun_route_exclude_addresses<'de, D>(deserializer: D) -> Result<Vec<IpNet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    deserialize_ipnet_vec("tun.route_exclude_address", deserializer)
+    super::parse::parse_domain_strategy("dns.strategy", &value).map_err(de::Error::custom)
 }
 
 #[cfg(feature = "wireguard")]
@@ -586,11 +355,7 @@ fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Er
 where
     S: Serializer,
 {
-    value
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .serialize(serializer)
+    super::parse::serialize_ipnet_vec(value, serializer)
 }
 
 fn deserialize_route_rules<'de, D>(deserializer: D) -> Result<Vec<RawRouteRule>, D::Error>

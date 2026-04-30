@@ -5,7 +5,10 @@ use std::time::Duration;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
-use crate::log::Level;
+#[cfg(feature = "wireguard")]
+use super::constants;
+use super::inbound::Inbound;
+use super::log::LogOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -16,63 +19,6 @@ pub struct Options {
     #[cfg(feature = "wireguard")]
     pub endpoints: Vec<Endpoint>,
     pub route: RouteOptions,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LogOptions {
-    pub disabled: bool,
-    pub level: Level,
-    pub output: String,
-    pub timestamp: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Inbound {
-    pub id: String,
-    pub kind: InboundKind,
-}
-
-impl Inbound {
-    pub fn type_name(&self) -> &'static str {
-        match self.kind {
-            InboundKind::Tun(_) => "tun",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InboundKind {
-    Tun(TunInboundOptions),
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TunInboundOptions {
-    pub interface_name: String,
-    pub mtu: u32,
-    pub address: Vec<IpNet>,
-    pub route_address: Vec<IpNet>,
-    pub route_exclude_address: Vec<IpNet>,
-    pub auto_route: bool,
-    pub strict_route: bool,
-    pub stack: TunStack,
-    pub udp_timeout: Option<Duration>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TunStack {
-    #[default]
-    System,
-    Disabled,
-}
-
-impl TunStack {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Disabled => "disabled",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,32 +359,3 @@ impl DomainStrategy {
     }
 }
 
-pub mod constants {
-    pub const TYPE_TUN: &str = "tun";
-    pub const TYPE_HYSTERIA2: &str = "hysteria2";
-    pub const TYPE_DIRECT: &str = "direct";
-    pub const TYPE_BLOCK: &str = "block";
-    #[cfg(feature = "wireguard")]
-    pub const TYPE_WIREGUARD: &str = "wireguard";
-
-    pub const PROTOCOL_DNS: &str = "dns";
-    pub const PROTOCOL_QUIC: &str = "quic";
-
-    pub const REJECT_METHOD_DEFAULT: &str = "default";
-
-    pub const NETWORK_STRATEGY_DEFAULT: &str = "default";
-
-    pub const DEFAULT_TUN_ID: &str = "tun";
-    pub const DEFAULT_HYSTERIA_ID: &str = "hysteria2";
-    pub const DEFAULT_DIRECT_ID: &str = "direct";
-    pub const DEFAULT_DNS_ID: &str = "default";
-    pub const DEFAULT_TUN_STACK: &str = "system";
-    pub const DEFAULT_TUN_MTU: u32 = 9000;
-    pub const DEFAULT_DNS_PATH: &str = "/dns-query";
-    pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
-    /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
-    #[cfg(feature = "wireguard")]
-    pub const DEFAULT_WIREGUARD_MTU: u32 = 1408;
-    pub const DNS_TYPE_HOSTS: &str = "hosts";
-    pub const DNS_TYPE_LOCAL: &str = "local";
-}

@@ -8,10 +8,100 @@ use base64::Engine as _;
 #[cfg(feature = "wireguard")]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ipnet::IpNet;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use crate::error::HammerError;
 
 use super::options::DomainStrategy;
+
+/// Serialize a list of CIDRs back to TOML strings — shared by every section
+/// that has a `Vec<IpNet>` field (`tun.address`, `route.rules.ip_cidr`,
+/// `endpoints.address`, ...). Each section keeps its own `deserialize_with`
+/// so error messages can point at the offending key, but on the way out a
+/// generic `to_string()` round-trip is enough.
+pub fn serialize_ipnet_vec<S>(value: &[IpNet], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+/// Serialize an optional Go-style `Duration` (e.g. "300ms", "1h2m3s") so
+/// `format_config` produces output that round-trips back through
+/// `parse_optional_duration`.
+pub fn serialize_duration_option<S>(
+    value: &Option<Duration>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(value) => serializer.serialize_str(&format_duration_go_style(*value)),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Format a `Duration` using the largest single unit that divides it evenly
+/// (e.g. `60s` → `"1m"`, `1500ms` → `"1500ms"` since 1.5s isn't a whole
+/// second). Falls back to nanoseconds for sub-microsecond residues.
+pub fn format_duration_go_style(value: Duration) -> String {
+    const NS: u128 = 1;
+    const US: u128 = 1_000 * NS;
+    const MS: u128 = 1_000 * US;
+    const S: u128 = 1_000 * MS;
+    const M: u128 = 60 * S;
+    const H: u128 = 60 * M;
+
+    let nanos = value.as_nanos();
+    if nanos == 0 {
+        return "0s".to_owned();
+    }
+    for (unit, scale) in [
+        ("h", H),
+        ("m", M),
+        ("s", S),
+        ("ms", MS),
+        ("us", US),
+        ("ns", NS),
+    ] {
+        if nanos.is_multiple_of(scale) {
+            return format!("{}{}", nanos / scale, unit);
+        }
+    }
+    format!("{nanos}ns")
+}
+
+/// Deserialize a `Vec<IpNet>` from a list of CIDR / IP strings, attaching
+/// `field` to any error so downstream messages name the bad key. Each
+/// section wraps this with its own field-tagged `deserialize_with` because
+/// serde's attribute strings reference a single function name.
+pub fn deserialize_ipnet_vec<'de, D>(field: &str, deserializer: D) -> Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| parse_ipnet(field, &value).map_err(de::Error::custom))
+        .collect()
+}
+
+/// Deserialize an optional Go-style duration string. Empty string yields
+/// `Ok(None)`; an unparseable value bubbles up tagged with `field`.
+pub fn deserialize_duration_option<'de, D>(
+    field: &str,
+    deserializer: D,
+) -> Result<Option<Duration>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_optional_duration(field, &value).map_err(de::Error::custom)
+}
 
 /// Parse Go-style duration strings like "300ms", "1.5s", "2m30s", "1h".
 /// Empty input yields `None`.

@@ -5,7 +5,9 @@ use url::Url;
 
 use crate::error::HammerError;
 
-use super::options::constants as C;
+use super::constants as C;
+use super::inbound::{RawTunConfig, build_tun_inbound};
+use super::log::build_log_options;
 use super::options::*;
 use super::parse::parse_optional_port;
 #[cfg(feature = "wireguard")]
@@ -31,12 +33,7 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         route: raw_route,
     } = raw;
 
-    let tun_id = if raw_tun.id.is_empty() {
-        C::DEFAULT_TUN_ID.to_owned()
-    } else {
-        raw_tun.id.clone()
-    };
-    let tun_options = build_tun_options(&raw_tun)?;
+    let (tun_inbound, tun_id) = build_tun_inbound(&raw_tun)?;
     let mut rules = derive_tun_route_rules(&raw_tun, &tun_id)?;
     rules.extend(build_user_rules(&raw_route.rules)?);
 
@@ -63,17 +60,9 @@ pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     };
 
     Ok(Options {
-        log: LogOptions {
-            disabled: raw_log.disabled,
-            level: raw_log.level.unwrap_or_default(),
-            output: raw_log.output,
-            timestamp: raw_log.timestamp,
-        },
+        log: build_log_options(raw_log),
         dns: dns_options,
-        inbounds: vec![Inbound {
-            id: tun_id,
-            kind: InboundKind::Tun(tun_options),
-        }],
+        inbounds: vec![tun_inbound],
         outbounds: build_outbounds(hysteria_options, hysteria_id),
         #[cfg(feature = "wireguard")]
         endpoints,
@@ -94,33 +83,6 @@ fn build_outbounds(hysteria: Hysteria2OutboundOptions, hysteria_id: String) -> V
             }),
         },
     ]
-}
-
-fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerError> {
-    let mtu = if raw.mtu == 0 {
-        C::DEFAULT_TUN_MTU
-    } else {
-        raw.mtu
-    };
-    let stack = raw.stack.unwrap_or_default();
-    let address = raw.address.clone();
-    if address.is_empty() {
-        return Err(HammerError::config_validation("tun.address is required"));
-    }
-    let route_address = raw.route_address.clone();
-    let route_exclude_address = raw.route_exclude_address.clone();
-    let auto_route = raw.auto_route.unwrap_or(true);
-    Ok(TunInboundOptions {
-        interface_name: raw.interface_name.clone(),
-        mtu,
-        address,
-        route_address,
-        route_exclude_address,
-        auto_route,
-        strict_route: raw.strict_route,
-        stack,
-        udp_timeout: raw.udp_timeout,
-    })
 }
 
 fn build_hysteria_options(
