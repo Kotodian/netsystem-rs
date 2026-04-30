@@ -480,4 +480,113 @@ mod tests {
         );
         assert_eq!(ep.peers()[0].reserved(), [1, 2, 3]);
     }
+
+    /// End-to-end tunnel smoke: stand up two `WireguardEndpoint`s configured
+    /// as each other's peer, drive lifecycle Start so the transport + smoltcp
+    /// actors are live, bind a UDP socket on each side, then push a payload
+    /// from A's in-tunnel address to B's. The packet has to traverse:
+    ///
+    ///   A.dial(UDP) → smoltcp tx → boringtun.encapsulate → real UDP → B
+    ///   → boringtun.decapsulate → smoltcp rx → B.recv_from
+    ///
+    /// This exercises every layer that landed in commits 3 → 4b in one pass.
+    /// We don't try TCP yet because the stack only exposes `dial`, not
+    /// `listen` — closing the loop on inbound TCP is a future follow-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnel_udp_round_trip_end_to_end() {
+        use hammer_adapter::ProxyPacketConn;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // Pick two ephemeral ports for the outer UDP sockets. Bind+drop is the
+        // standard "ask the OS for a free port" trick — fine on localhost.
+        fn ephemeral_port() -> u16 {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        let a_priv = [33u8; 32];
+        let b_priv = [44u8; 32];
+        let a_pub = x25519_public(a_priv);
+        let b_pub = x25519_public(b_priv);
+
+        let port_a = ephemeral_port();
+        let port_b = ephemeral_port();
+        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+
+        let a_options = WireguardEndpointOptions {
+            private_key: a_priv,
+            listen_port: port_a,
+            mtu: 1408,
+            address: vec!["10.0.0.1/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: b_pub,
+                pre_shared_key: None,
+                endpoint: outer_b,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+        let b_options = WireguardEndpointOptions {
+            private_key: b_priv,
+            listen_port: port_b,
+            mtu: 1408,
+            address: vec!["10.0.0.2/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: a_pub,
+                pre_shared_key: None,
+                endpoint: outer_a,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+
+        let a = endpoint_for_test(logger("wg-a"), "wg-a".to_owned(), a_options);
+        let b = endpoint_for_test(logger("wg-b"), "wg-b".to_owned(), b_options);
+        a.boot().expect("boot a");
+        b.boot().expect("boot b");
+
+        let stack_a = a.stack_handle().expect("stack a ready");
+        let stack_b = b.stack_handle().expect("stack b ready");
+
+        let mut udp_a = stack_a.bind_udp().await.expect("bind udp a");
+        let mut udp_b = stack_b.bind_udp().await.expect("bind udp b");
+        let port_b_inside = udp_b.local_port();
+
+        // A's in-tunnel address is 10.0.0.1 ← bound by the smoltcp Interface;
+        // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
+        let dst = SocksAddr {
+            host: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            port: port_b_inside,
+        };
+        let payload = b"hello over wireguard".to_vec();
+        udp_a
+            .send_to(dst, &payload)
+            .await
+            .expect("udp_a.send_to");
+
+        // 5s is plenty: the boringtun handshake completes in <50 ms over
+        // localhost even with the 250 ms timer driving retransmits.
+        let datagram = timeout(Duration::from_secs(5), udp_b.recv_from())
+            .await
+            .expect("timed out waiting for tunnel UDP")
+            .expect("udp_b.recv_from");
+        assert_eq!(datagram.payload, payload);
+        assert_eq!(
+            datagram.destination.host,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            "src must be A's in-tunnel address"
+        );
+
+        // Aborting actors via shutdown — Drop order is undefined across the two
+        // endpoints' Mutex guards, so do it explicitly.
+        a.shutdown();
+        b.shutdown();
+    }
 }

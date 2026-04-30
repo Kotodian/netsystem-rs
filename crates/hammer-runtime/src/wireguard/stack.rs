@@ -114,6 +114,16 @@ impl StackHandles {
 pub(crate) struct UdpHandle {
     send_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     recv_rx: AsyncMutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    /// Port allocated by the actor inside the smoltcp Interface. Useful for
+    /// integration tests that need to address one side from the other through
+    /// the tunnel.
+    local_port: u16,
+}
+
+impl UdpHandle {
+    pub(crate) fn local_port(&self) -> u16 {
+        self.local_port
+    }
 }
 
 #[async_trait]
@@ -456,6 +466,7 @@ impl StackInner {
         Ok(UdpHandle {
             send_tx: send_user_tx,
             recv_rx: AsyncMutex::new(recv_user_rx),
+            local_port,
         })
     }
 
