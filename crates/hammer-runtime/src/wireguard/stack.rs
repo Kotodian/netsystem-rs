@@ -91,6 +91,17 @@ impl StackHandles {
             .map_err(|_| HammerError::internal("wireguard stack: bind response dropped"))?
     }
 
+    /// Build a `TcpListener` bound to `port` inside the tunnel. The listener
+    /// is just a thin command sender — the actual smoltcp socket is created
+    /// per-`accept()` call so the stack supports an unbounded series of
+    /// inbound connections without juggling backlog state itself.
+    pub(crate) fn listen_tcp(&self, port: u16) -> TcpListener {
+        TcpListener {
+            cmd_tx: self.cmd_tx.clone(),
+            port,
+        }
+    }
+
     /// Tell the actor task to exit at its next select! poll. Idempotent —
     /// subsequent calls find the sender already taken.
     pub(crate) fn signal_shutdown(&self) {
@@ -108,6 +119,36 @@ impl StackHandles {
     /// `signal_shutdown` for the lifecycle close path.
     pub(crate) fn abort(&self) {
         self.join.abort();
+    }
+}
+
+/// Inbound-TCP listener bound to a port inside the tunnel. `accept()` runs
+/// one acceptance cycle per call: it sends an `AcceptTcp` command to the
+/// stack actor, which spins up a fresh smoltcp listening socket on that port,
+/// and replies with a `DuplexStream` once the three-way handshake completes.
+/// Concurrent accepts are fine — each gets its own socket.
+pub(crate) struct TcpListener {
+    cmd_tx: mpsc::Sender<StackCommand>,
+    port: u16,
+}
+
+impl TcpListener {
+    pub(crate) fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub(crate) async fn accept(&self) -> Result<DuplexStream, HammerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(StackCommand::AcceptTcp {
+                port: self.port,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HammerError::internal("wireguard stack: actor closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| HammerError::internal("wireguard stack: accept response dropped"))?
     }
 }
 
@@ -203,6 +244,7 @@ pub(crate) fn spawn_stack(
         shutdown_rx,
         tcp_bridges: HashMap::new(),
         udp_bridges: HashMap::new(),
+        pending_accepts: Vec::new(),
         next_port: EPHEMERAL_FLOOR,
         started,
     };
@@ -224,6 +266,19 @@ enum StackCommand {
     BindUdp {
         reply: oneshot::Sender<Result<UdpHandle, HammerError>>,
     },
+    AcceptTcp {
+        port: u16,
+        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    },
+}
+
+/// One in-flight inbound TCP accept. The listening smoltcp socket sits in
+/// `SocketSet`; once the three-way handshake completes (`may_recv` &&
+/// `may_send`) we hand the established socket off to a freshly-spawned
+/// bridge task and reply to `oneshot` with the user-side `DuplexStream`.
+struct PendingAccept {
+    handle: SocketHandle,
+    reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
 }
 
 /// Messages that the per-socket bridge tasks send back to the actor. Each
@@ -274,6 +329,7 @@ struct StackInner {
     shutdown_rx: oneshot::Receiver<()>,
     tcp_bridges: HashMap<SocketHandle, TcpBridge>,
     udp_bridges: HashMap<SocketHandle, UdpBridge>,
+    pending_accepts: Vec<PendingAccept>,
     next_port: u16,
     started: TokioInstant,
 }
@@ -327,10 +383,67 @@ impl StackInner {
             }
         }
 
+        self.check_pending_accepts();
         self.drain_tcp_recv();
         self.retry_pending_tcp_writes();
         self.drain_udp_recv();
         self.reap_dead_sockets();
+    }
+
+    /// Walk pending accepts and resolve any whose listening socket has
+    /// finished the SYN/SYN-ACK/ACK exchange. Each resolved accept transfers
+    /// the now-established socket from "listen pool" to a regular bridge so
+    /// the caller's `DuplexStream` can shovel bytes through it like a dial.
+    fn check_pending_accepts(&mut self) {
+        use smoltcp::socket::tcp::State;
+        if self.pending_accepts.is_empty() {
+            return;
+        }
+        let drained = std::mem::take(&mut self.pending_accepts);
+        for accept in drained {
+            let socket = self.sockets.get::<tcp::Socket>(accept.handle);
+            match socket.state() {
+                State::Listen | State::SynReceived | State::SynSent => {
+                    // Still mid-handshake; check again next poll.
+                    self.pending_accepts.push(accept);
+                }
+                State::Established
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck => {
+                    // Connection is up (or already half-closing — let the
+                    // bridge surface that to the caller).
+                    let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
+                    let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(TCP_DATA_QUEUE);
+                    let event_tx = self.event_tx.clone();
+                    tokio::spawn(tcp_bridge_task(
+                        accept.handle,
+                        actor_side,
+                        data_rx,
+                        event_tx,
+                    ));
+                    self.tcp_bridges.insert(
+                        accept.handle,
+                        TcpBridge {
+                            data_tx,
+                            pending_tx: Vec::new(),
+                        },
+                    );
+                    let _ = accept.reply.send(Ok(user_side));
+                }
+                State::Closed | State::TimeWait => {
+                    // Listening socket aborted (RST) or completed and closed
+                    // before we surfaced it. Drop it and let the caller decide
+                    // whether to re-listen.
+                    self.sockets.remove(accept.handle);
+                    let _ = accept.reply.send(Err(HammerError::internal(
+                        "wireguard tcp listen aborted before connection established",
+                    )));
+                }
+            }
+        }
     }
 
     fn handle_event(&mut self, event: SocketEvent) {
@@ -393,7 +506,31 @@ impl StackInner {
             StackCommand::BindUdp { reply } => {
                 let _ = reply.send(self.bind_udp());
             }
+            StackCommand::AcceptTcp { port, reply } => {
+                self.queue_accept(port, reply);
+            }
         }
+    }
+
+    /// Park a fresh listening socket and remember the reply channel. The next
+    /// poll cycle will notice when it transitions to ESTABLISHED and hand the
+    /// caller a `DuplexStream`.
+    fn queue_accept(
+        &mut self,
+        port: u16,
+        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    ) {
+        let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+        let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
+        let mut socket = tcp::Socket::new(rx_buf, tx_buf);
+        if let Err(err) = socket.listen(port) {
+            let _ = reply.send(Err(HammerError::internal(format!(
+                "wireguard tcp listen on {port}: {err:?}"
+            ))));
+            return;
+        }
+        let handle = self.sockets.add(socket);
+        self.pending_accepts.push(PendingAccept { handle, reply });
     }
 
     fn dial_tcp(&mut self, dst: SocketAddr) -> Result<DuplexStream, HammerError> {
