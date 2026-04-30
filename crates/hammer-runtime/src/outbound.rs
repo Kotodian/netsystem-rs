@@ -67,6 +67,18 @@ impl OutboundManager {
         self.register_descriptor_with_protector(option, SocketProtector::default());
     }
 
+    /// Register an already-constructed outbound (e.g. an endpoint that lives
+    /// in `EndpointManager`) so the router can resolve its tag through the
+    /// usual `OutboundManager::get` path. Mirrors sing-box, where every
+    /// endpoint shows up as both an Endpoint *and* an Outbound — same Arc,
+    /// two views.
+    pub fn register_outbound(&self, tag: String, descriptor: Arc<dyn Outbound>) {
+        self.items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .insert(tag, descriptor);
+    }
+
     fn register_descriptor_with_protector(
         &self,
         option: &OutboundOptions,

@@ -119,6 +119,14 @@ impl HammerService {
             &options.outbounds,
             Arc::clone(&adapter) as Arc<dyn PlatformInterface>,
         ));
+        // Endpoints are also outbounds — register their Outbound view with
+        // OutboundManager so the router can resolve their tag through the
+        // standard `OutboundManager::get` path. sing-box does the same;
+        // ownership stays with EndpointManager (lifecycle Start/Close fire
+        // there), this is purely a second view of the same Arc.
+        for (tag, view) in endpoint.outbound_view() {
+            outbound.register_outbound(tag, view);
+        }
         let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(
             new_logger(&log_factory, "dns-transport"),
             &options.dns,
