@@ -21,6 +21,8 @@ url = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 ipnet = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 base64 = { workspace = true, optional = true }
 
 [dev-dependencies]

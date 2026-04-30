@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use tracing::info;
 
 use async_trait::async_trait;
 use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr};
@@ -10,7 +11,6 @@ use tokio::net::{TcpSocket, UdpSocket};
 use crate::socket_protector::SocketProtector;
 
 pub struct DirectOutbound {
-    logger: Logger,
     id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
@@ -18,9 +18,8 @@ pub struct DirectOutbound {
 }
 
 impl DirectOutbound {
-    pub fn new(logger: Logger, id: impl Into<String>) -> Self {
+    pub fn new(_logger: Logger, id: impl Into<String>) -> Self {
         Self {
-            logger,
             id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
@@ -29,12 +28,11 @@ impl DirectOutbound {
     }
 
     pub(crate) fn new_with_protector(
-        logger: Logger,
+        _logger: Logger,
         id: impl Into<String>,
         protector: SocketProtector,
     ) -> Self {
         Self {
-            logger,
             id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
@@ -70,8 +68,7 @@ impl Outbound for DirectOutbound {
         if network != Network::Tcp {
             return Err(HammerError::internal("direct dial only supports tcp"));
         }
-        self.logger
-            .info(format!("outbound connection to {destination}"));
+        info!("outbound connection to {destination}");
         let socket = if destination.host.is_ipv6() {
             TcpSocket::new_v6()
         } else {
@@ -93,7 +90,7 @@ impl Outbound for DirectOutbound {
     }
 
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        self.logger.info("outbound packet connection");
+        info!("outbound packet connection");
         let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
             .await
             .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
@@ -135,16 +132,14 @@ impl ProxyPacketConn for DirectPacketConn {
 }
 
 pub struct BlockOutbound {
-    logger: Logger,
     id: String,
     networks: Vec<Network>,
     dependencies: Vec<String>,
 }
 
 impl BlockOutbound {
-    pub fn new(logger: Logger, id: impl Into<String>) -> Self {
+    pub fn new(_logger: Logger, id: impl Into<String>) -> Self {
         Self {
-            logger,
             id: id.into(),
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
@@ -176,15 +171,14 @@ impl Outbound for BlockOutbound {
         destination: SocksAddr,
         _initial_payload: &[u8],
     ) -> Result<Box<dyn ProxyStream>, HammerError> {
-        self.logger
-            .info(format!("blocked connection to {destination}"));
+        info!("blocked connection to {destination}");
         Err(HammerError::internal(format!(
             "blocked connection to {destination}"
         )))
     }
 
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        self.logger.info("blocked packet connection");
+        info!("blocked packet connection");
         Err(HammerError::internal("blocked packet connection"))
     }
 }

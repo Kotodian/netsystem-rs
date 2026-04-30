@@ -253,8 +253,8 @@ pub enum RawEndpoint {
     Wireguard(RawWireguardEndpoint),
 }
 
+#[cfg(feature = "wireguard")]
 raw_struct! {
-    #[cfg(feature = "wireguard")]
     pub struct RawWireguardEndpoint {
         /// Endpoint id used by route rules and lifecycle managers.
         pub id: String => "String::is_empty",
@@ -275,8 +275,8 @@ raw_struct! {
     }
 }
 
+#[cfg(feature = "wireguard")]
 raw_struct! {
-    #[cfg(feature = "wireguard")]
     pub struct RawWireguardPeer {
         /// Base64-encoded peer public key.
         pub public_key: RawBase64Key => "RawBase64Key::is_empty",

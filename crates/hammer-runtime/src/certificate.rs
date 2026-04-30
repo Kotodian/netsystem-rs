@@ -13,16 +13,12 @@ use crate::impl_logging_lifecycle;
 /// `common/certificate.Store` placeholder. M3+ wires the real rustls-backed
 /// certificate pool + system trust roots ingestion.
 pub struct CertificateStore {
-    logger: Logger,
     exclusive_anchors: bool,
 }
 
 impl CertificateStore {
-    pub fn new(logger: Logger, exclusive_anchors: bool) -> Self {
-        Self {
-            logger,
-            exclusive_anchors,
-        }
+    pub fn new(_logger: Logger, exclusive_anchors: bool) -> Self {
+        Self { exclusive_anchors }
     }
 }
 
@@ -35,14 +31,12 @@ impl CertificateStoreTrait for CertificateStore {
 }
 
 pub struct CertificateProviderManager {
-    logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn CertificateProviderService>>>,
 }
 
 impl CertificateProviderManager {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             items: Mutex::new(HashMap::new()),
         }
     }

@@ -36,6 +36,7 @@ base64 = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 smoltcp = { workspace = true }
 tun-rs = { workspace = true }
 ipnet = { workspace = true }

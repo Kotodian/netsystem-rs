@@ -35,6 +35,8 @@ toml = "1.1"
 url = "2.5"
 thiserror = "2.0"
 async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 bytes = "1.11"
 http = "1.4"

@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use tracing::{debug, error, info, trace};
 
 use hammer_adapter::{
     DefaultInterfaceUpdateListener, NetworkInterface, NetworkManager as NetworkManagerTrait,
@@ -15,7 +16,6 @@ use crate::{ConnectionManager, PauseManager};
 /// path land in M4 once the Platform.get_interfaces / start_default_interface_monitor
 /// callbacks are wired in.
 pub struct NetworkManager {
-    logger: Logger,
     auto_detect_interface: bool,
     need_wifi_state: AtomicBool,
     platform: Option<Arc<dyn PlatformInterface>>,
@@ -29,9 +29,8 @@ pub struct NetworkManager {
 }
 
 impl NetworkManager {
-    pub fn new(logger: Logger, auto_detect_interface: bool) -> Self {
+    pub fn new(_logger: Logger, auto_detect_interface: bool) -> Self {
         Self {
-            logger,
             auto_detect_interface,
             need_wifi_state: AtomicBool::new(false),
             platform: None,
@@ -46,14 +45,13 @@ impl NetworkManager {
     }
 
     pub fn with_platform(
-        logger: Logger,
+        _logger: Logger,
         auto_detect_interface: bool,
         platform: Arc<dyn PlatformInterface>,
         pause: Arc<PauseManager>,
         connection: Arc<ConnectionManager>,
     ) -> Arc<Self> {
         Arc::new_cyclic(|weak| Self {
-            logger,
             auto_detect_interface,
             need_wifi_state: AtomicBool::new(false),
             platform: Some(platform),
@@ -114,7 +112,7 @@ impl Lifecycle for NetworkManager {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        debug!("stage {}", stage.name());
         match stage {
             StartStage::Initialize => {
                 self.update_interfaces()?;
@@ -148,7 +146,7 @@ impl Lifecycle for NetworkManager {
         ) {
             platform.close_default_interface_monitor(listener)?;
         }
-        self.logger.debug("close");
+        debug!("close");
         Ok(())
     }
 }
@@ -176,7 +174,7 @@ impl NetworkManagerTrait for NetworkManager {
         if let Some(connection) = &self.connection {
             connection.close_all();
         }
-        self.logger.debug("reset_network");
+        debug!("reset_network");
     }
 }
 
@@ -196,7 +194,7 @@ impl DefaultInterfaceUpdateListener for NetworkUpdateListener {
             return;
         };
         if let Err(err) = manager.update_interfaces() {
-            manager.logger.error(format!("update interfaces: {err}"));
+            error!("update interfaces: {err}");
         }
         manager.set_default_interface(
             interface_name,
@@ -221,14 +219,14 @@ impl NetworkManager {
                 .lock()
                 .expect("NetworkManager default interface poisoned");
             if current.is_none() {
-                self.logger.trace("default interface is still missing");
+                trace!("default interface is still missing");
                 return;
             }
             *current = None;
             if let Some(pause) = &self.pause {
                 pause.network_pause();
             }
-            self.logger.error("missing default interface");
+            error!("missing default interface");
             return;
         }
 
@@ -258,10 +256,10 @@ impl NetworkManager {
                 .lock()
                 .expect("NetworkManager default interface poisoned");
             if current.as_ref() == Some(&default) {
-                self.logger.trace(format!(
+                trace!(
                     "default interface unchanged {}, index {}",
                     default.name, default.index
-                ));
+                );
                 return;
             }
             *current = Some(default.clone());
@@ -270,10 +268,10 @@ impl NetworkManager {
             pause.network_wake();
         }
         self.update_wifi_state();
-        self.logger.info(format!(
+        info!(
             "updated default interface {}, index {}",
             default.name, default.index
-        ));
+        );
         if self.started.load(Ordering::SeqCst) {
             self.reset_network();
         }

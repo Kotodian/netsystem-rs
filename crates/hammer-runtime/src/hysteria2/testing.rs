@@ -36,10 +36,10 @@ impl EchoServer {
 }
 
 fn spawn_accept(endpoint: quinn::Endpoint, password: String) {
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let password = password.clone();
-            tokio::spawn(async move {
+            crate::spawn::spawn(async move {
                 if let Ok(connection) = incoming.await {
                     let _ = handle_connection(connection, password).await;
                 }
@@ -98,7 +98,7 @@ async fn handle_auth(connection: quinn::Connection, password: String) -> Result<
         .finish()
         .await
         .map_err(|err| HammerError::internal(format!("finish auth response: {err}")))?;
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         let _incoming = incoming;
         std::future::pending::<()>().await;
     });
@@ -106,9 +106,9 @@ async fn handle_auth(connection: quinn::Connection, password: String) -> Result<
 }
 
 fn spawn_tcp_echo(connection: quinn::Connection) {
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         while let Ok((mut send, mut recv)) = connection.accept_bi().await {
-            tokio::spawn(async move {
+            crate::spawn::spawn(async move {
                 if protocol::read_tcp_request_header(&mut recv).await.is_err() {
                     return;
                 }
@@ -141,7 +141,7 @@ fn spawn_tcp_echo(connection: quinn::Connection) {
 }
 
 fn spawn_udp_echo(connection: quinn::Connection) {
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         while let Ok(datagram) = connection.read_datagram().await {
             if let Ok(request) = protocol::UdpMessage::decode(&datagram) {
                 let _ = parse_destination(&request.destination);

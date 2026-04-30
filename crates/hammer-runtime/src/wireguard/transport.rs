@@ -20,6 +20,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, info, warn};
 
 use boringtun::noise::TunnResult;
 use tokio::net::UdpSocket;
@@ -82,7 +83,7 @@ impl TransportHandles {
 /// blocking `Lifecycle::start` path; the resulting tokio `UdpSocket` is then
 /// handed to a detached task.
 pub(crate) fn spawn_transport(
-    logger: Logger,
+    _logger: Logger,
     peers: Arc<Vec<Peer>>,
     listen_port: u16,
     mtu: u32,
@@ -100,14 +101,13 @@ pub(crate) fn spawn_transport(
     let local_addr = socket
         .local_addr()
         .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))?;
-    logger.info(format!("wireguard transport listening on {local_addr}"));
+    info!("wireguard transport listening on {local_addr}");
 
     let (encrypt_tx, encrypt_rx) = mpsc::channel::<Vec<u8>>(ENCRYPT_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    let join = tokio::spawn(run_actor(
-        logger,
+    let join = crate::spawn::spawn(run_actor(
         Arc::new(socket),
         peers,
         mtu,
@@ -138,7 +138,6 @@ fn bind_addr_for_peers(peers: &[Peer], listen_port: u16) -> SocketAddr {
 /// fairly easy to reason about; backpressure on either mpsc is handled by
 /// dropping packets after a warn-log because wg is best-effort at L3 anyway.
 async fn run_actor(
-    logger: Logger,
     socket: Arc<UdpSocket>,
     peers: Arc<Vec<Peer>>,
     mtu: u32,
@@ -158,36 +157,35 @@ async fn run_actor(
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
-                logger.debug("wireguard transport: shutdown");
+                debug!("wireguard transport: shutdown");
                 break;
             }
             res = socket.recv_from(&mut udp_buf) => {
                 match res {
                     Ok((n, src)) => {
                         let datagram = udp_buf[..n].to_vec();
-                        handle_inbound(&logger, &socket, &peers, mtu, src, datagram, &inbound_tx).await;
+                        handle_inbound(&socket, &peers, mtu, src, datagram, &inbound_tx).await;
                     }
                     Err(err) => {
-                        logger.warn(format!("wireguard udp recv: {err}"));
+                        warn!("wireguard udp recv: {err}");
                     }
                 }
             }
             ip = encrypt_rx.recv() => {
                 let Some(packet) = ip else {
-                    logger.debug("wireguard transport: encrypt_rx closed");
+                    debug!("wireguard transport: encrypt_rx closed");
                     break;
                 };
-                handle_outbound(&logger, &socket, &peers, mtu, packet).await;
+                handle_outbound(&socket, &peers, mtu, packet).await;
             }
             _ = timer.tick() => {
-                tick_timers(&logger, &socket, &peers, mtu).await;
+                tick_timers(&socket, &peers, mtu).await;
             }
         }
     }
 }
 
 async fn handle_inbound(
-    logger: &Logger,
     socket: &UdpSocket,
     peers: &[Peer],
     mtu: u32,
@@ -196,10 +194,10 @@ async fn handle_inbound(
     inbound_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let Some(peer_idx) = peers.iter().position(|peer| peer.endpoint() == src) else {
-        logger.warn(format!(
+        warn!(
             "wireguard udp: dropped {} byte datagram from unknown source {src}",
             datagram.len()
-        ));
+        );
         return;
     };
     let peer = &peers[peer_idx];
@@ -218,7 +216,7 @@ async fn handle_inbound(
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
     let mut scratch = vec![0u8; buf_size];
     let outputs = step_decapsulate(peer, Some(src.ip()), &datagram, &mut scratch);
-    drain_outputs(logger, socket, peer, outputs, inbound_tx).await;
+    drain_outputs(socket, peer, outputs, inbound_tx).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
@@ -229,7 +227,7 @@ async fn handle_inbound(
         if outputs.is_empty() {
             break;
         }
-        drain_outputs(logger, socket, peer, outputs, inbound_tx).await;
+        drain_outputs(socket, peer, outputs, inbound_tx).await;
     }
 }
 
@@ -242,7 +240,6 @@ enum Output {
 }
 
 async fn drain_outputs(
-    logger: &Logger,
     socket: &UdpSocket,
     peer: &Peer,
     outputs: Vec<Output>,
@@ -253,12 +250,12 @@ async fn drain_outputs(
             Output::SendNetwork(buf, dst) => {
                 let buf = stamp_reserved(buf, peer.reserved());
                 if let Err(err) = socket.send_to(&buf, dst).await {
-                    logger.warn(format!("wireguard udp send_to {dst}: {err}"));
+                    warn!("wireguard udp send_to {dst}: {err}");
                 }
             }
             Output::SendInbound(buf) => {
                 if inbound_tx.try_send(buf).is_err() {
-                    logger.warn("wireguard inbound queue full or closed; dropping packet");
+                    warn!("wireguard inbound queue full or closed; dropping packet");
                 }
             }
         }
@@ -287,21 +284,13 @@ fn step_decapsulate(
     }
 }
 
-async fn handle_outbound(
-    logger: &Logger,
-    socket: &UdpSocket,
-    peers: &[Peer],
-    mtu: u32,
-    ip_packet: Vec<u8>,
-) {
+async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], mtu: u32, ip_packet: Vec<u8>) {
     let Some(dst_ip) = first_hop_destination(&ip_packet) else {
-        logger.warn("wireguard outbound: malformed IP packet, dropping");
+        warn!("wireguard outbound: malformed IP packet, dropping");
         return;
     };
     let Some(peer_idx) = peer::route_outbound(peers, dst_ip) else {
-        logger.warn(format!(
-            "wireguard outbound: no peer covers {dst_ip}, dropping"
-        ));
+        warn!("wireguard outbound: no peer covers {dst_ip}, dropping");
         return;
     };
     let peer = &peers[peer_idx];
@@ -323,11 +312,11 @@ async fn handle_outbound(
     let buf = stamp_reserved(buf, peer.reserved());
     let dst = peer.endpoint();
     if let Err(err) = socket.send_to(&buf, dst).await {
-        logger.warn(format!("wireguard udp send_to {dst}: {err}"));
+        warn!("wireguard udp send_to {dst}: {err}");
     }
 }
 
-async fn tick_timers(logger: &Logger, socket: &UdpSocket, peers: &[Peer], mtu: u32) {
+async fn tick_timers(socket: &UdpSocket, peers: &[Peer], mtu: u32) {
     let buf_size = (mtu as usize) + WIREGUARD_OVERHEAD;
     for peer in peers {
         let mut scratch = vec![0u8; buf_size];
@@ -342,7 +331,7 @@ async fn tick_timers(logger: &Logger, socket: &UdpSocket, peers: &[Peer], mtu: u
             let buf = stamp_reserved(buf, peer.reserved());
             let dst = peer.endpoint();
             if let Err(err) = socket.send_to(&buf, dst).await {
-                logger.warn(format!("wireguard timer send {dst}: {err}"));
+                warn!("wireguard timer send {dst}: {err}");
             }
         }
     }

@@ -14,12 +14,12 @@ macro_rules! impl_logging_lifecycle {
                 &self,
                 stage: $crate::adapter::StartStage,
             ) -> ::std::result::Result<(), $crate::HammerError> {
-                self.logger.debug(format!("stage {}", stage.name()));
+                ::tracing::debug!(target: $name, "stage {}", stage.name());
                 Ok(())
             }
 
             fn close(&self) -> ::std::result::Result<(), $crate::HammerError> {
-                self.logger.debug("close");
+                ::tracing::debug!(target: $name, "close");
                 Ok(())
             }
         }

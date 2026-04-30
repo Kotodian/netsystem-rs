@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 #[cfg(feature = "wireguard")]
 use hammer_adapter::PlatformInterface;
@@ -102,7 +103,7 @@ impl Lifecycle for EndpointManager {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        debug!("stage {}", stage.name());
         // Forward the stage to every concrete endpoint so that protocols
         // wanting to spin up actor tasks (e.g. wg's transport + smoltcp stack)
         // can latch onto the right phase. We snapshot the Arc list to avoid
@@ -121,7 +122,7 @@ impl Lifecycle for EndpointManager {
     }
 
     fn close(&self) -> Result<(), HammerError> {
-        self.logger.debug("close");
+        debug!("close");
         let items: Vec<Arc<dyn Endpoint>> = self
             .items
             .lock()

@@ -4,6 +4,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant as StdInstant;
+use tracing::{debug, error, info, trace};
 
 use async_trait::async_trait;
 use hammer_adapter::{
@@ -395,9 +396,8 @@ impl SystemTunStack {
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv4 listener addr: {err}")))?
                 .port();
-            self.logger
-                .info(format!("system stack TCP listener {}:{port}", v4.listener));
-            handles.push(tokio::spawn(accept_tcp_loop(
+            info!("system stack TCP listener {}:{port}", v4.listener);
+            handles.push(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
@@ -420,11 +420,8 @@ impl SystemTunStack {
                 .local_addr()
                 .map_err(|err| HammerError::internal(format!("read IPv6 listener addr: {err}")))?
                 .port();
-            self.logger.info(format!(
-                "system stack TCP listener [{}]:{port}",
-                v6.listener
-            ));
-            handles.push(tokio::spawn(accept_tcp_loop(
+            info!("system stack TCP listener [{}]:{port}", v6.listener);
+            handles.push(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
@@ -438,7 +435,7 @@ impl SystemTunStack {
                 listener_port: port,
             });
         }
-        handles.push(tokio::spawn(packet_loop(
+        handles.push(crate::spawn::spawn(packet_loop(
             self.logger.clone(),
             Arc::clone(&self.router),
             Arc::clone(&self.dns_router),
@@ -456,7 +453,7 @@ impl SystemTunStack {
             .lock()
             .expect("SystemTunStack tasks poisoned")
             .extend(handles);
-        self.logger.info("system stack started");
+        info!("system stack started");
         Ok(())
     }
 
@@ -832,7 +829,6 @@ pub fn sniff_packet(packet: &mut TunPacket) {
 }
 
 pub struct SmoltcpTunStack {
-    logger: Logger,
     router: Arc<Router>,
     dns_router: Option<Arc<DnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
@@ -840,9 +836,8 @@ pub struct SmoltcpTunStack {
 }
 
 impl SmoltcpTunStack {
-    pub fn new(logger: Logger, router: Arc<Router>, inbound_id: String) -> Self {
+    pub fn new(_logger: Logger, router: Arc<Router>, inbound_id: String) -> Self {
         Self {
-            logger,
             router,
             dns_router: None,
             outbound: None,
@@ -851,14 +846,13 @@ impl SmoltcpTunStack {
     }
 
     pub fn new_with_runtime(
-        logger: Logger,
+        _logger: Logger,
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
         inbound_id: String,
     ) -> Self {
         Self {
-            logger,
             router,
             dns_router: Some(dns_router),
             outbound: Some(outbound),
@@ -869,10 +863,7 @@ impl SmoltcpTunStack {
     pub fn handle_packet(&self, packet: &[u8]) -> Result<PacketFlow, HammerError> {
         let mut tun_packet = self.packet_context(packet)?;
         let decision = self.router.match_route(&mut tun_packet.metadata)?;
-        self.logger.debug(format!(
-            "handled TUN {:?} packet",
-            tun_packet.metadata.network
-        ));
+        debug!("handled TUN {:?} packet", tun_packet.metadata.network);
         Ok(PacketFlow {
             metadata: tun_packet.metadata,
             decision,
@@ -1466,7 +1457,7 @@ fn is_global_unicast(addr: IpAddr) -> bool {
 }
 
 async fn accept_tcp_loop(
-    logger: Logger,
+    _logger: Logger,
     router: Arc<Router>,
     outbound: Arc<OutboundManager>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
@@ -1477,7 +1468,7 @@ async fn accept_tcp_loop(
         let (mut inbound, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                logger.debug(format!("system TCP listener closed: {err}"));
+                debug!("system TCP listener closed: {err}");
                 return;
             }
         };
@@ -1486,14 +1477,13 @@ async fn accept_tcp_loop(
             nat.lookup_back(peer.port())
         };
         let Some(session) = session else {
-            logger.debug(format!("unknown system TCP NAT session: {}", peer.port()));
+            debug!("unknown system TCP NAT session: {}", peer.port());
             continue;
         };
         let router = Arc::clone(&router);
         let outbound = Arc::clone(&outbound);
-        let logger = logger.clone();
         let inbound_id = inbound_id.clone();
-        tokio::spawn(async move {
+        crate::spawn::spawn(async move {
             let mut metadata = RouteMetadata {
                 inbound: inbound_id,
                 network: Network::Tcp,
@@ -1504,7 +1494,7 @@ async fn accept_tcp_loop(
             let decision = match router.match_route(&mut metadata) {
                 Ok(decision) => decision,
                 Err(err) => {
-                    logger.debug(format!("route TCP connection: {err}"));
+                    debug!("route TCP connection: {err}");
                     return;
                 }
             };
@@ -1512,11 +1502,11 @@ async fn accept_tcp_loop(
                 outbound: outbound_id,
             } = decision
             else {
-                logger.debug("system TCP connection rejected");
+                debug!("system TCP connection rejected");
                 return;
             };
             let Some(outbound) = outbound.get(&outbound_id) else {
-                logger.error(format!("outbound not found: {outbound_id}"));
+                error!("outbound not found: {outbound_id}");
                 return;
             };
             let mut outbound_stream = match outbound
@@ -1525,15 +1515,15 @@ async fn accept_tcp_loop(
             {
                 Ok(stream) => stream,
                 Err(err) => {
-                    logger.debug(format!("dial TCP outbound: {err}"));
+                    debug!("dial TCP outbound: {err}");
                     return;
                 }
             };
             match copy_bidirectional(&mut inbound, &mut outbound_stream).await {
-                Ok((from_inbound, from_outbound)) => logger.debug(format!(
-                    "system TCP copied {from_inbound}/{from_outbound} bytes"
-                )),
-                Err(err) => logger.debug(format!("copy system TCP: {err}")),
+                Ok((from_inbound, from_outbound)) => {
+                    debug!("system TCP copied {from_inbound}/{from_outbound} bytes")
+                }
+                Err(err) => debug!("copy system TCP: {err}"),
             }
         });
     }
@@ -1541,7 +1531,7 @@ async fn accept_tcp_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn packet_loop(
-    logger: Logger,
+    _logger: Logger,
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
@@ -1552,7 +1542,7 @@ async fn packet_loop(
     routes: SystemStackRoutes,
     udp_timeout: Duration,
 ) {
-    logger.info("system packet loop started");
+    info!("system packet loop started");
     // Pull packets in batches when the underlying device supports it (Apple's
     // utun driver, currently). On platforms where recv_batch falls back to
     // single-packet recv() the batch is just `vec![pkt]` and the loop body
@@ -1563,7 +1553,7 @@ async fn packet_loop(
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
             Err(err) => {
-                logger.debug(format!("read TUN packet loop stopped: {err}"));
+                debug!("read TUN packet loop stopped: {err}");
                 return;
             }
         };
@@ -1587,7 +1577,7 @@ async fn packet_loop(
                 let parsed = match parse_ip_packet(&packet) {
                     Ok(parsed) => parsed,
                     Err(err) => {
-                        logger.trace(format!("ignore unsupported TUN packet: {err}"));
+                        trace!("ignore unsupported TUN packet: {err}");
                         continue;
                     }
                 };
@@ -1597,18 +1587,18 @@ async fn packet_loop(
                 match parsed.network {
                     Network::Tcp => {
                         let Some(route) = routes.for_packet(&packet) else {
-                            logger.debug("missing system TCP route for packet family");
+                            debug!("missing system TCP route for packet family");
                             continue;
                         };
                         let rewrite_result = process_system_tcp_packet(
                             &mut packet,
-                            &mut *nat,
+                            &mut nat,
                             route.listener_addr,
                             route.nat_addr,
                             route.listener_port,
                         );
                         if let Err(err) = rewrite_result {
-                            logger.debug(format!("rewrite system TCP packet: {err}"));
+                            debug!("rewrite system TCP packet: {err}");
                             continue;
                         }
                         tcp_writeback.push(packet);
@@ -1624,7 +1614,7 @@ async fn packet_loop(
         if !tcp_writeback.is_empty() {
             let staged = std::mem::take(&mut tcp_writeback);
             if let Err(err) = device.send_batch(staged).await {
-                logger.debug(format!("write system TCP packets: {err}"));
+                debug!("write system TCP packets: {err}");
             }
         }
         // Pass 3: UDP / DNS handling stays sequential — these awaits would
@@ -1632,7 +1622,6 @@ async fn packet_loop(
         // batching them would not pay for itself.
         for (packet, parsed) in udp_pending {
             if let Err(err) = handle_system_udp_packet(
-                logger.clone(),
                 Arc::clone(&router),
                 Arc::clone(&dns_router),
                 Arc::clone(&outbound),
@@ -1645,7 +1634,7 @@ async fn packet_loop(
             )
             .await
             {
-                logger.debug(format!("handle system UDP packet: {err}"));
+                debug!("handle system UDP packet: {err}");
             }
         }
     }
@@ -1653,7 +1642,6 @@ async fn packet_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_system_udp_packet(
-    logger: Logger,
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
@@ -1692,9 +1680,9 @@ async fn handle_system_udp_packet(
                 method, parsed.destination, tun_packet.metadata.protocol
             );
             if tun_packet.metadata.protocol == "quic" {
-                logger.trace(message);
+                trace!("{}", message);
             } else {
-                logger.debug(message);
+                debug!("{}", message);
             }
             if let Ok(response) = udp_unreachable_packet(&packet) {
                 device.send(response).await?;
@@ -1741,8 +1729,7 @@ async fn handle_system_udp_packet(
                             last_active: Instant::now(),
                         },
                     );
-                    tokio::spawn(system_udp_flow_loop(
-                        logger.clone(),
+                    crate::spawn::spawn(system_udp_flow_loop(
                         Arc::clone(&device),
                         Arc::clone(&udp_flows),
                         key,
@@ -1756,7 +1743,7 @@ async fn handle_system_udp_packet(
                 }
             };
             if let Err(err) = sender.try_send(tun_packet.payload) {
-                logger.debug(format!("drop UDP packet for busy system flow: {err}"));
+                debug!("drop UDP packet for busy system flow: {err}");
             }
         }
     }
@@ -1764,7 +1751,6 @@ async fn handle_system_udp_packet(
 }
 
 async fn system_udp_flow_loop(
-    logger: Logger,
     device: Arc<dyn TunDevice>,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     key: UdpFlowKey,
@@ -1784,7 +1770,7 @@ async fn system_udp_flow_loop(
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
                 if let Err(err) = packet_conn.send_to(destination.clone(), &payload).await {
-                    logger.debug(format!("send system UDP outbound: {err}"));
+                    debug!("send system UDP outbound: {err}");
                     break;
                 }
             }
@@ -1792,7 +1778,7 @@ async fn system_udp_flow_loop(
                 let response = match response {
                     Ok(response) => response,
                     Err(err) => {
-                        logger.debug(format!("receive system UDP outbound: {err}"));
+                        debug!("receive system UDP outbound: {err}");
                         break;
                     }
                 };
@@ -1800,11 +1786,11 @@ async fn system_udp_flow_loop(
                 match response_template.build(response.destination, &response.payload) {
                     Ok(packet) => {
                         if let Err(err) = device.send(packet).await {
-                            logger.debug(format!("write system UDP response: {err}"));
+                            debug!("write system UDP response: {err}");
                             break;
                         }
                     }
-                    Err(err) => logger.debug(format!("build system UDP response: {err}")),
+                    Err(err) => debug!("build system UDP response: {err}"),
                 }
             }
             _ = &mut idle_timer => {

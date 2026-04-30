@@ -56,6 +56,30 @@ impl Level {
     }
 }
 
+impl From<tracing::Level> for Level {
+    fn from(level: tracing::Level) -> Self {
+        match level {
+            tracing::Level::ERROR => Level::Error,
+            tracing::Level::WARN => Level::Warn,
+            tracing::Level::INFO => Level::Info,
+            tracing::Level::DEBUG => Level::Debug,
+            tracing::Level::TRACE => Level::Trace,
+        }
+    }
+}
+
+impl From<Level> for tracing::Level {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Panic | Level::Fatal | Level::Error => tracing::Level::ERROR,
+            Level::Warn => tracing::Level::WARN,
+            Level::Info => tracing::Level::INFO,
+            Level::Debug => tracing::Level::DEBUG,
+            Level::Trace => tracing::Level::TRACE,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

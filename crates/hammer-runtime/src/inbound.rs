@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 use hammer_adapter::{Inbound, InboundManager as InboundManagerTrait, PlatformInterface};
 use hammer_core::config::{Inbound as InboundOptions, InboundKind};
@@ -10,14 +11,12 @@ use hammer_core::log::Logger;
 use crate::{DnsRouter, OutboundManager, Router, TunInbound};
 
 pub struct InboundManager {
-    logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn Inbound>>>,
 }
 
 impl InboundManager {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             items: Mutex::new(HashMap::new()),
         }
     }
@@ -88,7 +87,7 @@ impl Lifecycle for InboundManager {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        debug!("stage {}", stage.name());
         for inbound in self.list() {
             inbound.start(stage)?;
         }
@@ -102,7 +101,7 @@ impl Lifecycle for InboundManager {
                 errors.push(format!("{}: {}", inbound.id(), err));
             }
         }
-        self.logger.debug("close");
+        debug!("close");
         if errors.is_empty() {
             Ok(())
         } else {

@@ -20,6 +20,7 @@ mod transport;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use tracing::info;
 
 use async_trait::async_trait;
 use boringtun::x25519;
@@ -255,7 +256,7 @@ impl Outbound for WireguardEndpoint {
         }
         let stack = self.stack_handle()?;
         let dst = SocketAddr::new(destination.host, destination.port);
-        self.logger.info(format!("wireguard dial -> {dst}"));
+        info!("wireguard dial -> {dst}");
         let mut stream = stack.dial_tcp(dst).await?;
         if !initial_payload.is_empty() {
             stream
@@ -653,7 +654,7 @@ mod tests {
         let listener = stack_b.listen_tcp(PORT);
         // Park the accept stage first so the listening socket is in SocketSet
         // before A's SYN arrives — otherwise smoltcp would RST it.
-        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let accept_task = crate::spawn::spawn(async move { listener.accept().await });
 
         // A dials B's in-tunnel address.
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), PORT);
@@ -757,7 +758,7 @@ mod tests {
 
         const PORT: u16 = 8081;
         let listener = stack_b.listen_tcp(PORT);
-        let accept_task = tokio::spawn(async move { listener.accept().await });
+        let accept_task = crate::spawn::spawn(async move { listener.accept().await });
 
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)), PORT);
         let mut stream_a = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
@@ -774,7 +775,7 @@ mod tests {
             .map(|idx| (idx % 251) as u8)
             .collect::<Vec<_>>();
         let expected = payload.clone();
-        let writer = tokio::spawn(async move {
+        let writer = crate::spawn::spawn(async move {
             for chunk in payload.chunks(4096) {
                 stream_a.write_all(chunk).await.expect("write payload");
             }

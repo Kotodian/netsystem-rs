@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::io;
 use std::sync::{Arc, Mutex};
+use tracing::{debug, info};
 
 use hammer_adapter::{Inbound, PlatformInterface, TunOptions};
 use hammer_core::config::{TunInboundOptions, TunStack};
@@ -103,20 +104,19 @@ impl TunInbound {
         };
 
         let options = self.platform_options()?;
-        self.logger
-            .info(format!("opening TUN {}, mtu {}", options.name, options.mtu));
+        info!("opening TUN {}, mtu {}", options.name, options.mtu);
         let fd = platform.open_tun(options)?;
         let stack = self.build_system_stack(fd)?;
         *self.tun_fd.lock().expect("TunInbound fd poisoned") = Some(fd);
         *self.system_stack.lock().expect("TunInbound stack poisoned") = stack;
-        self.logger.info(format!("opened TUN fd {fd}"));
+        info!("opened TUN fd {fd}");
         Ok(())
     }
 
     fn build_system_stack(&self, fd: i32) -> Result<Option<Arc<SystemTunStack>>, HammerError> {
         match self.options.stack {
             TunStack::Disabled => {
-                self.logger.debug("skip disabled TUN data path");
+                debug!("skip disabled TUN data path");
                 return Ok(None);
             }
             TunStack::System => {}
@@ -129,10 +129,9 @@ impl TunInbound {
             .map_err(|_| HammerError::internal("TUN MTU does not fit in usize"))?;
         let tun_interface_index = tun_interface_index_from_fd(fd);
         if let Some(index) = tun_interface_index {
-            self.logger.info(format!("TUN interface index {index}"));
+            info!("TUN interface index {index}");
         } else {
-            self.logger
-                .debug("TUN interface index unavailable; listener will not bind to TUN");
+            debug!("TUN interface index unavailable; listener will not bind to TUN");
         }
         let device: Arc<dyn TunDevice> = unsafe { open_system_tun_device(dup_fd, mtu)? };
         Ok(Some(Arc::new(SystemTunStack::new_with_interface_index(
@@ -211,7 +210,7 @@ impl Lifecycle for TunInbound {
             stack.close();
         }
         *self.tun_fd.lock().expect("TunInbound fd poisoned") = None;
-        self.logger.debug("close");
+        debug!("close");
         Ok(())
     }
 }

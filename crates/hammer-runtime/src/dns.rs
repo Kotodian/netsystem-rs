@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -221,15 +222,13 @@ struct CacheValue {
 }
 
 pub struct DnsClient {
-    logger: Logger,
     cache: Mutex<HashMap<CacheKey, CacheValue>>,
     cache_tick: AtomicU64,
 }
 
 impl DnsClient {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             cache: Mutex::new(HashMap::new()),
             cache_tick: AtomicU64::new(0),
         }
@@ -242,8 +241,7 @@ impl DnsClient {
         options: DnsQueryOptions,
     ) -> Result<Message, HammerError> {
         if message.queries.len() != 1 {
-            self.logger
-                .warn(format!("bad question size: {}", message.queries.len()));
+            warn!("bad question size: {}", message.queries.len());
             return Ok(message.fixed_response(FixedResponseCode::FormatError));
         }
         let query = first_query(&message)?.clone();
@@ -578,20 +576,18 @@ pub struct UdpDnsTransport {
     server: String,
     port: u16,
     via: String,
-    logger: Logger,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
     protector: SocketProtector,
 }
 
 impl UdpDnsTransport {
-    pub fn new(id: impl Into<String>, server: String, port: u16, logger: Logger) -> Self {
+    pub fn new(id: impl Into<String>, server: String, port: u16, _logger: Logger) -> Self {
         Self {
             id: id.into(),
             server,
             port,
             via: String::new(),
-            logger,
             dependencies: Vec::new(),
             outbound: None,
             protector: SocketProtector::default(),
@@ -601,7 +597,7 @@ impl UdpDnsTransport {
     fn new_with_runtime(
         id: impl Into<String>,
         options: &RemoteDnsServer,
-        logger: Logger,
+        _logger: Logger,
         outbound: Option<Arc<OutboundManager>>,
         protector: SocketProtector,
     ) -> Self {
@@ -610,7 +606,6 @@ impl UdpDnsTransport {
             server: options.server.clone(),
             port: options.server_port,
             via: options.via.clone(),
-            logger,
             dependencies: dependency(&options.via),
             outbound,
             protector,
@@ -647,7 +642,6 @@ impl DnsTransport for UdpDnsTransport {
         let server = resolve_first(&self.server, self.port).await?;
         if !self.via.is_empty() {
             let response = udp_exchange_via(
-                &self.logger,
                 self.outbound.as_ref(),
                 &self.via,
                 socket_addr_to_socks(server),
@@ -656,7 +650,7 @@ impl DnsTransport for UdpDnsTransport {
             .await?;
             let response = <Message as MessageExt>::from_bytes(&response)?;
             if response.metadata.truncation {
-                self.logger.info("response truncated, retrying with TCP");
+                info!("response truncated, retrying with TCP");
                 return tcp_exchange_via_or_direct(
                     self.outbound.as_ref(),
                     &self.via,
@@ -692,7 +686,7 @@ impl DnsTransport for UdpDnsTransport {
             .map_err(|e| HammerError::internal(format!("read UDP DNS response: {e}")))?;
         let response = <Message as MessageExt>::from_bytes(&buf[..len])?;
         if response.metadata.truncation {
-            self.logger.info("response truncated, retrying with TCP");
+            info!("response truncated, retrying with TCP");
             return tcp_exchange_direct(&server, message, &self.protector).await;
         }
         Ok(response)
@@ -966,7 +960,7 @@ async fn doh_exchange_http2(
     let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
         .await
         .map_err(|err| HammerError::internal(format!("start HTTPS DNS h2: {err}")))?;
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         let _ = connection.await;
     });
     let request = Request::post(path)
@@ -1052,13 +1046,12 @@ async fn direct_tcp_connect(
 }
 
 async fn udp_exchange_via(
-    logger: &Logger,
     outbound: Option<&Arc<OutboundManager>>,
     via: &str,
     destination: SocksAddr,
     payload: &[u8],
 ) -> Result<Vec<u8>, HammerError> {
-    logger.debug(format!("dns udp via outbound={via} dest={destination}"));
+    debug!("dns udp via outbound={via} dest={destination}");
     let mut conn = outbound_by_id(outbound, via)?.listen_packet().await?;
     conn.send_to(destination, payload).await?;
     Ok(conn.recv_from().await?.payload)
@@ -1129,15 +1122,13 @@ fn fixed_address_response(
 }
 
 pub struct DnsTransportManager {
-    logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn DnsTransport>>>,
     default_id: String,
 }
 
 impl DnsTransportManager {
-    pub fn new(logger: Logger, default_id: impl Into<String>) -> Self {
+    pub fn new(_logger: Logger, default_id: impl Into<String>) -> Self {
         Self {
-            logger,
             items: Mutex::new(HashMap::new()),
             default_id: default_id.into(),
         }
@@ -1242,7 +1233,7 @@ impl Lifecycle for DnsTransportManager {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        debug!("stage {}", stage.name());
         if stage != StartStage::Start {
             return Ok(());
         }
@@ -1259,7 +1250,7 @@ impl Lifecycle for DnsTransportManager {
     }
 
     fn close(&self) -> Result<(), HammerError> {
-        self.logger.debug("close");
+        debug!("close");
         for transport in self.list() {
             transport.close()?;
         }
@@ -1296,7 +1287,6 @@ struct ReverseValue {
 }
 
 pub struct DnsRouter {
-    logger: Logger,
     transport: Arc<DnsTransportManager>,
     client: DnsClient,
     default_strategy: DomainStrategy,
@@ -1316,7 +1306,6 @@ impl DnsRouter {
         default_strategy: DomainStrategy,
     ) -> Self {
         Self {
-            logger: logger.clone(),
             client: DnsClient::new(logger.clone()),
             transport,
             default_strategy,
@@ -1335,25 +1324,24 @@ impl DnsRouter {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        self.logger.info(format!(
+        info!(
             "exchange query={} server={} strategy={:?}",
             query_summary,
             transport.id(),
             options.strategy
-        ));
+        );
         let response = match self.client.exchange(transport, message, options).await {
             Ok(response) => response,
             Err(err) => {
-                self.logger
-                    .warn(format!("exchange failed query={query_summary}: {err}"));
+                warn!("exchange failed query={query_summary}: {err}");
                 return Err(err);
             }
         };
-        self.logger.info(format!(
+        info!(
             "exchange response query={} {}",
             query_summary,
             dns_response_log_summary(&response)
-        ));
+        );
         self.save_reverse_mapping(&response);
         Ok(response)
     }
@@ -1363,8 +1351,7 @@ impl DnsRouter {
         domain: &str,
         mut options: DnsQueryOptions,
     ) -> Result<Vec<IpAddr>, HammerError> {
-        self.logger
-            .debug(format!("lookup domain {}", normalize_domain(domain)));
+        debug!("lookup domain {}", normalize_domain(domain));
         let transport = self.resolve_transport(&options)?;
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
@@ -1481,12 +1468,12 @@ impl Lifecycle for DnsRouter {
     }
 
     fn start(&self, stage: StartStage) -> Result<(), HammerError> {
-        self.logger.debug(format!("stage {}", stage.name()));
+        debug!("stage {}", stage.name());
         Ok(())
     }
 
     fn close(&self) -> Result<(), HammerError> {
-        self.logger.debug("close");
+        debug!("close");
         self.clear_cache();
         Ok(())
     }

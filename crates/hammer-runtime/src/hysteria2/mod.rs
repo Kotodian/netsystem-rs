@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
+use tracing::{debug, error};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -72,11 +73,13 @@ pub struct Hysteria2Client {
     _h3_sender: client::SendRequest<h3_quinn::OpenStreams, Bytes>,
     sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<ProxyDatagram>>>>,
     next_session: AtomicU32,
-    logger: Logger,
 }
 
 impl Hysteria2Client {
-    pub async fn connect(options: ClientOptions, logger: Logger) -> Result<Arc<Self>, HammerError> {
+    pub async fn connect(
+        options: ClientOptions,
+        _logger: Logger,
+    ) -> Result<Arc<Self>, HammerError> {
         let address = resolve_server(&options.server, options.server_port).await?;
         let congestion = CongestionControlHandle::default();
         let endpoint = client_endpoint(&options, address, congestion.clone())?;
@@ -101,7 +104,6 @@ impl Hysteria2Client {
             _h3_sender: h3_sender,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session: AtomicU32::new(1),
-            logger,
         });
         if options.udp_enabled {
             spawn_datagram_loop(Arc::clone(&client));
@@ -130,8 +132,7 @@ impl Hysteria2Client {
                 response.message
             )));
         }
-        self.logger
-            .debug(format!("outbound connection to {destination}"));
+        debug!("outbound connection to {destination}");
         Ok(Hysteria2Stream { send, recv })
     }
 
@@ -246,7 +247,7 @@ impl Drop for Hysteria2PacketConn {
     fn drop(&mut self) {
         let sessions = Arc::clone(&self.sessions);
         let session_id = self.session_id;
-        tokio::spawn(async move {
+        crate::spawn::spawn(async move {
             sessions.lock().await.remove(&session_id);
         });
     }
@@ -383,7 +384,7 @@ async fn authenticate(
     let (mut driver, mut sender) = client::new(h3_conn)
         .await
         .map_err(|err| HammerError::internal(format!("h3 client init: {err}")))?;
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         let _ = future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
     let mut request = Request::post(format!(
@@ -423,17 +424,17 @@ async fn authenticate(
 }
 
 fn spawn_datagram_loop(client: Arc<Hysteria2Client>) {
-    tokio::spawn(async move {
+    crate::spawn::spawn(async move {
         loop {
             let datagram = match client.connection.read_datagram().await {
                 Ok(datagram) => datagram,
                 Err(err) => {
-                    client.logger.error(format!("receive datagram: {err}"));
+                    error!("receive datagram: {err}");
                     return;
                 }
             };
             if let Err(err) = handle_datagram(&client, &datagram).await {
-                client.logger.error(format!("handle datagram: {err}"));
+                error!("handle datagram: {err}");
             }
         }
     });

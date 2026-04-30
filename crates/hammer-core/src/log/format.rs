@@ -90,6 +90,11 @@ fn apply_line_break(message: String, strip: bool) -> String {
 }
 
 pub fn display_id(id: &str) -> String {
+    let id = id
+        .strip_prefix("hammer_runtime::")
+        .or_else(|| id.strip_prefix("hammer_ffi::"))
+        .or_else(|| id.strip_prefix("hammer_core::"))
+        .unwrap_or(id);
     match id {
         "dns" => return "resolve".into(),
         "dns-transport" => return "resolve.transport".into(),

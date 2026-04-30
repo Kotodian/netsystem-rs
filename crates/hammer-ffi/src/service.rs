@@ -216,6 +216,12 @@ impl HammerService {
 
         log_factory.close();
         let _runtime_guard = runtime_handle.enter();
+        // Pin this Service's tracing Dispatch onto the calling thread so any
+        // tracing events emitted by lifecycle code (and any tasks spawned via
+        // `crate::spawn::spawn`, which captures the current dispatcher via
+        // `with_current_subscriber`) route to this Factory's writer instead
+        // of falling on the floor or stealing another Factory's events.
+        let _dispatch_guard = tracing::dispatcher::set_default(log_factory.dispatch());
 
         for stage in ALL_STAGES {
             for lc in &lifecycles {
@@ -236,14 +242,15 @@ impl HammerService {
     }
 
     pub fn close(&self) -> Result<(), HammerError> {
-        let lifecycles = {
+        let (lifecycles, log_factory) = {
             let mut inner = self.inner.lock().expect("service mutex poisoned");
             if inner.state == ServiceState::Closed {
                 return Ok(());
             }
             inner.state = ServiceState::Closed;
-            inner.lifecycles.clone()
+            (inner.lifecycles.clone(), Arc::clone(&inner.log_factory))
         };
+        let _dispatch_guard = tracing::dispatcher::set_default(log_factory.dispatch());
 
         let mut errors = Vec::new();
         for lc in lifecycles.iter().rev() {
@@ -260,26 +267,31 @@ impl HammerService {
 
     pub fn pause(&self) {
         let inner = self.inner.lock().expect("service mutex poisoned");
+        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
         inner.pause.pause();
     }
 
     pub fn wake(&self) {
         let inner = self.inner.lock().expect("service mutex poisoned");
+        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
         inner.pause.wake();
     }
 
     pub fn reset_network(&self) {
         let inner = self.inner.lock().expect("service mutex poisoned");
+        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
         inner.network.reset_network();
     }
 
     pub fn need_wifi_state(&self) -> bool {
         let inner = self.inner.lock().expect("service mutex poisoned");
+        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
         inner.network.need_wifi_state()
     }
 
     pub fn update_wifi_state(&self) {
         let inner = self.inner.lock().expect("service mutex poisoned");
+        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
         inner.network.update_wifi_state();
     }
 }

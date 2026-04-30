@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tracing::debug;
 
 use hammer_adapter::{ConnectionHandle, ConnectionManager as ConnectionManagerTrait};
 use hammer_core::log::Logger;
@@ -8,15 +9,13 @@ use hammer_core::log::Logger;
 use crate::impl_logging_lifecycle;
 
 pub struct ConnectionManager {
-    logger: Logger,
     next_id: AtomicU64,
     connections: Mutex<HashMap<u64, Arc<dyn ConnectionHandle>>>,
 }
 
 impl ConnectionManager {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             next_id: AtomicU64::new(1),
             connections: Mutex::new(HashMap::new()),
         }
@@ -77,6 +76,6 @@ impl ConnectionManagerTrait for ConnectionManager {
         for handle in handles {
             handle.close();
         }
-        self.logger.debug("close_all");
+        debug!("close_all");
     }
 }

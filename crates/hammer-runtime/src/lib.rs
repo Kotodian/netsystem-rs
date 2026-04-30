@@ -33,6 +33,7 @@ pub mod pause;
 mod router;
 mod service_mgr;
 mod socket_protector;
+pub mod spawn;
 mod tls_support;
 pub mod tun;
 mod tun_inbound;

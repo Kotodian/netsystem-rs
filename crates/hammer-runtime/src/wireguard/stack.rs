@@ -13,6 +13,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
+use tracing::{debug, warn};
 
 use async_trait::async_trait;
 use ipnet::IpNet;
@@ -254,7 +255,7 @@ pub(crate) fn spawn_stack(
         started,
     };
 
-    let join = tokio::spawn(inner.run());
+    let join = crate::spawn::spawn(inner.run());
 
     Ok(StackHandles {
         cmd_tx,
@@ -377,7 +378,7 @@ impl StackInner {
             tokio::select! {
                 biased;
                 _ = &mut self.shutdown_rx => {
-                    self.logger.debug("wireguard stack: shutdown");
+                    debug!("wireguard stack: shutdown");
                     return;
                 }
                 Some(cmd) = self.cmd_rx.recv() => {
@@ -405,8 +406,7 @@ impl StackInner {
         // Flush smoltcp's outbound IP packets up to the transport.
         while let Ok(buf) = self.egress_rx.try_recv() {
             if self.encrypt_tx.send(buf).await.is_err() {
-                self.logger
-                    .warn("wireguard stack: encrypt_tx closed, transport stopped");
+                warn!("wireguard stack: encrypt_tx closed, transport stopped");
                 return;
             }
         }
@@ -527,8 +527,7 @@ impl StackInner {
                 };
                 let socket = self.sockets.get_mut::<udp::Socket>(handle);
                 if let Err(err) = socket.send_slice(&data, endpoint) {
-                    self.logger
-                        .warn(format!("wireguard udp send_slice: {err:?}"));
+                    warn!("wireguard udp send_slice: {err:?}");
                 }
             }
             SocketEvent::UdpClose { handle } => {
@@ -614,7 +613,7 @@ impl StackInner {
         let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(TCP_DATA_QUEUE);
         let event_tx = self.event_tx.clone();
-        tokio::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
+        crate::spawn::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
         self.tcp_bridges.insert(
             handle,
             TcpBridge {
@@ -673,8 +672,7 @@ impl StackInner {
         match socket.send_slice(data) {
             Ok(n) => n,
             Err(err) => {
-                self.logger
-                    .debug(format!("wireguard tcp send_slice deferred: {err:?}"));
+                debug!("wireguard tcp send_slice deferred: {err:?}");
                 0
             }
         }
@@ -713,7 +711,7 @@ impl StackInner {
         let (recv_user_tx, recv_user_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE);
         let (send_user_tx, send_user_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE);
         let event_tx = self.event_tx.clone();
-        tokio::spawn(udp_bridge_task(handle, send_user_rx, event_tx));
+        crate::spawn::spawn(udp_bridge_task(handle, send_user_rx, event_tx));
 
         self.udp_bridges.insert(
             handle,
@@ -788,8 +786,7 @@ impl StackInner {
                         }
                     }
                     Err(err) => {
-                        self.logger
-                            .debug(format!("wireguard tcp retry deferred: {err:?}"));
+                        debug!("wireguard tcp retry deferred: {err:?}");
                         break;
                     }
                 }

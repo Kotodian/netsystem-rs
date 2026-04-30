@@ -18,16 +18,14 @@ use crate::impl_logging_lifecycle;
 /// non-terminal rules (sniff/resolve/route_options) mutate metadata and fall
 /// through.
 pub struct Router {
-    logger: Logger,
     rules: Vec<RuntimeRule>,
     outbound: Option<Arc<OutboundManager>>,
     default_outbound: String,
 }
 
 impl Router {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             rules: Vec::new(),
             outbound: None,
             default_outbound: String::new(),
@@ -35,7 +33,7 @@ impl Router {
     }
 
     pub fn from_options(
-        logger: Logger,
+        _logger: Logger,
         options: RouteOptions,
         outbound: Arc<OutboundManager>,
     ) -> Result<Self, HammerError> {
@@ -55,7 +53,6 @@ impl Router {
             }
         }
         Ok(Self {
-            logger,
             rules,
             outbound: Some(outbound),
             default_outbound: options.final_,

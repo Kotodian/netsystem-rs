@@ -8,14 +8,12 @@ use hammer_core::log::Logger;
 use crate::impl_logging_lifecycle;
 
 pub struct ServiceManager {
-    logger: Logger,
     items: Mutex<HashMap<String, Arc<dyn LifecycleService>>>,
 }
 
 impl ServiceManager {
-    pub fn new(logger: Logger) -> Self {
+    pub fn new(_logger: Logger) -> Self {
         Self {
-            logger,
             items: Mutex::new(HashMap::new()),
         }
     }

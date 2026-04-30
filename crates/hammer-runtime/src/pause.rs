@@ -111,7 +111,7 @@ mod tests {
         let pm = Arc::new(PauseManager::new());
         pm.device_pause();
         let pm2 = Arc::clone(&pm);
-        let waker = tokio::spawn(async move {
+        let waker = crate::spawn::spawn(async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
             pm2.device_wake();
         });
@@ -128,7 +128,7 @@ mod tests {
         pm.device_pause();
         pm.network_pause();
         let pm2 = Arc::clone(&pm);
-        tokio::spawn(async move {
+        crate::spawn::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             pm2.device_wake();
             tokio::time::sleep(Duration::from_millis(20)).await;

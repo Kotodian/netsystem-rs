@@ -24,6 +24,7 @@ hammer-runtime = { path = "../hammer-runtime" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 uniffi = { workspace = true }
 
 [build-dependencies]
