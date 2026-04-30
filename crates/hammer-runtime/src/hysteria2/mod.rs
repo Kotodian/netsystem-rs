@@ -14,7 +14,10 @@ use h3::client;
 use hammer_adapter::{
     Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
 };
-use hammer_core::config::{Hysteria2Obfs, Hysteria2OutboundOptions};
+use hammer_core::config::{
+    Hysteria2BbrProfile, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
+    Hysteria2OutboundOptions,
+};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use http::Request;
@@ -270,7 +273,7 @@ impl Hysteria2Outbound {
         options: Hysteria2OutboundOptions,
         protector: SocketProtector,
     ) -> Self {
-        let networks = parse_networks(&options.network);
+        let networks = adapter_networks(&options.network);
         Self {
             logger,
             tag,
@@ -300,8 +303,7 @@ impl Hysteria2Outbound {
             server_name: self.options.tls.server_name.clone(),
             insecure: self.options.tls.insecure,
             udp_enabled: self.networks.contains(&Network::Udp),
-            bbr_profile: BbrProfile::parse(&self.options.bbr_profile)
-                .map_err(HammerError::internal)?,
+            bbr_profile: runtime_bbr_profile(self.options.bbr_profile),
             disable_path_mtu_discovery: self.options.disable_path_mtu_discovery,
             initial_packet_size: self.options.initial_packet_size,
             idle_timeout: self.options.idle_timeout,
@@ -550,16 +552,12 @@ fn wrap_obfs_socket(
     let Some(obfs) = obfs else {
         return Ok(socket);
     };
-    if obfs.type_ != "salamander" {
-        return Err(HammerError::internal(format!(
-            "unknown obfs type: {}",
-            obfs.type_
-        )));
+    match obfs.type_ {
+        Hysteria2ObfsType::Salamander => Ok(Arc::new(SalamanderUdpSocket {
+            inner: socket,
+            obfs: Salamander::new(obfs.password.as_bytes().to_vec()),
+        })),
     }
-    Ok(Arc::new(SalamanderUdpSocket {
-        inner: socket,
-        obfs: Salamander::new(obfs.password.as_bytes().to_vec()),
-    }))
 }
 
 #[derive(Debug)]
@@ -655,19 +653,25 @@ fn actual_tx_bps(send_bps: u64, server_rx: u64) -> u64 {
     }
 }
 
-fn parse_networks(value: &str) -> Vec<Network> {
-    let mut networks = Vec::new();
-    for item in value.lines() {
-        match item {
-            "tcp" => networks.push(Network::Tcp),
-            "udp" => networks.push(Network::Udp),
-            _ => {}
-        }
+fn adapter_networks(value: &[Hysteria2Network]) -> Vec<Network> {
+    if value.is_empty() {
+        return vec![Network::Tcp, Network::Udp];
     }
-    if networks.is_empty() {
-        vec![Network::Tcp, Network::Udp]
-    } else {
-        networks
+    value.iter().copied().map(adapter_network).collect()
+}
+
+fn runtime_bbr_profile(profile: Hysteria2BbrProfile) -> BbrProfile {
+    match profile {
+        Hysteria2BbrProfile::Standard => BbrProfile::Standard,
+        Hysteria2BbrProfile::Conservative => BbrProfile::Conservative,
+        Hysteria2BbrProfile::Aggressive => BbrProfile::Aggressive,
+    }
+}
+
+fn adapter_network(value: Hysteria2Network) -> Network {
+    match value {
+        Hysteria2Network::Tcp => Network::Tcp,
+        Hysteria2Network::Udp => Network::Udp,
     }
 }
 
@@ -762,13 +766,10 @@ fn server_config() -> Result<quinn::ServerConfig, HammerError> {
 }
 
 fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
-    if let Some(obfs) = obfs
-        && obfs.type_ != "salamander"
-    {
-        return Err(HammerError::internal(format!(
-            "unknown obfs type: {}",
-            obfs.type_
-        )));
+    if let Some(obfs) = obfs {
+        match obfs.type_ {
+            Hysteria2ObfsType::Salamander => {}
+        }
     }
     Ok(())
 }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -51,8 +52,25 @@ pub struct TunInboundOptions {
     pub route_exclude_address: Vec<Prefix>,
     pub auto_route: bool,
     pub strict_route: bool,
-    pub stack: String,
+    pub stack: TunStack,
     pub udp_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunStack {
+    #[default]
+    System,
+    Disabled,
+}
+
+impl TunStack {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,17 +164,52 @@ pub struct Hysteria2OutboundOptions {
     pub password: String,
     pub up_mbps: i64,
     pub down_mbps: i64,
-    pub network: String,
+    pub network: Vec<Hysteria2Network>,
     pub hop_interval: Option<Duration>,
     pub hop_interval_max: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub keep_alive_period: Option<Duration>,
-    pub bbr_profile: String,
+    pub bbr_profile: Hysteria2BbrProfile,
     pub brutal_debug: bool,
     pub disable_path_mtu_discovery: bool,
     pub initial_packet_size: u16,
     pub tls: OutboundTlsOptions,
     pub obfs: Option<Hysteria2Obfs>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hysteria2Network {
+    Tcp,
+    Udp,
+}
+
+impl Hysteria2Network {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hysteria2BbrProfile {
+    #[default]
+    Standard,
+    Conservative,
+    Aggressive,
+}
+
+impl Hysteria2BbrProfile {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Conservative => "conservative",
+            Self::Aggressive => "aggressive",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -168,8 +221,23 @@ pub struct OutboundTlsOptions {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hysteria2Obfs {
-    pub type_: String,
+    pub type_: Hysteria2ObfsType,
     pub password: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Hysteria2ObfsType {
+    #[default]
+    Salamander,
+}
+
+impl Hysteria2ObfsType {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Salamander => "salamander",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -309,7 +377,8 @@ pub struct RouteOptionsActionOptions {
     pub udp_disable_domain_unmapping: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DomainStrategy {
     #[default]
     AsIs,
@@ -320,6 +389,10 @@ pub enum DomainStrategy {
 }
 
 impl DomainStrategy {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             DomainStrategy::AsIs => "as_is",

@@ -76,20 +76,6 @@ pub fn parse_domain_strategy(field: &str, value: &str) -> Result<DomainStrategy,
     }
 }
 
-pub fn build_network_list(field: &str, network: &[String]) -> Result<String, HammerError> {
-    if network.is_empty() {
-        return Ok(String::new());
-    }
-    for n in network {
-        if n != "tcp" && n != "udp" {
-            return Err(HammerError::config_validation(format!(
-                "{field}: unknown network {n:?}"
-            )));
-        }
-    }
-    Ok(network.join("\n"))
-}
-
 /// Mimic of `time.ParseDuration` covering ms / s / m / h with decimal fractions.
 /// Accepts e.g. `"300ms"`, `"1.5s"`, `"2m30s"`, `"1h2m3s"`.
 fn parse_duration_go_style(input: &str) -> Result<Duration, String> {

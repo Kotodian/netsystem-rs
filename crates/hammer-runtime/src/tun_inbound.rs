@@ -3,14 +3,14 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{Inbound, PlatformInterface, TunOptions};
-use hammer_core::config::TunInboundOptions;
+use hammer_core::config::{TunInboundOptions, TunStack};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::tun::{SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index_from_fd};
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 use crate::tun::AsyncTunDevice;
+use crate::tun::{SmoltcpTunStack, SystemTunStack, TunDevice, tun_interface_index_from_fd};
 use crate::{DnsRouter, OutboundManager, Router};
 
 pub struct TunInbound {
@@ -114,15 +114,12 @@ impl TunInbound {
     }
 
     fn build_system_stack(&self, fd: i32) -> Result<Option<Arc<SystemTunStack>>, HammerError> {
-        if self.options.stack == "disabled" {
-            self.logger.debug("skip disabled TUN data path");
-            return Ok(None);
-        }
-        if self.options.stack != "system" {
-            return Err(HammerError::internal(format!(
-                "unsupported TUN stack: {}",
-                self.options.stack
-            )));
+        match self.options.stack {
+            TunStack::Disabled => {
+                self.logger.debug("skip disabled TUN data path");
+                return Ok(None);
+            }
+            TunStack::System => {}
         }
         let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
             return Ok(None);

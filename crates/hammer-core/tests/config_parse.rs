@@ -2,7 +2,10 @@ use std::time::Duration;
 
 #[cfg(feature = "wireguard")]
 use hammer_core::config::EndpointKind;
-use hammer_core::config::{self, DnsServerKind, InboundKind, OutboundKind, RuleActionKind};
+use hammer_core::config::{
+    self, DnsServerKind, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, InboundKind,
+    OutboundKind, RuleActionKind, TunStack,
+};
 
 const MINIMAL_CONFIG: &str = r#"
 [log]
@@ -47,6 +50,8 @@ fn parse_config_builds_hysteria_tun_options() {
     assert_eq!(options.inbounds.len(), 1);
     assert_eq!(options.inbounds[0].type_name(), "tun");
     matches::assert_inbound_tun(&options.inbounds[0].kind);
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind;
+    assert_eq!(tun.stack, TunStack::System);
 
     assert_eq!(options.route.rules.len(), 5, "expected 5 tun rules");
     assert_rule_action(&options.route.rules[0].default_options.action, "sniff");
@@ -97,6 +102,17 @@ fn parse_config_builds_hysteria_tun_options() {
 
     assert_eq!(options.outbounds.len(), 2);
     assert_eq!(options.outbounds[0].type_name(), "hysteria2");
+    let hysteria = match &options.outbounds[0].kind {
+        OutboundKind::Hysteria2(o) => o,
+        _ => panic!("outbound[0] not hysteria2"),
+    };
+    assert_eq!(
+        hysteria.network,
+        vec![Hysteria2Network::Tcp, Hysteria2Network::Udp]
+    );
+    assert_eq!(hysteria.bbr_profile, Hysteria2BbrProfile::Standard);
+    let obfs = hysteria.obfs.as_ref().expect("obfs should be parsed");
+    assert_eq!(obfs.type_, Hysteria2ObfsType::Salamander);
     assert_eq!(options.outbounds[1].type_name(), "direct");
     assert_eq!(options.outbounds[1].tag, "direct");
 

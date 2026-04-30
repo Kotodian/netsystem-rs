@@ -10,10 +10,7 @@ use super::options::constants as C;
 use super::options::*;
 #[cfg(feature = "wireguard")]
 use super::parse::{parse_base64_key, parse_ipnet_list, parse_socket_addr};
-use super::parse::{
-    build_network_list, parse_domain_strategy, parse_optional_duration, parse_optional_port,
-    parse_prefix_list,
-};
+use super::parse::{parse_optional_duration, parse_optional_port, parse_prefix_list};
 use super::raw::*;
 
 pub(crate) fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
@@ -106,11 +103,7 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
     } else {
         raw.mtu
     };
-    let stack = if raw.stack.is_empty() {
-        C::DEFAULT_TUN_STACK.to_owned()
-    } else {
-        raw.stack.clone()
-    };
+    let stack = raw.stack.unwrap_or_default();
     let address = parse_prefix_list("tun.address", &raw.address)?;
     if address.is_empty() {
         return Err(HammerError::config_validation("tun.address is required"));
@@ -176,14 +169,18 @@ fn build_hysteria_options(
             "hysteria2.sni is required unless insecure=true",
         ));
     }
-    let network = build_network_list("hysteria2.network", &raw.network)?;
+    let network = if raw.network.is_empty() {
+        vec![Hysteria2Network::Tcp, Hysteria2Network::Udp]
+    } else {
+        raw.network
+    };
     let hop_interval = parse_optional_duration("hysteria2.hop_interval", &raw.hop_interval)?;
     let hop_interval_max =
         parse_optional_duration("hysteria2.hop_interval_max", &raw.hop_interval_max)?;
     let idle_timeout = parse_optional_duration("hysteria2.idle_timeout", &raw.idle_timeout)?;
     let keep_alive_period =
         parse_optional_duration("hysteria2.keep_alive_period", &raw.keep_alive_period)?;
-    let bbr_profile = normalize_bbr_profile(&raw.bbr_profile)?;
+    let bbr_profile = raw.bbr_profile.unwrap_or_default();
     let obfs = build_obfs(raw.obfs)?;
     Ok((
         Hysteria2OutboundOptions {
@@ -213,27 +210,22 @@ fn build_hysteria_options(
     ))
 }
 
-fn normalize_bbr_profile(value: &str) -> Result<String, HammerError> {
-    match value {
-        "" => Ok("standard".to_owned()),
-        "standard" | "conservative" | "aggressive" => Ok(value.to_owned()),
-        _ => Err(HammerError::config_validation(format!(
-            "hysteria2.bbr_profile unsupported BBR profile: {value}",
-        ))),
-    }
-}
-
 fn build_obfs(raw: RawHysteria2Obfs) -> Result<Option<Hysteria2Obfs>, HammerError> {
-    if raw.type_.is_empty() && raw.password.is_empty() {
+    if raw.type_.is_none() && raw.password.is_empty() {
         return Ok(None);
     }
-    if raw.type_.is_empty() || raw.password.is_empty() {
+    let Some(type_) = raw.type_ else {
+        return Err(HammerError::config_validation(
+            "hysteria2.obfs.type and hysteria2.obfs.password must be set together",
+        ));
+    };
+    if raw.password.is_empty() {
         return Err(HammerError::config_validation(
             "hysteria2.obfs.type and hysteria2.obfs.password must be set together",
         ));
     }
     Ok(Some(Hysteria2Obfs {
-        type_: raw.type_,
+        type_,
         password: raw.password,
     }))
 }
@@ -247,13 +239,12 @@ fn build_dns_options(raw: &RawDnsConfig, default_via: &str) -> Result<DnsOptions
     } else {
         raw.via.clone()
     };
-    let strategy = parse_domain_strategy("dns.strategy", &raw.strategy)?;
     let server = build_dns_server(raw, &via)?;
     let final_tag = server.tag.clone();
     Ok(DnsOptions {
         servers: vec![server],
         final_: final_tag,
-        strategy,
+        strategy: raw.strategy,
     })
 }
 
@@ -359,7 +350,7 @@ pub(crate) fn derive_tun_route_rules(
     tun_tag: &str,
 ) -> Result<Vec<Rule>, HammerError> {
     let sniff_timeout = parse_optional_duration("tun.sniff_timeout", &raw_tun.sniff_timeout)?;
-    let domain_strategy = parse_domain_strategy("tun.domain_strategy", &raw_tun.domain_strategy)?;
+    let domain_strategy = raw_tun.domain_strategy;
     if raw_tun.sniff_override_destination && !raw_tun.sniff {
         return Err(HammerError::config_validation(
             "tun.sniff_override_destination requires tun.sniff=true",
@@ -508,9 +499,10 @@ fn build_wireguard_peer(
     let prefix = format!("endpoints[{endpoint_idx}].peers[{peer_idx}]");
     let public_key = parse_base64_key(&format!("{prefix}.public_key"), raw.public_key.trim())?;
     let pre_shared_key = match raw.pre_shared_key.as_deref().map(str::trim) {
-        Some(value) if !value.is_empty() => {
-            Some(parse_base64_key(&format!("{prefix}.pre_shared_key"), value)?)
-        }
+        Some(value) if !value.is_empty() => Some(parse_base64_key(
+            &format!("{prefix}.pre_shared_key"),
+            value,
+        )?),
         _ => None,
     };
     if raw.address.is_empty() {

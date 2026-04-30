@@ -1,4 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+
+use super::options::{
+    DomainStrategy, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, TunStack,
+};
+use super::parse::parse_domain_strategy;
 
 // Raw config structs are mostly serde field declarations with the same
 // `default + skip_serializing_if` pattern. Keep the actual field list explicit,
@@ -102,7 +107,8 @@ raw_struct_with_default_check! {
         /// TUN MTU.
         pub mtu: u32 => "is_zero_u32",
         /// Packet stack mode, for example `system` or `disabled`.
-        pub stack: String => "String::is_empty",
+        #[serde(deserialize_with = "deserialize_tun_stack")]
+        pub stack: Option<TunStack> => "Option::is_none",
         /// Local interface addresses in CIDR form.
         pub address: Vec<String> => "Vec::is_empty",
         /// Routes included through the tunnel.
@@ -124,7 +130,8 @@ raw_struct_with_default_check! {
         /// Sniffing timeout string.
         pub sniff_timeout: String => "String::is_empty",
         /// Domain resolution strategy for sniffed/routed traffic.
-        pub domain_strategy: String => "String::is_empty",
+        #[serde(deserialize_with = "deserialize_tun_domain_strategy")]
+        pub domain_strategy: DomainStrategy => "DomainStrategy::is_default",
         /// Whether UDP domain unmapping is disabled for this inbound.
         pub udp_disable_domain_unmapping: bool => "is_false",
         /// Whether detected QUIC traffic should be rejected.
@@ -153,7 +160,8 @@ raw_struct_with_default_check! {
         /// Whether invalid TLS certificates are accepted.
         pub insecure: bool => "is_false",
         /// Enabled network list from the raw config.
-        pub network: Vec<String> => "Vec::is_empty",
+        #[serde(deserialize_with = "deserialize_hysteria2_networks")]
+        pub network: Vec<Hysteria2Network> => "Vec::is_empty",
         /// Port-hopping interval string.
         pub hop_interval: String => "String::is_empty",
         /// Maximum port-hopping interval string.
@@ -162,8 +170,9 @@ raw_struct_with_default_check! {
         pub idle_timeout: String => "String::is_empty",
         /// QUIC keep-alive period string.
         pub keep_alive_period: String => "String::is_empty",
-        /// Hysteria2 BBR profile name.
-        pub bbr_profile: String => "String::is_empty",
+        /// Hysteria2 BBR profile.
+        #[serde(deserialize_with = "deserialize_hysteria2_bbr_profile")]
+        pub bbr_profile: Option<Hysteria2BbrProfile> => "Option::is_none",
         /// Whether Brutal congestion-control debug output is enabled.
         pub brutal_debug: bool => "is_false",
         /// Whether QUIC path MTU discovery is disabled.
@@ -180,7 +189,8 @@ raw_struct_with_default_check! {
     pub struct RawHysteria2Obfs {
         /// Obfuscation type.
         #[serde(rename = "type")]
-        pub type_: String => "String::is_empty",
+        #[serde(deserialize_with = "deserialize_hysteria2_obfs_type")]
+        pub type_: Option<Hysteria2ObfsType> => "Option::is_none",
         /// Obfuscation password.
         pub password: String => "String::is_empty",
     }
@@ -242,7 +252,8 @@ raw_struct_with_default_check! {
         /// Upstream DNS server URL or address.
         pub server: String => "String::is_empty",
         /// DNS answer selection strategy.
-        pub strategy: String => "String::is_empty",
+        #[serde(deserialize_with = "deserialize_dns_strategy")]
+        pub strategy: DomainStrategy => "DomainStrategy::is_default",
         /// Outbound tag used to reach the upstream DNS server.
         pub via: String => "String::is_empty",
     }
@@ -290,4 +301,87 @@ fn is_zero_u32(v: &u32) -> bool {
 }
 fn is_zero_i64(v: &i64) -> bool {
     *v == 0
+}
+
+fn deserialize_tun_stack<'de, D>(deserializer: D) -> Result<Option<TunStack>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "" => Ok(None),
+        "system" => Ok(Some(TunStack::System)),
+        "disabled" => Ok(Some(TunStack::Disabled)),
+        other => Err(de::Error::custom(format!(
+            "tun.stack: unknown stack {other:?}"
+        ))),
+    }
+}
+
+fn deserialize_tun_domain_strategy<'de, D>(deserializer: D) -> Result<DomainStrategy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_domain_strategy("tun.domain_strategy", &value).map_err(de::Error::custom)
+}
+
+fn deserialize_dns_strategy<'de, D>(deserializer: D) -> Result<DomainStrategy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    parse_domain_strategy("dns.strategy", &value).map_err(de::Error::custom)
+}
+
+fn deserialize_hysteria2_networks<'de, D>(
+    deserializer: D,
+) -> Result<Vec<Hysteria2Network>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "tcp" => Ok(Hysteria2Network::Tcp),
+            "udp" => Ok(Hysteria2Network::Udp),
+            other => Err(de::Error::custom(format!(
+                "hysteria2.network: unknown network {other:?}"
+            ))),
+        })
+        .collect()
+}
+
+fn deserialize_hysteria2_bbr_profile<'de, D>(
+    deserializer: D,
+) -> Result<Option<Hysteria2BbrProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "" => Ok(None),
+        "standard" => Ok(Some(Hysteria2BbrProfile::Standard)),
+        "conservative" => Ok(Some(Hysteria2BbrProfile::Conservative)),
+        "aggressive" => Ok(Some(Hysteria2BbrProfile::Aggressive)),
+        other => Err(de::Error::custom(format!(
+            "hysteria2.bbr_profile unsupported BBR profile: {other}"
+        ))),
+    }
+}
+
+fn deserialize_hysteria2_obfs_type<'de, D>(
+    deserializer: D,
+) -> Result<Option<Hysteria2ObfsType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "" => Ok(None),
+        "salamander" => Ok(Some(Hysteria2ObfsType::Salamander)),
+        other => Err(de::Error::custom(format!(
+            "hysteria2.obfs.type: unknown obfs type {other:?}"
+        ))),
+    }
 }
