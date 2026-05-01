@@ -196,7 +196,6 @@ impl RuntimeService {
             )
         };
 
-        log_factory.close();
         let _runtime_guard = runtime_handle.enter();
         let _dispatch_guard = tracing::dispatcher::set_default(log_factory.dispatch());
 
@@ -243,33 +242,33 @@ impl RuntimeService {
     }
 
     pub fn pause(&self) {
-        let inner = self.inner.lock().expect("service mutex poisoned");
-        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-        inner.pause.pause();
+        self.with_inner(|inner| inner.pause.pause());
     }
 
     pub fn wake(&self) {
-        let inner = self.inner.lock().expect("service mutex poisoned");
-        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-        inner.pause.wake();
+        self.with_inner(|inner| inner.pause.wake());
     }
 
     pub fn reset_network(&self) {
-        let inner = self.inner.lock().expect("service mutex poisoned");
-        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-        inner.network.reset_network();
+        self.with_inner(|inner| inner.network.reset_network());
     }
 
     pub fn need_wifi_state(&self) -> bool {
-        let inner = self.inner.lock().expect("service mutex poisoned");
-        let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-        inner.network.need_wifi_state()
+        self.with_inner(|inner| inner.network.need_wifi_state())
     }
 
     pub fn update_wifi_state(&self) {
+        self.with_inner(|inner| inner.network.update_wifi_state());
+    }
+
+    /// Lock the inner state and pin this Service's tracing Dispatch onto the
+    /// calling thread for the duration of `f`. Every short sync FFI entry
+    /// point that touches inner state goes through here so they all route
+    /// tracing events to this Factory's writer.
+    fn with_inner<R>(&self, f: impl FnOnce(&ServiceInner) -> R) -> R {
         let inner = self.inner.lock().expect("service mutex poisoned");
         let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-        inner.network.update_wifi_state();
+        f(&inner)
     }
 }
 

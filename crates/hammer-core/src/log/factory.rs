@@ -73,8 +73,6 @@ impl Factory {
             factory: Arc::clone(self),
         }
     }
-
-    pub fn close(&self) {}
 }
 
 #[derive(Clone)]
