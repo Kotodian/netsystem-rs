@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use h3::server;
@@ -9,14 +11,24 @@ use http::Response;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::PrivateKeyDer;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Notify;
 
 pub struct EchoServer {
     endpoint: quinn::Endpoint,
     port: u16,
+    auth_count: Arc<AtomicUsize>,
+    auth_notify: Arc<Notify>,
 }
 
 impl EchoServer {
     pub async fn start(password: &str) -> Result<Self, HammerError> {
+        Self::start_with_auth_delay(password, Duration::ZERO).await
+    }
+
+    pub async fn start_with_auth_delay(
+        password: &str,
+        auth_delay: Duration,
+    ) -> Result<Self, HammerError> {
         let endpoint = quinn::Endpoint::server(
             server_config()?,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -26,23 +38,59 @@ impl EchoServer {
             .local_addr()
             .map_err(|err| HammerError::internal(format!("echo server addr: {err}")))?
             .port();
-        let server = Self { endpoint, port };
-        spawn_accept(server.endpoint.clone(), password.to_owned());
+        let server = Self {
+            endpoint,
+            port,
+            auth_count: Arc::new(AtomicUsize::new(0)),
+            auth_notify: Arc::new(Notify::new()),
+        };
+        spawn_accept(
+            server.endpoint.clone(),
+            password.to_owned(),
+            auth_delay,
+            Arc::clone(&server.auth_count),
+            Arc::clone(&server.auth_notify),
+        );
         Ok(server)
     }
 
     pub fn port(&self) -> u16 {
         self.port
     }
+
+    pub fn auth_count(&self) -> usize {
+        self.auth_count.load(Ordering::SeqCst)
+    }
+
+    pub async fn wait_for_auth_count(&self, expected: usize) {
+        while self.auth_count() < expected {
+            self.auth_notify.notified().await;
+        }
+    }
 }
 
-fn spawn_accept(endpoint: quinn::Endpoint, password: String) {
+fn spawn_accept(
+    endpoint: quinn::Endpoint,
+    password: String,
+    auth_delay: Duration,
+    auth_count: Arc<AtomicUsize>,
+    auth_notify: Arc<Notify>,
+) {
     hammer_runtime::spawn::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let password = password.clone();
+            let auth_count = Arc::clone(&auth_count);
+            let auth_notify = Arc::clone(&auth_notify);
             hammer_runtime::spawn::spawn(async move {
                 if let Ok(connection) = incoming.await {
-                    let _ = handle_connection(connection, password).await;
+                    let _ = handle_connection(
+                        connection,
+                        password,
+                        auth_delay,
+                        auth_count,
+                        auth_notify,
+                    )
+                    .await;
                 }
             });
         }
@@ -52,14 +100,30 @@ fn spawn_accept(endpoint: quinn::Endpoint, password: String) {
 async fn handle_connection(
     connection: quinn::Connection,
     password: String,
+    auth_delay: Duration,
+    auth_count: Arc<AtomicUsize>,
+    auth_notify: Arc<Notify>,
 ) -> Result<(), HammerError> {
-    handle_auth(connection.clone(), password).await?;
+    handle_auth(
+        connection.clone(),
+        password,
+        auth_delay,
+        auth_count,
+        auth_notify,
+    )
+    .await?;
     spawn_tcp_echo(connection.clone());
     spawn_udp_echo(connection);
     Ok(())
 }
 
-async fn handle_auth(connection: quinn::Connection, password: String) -> Result<(), HammerError> {
+async fn handle_auth(
+    connection: quinn::Connection,
+    password: String,
+    auth_delay: Duration,
+    auth_count: Arc<AtomicUsize>,
+    auth_notify: Arc<Notify>,
+) -> Result<(), HammerError> {
     let h3_conn = h3_quinn::Connection::new(connection);
     let mut incoming: server::Connection<_, Bytes> = server::Connection::new(h3_conn)
         .await
@@ -73,6 +137,11 @@ async fn handle_auth(connection: quinn::Connection, password: String) -> Result<
         .resolve_request()
         .await
         .map_err(|err| HammerError::internal(format!("resolve auth request: {err}")))?;
+    auth_count.fetch_add(1, Ordering::SeqCst);
+    auth_notify.notify_waiters();
+    if !auth_delay.is_zero() {
+        tokio::time::sleep(auth_delay).await;
+    }
     let auth = protocol::auth_request_from_headers(request.headers());
     let status = if auth.auth == password {
         protocol::STATUS_AUTH_OK

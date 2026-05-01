@@ -113,6 +113,9 @@ impl From<AdapterTunOptions> for HammerTunOptions {
             mtu: value.mtu,
             address: value.address,
             route: value.route,
+            route_exclude: value.route_exclude,
+            auto_route: value.auto_route,
+            strict_route: value.strict_route,
         }
     }
 }

@@ -15,6 +15,9 @@ level = "debug"
 interface_name = "utun"
 address = ["172.19.0.1/30"]
 route_address = ["0.0.0.0/0"]
+route_exclude_address = ["10.0.0.0/8"]
+auto_route = false
+strict_route = true
 mtu = 1400
 stack = "disabled"
 [hysteria2]
@@ -118,6 +121,9 @@ fn service_start_opens_tun_with_configured_options() {
     assert_eq!(options.mtu, 1400);
     assert_eq!(options.address, vec!["172.19.0.1/30"]);
     assert_eq!(options.route, vec!["0.0.0.0/0"]);
+    assert_eq!(options.route_exclude, vec!["10.0.0.0/8"]);
+    assert!(!options.auto_route);
+    assert!(options.strict_route);
 }
 
 #[test]

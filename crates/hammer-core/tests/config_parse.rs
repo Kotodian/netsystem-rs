@@ -517,6 +517,19 @@ fn parse_config_rejects_unknown_route_final() {
 }
 
 #[test]
+fn parse_config_rejects_unknown_user_rule_outbound() {
+    let cfg = format!(
+        "{MINIMAL_CONFIG}\n[[route.rules]]\ndomain_suffix = [\"example.com\"]\noutbound = \"missing\"\n"
+    );
+    let err = config::parse_config(&cfg).expect_err("unknown route rule outbound");
+    assert!(
+        err.to_string()
+            .contains("route.rules outbound references unknown outbound id: missing"),
+        "error = {err:?}"
+    );
+}
+
+#[test]
 fn parse_config_rejects_unknown_dns_final() {
     let cfg = MINIMAL_CONFIG.replace(
         "[dns]\nserver = \"https://1.1.1.1/dns-query\"\n",
@@ -533,6 +546,17 @@ server = "1.1.1.1"
     assert!(
         err.to_string()
             .contains("dns.final references unknown server id: missing"),
+        "error = {err:?}"
+    );
+}
+
+#[test]
+fn parse_config_rejects_unknown_dns_via() {
+    let cfg = MINIMAL_CONFIG.replacen("[dns]\n", "[dns]\nvia = \"missing\"\n", 1);
+    let err = config::parse_config(&cfg).expect_err("unknown dns via");
+    assert!(
+        err.to_string()
+            .contains("dns.server via references unknown outbound id: missing"),
         "error = {err:?}"
     );
 }

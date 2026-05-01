@@ -122,6 +122,12 @@ impl OutboundManager {
         self.register_descriptor_with_protector(option, SocketProtector::default())
     }
 
+    pub fn reset_network(&self) {
+        for outbound in self.list() {
+            outbound.reset();
+        }
+    }
+
     /// Register an already-constructed outbound (e.g. an endpoint that lives
     /// in `EndpointManager`) so the router can resolve its id through the
     /// usual `OutboundManager::get` path. Mirrors sing-box, where every

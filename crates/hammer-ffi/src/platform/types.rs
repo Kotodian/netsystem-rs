@@ -22,6 +22,9 @@ pub struct HammerTunOptions {
     pub mtu: i32,
     pub address: Vec<String>,
     pub route: Vec<String>,
+    pub route_exclude: Vec<String>,
+    pub auto_route: bool,
+    pub strict_route: bool,
 }
 
 #[derive(Debug, Clone)]

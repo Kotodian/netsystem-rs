@@ -20,7 +20,7 @@ mod transport;
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use tracing::{error, info};
 
 use async_trait::async_trait;
 use boringtun::x25519;
@@ -197,6 +197,32 @@ impl WireguardEndpoint {
         }
     }
 
+    /// Restart the actors after an outer network change. Unlike `close`, this
+    /// keeps the endpoint usable and replaces the UDP socket + smoltcp stack.
+    fn restart(&self) {
+        let runtime = {
+            let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+            match std::mem::replace(&mut *inner, EndpointState::Idle) {
+                EndpointState::Running(rt) => Some(rt),
+                EndpointState::Idle => None,
+                EndpointState::Closed => {
+                    *inner = EndpointState::Closed;
+                    None
+                }
+            }
+        };
+        let Some(rt) = runtime else {
+            return;
+        };
+        let _ = rt.transport.shutdown.send(());
+        rt.transport.join.abort();
+        rt.stack.signal_shutdown();
+        rt.stack.abort();
+        if let Err(err) = self.boot() {
+            error!("restart wireguard endpoint {}: {err}", self.id);
+        }
+    }
+
     fn stack_handle(&self) -> Result<Arc<StackHandles>, HammerError> {
         let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         match &*inner {
@@ -243,6 +269,10 @@ impl Outbound for WireguardEndpoint {
 
     fn dependencies(&self) -> &[String] {
         &self.dependencies
+    }
+
+    fn reset(&self) {
+        self.restart();
     }
 
     async fn dial(
@@ -493,6 +523,26 @@ mod tests {
             ep.mtu() as usize + WIREGUARD_OVERHEAD
         );
         assert_eq!(ep.peers()[0].reserved(), [1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_reset_restarts_transport_and_stack() {
+        let priv_key = [12u8; 32];
+        let peer_pub = x25519_public([13u8; 32]);
+        let ep = make_endpoint("wg-reset", priv_key, peer_pub);
+
+        ep.boot().expect("boot endpoint");
+        let before = ep.stack_handle().expect("stack before reset");
+
+        ep.reset();
+
+        let after = ep.stack_handle().expect("stack after reset");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "reset must replace the running WireGuard transport/stack"
+        );
+
+        ep.shutdown();
     }
 
     /// End-to-end tunnel smoke: stand up two `WireguardEndpoint`s configured

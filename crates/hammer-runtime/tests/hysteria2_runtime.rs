@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod support;
 
@@ -17,7 +17,7 @@ use hammer_runtime::OutboundManager;
 use hammer_runtime::hysteria2::bbr::{BbrProfile, CongestionControlHandle, HysteriaBbrConfig};
 use hammer_runtime::hysteria2::{ClientOptions, Hysteria2Client, obfs::Salamander, protocol};
 use support::hysteria2_echo::EchoServer;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -266,6 +266,54 @@ async fn outbound_manager_registers_real_hysteria2_outbound() {
         .await
         .expect("read outbound");
     assert_eq!(payload, b"echo:hello");
+}
+
+#[tokio::test]
+async fn outbound_reset_during_initial_connect_discards_stale_client() {
+    let server = EchoServer::start_with_auth_delay("secret", Duration::from_millis(200))
+        .await
+        .expect("start echo server");
+    let options = options("127.0.0.1".to_owned(), server.port());
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        options.route.final_.clone(),
+        &options.outbounds,
+    )
+    .expect("outbound manager");
+
+    let outbound = manager.get("hysteria2").expect("hysteria2 outbound");
+    let dial_outbound = Arc::clone(&outbound);
+    let destination = SocksAddr {
+        host: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
+        port: 80,
+    };
+    let dial = tokio::spawn(async move {
+        dial_outbound
+            .dial(Network::Tcp, destination, b"after-reset")
+            .await
+    });
+
+    server.wait_for_auth_count(1).await;
+    outbound.reset();
+
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), dial)
+        .await
+        .expect("dial should complete")
+        .expect("dial task")
+        .expect("dial through outbound");
+    stream.shutdown().await.expect("finish outbound request");
+    let mut payload = Vec::new();
+    stream
+        .read_to_end(&mut payload)
+        .await
+        .expect("read outbound");
+
+    assert_eq!(payload, b"echo:after-reset");
+    assert_eq!(
+        server.auth_count(),
+        2,
+        "client created before reset must be discarded and reconnected"
+    );
 }
 
 #[test]

@@ -43,6 +43,9 @@ dictionary HammerTunOptions {
   i32 mtu;
   sequence<string> address;
   sequence<string> route;
+  sequence<string> route_exclude;
+  boolean auto_route;
+  boolean strict_route;
 };
 
 dictionary HammerNetworkInterface {

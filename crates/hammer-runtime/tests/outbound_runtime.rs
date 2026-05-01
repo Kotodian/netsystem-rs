@@ -3,9 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use async_trait::async_trait;
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener, Network, NetworkInterface, OutboundManager as _,
-    PlatformInterface, SocksAddr, TunOptions, WifiState,
+    DefaultInterfaceUpdateListener, Network, NetworkInterface, Outbound as AdapterOutbound,
+    OutboundManager as _, PlatformInterface, ProxyPacketConn, ProxyStream, SocksAddr, TunOptions,
+    WifiState,
 };
 use hammer_core::config::{
     DirectOutboundOptions, Hysteria2OutboundOptions, Outbound, OutboundKind,
@@ -24,6 +26,47 @@ fn destination(addr: std::net::SocketAddr) -> SocksAddr {
     SocksAddr {
         host: addr.ip(),
         port: addr.port(),
+    }
+}
+
+#[derive(Default)]
+struct ResettableOutbound {
+    resets: AtomicUsize,
+}
+
+#[async_trait]
+impl AdapterOutbound for ResettableOutbound {
+    fn type_name(&self) -> &str {
+        "resettable"
+    }
+
+    fn id(&self) -> &str {
+        "resettable"
+    }
+
+    fn networks(&self) -> &[Network] {
+        &[]
+    }
+
+    fn dependencies(&self) -> &[String] {
+        &[]
+    }
+
+    fn reset(&self) {
+        self.resets.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn dial(
+        &self,
+        _network: Network,
+        _destination: SocksAddr,
+        _initial_payload: &[u8],
+    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        Err(HammerError::internal("not implemented"))
+    }
+
+    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        Err(HammerError::internal("not implemented"))
     }
 }
 
@@ -73,6 +116,22 @@ impl PlatformInterface for ProtectPlatform {
     fn read_wifi_state(&self) -> Option<WifiState> {
         None
     }
+}
+
+#[test]
+fn outbound_manager_reset_network_resets_registered_outbounds() {
+    let manager = OutboundManager::new(logger("outbound"), "resettable");
+    let outbound = Arc::new(ResettableOutbound::default());
+    manager
+        .register_outbound(
+            "resettable".to_owned(),
+            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
+        )
+        .expect("register outbound");
+
+    manager.reset_network();
+
+    assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

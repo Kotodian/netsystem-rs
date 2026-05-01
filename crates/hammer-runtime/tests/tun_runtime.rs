@@ -166,6 +166,61 @@ fn sniffers_detect_http_dns_quic_and_stun() {
 }
 
 #[test]
+fn sniff_stream_extracts_tls_sni() {
+    let mut tcp = TunPacket::for_test(Network::Tcp, 443, tls_client_hello("Example.COM"));
+
+    sniff_stream(&mut tcp);
+
+    assert_eq!(tcp.metadata.protocol, "tls");
+    assert_eq!(tcp.metadata.domain.as_deref(), Some("example.com"));
+}
+
+#[test]
+fn tun_stack_does_not_sniff_when_sniff_rule_is_disabled() {
+    let options = config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "hosts"
+
+[route]
+final = "direct"
+
+[[route.rules]]
+protocol = ["dns"]
+outbound = "hysteria2"
+"#,
+    )
+    .expect("parse config");
+    let router = router_from_options(&options);
+    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [1, 1, 1, 1],
+        5353,
+        53,
+        dns_query("example.com"),
+    );
+
+    let flow = stack.handle_packet(&packet).expect("handle packet");
+
+    assert_eq!(flow.metadata.protocol, "");
+    assert_eq!(
+        flow.decision,
+        RouteDecision::Route {
+            outbound: "direct".to_owned()
+        }
+    );
+}
+
+#[test]
 fn smoltcp_stack_facade_routes_packets_through_router() {
     let options = options();
     let router = router_from_options(&options);
@@ -313,6 +368,52 @@ fn system_stack_rewrites_tcp_packets_to_local_listener_and_back() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))
     );
     assert_eq!(reverse.destination.port, 49152);
+}
+
+#[test]
+fn system_tcp_nat_refreshes_forward_flow_activity() {
+    let mut nat = SystemTcpNat::new_with_timeout(std::time::Duration::from_millis(100));
+    let mut first = ipv4_tcp_packet([10, 0, 0, 2], [93, 184, 216, 34], 49152, 443, b"");
+
+    process_system_tcp_packet(
+        &mut first,
+        &mut nat,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+        23456,
+    )
+    .expect("rewrite first packet");
+    let first_port = parse_ip_packet(&first).expect("parse first").source.port;
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let mut second = ipv4_tcp_packet([10, 0, 0, 2], [93, 184, 216, 34], 49152, 443, b"");
+    process_system_tcp_packet(
+        &mut second,
+        &mut nat,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+        23456,
+    )
+    .expect("rewrite second packet");
+    let second_port = parse_ip_packet(&second).expect("parse second").source.port;
+
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    let mut third = ipv4_tcp_packet([10, 0, 0, 2], [93, 184, 216, 34], 49152, 443, b"");
+    process_system_tcp_packet(
+        &mut third,
+        &mut nat,
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(172, 19, 0, 2)),
+        23456,
+    )
+    .expect("rewrite third packet");
+    let third_port = parse_ip_packet(&third).expect("parse third").source.port;
+
+    assert_eq!(first_port, second_port);
+    assert_eq!(
+        second_port, third_port,
+        "forward traffic should keep NAT session alive"
+    );
 }
 
 #[test]
@@ -486,6 +587,47 @@ fn dns_query(name: &str) -> Vec<u8> {
     }
     packet.extend_from_slice(&[0, 0, 1, 0, 1]);
     packet
+}
+
+fn tls_client_hello(server_name: &str) -> Vec<u8> {
+    let name = server_name.as_bytes();
+    let mut sni = Vec::new();
+    sni.extend_from_slice(&((1 + 2 + name.len()) as u16).to_be_bytes());
+    sni.push(0);
+    sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    sni.extend_from_slice(name);
+
+    let mut extensions = Vec::new();
+    extensions.extend_from_slice(&0u16.to_be_bytes());
+    extensions.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(&sni);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1);
+    body.push(0);
+    body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+    body.extend_from_slice(&extensions);
+
+    let mut handshake = Vec::new();
+    handshake.push(1);
+    handshake.extend_from_slice(&[
+        ((body.len() >> 16) & 0xff) as u8,
+        ((body.len() >> 8) & 0xff) as u8,
+        (body.len() & 0xff) as u8,
+    ]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.push(22);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+    record
 }
 
 fn quic_initial() -> Vec<u8> {

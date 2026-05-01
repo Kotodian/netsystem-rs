@@ -15,12 +15,15 @@
 //! The smoltcp actor owns the inner IP stack; this actor only moves encrypted
 //! UDP frames between peers and the stack-facing queues.
 
+use std::future;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use boringtun::noise::TunnResult;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -65,6 +68,32 @@ pub(crate) struct TransportHandles {
     pub(crate) join: JoinHandle<()>,
 }
 
+struct TransportSockets {
+    ipv4: Option<Arc<UdpSocket>>,
+    ipv6: Option<Arc<UdpSocket>>,
+}
+
+impl TransportSockets {
+    fn local_addr(&self) -> Result<SocketAddr, HammerError> {
+        let socket = self
+            .ipv4
+            .as_deref()
+            .or(self.ipv6.as_deref())
+            .ok_or_else(|| HammerError::internal("wireguard transport has no UDP socket"))?;
+        socket
+            .local_addr()
+            .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))
+    }
+
+    fn send_socket(&self, destination: SocketAddr) -> Option<&UdpSocket> {
+        if destination.is_ipv4() {
+            self.ipv4.as_deref()
+        } else {
+            self.ipv6.as_deref()
+        }
+    }
+}
+
 impl TransportHandles {
     /// Send the cancellation signal and await the actor finishing.
     #[allow(dead_code)]
@@ -87,18 +116,8 @@ pub(crate) fn spawn_transport(
     mtu: u32,
     protector: SocketProtector,
 ) -> Result<TransportHandles, HammerError> {
-    let bind = bind_addr_for_peers(&peers, listen_port);
-    let std_socket = std::net::UdpSocket::bind(bind)
-        .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
-    std_socket
-        .set_nonblocking(true)
-        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
-    let socket = UdpSocket::from_std(std_socket)
-        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
-    protector.protect(&socket)?;
-    let local_addr = socket
-        .local_addr()
-        .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))?;
+    let sockets = bind_transport_sockets(&peers, listen_port, &protector)?;
+    let local_addr = sockets.local_addr()?;
     info!("wireguard transport listening on {local_addr}");
 
     let (encrypt_tx, encrypt_rx) = mpsc::channel::<Vec<u8>>(ENCRYPT_QUEUE);
@@ -106,7 +125,7 @@ pub(crate) fn spawn_transport(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let join = crate::spawn::spawn(run_actor(
-        Arc::new(socket),
+        sockets,
         peers,
         mtu,
         encrypt_rx,
@@ -123,20 +142,104 @@ pub(crate) fn spawn_transport(
     })
 }
 
-fn bind_addr_for_peers(peers: &[Peer], listen_port: u16) -> SocketAddr {
+fn bind_transport_sockets(
+    peers: &[Peer],
+    listen_port: u16,
+    protector: &SocketProtector,
+) -> Result<TransportSockets, HammerError> {
+    let needs_ipv4 = peers.iter().any(|peer| peer.endpoint().is_ipv4());
     let needs_ipv6 = peers.iter().any(|peer| peer.endpoint().is_ipv6());
-    if needs_ipv6 {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port)
+    let needs_ipv4 = needs_ipv4 || !needs_ipv6;
+
+    let mut ipv6 = if needs_ipv6 {
+        Some(bind_udp_socket(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), listen_port),
+            true,
+            protector,
+        )?)
     } else {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port)
+        None
+    };
+    let ipv4_port = if listen_port == 0 && needs_ipv4 && needs_ipv6 {
+        ipv6.as_ref()
+            .expect("ipv6 socket just bound")
+            .local_addr()
+            .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))?
+            .port()
+    } else {
+        listen_port
+    };
+    let ipv4 = if needs_ipv4 {
+        Some(bind_udp_socket(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ipv4_port),
+            false,
+            protector,
+        )?)
+    } else {
+        None
+    };
+
+    // Prefer the IPv4 socket as the public handle when both exist; it proves
+    // IPv4 peers are not accidentally routed through an IPv6-only socket.
+    Ok(TransportSockets {
+        ipv4,
+        ipv6: ipv6.take(),
+    })
+}
+
+fn bind_udp_socket(
+    bind: SocketAddr,
+    ipv6_only: bool,
+    protector: &SocketProtector,
+) -> Result<Arc<UdpSocket>, HammerError> {
+    if bind.is_ipv4() {
+        return std_udp_socket(bind, protector);
     }
+    let domain = if bind.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|err| HammerError::internal(format!("wireguard udp socket {bind}: {err}")))?;
+    if bind.is_ipv6() {
+        socket
+            .set_only_v6(ipv6_only)
+            .map_err(|err| HammerError::internal(format!("wireguard udp set_only_v6: {err}")))?;
+    }
+    socket
+        .bind(&bind.into())
+        .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    std_socket
+        .set_nonblocking(true)
+        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
+    let socket = UdpSocket::from_std(std_socket)
+        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
+    protector.protect(&socket)?;
+    Ok(Arc::new(socket))
+}
+
+fn std_udp_socket(
+    bind: SocketAddr,
+    protector: &SocketProtector,
+) -> Result<Arc<UdpSocket>, HammerError> {
+    let socket = std::net::UdpSocket::bind(bind)
+        .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
+    let socket = UdpSocket::from_std(socket)
+        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
+    protector.protect(&socket)?;
+    Ok(Arc::new(socket))
 }
 
 /// The actor body. Each branch is a single `select!` arm to keep the loop
 /// fairly easy to reason about; backpressure on either mpsc is handled by
 /// dropping packets after a warn-log because wg is best-effort at L3 anyway.
 async fn run_actor(
-    socket: Arc<UdpSocket>,
+    sockets: TransportSockets,
     peers: Arc<Vec<Peer>>,
     mtu: u32,
     mut encrypt_rx: mpsc::Receiver<Vec<u8>>,
@@ -145,7 +248,8 @@ async fn run_actor(
 ) {
     // 65535 is the IPv4 datagram ceiling; boringtun's WG frames cap out at
     // mtu + 32, so this is generous.
-    let mut udp_buf = vec![0u8; 65_535];
+    let mut udp_buf_v4 = vec![0u8; 65_535];
+    let mut udp_buf_v6 = vec![0u8; 65_535];
     // Boringtun writes encapsulate / decapsulate output into this buffer and
     // returns a slice into it; we send that slice and reuse the buffer for
     // the next packet. Allocated once per actor.
@@ -162,14 +266,32 @@ async fn run_actor(
                 debug!("wireguard transport: shutdown");
                 break;
             }
-            res = socket.recv_from(&mut udp_buf) => {
+            res = recv_from_optional(sockets.ipv4.as_deref(), &mut udp_buf_v4), if sockets.ipv4.is_some() => {
                 match res {
                     Ok((n, src)) => {
                         handle_inbound(
-                            &socket,
+                            &sockets,
                             &peers,
                             src,
-                            &mut udp_buf[..n],
+                            &mut udp_buf_v4[..n],
+                            &mut scratch,
+                            &inbound_tx,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        warn!("wireguard udp recv: {err}");
+                    }
+                }
+            }
+            res = recv_from_optional(sockets.ipv6.as_deref(), &mut udp_buf_v6), if sockets.ipv6.is_some() => {
+                match res {
+                    Ok((n, src)) => {
+                        handle_inbound(
+                            &sockets,
+                            &peers,
+                            src,
+                            &mut udp_buf_v6[..n],
                             &mut scratch,
                             &inbound_tx,
                         )
@@ -185,17 +307,27 @@ async fn run_actor(
                     debug!("wireguard transport: encrypt_rx closed");
                     break;
                 };
-                handle_outbound(&socket, &peers, &packet, &mut scratch).await;
+                handle_outbound(&sockets, &peers, &packet, &mut scratch).await;
             }
             _ = timer.tick() => {
-                tick_timers(&socket, &peers, &mut scratch).await;
+                tick_timers(&sockets, &peers, &mut scratch).await;
             }
         }
     }
 }
 
+async fn recv_from_optional(
+    socket: Option<&UdpSocket>,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(socket) => socket.recv_from(buf).await,
+        None => future::pending().await,
+    }
+}
+
 async fn handle_inbound(
-    socket: &UdpSocket,
+    sockets: &TransportSockets,
     peers: &[Peer],
     src: SocketAddr,
     datagram: &mut [u8],
@@ -222,7 +354,7 @@ async fn handle_inbound(
 
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
     let action = step_decapsulate(peer, Some(src.ip()), datagram, scratch);
-    dispatch_action(socket, peer, action, scratch, inbound_tx).await;
+    dispatch_action(sockets, peer, action, scratch, inbound_tx).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
@@ -232,7 +364,7 @@ async fn handle_inbound(
         if matches!(action, DecapAction::Idle) {
             break;
         }
-        dispatch_action(socket, peer, action, scratch, inbound_tx).await;
+        dispatch_action(sockets, peer, action, scratch, inbound_tx).await;
     }
 }
 
@@ -252,7 +384,7 @@ enum DecapAction {
 }
 
 async fn dispatch_action(
-    socket: &UdpSocket,
+    sockets: &TransportSockets,
     peer: &Peer,
     action: DecapAction,
     scratch: &mut [u8],
@@ -262,6 +394,10 @@ async fn dispatch_action(
         DecapAction::Idle => {}
         DecapAction::SendNetwork { len, dst } => {
             stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
+            let Some(socket) = sockets.send_socket(dst) else {
+                warn!("wireguard udp has no socket for {dst}");
+                return;
+            };
             if let Err(err) = socket.send_to(&scratch[..len], dst).await {
                 warn!("wireguard udp send_to {dst}: {err}");
             }
@@ -305,7 +441,12 @@ fn step_decapsulate(
     }
 }
 
-async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], ip_packet: &[u8], scratch: &mut [u8]) {
+async fn handle_outbound(
+    sockets: &TransportSockets,
+    peers: &[Peer],
+    ip_packet: &[u8],
+    scratch: &mut [u8],
+) {
     let Some(dst_ip) = first_hop_destination(ip_packet) else {
         warn!("wireguard outbound: malformed IP packet, dropping");
         return;
@@ -333,12 +474,16 @@ async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], ip_packet: &[u8], s
     let Some(len) = len else { return };
     stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
     let dst = peer.endpoint();
+    let Some(socket) = sockets.send_socket(dst) else {
+        warn!("wireguard udp has no socket for {dst}");
+        return;
+    };
     if let Err(err) = socket.send_to(&scratch[..len], dst).await {
         warn!("wireguard udp send_to {dst}: {err}");
     }
 }
 
-async fn tick_timers(socket: &UdpSocket, peers: &[Peer], scratch: &mut [u8]) {
+async fn tick_timers(sockets: &TransportSockets, peers: &[Peer], scratch: &mut [u8]) {
     for peer in peers {
         let len = {
             let mut tunn = peer.lock_tunn();
@@ -350,6 +495,10 @@ async fn tick_timers(socket: &UdpSocket, peers: &[Peer], scratch: &mut [u8]) {
         if let Some(len) = len {
             stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
             let dst = peer.endpoint();
+            let Some(socket) = sockets.send_socket(dst) else {
+                warn!("wireguard udp has no socket for {dst}");
+                continue;
+            };
             if let Err(err) = socket.send_to(&scratch[..len], dst).await {
                 warn!("wireguard timer send {dst}: {err}");
             }
@@ -523,6 +672,42 @@ mod tests {
         assert!(
             handles.local_addr.is_ipv6(),
             "IPv6 peer endpoints need an IPv6 UDP socket, got {}",
+            handles.local_addr
+        );
+
+        let _ = handles.shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_keeps_ipv4_socket_available_for_mixed_peer_endpoints() {
+        let local_priv = [99u8; 32];
+        let v4_pub = x25519_public([100u8; 32]);
+        let v6_pub = x25519_public([101u8; 32]);
+        let v4_peer = make_peer(
+            v4_pub,
+            local_priv,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
+            0,
+        );
+        let v6_peer = make_peer(
+            v6_pub,
+            local_priv,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51821),
+            1,
+        );
+
+        let handles = spawn_transport(
+            logger("transport-mixed"),
+            Arc::new(vec![v4_peer, v6_peer]),
+            0,
+            1408,
+            SocketProtector::default(),
+        )
+        .expect("spawn mixed transport");
+
+        assert!(
+            handles.local_addr.is_ipv4(),
+            "mixed peers must keep an IPv4 UDP socket for IPv4 endpoints, got {}",
             handles.local_addr
         );
 

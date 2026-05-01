@@ -406,7 +406,7 @@ impl Controller for BrutalController {
     fn initial_window(&self) -> u64 {
         // Mirrors the previous shared helper: 10 * MTU, clamped to a
         // minimum window of 14720 bytes, never below 2 * MTU.
-        (10 * self.mtu).min((2 * self.mtu).max(14_720))
+        (10 * self.mtu).max((2 * self.mtu).max(14_720))
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -467,5 +467,12 @@ mod tests {
 
         controller.record_packets(start + Duration::from_secs(6), 50, 0);
         assert_eq!(controller.ack_rate_milli, 1000);
+    }
+
+    #[test]
+    fn brutal_controller_initial_window_respects_minimum_window() {
+        let controller = BrutalController::new(1200, false);
+
+        assert_eq!(controller.initial_window(), 14_720);
     }
 }

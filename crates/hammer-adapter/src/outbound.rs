@@ -34,6 +34,7 @@ pub trait Outbound: Send + Sync + 'static {
     fn id(&self) -> &str;
     fn networks(&self) -> &[Network];
     fn dependencies(&self) -> &[String];
+    fn reset(&self) {}
 
     async fn dial(
         &self,

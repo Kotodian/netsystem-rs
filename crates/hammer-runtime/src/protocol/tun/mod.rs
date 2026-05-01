@@ -182,6 +182,14 @@ impl TunInbound {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            route_exclude: self
+                .options
+                .route_exclude_address
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            auto_route: self.options.auto_route,
+            strict_route: self.options.strict_route,
         })
     }
 }

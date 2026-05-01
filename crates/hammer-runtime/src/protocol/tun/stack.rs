@@ -278,6 +278,9 @@ impl SystemTcpNat {
         self.cleanup_expired();
         let key = (source.host, source.port, destination.host, destination.port);
         if let Some(port) = self.by_flow.get(&key) {
+            if let Some(session) = self.by_port.get_mut(port) {
+                session.last_active = StdInstant::now();
+            }
             return *port;
         }
         let port = self.next_port;
@@ -895,9 +898,11 @@ impl SmoltcpTunStack {
             },
             payload: parsed.payload,
         };
-        match tun_packet.metadata.network {
-            Network::Tcp => sniff_stream(&mut tun_packet),
-            Network::Udp => sniff_packet(&mut tun_packet),
+        if self.router.should_sniff(&tun_packet.metadata) {
+            match tun_packet.metadata.network {
+                Network::Tcp => sniff_stream(&mut tun_packet),
+                Network::Udp => sniff_packet(&mut tun_packet),
+            }
         }
         Ok(tun_packet)
     }
@@ -1489,6 +1494,28 @@ async fn accept_tcp_loop(
                 destination: Some(session.destination.clone()),
                 ..Default::default()
             };
+            let mut initial_payload = Vec::new();
+            if let Some(sniff_timeout) = router.sniff_timeout(&metadata) {
+                let mut buf = [0_u8; 4096];
+                match timeout(sniff_timeout, inbound.read(&mut buf)).await {
+                    Ok(Ok(0)) => return,
+                    Ok(Ok(n)) => {
+                        initial_payload.extend_from_slice(&buf[..n]);
+                        let mut packet = TunPacket {
+                            metadata,
+                            payload: initial_payload,
+                        };
+                        sniff_stream(&mut packet);
+                        metadata = packet.metadata;
+                        initial_payload = packet.payload;
+                    }
+                    Ok(Err(err)) => {
+                        debug!("read TCP sniff payload: {err}");
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
             let decision = match router.match_route(&mut metadata) {
                 Ok(decision) => decision,
                 Err(err) => {
@@ -1508,7 +1535,7 @@ async fn accept_tcp_loop(
                 return;
             };
             let mut outbound_stream = match outbound
-                .dial(Network::Tcp, session.destination.clone(), &[])
+                .dial(Network::Tcp, session.destination.clone(), &initial_payload)
                 .await
             {
                 Ok(stream) => stream,
@@ -1660,7 +1687,9 @@ async fn handle_system_udp_packet(
         },
         payload: parsed.payload.clone(),
     };
-    sniff_packet(&mut tun_packet);
+    if router.should_sniff(&tun_packet.metadata) {
+        sniff_packet(&mut tun_packet);
+    }
     match router.match_route(&mut tun_packet.metadata)? {
         RouteDecision::HijackDns => {
             let message = <Message as MessageExt>::from_bytes(&tun_packet.payload)?;
@@ -1913,6 +1942,72 @@ fn sniff_stun(packet: &mut TunPacket) {
     }
 }
 
-fn parse_tls_sni(_payload: &[u8]) -> Option<String> {
+fn parse_tls_sni(payload: &[u8]) -> Option<String> {
+    if payload.len() < 5 || payload[0] != 22 {
+        return None;
+    }
+    let record_len = read_u16(payload, 3) as usize;
+    let record = payload.get(5..5 + record_len)?;
+    if record.len() < 4 || record[0] != 1 {
+        return None;
+    }
+    let handshake_len =
+        ((record[1] as usize) << 16) | ((record[2] as usize) << 8) | record[3] as usize;
+    let body = record.get(4..4 + handshake_len)?;
+
+    let mut pos = 0;
+    read_tls_bytes(body, &mut pos, 2)?; // legacy_version
+    read_tls_bytes(body, &mut pos, 32)?; // random
+    let session_id_len = *body.get(pos)? as usize;
+    pos += 1;
+    read_tls_bytes(body, &mut pos, session_id_len)?;
+    let cipher_suites_len = read_tls_u16(body, &mut pos)? as usize;
+    read_tls_bytes(body, &mut pos, cipher_suites_len)?;
+    let compression_methods_len = *body.get(pos)? as usize;
+    pos += 1;
+    read_tls_bytes(body, &mut pos, compression_methods_len)?;
+    let extensions_len = read_tls_u16(body, &mut pos)? as usize;
+    let extensions = read_tls_bytes(body, &mut pos, extensions_len)?;
+
+    let mut ext_pos = 0;
+    while ext_pos < extensions.len() {
+        let extension_type = read_tls_u16(extensions, &mut ext_pos)?;
+        let extension_len = read_tls_u16(extensions, &mut ext_pos)? as usize;
+        let extension = read_tls_bytes(extensions, &mut ext_pos, extension_len)?;
+        if extension_type == 0 {
+            return parse_tls_server_name_extension(extension);
+        }
+    }
     None
+}
+
+fn parse_tls_server_name_extension(extension: &[u8]) -> Option<String> {
+    let mut pos = 0;
+    let list_len = read_tls_u16(extension, &mut pos)? as usize;
+    let list = read_tls_bytes(extension, &mut pos, list_len)?;
+    let mut list_pos = 0;
+    while list_pos < list.len() {
+        let name_type = *list.get(list_pos)?;
+        list_pos += 1;
+        let name_len = read_tls_u16(list, &mut list_pos)? as usize;
+        let name = read_tls_bytes(list, &mut list_pos, name_len)?;
+        if name_type == 0 && !name.is_empty() {
+            return std::str::from_utf8(name)
+                .ok()
+                .map(|name| name.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn read_tls_u16(data: &[u8], pos: &mut usize) -> Option<u16> {
+    let bytes = read_tls_bytes(data, pos, 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_tls_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+    let end = pos.checked_add(len)?;
+    let out = data.get(*pos..end)?;
+    *pos = end;
+    Some(out)
 }

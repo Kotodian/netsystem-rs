@@ -52,7 +52,13 @@ dns-local = []
 endpoint = ["hammer-core/endpoint"]
 # Enables the WireGuard endpoint module. Pulls in the matching feature in
 # hammer-core. Off by default to keep the iOS xcframework slim.
-wireguard = ["endpoint", "hammer-core/wireguard", "dep:boringtun", "dep:smoltcp"]
+wireguard = [
+    "endpoint",
+    "hammer-core/wireguard",
+    "dep:boringtun",
+    "dep:smoltcp",
+    "dep:socket2",
+]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
@@ -78,6 +84,7 @@ rand = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 smoltcp = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
 tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
 libc = { workspace = true, optional = true }

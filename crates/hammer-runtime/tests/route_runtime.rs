@@ -6,7 +6,7 @@ use std::time::Instant;
 use hammer_adapter::{
     ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata, SocksAddr,
 };
-use hammer_core::config::{self, DomainStrategy, Options};
+use hammer_core::config::{self, DomainStrategy, Options, RuleActionKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
@@ -225,9 +225,20 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
 
 #[test]
 fn router_rejects_unknown_outbound_at_construction() {
-    let opts = options_with_user_rules(
-        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"typo\"\n",
+    let mut opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"direct\"\n",
     );
+    let RuleActionKind::Route(action) = &mut opts
+        .route
+        .rules
+        .last_mut()
+        .expect("user route rule")
+        .default_options
+        .action
+    else {
+        panic!("last rule should be a route action");
+    };
+    action.outbound = "typo".to_owned();
     let outbound = Arc::new(
         OutboundManager::from_options(
             logger("outbound"),

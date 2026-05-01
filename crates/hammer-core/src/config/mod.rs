@@ -293,6 +293,17 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             .chain(endpoints.iter().map(|item| item.id.as_str())),
     )?;
 
+    #[cfg(feature = "endpoint")]
+    validate_route_rule_outbounds(
+        &rules,
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+    #[cfg(not(feature = "endpoint"))]
+    validate_route_rule_outbounds(&rules, outbounds.iter().map(|item| item.id.as_str()))?;
+
     let route_final = if raw_route.final_.is_empty() {
         default_route_final
     } else {
@@ -327,6 +338,19 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         &dns_options.final_,
         dns_options.servers.iter().map(|item| item.id.as_str()),
     )?;
+    #[cfg(feature = "endpoint")]
+    validate_dns_server_via(
+        &dns_options.servers,
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+    #[cfg(not(feature = "endpoint"))]
+    validate_dns_server_via(
+        &dns_options.servers,
+        outbounds.iter().map(|item| item.id.as_str()),
+    )?;
     let route_options = route::RouteOptions {
         final_: route_final,
         auto_detect_interface: auto_detect,
@@ -345,6 +369,43 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         endpoints,
         route: route_options,
     })
+}
+
+fn validate_route_rule_outbounds<'a>(
+    rules: &[route::Rule],
+    known: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
+    let known = known.into_iter().collect::<HashSet<_>>();
+    for rule in rules {
+        let route::RuleActionKind::Route(action) = &rule.default_options.action else {
+            continue;
+        };
+        if known.contains(action.outbound.as_str()) {
+            continue;
+        }
+        return Err(HammerError::config_validation(format!(
+            "route.rules outbound references unknown outbound id: {}",
+            action.outbound
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dns_server_via<'a>(
+    servers: &[dns::DnsServer],
+    known: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
+    let known = known.into_iter().collect::<HashSet<_>>();
+    for server in servers {
+        let via = server.via();
+        if via.is_empty() || known.contains(via) {
+            continue;
+        }
+        return Err(HammerError::config_validation(format!(
+            "dns.server via references unknown outbound id: {via}"
+        )));
+    }
+    Ok(())
 }
 
 fn default_outbound_id(outbounds: &[outbound::Outbound]) -> Result<String, HammerError> {

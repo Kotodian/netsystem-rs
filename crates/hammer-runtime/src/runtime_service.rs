@@ -37,6 +37,8 @@ struct ServiceInner {
     lifecycles: Vec<Arc<dyn Lifecycle>>,
     pause: Arc<PauseManager>,
     network: Arc<NetworkManager>,
+    dns_router: Arc<DnsRouter>,
+    outbound: Arc<OutboundManager>,
     _runtime: tokio::runtime::Runtime,
     _options: Options,
 }
@@ -151,8 +153,8 @@ impl RuntimeService {
         lifecycles.extend([
             Arc::clone(&network) as Arc<dyn Lifecycle>,
             dns_transport as Arc<dyn Lifecycle>,
-            outbound as Arc<dyn Lifecycle>,
-            dns_router as Arc<dyn Lifecycle>,
+            Arc::clone(&outbound) as Arc<dyn Lifecycle>,
+            Arc::clone(&dns_router) as Arc<dyn Lifecycle>,
             router as Arc<dyn Lifecycle>,
             inbound as Arc<dyn Lifecycle>,
             service_mgr as Arc<dyn Lifecycle>,
@@ -174,6 +176,8 @@ impl RuntimeService {
                 lifecycles,
                 pause,
                 network,
+                dns_router,
+                outbound,
                 _runtime: runtime,
                 _options: options,
             }),
@@ -250,7 +254,11 @@ impl RuntimeService {
     }
 
     pub fn reset_network(&self) {
-        self.with_inner(|inner| inner.network.reset_network());
+        self.with_inner(|inner| {
+            inner.network.reset_network();
+            inner.dns_router.reset_network();
+            inner.outbound.reset_network();
+        });
     }
 
     pub fn need_wifi_state(&self) -> bool {

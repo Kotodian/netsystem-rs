@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tracing::{debug, error};
@@ -26,7 +26,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, OnceCell, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 pub mod bbr;
 pub mod obfs;
@@ -147,6 +147,10 @@ impl Hysteria2Client {
             rx,
         })
     }
+
+    pub fn close(&self, reason: &'static [u8]) {
+        self.connection.close(0u32.into(), reason);
+    }
 }
 
 pub struct Hysteria2Stream {
@@ -258,7 +262,9 @@ pub struct Hysteria2Outbound {
     options: Hysteria2OutboundOptions,
     networks: Vec<Network>,
     dependencies: Vec<String>,
-    client: OnceCell<Arc<Hysteria2Client>>,
+    client: StdMutex<Option<Arc<Hysteria2Client>>>,
+    client_init: Mutex<()>,
+    client_epoch: AtomicU64,
     protector: SocketProtector,
 }
 
@@ -280,19 +286,47 @@ impl Hysteria2Outbound {
             options,
             networks,
             dependencies: Vec::new(),
-            client: OnceCell::new(),
+            client: StdMutex::new(None),
+            client_init: Mutex::new(()),
+            client_epoch: AtomicU64::new(0),
             protector,
         }
     }
 
     async fn client(&self) -> Result<Arc<Hysteria2Client>, HammerError> {
-        self.client
-            .get_or_try_init(|| async {
-                let options = self.client_options()?;
-                Hysteria2Client::connect(options, self.logger.clone()).await
-            })
-            .await
-            .map(Arc::clone)
+        if let Some(client) = self
+            .client
+            .lock()
+            .expect("Hysteria2Outbound client poisoned")
+            .clone()
+        {
+            return Ok(client);
+        }
+        loop {
+            let _guard = self.client_init.lock().await;
+            if let Some(client) = self
+                .client
+                .lock()
+                .expect("Hysteria2Outbound client poisoned")
+                .clone()
+            {
+                return Ok(client);
+            }
+            let epoch = self.client_epoch.load(Ordering::SeqCst);
+            let options = self.client_options()?;
+            let client = Hysteria2Client::connect(options, self.logger.clone()).await?;
+            let mut cached = self
+                .client
+                .lock()
+                .expect("Hysteria2Outbound client poisoned");
+            if self.client_epoch.load(Ordering::SeqCst) != epoch {
+                drop(cached);
+                client.close(b"network reset during connect");
+                continue;
+            }
+            *cached = Some(Arc::clone(&client));
+            return Ok(client);
+        }
     }
 
     fn client_options(&self) -> Result<ClientOptions, HammerError> {
@@ -352,6 +386,18 @@ impl Outbound for Hysteria2Outbound {
 
     fn dependencies(&self) -> &[String] {
         &self.dependencies
+    }
+
+    fn reset(&self) {
+        self.client_epoch.fetch_add(1, Ordering::SeqCst);
+        let client = self
+            .client
+            .lock()
+            .expect("Hysteria2Outbound client poisoned")
+            .take();
+        if let Some(client) = client {
+            client.close(b"network reset");
+        }
     }
 
     async fn dial(
@@ -469,13 +515,15 @@ async fn handle_datagram(client: &Hysteria2Client, data: Bytes) -> Result<(), Ha
             .get(&message.session_id)
             .cloned()
     };
-    if let Some(sender) = sender {
-        let _ = sender
-            .send(ProxyDatagram {
+    if let Some(sender) = sender
+        && sender
+            .try_send(ProxyDatagram {
                 destination,
                 payload: message.payload,
             })
-            .await;
+            .is_err()
+    {
+        debug!("drop hysteria2 UDP datagram for busy session");
     }
     Ok(())
 }

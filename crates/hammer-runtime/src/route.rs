@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use hammer_adapter::{
     Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata,
@@ -11,6 +12,8 @@ use ipnet::IpNet;
 
 use crate::OutboundManager;
 use crate::impl_logging_lifecycle;
+
+const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// `route.Router` — matches each connection against the configured rule set and
 /// returns a [`RouteDecision`]. Each rule has exactly one matcher; values inside
@@ -76,6 +79,22 @@ impl Router {
             }
         }
         self.route_to_default(metadata.network)
+    }
+
+    pub fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        self.rules.iter().find_map(|rule| {
+            if !rule.matches(metadata) {
+                return None;
+            }
+            let RuleActionKind::Sniff(options) = &rule.action else {
+                return None;
+            };
+            Some(options.timeout.unwrap_or(DEFAULT_SNIFF_TIMEOUT))
+        })
+    }
+
+    pub fn should_sniff(&self, metadata: &RouteMetadata) -> bool {
+        self.sniff_timeout(metadata).is_some()
     }
 
     fn route_to_default(&self, network: Network) -> Result<RouteDecision, HammerError> {

@@ -1040,6 +1040,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "smoltcp",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",
