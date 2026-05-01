@@ -284,12 +284,37 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     let endpoints = endpoint::build_endpoints(raw_endpoints)?;
     #[cfg(feature = "endpoint")]
     validate_unique_ids("endpoints", endpoints.iter().map(|item| item.id.as_str()))?;
+    #[cfg(feature = "endpoint")]
+    validate_unique_ids(
+        "outbound/endpoint",
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
 
     let route_final = if raw_route.final_.is_empty() {
         default_route_final
     } else {
         raw_route.final_.clone()
     };
+    #[cfg(feature = "endpoint")]
+    validate_known_id_kind(
+        "route.final",
+        &route_final,
+        "outbound id",
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+    #[cfg(not(feature = "endpoint"))]
+    validate_known_id_kind(
+        "route.final",
+        &route_final,
+        "outbound id",
+        outbounds.iter().map(|item| item.id.as_str()),
+    )?;
     let auto_detect = raw_route.auto_detect_interface.unwrap_or(true);
 
     let dns_options = dns::build_dns_options(&raw_dns, constants::DEFAULT_DIRECT_ID)?;
@@ -351,11 +376,20 @@ fn validate_known_id<'a>(
     id: &str,
     known: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), HammerError> {
+    validate_known_id_kind(field, id, "server id", known)
+}
+
+fn validate_known_id_kind<'a>(
+    field: &str,
+    id: &str,
+    kind: &str,
+    known: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
     if known.into_iter().any(|candidate| candidate == id) {
         return Ok(());
     }
     Err(HammerError::config_validation(format!(
-        "{field} references unknown server id: {id}"
+        "{field} references unknown {kind}: {id}"
     )))
 }
 

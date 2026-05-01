@@ -125,6 +125,81 @@ impl Lifecycle for CountingTransport {
     }
 }
 
+#[derive(Debug)]
+struct IndexedTransport {
+    calls: AtomicUsize,
+    ttl: u32,
+}
+
+impl IndexedTransport {
+    fn new(ttl: u32) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            ttl,
+        }
+    }
+}
+
+impl Lifecycle for IndexedTransport {
+    fn name(&self) -> &str {
+        "indexed"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DnsTransport for IndexedTransport {
+    fn type_name(&self) -> &str {
+        "mock"
+    }
+
+    fn id(&self) -> &str {
+        "indexed"
+    }
+
+    fn dependencies(&self) -> &[String] {
+        &[]
+    }
+
+    fn reset(&self) {}
+
+    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let index = index_from_query(&message);
+        Ok(response_for(&message, self.ttl, indexed_addr(index)))
+    }
+}
+
+fn index_from_query(message: &Message) -> usize {
+    let name = message.queries[0].name().to_ascii();
+    let label = name
+        .split('.')
+        .next()
+        .expect("test query must have a first label");
+    label
+        .rsplit_once('-')
+        .expect("test query label must end with an index")
+        .1
+        .parse()
+        .expect("test query index must be numeric")
+}
+
+fn indexed_addr(index: usize) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(
+        10,
+        ((index >> 16) & 0xff) as u8,
+        ((index >> 8) & 0xff) as u8,
+        (index & 0xff) as u8,
+    ))
+}
+
 #[async_trait]
 impl DnsTransport for CountingTransport {
     fn type_name(&self) -> &str {
@@ -227,7 +302,45 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dns_client_bounds_cache_and_evicts_least_recently_used_entry() {
+async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
+    let transport = Arc::new(CountingTransport::new(
+        60,
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12)),
+    ));
+    let client = DnsClient::new(logger("dns"));
+    let base_options = DnsQueryOptions {
+        lookup_strategy: DomainStrategy::Ipv4Only,
+        ..DnsQueryOptions::default()
+    };
+
+    let first = client
+        .exchange(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            query("rewrite-hit.test", RecordType::A),
+            base_options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.answers[0].ttl, 60);
+
+    let cached = client
+        .exchange(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            query("rewrite-hit.test", RecordType::A),
+            DnsQueryOptions {
+                rewrite_ttl: Some(5),
+                ..base_options
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(cached.answers[0].ttl, 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
     let transport = Arc::new(CountingTransport::new(
         60,
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
@@ -238,7 +351,7 @@ async fn dns_client_bounds_cache_and_evicts_least_recently_used_entry() {
         ..DnsQueryOptions::default()
     };
 
-    for index in 0..1025 {
+    for index in 0..1024 {
         let domain = format!("bounded-{index}.test");
         let _ = client
             .lookup(
@@ -249,18 +362,46 @@ async fn dns_client_bounds_cache_and_evicts_least_recently_used_entry() {
             .await
             .unwrap();
     }
-    let calls_after_fill = transport.calls.load(Ordering::SeqCst);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
 
     let _ = client
         .lookup(
             Arc::clone(&transport) as Arc<dyn DnsTransport>,
             "bounded-0.test",
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
+
+    let _ = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "bounded-1024.test",
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
+
+    let _ = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "bounded-0.test",
+            options.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
+
+    let _ = client
+        .lookup(
+            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            "bounded-1.test",
             options,
         )
         .await
         .unwrap();
-
-    assert_eq!(calls_after_fill, 1025);
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
 }
 
@@ -481,4 +622,36 @@ async fn router_lookup_uses_default_transport_and_tracks_reverse_mapping() {
         router.lookup_reverse_mapping(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22))),
         Some("router.test".to_owned())
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn router_reverse_cache_bounds_and_promotes_touched_lru_mapping() {
+    let manager = Arc::new(DnsTransportManager::new(logger("dns-transport"), "indexed"));
+    manager.insert(Arc::new(IndexedTransport::new(60)));
+    let router = DnsRouter::new_with_manager(logger("dns"), manager, DomainStrategy::AsIs);
+    let options = DnsQueryOptions {
+        lookup_strategy: DomainStrategy::Ipv4Only,
+        ..DnsQueryOptions::default()
+    };
+
+    for index in 0..2048 {
+        let domain = format!("reverse-{index}.test");
+        let _ = router.lookup(&domain, options.clone()).await.unwrap();
+    }
+
+    assert_eq!(
+        router.lookup_reverse_mapping(indexed_addr(0)),
+        Some("reverse-0.test".to_owned())
+    );
+
+    let _ = router
+        .lookup("reverse-2048.test", options.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        router.lookup_reverse_mapping(indexed_addr(0)),
+        Some("reverse-0.test".to_owned())
+    );
+    assert_eq!(router.lookup_reverse_mapping(indexed_addr(1)), None);
 }

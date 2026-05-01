@@ -12,7 +12,7 @@ use hammer_core::config::{
 };
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::OutboundManager;
+use hammer_runtime::{OutboundManager, outbounds::BlockOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -184,6 +184,38 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
 }
 
 #[tokio::test]
+async fn direct_outbound_sends_and_receives_ipv6_udp_datagrams() {
+    let socket = UdpSocket::bind("[::1]:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0_u8; 16];
+        let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..len], b"dns6");
+        socket.send_to(b"echo:dns6", peer).await.unwrap();
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "direct",
+        &[Outbound {
+            id: "direct".to_owned(),
+            kind: OutboundKind::Direct(DirectOutboundOptions::default()),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("direct").expect("direct outbound");
+    let mut packet = outbound.listen_packet().await.expect("listen direct udp");
+    packet
+        .send_to(destination(addr), b"dns6")
+        .await
+        .expect("send direct ipv6 udp");
+
+    let got = packet.recv_from().await.expect("recv direct ipv6 udp");
+    assert_eq!(got.destination, destination(addr));
+    assert_eq!(got.payload.as_ref(), b"echo:dns6");
+}
+
+#[tokio::test]
 async fn direct_outbound_protects_tcp_and_udp_sockets() {
     let platform = Arc::new(ProtectPlatform::default());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -287,4 +319,27 @@ fn outbound_manager_registers_concrete_m7_outbounds() {
     assert_eq!(manager.get("direct").unwrap().type_name(), "direct");
     assert_eq!(manager.get("block").unwrap().type_name(), "block");
     assert_eq!(manager.default().unwrap().id(), "direct");
+}
+
+#[test]
+fn outbound_manager_rejects_duplicate_registered_endpoint_view_id() {
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "direct",
+        &[Outbound {
+            id: "direct".to_owned(),
+            kind: OutboundKind::Direct(DirectOutboundOptions::default()),
+        }],
+    )
+    .expect("outbound manager");
+    let duplicate = Arc::new(BlockOutbound::new(logger("block"), "direct"));
+
+    let err = manager
+        .register_outbound("direct".to_owned(), duplicate)
+        .expect_err("duplicate endpoint outbound id must be rejected");
+    assert!(
+        err.to_string().contains("duplicate outbound id: direct"),
+        "error = {err:?}"
+    );
+    assert_eq!(manager.get("direct").unwrap().type_name(), "direct");
 }

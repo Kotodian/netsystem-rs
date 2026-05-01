@@ -506,6 +506,17 @@ id = "dup"
 }
 
 #[test]
+fn parse_config_rejects_unknown_route_final() {
+    let cfg = MINIMAL_CONFIG.replacen("final = \"hysteria2\"", "final = \"typo\"", 1);
+    let err = config::parse_config(&cfg).expect_err("unknown route.final");
+    assert!(
+        err.to_string()
+            .contains("route.final references unknown outbound id: typo"),
+        "error = {err:?}"
+    );
+}
+
+#[test]
 fn parse_config_rejects_unknown_dns_final() {
     let cfg = MINIMAL_CONFIG.replace(
         "[dns]\nserver = \"https://1.1.1.1/dns-query\"\n",
@@ -522,6 +533,19 @@ server = "1.1.1.1"
     assert!(
         err.to_string()
             .contains("dns.final references unknown server id: missing"),
+        "error = {err:?}"
+    );
+}
+
+#[cfg(feature = "wireguard")]
+#[test]
+fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
+    let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
+    let cfg = cfg.replacen("id = \"wg-out\"", "id = \"hysteria2\"", 1);
+    let err = config::parse_config(&cfg).expect_err("endpoint id collides with outbound id");
+    assert!(
+        err.to_string()
+            .contains("duplicate outbound/endpoint id: hysteria2"),
         "error = {err:?}"
     );
 }

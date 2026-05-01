@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tracing::info;
 
@@ -110,22 +110,46 @@ impl Outbound for DirectOutbound {
 
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
         info!("outbound packet connection");
-        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-            .await
-            .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
-        self.protector.protect(&socket)?;
-        Ok(Box::new(DirectPacketConn { socket }))
+        Ok(Box::new(DirectPacketConn {
+            protector: self.protector.clone(),
+            ipv4: None,
+            ipv6: None,
+        }))
     }
 }
 
 struct DirectPacketConn {
-    socket: UdpSocket,
+    protector: SocketProtector,
+    ipv4: Option<UdpSocket>,
+    ipv6: Option<UdpSocket>,
+}
+
+impl DirectPacketConn {
+    fn socket_for(&mut self, destination: IpAddr) -> Result<&UdpSocket, HammerError> {
+        if destination.is_ipv6() {
+            if self.ipv6.is_none() {
+                self.ipv6 = Some(bind_udp_socket(
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                    &self.protector,
+                )?);
+            }
+            return Ok(self.ipv6.as_ref().expect("IPv6 socket just initialized"));
+        }
+
+        if self.ipv4.is_none() {
+            self.ipv4 = Some(bind_udp_socket(
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                &self.protector,
+            )?);
+        }
+        Ok(self.ipv4.as_ref().expect("IPv4 socket just initialized"))
+    }
 }
 
 #[async_trait]
 impl ProxyPacketConn for DirectPacketConn {
     async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
-        self.socket
+        self.socket_for(destination.host)?
             .send_to(payload, socket_addr(&destination))
             .await
             .map_err(|err| HammerError::internal(format!("direct udp send: {err}")))?;
@@ -133,21 +157,56 @@ impl ProxyPacketConn for DirectPacketConn {
     }
 
     async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
-        let mut buf = vec![0_u8; 64 * 1024];
-        let (len, source) = self
-            .socket
-            .recv_from(&mut buf)
-            .await
-            .map_err(|err| HammerError::internal(format!("direct udp recv: {err}")))?;
-        buf.truncate(len);
-        Ok(ProxyDatagram {
-            destination: SocksAddr {
-                host: source.ip(),
-                port: source.port(),
-            },
-            payload: Bytes::from(buf),
-        })
+        match (self.ipv4.as_mut(), self.ipv6.as_mut()) {
+            (Some(ipv4), Some(ipv6)) => {
+                let mut v4 = vec![0_u8; 64 * 1024];
+                let mut v6 = vec![0_u8; 64 * 1024];
+                tokio::select! {
+                    res = ipv4.recv_from(&mut v4) => datagram_from_recv(res, v4),
+                    res = ipv6.recv_from(&mut v6) => datagram_from_recv(res, v6),
+                }
+            }
+            (Some(ipv4), None) => {
+                let mut buf = vec![0_u8; 64 * 1024];
+                datagram_from_recv(ipv4.recv_from(&mut buf).await, buf)
+            }
+            (None, Some(ipv6)) => {
+                let mut buf = vec![0_u8; 64 * 1024];
+                datagram_from_recv(ipv6.recv_from(&mut buf).await, buf)
+            }
+            (None, None) => Err(HammerError::internal(
+                "direct udp recv before any socket is opened",
+            )),
+        }
     }
+}
+
+fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> Result<UdpSocket, HammerError> {
+    let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
+        .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
+    socket
+        .set_nonblocking(true)
+        .map_err(|err| HammerError::internal(format!("direct udp set_nonblocking: {err}")))?;
+    let socket = UdpSocket::from_std(socket)
+        .map_err(|err| HammerError::internal(format!("direct udp from_std: {err}")))?;
+    protector.protect(&socket)?;
+    Ok(socket)
+}
+
+fn datagram_from_recv(
+    result: std::io::Result<(usize, SocketAddr)>,
+    mut buf: Vec<u8>,
+) -> Result<ProxyDatagram, HammerError> {
+    let (len, source) =
+        result.map_err(|err| HammerError::internal(format!("direct udp recv: {err}")))?;
+    buf.truncate(len);
+    Ok(ProxyDatagram {
+        destination: SocksAddr {
+            host: source.ip(),
+            port: source.port(),
+        },
+        payload: Bytes::from(buf),
+    })
 }
 
 fn socket_addr(destination: &SocksAddr) -> SocketAddr {

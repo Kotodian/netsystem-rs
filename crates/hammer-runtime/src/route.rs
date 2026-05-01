@@ -52,6 +52,12 @@ impl Router {
                 )));
             }
         }
+        if outbound.get(&options.final_).is_none() {
+            return Err(HammerError::config_validation(format!(
+                "route.final outbound {:?} is not declared",
+                options.final_
+            )));
+        }
         Ok(Self {
             rules,
             outbound: Some(outbound),

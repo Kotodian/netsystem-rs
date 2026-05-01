@@ -99,7 +99,7 @@ impl RuntimeService {
         #[cfg(feature = "endpoint")]
         {
             for (id, view) in endpoint.outbound_view() {
-                outbound.register_outbound(id, view);
+                outbound.register_outbound(id, view)?;
             }
         }
         let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(

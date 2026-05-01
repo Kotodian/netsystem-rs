@@ -146,6 +146,10 @@ async fn run_actor(
     // 65535 is the IPv4 datagram ceiling; boringtun's WG frames cap out at
     // mtu + 32, so this is generous.
     let mut udp_buf = vec![0u8; 65_535];
+    // Boringtun writes encapsulate / decapsulate output into this buffer and
+    // returns a slice into it; we send that slice and reuse the buffer for
+    // the next packet. Allocated once per actor.
+    let mut scratch = vec![0u8; (mtu as usize) + WIREGUARD_OVERHEAD];
 
     let mut timer = time::interval(TIMER_TICK);
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -161,8 +165,15 @@ async fn run_actor(
             res = socket.recv_from(&mut udp_buf) => {
                 match res {
                     Ok((n, src)) => {
-                        let datagram = udp_buf[..n].to_vec();
-                        handle_inbound(&socket, &peers, mtu, src, datagram, &inbound_tx).await;
+                        handle_inbound(
+                            &socket,
+                            &peers,
+                            src,
+                            &mut udp_buf[..n],
+                            &mut scratch,
+                            &inbound_tx,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         warn!("wireguard udp recv: {err}");
@@ -174,10 +185,10 @@ async fn run_actor(
                     debug!("wireguard transport: encrypt_rx closed");
                     break;
                 };
-                handle_outbound(&socket, &peers, mtu, packet).await;
+                handle_outbound(&socket, &peers, &packet, &mut scratch).await;
             }
             _ = timer.tick() => {
-                tick_timers(&socket, &peers, mtu).await;
+                tick_timers(&socket, &peers, &mut scratch).await;
             }
         }
     }
@@ -186,9 +197,9 @@ async fn run_actor(
 async fn handle_inbound(
     socket: &UdpSocket,
     peers: &[Peer],
-    mtu: u32,
     src: SocketAddr,
-    datagram: Vec<u8>,
+    datagram: &mut [u8],
+    scratch: &mut [u8],
     inbound_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let Some(peer_idx) = peers.iter().position(|peer| peer.endpoint() == src) else {
@@ -203,87 +214,99 @@ async fn handle_inbound(
     // WARP-style 3-byte reserved header: sing-box clears it on the inbound
     // side before letting boringtun parse the frame (boringtun expects bytes
     // 1..4 to be zero).
-    let mut datagram = datagram;
     if peer.reserved() != [0u8; 3] && datagram.len() >= 4 {
         datagram[1] = 0;
         datagram[2] = 0;
         datagram[3] = 0;
     }
 
-    let buf_size = (mtu as usize) + WIREGUARD_OVERHEAD;
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
-    let mut scratch = vec![0u8; buf_size];
-    let outputs = step_decapsulate(peer, Some(src.ip()), &datagram, &mut scratch);
-    drain_outputs(socket, peer, outputs, inbound_tx).await;
+    let action = step_decapsulate(peer, Some(src.ip()), datagram, scratch);
+    dispatch_action(socket, peer, action, scratch, inbound_tx).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
     // (e.g. the data packets that were waiting on a fresh handshake).
     loop {
-        let mut scratch = vec![0u8; buf_size];
-        let outputs = step_decapsulate(peer, None, &[], &mut scratch);
-        if outputs.is_empty() {
+        let action = step_decapsulate(peer, None, &[], scratch);
+        if matches!(action, DecapAction::Idle) {
             break;
         }
-        drain_outputs(socket, peer, outputs, inbound_tx).await;
+        dispatch_action(socket, peer, action, scratch, inbound_tx).await;
     }
 }
 
+/// What `step_decapsulate` decided we should do with the bytes it just wrote
+/// into the shared scratch buffer. Carrying only a length lets the caller
+/// reuse `scratch` without allocating per packet.
 #[derive(Debug)]
-enum Output {
-    /// Send these encapsulated bytes to a remote endpoint via UDP.
-    SendNetwork(Vec<u8>, SocketAddr),
-    /// Hand these decrypted IP bytes to the inner stack.
-    SendInbound(Vec<u8>),
+enum DecapAction {
+    /// Nothing to send. Either boringtun consumed the datagram silently
+    /// (`TunnResult::Done`) or returned an error (already trace-logged).
+    Idle,
+    /// Send `scratch[..len]` to `dst` over UDP.
+    SendNetwork { len: usize, dst: SocketAddr },
+    /// Hand `scratch[..len]` to the inner stack via `inbound_tx`. The bytes
+    /// must be cloned for the cross-actor channel.
+    SendInbound { len: usize },
 }
 
-async fn drain_outputs(
+async fn dispatch_action(
     socket: &UdpSocket,
     peer: &Peer,
-    outputs: Vec<Output>,
+    action: DecapAction,
+    scratch: &mut [u8],
     inbound_tx: &mpsc::Sender<Vec<u8>>,
 ) {
-    for out in outputs {
-        match out {
-            Output::SendNetwork(buf, dst) => {
-                let buf = stamp_reserved(buf, peer.reserved());
-                if let Err(err) = socket.send_to(&buf, dst).await {
-                    warn!("wireguard udp send_to {dst}: {err}");
-                }
+    match action {
+        DecapAction::Idle => {}
+        DecapAction::SendNetwork { len, dst } => {
+            stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
+            if let Err(err) = socket.send_to(&scratch[..len], dst).await {
+                warn!("wireguard udp send_to {dst}: {err}");
             }
-            Output::SendInbound(buf) => {
-                if inbound_tx.try_send(buf).is_err() {
-                    warn!("wireguard inbound queue full or closed; dropping packet");
-                }
+        }
+        DecapAction::SendInbound { len } => {
+            // Cross-actor hand-off requires owned bytes; this is the only
+            // remaining per-packet allocation in the inbound hot path.
+            let owned = scratch[..len].to_vec();
+            if inbound_tx.try_send(owned).is_err() {
+                warn!("wireguard inbound queue full or closed; dropping packet");
             }
         }
     }
 }
 
-/// Run a single `Tunn::decapsulate` call inside a short lock and translate the
-/// borrowed `TunnResult` into owned `Output`s. We don't loop here — the caller
-/// drains follow-up outputs with empty datagrams as boringtun specifies.
+/// Run a single `Tunn::decapsulate` call inside a short lock. boringtun
+/// writes any output bytes into `scratch` and returns a borrowed slice; we
+/// only keep the length so the caller can reuse the buffer.
 fn step_decapsulate(
     peer: &Peer,
     src_ip: Option<IpAddr>,
     datagram: &[u8],
     scratch: &mut [u8],
-) -> Vec<Output> {
+) -> DecapAction {
     let mut tunn = peer.lock_tunn();
     match tunn.decapsulate(src_ip, datagram, scratch) {
-        TunnResult::Done => Vec::new(),
-        TunnResult::Err(_) => Vec::new(),
-        TunnResult::WriteToNetwork(out) => {
-            vec![Output::SendNetwork(out.to_vec(), peer.endpoint())]
+        TunnResult::Done => DecapAction::Idle,
+        TunnResult::Err(err) => {
+            // Includes routine cases (replays, handshake retries) so trace,
+            // not warn — the previous code dropped the error entirely.
+            tracing::trace!(?err, "wireguard decapsulate error");
+            DecapAction::Idle
         }
+        TunnResult::WriteToNetwork(out) => DecapAction::SendNetwork {
+            len: out.len(),
+            dst: peer.endpoint(),
+        },
         TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
-            vec![Output::SendInbound(out.to_vec())]
+            DecapAction::SendInbound { len: out.len() }
         }
     }
 }
 
-async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], mtu: u32, ip_packet: Vec<u8>) {
-    let Some(dst_ip) = first_hop_destination(&ip_packet) else {
+async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], ip_packet: &[u8], scratch: &mut [u8]) {
+    let Some(dst_ip) = first_hop_destination(ip_packet) else {
         warn!("wireguard outbound: malformed IP packet, dropping");
         return;
     };
@@ -293,42 +316,41 @@ async fn handle_outbound(socket: &UdpSocket, peers: &[Peer], mtu: u32, ip_packet
     };
     let peer = &peers[peer_idx];
 
-    let buf_size = (mtu as usize) + WIREGUARD_OVERHEAD;
-    let mut scratch = vec![0u8; buf_size];
-    let to_send = {
+    let len = {
         let mut tunn = peer.lock_tunn();
-        match tunn.encapsulate(&ip_packet, &mut scratch) {
-            TunnResult::WriteToNetwork(out) => Some(out.to_vec()),
+        match tunn.encapsulate(ip_packet, scratch) {
+            TunnResult::WriteToNetwork(out) => Some(out.len()),
             TunnResult::Done => None,
-            TunnResult::Err(_) => None,
+            TunnResult::Err(err) => {
+                tracing::trace!(?err, "wireguard encapsulate error");
+                None
+            }
             // encapsulate never returns WriteToTunnel*, but match exhaustively.
             TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
         }
     };
 
-    let Some(buf) = to_send else { return };
-    let buf = stamp_reserved(buf, peer.reserved());
+    let Some(len) = len else { return };
+    stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
     let dst = peer.endpoint();
-    if let Err(err) = socket.send_to(&buf, dst).await {
+    if let Err(err) = socket.send_to(&scratch[..len], dst).await {
         warn!("wireguard udp send_to {dst}: {err}");
     }
 }
 
-async fn tick_timers(socket: &UdpSocket, peers: &[Peer], mtu: u32) {
-    let buf_size = (mtu as usize) + WIREGUARD_OVERHEAD;
+async fn tick_timers(socket: &UdpSocket, peers: &[Peer], scratch: &mut [u8]) {
     for peer in peers {
-        let mut scratch = vec![0u8; buf_size];
-        let to_send = {
+        let len = {
             let mut tunn = peer.lock_tunn();
-            match tunn.update_timers(&mut scratch) {
-                TunnResult::WriteToNetwork(out) => Some(out.to_vec()),
+            match tunn.update_timers(scratch) {
+                TunnResult::WriteToNetwork(out) => Some(out.len()),
                 _ => None,
             }
         };
-        if let Some(buf) = to_send {
-            let buf = stamp_reserved(buf, peer.reserved());
+        if let Some(len) = len {
+            stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
             let dst = peer.endpoint();
-            if let Err(err) = socket.send_to(&buf, dst).await {
+            if let Err(err) = socket.send_to(&scratch[..len], dst).await {
                 warn!("wireguard timer send {dst}: {err}");
             }
         }
@@ -337,11 +359,10 @@ async fn tick_timers(socket: &UdpSocket, peers: &[Peer], mtu: u32) {
 
 /// Stamp the WARP-style 3-byte reserved prefix into `packet[1..4]`. boringtun
 /// only writes the first byte (message type); the next three are ours.
-fn stamp_reserved(mut packet: Vec<u8>, reserved: [u8; 3]) -> Vec<u8> {
+fn stamp_reserved_in_place(packet: &mut [u8], reserved: [u8; 3]) {
     if reserved != [0u8; 3] && packet.len() >= 4 {
         packet[1..4].copy_from_slice(&reserved);
     }
-    packet
 }
 
 /// Read the destination IP out of an IPv4 or IPv6 header. Returns `None` for

@@ -127,11 +127,19 @@ impl OutboundManager {
     /// usual `OutboundManager::get` path. Mirrors sing-box, where every
     /// endpoint shows up as both an Endpoint *and* an Outbound — same Arc,
     /// two views.
-    pub fn register_outbound(&self, id: String, descriptor: Arc<dyn Outbound>) {
-        self.items
-            .lock()
-            .expect("OutboundManager poisoned")
-            .insert(id, descriptor);
+    pub fn register_outbound(
+        &self,
+        id: String,
+        descriptor: Arc<dyn Outbound>,
+    ) -> Result<(), HammerError> {
+        let mut items = self.items.lock().expect("OutboundManager poisoned");
+        if items.contains_key(&id) {
+            return Err(HammerError::config_validation(format!(
+                "duplicate outbound id: {id}"
+            )));
+        }
+        items.insert(id, descriptor);
+        Ok(())
     }
 
     fn register_descriptor_with_protector(
@@ -142,10 +150,14 @@ impl OutboundManager {
         let descriptor = self
             .factories
             .build(self.logger.clone(), option, protector)?;
-        self.items
-            .lock()
-            .expect("OutboundManager poisoned")
-            .insert(option.id.clone(), descriptor);
+        let mut items = self.items.lock().expect("OutboundManager poisoned");
+        if items.contains_key(&option.id) {
+            return Err(HammerError::config_validation(format!(
+                "duplicate outbound id: {}",
+                option.id
+            )));
+        }
+        items.insert(option.id.clone(), descriptor);
         Ok(())
     }
 }

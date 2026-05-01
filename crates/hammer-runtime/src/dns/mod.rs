@@ -254,6 +254,9 @@ impl DnsClient {
             && let Some(mut cached) = self.load_cache(&key)
         {
             cached.metadata.id = message.metadata.id;
+            if let Some(ttl) = options.rewrite_ttl {
+                normalize_ttl(&mut cached, ttl);
+            }
             return Ok(cached);
         }
         let mut response = tokio::time::timeout(DNS_TIMEOUT, transport.exchange(message))

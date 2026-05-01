@@ -247,6 +247,28 @@ fn router_rejects_unknown_outbound_at_construction() {
 }
 
 #[test]
+fn router_rejects_unknown_default_outbound_at_construction() {
+    let mut opts = options();
+    opts.route.final_ = "typo".to_owned();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let err = match Router::from_options(logger("router"), opts.route.clone(), outbound) {
+        Ok(_) => panic!("unknown default outbound should fail router construction"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("\"typo\""),
+        "error should mention the unknown default outbound id: {err}"
+    );
+}
+
+#[test]
 fn router_applies_non_terminal_actions_then_uses_default_outbound() {
     let router = router_from_options(&options());
     let mut metadata = RouteMetadata {
