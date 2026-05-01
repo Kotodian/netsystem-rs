@@ -58,6 +58,7 @@ base64 = "0.22"
 rand = "0.8"
 smoltcp = "0.13"
 boringtun = { version = "0.7", default-features = false }
+lru = "0.18"
 tun-rs = { version = "2.8.3", features = ["async"] }
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -16,6 +16,7 @@ use hammer_core::log::Logger;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
+use lru::LruCache;
 
 use crate::OutboundManager;
 use crate::socket_protector::SocketProtector;
@@ -214,19 +215,19 @@ struct CacheKey {
 struct CacheValue {
     response: Message,
     expires_at: Instant,
-    last_used: u64,
 }
 
 pub struct DnsClient {
-    cache: Mutex<HashMap<CacheKey, CacheValue>>,
-    cache_tick: AtomicU64,
+    cache: Mutex<LruCache<CacheKey, CacheValue>>,
 }
 
 impl DnsClient {
     pub fn new(_logger: Logger) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
-            cache_tick: AtomicU64::new(0),
+            cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DNS_CLIENT_CACHE_MAX_ENTRIES)
+                    .expect("DNS client cache capacity must be non-zero"),
+            )),
         }
     }
 
@@ -354,10 +355,9 @@ impl DnsClient {
         let value = cache.get_mut(key)?;
         let now = Instant::now();
         if now >= value.expires_at {
-            cache.remove(key);
+            cache.pop(key);
             return None;
         }
-        value.last_used = self.next_cache_tick();
         let ttl = value.expires_at.saturating_duration_since(now).as_secs() as u32;
         let mut response = value.response.clone();
         normalize_ttl(&mut response, ttl);
@@ -368,35 +368,24 @@ impl DnsClient {
         let now = Instant::now();
         let mut cache = self.cache.lock().expect("DnsClient cache poisoned");
         prune_cache(&mut cache, now);
-        if !cache.contains_key(&key) && cache.len() >= DNS_CLIENT_CACHE_MAX_ENTRIES {
-            evict_lru_cache_entry(&mut cache);
-        }
-        cache.insert(
+        cache.put(
             key,
             CacheValue {
                 response: response.clone(),
                 expires_at: now + Duration::from_secs(u64::from(ttl)),
-                last_used: self.next_cache_tick(),
             },
         );
     }
-
-    fn next_cache_tick(&self) -> u64 {
-        self.cache_tick.fetch_add(1, Ordering::Relaxed) + 1
-    }
 }
 
-fn prune_cache(cache: &mut HashMap<CacheKey, CacheValue>, now: Instant) {
-    cache.retain(|_, value| now < value.expires_at);
-}
-
-fn evict_lru_cache_entry(cache: &mut HashMap<CacheKey, CacheValue>) {
-    if let Some(key) = cache
+fn prune_cache(cache: &mut LruCache<CacheKey, CacheValue>, now: Instant) {
+    let expired: Vec<CacheKey> = cache
         .iter()
-        .min_by_key(|(_, value)| value.last_used)
+        .filter(|(_, value)| now >= value.expires_at)
         .map(|(key, _)| key.clone())
-    {
-        cache.remove(&key);
+        .collect();
+    for key in expired {
+        cache.pop(&key);
     }
 }
 
@@ -838,15 +827,13 @@ impl DnsTransportManagerTrait for DnsTransportManager {
 struct ReverseValue {
     domain: String,
     expires_at: Instant,
-    last_used: u64,
 }
 
 pub struct DnsRouter {
     transport: Arc<DnsTransportManager>,
     client: DnsClient,
     default_strategy: DomainStrategy,
-    reverse: Mutex<HashMap<IpAddr, ReverseValue>>,
-    reverse_tick: AtomicU64,
+    reverse: Mutex<LruCache<IpAddr, ReverseValue>>,
 }
 
 impl DnsRouter {
@@ -864,8 +851,10 @@ impl DnsRouter {
             client: DnsClient::new(logger.clone()),
             transport,
             default_strategy,
-            reverse: Mutex::new(HashMap::new()),
-            reverse_tick: AtomicU64::new(0),
+            reverse: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
+                    .expect("DNS reverse cache capacity must be non-zero"),
+            )),
         }
     }
 
@@ -934,10 +923,9 @@ impl DnsRouter {
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
         let value = reverse.get_mut(&ip)?;
         if Instant::now() >= value.expires_at {
-            reverse.remove(&ip);
+            reverse.pop(&ip);
             return None;
         }
-        value.last_used = self.next_reverse_tick();
         Some(value.domain.clone())
     }
 
@@ -980,40 +968,23 @@ impl DnsRouter {
 
     fn store_reverse_mapping_locked(
         &self,
-        reverse: &mut HashMap<IpAddr, ReverseValue>,
+        reverse: &mut LruCache<IpAddr, ReverseValue>,
         addr: IpAddr,
         domain: String,
         expires_at: Instant,
     ) {
-        if !reverse.contains_key(&addr) && reverse.len() >= DNS_REVERSE_CACHE_MAX_ENTRIES {
-            evict_lru_reverse_entry(reverse);
-        }
-        reverse.insert(
-            addr,
-            ReverseValue {
-                domain,
-                expires_at,
-                last_used: self.next_reverse_tick(),
-            },
-        );
-    }
-
-    fn next_reverse_tick(&self) -> u64 {
-        self.reverse_tick.fetch_add(1, Ordering::Relaxed) + 1
+        reverse.put(addr, ReverseValue { domain, expires_at });
     }
 }
 
-fn prune_reverse_cache(reverse: &mut HashMap<IpAddr, ReverseValue>, now: Instant) {
-    reverse.retain(|_, value| now < value.expires_at);
-}
-
-fn evict_lru_reverse_entry(reverse: &mut HashMap<IpAddr, ReverseValue>) {
-    if let Some(addr) = reverse
+fn prune_reverse_cache(reverse: &mut LruCache<IpAddr, ReverseValue>, now: Instant) {
+    let expired: Vec<IpAddr> = reverse
         .iter()
-        .min_by_key(|(_, value)| value.last_used)
+        .filter(|(_, value)| now >= value.expires_at)
         .map(|(addr, _)| *addr)
-    {
-        reverse.remove(&addr);
+        .collect();
+    for addr in expired {
+        reverse.pop(&addr);
     }
 }
 
