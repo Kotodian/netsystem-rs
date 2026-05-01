@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use hammer_adapter::{ConnectionHandle, ConnectionManager as ConnectionManagerTrait};
-use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
 
@@ -13,8 +12,14 @@ pub struct ConnectionManager {
     connections: Mutex<HashMap<u64, Arc<dyn ConnectionHandle>>>,
 }
 
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionManager {
-    pub fn new(_logger: Logger) -> Self {
+    pub fn new() -> Self {
         Self {
             next_id: AtomicU64::new(1),
             connections: Mutex::new(HashMap::new()),

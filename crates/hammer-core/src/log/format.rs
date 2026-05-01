@@ -125,29 +125,18 @@ pub fn display_id(id: &str) -> String {
 }
 
 fn push_elapsed(out: &mut String, duration: Duration) {
-    let total_ms = duration.as_millis() as i64;
-    let secs = total_ms / 1000;
-    let ms = (total_ms % 1000) as u32;
-    out.push_str(&secs.to_string());
-    out.push('.');
-    push_decimal(out, ms, 3);
-    out.push('s');
-}
-
-fn push_decimal(out: &mut String, value: u32, width: usize) {
-    let s = value.to_string();
-    for _ in s.len()..width {
-        out.push('0');
-    }
-    out.push_str(&s);
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "{}.{:03}s",
+        duration.as_secs(),
+        duration.subsec_millis()
+    );
 }
 
 fn push_hex(out: &mut String, value: u16, width: usize) {
-    let s = format!("{value:x}");
-    for _ in s.len()..width {
-        out.push('0');
-    }
-    out.push_str(&s);
+    use std::fmt::Write;
+    let _ = write!(out, "{value:0width$x}");
 }
 
 #[cfg(test)]

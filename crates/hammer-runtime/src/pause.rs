@@ -64,10 +64,14 @@ impl PauseManager {
             if !self.is_paused() {
                 return;
             }
-            // Subscribe before the second is_paused check so we don't miss a
-            // wake that happens concurrently.
+            // `notified()` does not enroll the waiter until the future is
+            // first polled, so a `notify_waiters()` racing between the
+            // double-check and `await` would be missed. `enable()` registers
+            // the wakeup eagerly — the idiom tokio's own `Notify` docs
+            // recommend for this exact double-check pattern.
             let notified = self.notify.notified();
             tokio::pin!(notified);
+            notified.as_mut().enable();
             if !self.is_paused() {
                 return;
             }

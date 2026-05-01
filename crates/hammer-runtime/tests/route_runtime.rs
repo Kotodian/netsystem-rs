@@ -281,7 +281,7 @@ impl ConnectionHandle for FakeHandle {
 
 #[test]
 fn connection_manager_tracks_removes_and_closes_connections() {
-    let manager = ConnectionManager::new(logger("connection"));
+    let manager = ConnectionManager::new();
     let first = Arc::new(FakeHandle::default());
     let second = Arc::new(FakeHandle::default());
 
@@ -377,7 +377,7 @@ impl PlatformInterface for MockPlatform {
 fn network_manager_tracks_platform_default_interface_and_pause_state() {
     let platform = Arc::new(MockPlatform::default());
     let pause = Arc::new(PauseManager::new());
-    let connection = Arc::new(ConnectionManager::new(logger("connection")));
+    let connection = Arc::new(ConnectionManager::new());
     let tracked = Arc::new(FakeHandle::default());
     connection.track(Arc::clone(&tracked) as Arc<dyn ConnectionHandle>);
     let network = NetworkManager::with_platform(
@@ -417,7 +417,7 @@ fn network_manager_tracks_platform_default_interface_and_pause_state() {
 fn network_manager_ignores_duplicate_default_interface_updates() {
     let platform = Arc::new(MockPlatform::default());
     let pause = Arc::new(PauseManager::new());
-    let connection = Arc::new(ConnectionManager::new(logger("connection")));
+    let connection = Arc::new(ConnectionManager::new());
     let first = Arc::new(FakeHandle::default());
     connection.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
     let network = NetworkManager::with_platform(

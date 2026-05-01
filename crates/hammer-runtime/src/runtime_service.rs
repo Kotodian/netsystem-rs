@@ -82,10 +82,7 @@ impl RuntimeService {
             &options.endpoints,
             Arc::clone(&platform),
         )?);
-        let connection = Arc::new(ConnectionManager::new(new_logger(
-            &log_factory,
-            "connection",
-        )));
+        let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
             new_logger(&log_factory, "network"),
             options.route.auto_detect_interface,
