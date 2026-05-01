@@ -421,10 +421,7 @@ fn system_stack_builds_full_udp_response_packet() {
     let request = ipv4_udp_packet([10, 0, 0, 2], [1, 1, 1, 1], 5353, 53, b"query".to_vec());
     let response = udp_response_packet(
         &request,
-        SocksAddr {
-            host: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            port: 53,
-        },
+        SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
         b"answer",
     )
     .expect("build udp response packet");

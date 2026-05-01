@@ -104,11 +104,17 @@ impl RuntimeService {
                 outbound.register_outbound(id, view)?;
             }
         }
+        let default_domain_resolver = options
+            .route
+            .default_domain_resolver
+            .as_ref()
+            .map(|d| d.server.as_str());
         let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(
             new_logger(&log_factory, "dns-transport"),
             &options.dns,
             Arc::clone(&outbound),
             Arc::clone(&platform),
+            default_domain_resolver,
         )?);
         let dns_router = Arc::new(DnsRouter::new_with_manager(
             new_logger(&log_factory, "dns-router"),

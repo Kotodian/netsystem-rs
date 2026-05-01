@@ -119,7 +119,10 @@ fn normalize_domain(domain: &str) -> String {
     domain.trim_end_matches('.').to_ascii_lowercase()
 }
 
-fn query_message(domain: &str, record_type: RecordType) -> Result<Message, HammerError> {
+pub(in crate::dns) fn query_message(
+    domain: &str,
+    record_type: RecordType,
+) -> Result<Message, HammerError> {
     let mut message = Message::new(0, MessageType::Query, OpCode::Query);
     message.add_query({
         let mut query = Query::query(fqdn(domain)?, record_type);
@@ -609,6 +612,7 @@ type DnsTransportBuilder = fn(
     &DnsServerKind,
     Logger,
     Option<Arc<OutboundManager>>,
+    Option<Arc<dyn DnsTransport>>,
     SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError>;
 
@@ -631,6 +635,7 @@ impl DnsTransportFactorySet {
         server: &DnsServer,
         logger: &Logger,
         outbound: Option<Arc<OutboundManager>>,
+        bootstrap: Option<Arc<dyn DnsTransport>>,
         protector: SocketProtector,
     ) -> Result<Arc<dyn DnsTransport>, HammerError> {
         let type_name = server.type_name();
@@ -642,6 +647,7 @@ impl DnsTransportFactorySet {
             &server.kind,
             logger.clone(),
             outbound,
+            bootstrap,
             protector,
         )
     }
@@ -682,16 +688,7 @@ impl DnsTransportManager {
     }
 
     pub fn from_options(logger: Logger, options: &DnsOptions) -> Result<Self, HammerError> {
-        let manager = Self::new(logger.clone(), options.final_.clone());
-        for server in &options.servers {
-            manager.insert(manager.factories.build(
-                server,
-                &logger,
-                None,
-                SocketProtector::default(),
-            )?);
-        }
-        Ok(manager)
+        Self::from_options_inner(logger, options, None, None, SocketProtector::default())
     }
 
     pub fn from_options_with_runtime(
@@ -699,14 +696,37 @@ impl DnsTransportManager {
         options: &DnsOptions,
         outbound: Arc<OutboundManager>,
         platform: Arc<dyn PlatformInterface>,
+        default_domain_resolver: Option<&str>,
+    ) -> Result<Self, HammerError> {
+        Self::from_options_inner(
+            logger,
+            options,
+            Some(outbound),
+            default_domain_resolver,
+            SocketProtector::new(platform),
+        )
+    }
+
+    /// Topological build: a DNS server's bootstrap (if any) must already be
+    /// registered before the server itself is built, since each transport
+    /// holds a strong `Arc<dyn DnsTransport>` to its bootstrap.
+    fn from_options_inner(
+        logger: Logger,
+        options: &DnsOptions,
+        outbound: Option<Arc<OutboundManager>>,
+        default_domain_resolver: Option<&str>,
+        protector: SocketProtector,
     ) -> Result<Self, HammerError> {
         let manager = Self::new(logger.clone(), options.final_.clone());
-        let protector = SocketProtector::new(platform);
-        for server in &options.servers {
+        let order = topo_sort_dns_servers(&options.servers, default_domain_resolver)?;
+        for server in order {
+            let bootstrap_tag = effective_runtime_bootstrap(server, default_domain_resolver);
+            let bootstrap = bootstrap_tag.and_then(|tag| manager.get(tag));
             manager.insert(manager.factories.build(
                 server,
                 &logger,
-                Some(Arc::clone(&outbound)),
+                outbound.clone(),
+                bootstrap,
                 protector.clone(),
             )?);
         }
@@ -743,11 +763,84 @@ impl DnsTransportManager {
 }
 
 #[cfg(feature = "dns-hosts")]
+/// Determine the bootstrap DNS server tag this server will actually use at
+/// runtime. Mirrors the validator semantics in hammer-core: per-server
+/// `domain_resolver` wins; falls back to `route.default_domain_resolver`;
+/// returns `None` for servers that don't need bootstrap (IP-literal or
+/// no via).
+fn effective_runtime_bootstrap<'a>(
+    server: &'a DnsServer,
+    default: Option<&'a str>,
+) -> Option<&'a str> {
+    let is_domain = server
+        .server_string()
+        .map(|s| s.parse::<IpAddr>().is_err())
+        .unwrap_or(false);
+    if !is_domain || server.via().is_empty() {
+        return None;
+    }
+    let tag = if !server.domain_resolver().is_empty() {
+        server.domain_resolver()
+    } else {
+        default.unwrap_or("")
+    };
+    (!tag.is_empty()).then_some(tag)
+}
+
+/// DFS post-order topological sort of DNS servers by their bootstrap edges.
+/// Servers with no bootstrap come first; each server appears after the
+/// bootstrap it depends on. Cycles are returned as Err (defense-in-depth;
+/// hammer-core's config validator rejects cycles up front).
+fn topo_sort_dns_servers<'a>(
+    servers: &'a [DnsServer],
+    default: Option<&'a str>,
+) -> Result<Vec<&'a DnsServer>, HammerError> {
+    let by_id: HashMap<&str, &DnsServer> = servers.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut visited: HashMap<&str, u8> = HashMap::new();
+    let mut order: Vec<&DnsServer> = Vec::new();
+    for s in servers {
+        topo_visit_dns(s.id.as_str(), &by_id, default, &mut visited, &mut order)?;
+    }
+    Ok(order)
+}
+
+fn topo_visit_dns<'a>(
+    node: &'a str,
+    by_id: &HashMap<&'a str, &'a DnsServer>,
+    default: Option<&'a str>,
+    visited: &mut HashMap<&'a str, u8>,
+    order: &mut Vec<&'a DnsServer>,
+) -> Result<(), HammerError> {
+    match visited.get(node).copied().unwrap_or(0) {
+        2 => return Ok(()),
+        1 => {
+            return Err(HammerError::internal(format!(
+                "dns transport bootstrap cycle at '{node}'"
+            )));
+        }
+        _ => {}
+    }
+    visited.insert(node, 1);
+    let Some(server) = by_id.get(node).copied() else {
+        visited.insert(node, 2);
+        return Ok(());
+    };
+    if let Some(bootstrap) = effective_runtime_bootstrap(server, default)
+        && by_id.contains_key(bootstrap)
+    {
+        topo_visit_dns(bootstrap, by_id, default, visited, order)?;
+    }
+    order.push(server);
+    visited.insert(node, 2);
+    Ok(())
+}
+
 fn build_hosts_transport(
     id: String,
     kind: &DnsServerKind,
     _logger: Logger,
     _outbound: Option<Arc<OutboundManager>>,
+    _bootstrap: Option<Arc<dyn DnsTransport>>,
     _protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     match kind {
@@ -764,6 +857,7 @@ fn build_local_transport(
     kind: &DnsServerKind,
     _logger: Logger,
     _outbound: Option<Arc<OutboundManager>>,
+    _bootstrap: Option<Arc<dyn DnsTransport>>,
     _protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     match kind {

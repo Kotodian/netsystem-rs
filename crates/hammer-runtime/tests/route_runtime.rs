@@ -22,6 +22,7 @@ fn options() -> Options {
 [tun]
 address = ["172.19.0.1/30"]
 sniff = true
+sniff_override_destination = true
 hijack_dns = true
 block_quic = true
 domain_strategy = "prefer_ipv4"
@@ -67,6 +68,8 @@ fn router_matches_hijack_dns_before_default_outbound() {
     let decision = router.match_route(&mut metadata).expect("match route");
 
     assert_eq!(decision, RouteDecision::HijackDns);
+    assert_eq!(metadata.domain_strategy, Some(DomainStrategy::PreferIpv4));
+    assert!(metadata.udp_disable_domain_unmapping);
 }
 
 #[test]
@@ -127,7 +130,7 @@ fn metadata_with_destination(host: IpAddr) -> RouteMetadata {
         inbound: "tun".to_owned(),
         network: Network::Tcp,
         protocol: "https".to_owned(),
-        destination: Some(SocksAddr { host, port: 443 }),
+        destination: Some(SocksAddr::ip(host, 443)),
         ..Default::default()
     }
 }
@@ -299,6 +302,32 @@ fn router_applies_non_terminal_actions_then_uses_default_outbound() {
     );
     assert_eq!(metadata.domain_strategy, Some(DomainStrategy::PreferIpv4));
     assert!(metadata.udp_disable_domain_unmapping);
+}
+
+#[test]
+fn router_applies_sniff_override_destination_option() {
+    let router = router_from_options(&options());
+    let mut metadata = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        protocol: "tls".to_owned(),
+        domain: Some("example.com".to_owned()),
+        destination: Some(SocksAddr::ip(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            443,
+        )),
+        ..Default::default()
+    };
+
+    let decision = router.match_route(&mut metadata).expect("match route");
+
+    assert_eq!(
+        decision,
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+    assert!(metadata.override_destination);
 }
 
 #[derive(Default)]

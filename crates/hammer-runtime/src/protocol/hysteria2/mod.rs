@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -262,10 +262,14 @@ pub struct Hysteria2Outbound {
     options: Hysteria2OutboundOptions,
     networks: Vec<Network>,
     dependencies: Vec<String>,
-    client: StdMutex<Option<Arc<Hysteria2Client>>>,
+    client_state: StdMutex<ClientState>,
     client_init: Mutex<()>,
-    client_epoch: AtomicU64,
     protector: SocketProtector,
+}
+
+struct ClientState {
+    epoch: u64,
+    client: Option<Arc<Hysteria2Client>>,
 }
 
 impl Hysteria2Outbound {
@@ -286,47 +290,54 @@ impl Hysteria2Outbound {
             options,
             networks,
             dependencies: Vec::new(),
-            client: StdMutex::new(None),
+            client_state: StdMutex::new(ClientState {
+                epoch: 0,
+                client: None,
+            }),
             client_init: Mutex::new(()),
-            client_epoch: AtomicU64::new(0),
             protector,
         }
     }
 
     async fn client(&self) -> Result<Arc<Hysteria2Client>, HammerError> {
-        if let Some(client) = self
-            .client
-            .lock()
-            .expect("Hysteria2Outbound client poisoned")
-            .clone()
-        {
+        if let Some(client) = self.cached_client() {
             return Ok(client);
         }
         loop {
             let _guard = self.client_init.lock().await;
-            if let Some(client) = self
-                .client
-                .lock()
-                .expect("Hysteria2Outbound client poisoned")
-                .clone()
-            {
+            if let Some(client) = self.cached_client() {
                 return Ok(client);
             }
-            let epoch = self.client_epoch.load(Ordering::SeqCst);
+            let epoch = self.client_epoch();
             let options = self.client_options()?;
             let client = Hysteria2Client::connect(options, self.logger.clone()).await?;
-            let mut cached = self
-                .client
+            let mut state = self
+                .client_state
                 .lock()
                 .expect("Hysteria2Outbound client poisoned");
-            if self.client_epoch.load(Ordering::SeqCst) != epoch {
-                drop(cached);
+            if state.epoch != epoch {
+                drop(state);
                 client.close(b"network reset during connect");
                 continue;
             }
-            *cached = Some(Arc::clone(&client));
+            state.client = Some(Arc::clone(&client));
             return Ok(client);
         }
+    }
+
+    fn cached_client(&self) -> Option<Arc<Hysteria2Client>> {
+        self.client_state
+            .lock()
+            .expect("Hysteria2Outbound client poisoned")
+            .client
+            .clone()
+    }
+
+    fn client_epoch(&self) -> u64 {
+        self.client_state
+            .lock()
+            .expect("Hysteria2Outbound client poisoned")
+            .epoch
     }
 
     fn client_options(&self) -> Result<ClientOptions, HammerError> {
@@ -389,12 +400,14 @@ impl Outbound for Hysteria2Outbound {
     }
 
     fn reset(&self) {
-        self.client_epoch.fetch_add(1, Ordering::SeqCst);
-        let client = self
-            .client
-            .lock()
-            .expect("Hysteria2Outbound client poisoned")
-            .take();
+        let client = {
+            let mut state = self
+                .client_state
+                .lock()
+                .expect("Hysteria2Outbound client poisoned");
+            state.epoch = state.epoch.wrapping_add(1);
+            state.client.take()
+        };
         if let Some(client) = client {
             client.close(b"network reset");
         }
@@ -744,15 +757,18 @@ fn adapter_network(value: Hysteria2Network) -> Network {
 
 fn parse_destination(destination: &str) -> SocksAddr {
     if let Ok(addr) = destination.parse::<SocketAddr>() {
-        return SocksAddr {
-            host: addr.ip(),
-            port: addr.port(),
-        };
+        return SocksAddr::ip(addr.ip(), addr.port());
     }
-    SocksAddr {
-        host: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        port: 0,
+    if let Some((host, port)) = destination.rsplit_once(':')
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return SocksAddr::domain(
+            host.trim_matches(['[', ']']),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            port,
+        );
     }
+    SocksAddr::ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
 
 #[derive(Debug)]

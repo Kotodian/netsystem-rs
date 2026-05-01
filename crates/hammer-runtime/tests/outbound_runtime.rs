@@ -23,10 +23,7 @@ fn logger(id: &str) -> Logger {
 }
 
 fn destination(addr: std::net::SocketAddr) -> SocksAddr {
-    SocksAddr {
-        host: addr.ip(),
-        port: addr.port(),
-    }
+    SocksAddr::ip(addr.ip(), addr.port())
 }
 
 #[derive(Default)]
@@ -333,10 +330,7 @@ async fn block_outbound_returns_protocol_errors() {
         }],
     )
     .expect("outbound manager");
-    let destination = SocksAddr {
-        host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port: 9,
-    };
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::LOCALHOST), 9);
 
     let block = manager.get("block").expect("block outbound");
     assert_eq!(block.type_name(), "block");

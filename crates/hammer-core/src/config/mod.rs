@@ -17,7 +17,8 @@ pub use log::*;
 pub use outbound::*;
 pub use route::*;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 use crate::error::HammerError;
 
@@ -351,13 +352,22 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         &dns_options.servers,
         outbounds.iter().map(|item| item.id.as_str()),
     )?;
+    let default_domain_resolver = if raw_route.default_domain_resolver.is_empty() {
+        None
+    } else {
+        Some(dns::DomainResolveOptions {
+            server: raw_route.default_domain_resolver.clone(),
+        })
+    };
+    validate_dns_server_domain_resolver(
+        &dns_options.servers,
+        default_domain_resolver.as_ref().map(|d| d.server.as_str()),
+    )?;
     let route_options = route::RouteOptions {
         final_: route_final,
         auto_detect_interface: auto_detect,
         rules,
-        default_domain_resolver: Some(dns::DomainResolveOptions {
-            server: dns_options.final_.clone(),
-        }),
+        default_domain_resolver,
     };
 
     Ok(Options {
@@ -405,6 +415,118 @@ fn validate_dns_server_via<'a>(
             "dns.server via references unknown outbound id: {via}"
         )));
     }
+    Ok(())
+}
+
+/// True iff the server will perform a bootstrap lookup at runtime: it has a
+/// domain (not IP-literal) `server` AND a non-empty `via` outbound. IP-literal
+/// servers and direct (no-via) servers never trigger bootstrap.
+fn server_needs_bootstrap(server: &dns::DnsServer) -> bool {
+    let is_domain = server
+        .server_string()
+        .map(|s| s.parse::<IpAddr>().is_err())
+        .unwrap_or(false);
+    is_domain && !server.via().is_empty()
+}
+
+/// The bootstrap DNS server tag actually used to resolve `server`'s domain.
+/// Returns empty for servers that don't need bootstrap (IP-literal or
+/// direct). Per-server `domain_resolver` wins; otherwise the global default.
+fn effective_bootstrap<'a>(server: &'a dns::DnsServer, default: Option<&'a str>) -> &'a str {
+    if !server_needs_bootstrap(server) {
+        return "";
+    }
+    if !server.domain_resolver().is_empty() {
+        server.domain_resolver()
+    } else {
+        default.unwrap_or("")
+    }
+}
+
+fn validate_dns_server_domain_resolver(
+    servers: &[dns::DnsServer],
+    default: Option<&str>,
+) -> Result<(), HammerError> {
+    let tags: HashSet<&str> = servers.iter().map(|s| s.id.as_str()).collect();
+
+    if let Some(default_tag) = default
+        && !tags.contains(default_tag)
+    {
+        return Err(HammerError::config_validation(format!(
+            "route.default_domain_resolver references unknown dns.server id: {default_tag}"
+        )));
+    }
+
+    for server in servers {
+        // Per-server domain_resolver field, if explicitly set, must
+        // reference a real DNS server id even when this server itself
+        // will not perform bootstrap lookups — catches typos early.
+        let raw_resolver = server.domain_resolver();
+        if !raw_resolver.is_empty() && !tags.contains(raw_resolver) {
+            return Err(HammerError::config_validation(format!(
+                "dns.server '{}': domain_resolver references unknown dns.server id: {raw_resolver}",
+                server.id
+            )));
+        }
+
+        // Strict: a server that will actually run a bootstrap lookup
+        // must have an effective bootstrap source.
+        if server_needs_bootstrap(server) && effective_bootstrap(server, default).is_empty() {
+            return Err(HammerError::config_validation(format!(
+                "dns.server '{}': domain server with via requires \
+                 domain_resolver or route.default_domain_resolver",
+                server.id
+            )));
+        }
+    }
+
+    detect_dns_bootstrap_cycle(servers, default)
+}
+
+fn detect_dns_bootstrap_cycle(
+    servers: &[dns::DnsServer],
+    default: Option<&str>,
+) -> Result<(), HammerError> {
+    let by_id: HashMap<&str, &dns::DnsServer> =
+        servers.iter().map(|s| (s.id.as_str(), s)).collect();
+    let mut color: HashMap<&str, u8> = HashMap::new();
+    let mut path: Vec<&str> = Vec::new();
+    for start in servers.iter().map(|s| s.id.as_str()) {
+        visit_for_cycle(start, &by_id, default, &mut color, &mut path)?;
+    }
+    Ok(())
+}
+
+fn visit_for_cycle<'a>(
+    node: &'a str,
+    by_id: &HashMap<&'a str, &'a dns::DnsServer>,
+    default: Option<&'a str>,
+    color: &mut HashMap<&'a str, u8>,
+    path: &mut Vec<&'a str>,
+) -> Result<(), HammerError> {
+    match color.get(node).copied().unwrap_or(0) {
+        2 => return Ok(()),
+        1 => {
+            let cycle_start = path.iter().position(|&n| n == node).unwrap_or(0);
+            let mut cycle: Vec<&str> = path[cycle_start..].to_vec();
+            cycle.push(node);
+            return Err(HammerError::config_validation(format!(
+                "dns.server bootstrap cycle: {}",
+                cycle.join(" -> ")
+            )));
+        }
+        _ => {}
+    }
+    color.insert(node, 1);
+    path.push(node);
+    if let Some(server) = by_id.get(node) {
+        let next = effective_bootstrap(server, default);
+        if !next.is_empty() && by_id.contains_key(next) {
+            visit_for_cycle(next, by_id, default, color, path)?;
+        }
+    }
+    path.pop();
+    color.insert(node, 2);
     Ok(())
 }
 

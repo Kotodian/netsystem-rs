@@ -147,7 +147,12 @@ impl RuntimeRule {
 
     fn apply(&self, metadata: &mut RouteMetadata) -> Result<RuleApply, HammerError> {
         match &self.action {
-            RuleActionKind::Sniff(_) => Ok(RuleApply::Continue),
+            RuleActionKind::Sniff(o) => {
+                if o.override_destination {
+                    metadata.override_destination = true;
+                }
+                Ok(RuleApply::Continue)
+            }
             RuleActionKind::HijackDns => Ok(RuleApply::Decision(RouteDecision::HijackDns)),
             RuleActionKind::Reject(o) => Ok(RuleApply::Decision(RouteDecision::Reject {
                 method: o.method.clone(),

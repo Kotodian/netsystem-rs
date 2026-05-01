@@ -181,10 +181,7 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
     .await
     .expect("connect client");
 
-    let destination = SocksAddr {
-        host: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
-        port: 443,
-    };
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 443);
 
     let mut stream = client
         .dial_tcp(destination.clone(), b"ping")
@@ -252,10 +249,7 @@ async fn outbound_manager_registers_real_hysteria2_outbound() {
     assert_eq!(outbound.type_name(), "hysteria2");
     assert_eq!(outbound.networks(), &[Network::Tcp, Network::Udp]);
 
-    let destination = SocksAddr {
-        host: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
-        port: 80,
-    };
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 80);
     let mut stream = outbound
         .dial(Network::Tcp, destination, b"hello")
         .await
@@ -283,10 +277,7 @@ async fn outbound_reset_during_initial_connect_discards_stale_client() {
 
     let outbound = manager.get("hysteria2").expect("hysteria2 outbound");
     let dial_outbound = Arc::clone(&outbound);
-    let destination = SocksAddr {
-        host: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)),
-        port: 80,
-    };
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)), 80);
     let dial = tokio::spawn(async move {
         dial_outbound
             .dial(Network::Tcp, destination, b"after-reset")

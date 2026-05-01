@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,8 +19,8 @@ use crate::socket_protector::SocketProtector;
 use crate::tls_support::root_cert_store;
 
 use super::{
-    dependency, direct_tcp_connect, host_header, outbound_by_id, resolve_first,
-    socket_addr_to_socks,
+    dependency_with_bootstrap, destination_via_bootstrap, direct_tcp_connect, host_header,
+    outbound_by_id, resolve_first, socks_to_socket_addr,
 };
 
 const DOH_MIME_TYPE: &str = "application/dns-message";
@@ -35,19 +34,21 @@ pub struct HttpsDnsTransport {
     url: String,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
     platform: Option<Arc<dyn PlatformInterface>>,
 }
 
 impl HttpsDnsTransport {
     pub fn new(id: impl Into<String>, options: &RemoteHttpsDnsServer) -> Self {
-        Self::new_with_runtime(id, options, None, SocketProtector::default())
+        Self::new_with_runtime(id, options, None, None, SocketProtector::default())
     }
 
     pub(in crate::dns) fn new_with_runtime(
         id: impl Into<String>,
         options: &RemoteHttpsDnsServer,
         outbound: Option<Arc<OutboundManager>>,
+        bootstrap: Option<Arc<dyn DnsTransport>>,
         protector: SocketProtector,
     ) -> Self {
         let host = if options.server_port == 443 {
@@ -67,9 +68,10 @@ impl HttpsDnsTransport {
             path: path.to_owned(),
             via: options.via.clone(),
             url: format!("https://{host}{path}"),
-            dependencies: dependency(&options.via),
+            dependencies: dependency_with_bootstrap(&options.via, &options.domain_resolver),
             platform: protector.platform(),
             outbound,
+            bootstrap,
             protector,
         }
     }
@@ -80,11 +82,12 @@ pub(crate) fn build_transport(
     kind: &DnsServerKind,
     _logger: hammer_core::log::Logger,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     match kind {
         DnsServerKind::Https(options) => Ok(Arc::new(HttpsDnsTransport::new_with_runtime(
-            id, options, outbound, protector,
+            id, options, outbound, bootstrap, protector,
         ))),
         _ => Err(HammerError::internal(
             "https DNS factory received wrong options",
@@ -118,7 +121,8 @@ impl DnsTransport for HttpsDnsTransport {
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
+        let server =
+            destination_via_bootstrap(self.bootstrap.as_ref(), &self.server, self.port).await?;
         let payload = MessageExt::to_bytes(&message)?;
         let bytes = doh_exchange_http2(
             self.outbound.as_ref(),
@@ -140,7 +144,7 @@ impl DnsTransport for HttpsDnsTransport {
 async fn doh_exchange_http2(
     outbound: Option<&Arc<OutboundManager>>,
     via: &str,
-    server: SocketAddr,
+    server: hammer_adapter::SocksAddr,
     server_name: &str,
     path: &str,
     url: &str,
@@ -150,10 +154,15 @@ async fn doh_exchange_http2(
 ) -> Result<Bytes, HammerError> {
     let host_name = server_name.to_owned();
     let stream: Box<dyn ProxyStream> = if via.is_empty() {
+        let server = if let Some(server) = socks_to_socket_addr(&server) {
+            server
+        } else {
+            resolve_first(&server.destination_host(), server.port).await?
+        };
         Box::new(direct_tcp_connect(server, protector).await?)
     } else {
         outbound_by_id(outbound, via)?
-            .dial(Network::Tcp, socket_addr_to_socks(server), &[])
+            .dial(Network::Tcp, server.clone(), &[])
             .await?
     };
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -178,7 +187,7 @@ async fn doh_exchange_http2(
         let _ = connection.await;
     });
     let request = Request::post(path)
-        .header(http::header::HOST, host_header(&host_name, server.port()))
+        .header(http::header::HOST, host_header(&host_name, server.port))
         .header(http::header::CONTENT_TYPE, DOH_MIME_TYPE)
         .header(http::header::ACCEPT, DOH_MIME_TYPE)
         .body(Full::new(Bytes::from(payload)))

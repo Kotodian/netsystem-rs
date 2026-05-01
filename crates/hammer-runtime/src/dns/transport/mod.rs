@@ -52,6 +52,63 @@ pub(super) async fn resolve_first(server: &str, port: u16) -> Result<SocketAddr,
         .ok_or_else(|| HammerError::internal(format!("resolve DNS server {server}: empty result")))
 }
 
+// Subsumed by `destination_via_bootstrap`; left in place for direct callers
+// that don't need bootstrap-aware resolution.
+#[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
+#[allow(dead_code)]
+pub(super) fn server_destination(server: &str, port: u16) -> SocksAddr {
+    if let Ok(ip) = server.parse::<IpAddr>() {
+        SocksAddr::ip(ip, port)
+    } else {
+        SocksAddr::domain(server, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+    }
+}
+
+/// Resolve `server` into a `SocksAddr` suitable for handing to an outbound's
+/// dial / packet send. IP literal → returned directly. Domain → if a
+/// `bootstrap` DNS transport is configured, query it for an A record and
+/// return an IP-resolved `SocksAddr`. With no bootstrap, fall back to a
+/// domain `SocksAddr` (host field unspecified) — direct outbounds can still
+/// resolve domains themselves; outbounds that require IPs (wireguard) will
+/// reject it, but the config validator should already have caught that case
+/// at startup for via-routed domain servers.
+#[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
+pub(super) async fn destination_via_bootstrap(
+    bootstrap: Option<&Arc<dyn hammer_adapter::DnsTransport>>,
+    server: &str,
+    port: u16,
+) -> Result<SocksAddr, HammerError> {
+    if let Ok(ip) = server.parse::<IpAddr>() {
+        return Ok(SocksAddr::ip(ip, port));
+    }
+    if let Some(bootstrap) = bootstrap {
+        let ip = lookup_first_a(bootstrap, server).await?;
+        return Ok(SocksAddr::ip(ip, port));
+    }
+    Ok(SocksAddr::domain(
+        server,
+        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        port,
+    ))
+}
+
+#[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
+async fn lookup_first_a(
+    bootstrap: &Arc<dyn hammer_adapter::DnsTransport>,
+    host: &str,
+) -> Result<IpAddr, HammerError> {
+    use crate::dns::{MessageExt, query_message};
+    use hickory_proto::rr::RecordType;
+    let msg = query_message(host, RecordType::A)?;
+    let response = bootstrap.exchange(msg).await?;
+    response.addresses().into_iter().next().ok_or_else(|| {
+        HammerError::internal(format!(
+            "bootstrap '{}' returned no A record for {host}",
+            bootstrap.id()
+        ))
+    })
+}
+
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
 pub(super) fn dependency(via: &str) -> Vec<String> {
     if via.is_empty() {
@@ -61,12 +118,24 @@ pub(super) fn dependency(via: &str) -> Vec<String> {
     }
 }
 
+/// Combined dependency list including the via outbound and an optional
+/// bootstrap DNS server tag. Either or both may be empty.
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
-pub(super) fn socket_addr_to_socks(addr: SocketAddr) -> SocksAddr {
-    SocksAddr {
-        host: addr.ip(),
-        port: addr.port(),
+pub(super) fn dependency_with_bootstrap(via: &str, bootstrap_tag: &str) -> Vec<String> {
+    let mut deps = dependency(via);
+    if !bootstrap_tag.is_empty() {
+        deps.push(bootstrap_tag.to_owned());
     }
+    deps
+}
+
+#[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
+#[cfg(any(feature = "dns-tcp", feature = "dns-https"))]
+pub(super) fn socks_to_socket_addr(destination: &SocksAddr) -> Option<SocketAddr> {
+    destination
+        .domain
+        .is_none()
+        .then_some(SocketAddr::new(destination.host, destination.port))
 }
 
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]

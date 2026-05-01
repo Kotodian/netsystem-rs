@@ -215,10 +215,10 @@ impl TunPacket {
         Self {
             metadata: RouteMetadata {
                 network,
-                destination: Some(SocksAddr {
-                    host: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
-                    port: destination_port,
-                }),
+                destination: Some(SocksAddr::ip(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+                    destination_port,
+                )),
                 ..Default::default()
             },
             payload: payload.into(),
@@ -914,7 +914,7 @@ impl SmoltcpTunStack {
             .ok_or_else(|| HammerError::internal("TUN DNS router is not configured"))?;
         let message = <Message as MessageExt>::from_bytes(&tun_packet.payload)?;
         let response = dns_router
-            .exchange(message, DnsQueryOptions::default())
+            .exchange(message, dns_query_options(&tun_packet.metadata))
             .await?;
         Ok(TunDispatch::DnsResponse {
             metadata: tun_packet.metadata,
@@ -934,11 +934,7 @@ impl SmoltcpTunStack {
         let outbound = outbound_manager
             .get(outbound_id)
             .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
-        let destination = tun_packet
-            .metadata
-            .destination
-            .clone()
-            .ok_or_else(|| HammerError::internal("TUN packet missing destination"))?;
+        let destination = route_destination(&tun_packet.metadata, self.dns_router.as_deref())?;
         match tun_packet.metadata.network {
             Network::Tcp => {
                 let mut stream = outbound
@@ -1031,14 +1027,8 @@ fn parse_tcp(
     }
     Ok(ParsedIpPacket {
         network: Network::Tcp,
-        source: SocksAddr {
-            host: source,
-            port: source_port,
-        },
-        destination: SocksAddr {
-            host: destination,
-            port: destination_port,
-        },
+        source: SocksAddr::ip(source, source_port),
+        destination: SocksAddr::ip(destination, destination_port),
         payload: transport[data_offset..].to_vec(),
     })
 }
@@ -1059,14 +1049,8 @@ fn parse_udp(
     }
     Ok(ParsedIpPacket {
         network: Network::Udp,
-        source: SocksAddr {
-            host: source,
-            port: source_port,
-        },
-        destination: SocksAddr {
-            host: destination,
-            port: destination_port,
-        },
+        source: SocksAddr::ip(source, source_port),
+        destination: SocksAddr::ip(destination, destination_port),
         payload: transport[8..length].to_vec(),
     })
 }
@@ -1104,14 +1088,8 @@ fn process_system_tcp_ipv4(
         write_ip_addr(packet, 16, session.source.host)?;
         write_u16(packet, tcp + 2, session.source.port);
     } else {
-        let source = SocksAddr {
-            host: source_addr,
-            port: source_port,
-        };
-        let destination = SocksAddr {
-            host: destination_addr,
-            port: destination_port,
-        };
+        let source = SocksAddr::ip(source_addr, source_port);
+        let destination = SocksAddr::ip(destination_addr, destination_port);
         let nat_port = nat.lookup_or_insert(source, destination);
         write_ip_addr(packet, 12, nat_addr)?;
         write_u16(packet, tcp, nat_port);
@@ -1150,14 +1128,8 @@ fn process_system_tcp_ipv6(
         write_ip_addr(packet, 24, session.source.host)?;
         write_u16(packet, tcp + 2, session.source.port);
     } else {
-        let source = SocksAddr {
-            host: source_addr,
-            port: source_port,
-        };
-        let destination = SocksAddr {
-            host: destination_addr,
-            port: destination_port,
-        };
+        let source = SocksAddr::ip(source_addr, source_port);
+        let destination = SocksAddr::ip(destination_addr, destination_port);
         let nat_port = nat.lookup_or_insert(source, destination);
         write_ip_addr(packet, 8, nat_addr)?;
         write_u16(packet, tcp, nat_port);
@@ -1534,8 +1506,15 @@ async fn accept_tcp_loop(
                 error!("outbound not found: {outbound_id}");
                 return;
             };
+            let destination = match route_destination(&metadata, None) {
+                Ok(destination) => destination,
+                Err(err) => {
+                    debug!("build TCP destination: {err}");
+                    return;
+                }
+            };
             let mut outbound_stream = match outbound
-                .dial(Network::Tcp, session.destination.clone(), &initial_payload)
+                .dial(Network::Tcp, destination, &initial_payload)
                 .await
             {
                 Ok(stream) => stream,
@@ -1694,7 +1673,7 @@ async fn handle_system_udp_packet(
         RouteDecision::HijackDns => {
             let message = <Message as MessageExt>::from_bytes(&tun_packet.payload)?;
             let response = dns_router
-                .exchange(message, DnsQueryOptions::default())
+                .exchange(message, dns_query_options(&tun_packet.metadata))
                 .await?;
             let response_bytes = MessageExt::to_bytes(&response)?;
             let response_packet =
@@ -1761,7 +1740,7 @@ async fn handle_system_udp_packet(
                         Arc::clone(&udp_flows),
                         key,
                         packet_conn,
-                        parsed.destination.clone(),
+                        route_destination(&tun_packet.metadata, Some(dns_router.as_ref()))?,
                         template,
                         udp_timeout,
                         rx,
@@ -1775,6 +1754,49 @@ async fn handle_system_udp_packet(
         }
     }
     Ok(())
+}
+
+fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
+    DnsQueryOptions {
+        strategy: metadata.domain_strategy.unwrap_or_default(),
+        ..DnsQueryOptions::default()
+    }
+}
+
+fn route_destination(
+    metadata: &RouteMetadata,
+    dns_router: Option<&DnsRouter>,
+) -> Result<SocksAddr, HammerError> {
+    let mut destination = metadata
+        .destination
+        .clone()
+        .ok_or_else(|| HammerError::internal("TUN packet missing destination"))?;
+    if metadata.override_destination
+        && let Some(domain) = metadata.domain.as_deref()
+    {
+        destination.domain = Some(normalize_destination_domain(domain));
+        return Ok(destination);
+    }
+    if metadata.network == Network::Udp
+        && !metadata.udp_disable_domain_unmapping
+        && destination.domain.is_none()
+        && let Some(router) = dns_router
+        && let Some(domain) = router.lookup_reverse_mapping(destination.host)
+    {
+        destination.domain = Some(normalize_destination_domain(&domain));
+    }
+    Ok(destination)
+}
+
+fn normalize_destination_domain(domain: &str) -> String {
+    let domain = domain.trim().trim_end_matches('.');
+    if let Some((host, port)) = domain.rsplit_once(':')
+        && !host.contains(':')
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return host.to_owned();
+    }
+    domain.to_owned()
 }
 
 #[allow(clippy::too_many_arguments)]

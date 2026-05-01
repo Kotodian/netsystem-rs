@@ -68,39 +68,39 @@ fn parse_config_builds_hysteria_tun_options() {
         RuleMatcher::Inbound(vec!["tun".to_owned()])
     );
 
-    assert_rule_action(&options.route.rules[1].default_options.action, "hijack-dns");
-    assert_eq!(
-        options.route.rules[1].default_options.matcher,
-        RuleMatcher::Protocol(vec!["dns".to_owned()])
-    );
-
-    assert_rule_action(&options.route.rules[2].default_options.action, "reject");
-    assert_eq!(
-        options.route.rules[2].default_options.matcher,
-        RuleMatcher::Protocol(vec!["quic".to_owned()])
-    );
-    let reject = match &options.route.rules[2].default_options.action {
-        RuleActionKind::Reject(o) => o,
-        _ => panic!("rule[2] not Reject"),
-    };
-    assert_eq!(reject.method, "default");
-
-    assert_rule_action(&options.route.rules[3].default_options.action, "resolve");
-    let resolve = match &options.route.rules[3].default_options.action {
+    assert_rule_action(&options.route.rules[1].default_options.action, "resolve");
+    let resolve = match &options.route.rules[1].default_options.action {
         RuleActionKind::Resolve(o) => o,
-        _ => panic!("rule[3] not Resolve"),
+        _ => panic!("rule[1] not Resolve"),
     };
     assert_eq!(resolve.strategy, config::DomainStrategy::PreferIpv4);
 
     assert_rule_action(
-        &options.route.rules[4].default_options.action,
+        &options.route.rules[2].default_options.action,
         "route-options",
     );
-    let route_opts = match &options.route.rules[4].default_options.action {
+    let route_opts = match &options.route.rules[2].default_options.action {
         RuleActionKind::RouteOptions(o) => o,
-        _ => panic!("rule[4] not RouteOptions"),
+        _ => panic!("rule[2] not RouteOptions"),
     };
     assert!(route_opts.udp_disable_domain_unmapping);
+
+    assert_rule_action(&options.route.rules[3].default_options.action, "hijack-dns");
+    assert_eq!(
+        options.route.rules[3].default_options.matcher,
+        RuleMatcher::Protocol(vec!["dns".to_owned()])
+    );
+
+    assert_rule_action(&options.route.rules[4].default_options.action, "reject");
+    assert_eq!(
+        options.route.rules[4].default_options.matcher,
+        RuleMatcher::Protocol(vec!["quic".to_owned()])
+    );
+    let reject = match &options.route.rules[4].default_options.action {
+        RuleActionKind::Reject(o) => o,
+        _ => panic!("rule[4] not Reject"),
+    };
+    assert_eq!(reject.method, "default");
 
     assert_eq!(options.outbounds.len(), 2);
     assert_eq!(options.outbounds[0].type_name(), "hysteria2");
@@ -140,15 +140,28 @@ fn check_config_rejects_unsupported_config_keys() {
 }
 
 #[test]
-fn parse_config_uses_custom_dns_id_for_domain_resolver() {
-    let cfg = MINIMAL_CONFIG.replacen("[dns]\n", "[dns]\nid = \"primary\"\n", 1);
-    let options = config::parse_config(&cfg).expect("parse");
+fn parse_config_passes_through_default_domain_resolver() {
+    // Explicit-only: route.default_domain_resolver is no longer
+    // auto-populated from dns.final. Without it set, the typed value
+    // stays None.
+    let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
+    assert!(
+        options.route.default_domain_resolver.is_none(),
+        "default_domain_resolver must be None when not configured"
+    );
+
+    // When explicitly set to a known DNS server id it round-trips.
+    let cfg = MINIMAL_CONFIG.replace(
+        "[route]\nfinal = \"hysteria2\"\n",
+        "[route]\nfinal = \"hysteria2\"\ndefault_domain_resolver = \"default\"\n",
+    );
+    let options = config::parse_config(&cfg).expect("parse with default resolver");
     let resolver = options
         .route
         .default_domain_resolver
         .as_ref()
-        .expect("DefaultDomainResolver must be present");
-    assert_eq!(resolver.server, "primary");
+        .expect("default_domain_resolver must round-trip when set");
+    assert_eq!(resolver.server, "default");
 }
 
 #[test]
@@ -397,6 +410,7 @@ id = "local"
 
 [route]
 auto_detect_interface = true
+default_domain_resolver = "cf"
 "#;
     let options = config::parse_config(cfg).expect("parse declared config");
 
@@ -765,6 +779,152 @@ fn parse_config_default_endpoints_is_empty() {
     assert!(
         options.endpoints.is_empty(),
         "endpoints default must be empty"
+    );
+}
+
+/// Two-server fixture used by the domain_resolver suite below. Bootstrap is
+/// an IP-literal UDP server on `direct`; remote is a domain UDP server whose
+/// `domain_resolver` (or the route-level fallback) decides who resolves it.
+const DOMAIN_RESOLVER_FIXTURE: &str = r#"
+[log]
+level = "info"
+
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[dns.servers]]
+type = "udp"
+id = "bootstrap"
+server = "1.1.1.1"
+
+[[dns.servers]]
+type = "udp"
+id = "remote"
+server = "resolver.example.com"
+via = "direct"
+domain_resolver = "bootstrap"
+
+[dns]
+final = "remote"
+
+[route]
+final = "direct"
+"#;
+
+#[test]
+fn parse_config_round_trips_dns_server_domain_resolver() {
+    let options = config::parse_config(DOMAIN_RESOLVER_FIXTURE).expect("parse");
+    let remote = options
+        .dns
+        .servers
+        .iter()
+        .find(|s| s.id == "remote")
+        .expect("remote dns server");
+    let kind = match &remote.kind {
+        DnsServerKind::Udp(o) => o,
+        _ => panic!("remote is not UDP"),
+    };
+    assert_eq!(kind.domain_resolver, "bootstrap");
+    assert_eq!(kind.via, "direct");
+}
+
+#[test]
+fn parse_config_rejects_unknown_dns_server_domain_resolver_tag() {
+    let cfg = DOMAIN_RESOLVER_FIXTURE.replace(
+        "domain_resolver = \"bootstrap\"",
+        "domain_resolver = \"nope\"",
+    );
+    let err = config::parse_config(&cfg).expect_err("unknown tag must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("domain_resolver references unknown dns.server id"),
+        "unexpected: {msg}"
+    );
+}
+
+#[test]
+fn parse_config_requires_domain_resolver_for_domain_via_server() {
+    // Strip per-server domain_resolver and route-level fallback. The
+    // remote server is domain + via -> strict validation must reject.
+    let cfg = DOMAIN_RESOLVER_FIXTURE.replace("domain_resolver = \"bootstrap\"\n", "");
+    let err = config::parse_config(&cfg).expect_err("missing bootstrap must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("domain server with via requires"),
+        "unexpected: {msg}"
+    );
+}
+
+#[test]
+fn parse_config_accepts_default_domain_resolver_as_fallback() {
+    // Per-server unset, but route.default_domain_resolver provides
+    // the fallback bootstrap.
+    let cfg = DOMAIN_RESOLVER_FIXTURE
+        .replace("domain_resolver = \"bootstrap\"\n", "")
+        .replace(
+            "[route]\nfinal = \"direct\"\n",
+            "[route]\nfinal = \"direct\"\ndefault_domain_resolver = \"bootstrap\"\n",
+        );
+    let options = config::parse_config(&cfg).expect("default fallback must validate");
+    let resolver = options
+        .route
+        .default_domain_resolver
+        .as_ref()
+        .expect("default_domain_resolver round-trips");
+    assert_eq!(resolver.server, "bootstrap");
+}
+
+#[test]
+fn parse_config_rejects_dns_bootstrap_cycle() {
+    // Two domain-via servers pointing at each other -> cycle.
+    let cfg = r#"
+[log]
+level = "info"
+
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[dns.servers]]
+type = "udp"
+id = "a"
+server = "a.example.com"
+via = "direct"
+domain_resolver = "b"
+
+[[dns.servers]]
+type = "udp"
+id = "b"
+server = "b.example.com"
+via = "direct"
+domain_resolver = "a"
+
+[dns]
+final = "a"
+
+[route]
+final = "direct"
+"#;
+    let err = config::parse_config(cfg).expect_err("cycle must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("dns.server bootstrap cycle"),
+        "unexpected: {msg}"
     );
 }
 

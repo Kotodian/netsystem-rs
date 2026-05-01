@@ -88,7 +88,8 @@ impl Outbound for DirectOutbound {
             return Err(HammerError::internal("direct dial only supports tcp"));
         }
         info!("outbound connection to {destination}");
-        let socket = if destination.host.is_ipv6() {
+        let target = resolve_destination(&destination).await?;
+        let socket = if target.is_ipv6() {
             TcpSocket::new_v6()
         } else {
             TcpSocket::new_v4()
@@ -96,7 +97,7 @@ impl Outbound for DirectOutbound {
         .map_err(|err| HammerError::internal(format!("create direct tcp socket: {err}")))?;
         self.protector.protect(&socket)?;
         let mut stream = socket
-            .connect(socket_addr(&destination))
+            .connect(target)
             .await
             .map_err(|err| HammerError::internal(format!("direct tcp connect: {err}")))?;
         if !initial_payload.is_empty() {
@@ -149,8 +150,9 @@ impl DirectPacketConn {
 #[async_trait]
 impl ProxyPacketConn for DirectPacketConn {
     async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
-        self.socket_for(destination.host)?
-            .send_to(payload, socket_addr(&destination))
+        let target = resolve_destination(&destination).await?;
+        self.socket_for(target.ip())?
+            .send_to(payload, target)
             .await
             .map_err(|err| HammerError::internal(format!("direct udp send: {err}")))?;
         Ok(())
@@ -201,14 +203,19 @@ fn datagram_from_recv(
         result.map_err(|err| HammerError::internal(format!("direct udp recv: {err}")))?;
     buf.truncate(len);
     Ok(ProxyDatagram {
-        destination: SocksAddr {
-            host: source.ip(),
-            port: source.port(),
-        },
+        destination: SocksAddr::ip(source.ip(), source.port()),
         payload: Bytes::from(buf),
     })
 }
 
-fn socket_addr(destination: &SocksAddr) -> SocketAddr {
-    SocketAddr::new(destination.host, destination.port)
+async fn resolve_destination(destination: &SocksAddr) -> Result<SocketAddr, HammerError> {
+    let Some(domain) = destination.domain.as_deref() else {
+        return Ok(SocketAddr::new(destination.host, destination.port));
+    };
+    let mut addrs = tokio::net::lookup_host((domain, destination.port))
+        .await
+        .map_err(|err| HammerError::internal(format!("direct resolve {domain}: {err}")))?;
+    addrs
+        .next()
+        .ok_or_else(|| HammerError::internal(format!("direct resolve {domain}: empty result")))
 }

@@ -27,6 +27,10 @@ raw_struct_with_default_check! {
         pub strategy: DomainStrategy => "DomainStrategy::is_default",
         /// Outbound id used to reach the upstream DNS server.
         pub via: String => "String::is_empty",
+        /// Single-server form: bootstrap DNS server tag for resolving
+        /// `server` when it is a domain name. Equivalent of
+        /// `[[dns.servers]].domain_resolver`.
+        pub domain_resolver: String => "String::is_empty",
         /// Explicit DNS transport list.
         pub servers: Vec<RawDnsServer> => "Vec::is_empty",
     }
@@ -42,6 +46,10 @@ raw_struct! {
         pub server_port: Option<u16> => "Option::is_none",
         /// Outbound id used to reach the upstream DNS server.
         pub via: String => "String::is_empty",
+        /// DNS server tag used to resolve `server` when it is a domain.
+        /// Required when `via` is non-empty and `server` is a domain,
+        /// unless `route.default_domain_resolver` provides a fallback.
+        pub domain_resolver: String => "String::is_empty",
     }
 }
 
@@ -57,6 +65,8 @@ raw_struct! {
         pub via: String => "String::is_empty",
         /// HTTP path for DNS-over-HTTPS.
         pub path: String => "String::is_empty",
+        /// DNS server tag used to resolve `server` when it is a domain.
+        pub domain_resolver: String => "String::is_empty",
     }
 }
 
@@ -109,6 +119,29 @@ impl DnsServer {
             DnsServerKind::Hosts | DnsServerKind::Local => "",
         }
     }
+
+    /// Bootstrap DNS server tag for resolving this server's `server`
+    /// when it is a domain. Empty means "unset; rely on
+    /// `route.default_domain_resolver`".
+    pub fn domain_resolver(&self) -> &str {
+        match &self.kind {
+            DnsServerKind::Udp(o) => &o.domain_resolver,
+            DnsServerKind::Tcp(o) => &o.domain_resolver,
+            DnsServerKind::Https(o) => &o.domain_resolver,
+            DnsServerKind::Hosts | DnsServerKind::Local => "",
+        }
+    }
+
+    /// Upstream server string (host or IP) for remote kinds, `None`
+    /// for hosts/local which have no remote endpoint.
+    pub fn server_string(&self) -> Option<&str> {
+        match &self.kind {
+            DnsServerKind::Udp(o) => Some(o.server.as_str()),
+            DnsServerKind::Tcp(o) => Some(o.server.as_str()),
+            DnsServerKind::Https(o) => Some(o.server.as_str()),
+            DnsServerKind::Hosts | DnsServerKind::Local => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +158,10 @@ pub struct RemoteDnsServer {
     pub server: String,
     pub server_port: u16,
     pub via: String,
+    /// DNS server tag used to bootstrap-resolve `server` when it is a
+    /// domain name. Empty means "unset; fall back to
+    /// `route.default_domain_resolver`".
+    pub domain_resolver: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -133,6 +170,7 @@ pub struct RemoteHttpsDnsServer {
     pub server_port: u16,
     pub via: String,
     pub path: String,
+    pub domain_resolver: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,7 +232,7 @@ pub(super) fn build_dns_options(
     } else {
         raw.via.clone()
     };
-    let server = build_dns_server(raw, &via)?;
+    let server = build_dns_server(raw, &via, &raw.domain_resolver)?;
     let final_id = server.id.clone();
     Ok(DnsOptions {
         servers: vec![server],
@@ -280,6 +318,7 @@ fn build_declared_dns_server(
                     } else {
                         raw.path.clone()
                     },
+                    domain_resolver: raw.domain_resolver.clone(),
                 }),
             })
         }
@@ -317,10 +356,15 @@ fn remote_dns_options(
             .filter(|port| *port != 0)
             .unwrap_or(default_port),
         via,
+        domain_resolver: raw.domain_resolver.clone(),
     })
 }
 
-fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerError> {
+fn build_dns_server(
+    raw: &RawDnsConfig,
+    via: &str,
+    domain_resolver: &str,
+) -> Result<DnsServer, HammerError> {
     let id = dns_id(raw).to_owned();
 
     match raw.server.as_str() {
@@ -343,7 +387,7 @@ fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerEr
         && !parsed.scheme().is_empty()
         && parsed.has_host()
     {
-        return build_dns_server_from_url(parsed, id, via);
+        return build_dns_server_from_url(parsed, id, via, domain_resolver);
     }
 
     let (host, port_str) = match raw.server.rsplit_once(':') {
@@ -365,11 +409,17 @@ fn build_dns_server(raw: &RawDnsConfig, via: &str) -> Result<DnsServer, HammerEr
             server: host,
             server_port: port,
             via: via.to_owned(),
+            domain_resolver: domain_resolver.to_owned(),
         }),
     })
 }
 
-fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsServer, HammerError> {
+fn build_dns_server_from_url(
+    parsed: Url,
+    id: String,
+    via: &str,
+    domain_resolver: &str,
+) -> Result<DnsServer, HammerError> {
     let host = parsed
         .host_str()
         .ok_or_else(|| HammerError::config_validation("dns.server host is required"))?
@@ -389,6 +439,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
                     server_port: port,
                     via: via.to_owned(),
                     path,
+                    domain_resolver: domain_resolver.to_owned(),
                 }),
             })
         }
@@ -398,6 +449,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
                 server: host,
                 server_port: parsed.port().unwrap_or(53),
                 via: via.to_owned(),
+                domain_resolver: domain_resolver.to_owned(),
             }),
         }),
         "tcp" => Ok(DnsServer {
@@ -406,6 +458,7 @@ fn build_dns_server_from_url(parsed: Url, id: String, via: &str) -> Result<DnsSe
                 server: host,
                 server_port: parsed.port().unwrap_or(53),
                 via: via.to_owned(),
+                domain_resolver: domain_resolver.to_owned(),
             }),
         }),
         other => Err(HammerError::config_validation(format!(

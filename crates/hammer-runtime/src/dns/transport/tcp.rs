@@ -14,8 +14,8 @@ use crate::dns::MessageExt;
 use crate::socket_protector::SocketProtector;
 
 use super::{
-    dependency, direct_tcp_connect, encode_tcp_dns_query, outbound_by_id, read_tcp_dns_response,
-    resolve_first, socket_addr_to_socks,
+    dependency_with_bootstrap, destination_via_bootstrap, direct_tcp_connect, encode_tcp_dns_query,
+    outbound_by_id, read_tcp_dns_response, resolve_first, socks_to_socket_addr,
 };
 
 pub struct TcpDnsTransport {
@@ -25,6 +25,7 @@ pub struct TcpDnsTransport {
     via: String,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
 }
 
@@ -37,6 +38,7 @@ impl TcpDnsTransport {
             via: String::new(),
             dependencies: Vec::new(),
             outbound: None,
+            bootstrap: None,
             protector: SocketProtector::default(),
         }
     }
@@ -45,6 +47,7 @@ impl TcpDnsTransport {
         id: impl Into<String>,
         options: &RemoteDnsServer,
         outbound: Option<Arc<OutboundManager>>,
+        bootstrap: Option<Arc<dyn DnsTransport>>,
         protector: SocketProtector,
     ) -> Self {
         Self {
@@ -52,8 +55,9 @@ impl TcpDnsTransport {
             server: options.server.clone(),
             port: options.server_port,
             via: options.via.clone(),
-            dependencies: dependency(&options.via),
+            dependencies: dependency_with_bootstrap(&options.via, &options.domain_resolver),
             outbound,
+            bootstrap,
             protector,
         }
     }
@@ -64,11 +68,12 @@ pub(crate) fn build_transport(
     kind: &DnsServerKind,
     _logger: hammer_core::log::Logger,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     match kind {
         DnsServerKind::Tcp(options) => Ok(Arc::new(TcpDnsTransport::new_with_runtime(
-            id, options, outbound, protector,
+            id, options, outbound, bootstrap, protector,
         ))),
         _ => Err(HammerError::internal(
             "tcp DNS factory received wrong options",
@@ -102,7 +107,8 @@ impl DnsTransport for TcpDnsTransport {
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
+        let server =
+            destination_via_bootstrap(self.bootstrap.as_ref(), &self.server, self.port).await?;
         tcp_exchange_via_or_direct(
             self.outbound.as_ref(),
             &self.via,
@@ -128,16 +134,21 @@ pub(super) async fn tcp_exchange_direct(
 pub(super) async fn tcp_exchange_via_or_direct(
     outbound: Option<&Arc<OutboundManager>>,
     via: &str,
-    server: SocketAddr,
+    server: hammer_adapter::SocksAddr,
     message: Message,
     protector: &SocketProtector,
 ) -> Result<Message, HammerError> {
     if via.is_empty() {
+        let server = if let Some(server) = socks_to_socket_addr(&server) {
+            server
+        } else {
+            resolve_first(&server.destination_host(), server.port).await?
+        };
         return tcp_exchange_direct(&server, message, protector).await;
     }
     let frame = encode_tcp_dns_query(&message)?;
     let mut stream = outbound_by_id(outbound, via)?
-        .dial(Network::Tcp, socket_addr_to_socks(server), &frame)
+        .dial(Network::Tcp, server, &frame)
         .await?;
     read_tcp_dns_response(&mut stream).await
 }

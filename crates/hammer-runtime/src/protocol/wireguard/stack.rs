@@ -32,6 +32,7 @@ use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 
 use super::device::WireguardDevice;
+use super::wireguard_destination_socket_addr;
 
 /// Per-TCP-socket smoltcp ring buffer size. 64 KiB matches a typical Linux
 /// SO_RCVBUF default and is plenty for the bursty HTTP/QUIC payloads we expect
@@ -176,7 +177,7 @@ impl UdpHandle {
 #[async_trait]
 impl ProxyPacketConn for UdpHandle {
     async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
-        let dst = SocketAddr::new(destination.host, destination.port);
+        let dst = wireguard_destination_socket_addr(&destination)?;
         self.send_tx
             .send((payload.to_vec(), dst))
             .await
@@ -190,10 +191,7 @@ impl ProxyPacketConn for UdpHandle {
             .await
             .ok_or_else(|| HammerError::internal("wireguard udp: stack closed"))?;
         Ok(ProxyDatagram {
-            destination: SocksAddr {
-                host: src.ip(),
-                port: src.port(),
-            },
+            destination: SocksAddr::ip(src.ip(), src.port()),
             payload: Bytes::from(payload),
         })
     }

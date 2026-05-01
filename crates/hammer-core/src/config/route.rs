@@ -24,6 +24,10 @@ raw_struct_with_default_check! {
         pub final_: String => "String::is_empty",
         /// Whether to let the runtime detect the platform default interface.
         pub auto_detect_interface: Option<bool> => "Option::is_none",
+        /// Default DNS server tag used to bootstrap-resolve any DNS
+        /// server whose `server` is a domain when the server itself
+        /// has no `domain_resolver`. Empty means "no fallback".
+        pub default_domain_resolver: String => "String::is_empty",
         /// Ordered user route rules.
         #[serde(
             deserialize_with = "deserialize_route_rules",
@@ -181,17 +185,6 @@ pub(super) fn derive_tun_route_rules(
             }),
         ));
     }
-    if hijack_dns {
-        rules.push(protocol_rule(C::PROTOCOL_DNS, RuleActionKind::HijackDns));
-    }
-    if block_quic {
-        rules.push(protocol_rule(
-            C::PROTOCOL_QUIC,
-            RuleActionKind::Reject(RejectActionOptions {
-                method: C::REJECT_METHOD_DEFAULT.to_owned(),
-            }),
-        ));
-    }
     if domain_strategy != DomainStrategy::AsIs {
         rules.push(tun_rule(
             tun_id,
@@ -205,6 +198,17 @@ pub(super) fn derive_tun_route_rules(
             tun_id,
             RuleActionKind::RouteOptions(RouteOptionsActionOptions {
                 udp_disable_domain_unmapping: true,
+            }),
+        ));
+    }
+    if hijack_dns {
+        rules.push(protocol_rule(C::PROTOCOL_DNS, RuleActionKind::HijackDns));
+    }
+    if block_quic {
+        rules.push(protocol_rule(
+            C::PROTOCOL_QUIC,
+            RuleActionKind::Reject(RejectActionOptions {
+                method: C::REJECT_METHOD_DEFAULT.to_owned(),
             }),
         ));
     }

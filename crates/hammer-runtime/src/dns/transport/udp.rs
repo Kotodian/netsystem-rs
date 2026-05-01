@@ -15,7 +15,9 @@ use crate::dns::MessageExt;
 use crate::socket_protector::SocketProtector;
 
 use super::tcp::{tcp_exchange_direct, tcp_exchange_via_or_direct};
-use super::{dependency, resolve_first, socket_addr_to_socks, udp_exchange_via};
+use super::{
+    dependency_with_bootstrap, destination_via_bootstrap, resolve_first, udp_exchange_via,
+};
 
 pub struct UdpDnsTransport {
     id: String,
@@ -24,6 +26,7 @@ pub struct UdpDnsTransport {
     via: String,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
 }
 
@@ -36,6 +39,7 @@ impl UdpDnsTransport {
             via: String::new(),
             dependencies: Vec::new(),
             outbound: None,
+            bootstrap: None,
             protector: SocketProtector::default(),
         }
     }
@@ -45,6 +49,7 @@ impl UdpDnsTransport {
         options: &RemoteDnsServer,
         _logger: Logger,
         outbound: Option<Arc<OutboundManager>>,
+        bootstrap: Option<Arc<dyn DnsTransport>>,
         protector: SocketProtector,
     ) -> Self {
         Self {
@@ -52,8 +57,9 @@ impl UdpDnsTransport {
             server: options.server.clone(),
             port: options.server_port,
             via: options.via.clone(),
-            dependencies: dependency(&options.via),
+            dependencies: dependency_with_bootstrap(&options.via, &options.domain_resolver),
             outbound,
+            bootstrap,
             protector,
         }
     }
@@ -64,11 +70,12 @@ pub(crate) fn build_transport(
     kind: &DnsServerKind,
     logger: Logger,
     outbound: Option<Arc<OutboundManager>>,
+    bootstrap: Option<Arc<dyn DnsTransport>>,
     protector: SocketProtector,
 ) -> Result<Arc<dyn DnsTransport>, HammerError> {
     match kind {
         DnsServerKind::Udp(options) => Ok(Arc::new(UdpDnsTransport::new_with_runtime(
-            id, options, logger, outbound, protector,
+            id, options, logger, outbound, bootstrap, protector,
         ))),
         _ => Err(HammerError::internal(
             "udp DNS factory received wrong options",
@@ -102,12 +109,13 @@ impl DnsTransport for UdpDnsTransport {
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-        let server = resolve_first(&self.server, self.port).await?;
         if !self.via.is_empty() {
+            let server =
+                destination_via_bootstrap(self.bootstrap.as_ref(), &self.server, self.port).await?;
             let response = udp_exchange_via(
                 self.outbound.as_ref(),
                 &self.via,
-                socket_addr_to_socks(server),
+                server.clone(),
                 &MessageExt::to_bytes(&message)?,
             )
             .await?;
@@ -125,6 +133,7 @@ impl DnsTransport for UdpDnsTransport {
             }
             return Ok(response);
         }
+        let server = resolve_first(&self.server, self.port).await?;
         let bind = if server.is_ipv6() {
             SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
         } else {

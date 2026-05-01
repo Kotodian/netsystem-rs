@@ -19,6 +19,8 @@ mod stack;
 mod transport;
 
 use std::net::{IpAddr, SocketAddr};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
@@ -63,6 +65,8 @@ pub struct WireguardEndpoint {
     peers: Arc<Vec<Peer>>,
     protector: SocketProtector,
     inner: Mutex<EndpointState>,
+    #[cfg(test)]
+    fail_next_start: AtomicBool,
 }
 
 struct EndpointRuntime {
@@ -101,6 +105,8 @@ impl WireguardEndpoint {
             peers: Arc::new(peers),
             protector,
             inner: Mutex::new(EndpointState::Idle),
+            #[cfg(test)]
+            fail_next_start: AtomicBool::new(false),
         }
     }
 
@@ -133,6 +139,22 @@ impl WireguardEndpoint {
             }
         }
 
+        let runtime = self.start_runtime()?;
+        let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        if matches!(*inner, EndpointState::Idle) {
+            *inner = EndpointState::Running(runtime);
+        } else {
+            stop_runtime(runtime);
+        }
+        Ok(())
+    }
+
+    fn start_runtime(&self) -> Result<EndpointRuntime, HammerError> {
+        #[cfg(test)]
+        if self.fail_next_start.swap(false, Ordering::SeqCst) {
+            return Err(HammerError::internal("injected wireguard start failure"));
+        }
+
         let transport = transport::spawn_transport(
             self.logger.clone(),
             Arc::clone(&self.peers),
@@ -159,7 +181,7 @@ impl WireguardEndpoint {
             encrypt_tx.clone(),
         )?;
 
-        let runtime = EndpointRuntime {
+        Ok(EndpointRuntime {
             transport: TransportHandles {
                 encrypt_tx,
                 // After hand-off the transport handle no longer needs to expose
@@ -171,10 +193,7 @@ impl WireguardEndpoint {
                 join,
             },
             stack: Arc::new(stack),
-        };
-
-        *self.inner.lock().expect("WireguardEndpoint poisoned") = EndpointState::Running(runtime);
-        Ok(())
+        })
     }
 
     /// Cancel the actors. Safe to call multiple times.
@@ -187,19 +206,18 @@ impl WireguardEndpoint {
             }
         };
         if let Some(rt) = runtime {
-            // Transport: send shutdown signal then abort to be sure.
-            let _ = rt.transport.shutdown.send(());
-            rt.transport.join.abort();
-            // Stack: same — Arc may have other refs (in-flight dial calls),
-            // signal_shutdown is safe under shared ownership.
-            rt.stack.signal_shutdown();
-            rt.stack.abort();
+            stop_runtime(rt);
         }
     }
 
     /// Restart the actors after an outer network change. Unlike `close`, this
     /// keeps the endpoint usable and replaces the UDP socket + smoltcp stack.
     fn restart(&self) {
+        if self.listen_port == 0 {
+            self.restart_ephemeral();
+            return;
+        }
+
         let runtime = {
             let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
             match std::mem::replace(&mut *inner, EndpointState::Idle) {
@@ -214,13 +232,59 @@ impl WireguardEndpoint {
         let Some(rt) = runtime else {
             return;
         };
-        let _ = rt.transport.shutdown.send(());
-        rt.transport.join.abort();
-        rt.stack.signal_shutdown();
-        rt.stack.abort();
+        stop_runtime(rt);
         if let Err(err) = self.boot() {
             error!("restart wireguard endpoint {}: {err}", self.id);
         }
+    }
+
+    fn restart_ephemeral(&self) {
+        {
+            let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+            if !matches!(*inner, EndpointState::Running(_)) {
+                return;
+            }
+        }
+
+        let new_runtime = match self.start_runtime() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                error!("restart wireguard endpoint {}: {err}", self.id);
+                return;
+            }
+        };
+        let old_runtime = {
+            let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+            match std::mem::replace(&mut *inner, EndpointState::Running(new_runtime)) {
+                EndpointState::Running(rt) => Some(rt),
+                EndpointState::Idle => {
+                    let EndpointState::Running(rt) =
+                        std::mem::replace(&mut *inner, EndpointState::Idle)
+                    else {
+                        unreachable!("new runtime was just installed")
+                    };
+                    stop_runtime(rt);
+                    None
+                }
+                EndpointState::Closed => {
+                    let EndpointState::Running(rt) =
+                        std::mem::replace(&mut *inner, EndpointState::Closed)
+                    else {
+                        unreachable!("new runtime was just installed")
+                    };
+                    stop_runtime(rt);
+                    None
+                }
+            }
+        };
+        if let Some(rt) = old_runtime {
+            stop_runtime(rt);
+        }
+    }
+
+    #[cfg(test)]
+    fn fail_next_start_for_test(&self) {
+        self.fail_next_start.store(true, Ordering::SeqCst);
     }
 
     fn stack_handle(&self) -> Result<Arc<StackHandles>, HammerError> {
@@ -230,6 +294,29 @@ impl WireguardEndpoint {
             EndpointState::Idle => Err(HammerError::internal("wireguard endpoint not started yet")),
             EndpointState::Closed => Err(HammerError::internal("wireguard endpoint is closed")),
         }
+    }
+}
+
+fn stop_runtime(rt: EndpointRuntime) {
+    let _ = rt.transport.shutdown.send(());
+    rt.transport.join.abort();
+    rt.stack.signal_shutdown();
+    rt.stack.abort();
+}
+
+fn wireguard_destination_socket_addr(destination: &SocksAddr) -> Result<SocketAddr, HammerError> {
+    if destination.domain.is_some() && is_unspecified_ip(destination.host) {
+        return Err(HammerError::internal(
+            "wireguard endpoint requires an IP destination or resolved fallback",
+        ));
+    }
+    Ok(SocketAddr::new(destination.host, destination.port))
+}
+
+fn is_unspecified_ip(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => addr.is_unspecified(),
+        IpAddr::V6(addr) => addr.is_unspecified(),
     }
 }
 
@@ -287,7 +374,7 @@ impl Outbound for WireguardEndpoint {
             ));
         }
         let stack = self.stack_handle()?;
-        let dst = SocketAddr::new(destination.host, destination.port);
+        let dst = wireguard_destination_socket_addr(&destination)?;
         info!("wireguard dial -> {dst}");
         let mut stream = stack.dial_tcp(dst).await?;
         if !initial_payload.is_empty() {
@@ -386,6 +473,52 @@ mod tests {
             }],
         };
         endpoint_for_test(logger(name), name.to_owned(), options)
+    }
+
+    #[test]
+    fn domain_destination_with_ip_fallback_routes_by_fallback_ip() {
+        let destination = SocksAddr::domain(
+            "resolver.example",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 53)),
+            53,
+        );
+
+        assert_eq!(
+            wireguard_destination_socket_addr(&destination).expect("fallback ip"),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 53)), 53),
+        );
+    }
+
+    #[test]
+    fn unresolved_domain_destination_is_rejected_by_wireguard() {
+        let destination =
+            SocksAddr::domain("resolver.example", IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53);
+
+        let err = wireguard_destination_socket_addr(&destination)
+            .expect_err("unresolved domain must not route to 0.0.0.0");
+        assert!(
+            err.to_string().contains("requires an IP destination"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_keeps_existing_runtime_when_reboot_fails() {
+        let a_priv = [3u8; 32];
+        let b_pub = x25519_public([4u8; 32]);
+        let endpoint = make_endpoint("wg-restart", a_priv, b_pub);
+        endpoint.boot().expect("boot endpoint");
+        let old_stack = endpoint.stack_handle().expect("old stack");
+
+        endpoint.fail_next_start_for_test();
+        endpoint.restart();
+
+        let current_stack = endpoint.stack_handle().expect("runtime should survive");
+        assert!(
+            Arc::ptr_eq(&old_stack, &current_stack),
+            "failed restart must keep the old runtime instead of dropping to Idle",
+        );
+        endpoint.shutdown();
     }
 
     /// Two `WireguardEndpoint`s configured as each other's peer must complete
@@ -625,10 +758,7 @@ mod tests {
 
         // A's in-tunnel address is 10.0.0.1 ← bound by the smoltcp Interface;
         // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
-        let dst = SocksAddr {
-            host: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
-            port: port_b_inside,
-        };
+        let dst = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
         let payload = b"hello over wireguard".to_vec();
         udp_a.send_to(dst, &payload).await.expect("udp_a.send_to");
 
