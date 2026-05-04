@@ -23,16 +23,16 @@ XCFRAMEWORK="${OUTPUT_DIR}/Hammer.xcframework"
 FRAMEWORK="${OUTPUT_DIR}/ios/Hammer.framework"
 DYLIB_SRC="target/aarch64-apple-ios/release/libhammer.dylib"
 BUILD_FEATURES="${FEATURES:-${CARGO_FEATURES:-}}"
-CARGO_FEATURE_ARGS=()
-if [[ -n "${BUILD_FEATURES}" ]]; then
-  CARGO_FEATURE_ARGS=(--features "${BUILD_FEATURES}")
-fi
 
 rm -rf "${OUTPUT_DIR}"
 mkdir -p "${GENERATED_DIR}" "${FRAMEWORK}/Headers" "${FRAMEWORK}/Modules"
 
 echo "==> cargo build cdylib (release, aarch64-apple-ios)"
-cargo build -p hammer-ffi "${CARGO_FEATURE_ARGS[@]}" --release --target aarch64-apple-ios
+if [[ -n "${BUILD_FEATURES}" ]]; then
+  cargo build -p hammer-ffi --features "${BUILD_FEATURES}" --release --target aarch64-apple-ios
+else
+  cargo build -p hammer-ffi --release --target aarch64-apple-ios
+fi
 
 echo "==> assemble Hammer.framework"
 cp "${DYLIB_SRC}" "${FRAMEWORK}/Hammer"
