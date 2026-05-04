@@ -157,27 +157,24 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
     let server = EchoServer::start("secret")
         .await
         .expect("start echo server");
-    let client = Hysteria2Client::connect(
-        ClientOptions {
-            server: "127.0.0.1".to_owned(),
-            server_port: server.port(),
-            password: "secret".to_owned(),
-            server_name: "localhost".to_owned(),
-            insecure: true,
-            udp_enabled: true,
-            bbr_profile: BbrProfile::Standard,
-            disable_path_mtu_discovery: false,
-            initial_packet_size: 1200,
-            idle_timeout: None,
-            keep_alive_period: None,
-            send_bps: 0,
-            receive_bps: 0,
-            brutal_debug: false,
-            obfs: None,
-            platform: None,
-        },
-        logger("outbound/hysteria2"),
-    )
+    let client = Hysteria2Client::connect(ClientOptions {
+        server: "127.0.0.1".to_owned(),
+        server_port: server.port(),
+        password: "secret".to_owned(),
+        server_name: "localhost".to_owned(),
+        insecure: true,
+        udp_enabled: true,
+        bbr_profile: BbrProfile::Standard,
+        disable_path_mtu_discovery: false,
+        initial_packet_size: 1200,
+        idle_timeout: None,
+        keep_alive_period: None,
+        send_bps: 0,
+        receive_bps: 0,
+        brutal_debug: false,
+        obfs: None,
+        platform: None,
+    })
     .await
     .expect("connect client");
 
@@ -205,27 +202,24 @@ async fn hysteria2_client_protects_quic_socket_before_connecting() {
         .await
         .expect("start echo server");
     let platform = Arc::new(ProtectPlatform::default());
-    let _client = Hysteria2Client::connect(
-        ClientOptions {
-            server: "127.0.0.1".to_owned(),
-            server_port: server.port(),
-            password: "secret".to_owned(),
-            server_name: "localhost".to_owned(),
-            insecure: true,
-            udp_enabled: true,
-            bbr_profile: BbrProfile::Standard,
-            disable_path_mtu_discovery: false,
-            initial_packet_size: 1200,
-            idle_timeout: None,
-            keep_alive_period: None,
-            send_bps: 0,
-            receive_bps: 0,
-            brutal_debug: false,
-            obfs: None,
-            platform: Some(Arc::clone(&platform) as Arc<dyn PlatformInterface>),
-        },
-        logger("outbound/hysteria2"),
-    )
+    let _client = Hysteria2Client::connect(ClientOptions {
+        server: "127.0.0.1".to_owned(),
+        server_port: server.port(),
+        password: "secret".to_owned(),
+        server_name: "localhost".to_owned(),
+        insecure: true,
+        udp_enabled: true,
+        bbr_profile: BbrProfile::Standard,
+        disable_path_mtu_discovery: false,
+        initial_packet_size: 1200,
+        idle_timeout: None,
+        keep_alive_period: None,
+        send_bps: 0,
+        receive_bps: 0,
+        brutal_debug: false,
+        obfs: None,
+        platform: Some(Arc::clone(&platform) as Arc<dyn PlatformInterface>),
+    })
     .await
     .expect("connect client");
 

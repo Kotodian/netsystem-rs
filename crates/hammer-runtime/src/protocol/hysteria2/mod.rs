@@ -75,11 +75,11 @@ pub struct Hysteria2Client {
 }
 
 impl Hysteria2Client {
-    pub async fn connect(
-        options: ClientOptions,
-        _logger: Logger,
-    ) -> Result<Arc<Self>, HammerError> {
+    pub async fn connect(options: ClientOptions) -> Result<Arc<Self>, HammerError> {
+        let server = format!("{}:{}", options.server, effective_port(options.server_port));
+        debug!("hysteria2 resolving server {server}");
         let address = resolve_server(&options.server, options.server_port).await?;
+        debug!("hysteria2 resolved server {server} -> {address}");
         let congestion = CongestionControlHandle::default();
         let endpoint = client_endpoint(&options, address, congestion.clone())?;
         let server_name = if options.server_name.is_empty() {
@@ -87,12 +87,19 @@ impl Hysteria2Client {
         } else {
             options.server_name.as_str()
         };
+        debug!(
+            "hysteria2 connecting {address} server_name={server_name} udp={}",
+            options.udp_enabled
+        );
         let connection = endpoint
             .connect(address, server_name)
             .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?
             .await
             .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?;
+        debug!("hysteria2 connected {address}");
+        debug!("hysteria2 authenticating");
         let (h3_sender, auth_response) = authenticate(&connection, &options).await?;
+        debug!("hysteria2 authenticated udp={}", options.udp_enabled);
         let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
         if !auth_response.rx_auto && actual_tx > 0 {
             congestion.use_brutal(actual_tx);
@@ -225,6 +232,13 @@ impl ProxyPacketConn for Hysteria2PacketConn {
             return Err(HammerError::internal("UDP packet too large"));
         }
         let packet_id = self.packet_id.fetch_add(1, Ordering::SeqCst);
+        debug!(
+            "hysteria2 UDP send session={} packet={} dest={} bytes={}",
+            self.session_id,
+            packet_id,
+            destination,
+            payload.len()
+        );
         let message = protocol::UdpMessage {
             session_id: self.session_id,
             packet_id,
@@ -239,10 +253,18 @@ impl ProxyPacketConn for Hysteria2PacketConn {
     }
 
     async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| HammerError::internal("hysteria2 UDP session closed"))
+        match self.rx.recv().await {
+            Some(datagram) => {
+                debug!(
+                    "hysteria2 UDP recv session={} addr={} bytes={}",
+                    self.session_id,
+                    datagram.destination,
+                    datagram.payload.len()
+                );
+                Ok(datagram)
+            }
+            None => Err(HammerError::internal("hysteria2 UDP session closed")),
+        }
     }
 }
 
@@ -257,7 +279,6 @@ impl Drop for Hysteria2PacketConn {
 }
 
 pub struct Hysteria2Outbound {
-    logger: Logger,
     id: String,
     options: Hysteria2OutboundOptions,
     networks: Vec<Network>,
@@ -278,14 +299,13 @@ impl Hysteria2Outbound {
     }
 
     pub(crate) fn new_with_protector(
-        logger: Logger,
+        _logger: Logger,
         id: String,
         options: Hysteria2OutboundOptions,
         protector: SocketProtector,
     ) -> Self {
         let networks = adapter_networks(&options.network);
         Self {
-            logger,
             id,
             options,
             networks,
@@ -310,7 +330,14 @@ impl Hysteria2Outbound {
             }
             let epoch = self.client_epoch();
             let options = self.client_options()?;
-            let client = Hysteria2Client::connect(options, self.logger.clone()).await?;
+            debug!("hysteria2 outbound {} initializing client", self.id);
+            let client = match Hysteria2Client::connect(options).await {
+                Ok(client) => client,
+                Err(err) => {
+                    error!("hysteria2 outbound {} connect failed: {err}", self.id);
+                    return Err(err);
+                }
+            };
             let mut state = self
                 .client_state
                 .lock()
@@ -321,6 +348,7 @@ impl Hysteria2Outbound {
                 continue;
             }
             state.client = Some(Arc::clone(&client));
+            debug!("hysteria2 outbound {} client ready", self.id);
             return Ok(client);
         }
     }
@@ -705,7 +733,7 @@ impl quinn::AsyncUdpSocket for SalamanderUdpSocket {
 }
 
 async fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
-    let port = if port == 0 { 443 } else { port };
+    let port = effective_port(port);
     if let Ok(ip) = server.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
@@ -714,6 +742,10 @@ async fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerErr
         .map_err(|err| HammerError::internal(format!("resolve hysteria2 server: {err}")))?
         .next()
         .ok_or_else(|| HammerError::internal("empty hysteria2 server resolution"))
+}
+
+fn effective_port(port: u16) -> u16 {
+    if port == 0 { 443 } else { port }
 }
 
 fn mbps_to_bps(mbps: i64) -> Result<u64, HammerError> {

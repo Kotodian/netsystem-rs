@@ -178,10 +178,21 @@ pub(super) async fn udp_exchange_via(
     destination: SocksAddr,
     payload: &[u8],
 ) -> Result<Bytes, HammerError> {
-    debug!("dns udp via outbound={via} dest={destination}");
+    debug!(
+        "dns udp via outbound={via} dest={destination} bytes={}",
+        payload.len()
+    );
     let mut conn = outbound_by_id(outbound, via)?.listen_packet().await?;
-    conn.send_to(destination, payload).await?;
-    Ok(conn.recv_from().await?.payload)
+    debug!("dns udp via outbound={via} packet conn ready");
+    conn.send_to(destination.clone(), payload).await?;
+    debug!("dns udp via outbound={via} sent dest={destination}");
+    let response = conn.recv_from().await?;
+    debug!(
+        "dns udp via outbound={via} received from {} bytes={}",
+        response.destination,
+        response.payload.len()
+    );
+    Ok(response.payload)
 }
 
 #[cfg(feature = "dns-tcp")]
