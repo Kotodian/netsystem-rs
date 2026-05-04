@@ -762,7 +762,6 @@ impl DnsTransportManager {
     }
 }
 
-#[cfg(feature = "dns-hosts")]
 /// Determine the bootstrap DNS server tag this server will actually use at
 /// runtime. Mirrors the validator semantics in hammer-core: per-server
 /// `domain_resolver` wins; falls back to `route.default_domain_resolver`;
@@ -835,6 +834,7 @@ fn topo_visit_dns<'a>(
     Ok(())
 }
 
+#[cfg(feature = "dns-hosts")]
 fn build_hosts_transport(
     id: String,
     kind: &DnsServerKind,

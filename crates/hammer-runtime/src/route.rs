@@ -81,6 +81,23 @@ impl Router {
         self.route_to_default(metadata.network)
     }
 
+    #[cfg(feature = "inbound-tun")]
+    pub(crate) fn prepare_route_metadata(
+        &self,
+        metadata: &mut RouteMetadata,
+    ) -> Result<(), HammerError> {
+        for rule in &self.rules {
+            if !rule.matches(metadata) {
+                continue;
+            }
+            match rule.apply(metadata)? {
+                RuleApply::Continue => {}
+                RuleApply::Decision(_) => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
     pub fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
         self.rules.iter().find_map(|rule| {
             if !rule.matches(metadata) {

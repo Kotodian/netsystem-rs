@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use hammer_adapter::{
     DnsTransport, InboundManager as _, Lifecycle, Network, RouteDecision, SocksAddr,
 };
-use hammer_core::config::{self, DirectOutboundOptions, Options, Outbound, OutboundKind};
+use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
@@ -69,12 +69,8 @@ fn router_from_options(options: &Options) -> Arc<Router> {
 }
 
 fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
-    let outbounds = vec![Outbound {
-        id: final_outbound.to_owned(),
-        kind: OutboundKind::Direct(DirectOutboundOptions::default()),
-    }];
     let outbound = Arc::new(
-        OutboundManager::from_options(logger("outbound"), final_outbound, &outbounds)
+        OutboundManager::from_options(logger("outbound"), final_outbound, &options.outbounds)
             .expect("outbound manager"),
     );
     let route_options = hammer_core::config::RouteOptions {
@@ -99,6 +95,64 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
         outbound,
         "tun".to_owned(),
     )
+}
+
+#[tokio::test]
+async fn tun_stack_matches_udp_routes_using_reverse_dns_before_default_route() {
+    let options = config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "direct"
+
+[[route.rules]]
+domain_suffix = ["example.com"]
+outbound = "hysteria2"
+"#,
+    )
+    .expect("parse config");
+    let stack = runtime_stack(&options, "direct");
+    let dns_packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [1, 1, 1, 1],
+        5353,
+        53,
+        dns_query("www.example.com"),
+    );
+
+    stack
+        .dispatch_packet(&dns_packet)
+        .await
+        .expect("populate reverse DNS");
+
+    let routed_packet = ipv4_udp_packet(
+        [10, 0, 0, 2],
+        [203, 0, 113, 53],
+        5353,
+        443,
+        b"payload".to_vec(),
+    );
+    let flow = stack.handle_packet(&routed_packet).expect("handle packet");
+
+    assert_eq!(flow.metadata.domain.as_deref(), Some("www.example.com"));
+    assert_eq!(
+        flow.decision,
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
 }
 
 #[tokio::test]

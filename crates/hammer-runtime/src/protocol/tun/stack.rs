@@ -865,6 +865,11 @@ impl SmoltcpTunStack {
 
     pub fn handle_packet(&self, packet: &[u8]) -> Result<PacketFlow, HammerError> {
         let mut tun_packet = self.packet_context(packet)?;
+        prepare_route_metadata(
+            self.router.as_ref(),
+            &mut tun_packet.metadata,
+            self.dns_router.as_deref(),
+        )?;
         let decision = self.router.match_route(&mut tun_packet.metadata)?;
         debug!("handled TUN {:?} packet", tun_packet.metadata.network);
         Ok(PacketFlow {
@@ -875,6 +880,11 @@ impl SmoltcpTunStack {
 
     pub async fn dispatch_packet(&self, packet: &[u8]) -> Result<TunDispatch, HammerError> {
         let mut tun_packet = self.packet_context(packet)?;
+        prepare_route_metadata(
+            self.router.as_ref(),
+            &mut tun_packet.metadata,
+            self.dns_router.as_deref(),
+        )?;
         let decision = self.router.match_route(&mut tun_packet.metadata)?;
         match decision {
             RouteDecision::HijackDns => self.dispatch_dns(tun_packet).await,
@@ -1669,6 +1679,11 @@ async fn handle_system_udp_packet(
     if router.should_sniff(&tun_packet.metadata) {
         sniff_packet(&mut tun_packet);
     }
+    prepare_route_metadata(
+        router.as_ref(),
+        &mut tun_packet.metadata,
+        Some(dns_router.as_ref()),
+    )?;
     match router.match_route(&mut tun_packet.metadata)? {
         RouteDecision::HijackDns => {
             let message = <Message as MessageExt>::from_bytes(&tun_packet.payload)?;
@@ -1761,6 +1776,40 @@ fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
         strategy: metadata.domain_strategy.unwrap_or_default(),
         ..DnsQueryOptions::default()
     }
+}
+
+fn prepare_route_metadata(
+    router: &Router,
+    metadata: &mut RouteMetadata,
+    dns_router: Option<&DnsRouter>,
+) -> Result<(), HammerError> {
+    router.prepare_route_metadata(metadata)?;
+    apply_reverse_dns_mapping(metadata, dns_router);
+    Ok(())
+}
+
+fn apply_reverse_dns_mapping(metadata: &mut RouteMetadata, dns_router: Option<&DnsRouter>) {
+    if metadata.network != Network::Udp
+        || metadata.udp_disable_domain_unmapping
+        || metadata.domain.is_some()
+    {
+        return;
+    }
+    let Some(destination) = metadata.destination.as_mut() else {
+        return;
+    };
+    if destination.domain.is_some() {
+        return;
+    }
+    let Some(router) = dns_router else {
+        return;
+    };
+    let Some(domain) = router.lookup_reverse_mapping(destination.host) else {
+        return;
+    };
+    let domain = normalize_destination_domain(&domain);
+    metadata.domain = Some(domain.clone());
+    destination.domain = Some(domain);
 }
 
 fn route_destination(
