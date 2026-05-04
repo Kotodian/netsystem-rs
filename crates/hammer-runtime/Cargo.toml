@@ -30,6 +30,7 @@ outbound-hysteria2 = [
     "dep:rand",
     "dep:rustls",
     "dep:rustls-native-certs",
+    "dep:rustls-platform-verifier",
 ]
 outbound-direct = []
 outbound-block = []
@@ -43,6 +44,7 @@ dns-https = [
     "dep:hyper-util",
     "dep:rustls",
     "dep:rustls-native-certs",
+    "dep:rustls-platform-verifier",
     "dep:tokio-rustls",
 ]
 dns-hosts = []
@@ -89,6 +91,9 @@ tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
 libc = { workspace = true, optional = true }
 lru = { workspace = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rustls-platform-verifier = { workspace = true, optional = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

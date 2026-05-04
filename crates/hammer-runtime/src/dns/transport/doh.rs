@@ -16,7 +16,7 @@ use tokio_rustls::TlsConnector;
 use crate::OutboundManager;
 use crate::dns::MessageExt;
 use crate::socket_protector::SocketProtector;
-use crate::tls_support::root_cert_store;
+use crate::tls_support::client_verifier_builder;
 
 use super::{
     dependency_with_bootstrap, destination_via_bootstrap, direct_tcp_connect, host_header,
@@ -165,13 +165,12 @@ async fn doh_exchange_http2(
             .dial(Network::Tcp, server.clone(), &[])
             .await?
     };
-    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+    let tls_builder = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|err| HammerError::internal(format!("dns tls versions: {err}")))?
-    .with_root_certificates(root_cert_store(platform))
-    .with_no_client_auth();
+    .map_err(|err| HammerError::internal(format!("dns tls versions: {err}")))?;
+    let tls_config = client_verifier_builder(tls_builder, platform)?.with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
     let server_name = rustls::pki_types::ServerName::try_from(host_name.clone())
         .map_err(|err| HammerError::internal(format!("invalid DNS TLS server name: {err}")))?;

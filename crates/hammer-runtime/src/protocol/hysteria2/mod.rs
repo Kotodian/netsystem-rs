@@ -612,8 +612,8 @@ fn client_config(
             .with_custom_certificate_verifier(SkipServerVerification::new(provider))
             .with_no_client_auth()
     } else {
-        let roots = crate::tls_support::root_cert_store(options.platform.clone());
-        builder.with_root_certificates(roots).with_no_client_auth()
+        crate::tls_support::client_verifier_builder(builder, options.platform.clone())?
+            .with_no_client_auth()
     };
     crypto.alpn_protocols = vec![b"h3".to_vec()];
     let mut config = quinn::ClientConfig::new(Arc::new(
