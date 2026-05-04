@@ -15,8 +15,8 @@ namespace hammer {
   HammerService hammer_new_service(string config_content, HammerPlatform platform);
 
   // gomobile shipped a global helper that scanned the process for a utun fd.
-  // Rust services obtain the fd via `HammerPlatform.openTun`; this returns -1
-  // and the host should fall back to its own discovery (the legacy demo did).
+  // Rust keeps the same fallback on Apple platforms for hosts where
+  // NEPacketTunnelFlow does not expose a stable KVC fd path.
   i32 hammer_get_tunnel_file_descriptor();
 };
 

@@ -24,6 +24,7 @@ hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 async-trait = { workspace = true }
+libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

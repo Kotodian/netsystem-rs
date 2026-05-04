@@ -1005,6 +1005,7 @@ dependencies = [
  "hammer-core",
  "hammer-runtime",
  "indoc",
+ "libc",
  "thiserror",
  "tokio",
  "tracing",
