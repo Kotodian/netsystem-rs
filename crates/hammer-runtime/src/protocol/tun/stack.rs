@@ -238,6 +238,7 @@ pub struct SystemTcpSession {
     pub source: SocksAddr,
     pub destination: SocksAddr,
     last_active: StdInstant,
+    active_connections: usize,
 }
 
 #[derive(Debug)]
@@ -275,6 +276,22 @@ impl SystemTcpNat {
         Some(session.clone())
     }
 
+    fn claim_active(&mut self, port: u16) -> Option<SystemTcpSession> {
+        self.cleanup_expired();
+        let session = self.by_port.get_mut(&port)?;
+        session.last_active = StdInstant::now();
+        session.active_connections += 1;
+        Some(session.clone())
+    }
+
+    fn release_active(&mut self, port: u16) {
+        if let Some(session) = self.by_port.get_mut(&port) {
+            session.active_connections = session.active_connections.saturating_sub(1);
+            session.last_active = StdInstant::now();
+        }
+        self.cleanup_expired();
+    }
+
     fn lookup_or_insert(&mut self, source: SocksAddr, destination: SocksAddr) -> u16 {
         self.cleanup_expired();
         let key = (source.host, source.port, destination.host, destination.port);
@@ -297,6 +314,7 @@ impl SystemTcpNat {
                 source,
                 destination,
                 last_active: StdInstant::now(),
+                active_connections: 0,
             },
         );
         port
@@ -305,10 +323,30 @@ impl SystemTcpNat {
     fn cleanup_expired(&mut self) {
         let now = StdInstant::now();
         let timeout = self.timeout;
-        self.by_port
-            .retain(|_, session| now.duration_since(session.last_active) <= timeout);
+        self.by_port.retain(|_, session| {
+            session.active_connections > 0 || now.duration_since(session.last_active) <= timeout
+        });
         self.by_flow
             .retain(|_, port| self.by_port.contains_key(port));
+    }
+}
+
+struct SystemTcpNatLease {
+    nat: Arc<StdMutex<SystemTcpNat>>,
+    port: u16,
+}
+
+impl SystemTcpNatLease {
+    fn new(nat: Arc<StdMutex<SystemTcpNat>>, port: u16) -> Self {
+        Self { nat, port }
+    }
+}
+
+impl Drop for SystemTcpNatLease {
+    fn drop(&mut self) {
+        if let Ok(mut nat) = self.nat.lock() {
+            nat.release_active(self.port);
+        }
     }
 }
 
@@ -1528,17 +1566,19 @@ async fn accept_tcp_loop(
         };
         let session = {
             let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
-            nat.lookup_back(peer.port())
+            nat.claim_active(peer.port())
         };
         let Some(session) = session else {
             debug!("unknown system TCP NAT session: {}", peer.port());
             continue;
         };
+        let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
         let router = Arc::clone(&router);
         let outbound = Arc::clone(&outbound);
         let tcp_pending_dials = tcp_pending_dials.clone();
         let inbound_id = inbound_id.clone();
         crate::spawn::spawn(async move {
+            let _nat_lease = nat_lease;
             let mut metadata = RouteMetadata {
                 inbound: inbound_id,
                 network: Network::Tcp,
