@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -293,6 +293,64 @@ fn smoltcp_stack_facade_routes_packets_through_router() {
     assert_eq!(flow.decision, RouteDecision::HijackDns);
     assert_eq!(flow.metadata.network, Network::Udp);
     assert_eq!(flow.metadata.protocol, "dns");
+}
+
+#[test]
+fn smoltcp_stack_facade_sets_icmp_protocol_metadata_for_routing() {
+    let options = config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "hosts"
+
+[route]
+final = "direct"
+
+[[route.rules]]
+protocol = ["icmp"]
+outbound = "hysteria2"
+
+[[route.rules]]
+protocol = ["icmpv6"]
+outbound = "hysteria2"
+"#,
+    )
+    .expect("parse config");
+    let router = router_from_options(&options);
+    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+
+    let ipv4 = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping");
+    let flow = stack.handle_packet(&ipv4).expect("handle ipv4 icmp");
+    assert_eq!(flow.metadata.protocol, "icmp");
+    assert_eq!(
+        flow.decision,
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+
+    let ipv6 = ipv6_icmp_echo_request(
+        Ipv6Addr::LOCALHOST.octets(),
+        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111).octets(),
+        0xcafe,
+        2,
+        b"ping6",
+    );
+    let flow = stack.handle_packet(&ipv6).expect("handle ipv6 icmp");
+    assert_eq!(flow.metadata.protocol, "icmpv6");
+    assert_eq!(
+        flow.decision,
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
 }
 
 #[tokio::test]
@@ -704,7 +762,10 @@ fn parse_icmpv4_echo_request_yields_icmp_metadata() {
     let parsed = parse_ip_packet(&packet).expect("parse icmp echo");
     assert_eq!(parsed.network, Network::Icmp);
     assert_eq!(parsed.source.host, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
-    assert_eq!(parsed.destination.host, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    assert_eq!(
+        parsed.destination.host,
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
+    );
     // ICMP has no port concept; both ends carry the conventional 0.
     assert_eq!(parsed.source.port, 0);
     assert_eq!(parsed.destination.port, 0);
@@ -740,9 +801,12 @@ fn icmp_unreachable_packet_swaps_addresses_and_marks_host_unreachable() {
 #[test]
 fn icmp_echo_reply_packet_swaps_addresses_and_normalises_type() {
     let request = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"hello");
-    // Stub kernel-delivered reply body: type=0 echo reply, same id/seq.
+    // Stub kernel-delivered reply body: type=0 echo reply, with the
+    // kernel-owned ping-socket id/seq that must not leak back to the app.
     let mut reply_body = request[20..].to_vec();
     reply_body[0] = 0; // echo reply
+    reply_body[4..6].copy_from_slice(&0x4444_u16.to_be_bytes());
+    reply_body[6..8].copy_from_slice(&9_u16.to_be_bytes());
     reply_body[2] = 0; // zero checksum so we can recompute below
     reply_body[3] = 0;
     let csum = icmp_checksum(&reply_body);
@@ -758,6 +822,34 @@ fn icmp_echo_reply_packet_swaps_addresses_and_normalises_type() {
     assert_eq!(&response[24..26], &0xbeef_u16.to_be_bytes());
     assert_eq!(&response[26..28], &1_u16.to_be_bytes());
     assert_eq!(&response[28..], b"hello");
+    assert_eq!(icmp_checksum(&response[20..]), 0);
+}
+
+#[test]
+fn icmp_echo_reply_packet_restores_ipv6_identifier_and_sequence() {
+    let request = ipv6_icmp_echo_request(
+        Ipv6Addr::LOCALHOST.octets(),
+        Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111).octets(),
+        0xcafe,
+        2,
+        b"hello6",
+    );
+    let mut reply_body = request[40..].to_vec();
+    reply_body[0] = 129; // echo reply
+    reply_body[4..6].copy_from_slice(&0x5555_u16.to_be_bytes());
+    reply_body[6..8].copy_from_slice(&7_u16.to_be_bytes());
+    reply_body[2..4].copy_from_slice(&0_u16.to_be_bytes());
+
+    let response = icmp_echo_reply_packet(&request, &reply_body).expect("build reply");
+
+    assert_eq!(&response[8..24], &request[24..40]);
+    assert_eq!(&response[24..40], &request[8..24]);
+    assert_eq!(response[6], 58, "IPv6 reply must be ICMPv6");
+    assert_eq!(response[40], 129, "echo reply type");
+    assert_eq!(&response[44..46], &0xcafe_u16.to_be_bytes());
+    assert_eq!(&response[46..48], &2_u16.to_be_bytes());
+    assert_eq!(&response[48..], b"hello6");
+    assert_eq!(icmpv6_checksum(&response), 0);
 }
 
 #[tokio::test]
@@ -808,6 +900,31 @@ fn ipv4_icmp_echo_request(
     packet
 }
 
+fn ipv6_icmp_echo_request(
+    source: [u8; 16],
+    destination: [u8; 16],
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let icmp_len = 8 + payload.len();
+    let mut packet = vec![0u8; 40 + icmp_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(icmp_len as u16).to_be_bytes());
+    packet[6] = 58; // ICMPv6
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&source);
+    packet[24..40].copy_from_slice(&destination);
+    packet[40] = 128; // echo request
+    packet[41] = 0;
+    packet[44..46].copy_from_slice(&identifier.to_be_bytes());
+    packet[46..48].copy_from_slice(&sequence.to_be_bytes());
+    packet[48..].copy_from_slice(payload);
+    let csum = icmpv6_checksum(&packet);
+    packet[42..44].copy_from_slice(&csum.to_be_bytes());
+    packet
+}
+
 fn icmp_checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0;
@@ -822,4 +939,14 @@ fn icmp_checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+fn icmpv6_checksum(packet: &[u8]) -> u16 {
+    let icmp_len = packet.len() - 40;
+    let mut pseudo = Vec::with_capacity(40 + icmp_len);
+    pseudo.extend_from_slice(&packet[8..40]);
+    pseudo.extend_from_slice(&(icmp_len as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&packet[40..]);
+    icmp_checksum(&pseudo)
 }

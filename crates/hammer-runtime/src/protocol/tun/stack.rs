@@ -902,6 +902,10 @@ impl SmoltcpTunStack {
             metadata: RouteMetadata {
                 inbound: self.inbound_id.clone(),
                 network: parsed.network,
+                protocol: match parsed.network {
+                    Network::Icmp => icmp_protocol(parsed.destination.host).to_owned(),
+                    _ => String::new(),
+                },
                 source: Some(parsed.source),
                 destination: Some(parsed.destination),
                 ..Default::default()
@@ -912,8 +916,7 @@ impl SmoltcpTunStack {
             match tun_packet.metadata.network {
                 Network::Tcp => sniff_stream(&mut tun_packet),
                 Network::Udp => sniff_packet(&mut tun_packet),
-                // ICMP carries no application-layer payload to sniff;
-                // metadata stays as parsed (network=icmp, addresses set).
+                // ICMP carries no application-layer payload to sniff.
                 Network::Icmp => {}
             }
         }
@@ -2169,6 +2172,14 @@ const ICMPV4_ECHO_REPLY: u8 = 0;
 const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 
+fn icmp_protocol(destination: IpAddr) -> &'static str {
+    if destination.is_ipv6() {
+        "icmpv6"
+    } else {
+        "icmp"
+    }
+}
+
 fn parse_icmpv4(
     source: IpAddr,
     destination: IpAddr,
@@ -2229,11 +2240,7 @@ async fn handle_system_icmp_packet(
             network: Network::Icmp,
             source: Some(parsed.source.clone()),
             destination: Some(parsed.destination.clone()),
-            protocol: if parsed.destination.host.is_ipv6() {
-                "icmpv6".to_owned()
-            } else {
-                "icmp".to_owned()
-            },
+            protocol: icmp_protocol(parsed.destination.host).to_owned(),
             ..Default::default()
         },
         payload: parsed.payload.clone(),
@@ -2428,10 +2435,7 @@ fn ipv6_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> 
 /// Wrap the kernel-delivered ICMP reply body (starting at the ICMP
 /// type byte) into a tun-deliverable IP packet. We swap src/dst from
 /// the original echo request so the reply reaches the originating app.
-pub fn icmp_echo_reply_packet(
-    request: &[u8],
-    reply_body: &[u8],
-) -> Result<Vec<u8>, HammerError> {
+pub fn icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
     match request.first().map(|byte| byte >> 4) {
         Some(4) => ipv4_icmp_echo_reply_packet(request, reply_body),
         Some(6) => ipv6_icmp_echo_reply_packet(request, reply_body),
@@ -2442,12 +2446,13 @@ pub fn icmp_echo_reply_packet(
     }
 }
 
-fn ipv4_icmp_echo_reply_packet(
-    request: &[u8],
-    reply_body: &[u8],
-) -> Result<Vec<u8>, HammerError> {
+fn ipv4_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
     if request.len() < 20 {
         return Err(HammerError::internal("invalid IPv4 packet"));
+    }
+    let request_ihl = ((request[0] & 0x0f) as usize) * 4;
+    if request_ihl < 20 || request.len() < request_ihl + 8 {
+        return Err(HammerError::internal("invalid IPv4 ICMP packet"));
     }
     if reply_body.len() < 8 {
         return Err(HammerError::internal("ICMPv4 reply too short"));
@@ -2468,18 +2473,16 @@ fn ipv4_icmp_echo_reply_packet(
     // already carries type=0 in well-behaved cases, but we normalise
     // defensively in case a custom outbound passes back a literal echo.
     packet[20] = ICMPV4_ECHO_REPLY;
+    packet[24..28].copy_from_slice(&request[request_ihl + 4..request_ihl + 8]);
     write_u16(&mut packet, 22, 0);
     let icmp_checksum = checksum(&packet[20..]);
     write_u16(&mut packet, 22, icmp_checksum);
     Ok(packet)
 }
 
-fn ipv6_icmp_echo_reply_packet(
-    request: &[u8],
-    reply_body: &[u8],
-) -> Result<Vec<u8>, HammerError> {
-    if request.len() < 40 {
-        return Err(HammerError::internal("invalid IPv6 packet"));
+fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
+    if request.len() < 48 {
+        return Err(HammerError::internal("invalid IPv6 ICMP packet"));
     }
     if reply_body.len() < 8 {
         return Err(HammerError::internal("ICMPv6 reply too short"));
@@ -2494,6 +2497,7 @@ fn ipv6_icmp_echo_reply_packet(
     packet[24..40].copy_from_slice(&request[8..24]);
     packet[40..].copy_from_slice(reply_body);
     packet[40] = ICMPV6_ECHO_REPLY;
+    packet[44..48].copy_from_slice(&request[44..48]);
     update_ipv6_icmp_checksum(&mut packet)?;
     Ok(packet)
 }
