@@ -17,11 +17,13 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use libc::{c_int, c_void, iovec, size_t, socklen_t};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
+use tracing::debug;
 
 use hammer_core::error::HammerError;
 
@@ -515,6 +517,21 @@ impl TunDevice for AppleTunDevice {
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                     guard.clear_ready();
+                }
+                // utun is a kernel control socket; under burst the kctl pipe
+                // queue fills and `sendmsg_x` returns ENOBUFS or ENOSPC.
+                // Both are transient backpressure — kqueue may still report
+                // writable, so clear readiness AND sleep briefly to let the
+                // kernel drain before retrying the unsent suffix.
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(libc::ENOBUFS) | Some(libc::ENOSPC)
+                    ) =>
+                {
+                    debug!("apple TUN send backpressure: {err}; backing off 1ms");
+                    guard.clear_ready();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
                 Err(err) => {
                     break Err(HammerError::internal(format!("sendmsg_x: {err}")));
