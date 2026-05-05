@@ -2,13 +2,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hammer_adapter::{DnsTransport, Lifecycle, StartStage};
+use hammer_adapter::{DnsTransport, Lifecycle, OutboundManager as _, StartStage};
 use hammer_core::config::{DnsServerKind, RemoteDnsServer};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use tokio::net::UdpSocket;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::OutboundManager;
 use crate::dns::MessageExt;
@@ -87,7 +87,25 @@ impl Lifecycle for UdpDnsTransport {
     fn name(&self) -> &str {
         "dns/transport/udp"
     }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+        if stage != StartStage::Start || self.via.is_empty() {
+            return Ok(());
+        }
+        let Some(outbound) = self.outbound.clone() else {
+            return Ok(());
+        };
+        let id = self.id.clone();
+        let via = self.via.clone();
+        crate::spawn::spawn(async move {
+            let Some(outbound) = outbound.get(&via) else {
+                debug!("dns udp warm-up skipped server={id} via={via}: outbound not found");
+                return;
+            };
+            match outbound.listen_packet().await {
+                Ok(_conn) => debug!("dns udp warm-up ready server={id} via={via}"),
+                Err(err) => debug!("dns udp warm-up failed server={id} via={via}: {err}"),
+            }
+        });
         Ok(())
     }
     fn close(&self) -> Result<(), HammerError> {
