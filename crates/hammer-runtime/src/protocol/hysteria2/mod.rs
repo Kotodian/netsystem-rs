@@ -45,6 +45,7 @@ use crate::socket_protector::SocketProtector;
 const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = STREAM_RECEIVE_WINDOW / 2 * 5;
 const SEND_WINDOW: u64 = CONNECTION_RECEIVE_WINDOW as u64;
+const HYSTERIA2_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub struct ClientOptions {
@@ -76,45 +77,7 @@ pub struct Hysteria2Client {
 
 impl Hysteria2Client {
     pub async fn connect(options: ClientOptions) -> Result<Arc<Self>, HammerError> {
-        let server = format!("{}:{}", options.server, effective_port(options.server_port));
-        debug!("hysteria2 resolving server {server}");
-        let address = resolve_server(&options.server, options.server_port).await?;
-        debug!("hysteria2 resolved server {server} -> {address}");
-        let congestion = CongestionControlHandle::default();
-        let endpoint = client_endpoint(&options, address, congestion.clone())?;
-        let server_name = if options.server_name.is_empty() {
-            options.server.as_str()
-        } else {
-            options.server_name.as_str()
-        };
-        debug!(
-            "hysteria2 connecting {address} server_name={server_name} udp={}",
-            options.udp_enabled
-        );
-        let connection = endpoint
-            .connect(address, server_name)
-            .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?
-            .await
-            .map_err(|err| HammerError::internal(format!("connect hysteria2: {err}")))?;
-        debug!("hysteria2 connected {address}");
-        debug!("hysteria2 authenticating");
-        let (h3_sender, auth_response) = authenticate(&connection, &options).await?;
-        debug!("hysteria2 authenticated udp={}", options.udp_enabled);
-        let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
-        if !auth_response.rx_auto && actual_tx > 0 {
-            congestion.use_brutal(actual_tx);
-        }
-        let client = Arc::new(Self {
-            connection,
-            _endpoint: endpoint,
-            _h3_sender: h3_sender,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            next_session: AtomicU32::new(1),
-        });
-        if options.udp_enabled {
-            spawn_datagram_loop(Arc::clone(&client));
-        }
-        Ok(client)
+        connect_with_timeout(options, HYSTERIA2_CONNECT_TIMEOUT).await
     }
 
     pub async fn dial_tcp(
@@ -158,6 +121,68 @@ impl Hysteria2Client {
     pub fn close(&self, reason: &'static [u8]) {
         self.connection.close(0u32.into(), reason);
     }
+}
+
+async fn connect_with_timeout(
+    options: ClientOptions,
+    connect_timeout: Duration,
+) -> Result<Arc<Hysteria2Client>, HammerError> {
+    let server = format!("{}:{}", options.server, effective_port(options.server_port));
+    debug!("hysteria2 resolving server {server}");
+    let address = resolve_server(&options.server, options.server_port).await?;
+    debug!("hysteria2 resolved server {server} -> {address}");
+    let congestion = CongestionControlHandle::default();
+    let endpoint = client_endpoint(&options, address, congestion.clone())?;
+    let server_name = if options.server_name.is_empty() {
+        options.server.as_str()
+    } else {
+        options.server_name.as_str()
+    };
+    let tls_mode = tls_mode(&options);
+    debug!(
+        "hysteria2 connecting {address} server_name={server_name} tls={tls_mode} udp={} timeout={}",
+        options.udp_enabled,
+        duration_label(connect_timeout)
+    );
+    let context = connect_context(&server, address, server_name, tls_mode, options.udp_enabled);
+    let connecting = endpoint.connect(address, server_name).map_err(|err| {
+        HammerError::internal(format!("start hysteria2 connect failed {context}: {err}"))
+    })?;
+    let connection = match tokio::time::timeout(connect_timeout, connecting).await {
+        Ok(Ok(connection)) => connection,
+        Ok(Err(err)) => {
+            return Err(HammerError::internal(format!(
+                "connect hysteria2 failed {context}: {err}"
+            )));
+        }
+        Err(_) => {
+            return Err(HammerError::internal(format!(
+                "connect hysteria2 timed out after {} {context}; no QUIC handshake result",
+                duration_label(connect_timeout)
+            )));
+        }
+    };
+    debug!("hysteria2 connected {address}");
+    debug!("hysteria2 authenticating {context}");
+    let (h3_sender, auth_response) = authenticate(&connection, &options)
+        .await
+        .map_err(|err| HammerError::internal(format!("hysteria2 auth failed {context}: {err}")))?;
+    debug!("hysteria2 authenticated udp={}", options.udp_enabled);
+    let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
+    if !auth_response.rx_auto && actual_tx > 0 {
+        congestion.use_brutal(actual_tx);
+    }
+    let client = Arc::new(Hysteria2Client {
+        connection,
+        _endpoint: endpoint,
+        _h3_sender: h3_sender,
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        next_session: AtomicU32::new(1),
+    });
+    if options.udp_enabled {
+        spawn_datagram_loop(Arc::clone(&client));
+    }
+    Ok(client)
 }
 
 pub struct Hysteria2Stream {
@@ -581,7 +606,12 @@ fn client_endpoint(
     };
     let socket = std::net::UdpSocket::bind(bind_addr)
         .map_err(|err| HammerError::internal(format!("bind QUIC UDP socket: {err}")))?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|err| HammerError::internal(format!("read QUIC UDP socket addr: {err}")))?;
+    debug!("hysteria2 UDP socket bound local={local_addr}");
     SocketProtector::from(options.platform.clone()).protect(&socket)?;
+    debug!("hysteria2 UDP socket protected local={local_addr}");
     let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
     let socket = runtime
         .wrap_udp_socket(socket)
@@ -651,6 +681,38 @@ fn client_config(
         options.brutal_debug,
     );
     Ok(config)
+}
+
+fn connect_context(
+    server: &str,
+    address: SocketAddr,
+    server_name: &str,
+    tls_mode: &str,
+    udp_enabled: bool,
+) -> String {
+    format!(
+        "server={server} resolved={address} server_name={server_name} tls={tls_mode} udp={udp_enabled}"
+    )
+}
+
+fn tls_mode(options: &ClientOptions) -> &'static str {
+    if options.insecure {
+        "insecure"
+    } else if cfg!(target_vendor = "apple") {
+        "platform"
+    } else {
+        "native-roots"
+    }
+}
+
+fn duration_label(duration: Duration) -> String {
+    if duration.as_secs() == 0 {
+        return format!("{}ms", duration.as_millis());
+    }
+    if duration.subsec_millis() == 0 {
+        return format!("{}s", duration.as_secs());
+    }
+    format!("{}.{:03}s", duration.as_secs(), duration.subsec_millis())
 }
 
 fn wrap_obfs_socket(
@@ -864,4 +926,56 @@ fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn connect_timeout_reports_hysteria2_context_before_outer_dns_timeout() {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind blackhole UDP socket");
+        let port = socket.local_addr().expect("blackhole addr").port();
+        let _blackhole = crate::spawn::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+
+        let result = connect_with_timeout(
+            ClientOptions {
+                server: "127.0.0.1".to_owned(),
+                server_port: port,
+                password: "secret".to_owned(),
+                server_name: "localhost".to_owned(),
+                insecure: true,
+                udp_enabled: true,
+                bbr_profile: BbrProfile::Standard,
+                disable_path_mtu_discovery: false,
+                initial_packet_size: 1200,
+                idle_timeout: None,
+                keep_alive_period: None,
+                send_bps: 0,
+                receive_bps: 0,
+                brutal_debug: false,
+                obfs: None,
+                platform: None,
+            },
+            Duration::from_millis(50),
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("blackhole should time out"),
+            Err(err) => err,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("connect hysteria2 timed out after 50ms"));
+        assert!(message.contains("server=127.0.0.1"));
+        assert!(message.contains(&format!("resolved=127.0.0.1:{port}")));
+        assert!(message.contains("server_name=localhost"));
+        assert!(message.contains("tls=insecure"));
+        assert!(message.contains("udp=true"));
+    }
 }
