@@ -45,6 +45,8 @@ const PF_INET6_HEADER: [u8; 4] = [0, 0, 0, libc::AF_INET6 as u8];
 /// Ask the kernel to coalesce up to this many packets per recvmsg_x — matches
 /// the Go reference implementation's `batchSize := (512KiB / mtu) + 1`.
 const BATCH_TARGET_BYTES: usize = 512 * 1024;
+const SEND_BACKPRESSURE_RETRY_LIMIT: usize = 64;
+const SEND_BACKPRESSURE_RETRY_DELAY: Duration = Duration::from_millis(2);
 
 /// `setsockopt` option to hint the kernel about our batch size. Mirrors the
 /// `UTUN_OPT_MAX_PENDING_PACKETS` constant exposed in `<net/if_utun.h>` —
@@ -360,10 +362,16 @@ impl AppleTunDevice {
     /// Populate `chunk_len` slots in `state` from `packets[start..]`. Skips
     /// packets whose IP version we cannot identify, returning how many were
     /// actually staged.
-    fn stage_send_chunk(state: &mut TxState, packets: &[Vec<u8>], start: usize) -> usize {
+    fn stage_send_chunk(
+        state: &mut TxState,
+        packets: &[Vec<u8>],
+        start: usize,
+        max_packets: usize,
+    ) -> usize {
         let mut staged = 0;
+        let limit = state.headers.len().min(max_packets.max(1));
         for packet in packets.iter().skip(start) {
-            if staged == state.headers.len() {
+            if staged == limit {
                 break;
             }
             let header = match packet.first().map(|b| b >> 4) {
@@ -489,6 +497,8 @@ impl TunDevice for AppleTunDevice {
         }
 
         let mut offset = 0;
+        let mut max_chunk = usize::MAX;
+        let mut backpressure_retries = 0;
         let send_result = loop {
             if offset >= valid.len() {
                 break Ok::<(), HammerError>(());
@@ -504,36 +514,56 @@ impl TunDevice for AppleTunDevice {
             };
             let result = {
                 let mut state = self.tx.lock().expect("apple TUN tx poisoned");
-                let staged = Self::stage_send_chunk(&mut state, &valid, offset);
-                self.try_send_chunk(&mut state, staged).map(|n| (n, staged))
+                let staged = Self::stage_send_chunk(&mut state, &valid, offset, max_chunk);
+                self.try_send_chunk(&mut state, staged)
+                    .map(|n| (n, staged))
+                    .map_err(|err| (err, staged))
             };
             match result {
                 Ok((0, _)) => {
                     guard.clear_ready();
                     continue;
                 }
-                Ok((n_sent, _)) => {
+                Ok((n_sent, staged)) => {
                     offset += n_sent;
+                    if n_sent > 0 {
+                        backpressure_retries = 0;
+                        if n_sent == staged {
+                            max_chunk = usize::MAX;
+                        }
+                    }
                 }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err((err, _)) if err.kind() == io::ErrorKind::WouldBlock => {
                     guard.clear_ready();
                 }
                 // utun is a kernel control socket; under burst the kctl pipe
                 // queue fills and `sendmsg_x` returns ENOBUFS or ENOSPC.
-                // Both are transient backpressure — kqueue may still report
-                // writable, so clear readiness AND sleep briefly to let the
-                // kernel drain before retrying the unsent suffix.
-                Err(err)
-                    if matches!(
-                        err.raw_os_error(),
-                        Some(libc::ENOBUFS) | Some(libc::ENOSPC)
-                    ) =>
+                // Both are transient backpressure, but waiting forever here
+                // blocks the packet loop from draining inbound traffic. Cap
+                // retries and let TCP recover with retransmits if the kernel
+                // queue stays full.
+                Err((err, staged))
+                    if matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::ENOSPC)) =>
                 {
-                    debug!("apple TUN send backpressure: {err}; backing off 1ms");
+                    backpressure_retries += 1;
+                    max_chunk = if max_chunk == usize::MAX {
+                        (staged / 2).max(1)
+                    } else {
+                        (max_chunk / 2).max(1)
+                    };
+                    if backpressure_retries >= SEND_BACKPRESSURE_RETRY_LIMIT {
+                        break Err(HammerError::internal(format!(
+                            "apple TUN send backpressure exhausted after {backpressure_retries} retries: {err}; dropped {} packet(s)",
+                            valid.len() - offset
+                        )));
+                    }
+                    if backpressure_retries == 1 {
+                        debug!("apple TUN send backpressure: {err}; backing off");
+                    }
                     guard.clear_ready();
-                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    tokio::time::sleep(SEND_BACKPRESSURE_RETRY_DELAY).await;
                 }
-                Err(err) => {
+                Err((err, _)) => {
                     break Err(HammerError::internal(format!("sendmsg_x: {err}")));
                 }
             }
