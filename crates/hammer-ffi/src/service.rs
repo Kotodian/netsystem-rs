@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use hammer_core::log::LogWriter;
 use hammer_runtime::RuntimeService;
@@ -6,6 +7,20 @@ use hammer_runtime::RuntimeService;
 use crate::HammerPlatform;
 use crate::error::HammerError;
 use crate::platform::{PlatformAdapter, PlatformLogWriter};
+
+/// FFI-friendly latency probe report (one per outbound).
+///
+/// `ok=true` means the probe completed within `timeout_ms` and
+/// `latency_ms` carries the measured RTT. `ok=false` carries the
+/// transport error in `error` and `latency_ms=0`.
+#[derive(Debug, Clone)]
+pub struct HammerProbeReport {
+    pub outbound_id: String,
+    pub protocol: String,
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub error: String,
+}
 
 pub struct HammerService {
     inner: Arc<RuntimeService>,
@@ -50,5 +65,41 @@ impl HammerService {
 
     pub fn update_wifi_state(&self) {
         self.inner.update_wifi_state();
+    }
+
+    pub fn probe_outbounds(
+        &self,
+        protocol: String,
+        target: String,
+        timeout_ms: u64,
+    ) -> Result<Vec<HammerProbeReport>, HammerError> {
+        let timeout = Duration::from_millis(timeout_ms);
+        let reports = self
+            .inner
+            .probe_outbounds(&protocol, &target, timeout)
+            .map_err(HammerError::from)?;
+        Ok(reports
+            .into_iter()
+            .map(|report| {
+                let outbound_id = report.outbound_id;
+                let protocol = report.protocol;
+                match report.result {
+                    Ok(elapsed) => HammerProbeReport {
+                        outbound_id,
+                        protocol,
+                        ok: true,
+                        latency_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                        error: String::new(),
+                    },
+                    Err(err) => HammerProbeReport {
+                        outbound_id,
+                        protocol,
+                        ok: false,
+                        latency_ms: 0,
+                        error: err.to_string(),
+                    },
+                }
+            })
+            .collect())
     }
 }

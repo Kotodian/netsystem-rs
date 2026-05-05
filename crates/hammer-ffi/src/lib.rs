@@ -13,6 +13,6 @@ pub use platform::{
     HammerDefaultInterfaceUpdateListener, HammerNetworkInterface, HammerNetworkInterfaceIterator,
     HammerPlatform, HammerSetupOptions, HammerStringIterator, HammerTunOptions, HammerWIFIState,
 };
-pub use service::HammerService;
+pub use service::{HammerProbeReport, HammerService};
 
 uniffi::include_scaffolding!("hammer");

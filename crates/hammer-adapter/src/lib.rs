@@ -8,6 +8,7 @@ pub mod inbound;
 pub mod network;
 pub mod outbound;
 pub mod platform;
+pub mod probe;
 pub mod router;
 pub mod rule;
 pub mod service;
@@ -33,6 +34,7 @@ pub use outbound::{
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
+pub use probe::{ProbeProtocol, ProbeReport};
 pub use router::Router;
 pub use rule::{HeadlessRule, RouteDecision, RouteMetadata, Rule, SocksAddr};
 pub use service::ServiceManager;

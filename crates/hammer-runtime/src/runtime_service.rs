@@ -10,11 +10,20 @@ use hammer_core::registry::RuntimeRegistry;
 
 #[cfg(feature = "endpoint")]
 use crate::EndpointManager;
+#[cfg(feature = "probe")]
+use crate::{ProbeManager, TcpConnectProbe};
 use crate::{
     CertificateProviderManager, CertificateStore, ConnectionManager, DnsRouter,
     DnsTransportManager, InboundManager, NetworkManager, OutboundManager, PauseManager, Router,
     ServiceManager,
 };
+
+#[cfg(feature = "probe")]
+use std::net::SocketAddr;
+#[cfg(feature = "probe")]
+use std::time::Duration;
+#[cfg(feature = "probe")]
+use hammer_adapter::{ProbeProtocol, ProbeReport, SocksAddr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceState {
@@ -39,6 +48,8 @@ struct ServiceInner {
     network: Arc<NetworkManager>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
+    #[cfg(feature = "probe")]
+    probe: Arc<ProbeManager>,
     _runtime: tokio::runtime::Runtime,
     _options: Options,
 }
@@ -173,6 +184,8 @@ impl RuntimeService {
             "Service lifecycles must match LIFECYCLE_ORDER",
         );
 
+        #[cfg(feature = "probe")]
+        let probe = Arc::new(ProbeManager::new(Arc::clone(&outbound)));
         Ok(Arc::new(Self {
             inner: Mutex::new(ServiceInner {
                 state: ServiceState::NotStarted,
@@ -184,10 +197,43 @@ impl RuntimeService {
                 network,
                 dns_router,
                 outbound,
+                #[cfg(feature = "probe")]
+                probe,
                 _runtime: runtime,
                 _options: options,
             }),
         }))
+    }
+
+    /// Run a one-shot latency probe through every registered outbound
+    /// and return one report per outbound (order matches
+    /// `OutboundManager::list()`). `protocol` selects the probe
+    /// implementation (V1 only `"tcp"`); `target` is `"ip:port"`;
+    /// `timeout` applies per outbound, not to the batch.
+    ///
+    /// Probe failures (timeout, connection refused, unsupported
+    /// network) live inside each `ProbeReport.result` so the caller
+    /// always sees the full outbound list. Only invalid arguments
+    /// (unknown protocol, unparseable target) bubble up as `Err`.
+    #[cfg(feature = "probe")]
+    pub fn probe_outbounds(
+        &self,
+        protocol: &str,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ProbeReport>, HammerError> {
+        let probe = build_probe_protocol(protocol, target)?;
+        let (probe_mgr, runtime_handle) = {
+            let inner = self.inner.lock().expect("service mutex poisoned");
+            if inner.state == ServiceState::Closed {
+                return Err(HammerError::service_closed());
+            }
+            (
+                Arc::clone(&inner.probe),
+                inner._runtime.handle().clone(),
+            )
+        };
+        Ok(runtime_handle.block_on(probe_mgr.probe_all(probe, timeout)))
     }
 
     pub fn start(&self) -> Result<(), HammerError> {
@@ -288,4 +334,25 @@ impl RuntimeService {
 
 fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
+}
+
+#[cfg(feature = "probe")]
+fn build_probe_protocol(
+    protocol: &str,
+    target: &str,
+) -> Result<Arc<dyn ProbeProtocol>, HammerError> {
+    match protocol {
+        "tcp" => {
+            let addr: SocketAddr = target.parse().map_err(|err| {
+                HammerError::internal(format!("invalid probe target {target}: {err}"))
+            })?;
+            Ok(Arc::new(TcpConnectProbe::new(SocksAddr::ip(
+                addr.ip(),
+                addr.port(),
+            ))))
+        }
+        other => Err(HammerError::internal(format!(
+            "unknown probe protocol: {other}"
+        ))),
+    }
 }

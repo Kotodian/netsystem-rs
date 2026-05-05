@@ -33,6 +33,8 @@ mod macros;
 mod network;
 pub mod outbounds;
 pub mod pause;
+#[cfg(feature = "probe")]
+pub mod probe;
 pub mod protocol;
 pub mod route;
 mod runtime_service;
@@ -72,6 +74,8 @@ pub use inbounds::InboundManager;
 pub use network::NetworkManager;
 pub use outbounds::OutboundManager;
 pub use pause::PauseManager;
+#[cfg(feature = "probe")]
+pub use probe::{ProbeManager, TcpConnectProbe};
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use route::Router;
