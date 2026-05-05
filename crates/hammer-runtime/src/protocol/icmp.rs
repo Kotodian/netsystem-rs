@@ -220,10 +220,36 @@ fn icmp_reply_from_recv(
 ) -> Result<IcmpReply, HammerError> {
     let (len, source) = result.map_err(|err| HammerError::internal(format!("icmp recv: {err}")))?;
     buf.truncate(len);
+    let body = normalize_received_icmp_body(source.ip(), &buf);
     Ok(IcmpReply {
         source: source.ip(),
-        body: Bytes::from(buf),
+        body: Bytes::copy_from_slice(body),
     })
+}
+
+fn normalize_received_icmp_body(source: IpAddr, packet: &[u8]) -> &[u8] {
+    match source {
+        IpAddr::V4(_) => strip_ipv4_header(packet).unwrap_or(packet),
+        IpAddr::V6(_) => strip_ipv6_header(packet).unwrap_or(packet),
+    }
+}
+
+fn strip_ipv4_header(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    if header_len < 20 || packet.len() < header_len || packet[9] != 1 {
+        return None;
+    }
+    Some(&packet[header_len..])
+}
+
+fn strip_ipv6_header(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 || packet[6] != 58 {
+        return None;
+    }
+    Some(&packet[40..])
 }
 
 fn checksum(data: &[u8]) -> u16 {
@@ -278,6 +304,30 @@ mod tests {
             b"probe-token",
             &reply
         ));
+    }
+
+    #[test]
+    fn received_ipv4_packet_is_normalized_to_icmp_body() {
+        let icmp_body = b"\0\0\0\0\0\0\0\x07probe-token";
+        let mut packet = vec![
+            0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1,
+        ];
+        packet.extend_from_slice(icmp_body);
+
+        assert_eq!(
+            normalize_received_icmp_body(IpAddr::V4(Ipv4Addr::LOCALHOST), &packet),
+            icmp_body
+        );
+    }
+
+    #[test]
+    fn received_linux_icmp_body_is_left_unchanged() {
+        let icmp_body = b"\0\0\0\0\0\0\0\x07probe-token";
+
+        assert_eq!(
+            normalize_received_icmp_body(IpAddr::V4(Ipv4Addr::LOCALHOST), icmp_body),
+            icmp_body
+        );
     }
 
     struct FakeIcmpConn {
