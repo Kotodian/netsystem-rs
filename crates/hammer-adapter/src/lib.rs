@@ -26,7 +26,10 @@ pub use endpoint::{Endpoint, EndpointManager};
 pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundManager};
 pub use network::NetworkManager;
-pub use outbound::{Outbound, OutboundManager, ProxyDatagram, ProxyPacketConn, ProxyStream};
+pub use outbound::{
+    IcmpReply, Outbound, OutboundManager, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn,
+    ProxyStream,
+};
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };

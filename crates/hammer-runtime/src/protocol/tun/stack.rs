@@ -912,6 +912,9 @@ impl SmoltcpTunStack {
             match tun_packet.metadata.network {
                 Network::Tcp => sniff_stream(&mut tun_packet),
                 Network::Udp => sniff_packet(&mut tun_packet),
+                // ICMP carries no application-layer payload to sniff;
+                // metadata stays as parsed (network=icmp, addresses set).
+                Network::Icmp => {}
             }
         }
         Ok(tun_packet)
@@ -971,6 +974,41 @@ impl SmoltcpTunStack {
                     payload: response.payload,
                 })
             }
+            Network::Icmp => {
+                let dest_ip = match tun_packet.metadata.destination.as_ref() {
+                    Some(addr) => addr.host,
+                    None => {
+                        return Err(HammerError::internal(
+                            "TUN ICMP dispatch missing destination",
+                        ));
+                    }
+                };
+                let mut conn = match outbound.listen_icmp().await {
+                    Ok(conn) => conn,
+                    Err(_) => {
+                        // Outbound cannot carry ICMP — synthesize a Dest
+                        // Unreachable response and surface it through the
+                        // dispatch path. Caller is responsible for shipping
+                        // `payload` back into the tun.
+                        let unreachable = icmp_unreachable_response_for(
+                            &tun_packet.metadata,
+                            &tun_packet.payload,
+                        )?;
+                        return Ok(TunDispatch::RoutedResponse {
+                            metadata: tun_packet.metadata,
+                            payload: Bytes::from(unreachable),
+                        });
+                    }
+                };
+                conn.send_echo(dest_ip, &tun_packet.payload).await?;
+                let reply = timeout(Duration::from_secs(2), conn.recv_reply())
+                    .await
+                    .map_err(|_| HammerError::internal("TUN routed ICMP response timed out"))??;
+                Ok(TunDispatch::RoutedResponse {
+                    metadata: tun_packet.metadata,
+                    payload: reply.body,
+                })
+            }
         }
     }
 }
@@ -1015,6 +1053,8 @@ fn parse_transport(
     match protocol {
         6 => parse_tcp(source, destination, transport),
         17 => parse_udp(source, destination, transport),
+        1 => parse_icmpv4(source, destination, transport),
+        58 => parse_icmpv6(source, destination, transport),
         other => Err(HammerError::internal(format!(
             "unsupported transport protocol: {other}"
         ))),
@@ -1577,6 +1617,7 @@ async fn packet_loop(
         }
         tcp_writeback.clear();
         let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
+        let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
         // Pass 1: under one NAT mutex acquisition, rewrite every TCP packet
         // in the batch and stash UDP packets for sequential post-processing.
         // The guard is released at the end of this scope before any I/O
@@ -1620,6 +1661,9 @@ async fn packet_loop(
                     Network::Udp => {
                         udp_pending.push((packet, parsed));
                     }
+                    Network::Icmp => {
+                        icmp_pending.push((packet, parsed));
+                    }
                 }
             }
         }
@@ -1649,6 +1693,25 @@ async fn packet_loop(
             .await
             {
                 debug!("handle system UDP packet: {err}");
+            }
+        }
+        // Pass 4: ICMP echo handling, also sequential. Each ping flight is
+        // a synchronous send/recv round-trip via `outbound.listen_icmp()`;
+        // if the chosen outbound rejects ICMP, we synthesize a Destination
+        // Unreachable and write it back into the tun.
+        for (packet, parsed) in icmp_pending {
+            if let Err(err) = handle_system_icmp_packet(
+                Arc::clone(&router),
+                Arc::clone(&dns_router),
+                Arc::clone(&outbound),
+                inbound_id.clone(),
+                Arc::clone(&device),
+                packet,
+                parsed,
+            )
+            .await
+            {
+                debug!("handle system ICMP packet: {err}");
             }
         }
     }
@@ -2081,4 +2144,356 @@ fn read_tls_bytes<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a
     let out = data.get(*pos..end)?;
     *pos = end;
     Some(out)
+}
+
+// ============================================================================
+// ICMP echo handling
+// ============================================================================
+//
+// `parse_icmpv4` / `parse_icmpv6` validate that the packet is an echo
+// request (type 8 / 128) and feed `Network::Icmp` packets into the rest
+// of the route engine. Anything else is dropped at parse time so the
+// system stack loop does not waste a routing decision on a stray ICMP
+// type that the kernel itself would normally generate.
+//
+// `handle_system_icmp_packet` mirrors `handle_system_udp_packet` for the
+// echo subset: build a `TunPacket`, run the router, and either reply
+// with an ICMP Destination Unreachable (reject / unsupported outbound
+// fallback) or send the body through the chosen outbound's
+// `listen_icmp()` conduit and re-encapsulate the reply back into a tun
+// IP packet. The response stays per-flight; flow-level reuse is left
+// for a future iteration once burst ping volume justifies it.
+
+const ICMPV4_ECHO_REQUEST: u8 = 8;
+const ICMPV4_ECHO_REPLY: u8 = 0;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMPV6_ECHO_REPLY: u8 = 129;
+
+fn parse_icmpv4(
+    source: IpAddr,
+    destination: IpAddr,
+    transport: &[u8],
+) -> Result<ParsedIpPacket, HammerError> {
+    if transport.len() < 8 {
+        return Err(HammerError::internal("short ICMPv4 packet"));
+    }
+    if transport[0] != ICMPV4_ECHO_REQUEST {
+        return Err(HammerError::internal(format!(
+            "non-echo ICMPv4 dropped: type={}",
+            transport[0]
+        )));
+    }
+    Ok(ParsedIpPacket {
+        network: Network::Icmp,
+        source: SocksAddr::ip(source, 0),
+        destination: SocksAddr::ip(destination, 0),
+        payload: transport.to_vec(),
+    })
+}
+
+fn parse_icmpv6(
+    source: IpAddr,
+    destination: IpAddr,
+    transport: &[u8],
+) -> Result<ParsedIpPacket, HammerError> {
+    if transport.len() < 8 {
+        return Err(HammerError::internal("short ICMPv6 packet"));
+    }
+    if transport[0] != ICMPV6_ECHO_REQUEST {
+        return Err(HammerError::internal(format!(
+            "non-echo ICMPv6 dropped: type={}",
+            transport[0]
+        )));
+    }
+    Ok(ParsedIpPacket {
+        network: Network::Icmp,
+        source: SocksAddr::ip(source, 0),
+        destination: SocksAddr::ip(destination, 0),
+        payload: transport.to_vec(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_system_icmp_packet(
+    router: Arc<Router>,
+    dns_router: Arc<DnsRouter>,
+    outbound: Arc<OutboundManager>,
+    inbound_id: String,
+    device: Arc<dyn TunDevice>,
+    packet: Vec<u8>,
+    parsed: ParsedIpPacket,
+) -> Result<(), HammerError> {
+    let mut tun_packet = TunPacket {
+        metadata: RouteMetadata {
+            inbound: inbound_id,
+            network: Network::Icmp,
+            source: Some(parsed.source.clone()),
+            destination: Some(parsed.destination.clone()),
+            protocol: if parsed.destination.host.is_ipv6() {
+                "icmpv6".to_owned()
+            } else {
+                "icmp".to_owned()
+            },
+            ..Default::default()
+        },
+        payload: parsed.payload.clone(),
+    };
+    prepare_route_metadata(
+        router.as_ref(),
+        &mut tun_packet.metadata,
+        Some(dns_router.as_ref()),
+    )?;
+    match router.match_route(&mut tun_packet.metadata)? {
+        RouteDecision::HijackDns => {
+            // ICMP is not routable to the DNS hijack; this should not be
+            // reachable from any sane rule set but we must keep the match
+            // exhaustive — drop the packet quietly.
+            debug!(
+                "drop ICMP packet hitting DNS hijack rule: destination={}",
+                parsed.destination
+            );
+        }
+        RouteDecision::Reject { method } => {
+            debug!(
+                "drop ICMP packet by reject rule: method={method}, destination={}",
+                parsed.destination
+            );
+            if let Ok(response) = icmp_unreachable_packet(&packet) {
+                device.send(response).await?;
+            }
+        }
+        RouteDecision::Route {
+            outbound: outbound_id,
+        } => {
+            let Some(outbound_item) = outbound.get(&outbound_id) else {
+                return Err(HammerError::internal(format!(
+                    "outbound not found: {outbound_id}"
+                )));
+            };
+            let mut conn = match outbound_item.listen_icmp().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    debug!(
+                        "outbound {outbound_id} cannot carry ICMP ({err}); replying Destination Unreachable"
+                    );
+                    if let Ok(response) = icmp_unreachable_packet(&packet) {
+                        device.send(response).await?;
+                    }
+                    return Ok(());
+                }
+            };
+            let dest_ip = parsed.destination.host;
+            conn.send_echo(dest_ip, &tun_packet.payload).await?;
+            let reply = match timeout(Duration::from_secs(2), conn.recv_reply()).await {
+                Ok(Ok(reply)) => reply,
+                Ok(Err(err)) => {
+                    debug!("ICMP recv_reply failed: {err}");
+                    return Ok(());
+                }
+                Err(_) => {
+                    debug!(
+                        "ICMP recv_reply timed out: destination={}",
+                        parsed.destination
+                    );
+                    return Ok(());
+                }
+            };
+            let response_packet = icmp_echo_reply_packet(&packet, &reply.body)?;
+            device.send(response_packet).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Helper used by `dispatch_route` (the synchronous test/legacy path)
+/// to synthesize an ICMP Destination Unreachable when the chosen
+/// outbound rejects ICMP. The system loop path uses
+/// `icmp_unreachable_packet(&raw_packet)` directly because it has the
+/// full IP packet bytes; here we have only metadata + ICMP body so we
+/// reconstruct just enough of the IP header to feed the same builders.
+fn icmp_unreachable_response_for(
+    metadata: &RouteMetadata,
+    body: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    let source = metadata
+        .source
+        .as_ref()
+        .ok_or_else(|| HammerError::internal("ICMP unreachable: missing source"))?;
+    let destination = metadata
+        .destination
+        .as_ref()
+        .ok_or_else(|| HammerError::internal("ICMP unreachable: missing destination"))?;
+    let synthetic = synthesize_ip_packet(source.host, destination.host, body)?;
+    icmp_unreachable_packet(&synthetic)
+}
+
+fn synthesize_ip_packet(
+    source: IpAddr,
+    destination: IpAddr,
+    body: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    match (source, destination) {
+        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+            let total_len = 20 + body.len();
+            let mut packet = vec![0_u8; total_len];
+            packet[0] = 0x45;
+            write_u16(&mut packet, 2, total_len as u16);
+            packet[8] = 64;
+            packet[9] = 1;
+            packet[12..16].copy_from_slice(&src.octets());
+            packet[16..20].copy_from_slice(&dst.octets());
+            packet[20..].copy_from_slice(body);
+            let ip_checksum = checksum(&packet[..20]);
+            write_u16(&mut packet, 10, ip_checksum);
+            Ok(packet)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+            let payload_len = body.len();
+            let mut packet = vec![0_u8; 40 + payload_len];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+            packet[6] = 58;
+            packet[7] = 64;
+            packet[8..24].copy_from_slice(&src.octets());
+            packet[24..40].copy_from_slice(&dst.octets());
+            packet[40..].copy_from_slice(body);
+            Ok(packet)
+        }
+        _ => Err(HammerError::internal(
+            "ICMP synthesize: mixed v4/v6 source/destination",
+        )),
+    }
+}
+
+pub fn icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+    match request.first().map(|byte| byte >> 4) {
+        Some(4) => ipv4_icmp_unreachable_packet(request),
+        Some(6) => ipv6_icmp_unreachable_packet(request),
+        Some(version) => Err(HammerError::internal(format!(
+            "unsupported IP version: {version}"
+        ))),
+        None => Err(HammerError::internal("empty IP packet")),
+    }
+}
+
+fn ipv4_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+    if request.len() < 20 {
+        return Err(HammerError::internal("invalid IPv4 packet"));
+    }
+    let ihl = ((request[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || request.len() < ihl + 8 {
+        return Err(HammerError::internal("invalid IPv4 header"));
+    }
+    let quoted_len = request.len().min(ihl + 8);
+    let total_len = 20 + 8 + quoted_len;
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    write_u16(&mut packet, 2, total_len as u16);
+    packet[8] = 64;
+    packet[9] = 1;
+    // Swap src / dst from the request so the unreachable comes back to
+    // the originator.
+    packet[12..16].copy_from_slice(&request[16..20]);
+    packet[16..20].copy_from_slice(&request[12..16]);
+    packet[20] = 3; // type 3 = Destination Unreachable
+    packet[21] = 1; // code 1 = host unreachable (matches "outbound rejected ICMP")
+    packet[28..].copy_from_slice(&request[..quoted_len]);
+    let ip_checksum = checksum(&packet[..20]);
+    write_u16(&mut packet, 10, ip_checksum);
+    let icmp_checksum = checksum(&packet[20..]);
+    write_u16(&mut packet, 22, icmp_checksum);
+    Ok(packet)
+}
+
+fn ipv6_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+    if request.len() < 40 {
+        return Err(HammerError::internal("invalid IPv6 packet"));
+    }
+    let quoted_len = request.len().min(1232);
+    let payload_len = 8 + quoted_len;
+    let mut packet = vec![0_u8; 40 + payload_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[6] = 58; // next header = ICMPv6
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&request[24..40]);
+    packet[24..40].copy_from_slice(&request[8..24]);
+    packet[40] = 1; // type 1 = Destination Unreachable
+    packet[41] = 1; // code 1 = communication administratively prohibited
+    packet[48..].copy_from_slice(&request[..quoted_len]);
+    update_ipv6_icmp_checksum(&mut packet)?;
+    Ok(packet)
+}
+
+/// Wrap the kernel-delivered ICMP reply body (starting at the ICMP
+/// type byte) into a tun-deliverable IP packet. We swap src/dst from
+/// the original echo request so the reply reaches the originating app.
+pub fn icmp_echo_reply_packet(
+    request: &[u8],
+    reply_body: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    match request.first().map(|byte| byte >> 4) {
+        Some(4) => ipv4_icmp_echo_reply_packet(request, reply_body),
+        Some(6) => ipv6_icmp_echo_reply_packet(request, reply_body),
+        Some(version) => Err(HammerError::internal(format!(
+            "unsupported IP version: {version}"
+        ))),
+        None => Err(HammerError::internal("empty IP packet")),
+    }
+}
+
+fn ipv4_icmp_echo_reply_packet(
+    request: &[u8],
+    reply_body: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    if request.len() < 20 {
+        return Err(HammerError::internal("invalid IPv4 packet"));
+    }
+    if reply_body.len() < 8 {
+        return Err(HammerError::internal("ICMPv4 reply too short"));
+    }
+    let total_len = 20 + reply_body.len();
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    write_u16(&mut packet, 2, total_len as u16);
+    packet[8] = 64;
+    packet[9] = 1; // ICMP
+    // src = original dst, dst = original src (the originating app's IP).
+    packet[12..16].copy_from_slice(&request[16..20]);
+    packet[16..20].copy_from_slice(&request[12..16]);
+    let ip_checksum = checksum(&packet[..20]);
+    write_u16(&mut packet, 10, ip_checksum);
+    packet[20..].copy_from_slice(reply_body);
+    // Force the ICMP type to echo reply — the kernel-delivered body
+    // already carries type=0 in well-behaved cases, but we normalise
+    // defensively in case a custom outbound passes back a literal echo.
+    packet[20] = ICMPV4_ECHO_REPLY;
+    write_u16(&mut packet, 22, 0);
+    let icmp_checksum = checksum(&packet[20..]);
+    write_u16(&mut packet, 22, icmp_checksum);
+    Ok(packet)
+}
+
+fn ipv6_icmp_echo_reply_packet(
+    request: &[u8],
+    reply_body: &[u8],
+) -> Result<Vec<u8>, HammerError> {
+    if request.len() < 40 {
+        return Err(HammerError::internal("invalid IPv6 packet"));
+    }
+    if reply_body.len() < 8 {
+        return Err(HammerError::internal("ICMPv6 reply too short"));
+    }
+    let payload_len = reply_body.len();
+    let mut packet = vec![0_u8; 40 + payload_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[6] = 58; // ICMPv6
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&request[24..40]);
+    packet[24..40].copy_from_slice(&request[8..24]);
+    packet[40..].copy_from_slice(reply_body);
+    packet[40] = ICMPV6_ECHO_REPLY;
+    update_ipv6_icmp_checksum(&mut packet)?;
+    Ok(packet)
 }

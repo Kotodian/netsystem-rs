@@ -486,6 +486,12 @@ impl Outbound for Hysteria2Outbound {
                     .await?,
             )),
             Network::Udp => Err(HammerError::internal("use listen_packet for hysteria2 UDP")),
+            // Unreachable in practice: `self.networks` only ever
+            // contains Tcp/Udp (see `adapter_networks`), so the guard
+            // above already filters Icmp out. Kept for exhaustiveness.
+            Network::Icmp => Err(HammerError::internal(
+                "icmp not supported by hysteria2 outbound",
+            )),
         }
     }
 

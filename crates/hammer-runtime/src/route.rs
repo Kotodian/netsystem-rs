@@ -123,7 +123,14 @@ impl Router {
         let Some(default) = outbound.default() else {
             return Err(HammerError::internal("default outbound not found"));
         };
-        if !default.networks().contains(&network) {
+        // ICMP is treated as a soft-supported network: the dispatch
+        // path detects an outbound that lacks ICMP via `listen_icmp()`
+        // and synthesises a Destination Unreachable back into the tun.
+        // Skipping the strict pre-flight check here lets a user keep a
+        // simple `final = "hysteria2"` route (which only declares
+        // Tcp/Udp) and still receive a clean ICMP reply rather than a
+        // hard route engine error every time an app pings.
+        if network != Network::Icmp && !default.networks().contains(&network) {
             return Err(HammerError::internal(format!(
                 "{network} is not supported by default outbound: {}",
                 default.id()

@@ -6,6 +6,7 @@ pub enum Network {
     #[default]
     Tcp,
     Udp,
+    Icmp,
 }
 
 impl fmt::Display for Network {
@@ -13,6 +14,7 @@ impl fmt::Display for Network {
         f.write_str(match self {
             Network::Tcp => "tcp",
             Network::Udp => "udp",
+            Network::Icmp => "icmp",
         })
     }
 }

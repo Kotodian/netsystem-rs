@@ -15,7 +15,8 @@ use hammer_runtime::{
     dns::{FixedResponseCode, MessageExt},
     tun::{
         MemoryTunDevice, SmoltcpTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
-        parse_ip_packet, process_system_tcp_packet, sniff_packet, sniff_stream, tcp_reset_packet,
+        icmp_echo_reply_packet, icmp_unreachable_packet, parse_ip_packet,
+        process_system_tcp_packet, sniff_packet, sniff_stream, tcp_reset_packet,
         udp_response_packet, udp_unreachable_packet,
     },
 };
@@ -691,4 +692,134 @@ fn stun_binding() -> Vec<u8> {
     vec![
         0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xa4, 0x42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// ICMP echo coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_icmpv4_echo_request_yields_icmp_metadata() {
+    let packet = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping body");
+    let parsed = parse_ip_packet(&packet).expect("parse icmp echo");
+    assert_eq!(parsed.network, Network::Icmp);
+    assert_eq!(parsed.source.host, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+    assert_eq!(parsed.destination.host, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    // ICMP has no port concept; both ends carry the conventional 0.
+    assert_eq!(parsed.source.port, 0);
+    assert_eq!(parsed.destination.port, 0);
+    // Payload is the raw ICMP body starting at the type byte so the
+    // outbound conduit can hand it straight to the kernel.
+    assert_eq!(parsed.payload[0], 8);
+    assert_eq!(&parsed.payload[4..6], &0xbeef_u16.to_be_bytes());
+}
+
+#[test]
+fn parse_icmpv4_drops_non_echo_types() {
+    // Type 13 = Timestamp Request. Anything that isn't an echo request
+    // is ours to drop on the floor.
+    let mut packet = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0, 0, b"");
+    packet[20] = 13;
+    let result = parse_ip_packet(&packet);
+    assert!(result.is_err(), "non-echo ICMPv4 must be rejected");
+}
+
+#[test]
+fn icmp_unreachable_packet_swaps_addresses_and_marks_host_unreachable() {
+    let request = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0x1234, 1, b"data");
+    let response = icmp_unreachable_packet(&request).expect("build unreachable");
+    // src = original dst, dst = original src — so the unreachable flows
+    // back to whoever issued the echo.
+    assert_eq!(&response[12..16], &[8, 8, 8, 8]);
+    assert_eq!(&response[16..20], &[10, 0, 0, 2]);
+    assert_eq!(response[9], 1, "IPv4 reject must be ICMP");
+    assert_eq!(response[20], 3, "ICMP destination unreachable type");
+    assert_eq!(response[21], 1, "ICMP host unreachable code");
+}
+
+#[test]
+fn icmp_echo_reply_packet_swaps_addresses_and_normalises_type() {
+    let request = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"hello");
+    // Stub kernel-delivered reply body: type=0 echo reply, same id/seq.
+    let mut reply_body = request[20..].to_vec();
+    reply_body[0] = 0; // echo reply
+    reply_body[2] = 0; // zero checksum so we can recompute below
+    reply_body[3] = 0;
+    let csum = icmp_checksum(&reply_body);
+    reply_body[2..4].copy_from_slice(&csum.to_be_bytes());
+
+    let response = icmp_echo_reply_packet(&request, &reply_body).expect("build reply");
+    // Address swap and type=0 normalisation.
+    assert_eq!(&response[12..16], &[8, 8, 8, 8]);
+    assert_eq!(&response[16..20], &[10, 0, 0, 2]);
+    assert_eq!(response[9], 1, "IPv4 reply must be ICMP");
+    assert_eq!(response[20], 0, "echo reply type");
+    // Identifier + sequence + payload preserved end-to-end.
+    assert_eq!(&response[24..26], &0xbeef_u16.to_be_bytes());
+    assert_eq!(&response[26..28], &1_u16.to_be_bytes());
+    assert_eq!(&response[28..], b"hello");
+}
+
+#[tokio::test]
+async fn tun_dispatch_falls_back_to_dest_unreachable_when_outbound_rejects_icmp() {
+    // Hysteria2 outbound's default `listen_icmp` impl returns Err, so
+    // routing ICMP to it exercises the fallback path.
+    let stack = runtime_stack(&options(), "hysteria2");
+    let request = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping");
+
+    let dispatch = stack
+        .dispatch_packet(&request)
+        .await
+        .expect("dispatch icmp");
+
+    let TunDispatch::RoutedResponse { payload, metadata } = dispatch else {
+        panic!("unexpected dispatch result for ICMP fallback");
+    };
+    assert_eq!(metadata.network, Network::Icmp);
+    // payload must be a complete IPv4 ICMP Destination Unreachable packet.
+    assert_eq!(payload[9], 1);
+    assert_eq!(payload[20], 3);
+    assert_eq!(payload[21], 1);
+}
+
+fn ipv4_icmp_echo_request(
+    source: [u8; 4],
+    destination: [u8; 4],
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let icmp_len = 8 + payload.len();
+    let total_len = 20 + icmp_len;
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 1; // ICMP
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    packet[20] = 8; // echo request
+    packet[21] = 0;
+    packet[24..26].copy_from_slice(&identifier.to_be_bytes());
+    packet[26..28].copy_from_slice(&sequence.to_be_bytes());
+    packet[28..].copy_from_slice(payload);
+    let csum = icmp_checksum(&packet[20..]);
+    packet[22..24].copy_from_slice(&csum.to_be_bytes());
+    packet
+}
+
+fn icmp_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u32::from(u16::from_be_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    if i < data.len() {
+        sum += u32::from(data[i]) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
