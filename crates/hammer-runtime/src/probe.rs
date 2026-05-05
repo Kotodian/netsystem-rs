@@ -6,21 +6,18 @@
 //! manager safely composes with the existing service lifecycle without
 //! adding a background task.
 //!
-//! V1 ships exactly one concrete probe protocol, [`TcpConnectProbe`],
-//! which measures the time `outbound.dial(Network::Tcp, target, &[])`
-//! takes to return a connected stream. ICMP / HTTP / QUIC variants
-//! plug in by adding new `ProbeProtocol` implementations under the
-//! same trait surface.
+//! V1 ships exactly one concrete probe protocol, [`IcmpOutboundProbe`],
+//! which asks each outbound to measure latency to its own ICMP probe
+//! endpoint. HTTP / QUIC variants plug in by adding new
+//! `ProbeProtocol` implementations under the same trait surface.
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    Network, Outbound, OutboundManager as OutboundManagerTrait, ProbeProtocol, ProbeReport,
-    SocksAddr,
+    Outbound, OutboundManager as OutboundManagerTrait, ProbeProtocol, ProbeReport,
 };
 use hammer_core::error::HammerError;
-use tokio::time::timeout;
 
 use crate::OutboundManager;
 
@@ -101,42 +98,111 @@ impl ProbeManager {
     }
 }
 
-/// V1 probe: open a TCP connection through `outbound` and measure the
-/// time until `dial(Network::Tcp, target, &[])` returns Ok.
-///
-/// The returned stream is dropped immediately; we only care about the
-/// underlying handshake / proxy-connect latency. Connection refused,
-/// TLS errors, and proxy auth failures all surface as the inner
-/// `Err(CoreError)` — useful diagnostic for the caller.
-pub struct TcpConnectProbe {
-    pub target: SocksAddr,
-}
+/// Probe that measures latency to each outbound's own ICMP probe endpoint.
+pub struct IcmpOutboundProbe;
 
-impl TcpConnectProbe {
-    pub fn new(target: SocksAddr) -> Self {
-        Self { target }
+impl IcmpOutboundProbe {
+    pub fn new() -> Self {
+        Self
     }
 }
 
 #[async_trait]
-impl ProbeProtocol for TcpConnectProbe {
+impl ProbeProtocol for IcmpOutboundProbe {
     fn name(&self) -> &'static str {
-        "tcp"
+        "icmp"
     }
 
     async fn measure(
         &self,
         outbound: &Arc<dyn Outbound>,
-        deadline: Duration,
+        timeout: Duration,
     ) -> Result<Duration, HammerError> {
-        let started = Instant::now();
-        let fut = outbound.dial(Network::Tcp, self.target.clone(), &[]);
-        match timeout(deadline, fut).await {
-            Ok(Ok(_stream)) => Ok(started.elapsed()),
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(HammerError::internal(format!(
-                "tcp probe timed out after {deadline:?}"
-            ))),
+        outbound.probe_latency(self.name(), timeout).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use hammer_adapter::{Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr};
+    use hammer_core::error::HammerError;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct ProbeOnlyOutbound {
+        calls: Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl ProbeOnlyOutbound {
+        fn calls(&self) -> Vec<(String, Duration)> {
+            self.calls.lock().expect("calls lock").clone()
         }
+    }
+
+    #[async_trait]
+    impl Outbound for ProbeOnlyOutbound {
+        fn type_name(&self) -> &str {
+            "probe-only"
+        }
+
+        fn id(&self) -> &str {
+            "probe-only"
+        }
+
+        fn networks(&self) -> &[Network] {
+            &[]
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+
+        async fn dial(
+            &self,
+            _network: Network,
+            _destination: SocksAddr,
+            _initial_payload: &[u8],
+        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+            Err(HammerError::internal("not used"))
+        }
+
+        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+            Err(HammerError::internal("not used"))
+        }
+
+        async fn probe_latency(
+            &self,
+            protocol: &str,
+            timeout: Duration,
+        ) -> Result<Duration, HammerError> {
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push((protocol.to_owned(), timeout));
+            Ok(Duration::from_millis(7))
+        }
+    }
+
+    #[tokio::test]
+    async fn icmp_probe_delegates_to_outbound_probe_latency() {
+        let outbound = Arc::new(ProbeOnlyOutbound::default());
+        let erased = Arc::clone(&outbound) as Arc<dyn Outbound>;
+        let probe = IcmpOutboundProbe::new();
+
+        let elapsed = probe
+            .measure(&erased, Duration::from_millis(250))
+            .await
+            .expect("icmp probe should delegate");
+
+        assert_eq!(elapsed, Duration::from_millis(7));
+        assert_eq!(
+            outbound.calls(),
+            vec![("icmp".to_owned(), Duration::from_millis(250))]
+        );
     }
 }

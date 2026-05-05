@@ -1,5 +1,6 @@
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -47,11 +48,7 @@ pub struct IcmpReply {
 /// send.
 #[async_trait]
 pub trait ProxyIcmpConn: Send + Sync + 'static {
-    async fn send_echo(
-        &mut self,
-        destination: IpAddr,
-        body: &[u8],
-    ) -> Result<(), CoreError>;
+    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> Result<(), CoreError>;
     async fn recv_reply(&mut self) -> Result<IcmpReply, CoreError>;
 }
 
@@ -83,6 +80,20 @@ pub trait Outbound: Send + Sync + 'static {
     async fn listen_icmp(&self) -> Result<Box<dyn ProxyIcmpConn>, CoreError> {
         Err(CoreError::internal(format!(
             "icmp not supported by outbound: {}",
+            self.id()
+        )))
+    }
+
+    /// Measure latency to this outbound's own probe endpoint for the
+    /// requested protocol. The default reports unsupported; server-backed
+    /// outbounds can override without forcing probe code to downcast.
+    async fn probe_latency(
+        &self,
+        protocol: &str,
+        _timeout: Duration,
+    ) -> Result<Duration, CoreError> {
+        Err(CoreError::internal(format!(
+            "{protocol} probe not supported by outbound: {}",
             self.id()
         )))
     }

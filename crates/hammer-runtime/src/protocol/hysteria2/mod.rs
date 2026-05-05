@@ -35,6 +35,8 @@ pub mod protocol;
 use bbr::{BbrProfile, CongestionControlHandle, apply_transport_config_with_handle};
 use obfs::Salamander;
 
+#[cfg(feature = "probe")]
+use crate::protocol::icmp;
 use crate::socket_protector::SocketProtector;
 
 // Match sing-quic's hysteria2 client defaults
@@ -498,6 +500,10 @@ impl Hysteria2Outbound {
             platform: self.protector.platform(),
         })
     }
+
+    async fn resolve_probe_server(&self) -> Result<SocketAddr, HammerError> {
+        resolve_server(&self.options.server, self.options.server_port).await
+    }
 }
 
 pub(crate) fn build_outbound(
@@ -550,6 +556,34 @@ impl Outbound for Hysteria2Outbound {
             client.close(b"network reset");
         }
         self.clear_connect_backoff();
+    }
+
+    #[cfg(feature = "probe")]
+    async fn probe_latency(
+        &self,
+        protocol: &str,
+        timeout_duration: Duration,
+    ) -> Result<Duration, HammerError> {
+        if protocol != "icmp" {
+            return Err(HammerError::internal(format!(
+                "{protocol} probe not supported by outbound: {}",
+                self.id
+            )));
+        }
+
+        let protector = self.protector.clone();
+        let probe = async {
+            let server = self.resolve_probe_server().await?;
+            icmp::probe_echo(server.ip(), timeout_duration, protector).await
+        };
+
+        match tokio::time::timeout(timeout_duration, probe).await {
+            Ok(result) => result,
+            Err(_) => Err(HammerError::internal(format!(
+                "icmp probe timed out after {}",
+                duration_label(timeout_duration)
+            ))),
+        }
     }
 
     async fn dial(
@@ -1167,6 +1201,30 @@ mod tests {
 
         outbound.reset();
 
+        assert_eq!(outbound.connect_backoff_remaining(), None);
+    }
+
+    #[tokio::test]
+    async fn icmp_probe_resolves_configured_server_without_initializing_client() {
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(0),
+        );
+
+        let resolved = outbound
+            .resolve_probe_server()
+            .await
+            .expect("resolve probe server");
+
+        assert_eq!(
+            resolved,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443)
+        );
+        assert!(
+            outbound.cached_client().is_none(),
+            "ICMP probe destination resolution must not initialize the QUIC client"
+        );
         assert_eq!(outbound.connect_backoff_remaining(), None);
     }
 

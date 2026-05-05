@@ -1,16 +1,13 @@
 //! Outbound-level latency probing.
 //!
 //! `ProbeProtocol` is the plug-in seam: implementations measure
-//! round-trip time *through* an `Outbound` (so the latency reflects
-//! real proxied performance, not just the underlying network) using
-//! whichever transport surface fits — `dial(Network::Tcp, …)`,
-//! `listen_packet`, `listen_icmp`, etc. The `ProbeManager` (in the
+//! round-trip time to an `Outbound`'s own probe endpoint using
+//! whichever transport surface fits. The `ProbeManager` (in the
 //! runtime crate) is the orchestrator that fans probes out across
 //! every registered outbound.
 //!
-//! V1 only ships a TCP-connect probe, but a future ICMP echo probe
-//! drops in by adding a new `impl ProbeProtocol` — the trait surface,
-//! `Outbound`, and `OutboundManager` do not move.
+//! V1 ships an ICMP echo probe for server-backed outbounds. Future
+//! HTTP / QUIC probes drop in by adding a new `impl ProbeProtocol`.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,8 +16,9 @@ use hammer_core::error::CoreError;
 
 use crate::outbound::Outbound;
 
-/// One-shot latency probe. Implementations measure round-trip time
-/// through `outbound`, returning the elapsed `Duration` on success.
+/// One-shot latency probe. Implementations measure round-trip time to
+/// `outbound`'s own probe endpoint, returning the elapsed `Duration`
+/// on success.
 ///
 /// Implementations must be cheap to clone-via-`Arc` and stateless
 /// across calls — the manager may invoke `measure` concurrently for

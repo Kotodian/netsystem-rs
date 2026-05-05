@@ -19,10 +19,10 @@ default = [
     "dns-local",
     "probe",
 ]
-# Outbound-level latency probing. Adds `ProbeManager` + `TcpConnectProbe`
+# Outbound-level latency probing. Adds `ProbeManager` + `IcmpOutboundProbe`
 # under `crate::probe`, plus the `RuntimeService::probe_outbounds` API.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
-probe = []
+probe = ["dep:socket2"]
 inbound-tun = ["dep:libc", "dep:tun-rs"]
 outbound-hysteria2 = [
     "dep:base64",

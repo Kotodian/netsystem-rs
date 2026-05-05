@@ -70,13 +70,12 @@ impl HammerService {
     pub fn probe_outbounds(
         &self,
         protocol: String,
-        target: String,
         timeout_ms: u64,
     ) -> Result<Vec<HammerProbeReport>, HammerError> {
         let timeout = Duration::from_millis(timeout_ms);
         let reports = self
             .inner
-            .probe_outbounds(&protocol, &target, timeout)
+            .probe_outbounds(&protocol, timeout)
             .map_err(HammerError::from)?;
         Ok(reports
             .into_iter()

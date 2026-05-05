@@ -75,7 +75,7 @@ pub use network::NetworkManager;
 pub use outbounds::OutboundManager;
 pub use pause::PauseManager;
 #[cfg(feature = "probe")]
-pub use probe::{ProbeManager, TcpConnectProbe};
+pub use probe::{IcmpOutboundProbe, ProbeManager};
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use route::Router;
