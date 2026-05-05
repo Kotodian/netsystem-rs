@@ -17,7 +17,7 @@ use hickory_proto::op::Message;
 use ipnet::IpNet;
 use tokio::io::{AsyncReadExt, copy_bidirectional};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant, timeout};
 
@@ -28,6 +28,7 @@ const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
 const SYSTEM_UDP_FLOW_CAPACITY: usize = 1024;
 const SYSTEM_UDP_CHANNEL_CAPACITY: usize = 64;
+const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[async_trait]
@@ -325,6 +326,26 @@ struct UdpFlowState {
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
+#[derive(Clone)]
+struct TcpPendingDialLimiter {
+    semaphore: Arc<Semaphore>,
+}
+
+impl TcpPendingDialLimiter {
+    fn new(limit: usize) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit)),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, HammerError> {
+        self.semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| HammerError::internal("pending outbound TCP dial limit reached"))
+    }
+}
+
 pub struct SystemTunStack {
     logger: Logger,
     router: Arc<Router>,
@@ -334,6 +355,7 @@ pub struct SystemTunStack {
     options: hammer_core::config::TunInboundOptions,
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    tcp_pending_dials: TcpPendingDialLimiter,
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
@@ -376,6 +398,7 @@ impl SystemTunStack {
             options,
             device,
             tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
+            tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
             udp_flows: Arc::new(Mutex::new(HashMap::new())),
             tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
@@ -405,6 +428,7 @@ impl SystemTunStack {
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
+                self.tcp_pending_dials.clone(),
                 self.inbound_id.clone(),
                 listener,
             )));
@@ -429,6 +453,7 @@ impl SystemTunStack {
                 Arc::clone(&self.router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
+                self.tcp_pending_dials.clone(),
                 self.inbound_id.clone(),
                 listener,
             )));
@@ -1489,6 +1514,7 @@ async fn accept_tcp_loop(
     router: Arc<Router>,
     outbound: Arc<OutboundManager>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    tcp_pending_dials: TcpPendingDialLimiter,
     inbound_id: String,
     listener: TcpListener,
 ) {
@@ -1510,6 +1536,7 @@ async fn accept_tcp_loop(
         };
         let router = Arc::clone(&router);
         let outbound = Arc::clone(&outbound);
+        let tcp_pending_dials = tcp_pending_dials.clone();
         let inbound_id = inbound_id.clone();
         crate::spawn::spawn(async move {
             let mut metadata = RouteMetadata {
@@ -1566,6 +1593,13 @@ async fn accept_tcp_loop(
                     return;
                 }
             };
+            let dial_permit = match tcp_pending_dials.try_acquire() {
+                Ok(permit) => permit,
+                Err(err) => {
+                    debug!("drop system TCP connection before outbound dial: {err}");
+                    return;
+                }
+            };
             let mut outbound_stream = match outbound
                 .dial(Network::Tcp, destination, &initial_payload)
                 .await
@@ -1576,6 +1610,7 @@ async fn accept_tcp_loop(
                     return;
                 }
             };
+            drop(dial_permit);
             match copy_bidirectional(&mut inbound, &mut outbound_stream).await {
                 Ok((from_inbound, from_outbound)) => {
                     debug!("system TCP copied {from_inbound}/{from_outbound} bytes")
@@ -2500,4 +2535,27 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
     packet[44..48].copy_from_slice(&request[44..48]);
     update_ipv6_icmp_checksum(&mut packet)?;
     Ok(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_pending_dial_limiter_rejects_when_full_and_releases_permit() {
+        let limiter = TcpPendingDialLimiter::new(1);
+        let first = limiter.try_acquire().expect("first dial permit");
+
+        let err = match limiter.try_acquire() {
+            Ok(_) => panic!("second permit should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("pending outbound TCP dial limit reached")
+        );
+
+        drop(first);
+        let _second = limiter.try_acquire().expect("permit released after drop");
+    }
 }

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant as StdInstant};
 use tracing::{debug, error};
 
 use async_trait::async_trait;
@@ -46,6 +46,8 @@ const STREAM_RECEIVE_WINDOW: u32 = 8 * 1024 * 1024;
 const CONNECTION_RECEIVE_WINDOW: u32 = STREAM_RECEIVE_WINDOW / 2 * 5;
 const SEND_WINDOW: u64 = CONNECTION_RECEIVE_WINDOW as u64;
 const HYSTERIA2_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const HYSTERIA2_CONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const HYSTERIA2_CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ClientOptions {
@@ -309,6 +311,7 @@ pub struct Hysteria2Outbound {
     networks: Vec<Network>,
     dependencies: Vec<String>,
     client_state: StdMutex<ClientState>,
+    connect_backoff: StdMutex<ConnectBackoff>,
     client_init: Mutex<()>,
     protector: SocketProtector,
 }
@@ -316,6 +319,42 @@ pub struct Hysteria2Outbound {
 struct ClientState {
     epoch: u64,
     client: Option<Arc<Hysteria2Client>>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectBackoff {
+    current_delay: Duration,
+    next_allowed: Option<StdInstant>,
+}
+
+impl ConnectBackoff {
+    fn remaining(&self, now: StdInstant) -> Option<Duration> {
+        let next_allowed = self.next_allowed?;
+        if now >= next_allowed {
+            None
+        } else {
+            Some(next_allowed.duration_since(now))
+        }
+    }
+
+    fn record_failure(&mut self, now: StdInstant) {
+        self.current_delay = if self.current_delay.is_zero() {
+            HYSTERIA2_CONNECT_BACKOFF_INITIAL
+        } else {
+            (self.current_delay * 2).min(HYSTERIA2_CONNECT_BACKOFF_MAX)
+        };
+        self.next_allowed = Some(now + self.current_delay);
+    }
+
+    fn reset(&mut self) {
+        self.current_delay = Duration::ZERO;
+        self.next_allowed = None;
+    }
+
+    #[cfg(test)]
+    fn current_delay(&self) -> Duration {
+        self.current_delay
+    }
 }
 
 impl Hysteria2Outbound {
@@ -339,12 +378,20 @@ impl Hysteria2Outbound {
                 epoch: 0,
                 client: None,
             }),
+            connect_backoff: StdMutex::new(ConnectBackoff::default()),
             client_init: Mutex::new(()),
             protector,
         }
     }
 
     async fn client(&self) -> Result<Arc<Hysteria2Client>, HammerError> {
+        self.client_with_timeout(HYSTERIA2_CONNECT_TIMEOUT).await
+    }
+
+    async fn client_with_timeout(
+        &self,
+        connect_timeout: Duration,
+    ) -> Result<Arc<Hysteria2Client>, HammerError> {
         if let Some(client) = self.cached_client() {
             return Ok(client);
         }
@@ -353,12 +400,27 @@ impl Hysteria2Outbound {
             if let Some(client) = self.cached_client() {
                 return Ok(client);
             }
+            if let Some(remaining) = self.connect_backoff_remaining() {
+                return Err(HammerError::internal(format!(
+                    "hysteria2 outbound {} connect backing off for {} after recent failure",
+                    self.id,
+                    duration_label(remaining)
+                )));
+            }
             let epoch = self.client_epoch();
             let options = self.client_options()?;
             debug!("hysteria2 outbound {} initializing client", self.id);
-            let client = match Hysteria2Client::connect(options).await {
+            let client = match connect_with_timeout(options, connect_timeout).await {
                 Ok(client) => client,
                 Err(err) => {
+                    if self.client_epoch() != epoch {
+                        debug!(
+                            "hysteria2 outbound {} stale connect failed after reset: {err}",
+                            self.id
+                        );
+                        continue;
+                    }
+                    self.record_connect_failure();
                     error!("hysteria2 outbound {} connect failed: {err}", self.id);
                     return Err(err);
                 }
@@ -373,9 +435,32 @@ impl Hysteria2Outbound {
                 continue;
             }
             state.client = Some(Arc::clone(&client));
+            drop(state);
+            self.clear_connect_backoff();
             debug!("hysteria2 outbound {} client ready", self.id);
             return Ok(client);
         }
+    }
+
+    fn connect_backoff_remaining(&self) -> Option<Duration> {
+        self.connect_backoff
+            .lock()
+            .expect("Hysteria2Outbound connect backoff poisoned")
+            .remaining(StdInstant::now())
+    }
+
+    fn record_connect_failure(&self) {
+        self.connect_backoff
+            .lock()
+            .expect("Hysteria2Outbound connect backoff poisoned")
+            .record_failure(StdInstant::now());
+    }
+
+    fn clear_connect_backoff(&self) {
+        self.connect_backoff
+            .lock()
+            .expect("Hysteria2Outbound connect backoff poisoned")
+            .reset();
     }
 
     fn cached_client(&self) -> Option<Arc<Hysteria2Client>> {
@@ -464,6 +549,7 @@ impl Outbound for Hysteria2Outbound {
         if let Some(client) = client {
             client.close(b"network reset");
         }
+        self.clear_connect_backoff();
     }
 
     async fn dial(
@@ -937,6 +1023,152 @@ fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    fn logger(id: &str) -> Logger {
+        Factory::new(std::time::Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    fn client_options_for_test(port: u16) -> ClientOptions {
+        ClientOptions {
+            server: "127.0.0.1".to_owned(),
+            server_port: port,
+            password: "secret".to_owned(),
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            udp_enabled: true,
+            bbr_profile: BbrProfile::Standard,
+            disable_path_mtu_discovery: false,
+            initial_packet_size: 1200,
+            idle_timeout: None,
+            keep_alive_period: None,
+            send_bps: 0,
+            receive_bps: 0,
+            brutal_debug: false,
+            obfs: None,
+            platform: None,
+        }
+    }
+
+    fn outbound_options_for_test(port: u16) -> Hysteria2OutboundOptions {
+        Hysteria2OutboundOptions {
+            server: "127.0.0.1".to_owned(),
+            server_port: port,
+            password: "secret".to_owned(),
+            up_mbps: 0,
+            down_mbps: 0,
+            network: vec![Hysteria2Network::Tcp, Hysteria2Network::Udp],
+            idle_timeout: None,
+            keep_alive_period: None,
+            initial_packet_size: 1200,
+            tls: hammer_core::config::OutboundTlsOptions {
+                enabled: true,
+                server_name: "localhost".to_owned(),
+                insecure: true,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn connect_backoff_doubles_until_max_and_resets() {
+        let now = std::time::Instant::now();
+        let mut backoff = ConnectBackoff::default();
+
+        assert_eq!(backoff.remaining(now), None);
+        backoff.record_failure(now);
+        assert_eq!(backoff.current_delay(), HYSTERIA2_CONNECT_BACKOFF_INITIAL);
+        assert_eq!(
+            backoff.remaining(now),
+            Some(HYSTERIA2_CONNECT_BACKOFF_INITIAL)
+        );
+
+        backoff.record_failure(now + HYSTERIA2_CONNECT_BACKOFF_INITIAL);
+        assert_eq!(
+            backoff.current_delay(),
+            HYSTERIA2_CONNECT_BACKOFF_INITIAL * 2
+        );
+
+        for _ in 0..10 {
+            backoff.record_failure(now + HYSTERIA2_CONNECT_BACKOFF_MAX);
+        }
+        assert_eq!(backoff.current_delay(), HYSTERIA2_CONNECT_BACKOFF_MAX);
+
+        backoff.reset();
+        assert_eq!(backoff.remaining(now), None);
+        assert_eq!(backoff.current_delay(), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn outbound_connect_backoff_fails_fast_after_connect_error() {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind blackhole UDP socket");
+        let port = socket.local_addr().expect("blackhole addr").port();
+        let _blackhole = crate::spawn::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(port),
+        );
+
+        let first = match outbound
+            .client_with_timeout(Duration::from_millis(50))
+            .await
+        {
+            Ok(_) => panic!("blackhole should time out"),
+            Err(err) => err,
+        };
+        assert!(first.to_string().contains("connect hysteria2 timed out"));
+
+        let started = std::time::Instant::now();
+        let second = match outbound
+            .client_with_timeout(Duration::from_millis(50))
+            .await
+        {
+            Ok(_) => panic!("second attempt should be blocked by backoff"),
+            Err(err) => err,
+        };
+        assert!(
+            started.elapsed() < Duration::from_millis(25),
+            "backoff should fail fast instead of waiting for connect timeout"
+        );
+        assert!(second.to_string().contains("connect backing off"));
+    }
+
+    #[tokio::test]
+    async fn outbound_reset_clears_connect_backoff() {
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind blackhole UDP socket");
+        let port = socket.local_addr().expect("blackhole addr").port();
+        let _blackhole = crate::spawn::spawn(async move {
+            let mut buf = [0u8; 2048];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(port),
+        );
+
+        let err = match outbound
+            .client_with_timeout(Duration::from_millis(50))
+            .await
+        {
+            Ok(_) => panic!("blackhole should time out"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("connect hysteria2 timed out"));
+        assert!(outbound.connect_backoff_remaining().is_some());
+
+        outbound.reset();
+
+        assert_eq!(outbound.connect_backoff_remaining(), None);
+    }
 
     #[tokio::test]
     async fn connect_timeout_reports_hysteria2_context_before_outer_dns_timeout() {
@@ -949,28 +1181,8 @@ mod tests {
             while socket.recv_from(&mut buf).await.is_ok() {}
         });
 
-        let result = connect_with_timeout(
-            ClientOptions {
-                server: "127.0.0.1".to_owned(),
-                server_port: port,
-                password: "secret".to_owned(),
-                server_name: "localhost".to_owned(),
-                insecure: true,
-                udp_enabled: true,
-                bbr_profile: BbrProfile::Standard,
-                disable_path_mtu_discovery: false,
-                initial_packet_size: 1200,
-                idle_timeout: None,
-                keep_alive_period: None,
-                send_bps: 0,
-                receive_bps: 0,
-                brutal_debug: false,
-                obfs: None,
-                platform: None,
-            },
-            Duration::from_millis(50),
-        )
-        .await;
+        let result =
+            connect_with_timeout(client_options_for_test(port), Duration::from_millis(50)).await;
         let err = match result {
             Ok(_) => panic!("blackhole should time out"),
             Err(err) => err,
