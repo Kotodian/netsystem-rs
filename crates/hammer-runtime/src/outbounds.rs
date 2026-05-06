@@ -226,6 +226,7 @@ impl Lifecycle for OutboundManager {
     }
 
     fn close(&self) -> Result<(), HammerError> {
+        self.reset_network();
         tracing::debug!(target: "outbound", "close");
         Ok(())
     }

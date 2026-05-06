@@ -363,6 +363,25 @@ fn connection_manager_tracks_removes_and_closes_connections() {
     assert!(!manager.remove(second_id));
 }
 
+#[test]
+fn connection_manager_lifecycle_close_closes_all_connections() {
+    let manager = ConnectionManager::new();
+    let first = Arc::new(FakeHandle::default());
+    let second = Arc::new(FakeHandle::default());
+
+    manager.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
+    manager.track(Arc::clone(&second) as Arc<dyn ConnectionHandle>);
+
+    Lifecycle::close(&manager).expect("lifecycle close");
+
+    assert!(first.closed.load(Ordering::SeqCst));
+    assert!(second.closed.load(Ordering::SeqCst));
+    assert_eq!(manager.count(), 0);
+
+    Lifecycle::close(&manager).expect("second lifecycle close");
+    assert_eq!(manager.count(), 0);
+}
+
 #[derive(Default)]
 struct MockPlatform {
     listener: std::sync::Mutex<Option<Arc<dyn hammer_adapter::DefaultInterfaceUpdateListener>>>,

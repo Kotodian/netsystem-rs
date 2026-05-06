@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use hammer_adapter::{ConnectionHandle, ConnectionManager as ConnectionManagerTrait};
-
-use crate::impl_logging_lifecycle;
+use hammer_core::error::HammerError;
+use hammer_core::lifecycle::{Lifecycle, StartStage};
 
 pub struct ConnectionManager {
     next_id: AtomicU64,
@@ -43,7 +43,22 @@ impl ConnectionManager {
     }
 }
 
-impl_logging_lifecycle!(ConnectionManager, "connection");
+impl Lifecycle for ConnectionManager {
+    fn name(&self) -> &str {
+        "connection"
+    }
+
+    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+        debug!(target: "connection", "stage {}", stage.name());
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        self.close_all();
+        debug!(target: "connection", "close");
+        Ok(())
+    }
+}
 
 impl ConnectionManagerTrait for ConnectionManager {
     fn count(&self) -> usize {

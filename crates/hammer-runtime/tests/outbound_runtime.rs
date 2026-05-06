@@ -13,6 +13,7 @@ use hammer_core::config::{
     DirectOutboundOptions, Hysteria2OutboundOptions, Outbound, OutboundKind,
 };
 use hammer_core::error::HammerError;
+use hammer_core::lifecycle::Lifecycle;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{OutboundManager, outbounds::BlockOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,6 +128,22 @@ fn outbound_manager_reset_network_resets_registered_outbounds() {
         .expect("register outbound");
 
     manager.reset_network();
+
+    assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn outbound_manager_lifecycle_close_resets_registered_outbounds() {
+    let manager = OutboundManager::new(logger("outbound"), "resettable");
+    let outbound = Arc::new(ResettableOutbound::default());
+    manager
+        .register_outbound(
+            "resettable".to_owned(),
+            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
+        )
+        .expect("register outbound");
+
+    Lifecycle::close(&manager).expect("lifecycle close");
 
     assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
 }
