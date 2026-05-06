@@ -99,9 +99,8 @@ pub trait Outbound: Send + Sync + 'static {
     }
 
     /// Hook invoked once after the runtime finishes the regular `Start`
-    /// stage. Aggregate outbounds (e.g. urltest) override to kick off the
-    /// first latency sweep without having to listen on a separate
-    /// lifecycle slot. Default is no-op so leaf outbounds need no opt-in.
+    /// stage. Outbounds may override it for non-blocking startup work.
+    /// Default is no-op so leaf outbounds need no opt-in.
     ///
     /// Returning `Err` is logged but does not abort service startup —
     /// callers treat the hook as fire-and-forget.

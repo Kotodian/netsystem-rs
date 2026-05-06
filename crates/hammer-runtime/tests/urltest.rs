@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    Network, Outbound as AdapterOutbound, OutboundManager as _, ProxyPacketConn, ProxyStream,
-    SocksAddr,
+    Lifecycle, Network, Outbound as AdapterOutbound, OutboundManager as _, ProxyPacketConn,
+    ProxyStream, SocksAddr,
 };
 use hammer_core::config::{Outbound, OutboundKind, UrltestOutboundOptions};
 use hammer_core::error::HammerError;
+use hammer_core::lifecycle::StartStage;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::OutboundManager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,6 +33,7 @@ struct LatencyOutbound {
     networks: Vec<Network>,
     delay: Duration,
     fail_dial: AtomicUsize,
+    dial_attempts: AtomicUsize,
 }
 
 impl LatencyOutbound {
@@ -41,11 +43,16 @@ impl LatencyOutbound {
             networks,
             delay,
             fail_dial: AtomicUsize::new(0),
+            dial_attempts: AtomicUsize::new(0),
         })
     }
 
     fn fail_next_dials(&self, count: usize) {
         self.fail_dial.fetch_add(count, Ordering::SeqCst);
+    }
+
+    fn dial_attempts(&self) -> usize {
+        self.dial_attempts.load(Ordering::SeqCst)
     }
 }
 
@@ -73,6 +80,7 @@ impl AdapterOutbound for LatencyOutbound {
         _destination: SocksAddr,
         _initial_payload: &[u8],
     ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        self.dial_attempts.fetch_add(1, Ordering::SeqCst);
         if self
             .fail_dial
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
@@ -147,6 +155,39 @@ fn build_manager(
     let manager = Arc::new(manager);
     manager.bind_aggregates();
     manager
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_start_does_not_probe_until_group_probe_is_requested() {
+    let child = LatencyOutbound::new("hysteria2", vec![Network::Tcp], Duration::from_millis(20));
+    let manager = build_manager(
+        vec![Arc::clone(&child)],
+        Duration::from_millis(50),
+        Duration::from_secs(2),
+    );
+    let urltest = manager.get("auto").expect("urltest registered");
+
+    manager
+        .start(StartStage::PostStart)
+        .expect("post-start hooks");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        child.dial_attempts(),
+        0,
+        "urltest post-start must not probe before the user requests it"
+    );
+    assert_eq!(urltest.now(), None);
+
+    let reports = urltest
+        .probe_group(Duration::from_secs(2))
+        .await
+        .expect("manual urltest probe");
+
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].result.is_ok());
+    assert_eq!(child.dial_attempts(), 1);
+    assert_eq!(urltest.now().as_deref(), Some("hysteria2"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

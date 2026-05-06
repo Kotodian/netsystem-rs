@@ -3,8 +3,7 @@
 //!
 //! Mirrors sing-box's `protocol/group/urltest.go` design but trimmed for V1:
 //! no automatic ticker, no idle-timeout, no `interrupt_exist_connections`.
-//! The first probe is kicked off in [`UrltestOutbound::post_start`]; further
-//! sweeps are triggered explicitly through the FFI surface.
+//! Probe sweeps are triggered explicitly through the FFI surface.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -366,9 +365,8 @@ impl Outbound for UrltestOutbound {
     }
 
     async fn post_start(&self) -> Result<(), HammerError> {
-        // Fire-and-forget: errors are logged inside run_probe, so service
-        // start never blocks on a slow probe sweep.
-        self.run_probe(self.timeout).await;
+        // The demo drives urltest explicitly from the UI. Do not warm or probe
+        // during service startup; that can compete with the first real flow.
         Ok(())
     }
 
