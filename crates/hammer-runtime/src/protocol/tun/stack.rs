@@ -55,6 +55,16 @@ pub trait TunDevice: Send + Sync + 'static {
     fn close(&self);
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) fn is_transient_tun_send_backpressure(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::ENOSPC))
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "tvos"))]
+pub(crate) fn should_clear_tun_send_readiness(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::WouldBlock
+}
+
 pub struct MemoryTunDevice {
     input_tx: mpsc::Sender<Vec<u8>>,
     input_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
@@ -2580,6 +2590,26 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+
+    #[test]
+    fn tun_send_backpressure_does_not_clear_asyncfd_readiness() {
+        let enospc = io::Error::from_raw_os_error(libc::ENOSPC);
+        let enobufs = io::Error::from_raw_os_error(libc::ENOBUFS);
+
+        assert!(is_transient_tun_send_backpressure(&enospc));
+        assert!(is_transient_tun_send_backpressure(&enobufs));
+        assert!(!should_clear_tun_send_readiness(&enospc));
+        assert!(!should_clear_tun_send_readiness(&enobufs));
+    }
+
+    #[test]
+    fn tun_send_would_block_clears_asyncfd_readiness() {
+        let would_block = io::Error::from(io::ErrorKind::WouldBlock);
+
+        assert!(!is_transient_tun_send_backpressure(&would_block));
+        assert!(should_clear_tun_send_readiness(&would_block));
+    }
 
     #[test]
     fn tcp_pending_dial_limiter_rejects_when_full_and_releases_permit() {

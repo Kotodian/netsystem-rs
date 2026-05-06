@@ -28,6 +28,9 @@ use tracing::debug;
 use hammer_core::error::HammerError;
 
 use crate::protocol::tun::TunDevice;
+use crate::protocol::tun::stack::{
+    is_transient_tun_send_backpressure, should_clear_tun_send_readiness,
+};
 
 /// macOS/iOS private syscall numbers (`<sys/syscall.h>`). On Apple targets
 /// `libc::syscall` is variadic with the first arg typed as `c_int`, so these
@@ -521,8 +524,7 @@ impl TunDevice for AppleTunDevice {
             };
             match result {
                 Ok((0, _)) => {
-                    guard.clear_ready();
-                    continue;
+                    break Err(HammerError::internal("sendmsg_x wrote zero packets"));
                 }
                 Ok((n_sent, staged)) => {
                     offset += n_sent;
@@ -533,18 +535,16 @@ impl TunDevice for AppleTunDevice {
                         }
                     }
                 }
-                Err((err, _)) if err.kind() == io::ErrorKind::WouldBlock => {
+                Err((err, _)) if should_clear_tun_send_readiness(&err) => {
                     guard.clear_ready();
                 }
                 // utun is a kernel control socket; under burst the kctl pipe
                 // queue fills and `sendmsg_x` returns ENOBUFS or ENOSPC.
-                // Both are transient backpressure, but waiting forever here
-                // blocks the packet loop from draining inbound traffic. Cap
-                // retries and let TCP recover with retransmits if the kernel
-                // queue stays full.
-                Err((err, staged))
-                    if matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::ENOSPC)) =>
-                {
+                // Both are transient backpressure, but they are not readiness
+                // loss signals. Clearing AsyncFd readiness here can park this
+                // packet loop waiting for an edge that never arrives.
+                Err((err, staged)) if is_transient_tun_send_backpressure(&err) => {
+                    drop(guard);
                     backpressure_retries += 1;
                     max_chunk = if max_chunk == usize::MAX {
                         (staged / 2).max(1)
@@ -560,7 +560,6 @@ impl TunDevice for AppleTunDevice {
                     if backpressure_retries == 1 {
                         debug!("apple TUN send backpressure: {err}; backing off");
                     }
-                    guard.clear_ready();
                     tokio::time::sleep(SEND_BACKPRESSURE_RETRY_DELAY).await;
                 }
                 Err((err, _)) => {
