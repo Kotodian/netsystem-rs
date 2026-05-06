@@ -77,28 +77,47 @@ impl HammerService {
             .inner
             .probe_outbounds(&protocol, timeout)
             .map_err(HammerError::from)?;
-        Ok(reports
-            .into_iter()
-            .map(|report| {
-                let outbound_id = report.outbound_id;
-                let protocol = report.protocol;
-                match report.result {
-                    Ok(elapsed) => HammerProbeReport {
-                        outbound_id,
-                        protocol,
-                        ok: true,
-                        latency_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                        error: String::new(),
-                    },
-                    Err(err) => HammerProbeReport {
-                        outbound_id,
-                        protocol,
-                        ok: false,
-                        latency_ms: 0,
-                        error: err.to_string(),
-                    },
-                }
-            })
-            .collect())
+        Ok(reports.into_iter().map(probe_report_to_ffi).collect())
+    }
+
+    pub fn current_selection(&self, outbound_id: String) -> Option<String> {
+        self.inner.current_selection(&outbound_id)
+    }
+
+    pub fn urltest(
+        &self,
+        outbound_id: String,
+        timeout_ms: u64,
+    ) -> Result<Vec<HammerProbeReport>, HammerError> {
+        let timeout = Duration::from_millis(timeout_ms);
+        let reports = self
+            .inner
+            .urltest(&outbound_id, timeout)
+            .map_err(HammerError::from)?;
+        Ok(reports.into_iter().map(probe_report_to_ffi).collect())
+    }
+}
+
+fn probe_report_to_ffi(report: hammer_runtime::adapter::ProbeReport) -> HammerProbeReport {
+    let hammer_runtime::adapter::ProbeReport {
+        outbound_id,
+        protocol,
+        result,
+    } = report;
+    match result {
+        Ok(elapsed) => HammerProbeReport {
+            outbound_id,
+            protocol,
+            ok: true,
+            latency_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            error: String::new(),
+        },
+        Err(err) => HammerProbeReport {
+            outbound_id,
+            protocol,
+            ok: false,
+            latency_ms: 0,
+            error: err.to_string(),
+        },
     }
 }

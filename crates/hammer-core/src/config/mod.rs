@@ -88,8 +88,19 @@ pub mod constants {
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
+    pub const TYPE_URLTEST: &str = "urltest";
     #[cfg(feature = "wireguard")]
     pub const TYPE_WIREGUARD: &str = "wireguard";
+
+    /// Default URL probed by the urltest outbound when the user does not
+    /// configure one. Mirrors sing-box.
+    pub const DEFAULT_URLTEST_URL: &str = "https://www.gstatic.com/generate_204";
+    /// Default tolerance window for urltest selection in milliseconds. A new
+    /// candidate must be at least this much faster than the current pick to
+    /// trigger a switch.
+    pub const DEFAULT_URLTEST_TOLERANCE_MS: u64 = 50;
+    /// Default per-probe timeout for urltest in milliseconds.
+    pub const DEFAULT_URLTEST_TIMEOUT_MS: u64 = 5_000;
 
     pub const PROTOCOL_DNS: &str = "dns";
     pub const PROTOCOL_QUIC: &str = "quic";
@@ -292,6 +303,20 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             .iter()
             .map(|item| item.id.as_str())
             .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+
+    #[cfg(feature = "endpoint")]
+    outbound::validate_urltest_dependencies(
+        &outbounds,
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+    #[cfg(not(feature = "endpoint"))]
+    outbound::validate_urltest_dependencies(
+        &outbounds,
+        outbounds.iter().map(|item| item.id.as_str()),
     )?;
 
     #[cfg(feature = "endpoint")]

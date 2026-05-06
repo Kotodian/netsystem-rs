@@ -588,6 +588,47 @@ fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
     );
 }
 
+#[cfg(feature = "wireguard")]
+#[test]
+fn parse_config_accepts_urltest_child_that_is_endpoint_id() {
+    let cfg = format!(
+        r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["wg-out", "direct"]
+
+[dns]
+server = "udp://1.1.1.1"
+
+[route]
+final = "auto"
+{}
+"#,
+        wg_endpoint_block("")
+    );
+    let options = config::parse_config(&cfg).expect("endpoint child should be valid");
+    assert_eq!(options.endpoints.len(), 1);
+    let urltest = options
+        .outbounds
+        .iter()
+        .find(|outbound| outbound.id == "auto")
+        .expect("auto outbound");
+    let OutboundKind::Urltest(urltest) = &urltest.kind else {
+        panic!("auto is not urltest");
+    };
+    assert_eq!(urltest.outbounds, vec!["wg-out", "direct"]);
+}
+
 #[test]
 fn format_config_round_trips_and_strips_unknown() {
     let formatted = config::format_config(MINIMAL_CONFIG).expect("format");
@@ -928,6 +969,159 @@ final = "direct"
     );
 }
 
+#[test]
+fn urltest_outbound_parses_with_defaults() {
+    let cfg = r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "direct"
+id = "direct-2"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["direct", "direct-2"]
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "auto"
+"#;
+    let opts = config::parse_config(cfg).expect("parse urltest");
+    let urltest = opts
+        .outbounds
+        .iter()
+        .find(|o| o.id == "auto")
+        .expect("auto outbound");
+    let OutboundKind::Urltest(opts) = &urltest.kind else {
+        panic!("auto is not urltest");
+    };
+    assert_eq!(opts.outbounds, vec!["direct", "direct-2"]);
+    assert_eq!(opts.url.as_str(), "https://www.gstatic.com/generate_204");
+    assert_eq!(opts.tolerance, Duration::from_millis(50));
+    assert_eq!(opts.timeout, Duration::from_secs(5));
+}
+
+#[test]
+fn urltest_rejects_unknown_child_id() {
+    let cfg = r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["direct", "missing"]
+
+[route]
+final = "auto"
+"#;
+    let err = config::parse_config(cfg).expect_err("dangling child should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("references unknown outbound id: missing"),
+        "unexpected: {msg}"
+    );
+}
+
+#[test]
+fn urltest_rejects_nested_urltest() {
+    let cfg = r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "inner"
+outbounds = ["direct"]
+
+[[outbounds]]
+type = "urltest"
+id = "outer"
+outbounds = ["inner"]
+
+[route]
+final = "outer"
+"#;
+    let err = config::parse_config(cfg).expect_err("nested urltest should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("cannot nest another urltest"),
+        "unexpected: {msg}"
+    );
+}
+
+#[test]
+fn urltest_rejects_self_reference() {
+    let cfg = r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["direct", "auto"]
+
+[route]
+final = "auto"
+"#;
+    let err = config::parse_config(cfg).expect_err("self-reference should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("cannot reference itself"), "unexpected: {msg}");
+}
+
+#[test]
+fn urltest_rejects_duplicate_child_id() {
+    let cfg = r#"
+[tun]
+mtu = 9000
+stack = "system"
+address = ["172.19.0.1/30"]
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["direct", "direct"]
+
+[route]
+final = "auto"
+"#;
+    let err = config::parse_config(cfg).expect_err("duplicate child should fail");
+    let msg = err.to_string();
+    assert!(msg.contains("duplicate child id"), "unexpected: {msg}");
+}
+
 mod matches {
     use super::*;
 
@@ -943,6 +1137,7 @@ mod matches {
             OutboundKind::Hysteria2(_) => "hysteria2",
             OutboundKind::Direct(_) => "direct",
             OutboundKind::Block => "block",
+            OutboundKind::Urltest(_) => "urltest",
         }
     }
 }

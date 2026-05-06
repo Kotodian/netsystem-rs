@@ -13,6 +13,7 @@ default = [
     "outbound-hysteria2",
     "outbound-direct",
     "outbound-block",
+    "outbound-urltest",
     "dns-udp",
     "dns-tcp",
     "dns-hosts",
@@ -39,6 +40,18 @@ outbound-hysteria2 = [
 ]
 outbound-direct = ["dep:socket2"]
 outbound-block = []
+# Outbound group that probes child outbounds via HTTP HEAD over the proxied
+# stream and routes traffic through the lowest-latency child. Carries its own
+# TLS stack since the probe URL is normally https.
+outbound-urltest = [
+    "dep:base64",
+    "dep:httparse",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-platform-verifier",
+    "dep:tokio-rustls",
+    "dep:url",
+]
 dns-udp = ["dns-tcp"]
 dns-tcp = []
 dns-https = [
@@ -85,6 +98,8 @@ h3-quinn = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
+httparse = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }

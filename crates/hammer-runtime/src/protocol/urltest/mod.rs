@@ -1,0 +1,529 @@
+//! `urltest` outbound group — probes child outbounds via HTTP HEAD over the
+//! proxied stream and routes traffic through the lowest-latency child.
+//!
+//! Mirrors sing-box's `protocol/group/urltest.go` design but trimmed for V1:
+//! no automatic ticker, no idle-timeout, no `interrupt_exist_connections`.
+//! The first probe is kicked off in [`UrltestOutbound::post_start`]; further
+//! sweeps are triggered explicitly through the FFI surface.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use hammer_adapter::{
+    Network, Outbound, OutboundManager as OutboundManagerTrait, ProbeReport, ProxyPacketConn,
+    ProxyStream, SocksAddr,
+};
+use hammer_core::config::{OutboundKind, UrltestOutboundOptions};
+use hammer_core::error::HammerError;
+use hammer_core::log::Logger;
+
+use crate::socket_protector::SocketProtector;
+
+mod probe;
+
+pub use probe::HttpUrltestProbe;
+
+const TCP_AND_UDP: [Network; 2] = [Network::Tcp, Network::Udp];
+
+/// Latency sample for one child outbound. `at` lets future ticker variants
+/// reason about cache freshness; V1 only uses the most recent sample.
+#[derive(Clone, Copy)]
+struct Sample {
+    delay: Duration,
+    #[allow(dead_code)]
+    at: Instant,
+}
+
+/// Mutable urltest state. The outer `Mutex` is taken only for short
+/// synchronous critical sections — never held across `.await`.
+#[derive(Default)]
+struct UrltestState {
+    selected_tcp: Option<String>,
+    selected_udp: Option<String>,
+    history: HashMap<String, Sample>,
+}
+
+/// One probe report carried back to the FFI surface.
+pub struct UrltestSample {
+    pub id: String,
+    pub result: Result<Duration, HammerError>,
+}
+
+/// Aggregate outbound that selects the lowest-latency child each probe
+/// sweep. Implements [`Outbound`] so the router treats it like any other
+/// outbound — children are looked up dynamically through the
+/// [`OutboundManager`](OutboundManagerTrait) the runtime binds in via
+/// [`Outbound::bind_resolver`].
+pub struct UrltestOutbound {
+    id: String,
+    children_ids: Vec<String>,
+    networks: Vec<Network>,
+    probe: Arc<HttpUrltestProbe>,
+    timeout: Duration,
+    tolerance: Duration,
+    state: Mutex<UrltestState>,
+    resolver: OnceLock<Weak<dyn OutboundManagerTrait>>,
+    logger: Logger,
+}
+
+impl UrltestOutbound {
+    fn new(
+        logger: Logger,
+        id: String,
+        options: &UrltestOutboundOptions,
+        protector: SocketProtector,
+    ) -> Result<Arc<Self>, HammerError> {
+        let probe = HttpUrltestProbe::new(options.url.clone(), protector.platform())?;
+        Ok(Arc::new(Self {
+            id,
+            children_ids: options.outbounds.clone(),
+            networks: TCP_AND_UDP.to_vec(),
+            probe: Arc::new(probe),
+            timeout: options.timeout,
+            tolerance: options.tolerance,
+            state: Mutex::new(UrltestState::default()),
+            resolver: OnceLock::new(),
+            logger,
+        }))
+    }
+
+    /// Per-probe timeout configured at construction time. Callers that
+    /// don't want to override should pass this to [`Self::run_probe`].
+    pub fn default_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    fn resolver(&self) -> Result<Arc<dyn OutboundManagerTrait>, HammerError> {
+        self.resolver.get().and_then(Weak::upgrade).ok_or_else(|| {
+            HammerError::internal(format!(
+                "urltest '{}' is not bound to an OutboundManager",
+                self.id
+            ))
+        })
+    }
+
+    /// Run one probe sweep against every child concurrently. Updates the
+    /// internal history + selection and returns one [`UrltestSample`] per
+    /// child in declaration order. `per_probe_timeout` overrides the
+    /// configured per-probe timeout for this sweep — pass
+    /// [`Self::default_timeout`] to use the configured value.
+    pub async fn run_probe(&self, per_probe_timeout: Duration) -> Vec<UrltestSample> {
+        let resolver = match self.resolver() {
+            Ok(r) => r,
+            Err(err) => {
+                self.logger.warn(err.to_string());
+                return Vec::new();
+            }
+        };
+
+        let mut handles: Vec<(
+            String,
+            tokio::task::JoinHandle<Result<Duration, HammerError>>,
+        )> = Vec::with_capacity(self.children_ids.len());
+        let mut missing: Vec<String> = Vec::new();
+        for child_id in &self.children_ids {
+            let Some(child) = resolver.get(child_id) else {
+                self.logger.warn(format!(
+                    "urltest '{}': child '{child_id}' missing during probe",
+                    self.id
+                ));
+                missing.push(child_id.clone());
+                continue;
+            };
+            let probe = Arc::clone(&self.probe);
+            let timeout = per_probe_timeout;
+            let id = child_id.clone();
+            handles.push((
+                id,
+                crate::spawn::spawn(async move { probe.measure(&child, timeout).await }),
+            ));
+        }
+
+        let mut samples = Vec::with_capacity(handles.len() + missing.len());
+        for (id, handle) in handles {
+            let result = match handle.await {
+                Ok(r) => r,
+                Err(err) => Err(HammerError::internal(format!(
+                    "urltest probe task panicked for '{id}': {err}"
+                ))),
+            };
+            samples.push(UrltestSample { id, result });
+        }
+        for id in missing {
+            samples.push(UrltestSample {
+                id,
+                result: Err(HammerError::internal("child outbound not registered")),
+            });
+        }
+
+        // Update history and re-pick selected outbounds. Mutex is taken
+        // synchronously and dropped before the function returns.
+        let mut state = self.state.lock().expect("urltest state poisoned");
+        let now = Instant::now();
+        for sample in &samples {
+            match &sample.result {
+                Ok(delay) => {
+                    state.history.insert(
+                        sample.id.clone(),
+                        Sample {
+                            delay: *delay,
+                            at: now,
+                        },
+                    );
+                }
+                Err(_) => {
+                    state.history.remove(&sample.id);
+                }
+            }
+        }
+        self.recompute_selection(&mut state, &resolver);
+        drop(state);
+
+        if let Some(now_id) = self.now() {
+            self.logger
+                .info(format!("urltest '{}' selected '{now_id}'", self.id));
+        }
+        samples
+    }
+
+    fn recompute_selection(
+        &self,
+        state: &mut UrltestState,
+        resolver: &Arc<dyn OutboundManagerTrait>,
+    ) {
+        state.selected_tcp = self.select(state, resolver, Network::Tcp);
+        state.selected_udp = self.select(state, resolver, Network::Udp);
+    }
+
+    /// Sing-box selection: prefer the current pick unless a candidate is
+    /// faster by at least `tolerance`. Falls back to the first
+    /// network-compatible child when no probe has succeeded yet so a
+    /// dial coming in before [`run_probe`] still gets a sensible target.
+    fn select(
+        &self,
+        state: &UrltestState,
+        resolver: &Arc<dyn OutboundManagerTrait>,
+        network: Network,
+    ) -> Option<String> {
+        if !matches!(network, Network::Tcp | Network::Udp) {
+            return None;
+        }
+        let current = match network {
+            Network::Tcp => state.selected_tcp.as_deref(),
+            Network::Udp => state.selected_udp.as_deref(),
+            _ => None,
+        };
+        let mut best: Option<(String, Duration)> =
+            current.and_then(|id| state.history.get(id).map(|s| (id.to_owned(), s.delay)));
+
+        for child_id in &self.children_ids {
+            let Some(child) = resolver.get(child_id) else {
+                continue;
+            };
+            if !child.networks().contains(&network) {
+                continue;
+            }
+            let Some(sample) = state.history.get(child_id) else {
+                continue;
+            };
+            match &best {
+                None => best = Some((child_id.clone(), sample.delay)),
+                Some((cur_id, cur_delay))
+                    if cur_id != child_id && sample.delay + self.tolerance <= *cur_delay =>
+                {
+                    best = Some((child_id.clone(), sample.delay));
+                }
+                _ => {}
+            }
+        }
+
+        best.map(|(id, _)| id).or_else(|| {
+            // No history yet — pick the first child whose `networks()`
+            // covers the requested protocol so the runtime can still dial.
+            self.children_ids
+                .iter()
+                .find(|id| {
+                    resolver
+                        .get(id)
+                        .is_some_and(|c| c.networks().contains(&network))
+                })
+                .cloned()
+        })
+    }
+
+    fn pick_for(&self, network: Network) -> Result<Arc<dyn Outbound>, HammerError> {
+        let resolver = self.resolver()?;
+        let cached = {
+            let state = self.state.lock().expect("urltest state poisoned");
+            match network {
+                Network::Tcp => state.selected_tcp.clone(),
+                Network::Udp => state.selected_udp.clone(),
+                _ => {
+                    return Err(HammerError::internal(format!(
+                        "urltest '{}': unsupported network {network}",
+                        self.id
+                    )));
+                }
+            }
+        };
+        if let Some(id) = cached.as_deref()
+            && let Some(child) = resolver.get(id)
+        {
+            return Ok(child);
+        }
+
+        // Cache miss (first dial before probe completes, or selected was
+        // dropped on failure). Recompute synchronously and try again.
+        let id = {
+            let mut state = self.state.lock().expect("urltest state poisoned");
+            self.recompute_selection(&mut state, &resolver);
+            match network {
+                Network::Tcp => state.selected_tcp.clone(),
+                Network::Udp => state.selected_udp.clone(),
+                _ => None,
+            }
+        };
+        let id = id.ok_or_else(|| {
+            HammerError::internal(format!(
+                "urltest '{}': no child supports {network}",
+                self.id
+            ))
+        })?;
+        resolver.get(&id).ok_or_else(|| {
+            HammerError::internal(format!(
+                "urltest '{}': selected child '{id}' disappeared",
+                self.id
+            ))
+        })
+    }
+
+    fn drop_child(&self, id: &str) {
+        let mut state = self.state.lock().expect("urltest state poisoned");
+        state.history.remove(id);
+        if state.selected_tcp.as_deref() == Some(id) {
+            state.selected_tcp = None;
+        }
+        if state.selected_udp.as_deref() == Some(id) {
+            state.selected_udp = None;
+        }
+    }
+}
+
+#[async_trait]
+impl Outbound for UrltestOutbound {
+    fn type_name(&self) -> &str {
+        hammer_core::config::constants::TYPE_URLTEST
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn networks(&self) -> &[Network] {
+        &self.networks
+    }
+
+    fn dependencies(&self) -> &[String] {
+        &self.children_ids
+    }
+
+    fn reset(&self) {
+        // Selected outbounds may carry stale connections after a network
+        // flip; clear them so the next dial recomputes against the
+        // children's fresh networks.
+        let mut state = self.state.lock().expect("urltest state poisoned");
+        state.selected_tcp = None;
+        state.selected_udp = None;
+    }
+
+    async fn dial(
+        &self,
+        network: Network,
+        destination: SocksAddr,
+        initial_payload: &[u8],
+    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        let child = self.pick_for(network)?;
+        match child.dial(network, destination, initial_payload).await {
+            Ok(stream) => Ok(stream),
+            Err(err) => {
+                self.drop_child(child.id());
+                Err(err)
+            }
+        }
+    }
+
+    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        let child = self.pick_for(Network::Udp)?;
+        match child.listen_packet().await {
+            Ok(conn) => Ok(conn),
+            Err(err) => {
+                self.drop_child(child.id());
+                Err(err)
+            }
+        }
+    }
+
+    async fn post_start(&self) -> Result<(), HammerError> {
+        // Fire-and-forget: errors are logged inside run_probe, so service
+        // start never blocks on a slow probe sweep.
+        self.run_probe(self.timeout).await;
+        Ok(())
+    }
+
+    async fn probe_group(&self, timeout: Duration) -> Result<Vec<ProbeReport>, HammerError> {
+        let effective = if timeout.is_zero() {
+            self.timeout
+        } else {
+            timeout
+        };
+        let samples = self.run_probe(effective).await;
+        Ok(samples
+            .into_iter()
+            .map(|sample| ProbeReport {
+                outbound_id: sample.id,
+                protocol: hammer_core::config::constants::TYPE_URLTEST.to_owned(),
+                result: sample.result,
+            })
+            .collect())
+    }
+
+    fn now(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.selected_tcp.clone())
+    }
+
+    fn bind_resolver(&self, resolver: Weak<dyn OutboundManagerTrait>) {
+        let _ = self.resolver.set(resolver);
+    }
+}
+
+/// Builder slot called by [`OutboundManager`](crate::OutboundManager) when it
+/// encounters a `urltest` entry in the config.
+pub(crate) fn build_outbound(
+    logger: Logger,
+    id: String,
+    kind: &OutboundKind,
+    protector: SocketProtector,
+) -> Result<Arc<dyn Outbound>, HammerError> {
+    let OutboundKind::Urltest(options) = kind else {
+        return Err(HammerError::internal(format!(
+            "urltest builder invoked for non-urltest outbound: {id}"
+        )));
+    };
+    let outbound = UrltestOutbound::new(logger, id, options, protector)?;
+    Ok(outbound as Arc<dyn Outbound>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_core::log::{DiscardWriter, Factory};
+    use url::Url;
+
+    struct LeafOutbound {
+        id: String,
+        networks: Vec<Network>,
+    }
+
+    #[async_trait]
+    impl Outbound for LeafOutbound {
+        fn type_name(&self) -> &str {
+            "leaf-test"
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn networks(&self) -> &[Network] {
+            &self.networks
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+
+        async fn dial(
+            &self,
+            _network: Network,
+            _destination: SocksAddr,
+            _initial_payload: &[u8],
+        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+            Err(HammerError::internal("leaf-test: dial not used"))
+        }
+
+        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+            Err(HammerError::internal("leaf-test: listen_packet not used"))
+        }
+    }
+
+    fn logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    fn leaf(id: &str) -> Arc<dyn Outbound> {
+        Arc::new(LeafOutbound {
+            id: id.to_owned(),
+            networks: vec![Network::Tcp],
+        })
+    }
+
+    #[test]
+    fn select_switches_when_candidate_is_exactly_tolerance_faster() {
+        let manager = Arc::new(crate::outbounds::OutboundManager::new(
+            logger("manager"),
+            "current",
+        ));
+        manager
+            .register_outbound("current".to_owned(), leaf("current"))
+            .expect("register current");
+        manager
+            .register_outbound("candidate".to_owned(), leaf("candidate"))
+            .expect("register candidate");
+        let resolver: Arc<dyn OutboundManagerTrait> = manager;
+
+        let options = UrltestOutboundOptions {
+            outbounds: vec!["current".to_owned(), "candidate".to_owned()],
+            url: Url::parse("http://urltest.example/probe").expect("valid URL"),
+            tolerance: Duration::from_millis(50),
+            timeout: Duration::from_secs(1),
+        };
+        let urltest = UrltestOutbound::new(
+            logger("urltest"),
+            "auto".to_owned(),
+            &options,
+            SocketProtector::default(),
+        )
+        .expect("urltest outbound");
+        let now = Instant::now();
+        let state = UrltestState {
+            selected_tcp: Some("current".to_owned()),
+            selected_udp: None,
+            history: HashMap::from([
+                (
+                    "current".to_owned(),
+                    Sample {
+                        delay: Duration::from_millis(100),
+                        at: now,
+                    },
+                ),
+                (
+                    "candidate".to_owned(),
+                    Sample {
+                        delay: Duration::from_millis(50),
+                        at: now,
+                    },
+                ),
+            ]),
+        };
+
+        assert_eq!(
+            urltest.select(&state, &resolver, Network::Tcp).as_deref(),
+            Some("candidate")
+        );
+    }
+}

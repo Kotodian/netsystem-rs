@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::HammerError;
 
@@ -89,6 +90,26 @@ raw_struct! {
     }
 }
 
+raw_struct! {
+    pub struct RawUrltestConfig {
+        /// Outbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// Child outbound ids — at least one is required. Each id must match
+        /// a declared outbound or an endpoint's outbound view.
+        pub outbounds: Vec<String> => "Vec::is_empty",
+        /// HTTP(S) URL probed via each child outbound. Defaults to
+        /// `https://www.gstatic.com/generate_204` when absent.
+        pub url: Option<Url> => "Option::is_none",
+        /// Tolerance in milliseconds. A new candidate must beat the
+        /// current pick by at least this much to trigger a switch.
+        pub tolerance_ms: Option<u64> => "Option::is_none",
+        /// Per-probe timeout. Applied as a wall-clock cap around the
+        /// dial + TLS handshake + HTTP HEAD round-trip.
+        #[serde(with = "humantime_serde::option")]
+        pub timeout: Option<Duration> => "Option::is_none",
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
@@ -96,6 +117,7 @@ pub enum RawOutbound {
     Hysteria2(RawHysteria2Config),
     Direct(RawDirectOutboundConfig),
     Block(RawBlockOutboundConfig),
+    Urltest(RawUrltestConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +132,7 @@ impl Outbound {
             OutboundKind::Hysteria2(_) => C::TYPE_HYSTERIA2,
             OutboundKind::Direct(_) => C::TYPE_DIRECT,
             OutboundKind::Block => C::TYPE_BLOCK,
+            OutboundKind::Urltest(_) => C::TYPE_URLTEST,
         }
     }
 }
@@ -120,6 +143,18 @@ pub enum OutboundKind {
     Hysteria2(Hysteria2OutboundOptions),
     Direct(DirectOutboundOptions),
     Block,
+    Urltest(UrltestOutboundOptions),
+}
+
+/// Resolved urltest outbound config — child ids stay as strings; the runtime
+/// `OutboundManager` resolves them to live `Outbound` Arcs at PostStart so
+/// declaration order does not matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrltestOutboundOptions {
+    pub outbounds: Vec<String>,
+    pub url: Url,
+    pub tolerance: Duration,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -273,11 +308,128 @@ pub(super) fn build_declared_outbounds(
                     kind: OutboundKind::Block,
                 }
             }
+            RawOutbound::Urltest(raw) => {
+                let (options, id) = build_urltest_options(idx, raw)?;
+                Outbound {
+                    id,
+                    kind: OutboundKind::Urltest(options),
+                }
+            }
         };
         outbounds.push(outbound);
     }
     ensure_direct_outbound(&mut outbounds);
     Ok(outbounds)
+}
+
+fn build_urltest_options(
+    idx: usize,
+    raw: RawUrltestConfig,
+) -> Result<(UrltestOutboundOptions, String), HammerError> {
+    let RawUrltestConfig {
+        id,
+        outbounds,
+        url,
+        tolerance_ms,
+        timeout,
+    } = raw;
+    if id.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "outbounds[{idx}].id is required"
+        )));
+    }
+    if outbounds.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "outbounds[{idx}] (urltest '{id}') requires at least one child in `outbounds`"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for child in &outbounds {
+        if child.is_empty() {
+            return Err(HammerError::config_validation(format!(
+                "outbounds[{idx}] (urltest '{id}') has an empty child id"
+            )));
+        }
+        if !seen.insert(child.as_str()) {
+            return Err(HammerError::config_validation(format!(
+                "outbounds[{idx}] (urltest '{id}') lists duplicate child id: {child}"
+            )));
+        }
+        if child == &id {
+            return Err(HammerError::config_validation(format!(
+                "outbounds[{idx}] (urltest '{id}') cannot reference itself"
+            )));
+        }
+    }
+    let url = match url {
+        Some(url) => url,
+        None => Url::parse(C::DEFAULT_URLTEST_URL).expect("default urltest URL is valid"),
+    };
+    match url.scheme() {
+        "http" | "https" => {}
+        scheme => {
+            return Err(HammerError::config_validation(format!(
+                "outbounds[{idx}] (urltest '{id}') url scheme must be http or https, got: {scheme}"
+            )));
+        }
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(HammerError::config_validation(format!(
+            "outbounds[{idx}] (urltest '{id}') url is missing a host"
+        )));
+    }
+    let tolerance = Duration::from_millis(tolerance_ms.unwrap_or(C::DEFAULT_URLTEST_TOLERANCE_MS));
+    let timeout = timeout.unwrap_or_else(|| Duration::from_millis(C::DEFAULT_URLTEST_TIMEOUT_MS));
+    if timeout.is_zero() {
+        return Err(HammerError::config_validation(format!(
+            "outbounds[{idx}] (urltest '{id}') timeout must be > 0"
+        )));
+    }
+    Ok((
+        UrltestOutboundOptions {
+            outbounds,
+            url,
+            tolerance,
+            timeout,
+        },
+        id,
+    ))
+}
+
+/// Validate that every urltest references real, non-urltest outbound ids.
+/// Nesting urltest inside urltest is rejected in V1 — sing-box flattens via
+/// `RealTag` indirection, but we want the simpler invariant of "leaves only".
+pub(super) fn validate_urltest_dependencies<'a>(
+    outbounds: &[Outbound],
+    valid_child_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<(), HammerError> {
+    use std::collections::{HashMap, HashSet};
+
+    let by_id: HashMap<&str, &Outbound> = outbounds.iter().map(|o| (o.id.as_str(), o)).collect();
+    let valid_child_ids: HashSet<&str> = valid_child_ids.into_iter().collect();
+    for outbound in outbounds {
+        let OutboundKind::Urltest(options) = &outbound.kind else {
+            continue;
+        };
+        for child_id in &options.outbounds {
+            if !valid_child_ids.contains(child_id.as_str()) {
+                return Err(HammerError::config_validation(format!(
+                    "urltest '{}' references unknown outbound id: {child_id}",
+                    outbound.id
+                )));
+            }
+            if by_id
+                .get(child_id.as_str())
+                .is_some_and(|child| matches!(child.kind, OutboundKind::Urltest(_)))
+            {
+                return Err(HammerError::config_validation(format!(
+                    "urltest '{}' cannot nest another urltest: {child_id}",
+                    outbound.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn ensure_direct_outbound(outbounds: &mut Vec<Outbound>) {

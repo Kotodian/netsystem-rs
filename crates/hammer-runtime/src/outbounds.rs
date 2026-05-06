@@ -1,12 +1,14 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use hammer_adapter::{Outbound, OutboundManager as OutboundManagerTrait, PlatformInterface};
+use hammer_adapter::{
+    Lifecycle, Outbound, OutboundManager as OutboundManagerTrait, PlatformInterface,
+};
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::HammerError;
+use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
-use crate::impl_logging_lifecycle;
 use crate::socket_protector::SocketProtector;
 
 #[cfg(feature = "outbound-block")]
@@ -61,6 +63,11 @@ fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, Outb
     builders.insert(
         "block",
         crate::protocol::block::build_outbound as OutboundBuilder,
+    );
+    #[cfg(feature = "outbound-urltest")]
+    builders.insert(
+        "urltest",
+        crate::protocol::urltest::build_outbound as OutboundBuilder,
     );
 }
 
@@ -166,9 +173,63 @@ impl OutboundManager {
         items.insert(option.id.clone(), descriptor);
         Ok(())
     }
+
+    /// Inject this manager (as a `Weak<dyn OutboundManager>`) into every
+    /// registered aggregate outbound so they can resolve their children
+    /// dynamically without owning the manager. Idempotent — leaves use the
+    /// default no-op `bind_resolver` and don't care; aggregates ignore
+    /// duplicate calls.
+    ///
+    /// Must be called **after** all outbounds (including endpoint-derived
+    /// ones registered via `register_outbound`) are in place, otherwise
+    /// late-registered children would be invisible to the aggregate.
+    pub fn bind_aggregates(self: &Arc<Self>) {
+        let weak: Weak<Self> = Arc::downgrade(self);
+        let resolver: Weak<dyn OutboundManagerTrait> = weak;
+        let items = self.items.lock().expect("OutboundManager poisoned");
+        for outbound in items.values() {
+            outbound.bind_resolver(resolver.clone());
+        }
+    }
+
+    fn spawn_post_start_hooks(&self) {
+        let items: Vec<Arc<dyn Outbound>> = self
+            .items
+            .lock()
+            .expect("OutboundManager poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for outbound in items {
+            let id = outbound.id().to_owned();
+            let logger = self.logger.clone();
+            crate::spawn::spawn(async move {
+                if let Err(err) = outbound.post_start().await {
+                    logger.warn(format!("outbound '{id}' post_start: {err}"));
+                }
+            });
+        }
+    }
 }
 
-impl_logging_lifecycle!(OutboundManager, "outbound");
+impl Lifecycle for OutboundManager {
+    fn name(&self) -> &str {
+        "outbound"
+    }
+
+    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+        tracing::debug!(target: "outbound", "stage {}", stage.name());
+        if stage == StartStage::PostStart {
+            self.spawn_post_start_hooks();
+        }
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        tracing::debug!(target: "outbound", "close");
+        Ok(())
+    }
+}
 
 impl OutboundManagerTrait for OutboundManager {
     fn list(&self) -> Vec<Arc<dyn Outbound>> {

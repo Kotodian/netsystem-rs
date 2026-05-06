@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -94,6 +94,45 @@ pub trait Outbound: Send + Sync + 'static {
     ) -> Result<Duration, CoreError> {
         Err(CoreError::internal(format!(
             "{protocol} probe not supported by outbound: {}",
+            self.id()
+        )))
+    }
+
+    /// Hook invoked once after the runtime finishes the regular `Start`
+    /// stage. Aggregate outbounds (e.g. urltest) override to kick off the
+    /// first latency sweep without having to listen on a separate
+    /// lifecycle slot. Default is no-op so leaf outbounds need no opt-in.
+    ///
+    /// Returning `Err` is logged but does not abort service startup —
+    /// callers treat the hook as fire-and-forget.
+    async fn post_start(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
+    /// Aggregate outbounds (urltest, future selectors) report the id of
+    /// the child currently selected. Returning `None` (the default) means
+    /// the outbound is a leaf and no inner choice exists.
+    fn now(&self) -> Option<String> {
+        None
+    }
+
+    /// Inject the resolver an aggregate outbound uses to look up its
+    /// children at run time. The runtime walks every registered outbound
+    /// after the manager is `Arc`-wrapped and calls this once with a
+    /// `Weak` so aggregates can fan out without owning the manager.
+    /// Default is a no-op for leaves.
+    fn bind_resolver(&self, _resolver: Weak<dyn OutboundManager>) {}
+
+    /// Run an aggregate outbound's group-probe sweep on demand. Reports
+    /// land in declaration order with `outbound_id` set to each child's
+    /// id and `protocol` to a sweep-kind tag (e.g. `"urltest"`). Leaf
+    /// outbounds reject the call by default since they have no children.
+    async fn probe_group(
+        &self,
+        _timeout: Duration,
+    ) -> Result<Vec<crate::probe::ProbeReport>, CoreError> {
+        Err(CoreError::internal(format!(
+            "outbound '{}' has no group probe",
             self.id()
         )))
     }

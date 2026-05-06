@@ -196,6 +196,35 @@ fn need_wifi_state_starts_false_and_update_does_not_panic() {
     svc.close().expect("close");
 }
 
+#[test]
+fn service_accepts_urltest_in_default_feature_set() {
+    let toml = r#"
+[tun]
+address = ["172.19.0.1/30"]
+mtu = 1400
+stack = "disabled"
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "urltest"
+id = "auto"
+outbounds = ["direct"]
+timeout = "10ms"
+
+[dns]
+server = "udp://1.1.1.1"
+
+[route]
+final = "auto"
+"#;
+    let platform = Arc::new(CapturePlatform::default());
+    HammerService::new(toml, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("default FFI build must construct urltest outbounds");
+}
+
 /// Booting a config with a `[[endpoints]]` block must walk the configured
 /// lifecycle graph and register the endpoint's outbound view.
 #[cfg(feature = "wireguard")]

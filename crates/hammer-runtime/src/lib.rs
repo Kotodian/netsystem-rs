@@ -12,7 +12,11 @@ pub use hammer_core::error::HammerError;
 /// Some rustls code paths may use the process-wide provider instead of an
 /// explicit builder provider. Idempotent — subsequent calls are no-ops when a
 /// provider is already installed.
-#[cfg(any(feature = "outbound-hysteria2", feature = "dns-https"))]
+#[cfg(any(
+    feature = "outbound-hysteria2",
+    feature = "outbound-urltest",
+    feature = "dns-https"
+))]
 pub fn install_default_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -20,7 +24,11 @@ pub fn install_default_crypto_provider() {
     });
 }
 
-#[cfg(not(any(feature = "outbound-hysteria2", feature = "dns-https")))]
+#[cfg(not(any(
+    feature = "outbound-hysteria2",
+    feature = "outbound-urltest",
+    feature = "dns-https"
+)))]
 pub fn install_default_crypto_provider() {}
 
 mod certificate;
@@ -41,7 +49,11 @@ mod runtime_service;
 mod service_mgr;
 mod socket_protector;
 pub mod spawn;
-#[cfg(any(feature = "outbound-hysteria2", feature = "dns-https"))]
+#[cfg(any(
+    feature = "outbound-hysteria2",
+    feature = "outbound-urltest",
+    feature = "dns-https"
+))]
 mod tls_support;
 
 #[cfg(feature = "outbound-hysteria2")]

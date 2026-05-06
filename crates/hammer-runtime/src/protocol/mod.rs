@@ -8,6 +8,8 @@ pub mod hysteria2;
 pub(crate) mod icmp;
 #[cfg(feature = "inbound-tun")]
 pub mod tun;
+#[cfg(feature = "outbound-urltest")]
+pub mod urltest;
 
 #[cfg(feature = "wireguard")]
 pub mod wireguard;

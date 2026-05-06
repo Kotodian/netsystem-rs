@@ -99,6 +99,7 @@ impl ProbeManager {
 }
 
 /// Probe that measures latency to each outbound's own ICMP probe endpoint.
+#[derive(Default)]
 pub struct IcmpOutboundProbe;
 
 impl IcmpOutboundProbe {

@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hammer_adapter::{Lifecycle, NetworkManager as _, PlatformInterface};
+use hammer_adapter::{Lifecycle, NetworkManager as _, OutboundManager as _, PlatformInterface};
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
@@ -19,8 +19,8 @@ use crate::{
 use crate::{IcmpOutboundProbe, ProbeManager};
 
 #[cfg(feature = "probe")]
-use hammer_adapter::{ProbeProtocol, ProbeReport};
-#[cfg(feature = "probe")]
+use hammer_adapter::ProbeProtocol;
+use hammer_adapter::ProbeReport;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,12 @@ impl RuntimeService {
                 outbound.register_outbound(id, view)?;
             }
         }
+        // Aggregate outbounds (urltest) need a `Weak<dyn OutboundManager>`
+        // before any children can be looked up. Bind once here, after every
+        // potential child — including endpoint-backed outbounds above — has
+        // been registered, so the urltest's first dial / probe can resolve
+        // every declared id without races.
+        outbound.bind_aggregates();
         let default_domain_resolver = options
             .route
             .default_domain_resolver
@@ -228,6 +234,45 @@ impl RuntimeService {
             (Arc::clone(&inner.probe), inner._runtime.handle().clone())
         };
         Ok(runtime_handle.block_on(probe_mgr.probe_all(probe, timeout)))
+    }
+
+    /// Return the id of the child currently selected by an aggregate
+    /// outbound (e.g. urltest). Leaf outbounds — and any unknown id —
+    /// return `None` so the FFI layer can map it to a nullable string.
+    pub fn current_selection(&self, outbound_id: &str) -> Option<String> {
+        self.with_inner(|inner| {
+            if inner.state == ServiceState::Closed {
+                return None;
+            }
+            inner.outbound.get(outbound_id).and_then(|o| o.now())
+        })
+    }
+
+    /// Trigger a one-shot probe sweep on an aggregate outbound and
+    /// collect per-child latency reports. Mirrors sing-box's
+    /// `URLTest()`: the call drives the same probe path used by the
+    /// PostStart kickoff, then returns the resulting samples.
+    ///
+    /// `timeout` is forwarded to each per-child probe. A zero value
+    /// means "use the value baked into the outbound config".
+    pub fn urltest(
+        &self,
+        outbound_id: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ProbeReport>, HammerError> {
+        let (outbound, runtime_handle) = {
+            let inner = self.inner.lock().expect("service mutex poisoned");
+            if inner.state == ServiceState::Closed {
+                return Err(HammerError::service_closed());
+            }
+            let outbound = inner.outbound.get(outbound_id).ok_or_else(|| {
+                HammerError::config_validation(format!(
+                    "outbound '{outbound_id}' is not registered"
+                ))
+            })?;
+            (outbound, inner._runtime.handle().clone())
+        };
+        runtime_handle.block_on(outbound.probe_group(timeout))
     }
 
     pub fn start(&self) -> Result<(), HammerError> {
