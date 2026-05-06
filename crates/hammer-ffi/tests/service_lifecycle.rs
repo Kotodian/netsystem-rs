@@ -197,6 +197,30 @@ fn need_wifi_state_starts_false_and_update_does_not_panic() {
 }
 
 #[test]
+fn service_exposes_runtime_metrics() {
+    let (_platform, svc) = make_service();
+    svc.start().expect("start");
+
+    let samples = svc.metrics();
+
+    svc.close().expect("close");
+    assert!(
+        samples.iter().any(|sample| sample.module == "outbound"
+            && sample.component_type == "outbound"
+            && sample.component_id == "hysteria2"
+            && sample.name == "dial_error_total"
+            && sample.kind == "counter"),
+        "samples = {samples:?}"
+    );
+    assert!(
+        samples.iter().any(|sample| sample.module == "route"
+            && sample.component_type == "router"
+            && sample.name == "error_total"),
+        "samples = {samples:?}"
+    );
+}
+
+#[test]
 fn service_accepts_urltest_in_default_feature_set() {
     let toml = r#"
 [tun]

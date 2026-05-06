@@ -15,7 +15,7 @@ use hammer_core::config::{
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::Lifecycle;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{OutboundManager, outbounds::BlockOutbound};
+use hammer_runtime::{MetricsRegistry, OutboundManager, outbounds::BlockOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -146,6 +146,33 @@ fn outbound_manager_lifecycle_close_resets_registered_outbounds() {
     Lifecycle::close(&manager).expect("lifecycle close");
 
     assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn outbound_manager_registers_error_metrics_for_registered_outbounds() {
+    let metrics = MetricsRegistry::new();
+    let manager =
+        OutboundManager::new_with_metrics(logger("outbound"), "resettable", Arc::clone(&metrics));
+    let outbound = Arc::new(ResettableOutbound::default());
+    manager
+        .register_outbound(
+            "resettable".to_owned(),
+            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
+        )
+        .expect("register outbound");
+
+    let samples = metrics.snapshot();
+    assert!(
+        samples.iter().any(|sample| sample.module == "outbound"
+            && sample.component_id == "resettable"
+            && sample.name == "dial_error_total"
+            && sample.value == 0
+            && sample
+                .labels
+                .iter()
+                .any(|label| label.key == "network" && label.value == "tcp")),
+        "samples = {samples:?}"
+    );
 }
 
 #[tokio::test]

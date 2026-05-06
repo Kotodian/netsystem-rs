@@ -371,11 +371,7 @@ impl Outbound for UrltestOutbound {
     }
 
     async fn probe_group(&self, timeout: Duration) -> Result<Vec<ProbeReport>, HammerError> {
-        let effective = if timeout.is_zero() {
-            self.timeout
-        } else {
-            timeout
-        };
+        let effective = self.probe_group_timeout(timeout);
         let samples = self.run_probe(effective).await;
         Ok(samples
             .into_iter()
@@ -392,6 +388,14 @@ impl Outbound for UrltestOutbound {
             .lock()
             .ok()
             .and_then(|state| state.selected_tcp.clone())
+    }
+
+    fn probe_group_timeout(&self, timeout: Duration) -> Duration {
+        if timeout.is_zero() {
+            self.timeout
+        } else {
+            timeout
+        }
     }
 
     fn bind_resolver(&self, resolver: Weak<dyn OutboundManagerTrait>) {
@@ -522,6 +526,32 @@ mod tests {
         assert_eq!(
             urltest.select(&state, &resolver, Network::Tcp).as_deref(),
             Some("candidate")
+        );
+    }
+
+    #[test]
+    fn probe_group_timeout_uses_configured_timeout_for_zero() {
+        let options = UrltestOutboundOptions {
+            outbounds: vec!["direct".to_owned()],
+            url: Url::parse("http://urltest.example/probe").expect("valid URL"),
+            tolerance: Duration::from_millis(50),
+            timeout: Duration::from_secs(12),
+        };
+        let urltest = UrltestOutbound::new(
+            logger("urltest"),
+            "auto".to_owned(),
+            &options,
+            SocketProtector::default(),
+        )
+        .expect("urltest outbound");
+
+        assert_eq!(
+            urltest.probe_group_timeout(Duration::ZERO),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            urltest.probe_group_timeout(Duration::from_secs(2)),
+            Duration::from_secs(2)
         );
     }
 }

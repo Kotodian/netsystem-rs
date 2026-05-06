@@ -8,6 +8,7 @@ use hammer_core::config::{Inbound as InboundOptions, InboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
+use hammer_core::metrics::MetricsRegistry;
 use tracing::debug;
 
 #[cfg(feature = "inbound-tun")]
@@ -22,6 +23,7 @@ type InboundBuilder = fn(
     Option<Arc<DnsRouter>>,
     Option<Arc<OutboundManager>>,
     Option<Arc<dyn PlatformInterface>>,
+    Arc<MetricsRegistry>,
 ) -> Result<Arc<dyn Inbound>, HammerError>;
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ impl InboundFactorySet {
         dns_router: Option<Arc<DnsRouter>>,
         outbound: Option<Arc<OutboundManager>>,
         platform: Option<Arc<dyn PlatformInterface>>,
+        metrics: Arc<MetricsRegistry>,
     ) -> Result<Arc<dyn Inbound>, HammerError> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
@@ -60,6 +63,7 @@ impl InboundFactorySet {
             dns_router,
             outbound,
             platform,
+            metrics,
         )
     }
 }
@@ -98,6 +102,7 @@ impl InboundManager {
                 None,
                 None,
                 None,
+                MetricsRegistry::new(),
             )?);
         }
         Ok(manager)
@@ -111,6 +116,26 @@ impl InboundManager {
         outbound: Arc<OutboundManager>,
         platform: Arc<dyn PlatformInterface>,
     ) -> Result<Self, HammerError> {
+        Self::from_options_with_runtime_and_metrics(
+            logger,
+            options,
+            router,
+            dns_router,
+            outbound,
+            platform,
+            MetricsRegistry::new(),
+        )
+    }
+
+    pub fn from_options_with_runtime_and_metrics(
+        logger: Logger,
+        options: &[InboundOptions],
+        router: Arc<Router>,
+        dns_router: Arc<DnsRouter>,
+        outbound: Arc<OutboundManager>,
+        platform: Arc<dyn PlatformInterface>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Result<Self, HammerError> {
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(
@@ -120,6 +145,7 @@ impl InboundManager {
                 Some(Arc::clone(&dns_router)),
                 Some(Arc::clone(&outbound)),
                 Some(Arc::clone(&platform)),
+                Arc::clone(&metrics),
             )?);
         }
         Ok(manager)

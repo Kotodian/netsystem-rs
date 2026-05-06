@@ -23,6 +23,8 @@ use tokio::time::{self, Duration, Instant, timeout};
 
 use crate::dns::MessageExt;
 use crate::{DnsRouter, OutboundManager, Router};
+use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
+use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
@@ -408,6 +410,7 @@ pub struct SystemTunStack {
     tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
+    metrics: TunMetrics,
 }
 
 impl SystemTunStack {
@@ -420,8 +423,9 @@ impl SystemTunStack {
         options: hammer_core::config::TunInboundOptions,
         device: Arc<dyn TunDevice>,
     ) -> Self {
+        let metrics = MetricsRegistry::new().scope("inbound", "tun", inbound_id.clone());
         Self::new_with_interface_index(
-            logger, router, dns_router, outbound, inbound_id, options, device, None,
+            logger, router, dns_router, outbound, inbound_id, options, device, None, metrics,
         )
     }
 
@@ -435,6 +439,7 @@ impl SystemTunStack {
         options: hammer_core::config::TunInboundOptions,
         device: Arc<dyn TunDevice>,
         tun_interface_index: Option<u32>,
+        metrics: MetricsScope,
     ) -> Self {
         let udp_timeout = options.udp_timeout.unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
         Self {
@@ -451,6 +456,7 @@ impl SystemTunStack {
             tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
             started: AtomicBool::new(false),
+            metrics: TunMetrics::new(metrics),
         }
     }
 
@@ -479,6 +485,7 @@ impl SystemTunStack {
                 self.tcp_pending_dials.clone(),
                 self.inbound_id.clone(),
                 listener,
+                self.metrics.clone(),
             )));
             routes.v4 = Some(SystemStackRoute {
                 listener_addr: IpAddr::V4(v4.listener),
@@ -504,6 +511,7 @@ impl SystemTunStack {
                 self.tcp_pending_dials.clone(),
                 self.inbound_id.clone(),
                 listener,
+                self.metrics.clone(),
             )));
             routes.v6 = Some(SystemStackRoute {
                 listener_addr: IpAddr::V6(v6.listener),
@@ -524,6 +532,7 @@ impl SystemTunStack {
             self.options
                 .udp_timeout
                 .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT),
+            self.metrics.clone(),
         )));
         self.tasks
             .lock()
@@ -547,6 +556,122 @@ impl SystemTunStack {
             flows.clear();
         }
     }
+}
+
+/// Plain counter set for the TUN inbound, registered directly against the
+/// inbound's [`MetricsScope`]. This keeps every TUN stack instance bound to
+/// its own `(module, component_type, component_id)` tuple instead of routing
+/// through a process-global recorder.
+#[derive(Clone)]
+struct TunCounters {
+    /// Errors reading a batch of packets from the TUN device.
+    packet_recv_error_total: Counter,
+    /// Empty packets dropped before parsing.
+    packet_drop_empty_total: Counter,
+    /// Packets that failed IP header parsing.
+    packet_parse_error_total: Counter,
+    /// Packets dropped because the destination is not a global unicast address.
+    packet_drop_non_global_total: Counter,
+    /// TUN write failures during the TCP rewrite batch.
+    tcp_writeback_error_total: Counter,
+    /// Errors accepting an inbound TCP connection from the system listener.
+    tcp_accept_error_total: Counter,
+    /// TCP accepts whose source port had no matching NAT entry.
+    tcp_unknown_nat_total: Counter,
+    /// Failures building the TCP outbound destination address.
+    tcp_destination_error_total: Counter,
+    /// TCP outbound dials dropped before issuing because of the pending-dial limit.
+    tcp_dial_dropped_total: Counter,
+    /// TCP outbound dial errors.
+    tcp_dial_error_total: Counter,
+    /// TCP bidirectional copy errors during the inbound/outbound bridge.
+    tcp_copy_error_total: Counter,
+    /// UDP route metadata preparation errors.
+    udp_route_prepare_error_total: Counter,
+    /// DNS hijack path errors (parse / exchange / serialize / write).
+    udp_dns_error_total: Counter,
+    /// Outbound `listen_packet()` errors when establishing a UDP flow.
+    udp_listen_error_total: Counter,
+    /// UDP flows evicted from the flow map because of capacity pressure.
+    udp_flow_evict_total: Counter,
+    /// UDP packets dropped because the chosen flow's send queue was full.
+    udp_flow_drop_busy_total: Counter,
+    /// UDP flow send errors.
+    udp_flow_send_error_total: Counter,
+    /// UDP flow recv errors.
+    udp_flow_recv_error_total: Counter,
+    /// UDP response write-back errors.
+    udp_flow_response_write_error_total: Counter,
+    /// UDP flows torn down by the idle timeout.
+    udp_flow_timeout_total: Counter,
+}
+
+impl TunCounters {
+    fn new(scope: &MetricsScope) -> Self {
+        let recorder = scope.recorder();
+        Self {
+            packet_recv_error_total: recorder_counter(&recorder, "packet_recv_error_total"),
+            packet_drop_empty_total: recorder_counter(&recorder, "packet_drop_empty_total"),
+            packet_parse_error_total: recorder_counter(&recorder, "packet_parse_error_total"),
+            packet_drop_non_global_total: recorder_counter(
+                &recorder,
+                "packet_drop_non_global_total",
+            ),
+            tcp_writeback_error_total: recorder_counter(&recorder, "tcp_writeback_error_total"),
+            tcp_accept_error_total: recorder_counter(&recorder, "tcp_accept_error_total"),
+            tcp_unknown_nat_total: recorder_counter(&recorder, "tcp_unknown_nat_total"),
+            tcp_destination_error_total: recorder_counter(&recorder, "tcp_destination_error_total"),
+            tcp_dial_dropped_total: recorder_counter(&recorder, "tcp_dial_dropped_total"),
+            tcp_dial_error_total: recorder_counter(&recorder, "tcp_dial_error_total"),
+            tcp_copy_error_total: recorder_counter(&recorder, "tcp_copy_error_total"),
+            udp_route_prepare_error_total: recorder_counter(
+                &recorder,
+                "udp_route_prepare_error_total",
+            ),
+            udp_dns_error_total: recorder_counter(&recorder, "udp_dns_error_total"),
+            udp_listen_error_total: recorder_counter(&recorder, "udp_listen_error_total"),
+            udp_flow_evict_total: recorder_counter(&recorder, "udp_flow_evict_total"),
+            udp_flow_drop_busy_total: recorder_counter(&recorder, "udp_flow_drop_busy_total"),
+            udp_flow_send_error_total: recorder_counter(&recorder, "udp_flow_send_error_total"),
+            udp_flow_recv_error_total: recorder_counter(&recorder, "udp_flow_recv_error_total"),
+            udp_flow_response_write_error_total: recorder_counter(
+                &recorder,
+                "udp_flow_response_write_error_total",
+            ),
+            udp_flow_timeout_total: recorder_counter(&recorder, "udp_flow_timeout_total"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TunMetrics {
+    counters: TunCounters,
+    /// Route lookup failures, partitioned by network. Replaces the
+    /// historical `tcp_route_error_total` / `udp_route_error_total`
+    /// twins.
+    route_error_total: NetworkCounters,
+    /// Reject-rule hits, partitioned by network.
+    reject_total: NetworkCounters,
+    /// Outbound id lookups that failed (config drift / missing
+    /// outbound), partitioned by network.
+    outbound_missing_total: NetworkCounters,
+}
+
+impl TunMetrics {
+    fn new(scope: MetricsScope) -> Self {
+        Self {
+            counters: TunCounters::new(&scope),
+            route_error_total: NetworkCounters::new(&scope, "route_error_total"),
+            reject_total: NetworkCounters::new(&scope, "reject_total"),
+            outbound_missing_total: NetworkCounters::new(&scope, "outbound_missing_total"),
+        }
+    }
+}
+
+fn recorder_counter(recorder: &RegistryRecorder, name: &str) -> Counter {
+    let key = Key::from_name(name.to_owned());
+    let metadata = Metadata::new("tun", metrics::Level::INFO, Some(module_path!()));
+    recorder.register_counter(&key, &metadata)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1557,6 +1682,7 @@ fn is_global_unicast(addr: IpAddr) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_tcp_loop(
     _logger: Logger,
     router: Arc<Router>,
@@ -1565,11 +1691,13 @@ async fn accept_tcp_loop(
     tcp_pending_dials: TcpPendingDialLimiter,
     inbound_id: String,
     listener: TcpListener,
+    metrics: TunMetrics,
 ) {
     loop {
         let (mut inbound, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
+                metrics.counters.tcp_accept_error_total.increment(1);
                 debug!("system TCP listener closed: {err}");
                 return;
             }
@@ -1579,6 +1707,7 @@ async fn accept_tcp_loop(
             nat.claim_active(peer.port())
         };
         let Some(session) = session else {
+            metrics.counters.tcp_unknown_nat_total.increment(1);
             debug!("unknown system TCP NAT session: {}", peer.port());
             continue;
         };
@@ -1587,6 +1716,7 @@ async fn accept_tcp_loop(
         let outbound = Arc::clone(&outbound);
         let tcp_pending_dials = tcp_pending_dials.clone();
         let inbound_id = inbound_id.clone();
+        let metrics = metrics.clone();
         crate::spawn::spawn(async move {
             let _nat_lease = nat_lease;
             let mut metadata = RouteMetadata {
@@ -1621,6 +1751,7 @@ async fn accept_tcp_loop(
             let decision = match router.match_route(&mut metadata) {
                 Ok(decision) => decision,
                 Err(err) => {
+                    metrics.route_error_total.inc(Network::Tcp);
                     debug!("route TCP connection: {err}");
                     return;
                 }
@@ -1629,16 +1760,19 @@ async fn accept_tcp_loop(
                 outbound: outbound_id,
             } = decision
             else {
+                metrics.reject_total.inc(Network::Tcp);
                 debug!("system TCP connection rejected");
                 return;
             };
             let Some(outbound) = outbound.get(&outbound_id) else {
+                metrics.outbound_missing_total.inc(Network::Tcp);
                 error!("outbound not found: {outbound_id}");
                 return;
             };
             let destination = match route_destination(&metadata, None) {
                 Ok(destination) => destination,
                 Err(err) => {
+                    metrics.counters.tcp_destination_error_total.increment(1);
                     debug!("build TCP destination: {err}");
                     return;
                 }
@@ -1646,6 +1780,7 @@ async fn accept_tcp_loop(
             let dial_permit = match tcp_pending_dials.try_acquire() {
                 Ok(permit) => permit,
                 Err(err) => {
+                    metrics.counters.tcp_dial_dropped_total.increment(1);
                     debug!("drop system TCP connection before outbound dial: {err}");
                     return;
                 }
@@ -1656,6 +1791,7 @@ async fn accept_tcp_loop(
             {
                 Ok(stream) => stream,
                 Err(err) => {
+                    metrics.counters.tcp_dial_error_total.increment(1);
                     debug!("dial TCP outbound: {err}");
                     return;
                 }
@@ -1665,7 +1801,10 @@ async fn accept_tcp_loop(
                 Ok((from_inbound, from_outbound)) => {
                     debug!("system TCP copied {from_inbound}/{from_outbound} bytes")
                 }
-                Err(err) => debug!("copy system TCP: {err}"),
+                Err(err) => {
+                    metrics.counters.tcp_copy_error_total.increment(1);
+                    debug!("copy system TCP: {err}")
+                }
             }
         });
     }
@@ -1683,6 +1822,7 @@ async fn packet_loop(
     udp_flows: Arc<Mutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     udp_timeout: Duration,
+    metrics: TunMetrics,
 ) {
     info!("system packet loop started");
     // Pull packets in batches when the underlying device supports it (Apple's
@@ -1695,6 +1835,7 @@ async fn packet_loop(
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
             Err(err) => {
+                metrics.counters.packet_recv_error_total.increment(1);
                 debug!("read TUN packet loop stopped: {err}");
                 return;
             }
@@ -1715,16 +1856,19 @@ async fn packet_loop(
             let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
             for mut packet in packets {
                 if packet.is_empty() {
+                    metrics.counters.packet_drop_empty_total.increment(1);
                     continue;
                 }
                 let parsed = match parse_ip_packet(&packet) {
                     Ok(parsed) => parsed,
                     Err(err) => {
+                        metrics.counters.packet_parse_error_total.increment(1);
                         trace!("ignore unsupported TUN packet: {err}");
                         continue;
                     }
                 };
                 if !is_global_unicast(parsed.destination.host) {
+                    metrics.counters.packet_drop_non_global_total.increment(1);
                     continue;
                 }
                 match parsed.network {
@@ -1760,6 +1904,7 @@ async fn packet_loop(
         if !tcp_writeback.is_empty() {
             let staged = std::mem::take(&mut tcp_writeback);
             if let Err(err) = device.send_batch(staged).await {
+                metrics.counters.tcp_writeback_error_total.increment(1);
                 debug!("write system TCP packets: {err}");
             }
         }
@@ -1777,6 +1922,7 @@ async fn packet_loop(
                 udp_timeout,
                 packet,
                 parsed,
+                metrics.clone(),
             )
             .await
             {
@@ -1816,6 +1962,7 @@ async fn handle_system_udp_packet(
     udp_timeout: Duration,
     packet: Vec<u8>,
     parsed: ParsedIpPacket,
+    metrics: TunMetrics,
 ) -> Result<(), HammerError> {
     let mut tun_packet = TunPacket {
         metadata: RouteMetadata {
@@ -1830,23 +1977,62 @@ async fn handle_system_udp_packet(
     if router.should_sniff(&tun_packet.metadata) {
         sniff_packet(&mut tun_packet);
     }
-    prepare_route_metadata(
+    if let Err(err) = prepare_route_metadata(
         router.as_ref(),
         &mut tun_packet.metadata,
         Some(dns_router.as_ref()),
-    )?;
-    match router.match_route(&mut tun_packet.metadata)? {
+    ) {
+        metrics.counters.udp_route_prepare_error_total.increment(1);
+        return Err(err);
+    }
+    let decision = match router.match_route(&mut tun_packet.metadata) {
+        Ok(decision) => decision,
+        Err(err) => {
+            metrics.route_error_total.inc(Network::Udp);
+            return Err(err);
+        }
+    };
+    match decision {
         RouteDecision::HijackDns => {
-            let message = <Message as MessageExt>::from_bytes(&tun_packet.payload)?;
-            let response = dns_router
+            let message = match <Message as MessageExt>::from_bytes(&tun_packet.payload) {
+                Ok(message) => message,
+                Err(err) => {
+                    metrics.counters.udp_dns_error_total.increment(1);
+                    return Err(err);
+                }
+            };
+            let response = match dns_router
                 .exchange(message, dns_query_options(&tun_packet.metadata))
-                .await?;
-            let response_bytes = MessageExt::to_bytes(&response)?;
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    metrics.counters.udp_dns_error_total.increment(1);
+                    return Err(err);
+                }
+            };
+            let response_bytes = match MessageExt::to_bytes(&response) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    metrics.counters.udp_dns_error_total.increment(1);
+                    return Err(err);
+                }
+            };
             let response_packet =
-                udp_response_packet(&packet, parsed.destination, &response_bytes)?;
-            device.send(response_packet).await?;
+                match udp_response_packet(&packet, parsed.destination, &response_bytes) {
+                    Ok(packet) => packet,
+                    Err(err) => {
+                        metrics.counters.udp_dns_error_total.increment(1);
+                        return Err(err);
+                    }
+                };
+            if let Err(err) = device.send(response_packet).await {
+                metrics.counters.udp_dns_error_total.increment(1);
+                return Err(err);
+            }
         }
         RouteDecision::Reject { method } => {
+            metrics.reject_total.inc(Network::Udp);
             let message = format!(
                 "drop UDP packet by reject rule: method={}, destination={}, protocol={}",
                 method, parsed.destination, tun_packet.metadata.protocol
@@ -1880,11 +2066,18 @@ async fn handle_system_udp_packet(
                 sender
             } else {
                 let Some(outbound_item) = outbound.get(&outbound_id) else {
+                    metrics.outbound_missing_total.inc(Network::Udp);
                     return Err(HammerError::internal(format!(
                         "outbound not found: {outbound_id}"
                     )));
                 };
-                let packet_conn = outbound_item.listen_packet().await?;
+                let packet_conn = match outbound_item.listen_packet().await {
+                    Ok(packet_conn) => packet_conn,
+                    Err(err) => {
+                        metrics.counters.udp_listen_error_total.increment(1);
+                        return Err(err);
+                    }
+                };
                 let template = UdpResponseTemplate::from_request(&packet)?;
                 let (tx, rx) = mpsc::channel(SYSTEM_UDP_CHANNEL_CAPACITY);
 
@@ -1893,7 +2086,7 @@ async fn handle_system_udp_packet(
                     flow.last_active = Instant::now();
                     flow.sender.clone()
                 } else {
-                    evict_udp_flow_if_needed(&mut flows);
+                    evict_udp_flow_if_needed(&mut flows, &metrics);
                     flows.insert(
                         key.clone(),
                         UdpFlowState {
@@ -1910,11 +2103,13 @@ async fn handle_system_udp_packet(
                         template,
                         udp_timeout,
                         rx,
+                        metrics.clone(),
                     ));
                     tx
                 }
             };
             if let Err(err) = sender.try_send(tun_packet.payload) {
+                metrics.counters.udp_flow_drop_busy_total.increment(1);
                 debug!("drop UDP packet for busy system flow: {err}");
             }
         }
@@ -2009,6 +2204,7 @@ async fn system_udp_flow_loop(
     response_template: UdpResponseTemplate,
     udp_timeout: Duration,
     mut rx: mpsc::Receiver<Vec<u8>>,
+    metrics: TunMetrics,
 ) {
     let idle_timer = time::sleep(udp_timeout);
     tokio::pin!(idle_timer);
@@ -2020,6 +2216,7 @@ async fn system_udp_flow_loop(
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
                 if let Err(err) = packet_conn.send_to(destination.clone(), &payload).await {
+                    metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
                 }
@@ -2028,6 +2225,7 @@ async fn system_udp_flow_loop(
                 let response = match response {
                     Ok(response) => response,
                     Err(err) => {
+                        metrics.counters.udp_flow_recv_error_total.increment(1);
                         debug!("receive system UDP outbound: {err}");
                         break;
                     }
@@ -2036,6 +2234,7 @@ async fn system_udp_flow_loop(
                 match response_template.build(response.destination, &response.payload) {
                     Ok(packet) => {
                         if let Err(err) = device.send(packet).await {
+                            metrics.counters.udp_flow_response_write_error_total.increment(1);
                             debug!("write system UDP response: {err}");
                             break;
                         }
@@ -2044,6 +2243,7 @@ async fn system_udp_flow_loop(
                 }
             }
             _ = &mut idle_timer => {
+                metrics.counters.udp_flow_timeout_total.increment(1);
                 break;
             }
         }
@@ -2051,7 +2251,7 @@ async fn system_udp_flow_loop(
     udp_flows.lock().await.remove(&key);
 }
 
-fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap) {
+fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap, metrics: &TunMetrics) {
     if flows.len() < SYSTEM_UDP_FLOW_CAPACITY {
         return;
     }
@@ -2061,6 +2261,7 @@ fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap) {
         .map(|(key, _)| key.clone())
     {
         flows.remove(&oldest_key);
+        metrics.counters.udp_flow_evict_total.increment(1);
     }
 }
 
@@ -2309,7 +2510,6 @@ fn parse_icmpv6(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_system_icmp_packet(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
@@ -2335,7 +2535,8 @@ async fn handle_system_icmp_packet(
         &mut tun_packet.metadata,
         Some(dns_router.as_ref()),
     )?;
-    match router.match_route(&mut tun_packet.metadata)? {
+    let decision = router.match_route(&mut tun_packet.metadata)?;
+    match decision {
         RouteDecision::HijackDns => {
             // ICMP is not routable to the DNS hijack; this should not be
             // reachable from any sane rule set but we must keep the match
@@ -2591,6 +2792,61 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
 mod tests {
     use super::*;
     use std::io;
+
+    #[test]
+    fn tun_metrics_register_counters_under_scope_component_id() {
+        let registry = MetricsRegistry::new();
+        let metrics = TunMetrics::new(registry.scope("inbound", "tun", "vpn-main"));
+        metrics.counters.packet_recv_error_total.increment(1);
+
+        let samples = registry.snapshot();
+        assert!(
+            samples.iter().any(|sample| sample.module == "inbound"
+                && sample.component_type == "tun"
+                && sample.component_id == "vpn-main"
+                && sample.name == "packet_recv_error_total"
+                && sample.value == 1),
+            "samples = {samples:?}"
+        );
+    }
+
+    #[test]
+    fn tun_metrics_do_not_leak_between_registries() {
+        let registry_a = MetricsRegistry::new();
+        let registry_b = MetricsRegistry::new();
+        let metrics_a = TunMetrics::new(registry_a.scope("inbound", "tun", "tun-a"));
+        let metrics_b = TunMetrics::new(registry_b.scope("inbound", "tun", "tun-b"));
+
+        metrics_a.counters.packet_recv_error_total.increment(3);
+        metrics_b.counters.packet_recv_error_total.increment(5);
+
+        let samples_a = registry_a.snapshot();
+        let samples_b = registry_b.snapshot();
+        assert!(
+            samples_a.iter().any(|sample| sample.component_id == "tun-a"
+                && sample.name == "packet_recv_error_total"
+                && sample.value == 3),
+            "samples_a = {samples_a:?}"
+        );
+        assert!(
+            samples_b.iter().any(|sample| sample.component_id == "tun-b"
+                && sample.name == "packet_recv_error_total"
+                && sample.value == 5),
+            "samples_b = {samples_b:?}"
+        );
+        assert!(
+            !samples_a
+                .iter()
+                .any(|sample| sample.component_id == "tun-b"),
+            "samples_a = {samples_a:?}"
+        );
+        assert!(
+            !samples_b
+                .iter()
+                .any(|sample| sample.component_id == "tun-a"),
+            "samples_b = {samples_b:?}"
+        );
+    }
 
     #[test]
     fn tun_send_backpressure_does_not_clear_asyncfd_readiness() {

@@ -10,7 +10,9 @@ use hammer_core::config::{self, DomainStrategy, Options, RuleActionKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{ConnectionManager, NetworkManager, OutboundManager, PauseManager, Router};
+use hammer_runtime::{
+    ConnectionManager, MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router,
+};
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -70,6 +72,43 @@ fn router_matches_hijack_dns_before_default_outbound() {
     assert_eq!(decision, RouteDecision::HijackDns);
     assert_eq!(metadata.domain_strategy, Some(DomainStrategy::PreferIpv4));
     assert!(metadata.udp_disable_domain_unmapping);
+}
+
+#[test]
+fn router_does_not_record_success_metrics() {
+    let opts = options();
+    let metrics = MetricsRegistry::new();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let router = Router::from_options_with_metrics(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        Arc::clone(&metrics),
+    )
+    .expect("router");
+    let mut metadata = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Udp,
+        protocol: "dns".to_owned(),
+        ..Default::default()
+    };
+
+    let _ = router.match_route(&mut metadata).expect("match route");
+
+    let samples = metrics.snapshot();
+    assert!(
+        samples
+            .iter()
+            .all(|sample| sample.name != "match_total" && sample.name != "decision_total"),
+        "samples = {samples:?}"
+    );
 }
 
 #[test]

@@ -33,6 +33,7 @@ pub fn install_default_crypto_provider() {}
 
 mod certificate;
 mod connection;
+mod control_thread;
 pub mod dns;
 #[cfg(feature = "endpoint")]
 pub mod endpoints;
@@ -79,9 +80,14 @@ mod apple_utun;
 
 pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use connection::ConnectionManager;
+pub(crate) use control_thread::{ControlLogWriter, ControlThread};
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 #[cfg(feature = "endpoint")]
 pub use endpoints::EndpointManager;
+pub use hammer_core::{
+    MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
+    MetricsScope,
+};
 pub use inbounds::InboundManager;
 pub use network::NetworkManager;
 pub use outbounds::OutboundManager;

@@ -138,6 +138,8 @@ interface HammerService {
     string outbound_id,
     u64 timeout_ms
   );
+
+  sequence<HammerMetricSample> metrics();
 };
 
 dictionary HammerProbeReport {
@@ -146,4 +148,19 @@ dictionary HammerProbeReport {
   boolean ok;
   u64 latency_ms;
   string error;
+};
+
+dictionary HammerMetricLabel {
+  string key;
+  string value;
+};
+
+dictionary HammerMetricSample {
+  string module;
+  string component_type;
+  string component_id;
+  string name;
+  string kind;
+  u64 value;
+  sequence<HammerMetricLabel> labels;
 };

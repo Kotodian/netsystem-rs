@@ -8,6 +8,7 @@ use hammer_core::config::{InboundKind, TunInboundOptions, TunStack};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
+use hammer_core::metrics::MetricsRegistry;
 
 pub mod stack;
 
@@ -23,6 +24,7 @@ pub struct TunInbound {
     dns_router: Option<Arc<DnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     platform: Option<Arc<dyn PlatformInterface>>,
+    metrics: Arc<MetricsRegistry>,
     tun_fd: Mutex<Option<i32>>,
     system_stack: Mutex<Option<Arc<SystemTunStack>>>,
 }
@@ -42,6 +44,7 @@ impl TunInbound {
             dns_router: None,
             outbound: None,
             platform: None,
+            metrics: MetricsRegistry::new(),
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
         }
@@ -56,6 +59,29 @@ impl TunInbound {
         outbound: Arc<OutboundManager>,
         platform: Arc<dyn PlatformInterface>,
     ) -> Self {
+        Self::new_with_runtime_and_metrics(
+            id,
+            logger,
+            options,
+            router,
+            dns_router,
+            outbound,
+            platform,
+            MetricsRegistry::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_runtime_and_metrics(
+        id: impl Into<String>,
+        logger: Logger,
+        options: TunInboundOptions,
+        router: Arc<Router>,
+        dns_router: Arc<DnsRouter>,
+        outbound: Arc<OutboundManager>,
+        platform: Arc<dyn PlatformInterface>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Self {
         Self {
             id: id.into(),
             logger,
@@ -64,6 +90,7 @@ impl TunInbound {
             dns_router: Some(dns_router),
             outbound: Some(outbound),
             platform: Some(platform),
+            metrics,
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
         }
@@ -144,6 +171,7 @@ impl TunInbound {
             self.options.clone(),
             device,
             tun_interface_index,
+            self.metrics.scope("inbound", "tun", self.id.clone()),
         ))))
     }
 
@@ -194,6 +222,7 @@ impl TunInbound {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_inbound(
     id: String,
     logger: Logger,
@@ -202,12 +231,13 @@ pub(crate) fn build_inbound(
     dns_router: Option<Arc<DnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     platform: Option<Arc<dyn PlatformInterface>>,
+    metrics: Arc<MetricsRegistry>,
 ) -> Result<Arc<dyn Inbound>, HammerError> {
     match kind {
         InboundKind::Tun(options) => {
             let inbound: Arc<dyn Inbound> = match (dns_router, outbound, platform) {
                 (Some(dns_router), Some(outbound), Some(platform)) => {
-                    Arc::new(TunInbound::new_with_runtime(
+                    Arc::new(TunInbound::new_with_runtime_and_metrics(
                         id,
                         logger,
                         options.clone(),
@@ -215,6 +245,7 @@ pub(crate) fn build_inbound(
                         dns_router,
                         outbound,
                         platform,
+                        metrics,
                     ))
                 }
                 _ => Arc::new(TunInbound::new(id, logger, options.clone(), router)),

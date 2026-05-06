@@ -115,6 +115,13 @@ pub trait Outbound: Send + Sync + 'static {
         None
     }
 
+    /// Resolve the effective per-probe timeout for an aggregate probe sweep.
+    /// Leaf/default implementations simply echo the caller value; aggregate
+    /// outbounds with configured defaults can override zero-duration calls.
+    fn probe_group_timeout(&self, timeout: Duration) -> Duration {
+        timeout
+    }
+
     /// Inject the resolver an aggregate outbound uses to look up its
     /// children at run time. The runtime walks every registered outbound
     /// after the manager is `Arc`-wrapped and calls this once with a

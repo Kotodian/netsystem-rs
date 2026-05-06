@@ -8,6 +8,7 @@ use hammer_adapter::{
 use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, RuleMatcher};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
+use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters};
 use ipnet::IpNet;
 
 use crate::OutboundManager;
@@ -24,14 +25,17 @@ pub struct Router {
     rules: Vec<RuntimeRule>,
     outbound: Option<Arc<OutboundManager>>,
     default_outbound: String,
+    metrics: RouterMetrics,
 }
 
 impl Router {
     pub fn new(_logger: Logger) -> Self {
+        let metrics = MetricsRegistry::new().scope("route", "router", "default");
         Self {
             rules: Vec::new(),
             outbound: None,
             default_outbound: String::new(),
+            metrics: RouterMetrics::new(&metrics, ""),
         }
     }
 
@@ -40,10 +44,21 @@ impl Router {
         options: RouteOptions,
         outbound: Arc<OutboundManager>,
     ) -> Result<Self, HammerError> {
+        Self::from_options_with_metrics(_logger, options, outbound, MetricsRegistry::new())
+    }
+
+    pub fn from_options_with_metrics(
+        _logger: Logger,
+        options: RouteOptions,
+        outbound: Arc<OutboundManager>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Result<Self, HammerError> {
+        let scope = metrics.scope("route", "router", "default");
         let rules: Vec<RuntimeRule> = options
             .rules
             .into_iter()
-            .map(RuntimeRule::from_options)
+            .enumerate()
+            .map(|(index, rule)| RuntimeRule::from_options(index, rule, &scope))
             .collect();
         for rule in &rules {
             if let RuleActionKind::Route(action) = &rule.action
@@ -64,21 +79,34 @@ impl Router {
         Ok(Self {
             rules,
             outbound: Some(outbound),
+            metrics: RouterMetrics::new(&scope, &options.final_),
             default_outbound: options.final_,
         })
     }
 
     pub fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+        let network = metadata.network;
         for rule in &self.rules {
             if !rule.matches(metadata) {
                 continue;
             }
-            match rule.apply(metadata)? {
-                RuleApply::Continue => {}
-                RuleApply::Decision(decision) => return Ok(decision),
+            match rule.apply(metadata) {
+                Ok(RuleApply::Continue) => {}
+                Ok(RuleApply::Decision(decision)) => return Ok(decision),
+                Err(err) => {
+                    self.metrics.error_total.inc(network);
+                    rule.metrics.error_total.inc(network);
+                    return Err(err);
+                }
             }
         }
-        self.route_to_default(metadata.network)
+        match self.route_to_default(network) {
+            Ok(decision) => Ok(decision),
+            Err(err) => {
+                self.metrics.error_total.inc(network);
+                Err(err)
+            }
+        }
     }
 
     #[cfg(feature = "inbound-tun")]
@@ -151,17 +179,78 @@ impl RouterTrait for Router {
     }
 }
 
+#[derive(Clone)]
+struct RouterMetrics {
+    error_total: NetworkCounters,
+}
+
+impl RouterMetrics {
+    fn new(scope: &MetricsScope, _default_outbound: &str) -> Self {
+        Self {
+            error_total: NetworkCounters::new(scope, "error_total"),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuntimeRuleMetrics {
+    error_total: NetworkCounters,
+}
+
+impl RuntimeRuleMetrics {
+    fn new(scope: &MetricsScope, index: usize, action: &RuleActionKind) -> Self {
+        let mut labels = action_metric_labels(action);
+        labels.push(("rule".to_owned(), index.to_string()));
+        Self {
+            error_total: NetworkCounters::with_labels(scope, "error_total", &labels),
+        }
+    }
+}
+
+fn action_metric_labels(action: &RuleActionKind) -> Vec<(String, String)> {
+    let mut labels = vec![("action".to_owned(), route_action_name(action).to_owned())];
+    match action {
+        RuleActionKind::Route(action) => {
+            labels.push(("outbound".to_owned(), action.outbound.clone()));
+        }
+        RuleActionKind::Reject(action) => {
+            labels.push(("method".to_owned(), action.method.clone()));
+        }
+        _ => {}
+    }
+    labels
+}
+
+fn route_action_name(action: &RuleActionKind) -> &'static str {
+    match action {
+        RuleActionKind::Sniff(_) => "sniff",
+        RuleActionKind::HijackDns => "hijack_dns",
+        RuleActionKind::Reject(_) => "reject",
+        RuleActionKind::Resolve(_) => "resolve",
+        RuleActionKind::RouteOptions(_) => "route_options",
+        RuleActionKind::Route(_) => "route",
+    }
+}
+
 struct RuntimeRule {
     matcher: Box<dyn Matcher>,
     action: RuleActionKind,
+    metrics: RuntimeRuleMetrics,
 }
 
 impl RuntimeRule {
-    fn from_options(options: RuleOptions) -> Self {
+    fn from_options(index: usize, options: RuleOptions, router_scope: &MetricsScope) -> Self {
         let default = options.default_options;
+        let action = default.action;
+        let metrics = RuntimeRuleMetrics::new(
+            &router_scope.child("rule", index.to_string()),
+            index,
+            &action,
+        );
         Self {
             matcher: matcher_from_options(default.matcher),
-            action: default.action,
+            action,
+            metrics,
         }
     }
 
