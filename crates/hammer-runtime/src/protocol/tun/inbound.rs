@@ -94,23 +94,6 @@ impl TunInbound {
         }
     }
 
-    pub fn stack(&self) -> SmoltcpTunStack {
-        match (&self.dns_router, &self.outbound) {
-            (Some(dns_router), Some(outbound)) => SmoltcpTunStack::new_with_runtime(
-                self.logger.clone(),
-                Arc::clone(&self.router),
-                Arc::clone(dns_router),
-                Arc::clone(outbound),
-                self.id.clone(),
-            ),
-            _ => SmoltcpTunStack::new(
-                self.logger.clone(),
-                Arc::clone(&self.router),
-                self.id.clone(),
-            ),
-        }
-    }
-
     pub fn mtu(&self) -> u32 {
         self.options.mtu
     }
