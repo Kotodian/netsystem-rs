@@ -267,6 +267,11 @@ impl AppleTunDevice {
                 iov_base: buf.as_mut_ptr().cast::<c_void>(),
                 iov_len: self.mtu,
             };
+            // Older XNU recvmsg_x validates that per-message output fields
+            // are zero on input. We reuse MsgHdrX slots across calls, so clear
+            // fields the kernel may have populated on the previous receive.
+            state.msgs[i].msg_flags = 0;
+            state.msgs[i].msg_datalen = 0;
         }
 
         let n = unsafe {
@@ -387,6 +392,8 @@ impl AppleTunDevice {
                 iov_base: packet.as_ptr() as *mut c_void,
                 iov_len: packet.len(),
             };
+            state.msgs[staged].msg_flags = 0;
+            state.msgs[staged].msg_datalen = 0;
             staged += 1;
         }
         staged
