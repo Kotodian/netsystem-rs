@@ -23,6 +23,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use boringtun::noise::TunnResult;
+use bytes::{Bytes, BytesMut};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
@@ -55,10 +56,10 @@ const INBOUND_QUEUE: usize = 64;
 pub(crate) struct TransportHandles {
     /// Push IP packets into here to have them encapsulated and shipped to
     /// whichever peer's `allowed_ips` matches the destination.
-    pub(crate) encrypt_tx: mpsc::Sender<Vec<u8>>,
+    pub(crate) encrypt_tx: mpsc::Sender<Bytes>,
     /// Receive decrypted IP packets coming back from any peer. The smoltcp
     /// stack drains this in the actor that owns the `phy::Device`.
-    pub(crate) inbound_rx: mpsc::Receiver<Vec<u8>>,
+    pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
     /// The address the OS bound the UDP socket to. Mostly useful for tests
     /// — production peers configure their endpoints out-of-band.
     pub(crate) local_addr: SocketAddr,
@@ -120,8 +121,8 @@ pub(crate) fn spawn_transport(
     let local_addr = sockets.local_addr()?;
     info!("wireguard transport listening on {local_addr}");
 
-    let (encrypt_tx, encrypt_rx) = mpsc::channel::<Vec<u8>>(ENCRYPT_QUEUE);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(INBOUND_QUEUE);
+    let (encrypt_tx, encrypt_rx) = mpsc::channel::<Bytes>(ENCRYPT_QUEUE);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let join = crate::spawn::spawn(run_actor(
@@ -242,18 +243,19 @@ async fn run_actor(
     sockets: TransportSockets,
     peers: Arc<Vec<Peer>>,
     mtu: u32,
-    mut encrypt_rx: mpsc::Receiver<Vec<u8>>,
-    inbound_tx: mpsc::Sender<Vec<u8>>,
+    mut encrypt_rx: mpsc::Receiver<Bytes>,
+    inbound_tx: mpsc::Sender<Bytes>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     // 65535 is the IPv4 datagram ceiling; boringtun's WG frames cap out at
-    // mtu + 32, so this is generous.
+    // mtu + 32, so this is generous. These two buffers stay with the actor;
+    // they're only borrowed into recv_from and never escape.
     let mut udp_buf_v4 = vec![0u8; 65_535];
     let mut udp_buf_v6 = vec![0u8; 65_535];
-    // Boringtun writes encapsulate / decapsulate output into this buffer and
-    // returns a slice into it; we send that slice and reuse the buffer for
-    // the next packet. Allocated once per actor.
-    let mut scratch = vec![0u8; (mtu as usize) + WIREGUARD_OVERHEAD];
+    // Capacity for every encap/decap output buffer the actor will allocate.
+    // Each step allocates its own BytesMut so the result can be `freeze()`d
+    // straight into `inbound_tx` without a memcpy.
+    let crypto_cap = (mtu as usize) + WIREGUARD_OVERHEAD;
 
     let mut timer = time::interval(TIMER_TICK);
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -274,7 +276,7 @@ async fn run_actor(
                             &peers,
                             src,
                             &mut udp_buf_v4[..n],
-                            &mut scratch,
+                            crypto_cap,
                             &inbound_tx,
                         )
                         .await;
@@ -292,7 +294,7 @@ async fn run_actor(
                             &peers,
                             src,
                             &mut udp_buf_v6[..n],
-                            &mut scratch,
+                            crypto_cap,
                             &inbound_tx,
                         )
                         .await;
@@ -307,10 +309,10 @@ async fn run_actor(
                     debug!("wireguard transport: encrypt_rx closed");
                     break;
                 };
-                handle_outbound(&sockets, &peers, &packet, &mut scratch).await;
+                handle_outbound(&sockets, &peers, &packet, crypto_cap).await;
             }
             _ = timer.tick() => {
-                tick_timers(&sockets, &peers, &mut scratch).await;
+                tick_timers(&sockets, &peers, crypto_cap).await;
             }
         }
     }
@@ -331,8 +333,8 @@ async fn handle_inbound(
     peers: &[Peer],
     src: SocketAddr,
     datagram: &mut [u8],
-    scratch: &mut [u8],
-    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    crypto_cap: usize,
+    inbound_tx: &mpsc::Sender<Bytes>,
 ) {
     let Some(peer_idx) = peers.iter().position(|peer| peer.endpoint() == src) else {
         warn!(
@@ -353,99 +355,122 @@ async fn handle_inbound(
     }
 
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
-    let action = step_decapsulate(peer, Some(src.ip()), datagram, scratch);
-    dispatch_action(sockets, peer, action, scratch, inbound_tx).await;
+    let action = step_decapsulate(peer, Some(src.ip()), datagram, crypto_cap);
+    dispatch_action(sockets, peer, action, inbound_tx).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
     // (e.g. the data packets that were waiting on a fresh handshake).
     loop {
-        let action = step_decapsulate(peer, None, &[], scratch);
+        let action = step_decapsulate(peer, None, &[], crypto_cap);
         if matches!(action, DecapAction::Idle) {
             break;
         }
-        dispatch_action(sockets, peer, action, scratch, inbound_tx).await;
+        dispatch_action(sockets, peer, action, inbound_tx).await;
     }
 }
 
-/// What `step_decapsulate` decided we should do with the bytes it just wrote
-/// into the shared scratch buffer. Carrying only a length lets the caller
-/// reuse `scratch` without allocating per packet.
+/// What `step_decapsulate` decided we should do with the bytes boringtun just
+/// wrote into the per-call buffer. Each variant owns the buffer outright so
+/// the dispatcher can hand it off (or `freeze()` it for the cross-actor mpsc)
+/// without a memcpy.
 #[derive(Debug)]
 enum DecapAction {
     /// Nothing to send. Either boringtun consumed the datagram silently
     /// (`TunnResult::Done`) or returned an error (already trace-logged).
     Idle,
-    /// Send `scratch[..len]` to `dst` over UDP.
-    SendNetwork { len: usize, dst: SocketAddr },
-    /// Hand `scratch[..len]` to the inner stack via `inbound_tx`. The bytes
-    /// must be cloned for the cross-actor channel.
-    SendInbound { len: usize },
+    /// Send the encrypted frame in `buf` to `dst` over UDP. The buffer is
+    /// already truncated to its real length; the WARP-reserved prefix gets
+    /// stamped in place before the syscall.
+    SendNetwork { buf: BytesMut, dst: SocketAddr },
+    /// Hand a plaintext IP packet to the inner stack via `inbound_tx`. Already
+    /// frozen into a `Bytes`, so the mpsc send is a zero-copy ownership move.
+    SendInbound(Bytes),
 }
 
 async fn dispatch_action(
     sockets: &TransportSockets,
     peer: &Peer,
     action: DecapAction,
-    scratch: &mut [u8],
-    inbound_tx: &mpsc::Sender<Vec<u8>>,
+    inbound_tx: &mpsc::Sender<Bytes>,
 ) {
     match action {
         DecapAction::Idle => {}
-        DecapAction::SendNetwork { len, dst } => {
-            stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
+        DecapAction::SendNetwork { mut buf, dst } => {
+            stamp_reserved_in_place(&mut buf, peer.reserved());
             let Some(socket) = sockets.send_socket(dst) else {
                 warn!("wireguard udp has no socket for {dst}");
                 return;
             };
-            if let Err(err) = socket.send_to(&scratch[..len], dst).await {
+            if let Err(err) = socket.send_to(&buf, dst).await {
                 warn!("wireguard udp send_to {dst}: {err}");
             }
         }
-        DecapAction::SendInbound { len } => {
-            // Cross-actor hand-off requires owned bytes; this is the only
-            // remaining per-packet allocation in the inbound hot path.
-            let owned = scratch[..len].to_vec();
-            if inbound_tx.try_send(owned).is_err() {
+        DecapAction::SendInbound(bytes) => {
+            if inbound_tx.try_send(bytes).is_err() {
                 warn!("wireguard inbound queue full or closed; dropping packet");
             }
         }
     }
 }
 
-/// Run a single `Tunn::decapsulate` call inside a short lock. boringtun
-/// writes any output bytes into `scratch` and returns a borrowed slice; we
-/// only keep the length so the caller can reuse the buffer.
+/// Run a single `Tunn::decapsulate` call inside a short lock. Allocates a
+/// fresh `BytesMut` of `crypto_cap` bytes — boringtun's `decapsulate` API
+/// requires a writable destination slice, and giving each call its own
+/// buffer means `WriteToTunnelV4/V6` results can be `freeze()`d straight
+/// into the inbound mpsc without copying.
 fn step_decapsulate(
     peer: &Peer,
     src_ip: Option<IpAddr>,
     datagram: &[u8],
-    scratch: &mut [u8],
+    crypto_cap: usize,
 ) -> DecapAction {
-    let mut tunn = peer.lock_tunn();
-    match tunn.decapsulate(src_ip, datagram, scratch) {
-        TunnResult::Done => DecapAction::Idle,
-        TunnResult::Err(err) => {
-            // Includes routine cases (replays, handshake retries) so trace,
-            // not warn — the previous code dropped the error entirely.
-            tracing::trace!(?err, "wireguard decapsulate error");
-            DecapAction::Idle
+    let mut buf = BytesMut::zeroed(crypto_cap);
+    let outcome = {
+        let mut tunn = peer.lock_tunn();
+        match tunn.decapsulate(src_ip, datagram, &mut buf[..]) {
+            TunnResult::Done => DecapOutcome::Idle,
+            TunnResult::Err(err) => {
+                // Includes routine cases (replays, handshake retries) so
+                // trace, not warn.
+                tracing::trace!(?err, "wireguard decapsulate error");
+                DecapOutcome::Idle
+            }
+            TunnResult::WriteToNetwork(out) => DecapOutcome::Network(out.len()),
+            TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
+                DecapOutcome::Tunnel(out.len())
+            }
         }
-        TunnResult::WriteToNetwork(out) => DecapAction::SendNetwork {
-            len: out.len(),
-            dst: peer.endpoint(),
-        },
-        TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
-            DecapAction::SendInbound { len: out.len() }
+    };
+    match outcome {
+        DecapOutcome::Idle => DecapAction::Idle,
+        DecapOutcome::Network(len) => {
+            buf.truncate(len);
+            DecapAction::SendNetwork {
+                buf,
+                dst: peer.endpoint(),
+            }
+        }
+        DecapOutcome::Tunnel(len) => {
+            buf.truncate(len);
+            DecapAction::SendInbound(buf.freeze())
         }
     }
+}
+
+/// Local helper enum so we can stage `out.len()` out of `tunn.decapsulate`'s
+/// borrow on `buf`, then mutate `buf` once the borrow ends.
+enum DecapOutcome {
+    Idle,
+    Network(usize),
+    Tunnel(usize),
 }
 
 async fn handle_outbound(
     sockets: &TransportSockets,
     peers: &[Peer],
     ip_packet: &[u8],
-    scratch: &mut [u8],
+    crypto_cap: usize,
 ) {
     let Some(dst_ip) = first_hop_destination(ip_packet) else {
         warn!("wireguard outbound: malformed IP packet, dropping");
@@ -457,9 +482,10 @@ async fn handle_outbound(
     };
     let peer = &peers[peer_idx];
 
+    let mut buf = BytesMut::zeroed(crypto_cap);
     let len = {
         let mut tunn = peer.lock_tunn();
-        match tunn.encapsulate(ip_packet, scratch) {
+        match tunn.encapsulate(ip_packet, &mut buf[..]) {
             TunnResult::WriteToNetwork(out) => Some(out.len()),
             TunnResult::Done => None,
             TunnResult::Err(err) => {
@@ -472,34 +498,37 @@ async fn handle_outbound(
     };
 
     let Some(len) = len else { return };
-    stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
+    buf.truncate(len);
+    stamp_reserved_in_place(&mut buf, peer.reserved());
     let dst = peer.endpoint();
     let Some(socket) = sockets.send_socket(dst) else {
         warn!("wireguard udp has no socket for {dst}");
         return;
     };
-    if let Err(err) = socket.send_to(&scratch[..len], dst).await {
+    if let Err(err) = socket.send_to(&buf, dst).await {
         warn!("wireguard udp send_to {dst}: {err}");
     }
 }
 
-async fn tick_timers(sockets: &TransportSockets, peers: &[Peer], scratch: &mut [u8]) {
+async fn tick_timers(sockets: &TransportSockets, peers: &[Peer], crypto_cap: usize) {
     for peer in peers {
+        let mut buf = BytesMut::zeroed(crypto_cap);
         let len = {
             let mut tunn = peer.lock_tunn();
-            match tunn.update_timers(scratch) {
+            match tunn.update_timers(&mut buf[..]) {
                 TunnResult::WriteToNetwork(out) => Some(out.len()),
                 _ => None,
             }
         };
         if let Some(len) = len {
-            stamp_reserved_in_place(&mut scratch[..len], peer.reserved());
+            buf.truncate(len);
+            stamp_reserved_in_place(&mut buf, peer.reserved());
             let dst = peer.endpoint();
             let Some(socket) = sockets.send_socket(dst) else {
                 warn!("wireguard udp has no socket for {dst}");
                 continue;
             };
-            if let Err(err) = socket.send_to(&scratch[..len], dst).await {
+            if let Err(err) = socket.send_to(&buf, dst).await {
                 warn!("wireguard timer send {dst}: {err}");
             }
         }
@@ -632,7 +661,7 @@ mod tests {
         let payload = dummy_ipv4_packet();
         handles_a
             .encrypt_tx
-            .send(payload.clone())
+            .send(Bytes::from(payload.clone()))
             .await
             .expect("encrypt_tx");
 
@@ -642,7 +671,7 @@ mod tests {
             .await
             .expect("timed out waiting for inbound packet")
             .expect("inbound_rx closed before delivering");
-        assert_eq!(recovered, payload);
+        assert_eq!(&recovered[..], payload.as_slice());
 
         // Dropping the handles closes both mpsc channels and the oneshot;
         // the actor's select! loop notices and exits cleanly.

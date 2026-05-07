@@ -17,6 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{debug, warn};
 
+use bytes::{Buf, Bytes, BytesMut};
 use ipnet::IpNet;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
@@ -158,8 +159,8 @@ impl TcpListener {
 }
 
 pub(crate) struct UdpHandle {
-    send_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    recv_rx: AsyncMutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>,
+    send_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    recv_rx: AsyncMutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
     /// Port allocated by the actor inside the smoltcp Interface. Useful for
     /// integration tests that need to address one side from the other across
     /// the stack.
@@ -175,7 +176,7 @@ impl UdpHandle {
     /// resolved any domain destination to a concrete `SocketAddr` — translating
     /// outbound-layer addressing types (`SocksAddr`, etc.) into IP is not the
     /// stack's job.
-    pub(crate) async fn send(&self, payload: Vec<u8>, dst: SocketAddr) -> Result<(), HammerError> {
+    pub(crate) async fn send(&self, payload: Bytes, dst: SocketAddr) -> Result<(), HammerError> {
         self.send_tx
             .send((payload, dst))
             .await
@@ -184,7 +185,7 @@ impl UdpHandle {
 
     /// Receive the next UDP datagram emitted by the stack, paired with the
     /// remote IP/port that sent it.
-    pub(crate) async fn recv(&self) -> Result<(Vec<u8>, SocketAddr), HammerError> {
+    pub(crate) async fn recv(&self) -> Result<(Bytes, SocketAddr), HammerError> {
         let mut rx = self.recv_rx.lock().await;
         rx.recv()
             .await
@@ -199,8 +200,8 @@ pub(crate) fn spawn_ipstack(
     logger: Logger,
     addresses: Vec<IpNet>,
     mtu: u32,
-    inbound_rx: mpsc::Receiver<Vec<u8>>,
-    encrypt_tx: mpsc::Sender<Vec<u8>>,
+    inbound_rx: mpsc::Receiver<Bytes>,
+    encrypt_tx: mpsc::Sender<Bytes>,
 ) -> Result<IpStackHandles, HammerError> {
     if addresses.is_empty() {
         return Err(HammerError::internal(
@@ -208,7 +209,7 @@ pub(crate) fn spawn_ipstack(
         ));
     }
 
-    let (egress_tx, egress_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (egress_tx, egress_rx) = mpsc::unbounded_channel::<Bytes>();
     let mut device = ChannelDevice::new(mtu, egress_tx);
 
     let started = TokioInstant::now();
@@ -295,7 +296,7 @@ struct PendingDial {
 enum SocketEvent {
     TcpWrite {
         handle: SocketHandle,
-        data: Vec<u8>,
+        data: Bytes,
         ack: oneshot::Sender<Result<(), HammerError>>,
     },
     TcpClose {
@@ -303,7 +304,7 @@ enum SocketEvent {
     },
     UdpSend {
         handle: SocketHandle,
-        data: Vec<u8>,
+        data: Bytes,
         dst: SocketAddr,
     },
     UdpClose {
@@ -313,21 +314,23 @@ enum SocketEvent {
 
 struct TcpBridge {
     /// Channel for the actor to push socket recv data into the bridge task.
-    data_tx: mpsc::Sender<Vec<u8>>,
+    data_tx: mpsc::Sender<Bytes>,
     /// Bytes the actor is still trying to push into the smoltcp tx buffer
     /// (didn't fit in a single send_slice call).
     pending_tx: VecDeque<PendingTcpWrite>,
 }
 
 struct PendingTcpWrite {
-    data: Vec<u8>,
-    offset: usize,
+    /// Remaining bytes to push into the smoltcp tx buffer. We `advance` it as
+    /// each partial `send_slice` succeeds; an empty `Bytes` means the write
+    /// is fully drained and the matching `ack` can fire.
+    data: Bytes,
     ack: Option<oneshot::Sender<Result<(), HammerError>>>,
 }
 
 struct UdpBridge {
     /// Channel for the actor to push (payload, src) to the bridge task.
-    data_tx: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    data_tx: mpsc::Sender<(Bytes, SocketAddr)>,
 }
 
 struct StackInner {
@@ -335,9 +338,9 @@ struct StackInner {
     iface: Interface,
     sockets: SocketSet<'static>,
     device: ChannelDevice,
-    egress_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    encrypt_tx: mpsc::Sender<Vec<u8>>,
-    inbound_rx: mpsc::Receiver<Vec<u8>>,
+    egress_rx: mpsc::UnboundedReceiver<Bytes>,
+    encrypt_tx: mpsc::Sender<Bytes>,
+    inbound_rx: mpsc::Receiver<Bytes>,
     cmd_rx: mpsc::Receiver<StackCommand>,
     event_rx: mpsc::Receiver<SocketEvent>,
     event_tx: mpsc::Sender<SocketEvent>,
@@ -605,7 +608,7 @@ impl StackInner {
 
     fn start_tcp_bridge(&mut self, handle: SocketHandle) -> DuplexStream {
         let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
-        let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(TCP_DATA_QUEUE);
+        let (data_tx, data_rx) = mpsc::channel::<Bytes>(TCP_DATA_QUEUE);
         let event_tx = self.event_tx.clone();
         crate::spawn::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
         self.tcp_bridges.insert(
@@ -621,7 +624,7 @@ impl StackInner {
     fn handle_tcp_write(
         &mut self,
         handle: SocketHandle,
-        data: Vec<u8>,
+        mut data: Bytes,
         ack: oneshot::Sender<Result<(), HammerError>>,
     ) {
         let Some(bridge) = self.tcp_bridges.get_mut(&handle) else {
@@ -632,7 +635,6 @@ impl StackInner {
         if !bridge.pending_tx.is_empty() {
             bridge.pending_tx.push_back(PendingTcpWrite {
                 data,
-                offset: 0,
                 ack: Some(ack),
             });
             return;
@@ -644,10 +646,12 @@ impl StackInner {
             return;
         }
 
+        // Partial write: record what's left for `retry_pending_tcp_writes` to
+        // push out as the smoltcp tx buffer drains.
+        data.advance(written);
         if let Some(bridge) = self.tcp_bridges.get_mut(&handle) {
             bridge.pending_tx.push_back(PendingTcpWrite {
                 data,
-                offset: written,
                 ack: Some(ack),
             });
         } else {
@@ -702,8 +706,8 @@ impl StackInner {
             .map_err(|err| HammerError::internal(format!("ipstack udp bind: {err:?}")))?;
         let handle = self.sockets.add(socket);
 
-        let (recv_user_tx, recv_user_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE);
-        let (send_user_tx, send_user_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE);
+        let (recv_user_tx, recv_user_rx) = mpsc::channel::<(Bytes, SocketAddr)>(UDP_QUEUE);
+        let (send_user_tx, send_user_rx) = mpsc::channel::<(Bytes, SocketAddr)>(UDP_QUEUE);
         let event_tx = self.event_tx.clone();
         crate::spawn::spawn(udp_bridge_task(handle, send_user_rx, event_tx));
 
@@ -734,11 +738,11 @@ impl StackInner {
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                let mut buf = vec![0u8; TCP_BUF];
+                let mut buf = BytesMut::zeroed(TCP_BUF);
                 match socket.recv_slice(&mut buf) {
                     Ok(n) if n > 0 => {
                         buf.truncate(n);
-                        permit.send(buf);
+                        permit.send(buf.freeze());
                     }
                     _ => break,
                 }
@@ -764,11 +768,11 @@ impl StackInner {
                 if !socket.may_send() {
                     break;
                 }
-                match socket.send_slice(&pending.data[pending.offset..]) {
+                match socket.send_slice(&pending.data) {
                     Ok(0) => break,
                     Ok(n) => {
-                        pending.offset += n;
-                        if pending.offset < pending.data.len() {
+                        pending.data.advance(n);
+                        if !pending.data.is_empty() {
                             break;
                         }
                         let mut done = bridge.pending_tx.pop_front().expect("front exists");
@@ -790,7 +794,7 @@ impl StackInner {
         for handle in handles {
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             while socket.can_recv() {
-                let mut buf = vec![0u8; UDP_PAYLOAD_LIMIT];
+                let mut buf = BytesMut::zeroed(UDP_PAYLOAD_LIMIT);
                 match socket.recv_slice(&mut buf) {
                     Ok((n, meta)) => {
                         buf.truncate(n);
@@ -799,7 +803,7 @@ impl StackInner {
                             Some(b) => b,
                             None => break,
                         };
-                        if bridge.data_tx.try_send((buf, src)).is_err() {
+                        if bridge.data_tx.try_send((buf.freeze(), src)).is_err() {
                             break;
                         }
                     }
@@ -854,22 +858,29 @@ impl StackInner {
 async fn tcp_bridge_task(
     handle: SocketHandle,
     mut duplex: DuplexStream,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut data_rx: mpsc::Receiver<Bytes>,
     event_tx: mpsc::Sender<SocketEvent>,
 ) {
-    let mut buf = vec![0u8; TCP_BUF];
+    // `read_buf` writes straight into the BytesMut without going through a
+    // local stack buffer, and `split().freeze()` turns each chunk into an
+    // owned `Bytes` we can ship across the actor boundary without memcpy.
+    let mut buf = BytesMut::with_capacity(TCP_BUF);
     loop {
         tokio::select! {
             // User wrote -> we read from the actor stage and forward to socket.
-            res = duplex.read(&mut buf) => {
+            res = duplex.read_buf(&mut buf) => {
                 match res {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
+                    Ok(_) => {
+                        let chunk = buf.split().freeze();
+                        // `split` leaves the BytesMut empty; reserve so the
+                        // next read has somewhere to land without growing.
+                        buf.reserve(TCP_BUF);
                         let (ack_tx, ack_rx) = oneshot::channel();
                         if event_tx
                             .send(SocketEvent::TcpWrite {
                                 handle,
-                                data: buf[..n].to_vec(),
+                                data: chunk,
                                 ack: ack_tx,
                             })
                             .await
@@ -898,7 +909,7 @@ async fn tcp_bridge_task(
 
 async fn udp_bridge_task(
     handle: SocketHandle,
-    mut send_rx: mpsc::Receiver<(Vec<u8>, SocketAddr)>,
+    mut send_rx: mpsc::Receiver<(Bytes, SocketAddr)>,
     event_tx: mpsc::Sender<SocketEvent>,
 ) {
     while let Some((data, dst)) = send_rx.recv().await {

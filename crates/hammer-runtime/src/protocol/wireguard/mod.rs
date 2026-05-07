@@ -404,14 +404,17 @@ struct WireguardUdp(UdpHandle);
 impl ProxyPacketConn for WireguardUdp {
     async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
         let dst = wireguard_destination_socket_addr(&destination)?;
-        self.0.send(payload.to_vec(), dst).await
+        // ProxyPacketConn hands us `&[u8]`; one copy here is unavoidable
+        // unless the trait itself starts speaking `Bytes`. `copy_from_slice`
+        // makes the cost explicit at the call site.
+        self.0.send(Bytes::copy_from_slice(payload), dst).await
     }
 
     async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
         let (payload, src) = self.0.recv().await?;
         Ok(ProxyDatagram {
             destination: SocksAddr::ip(src.ip(), src.port()),
-            payload: Bytes::from(payload),
+            payload,
         })
     }
 }
@@ -779,7 +782,7 @@ mod tests {
         // A's in-tunnel address is 10.0.0.1 ← bound by the smoltcp Interface;
         // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
-        let payload = b"hello over wireguard".to_vec();
+        let payload = Bytes::from_static(b"hello over wireguard");
         udp_a
             .send(payload.clone(), dst)
             .await

@@ -11,6 +11,7 @@
 
 use std::collections::VecDeque;
 
+use bytes::{Bytes, BytesMut};
 use smoltcp::phy::{
     Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken,
 };
@@ -22,13 +23,13 @@ use tokio::sync::mpsc::UnboundedSender;
 const INBOUND_BACKLOG: usize = 256;
 
 pub(crate) struct ChannelDevice {
-    inbound: VecDeque<Vec<u8>>,
-    egress: UnboundedSender<Vec<u8>>,
+    inbound: VecDeque<Bytes>,
+    egress: UnboundedSender<Bytes>,
     mtu: usize,
 }
 
 impl ChannelDevice {
-    pub(crate) fn new(mtu: u32, egress: UnboundedSender<Vec<u8>>) -> Self {
+    pub(crate) fn new(mtu: u32, egress: UnboundedSender<Bytes>) -> Self {
         Self {
             inbound: VecDeque::new(),
             egress,
@@ -39,7 +40,7 @@ impl ChannelDevice {
     /// Push an IP packet (just received from the carrier) into the inbound
     /// queue. Drops the oldest packet when the backlog overflows so a stalled
     /// poll loop can't keep pulling memory.
-    pub(crate) fn deliver(&mut self, packet: Vec<u8>) {
+    pub(crate) fn deliver(&mut self, packet: Bytes) {
         if self.inbound.len() >= INBOUND_BACKLOG {
             let _ = self.inbound.pop_front();
         }
@@ -99,7 +100,7 @@ impl Device for ChannelDevice {
 }
 
 pub(crate) struct ChannelRxToken {
-    packet: Vec<u8>,
+    packet: Bytes,
 }
 
 impl RxToken for ChannelRxToken {
@@ -112,7 +113,7 @@ impl RxToken for ChannelRxToken {
 }
 
 pub(crate) struct ChannelTxToken {
-    egress: UnboundedSender<Vec<u8>>,
+    egress: UnboundedSender<Bytes>,
 }
 
 impl TxToken for ChannelTxToken {
@@ -120,12 +121,16 @@ impl TxToken for ChannelTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
+        // smoltcp wants to write `len` bytes into a mutable slice; we hand it
+        // a freshly-allocated `BytesMut`, freeze it, and ship the resulting
+        // `Bytes` straight into the egress mpsc — zero memcpy across the
+        // ownership transfer.
+        let mut buf = BytesMut::zeroed(len);
         let result = f(&mut buf);
         // If the receiver has been dropped (actor shutting down) the packet is
         // discarded. smoltcp has no notion of "tx failed" past consume(), so
         // this is the cleanest place to swallow the error.
-        let _ = self.egress.send(buf);
+        let _ = self.egress.send(buf.freeze());
         result
     }
 }
@@ -139,8 +144,8 @@ mod tests {
     fn receive_returns_oldest_inbound_packet_first() {
         let (egress_tx, _egress_rx) = mpsc::unbounded_channel();
         let mut dev = ChannelDevice::new(1408, egress_tx);
-        dev.deliver(vec![1, 2, 3]);
-        dev.deliver(vec![4, 5, 6]);
+        dev.deliver(Bytes::from_static(&[1, 2, 3]));
+        dev.deliver(Bytes::from_static(&[4, 5, 6]));
         let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
         rx.consume(|buf| assert_eq!(buf, &[1, 2, 3]));
         let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
@@ -166,7 +171,7 @@ mod tests {
         let (egress_tx, _egress_rx) = mpsc::unbounded_channel();
         let mut dev = ChannelDevice::new(1408, egress_tx);
         for i in 0..(INBOUND_BACKLOG + 5) {
-            dev.deliver(vec![i as u8]);
+            dev.deliver(Bytes::from(vec![i as u8]));
         }
         // Oldest 5 must have been dropped — the next receive returns the 6th.
         let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
