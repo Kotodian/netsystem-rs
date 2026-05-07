@@ -86,14 +86,19 @@ impl Device for ChannelDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        // The carrier doesn't checksum at L3 — let smoltcp compute and check
-        // IP/TCP/UDP checksums itself. Cheaper than asking the carrier (e.g.
-        // boringtun) to skip work the OS isn't doing for us either.
+        // Tx-only checksumming: smoltcp still computes IP/TCP/UDP/ICMP
+        // checksums for outbound packets so peers get well-formed frames,
+        // but skips the redundant verification on inbound. Inbound IP
+        // packets arrive already authenticated by boringtun's Poly1305 (and
+        // by the kernel for the TUN-smoltcp path), so any tampering would
+        // already have been caught upstream — folding the inner checksums
+        // again is pure CPU. Mirrors sing-box's `CapabilityRXChecksumOffload`
+        // on its gVisor stack.
         let mut chk = ChecksumCapabilities::default();
-        chk.ipv4 = Checksum::Both;
-        chk.tcp = Checksum::Both;
-        chk.udp = Checksum::Both;
-        chk.icmpv4 = Checksum::Both;
+        chk.ipv4 = Checksum::Tx;
+        chk.tcp = Checksum::Tx;
+        chk.udp = Checksum::Tx;
+        chk.icmpv4 = Checksum::Tx;
         caps.checksum = chk;
         caps
     }

@@ -248,6 +248,9 @@ pub(crate) fn spawn_ipstack(
         pending_dials: Vec::new(),
         next_port: EPHEMERAL_FLOOR,
         started,
+        // One alloc + bzero for the lifetime of the actor; large enough to
+        // catch the worst case of either drain path.
+        recv_scratch: vec![0u8; TCP_BUF.max(UDP_PAYLOAD_LIMIT)],
     };
 
     let join = crate::spawn::spawn(inner.run());
@@ -351,6 +354,11 @@ struct StackInner {
     pending_dials: Vec<PendingDial>,
     next_port: u16,
     started: TokioInstant,
+    /// Reused across every `drain_tcp_recv` / `drain_udp_recv` call so we
+    /// don't allocate-and-bzero a 64 KiB BytesMut per inbound packet just to
+    /// truncate it down to a 1.5 KiB IP frame. `Bytes::copy_from_slice` then
+    /// allocates only the bytes we actually keep.
+    recv_scratch: Vec<u8>,
 }
 
 impl StackInner {
@@ -738,11 +746,9 @@ impl StackInner {
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                let mut buf = BytesMut::zeroed(TCP_BUF);
-                match socket.recv_slice(&mut buf) {
+                match socket.recv_slice(&mut self.recv_scratch[..TCP_BUF]) {
                     Ok(n) if n > 0 => {
-                        buf.truncate(n);
-                        permit.send(buf.freeze());
+                        permit.send(Bytes::copy_from_slice(&self.recv_scratch[..n]));
                     }
                     _ => break,
                 }
@@ -794,16 +800,15 @@ impl StackInner {
         for handle in handles {
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             while socket.can_recv() {
-                let mut buf = BytesMut::zeroed(UDP_PAYLOAD_LIMIT);
-                match socket.recv_slice(&mut buf) {
+                match socket.recv_slice(&mut self.recv_scratch[..UDP_PAYLOAD_LIMIT]) {
                     Ok((n, meta)) => {
-                        buf.truncate(n);
+                        let chunk = Bytes::copy_from_slice(&self.recv_scratch[..n]);
                         let src = ip_endpoint_to_socket(meta.endpoint);
                         let bridge = match self.udp_bridges.get(&handle) {
                             Some(b) => b,
                             None => break,
                         };
-                        if bridge.data_tx.try_send((buf.freeze(), src)).is_err() {
+                        if bridge.data_tx.try_send((chunk, src)).is_err() {
                             break;
                         }
                     }
