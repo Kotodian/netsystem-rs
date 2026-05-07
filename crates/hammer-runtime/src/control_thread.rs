@@ -553,7 +553,7 @@ fn build_component_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<Stri
     let mut chunks: Vec<Vec<&MetricSample>> = Vec::new();
     let mut diagnostics: Vec<String> = Vec::new();
     let mut current: Vec<&MetricSample> = Vec::new();
-    let chunk_header_size = component_chunk_header_size(ts, &component);
+    let chunk_header_size = component_chunk_header_size(ts, &component, samples.len());
     let mut current_size = chunk_header_size;
     for sample in samples {
         let sample_size = sample.approx_render_size();
@@ -632,9 +632,14 @@ fn build_oversized_line(sample: &MetricSample, ts: u64, component: &str) -> Stri
     s
 }
 
-fn component_chunk_header_size(ts: u64, component: &str) -> usize {
+fn component_chunk_header_size(ts: u64, component: &str, max_chunks: usize) -> usize {
+    // Each chunk carries at least one sample, so the caller's sample count is
+    // a tight upper bound for both `idx` (range 0..total) and `total`. Padding
+    // with `usize::MAX` here would over-count by ~57 bytes on 64-bit builds
+    // and push borderline samples into the .oversized fallback even when they
+    // would have fit in a numbered chunk.
     let mut s = String::new();
-    write_snapshot_prefix(&mut s, ts, component, Some((usize::MAX, usize::MAX)));
+    write_snapshot_prefix(&mut s, ts, component, Some((max_chunks, max_chunks)));
     s.len() + 1
 }
 
@@ -1379,4 +1384,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn component_chunk_header_size_is_a_tight_upper_bound() {
+        // chunk_header_size feeds the partition gate in
+        // build_component_snapshot_lines. If the estimate is much larger than
+        // the real worst-case header, samples that would fit in a numbered
+        // chunk get spuriously routed to .oversized — changing the output
+        // schema for valid snapshots.
+        let component = "outbound.outbound.direct";
+        let ts: u64 = 1_715_059_200;
+        for max_chunks in [1usize, 5, 10, 100, 999] {
+            let worst_idx = max_chunks.saturating_sub(1);
+            let mut real = String::new();
+            write_snapshot_prefix(&mut real, ts, component, Some((worst_idx, max_chunks)));
+            let real_size = real.len() + 1;
+
+            let estimate = component_chunk_header_size(ts, component, max_chunks);
+            assert!(
+                estimate >= real_size,
+                "estimate {estimate} must be >= real {real_size} for max_chunks={max_chunks}",
+            );
+            let slack = estimate - real_size;
+            assert!(
+                slack <= 3,
+                "estimate slack {slack} too loose for max_chunks={max_chunks} \
+                 (estimate={estimate}, real={real_size})",
+            );
+        }
+    }
 }
