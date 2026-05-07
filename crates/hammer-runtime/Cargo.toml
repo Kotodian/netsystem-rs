@@ -80,6 +80,10 @@ wireguard = [
     "dep:smoltcp",
     "dep:socket2",
 ]
+# Generic user-space TCP/IP stack on top of an arbitrary IP carrier. Currently
+# consumed only by the WireGuard outbound; the TUN inbound's smoltcp mode will
+# share it once it lands. Off by default to keep the iOS xcframework slim.
+ipstack = ["dep:smoltcp"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
