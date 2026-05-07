@@ -807,6 +807,112 @@ mod tests {
         b.shutdown();
     }
 
+    /// Same shape as `tunnel_udp_round_trip_end_to_end` but with a UDP payload
+    /// that's well over a single MTU (4 KiB vs MTU 1408). On the sender's
+    /// stack, smoltcp has to break the IPv4 datagram into multiple fragments;
+    /// on the receiver's stack, smoltcp has to reassemble them before the
+    /// `UdpHandle` can hand the bytes back. If the workspace's smoltcp
+    /// fragmentation cargo features (`reassembly-buffer-size-8192` /
+    /// `reassembly-buffer-count-4`) regress to defaults (1500 / 1) the
+    /// receiver will never see a complete datagram and this test will time out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tunnel_udp_fragmented_round_trip_end_to_end() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        fn ephemeral_port() -> u16 {
+            std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        }
+
+        let a_priv = [55u8; 32];
+        let b_priv = [66u8; 32];
+        let a_pub = x25519_public(a_priv);
+        let b_pub = x25519_public(b_priv);
+
+        let port_a = ephemeral_port();
+        let port_b = ephemeral_port();
+        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
+        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
+
+        let a_options = WireguardEndpointOptions {
+            private_key: a_priv,
+            listen_port: port_a,
+            mtu: 1408,
+            address: vec!["10.0.0.1/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: b_pub,
+                pre_shared_key: None,
+                endpoint: outer_b,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+        let b_options = WireguardEndpointOptions {
+            private_key: b_priv,
+            listen_port: port_b,
+            mtu: 1408,
+            address: vec!["10.0.0.2/32".parse().unwrap()],
+            peers: vec![WireguardPeerOptions {
+                public_key: a_pub,
+                pre_shared_key: None,
+                endpoint: outer_a,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                persistent_keepalive: None,
+                reserved: [0; 3],
+            }],
+        };
+
+        let a = endpoint_for_test(logger("wg-a-frag"), "wg-a-frag".to_owned(), a_options);
+        let b = endpoint_for_test(logger("wg-b-frag"), "wg-b-frag".to_owned(), b_options);
+        a.boot().expect("boot a");
+        b.boot().expect("boot b");
+
+        let stack_a = a.stack_handle().expect("stack a ready");
+        let stack_b = b.stack_handle().expect("stack b ready");
+
+        let udp_a = stack_a.bind_udp().await.expect("bind udp a");
+        let udp_b = stack_b.bind_udp().await.expect("bind udp b");
+        let port_b_inside = udp_b.local_port();
+
+        // 4 KiB UDP payload + 8 byte UDP + 20 byte IPv4 header = 4124 byte
+        // total IP packet, well over the 1408 MTU. smoltcp on A must split
+        // this into 3 IPv4 fragments; smoltcp on B must reassemble them.
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
+        let mut payload_vec = Vec::with_capacity(4096);
+        for i in 0..4096 {
+            // Non-trivial pattern so a partial / mis-ordered reassembly
+            // would show up as a content mismatch, not a length match.
+            payload_vec.push((i % 251) as u8);
+        }
+        let payload = Bytes::from(payload_vec);
+        udp_a
+            .send(payload.clone(), dst)
+            .await
+            .expect("udp_a.send");
+
+        let (recv_payload, src) = timeout(Duration::from_secs(5), udp_b.recv())
+            .await
+            .expect("timed out waiting for fragmented tunnel UDP")
+            .expect("udp_b.recv");
+        assert_eq!(
+            recv_payload, payload,
+            "reassembled payload must match the 4 KiB pattern byte-for-byte"
+        );
+        assert_eq!(
+            src.ip(),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            "src must be A's in-tunnel address"
+        );
+
+        a.shutdown();
+        b.shutdown();
+    }
+
     /// End-to-end TCP: B listens inside the tunnel, A dials it, both ends
     /// exchange a payload in each direction. Touches everything UDP doesn't:
     /// smoltcp `tcp::Socket` connect/listen, the SYN/ACK + handshake driving
