@@ -254,6 +254,12 @@ impl ControlThread {
     pub(crate) async fn run(mut self) {
         let mut metrics_tick = tokio::time::interval(self.metrics_interval);
         metrics_tick.tick().await;
+        // Once every `ControlLogWriter` is dropped, `log_rx.recv()` returns
+        // `None` permanently. Disable that branch instead of `continue`-ing,
+        // which would re-poll a ready-`None` future on every loop iteration
+        // and burn CPU. Command and metrics dispatch keep running until the
+        // command channel itself closes.
+        let mut log_open = true;
         loop {
             tokio::select! {
                 command = self.command_rx.recv() => {
@@ -264,8 +270,9 @@ impl ControlThread {
                         break;
                     }
                 }
-                log = self.log_rx.recv() => {
+                log = self.log_rx.recv(), if log_open => {
                     let Some(log) = log else {
+                        log_open = false;
                         continue;
                     };
                     self.inner.write_message(log.level, log.message);
