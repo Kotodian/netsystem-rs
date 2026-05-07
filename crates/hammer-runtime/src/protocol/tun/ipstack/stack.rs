@@ -760,10 +760,7 @@ impl StackInner {
             if !socket.may_send() {
                 continue;
             }
-            loop {
-                let Some(pending) = bridge.pending_tx.front_mut() else {
-                    break;
-                };
+            while let Some(pending) = bridge.pending_tx.front_mut() {
                 if !socket.may_send() {
                     break;
                 }

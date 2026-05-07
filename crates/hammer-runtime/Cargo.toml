@@ -76,8 +76,8 @@ endpoint = ["hammer-core/endpoint"]
 wireguard = [
     "endpoint",
     "hammer-core/wireguard",
+    "ipstack",
     "dep:boringtun",
-    "dep:smoltcp",
     "dep:socket2",
 ]
 # Generic user-space TCP/IP stack on top of an arbitrary IP carrier. Currently

@@ -13,9 +13,7 @@
 //! `allow(dead_code)` suppresses the warnings during the staged rollout.
 #![allow(dead_code)]
 
-mod device;
 mod peer;
-mod stack;
 mod transport;
 
 use std::net::{IpAddr, SocketAddr};
@@ -26,22 +24,23 @@ use tracing::{error, info};
 
 use async_trait::async_trait;
 use boringtun::x25519;
+use bytes::Bytes;
 use ipnet::IpNet;
 use tokio::io::AsyncWriteExt;
 
 use hammer_adapter::{
-    Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyPacketConn, ProxyStream,
-    SocksAddr,
+    Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn,
+    ProxyStream, SocksAddr,
 };
 use hammer_core::config::{EndpointKind, WireguardEndpointOptions};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
+use crate::protocol::tun::ipstack::{IpStackHandles, UdpHandle, spawn_ipstack};
 use crate::socket_protector::SocketProtector;
 
 use peer::Peer;
-use stack::StackHandles;
 use transport::TransportHandles;
 
 type EndpointViews = (Arc<dyn Endpoint>, Arc<dyn Outbound>);
@@ -71,7 +70,7 @@ pub struct WireguardEndpoint {
 
 struct EndpointRuntime {
     transport: TransportHandles,
-    stack: Arc<StackHandles>,
+    stack: Arc<IpStackHandles>,
 }
 
 enum EndpointState {
@@ -173,7 +172,7 @@ impl WireguardEndpoint {
             join,
         } = transport;
 
-        let stack = stack::spawn_stack(
+        let stack = spawn_ipstack(
             self.logger.clone(),
             self.addresses.clone(),
             self.mtu,
@@ -287,7 +286,7 @@ impl WireguardEndpoint {
         self.fail_next_start.store(true, Ordering::SeqCst);
     }
 
-    fn stack_handle(&self) -> Result<Arc<StackHandles>, HammerError> {
+    fn stack_handle(&self) -> Result<Arc<IpStackHandles>, HammerError> {
         let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         match &*inner {
             EndpointState::Running(rt) => Ok(Arc::clone(&rt.stack)),
@@ -389,11 +388,33 @@ impl Outbound for WireguardEndpoint {
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
         let stack = self.stack_handle()?;
         let handle = stack.bind_udp().await?;
-        Ok(Box::new(handle))
+        Ok(Box::new(WireguardUdp(handle)))
     }
 }
 
 impl Endpoint for WireguardEndpoint {}
+
+/// Adapter from the carrier-agnostic `ipstack::UdpHandle` (which only knows
+/// `SocketAddr`) onto `ProxyPacketConn` (which speaks `SocksAddr`). Translating
+/// SOCKS-style addressing into a concrete IP is a wireguard-outbound concern,
+/// so it lives here instead of in the shared stack.
+struct WireguardUdp(UdpHandle);
+
+#[async_trait]
+impl ProxyPacketConn for WireguardUdp {
+    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
+        let dst = wireguard_destination_socket_addr(&destination)?;
+        self.0.send(payload.to_vec(), dst).await
+    }
+
+    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+        let (payload, src) = self.0.recv().await?;
+        Ok(ProxyDatagram {
+            destination: SocksAddr::ip(src.ip(), src.port()),
+            payload: Bytes::from(payload),
+        })
+    }
+}
 
 /// Helper used by tests + EndpointManager: build an endpoint with a
 /// no-platform protector. Production callers go through
@@ -691,7 +712,6 @@ mod tests {
     /// `listen` — closing the loop on inbound TCP is a future follow-up.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tunnel_udp_round_trip_end_to_end() {
-        use hammer_adapter::ProxyPacketConn;
         use std::time::Duration;
         use tokio::time::timeout;
 
@@ -752,25 +772,28 @@ mod tests {
         let stack_a = a.stack_handle().expect("stack a ready");
         let stack_b = b.stack_handle().expect("stack b ready");
 
-        let mut udp_a = stack_a.bind_udp().await.expect("bind udp a");
-        let mut udp_b = stack_b.bind_udp().await.expect("bind udp b");
+        let udp_a = stack_a.bind_udp().await.expect("bind udp a");
+        let udp_b = stack_b.bind_udp().await.expect("bind udp b");
         let port_b_inside = udp_b.local_port();
 
         // A's in-tunnel address is 10.0.0.1 ← bound by the smoltcp Interface;
         // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
-        let dst = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
+        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
         let payload = b"hello over wireguard".to_vec();
-        udp_a.send_to(dst, &payload).await.expect("udp_a.send_to");
+        udp_a
+            .send(payload.clone(), dst)
+            .await
+            .expect("udp_a.send");
 
         // 5s is plenty: the boringtun handshake completes in <50 ms over
         // localhost even with the 250 ms timer driving retransmits.
-        let datagram = timeout(Duration::from_secs(5), udp_b.recv_from())
+        let (recv_payload, src) = timeout(Duration::from_secs(5), udp_b.recv())
             .await
             .expect("timed out waiting for tunnel UDP")
-            .expect("udp_b.recv_from");
-        assert_eq!(datagram.payload.as_ref(), payload.as_slice());
+            .expect("udp_b.recv");
+        assert_eq!(recv_payload, payload);
         assert_eq!(
-            datagram.destination.host,
+            src.ip(),
             IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             "src must be A's in-tunnel address"
         );
@@ -1061,7 +1084,7 @@ mod tests {
             .expect("dial should resolve")
             .expect_err("dial to closed remote port must fail");
         assert!(
-            err.to_string().contains("wireguard tcp connect failed"),
+            err.to_string().contains("ipstack tcp connect failed"),
             "unexpected error: {err}"
         );
 
