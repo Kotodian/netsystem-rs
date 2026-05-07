@@ -23,8 +23,7 @@ use tokio::time::{self, Duration, Instant, timeout};
 
 use crate::dns::MessageExt;
 use crate::{DnsRouter, OutboundManager, Router};
-use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
-use metrics::{Counter, Key, Metadata, Recorder};
+use hammer_core::metrics::{MetricCounter, MetricsRegistry, MetricsScope, NetworkCounters};
 
 const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
@@ -565,80 +564,71 @@ impl SystemTunStack {
 #[derive(Clone)]
 struct TunCounters {
     /// Errors reading a batch of packets from the TUN device.
-    packet_recv_error_total: Counter,
+    packet_recv_error_total: MetricCounter,
     /// Empty packets dropped before parsing.
-    packet_drop_empty_total: Counter,
+    packet_drop_empty_total: MetricCounter,
     /// Packets that failed IP header parsing.
-    packet_parse_error_total: Counter,
+    packet_parse_error_total: MetricCounter,
     /// Packets dropped because the destination is not a global unicast address.
-    packet_drop_non_global_total: Counter,
+    packet_drop_non_global_total: MetricCounter,
     /// TUN write failures during the TCP rewrite batch.
-    tcp_writeback_error_total: Counter,
+    tcp_writeback_error_total: MetricCounter,
     /// Errors accepting an inbound TCP connection from the system listener.
-    tcp_accept_error_total: Counter,
+    tcp_accept_error_total: MetricCounter,
     /// TCP accepts whose source port had no matching NAT entry.
-    tcp_unknown_nat_total: Counter,
+    tcp_unknown_nat_total: MetricCounter,
     /// Failures building the TCP outbound destination address.
-    tcp_destination_error_total: Counter,
+    tcp_destination_error_total: MetricCounter,
     /// TCP outbound dials dropped before issuing because of the pending-dial limit.
-    tcp_dial_dropped_total: Counter,
+    tcp_dial_dropped_total: MetricCounter,
     /// TCP outbound dial errors.
-    tcp_dial_error_total: Counter,
+    tcp_dial_error_total: MetricCounter,
     /// TCP bidirectional copy errors during the inbound/outbound bridge.
-    tcp_copy_error_total: Counter,
+    tcp_copy_error_total: MetricCounter,
     /// UDP route metadata preparation errors.
-    udp_route_prepare_error_total: Counter,
+    udp_route_prepare_error_total: MetricCounter,
     /// DNS hijack path errors (parse / exchange / serialize / write).
-    udp_dns_error_total: Counter,
+    udp_dns_error_total: MetricCounter,
     /// Outbound `listen_packet()` errors when establishing a UDP flow.
-    udp_listen_error_total: Counter,
+    udp_listen_error_total: MetricCounter,
     /// UDP flows evicted from the flow map because of capacity pressure.
-    udp_flow_evict_total: Counter,
+    udp_flow_evict_total: MetricCounter,
     /// UDP packets dropped because the chosen flow's send queue was full.
-    udp_flow_drop_busy_total: Counter,
+    udp_flow_drop_busy_total: MetricCounter,
     /// UDP flow send errors.
-    udp_flow_send_error_total: Counter,
+    udp_flow_send_error_total: MetricCounter,
     /// UDP flow recv errors.
-    udp_flow_recv_error_total: Counter,
+    udp_flow_recv_error_total: MetricCounter,
     /// UDP response write-back errors.
-    udp_flow_response_write_error_total: Counter,
+    udp_flow_response_write_error_total: MetricCounter,
     /// UDP flows torn down by the idle timeout.
-    udp_flow_timeout_total: Counter,
+    udp_flow_timeout_total: MetricCounter,
 }
 
 impl TunCounters {
     fn new(scope: &MetricsScope) -> Self {
-        let recorder = scope.recorder();
         Self {
-            packet_recv_error_total: recorder_counter(&recorder, "packet_recv_error_total"),
-            packet_drop_empty_total: recorder_counter(&recorder, "packet_drop_empty_total"),
-            packet_parse_error_total: recorder_counter(&recorder, "packet_parse_error_total"),
-            packet_drop_non_global_total: recorder_counter(
-                &recorder,
-                "packet_drop_non_global_total",
-            ),
-            tcp_writeback_error_total: recorder_counter(&recorder, "tcp_writeback_error_total"),
-            tcp_accept_error_total: recorder_counter(&recorder, "tcp_accept_error_total"),
-            tcp_unknown_nat_total: recorder_counter(&recorder, "tcp_unknown_nat_total"),
-            tcp_destination_error_total: recorder_counter(&recorder, "tcp_destination_error_total"),
-            tcp_dial_dropped_total: recorder_counter(&recorder, "tcp_dial_dropped_total"),
-            tcp_dial_error_total: recorder_counter(&recorder, "tcp_dial_error_total"),
-            tcp_copy_error_total: recorder_counter(&recorder, "tcp_copy_error_total"),
-            udp_route_prepare_error_total: recorder_counter(
-                &recorder,
-                "udp_route_prepare_error_total",
-            ),
-            udp_dns_error_total: recorder_counter(&recorder, "udp_dns_error_total"),
-            udp_listen_error_total: recorder_counter(&recorder, "udp_listen_error_total"),
-            udp_flow_evict_total: recorder_counter(&recorder, "udp_flow_evict_total"),
-            udp_flow_drop_busy_total: recorder_counter(&recorder, "udp_flow_drop_busy_total"),
-            udp_flow_send_error_total: recorder_counter(&recorder, "udp_flow_send_error_total"),
-            udp_flow_recv_error_total: recorder_counter(&recorder, "udp_flow_recv_error_total"),
-            udp_flow_response_write_error_total: recorder_counter(
-                &recorder,
-                "udp_flow_response_write_error_total",
-            ),
-            udp_flow_timeout_total: recorder_counter(&recorder, "udp_flow_timeout_total"),
+            packet_recv_error_total: scope.counter("packet_recv_error_total"),
+            packet_drop_empty_total: scope.counter("packet_drop_empty_total"),
+            packet_parse_error_total: scope.counter("packet_parse_error_total"),
+            packet_drop_non_global_total: scope.counter("packet_drop_non_global_total"),
+            tcp_writeback_error_total: scope.counter("tcp_writeback_error_total"),
+            tcp_accept_error_total: scope.counter("tcp_accept_error_total"),
+            tcp_unknown_nat_total: scope.counter("tcp_unknown_nat_total"),
+            tcp_destination_error_total: scope.counter("tcp_destination_error_total"),
+            tcp_dial_dropped_total: scope.counter("tcp_dial_dropped_total"),
+            tcp_dial_error_total: scope.counter("tcp_dial_error_total"),
+            tcp_copy_error_total: scope.counter("tcp_copy_error_total"),
+            udp_route_prepare_error_total: scope.counter("udp_route_prepare_error_total"),
+            udp_dns_error_total: scope.counter("udp_dns_error_total"),
+            udp_listen_error_total: scope.counter("udp_listen_error_total"),
+            udp_flow_evict_total: scope.counter("udp_flow_evict_total"),
+            udp_flow_drop_busy_total: scope.counter("udp_flow_drop_busy_total"),
+            udp_flow_send_error_total: scope.counter("udp_flow_send_error_total"),
+            udp_flow_recv_error_total: scope.counter("udp_flow_recv_error_total"),
+            udp_flow_response_write_error_total: scope
+                .counter("udp_flow_response_write_error_total"),
+            udp_flow_timeout_total: scope.counter("udp_flow_timeout_total"),
         }
     }
 }
@@ -666,12 +656,6 @@ impl TunMetrics {
             outbound_missing_total: NetworkCounters::new(&scope, "outbound_missing_total"),
         }
     }
-}
-
-fn recorder_counter(recorder: &RegistryRecorder, name: &str) -> Counter {
-    let key = Key::from_name(name.to_owned());
-    let metadata = Metadata::new("tun", metrics::Level::INFO, Some(module_path!()));
-    recorder.register_counter(&key, &metadata)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1697,7 +1681,7 @@ async fn accept_tcp_loop(
         let (mut inbound, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
-                metrics.counters.tcp_accept_error_total.increment(1);
+                metrics.counters.tcp_accept_error_total.inc();
                 debug!("system TCP listener closed: {err}");
                 return;
             }
@@ -1707,7 +1691,7 @@ async fn accept_tcp_loop(
             nat.claim_active(peer.port())
         };
         let Some(session) = session else {
-            metrics.counters.tcp_unknown_nat_total.increment(1);
+            metrics.counters.tcp_unknown_nat_total.inc();
             debug!("unknown system TCP NAT session: {}", peer.port());
             continue;
         };
@@ -1772,7 +1756,7 @@ async fn accept_tcp_loop(
             let destination = match route_destination(&metadata, None) {
                 Ok(destination) => destination,
                 Err(err) => {
-                    metrics.counters.tcp_destination_error_total.increment(1);
+                    metrics.counters.tcp_destination_error_total.inc();
                     debug!("build TCP destination: {err}");
                     return;
                 }
@@ -1780,7 +1764,7 @@ async fn accept_tcp_loop(
             let dial_permit = match tcp_pending_dials.try_acquire() {
                 Ok(permit) => permit,
                 Err(err) => {
-                    metrics.counters.tcp_dial_dropped_total.increment(1);
+                    metrics.counters.tcp_dial_dropped_total.inc();
                     debug!("drop system TCP connection before outbound dial: {err}");
                     return;
                 }
@@ -1791,7 +1775,7 @@ async fn accept_tcp_loop(
             {
                 Ok(stream) => stream,
                 Err(err) => {
-                    metrics.counters.tcp_dial_error_total.increment(1);
+                    metrics.counters.tcp_dial_error_total.inc();
                     debug!("dial TCP outbound: {err}");
                     return;
                 }
@@ -1802,7 +1786,7 @@ async fn accept_tcp_loop(
                     debug!("system TCP copied {from_inbound}/{from_outbound} bytes")
                 }
                 Err(err) => {
-                    metrics.counters.tcp_copy_error_total.increment(1);
+                    metrics.counters.tcp_copy_error_total.inc();
                     debug!("copy system TCP: {err}")
                 }
             }
@@ -1835,7 +1819,7 @@ async fn packet_loop(
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
             Err(err) => {
-                metrics.counters.packet_recv_error_total.increment(1);
+                metrics.counters.packet_recv_error_total.inc();
                 debug!("read TUN packet loop stopped: {err}");
                 return;
             }
@@ -1856,19 +1840,19 @@ async fn packet_loop(
             let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
             for mut packet in packets {
                 if packet.is_empty() {
-                    metrics.counters.packet_drop_empty_total.increment(1);
+                    metrics.counters.packet_drop_empty_total.inc();
                     continue;
                 }
                 let parsed = match parse_ip_packet(&packet) {
                     Ok(parsed) => parsed,
                     Err(err) => {
-                        metrics.counters.packet_parse_error_total.increment(1);
+                        metrics.counters.packet_parse_error_total.inc();
                         trace!("ignore unsupported TUN packet: {err}");
                         continue;
                     }
                 };
                 if !is_global_unicast(parsed.destination.host) {
-                    metrics.counters.packet_drop_non_global_total.increment(1);
+                    metrics.counters.packet_drop_non_global_total.inc();
                     continue;
                 }
                 match parsed.network {
@@ -1904,7 +1888,7 @@ async fn packet_loop(
         if !tcp_writeback.is_empty() {
             let staged = std::mem::take(&mut tcp_writeback);
             if let Err(err) = device.send_batch(staged).await {
-                metrics.counters.tcp_writeback_error_total.increment(1);
+                metrics.counters.tcp_writeback_error_total.inc();
                 debug!("write system TCP packets: {err}");
             }
         }
@@ -1982,7 +1966,7 @@ async fn handle_system_udp_packet(
         &mut tun_packet.metadata,
         Some(dns_router.as_ref()),
     ) {
-        metrics.counters.udp_route_prepare_error_total.increment(1);
+        metrics.counters.udp_route_prepare_error_total.inc();
         return Err(err);
     }
     let decision = match router.match_route(&mut tun_packet.metadata) {
@@ -1997,7 +1981,7 @@ async fn handle_system_udp_packet(
             let message = match <Message as MessageExt>::from_bytes(&tun_packet.payload) {
                 Ok(message) => message,
                 Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
+                    metrics.counters.udp_dns_error_total.inc();
                     return Err(err);
                 }
             };
@@ -2007,14 +1991,14 @@ async fn handle_system_udp_packet(
             {
                 Ok(response) => response,
                 Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
+                    metrics.counters.udp_dns_error_total.inc();
                     return Err(err);
                 }
             };
             let response_bytes = match MessageExt::to_bytes(&response) {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
+                    metrics.counters.udp_dns_error_total.inc();
                     return Err(err);
                 }
             };
@@ -2022,12 +2006,12 @@ async fn handle_system_udp_packet(
                 match udp_response_packet(&packet, parsed.destination, &response_bytes) {
                     Ok(packet) => packet,
                     Err(err) => {
-                        metrics.counters.udp_dns_error_total.increment(1);
+                        metrics.counters.udp_dns_error_total.inc();
                         return Err(err);
                     }
                 };
             if let Err(err) = device.send(response_packet).await {
-                metrics.counters.udp_dns_error_total.increment(1);
+                metrics.counters.udp_dns_error_total.inc();
                 return Err(err);
             }
         }
@@ -2074,7 +2058,7 @@ async fn handle_system_udp_packet(
                 let packet_conn = match outbound_item.listen_packet().await {
                     Ok(packet_conn) => packet_conn,
                     Err(err) => {
-                        metrics.counters.udp_listen_error_total.increment(1);
+                        metrics.counters.udp_listen_error_total.inc();
                         return Err(err);
                     }
                 };
@@ -2109,7 +2093,7 @@ async fn handle_system_udp_packet(
                 }
             };
             if let Err(err) = sender.try_send(tun_packet.payload) {
-                metrics.counters.udp_flow_drop_busy_total.increment(1);
+                metrics.counters.udp_flow_drop_busy_total.inc();
                 debug!("drop UDP packet for busy system flow: {err}");
             }
         }
@@ -2216,7 +2200,7 @@ async fn system_udp_flow_loop(
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
                 if let Err(err) = packet_conn.send_to(destination.clone(), &payload).await {
-                    metrics.counters.udp_flow_send_error_total.increment(1);
+                    metrics.counters.udp_flow_send_error_total.inc();
                     debug!("send system UDP outbound: {err}");
                     break;
                 }
@@ -2225,7 +2209,7 @@ async fn system_udp_flow_loop(
                 let response = match response {
                     Ok(response) => response,
                     Err(err) => {
-                        metrics.counters.udp_flow_recv_error_total.increment(1);
+                        metrics.counters.udp_flow_recv_error_total.inc();
                         debug!("receive system UDP outbound: {err}");
                         break;
                     }
@@ -2234,7 +2218,7 @@ async fn system_udp_flow_loop(
                 match response_template.build(response.destination, &response.payload) {
                     Ok(packet) => {
                         if let Err(err) = device.send(packet).await {
-                            metrics.counters.udp_flow_response_write_error_total.increment(1);
+                            metrics.counters.udp_flow_response_write_error_total.inc();
                             debug!("write system UDP response: {err}");
                             break;
                         }
@@ -2243,7 +2227,7 @@ async fn system_udp_flow_loop(
                 }
             }
             _ = &mut idle_timer => {
-                metrics.counters.udp_flow_timeout_total.increment(1);
+                metrics.counters.udp_flow_timeout_total.inc();
                 break;
             }
         }
@@ -2261,7 +2245,7 @@ fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap, metrics: &TunMetrics) {
         .map(|(key, _)| key.clone())
     {
         flows.remove(&oldest_key);
-        metrics.counters.udp_flow_evict_total.increment(1);
+        metrics.counters.udp_flow_evict_total.inc();
     }
 }
 
@@ -2797,7 +2781,7 @@ mod tests {
     fn tun_metrics_register_counters_under_scope_component_id() {
         let registry = MetricsRegistry::new();
         let metrics = TunMetrics::new(registry.scope("inbound", "tun", "vpn-main"));
-        metrics.counters.packet_recv_error_total.increment(1);
+        metrics.counters.packet_recv_error_total.inc();
 
         let samples = registry.snapshot();
         assert!(
@@ -2817,8 +2801,8 @@ mod tests {
         let metrics_a = TunMetrics::new(registry_a.scope("inbound", "tun", "tun-a"));
         let metrics_b = TunMetrics::new(registry_b.scope("inbound", "tun", "tun-b"));
 
-        metrics_a.counters.packet_recv_error_total.increment(3);
-        metrics_b.counters.packet_recv_error_total.increment(5);
+        metrics_a.counters.packet_recv_error_total.add(3);
+        metrics_b.counters.packet_recv_error_total.add(5);
 
         let samples_a = registry_a.snapshot();
         let samples_b = registry_b.snapshot();
