@@ -130,7 +130,6 @@ pub struct MetricsScope {
 }
 
 impl MetricsScope {
-    #[cfg(feature = "metrics")]
     pub fn recorder(&self) -> RegistryRecorder {
         RegistryRecorder::new(
             Arc::clone(&self.registry),
@@ -335,21 +334,18 @@ fn labels_sort_key(labels: &[MetricLabel]) -> String {
 }
 
 /// Bridges the `metrics` crate's [`metrics::Recorder`] trait into
-/// [`MetricsRegistry`]. Compiled in only when the `metrics` cargo
-/// feature is enabled (default on); the rest of the registry surface
-/// (`MetricsRegistry`, `MetricCounter`, `MetricGauge`, …) stays
-/// available either way.
+/// [`MetricsRegistry`].
 ///
-/// Install once per process via [`metrics::set_global_recorder`];
-/// afterwards every `metrics::counter!()` / `metrics::gauge!()` call
-/// lands in the same backing storage that [`MetricsRegistry::snapshot`]
-/// reads, so the existing FFI / log-dump paths keep working unchanged.
+/// Install once per process via [`metrics::set_global_recorder`]; afterwards
+/// every `metrics::counter!()` / `metrics::gauge!()` call (including the
+/// ones emitted by `metrics-derive`) lands in the same backing storage that
+/// [`MetricsRegistry::snapshot`] reads, so the existing FFI / log-dump
+/// paths keep working unchanged.
 ///
 /// Each recorder pins a single `(module, component_type, component_id)`
-/// scope; the metric name and any labels supplied via `metrics::Key`
-/// are translated into [`MetricKey`] entries beneath that scope.
-/// Histograms are not used by this codebase and are wired to no-ops.
-#[cfg(feature = "metrics")]
+/// scope; the metric name and any labels supplied via `metrics::Key` are
+/// translated into [`MetricKey`] entries beneath that scope. Histograms
+/// are not used by this codebase and are wired to no-ops.
 pub struct RegistryRecorder {
     registry: Arc<MetricsRegistry>,
     module: String,
@@ -357,7 +353,6 @@ pub struct RegistryRecorder {
     component_id: String,
 }
 
-#[cfg(feature = "metrics")]
 impl RegistryRecorder {
     pub fn new(
         registry: Arc<MetricsRegistry>,
@@ -388,7 +383,6 @@ impl RegistryRecorder {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl metrics::Recorder for RegistryRecorder {
     fn describe_counter(
         &self,
@@ -437,10 +431,8 @@ impl metrics::Recorder for RegistryRecorder {
     }
 }
 
-#[cfg(feature = "metrics")]
 struct AtomicCounterFn(Arc<AtomicU64>);
 
-#[cfg(feature = "metrics")]
 impl metrics::CounterFn for AtomicCounterFn {
     fn increment(&self, value: u64) {
         self.0.fetch_add(value, Ordering::Relaxed);
@@ -463,10 +455,8 @@ impl metrics::CounterFn for AtomicCounterFn {
     }
 }
 
-#[cfg(feature = "metrics")]
 struct AtomicGaugeFn(Arc<AtomicU64>);
 
-#[cfg(feature = "metrics")]
 impl AtomicGaugeFn {
     fn clamp_u64(value: f64) -> u64 {
         if value.is_nan() || value <= 0.0 {
@@ -479,7 +469,6 @@ impl AtomicGaugeFn {
     }
 }
 
-#[cfg(feature = "metrics")]
 impl metrics::GaugeFn for AtomicGaugeFn {
     fn increment(&self, value: f64) {
         self.0.fetch_add(Self::clamp_u64(value), Ordering::Relaxed);
@@ -508,7 +497,6 @@ fn saturating_fetch_sub(value: &AtomicU64, amount: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "metrics")]
     use metrics::Recorder;
 
     #[test]
@@ -558,7 +546,6 @@ mod tests {
         assert_eq!(registry.snapshot()[0].value, 0);
     }
 
-    #[cfg(feature = "metrics")]
     #[test]
     fn recorder_gauge_decrement_saturates_at_zero() {
         let registry = MetricsRegistry::new();

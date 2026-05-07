@@ -19,14 +19,7 @@ default = [
     "dns-hosts",
     "dns-local",
     "probe",
-    "metrics",
 ]
-# Enables the `metrics`-crate `Recorder` bridge inside `hammer-core`. The
-# self-built `MetricsRegistry`/`MetricCounter`/`MetricGauge` API is always
-# available (used internally by inbound/outbound/route instrumentation);
-# this feature only pulls in the external `metrics` crate so callers can
-# bridge `metrics::counter!()` into the same backing storage.
-metrics = ["dep:metrics", "hammer-core/metrics"]
 # Outbound-level latency probing. Adds `ProbeManager` + `IcmpOutboundProbe`
 # under `crate::probe`, plus the `RuntimeService::probe_outbounds` API.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
@@ -112,7 +105,8 @@ base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-metrics = { workspace = true, optional = true }
+metrics = { workspace = true }
+metrics-derive = { workspace = true }
 smoltcp = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 tun-rs = { workspace = true, optional = true }

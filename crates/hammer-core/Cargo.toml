@@ -8,7 +8,7 @@ publish.workspace = true
 name = "hammer_core"
 
 [features]
-default = ["metrics"]
+default = []
 # Enables the generic `[[endpoints]]` config section. Concrete endpoint
 # protocols opt into this parent feature.
 endpoint = []
@@ -16,15 +16,6 @@ endpoint = []
 # `type = "wireguard"`). Off by default to keep iOS xcframework builds slim
 # for users who only need hysteria2; opt in with `--features wireguard`.
 wireguard = ["endpoint", "dep:serde_with", "serde_with/base64"]
-# Enables the `metrics`-crate `Recorder` bridge (`RegistryRecorder`).
-# `MetricsRegistry`/`MetricCounter`/`MetricGauge` and the rest of the
-# self-built API stay available regardless of this feature; only the
-# adapter that lets `metrics::counter!()` / `metrics::gauge!()` macros
-# land in the same backing storage is gated. On by default so the iOS
-# NetExt binary keeps the existing surface; downstreams that don't
-# consume the external `metrics` crate API can opt out with
-# `default-features = false`.
-metrics = ["dep:metrics"]
 
 [dependencies]
 serde = { workspace = true }
@@ -36,7 +27,7 @@ tokio = { workspace = true }
 ipnet = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-metrics = { workspace = true, optional = true }
+metrics = { workspace = true }
 humantime-serde = { workspace = true }
 serde_with = { workspace = true, optional = true }
 
