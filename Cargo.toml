@@ -40,7 +40,6 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 metrics = "0.24"
-metrics-derive = "0.1"
 humantime-serde = "1.1"
 serde_with = { version = "3.18", default-features = false, features = ["std"] }
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
