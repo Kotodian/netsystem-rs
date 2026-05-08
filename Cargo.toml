@@ -28,6 +28,15 @@ panic = "abort"
 strip = "symbols"
 opt-level = "z"
 
+# Profiling-friendly variant: same codegen as release but keeps line-table
+# debuginfo so iOS Instruments can symbolicate Rust frames. Build via
+# `PROFILE=release-perf ./scripts/build-xcframework.sh`. Not the default — the
+# binary is ~30-50% larger because of the line tables.
+[profile.release-perf]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
 [workspace.dependencies]
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "macros", "time", "io-util", "net"] }
 serde = { version = "1.0.228", features = ["derive"] }

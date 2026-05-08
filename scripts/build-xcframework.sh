@@ -21,22 +21,29 @@ OUTPUT_DIR="${OUTPUT_DIR:-${BUILD_DIR:-dist/ios}}"
 GENERATED_DIR="${OUTPUT_DIR}/generated"
 XCFRAMEWORK="${OUTPUT_DIR}/Hammer.xcframework"
 FRAMEWORK="${OUTPUT_DIR}/ios/Hammer.framework"
-DYLIB_SRC="target/aarch64-apple-ios/release/libhammer.dylib"
 BUILD_FEATURES="${FEATURES:-${CARGO_FEATURES:-}}"
+# `release` (default, fully stripped) or `release-perf` (line-table debuginfo
+# preserved, no strip) for Instruments-friendly profiling builds.
+BUILD_PROFILE="${PROFILE:-release}"
+DYLIB_SRC="target/aarch64-apple-ios/${BUILD_PROFILE}/libhammer.dylib"
 
 rm -rf "${OUTPUT_DIR}"
 mkdir -p "${GENERATED_DIR}" "${FRAMEWORK}/Headers" "${FRAMEWORK}/Modules"
 
-echo "==> cargo build cdylib (release, aarch64-apple-ios)"
+echo "==> cargo build cdylib (profile=${BUILD_PROFILE}, aarch64-apple-ios)"
 if [[ -n "${BUILD_FEATURES}" ]]; then
-  cargo build -p hammer-ffi --features "${BUILD_FEATURES}" --release --target aarch64-apple-ios
+  cargo build -p hammer-ffi --features "${BUILD_FEATURES}" --profile "${BUILD_PROFILE}" --target aarch64-apple-ios
 else
-  cargo build -p hammer-ffi --release --target aarch64-apple-ios
+  cargo build -p hammer-ffi --profile "${BUILD_PROFILE}" --target aarch64-apple-ios
 fi
 
 echo "==> assemble Hammer.framework"
 cp "${DYLIB_SRC}" "${FRAMEWORK}/Hammer"
-strip -S -x "${FRAMEWORK}/Hammer"
+# Skip strip when caller asked for a profiling build — Instruments needs the
+# debug symbols that strip would otherwise wipe.
+if [[ "${BUILD_PROFILE}" != "release-perf" ]]; then
+  strip -S -x "${FRAMEWORK}/Hammer"
+fi
 # Frameworks must use an @rpath install_name so the host app can embed them.
 install_name_tool -id @rpath/Hammer.framework/Hammer "${FRAMEWORK}/Hammer"
 
