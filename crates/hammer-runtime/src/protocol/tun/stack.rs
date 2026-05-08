@@ -9,14 +9,15 @@ use tracing::{debug, error, info, trace};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    DnsQueryOptions, Network, OutboundManager as _, RouteDecision, RouteMetadata, SocksAddr,
+    DnsQueryOptions, Network, OutboundManager as _, ProxyStream, RouteDecision, RouteMetadata,
+    SocksAddr,
 };
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use ipnet::IpNet;
-use tokio::io::{AsyncReadExt, copy_bidirectional};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant, timeout};
@@ -358,6 +359,36 @@ impl Drop for SystemTcpNatLease {
     fn drop(&mut self) {
         if let Ok(mut nat) = self.nat.lock() {
             nat.release_active(self.port);
+        }
+    }
+}
+
+struct SystemTcpInboundGuard {
+    stream: TcpStream,
+    abort_on_drop: bool,
+}
+
+impl SystemTcpInboundGuard {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            abort_on_drop: true,
+        }
+    }
+
+    fn stream_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
+    fn disarm(&mut self) {
+        self.abort_on_drop = false;
+    }
+}
+
+impl Drop for SystemTcpInboundGuard {
+    fn drop(&mut self) {
+        if self.abort_on_drop {
+            abort_system_tcp_stream(&self.stream);
         }
     }
 }
@@ -1466,6 +1497,26 @@ fn update_ipv6_udp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
     Ok(())
 }
 
+fn abort_system_tcp_stream(stream: &TcpStream) {
+    if let Err(err) = stream.set_zero_linger() {
+        debug!("set system TCP zero linger: {err}");
+    }
+}
+
+async fn bridge_system_tcp_streams(
+    inbound: &mut TcpStream,
+    outbound_stream: &mut dyn ProxyStream,
+) -> std::io::Result<(u64, u64)> {
+    let result = copy_bidirectional(&mut *inbound, &mut *outbound_stream).await;
+    if result.is_err() {
+        abort_system_tcp_stream(inbound);
+    } else {
+        let _ = inbound.shutdown().await;
+        let _ = outbound_stream.shutdown().await;
+    }
+    result
+}
+
 fn ipv4_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
     if request.len() < 28 || request[9] != 17 {
         return Err(HammerError::internal("invalid IPv4 UDP packet"));
@@ -1694,7 +1745,7 @@ async fn accept_tcp_loop(
     metrics: TunMetrics,
 ) {
     loop {
-        let (mut inbound, peer) = match listener.accept().await {
+        let (inbound, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(err) => {
                 metrics.counters.tcp_accept_error_total.increment(1);
@@ -1709,6 +1760,7 @@ async fn accept_tcp_loop(
         let Some(session) = session else {
             metrics.counters.tcp_unknown_nat_total.increment(1);
             debug!("unknown system TCP NAT session: {}", peer.port());
+            abort_system_tcp_stream(&inbound);
             continue;
         };
         let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
@@ -1719,6 +1771,7 @@ async fn accept_tcp_loop(
         let metrics = metrics.clone();
         crate::spawn::spawn(async move {
             let _nat_lease = nat_lease;
+            let mut inbound = SystemTcpInboundGuard::new(inbound);
             let mut metadata = RouteMetadata {
                 inbound: inbound_id,
                 network: Network::Tcp,
@@ -1729,8 +1782,11 @@ async fn accept_tcp_loop(
             let mut initial_payload = Vec::new();
             if let Some(sniff_timeout) = router.sniff_timeout(&metadata) {
                 let mut buf = [0_u8; 4096];
-                match timeout(sniff_timeout, inbound.read(&mut buf)).await {
-                    Ok(Ok(0)) => return,
+                match timeout(sniff_timeout, inbound.stream_mut().read(&mut buf)).await {
+                    Ok(Ok(0)) => {
+                        inbound.disarm();
+                        return;
+                    }
                     Ok(Ok(n)) => {
                         initial_payload.extend_from_slice(&buf[..n]);
                         let mut packet = TunPacket {
@@ -1797,8 +1853,9 @@ async fn accept_tcp_loop(
                 }
             };
             drop(dial_permit);
-            match copy_bidirectional(&mut inbound, &mut outbound_stream).await {
+            match bridge_system_tcp_streams(inbound.stream_mut(), &mut *outbound_stream).await {
                 Ok((from_inbound, from_outbound)) => {
+                    inbound.disarm();
                     debug!("system TCP copied {from_inbound}/{from_outbound} bytes")
                 }
                 Err(err) => {
@@ -2793,6 +2850,9 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
 mod tests {
     use super::*;
     use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     #[test]
     fn tun_metrics_register_counters_under_scope_component_id() {
@@ -2884,5 +2944,66 @@ mod tests {
 
         drop(first);
         let _second = limiter.try_acquire().expect("permit released after drop");
+    }
+
+    struct ResetOnWriteStream;
+
+    impl AsyncRead for ResetOnWriteStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for ResetOnWriteStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn system_tcp_bridge_abortively_closes_inbound_on_copy_error() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = crate::spawn::spawn(async move {
+            let mut client = tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect client");
+            client
+                .write_all(b"GET / HTTP/1.1\r\n\r\n")
+                .await
+                .expect("write client payload");
+            client
+        });
+        let (mut inbound, _) = listener.accept().await.expect("accept inbound");
+        let mut outbound = ResetOnWriteStream;
+
+        let err = bridge_system_tcp_streams(&mut inbound, &mut outbound)
+            .await
+            .expect_err("copy should surface outbound reset");
+
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(
+            inbound.linger().expect("read inbound linger"),
+            Some(Duration::ZERO)
+        );
+        let _ = client.await.expect("client task");
     }
 }

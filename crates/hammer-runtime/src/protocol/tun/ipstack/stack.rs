@@ -42,9 +42,10 @@ const TCP_BUF: usize = 64 * 1024;
 /// Defensive backstop against an upstream that forgot to drop a stream:
 /// without this each forgotten connection holds ~256 KiB (smoltcp rx/tx
 /// rings + the bridge's `BytesMut` + the duplex tail), which is what causes
-/// the NetExt to drift up under sustained traffic. 15 min is far longer
-/// than any sane keepalive and still bounds worst-case retention.
-const TCP_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// the NetExt to drift up under sustained traffic. Keep it near common HTTP
+/// keepalive windows so idle browser connections are recycled quickly while
+/// active streams stay alive.
+const TCP_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Buffer between the actor and a TCP bridge task — small because we drain
 /// it immediately after every iface.poll cycle.
 const TCP_DATA_QUEUE: usize = 16;
@@ -133,6 +134,23 @@ impl IpStackHandles {
     /// `signal_shutdown` for the lifecycle close path.
     pub(crate) fn abort(&self) {
         self.join.abort();
+    }
+
+    /// Count UDP sockets currently parked in the smoltcp `SocketSet`. Used by
+    /// the leak regression test in this module to verify that closed UDP
+    /// sockets are removed from the SocketSet, not just unbound.
+    #[cfg(test)]
+    pub(super) async fn debug_udp_socket_count(&self) -> usize {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(StackCommand::DebugUdpSocketCount { reply: reply_tx })
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        reply_rx.await.unwrap_or(0)
     }
 }
 
@@ -291,6 +309,10 @@ enum StackCommand {
         port: u16,
         reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
     },
+    /// Inspect how many UDP sockets are currently parked in the smoltcp
+    /// `SocketSet`. Test-only — the production code never needs to ask.
+    #[cfg(test)]
+    DebugUdpSocketCount { reply: oneshot::Sender<usize> },
 }
 
 /// One in-flight inbound TCP accept. The listening smoltcp socket sits in
@@ -321,6 +343,7 @@ enum SocketEvent {
     },
     TcpClose {
         handle: SocketHandle,
+        mode: TcpCloseMode,
     },
     UdpSend {
         handle: SocketHandle,
@@ -332,12 +355,24 @@ enum SocketEvent {
     },
 }
 
+enum TcpCloseMode {
+    /// The user closed its write half. Preserve already-accepted bytes and
+    /// send a FIN once our user->socket queue drains.
+    GracefulWriteEof,
+    /// The user read half disappeared or our defensive idle timer fired. The
+    /// stream is no longer usable, so abort to release buffers promptly.
+    Abort,
+}
+
 struct TcpBridge {
     /// Channel for the actor to push socket recv data into the bridge task.
     data_tx: mpsc::Sender<Bytes>,
     /// Bytes the actor is still trying to push into the smoltcp tx buffer
     /// (didn't fit in a single send_slice call).
     pending_tx: VecDeque<PendingTcpWrite>,
+    /// User wrote EOF; call `socket.close()` once `pending_tx` is empty so
+    /// already-accepted bytes are not discarded by an early RST.
+    close_after_pending_tx: bool,
 }
 
 struct PendingTcpWrite {
@@ -539,18 +574,21 @@ impl StackInner {
             SocketEvent::TcpWrite { handle, data, ack } => {
                 self.handle_tcp_write(handle, data, ack);
             }
-            SocketEvent::TcpClose { handle } => {
+            SocketEvent::TcpClose { handle, mode } => {
                 if self.tcp_bridges.contains_key(&handle) {
-                    self.fail_pending_tcp_writes(handle, "ipstack tcp: user stream closed");
-                    let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                    // The user side dropped its stream, so we don't owe the
-                    // far side a graceful FIN exchange. `abort()` sends a
-                    // single RST and transitions straight to CLOSED, dodging
-                    // the FIN_WAIT_1/FIN_WAIT_2 trap where smoltcp parks the
-                    // socket waiting for a peer ACK that may never arrive on
-                    // a userspace stack with no protocol-level retry budget.
-                    // The next `reap_dead_sockets` call frees the slot.
-                    socket.abort();
+                    match mode {
+                        TcpCloseMode::GracefulWriteEof => {
+                            if let Some(bridge) = self.tcp_bridges.get_mut(&handle) {
+                                bridge.close_after_pending_tx = true;
+                            }
+                            self.close_tcp_if_pending_tx_drained(handle);
+                        }
+                        TcpCloseMode::Abort => {
+                            self.fail_pending_tcp_writes(handle, "ipstack tcp: user stream closed");
+                            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+                            socket.abort();
+                        }
+                    }
                 }
             }
             SocketEvent::UdpSend { handle, data, dst } => {
@@ -568,8 +606,7 @@ impl StackInner {
             }
             SocketEvent::UdpClose { handle } => {
                 if self.udp_bridges.remove(&handle).is_some() {
-                    let socket = self.sockets.get_mut::<udp::Socket>(handle);
-                    socket.close();
+                    self.sockets.remove(handle);
                 }
             }
         }
@@ -585,6 +622,15 @@ impl StackInner {
             }
             StackCommand::AcceptTcp { port, reply } => {
                 self.queue_accept(port, reply);
+            }
+            #[cfg(test)]
+            StackCommand::DebugUdpSocketCount { reply } => {
+                let count = self
+                    .sockets
+                    .iter()
+                    .filter(|(_, sock)| matches!(sock, smoltcp::socket::Socket::Udp(_)))
+                    .count();
+                let _ = reply.send(count);
             }
         }
     }
@@ -655,6 +701,7 @@ impl StackInner {
             TcpBridge {
                 data_tx,
                 pending_tx: VecDeque::new(),
+                close_after_pending_tx: false,
             },
         );
         user_side
@@ -682,6 +729,7 @@ impl StackInner {
         let written = self.write_tcp_slice(handle, &data);
         if written >= data.len() {
             let _ = ack.send(Ok(()));
+            self.close_tcp_if_pending_tx_drained(handle);
             return;
         }
 
@@ -723,6 +771,18 @@ impl StackInner {
             if let Some(ack) = pending.ack.take() {
                 let _ = ack.send(Err(HammerError::internal(reason)));
             }
+        }
+    }
+
+    fn close_tcp_if_pending_tx_drained(&mut self, handle: SocketHandle) {
+        let should_close = self
+            .tcp_bridges
+            .get(&handle)
+            .map(|bridge| bridge.close_after_pending_tx && bridge.pending_tx.is_empty())
+            .unwrap_or(false);
+        if should_close {
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+            socket.close();
         }
     }
 
@@ -823,6 +883,7 @@ impl StackInner {
                     }
                 }
             }
+            self.close_tcp_if_pending_tx_drained(handle);
         }
     }
 
@@ -926,12 +987,22 @@ async fn tcp_bridge_task(
     // local stack buffer, and `split().freeze()` turns each chunk into an
     // owned `Bytes` we can ship across the actor boundary without memcpy.
     let mut buf = BytesMut::with_capacity(TCP_BUF);
+    let mut user_write_open = true;
     loop {
         tokio::select! {
             // User wrote -> we read from the actor stage and forward to socket.
-            res = duplex.read_buf(&mut buf) => {
+            res = duplex.read_buf(&mut buf), if user_write_open => {
                 match res {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => {
+                        user_write_open = false;
+                        if send_tcp_close(&event_tx, handle, TcpCloseMode::GracefulWriteEof).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = send_tcp_close(&event_tx, handle, TcpCloseMode::Abort).await;
+                        break;
+                    }
                     Ok(_) => {
                         let chunk = buf.split().freeze();
                         // `split` leaves the BytesMut empty; reserve so the
@@ -960,6 +1031,7 @@ async fn tcp_bridge_task(
             data = data_rx.recv() => {
                 let Some(data) = data else { break };
                 if duplex.write_all(&data).await.is_err() {
+                    let _ = send_tcp_close(&event_tx, handle, TcpCloseMode::Abort).await;
                     break;
                 }
             }
@@ -968,11 +1040,19 @@ async fn tcp_bridge_task(
             // stream and let the bridge exit so the socket can be reaped.
             _ = tokio::time::sleep(TCP_BRIDGE_IDLE_TIMEOUT) => {
                 tracing::debug!("ipstack tcp bridge idle timeout, closing");
+                let _ = send_tcp_close(&event_tx, handle, TcpCloseMode::Abort).await;
                 break;
             }
         }
     }
-    let _ = event_tx.send(SocketEvent::TcpClose { handle }).await;
+}
+
+async fn send_tcp_close(
+    event_tx: &mpsc::Sender<SocketEvent>,
+    handle: SocketHandle,
+    mode: TcpCloseMode,
+) -> Result<(), mpsc::error::SendError<SocketEvent>> {
+    event_tx.send(SocketEvent::TcpClose { handle, mode }).await
 }
 
 async fn udp_bridge_task(
@@ -1038,4 +1118,68 @@ fn ip_endpoint_to_socket(endpoint: IpEndpoint) -> SocketAddr {
         IpAddress::Ipv6(v6) => IpAddr::V6(std::net::Ipv6Addr::from(v6.octets())),
     };
     SocketAddr::new(ip, endpoint.port)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    use super::*;
+
+    #[test]
+    fn tcp_bridge_idle_timeout_stays_within_netext_memory_budget() {
+        assert!(
+            TCP_BRIDGE_IDLE_TIMEOUT <= Duration::from_secs(60),
+            "idle TCP bridge timeout retains about 256 KiB per keepalive connection"
+        );
+    }
+
+    fn test_logger() -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger("ipstack-test")
+    }
+
+    /// Each `bind_udp` allocates a smoltcp UDP socket carrying ~128 KiB of rx/tx
+    /// payload buffers. When the user drops the `UdpHandle`, the bridge task
+    /// fires `UdpClose` so the actor `socket.close()`s the smoltcp socket — but
+    /// `close()` only unbinds, it does not free the SocketSet slot. Without an
+    /// explicit `sockets.remove(handle)` the slot lingers forever, the buffers
+    /// stay resident, and every `iface.poll` keeps walking the dead socket.
+    /// DNS-over-UDP via the wireguard outbound binds one of these per query, so
+    /// this leak shows up as steadily-growing NetExt RSS during normal browsing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bind_udp_then_drop_releases_smoltcp_socket_slot() {
+        let logger = test_logger();
+        let addrs = vec!["10.0.0.1/32".parse::<IpNet>().expect("local addr")];
+        let (_inbound_tx, inbound_rx) = mpsc::channel(16);
+        let (encrypt_tx, _encrypt_rx) = mpsc::channel(16);
+        let stack = spawn_ipstack(logger, addrs, 1408, inbound_rx, encrypt_tx).expect("spawn");
+
+        const ITERATIONS: usize = 32;
+        for _ in 0..ITERATIONS {
+            let handle = stack.bind_udp().await.expect("bind_udp");
+            drop(handle);
+        }
+
+        // Bridge tasks signal `UdpClose` asynchronously; wait until the actor
+        // has drained them. A handful of poll cycles is plenty.
+        let mut final_count = ITERATIONS;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            final_count = stack.debug_udp_socket_count().await;
+            if final_count == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            final_count, 0,
+            "smoltcp SocketSet retained closed UDP sockets — \
+             {final_count} of {ITERATIONS} bind/drop cycles leaked"
+        );
+
+        stack.signal_shutdown();
+    }
 }
