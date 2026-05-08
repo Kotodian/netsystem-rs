@@ -29,10 +29,10 @@ use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
-const SYSTEM_UDP_FLOW_CAPACITY: usize = 1024;
+const SYSTEM_UDP_FLOW_CAPACITY: usize = 256;
 const SYSTEM_UDP_CHANNEL_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
-const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait TunDevice: Send + Sync + 'static {
@@ -2933,6 +2933,18 @@ mod tests {
 
         assert!(!is_transient_tun_send_backpressure(&would_block));
         assert!(should_clear_tun_send_readiness(&would_block));
+    }
+
+    #[test]
+    fn system_udp_defaults_stay_within_netext_memory_budget() {
+        assert!(
+            DEFAULT_SYSTEM_UDP_TIMEOUT <= Duration::from_secs(30),
+            "idle video/QUIC UDP flows retain WireGuard UDP sockets until timeout"
+        );
+        assert!(
+            SYSTEM_UDP_FLOW_CAPACITY <= 256,
+            "each routed UDP flow can own a WireGuard ipstack UDP socket"
+        );
     }
 
     #[test]
