@@ -100,6 +100,12 @@ pub struct AppleTunDevice {
     fd: AsyncFd<OwnedFd>,
     mtu: usize,
     batch_size: usize,
+    /// Cap on the recycle pool size. Bursts can leave thousands of buffers
+    /// in flight; without this cap the pool grows monotonically to the peak
+    /// concurrency and never releases memory back to the allocator. Sized at
+    /// `2 * batch_size` so steady-state churn never reallocates while a
+    /// transient burst is allowed to drop excess capacity.
+    max_pool_size: usize,
     closed: AtomicBool,
     rx: Mutex<RxState>,
     tx: Mutex<TxState>,
@@ -236,10 +242,12 @@ impl AppleTunDevice {
         for _ in 0..batch_size {
             pool.push(Vec::with_capacity(mtu));
         }
+        let max_pool_size = batch_size.saturating_mul(2);
         Ok(Arc::new(Self {
             fd: async_fd,
             mtu,
             batch_size,
+            max_pool_size,
             closed: AtomicBool::new(false),
             rx: Mutex::new(RxState::new(batch_size)),
             tx: Mutex::new(TxState::new(batch_size)),
@@ -336,12 +344,20 @@ impl AppleTunDevice {
     fn return_pool_buffers(&self, mut bufs: Vec<Vec<u8>>) {
         let mut pool = self.pool.lock().expect("apple TUN pool poisoned");
         for mut buf in bufs.drain(..) {
-            if buf.capacity() >= self.mtu {
-                unsafe {
-                    buf.set_len(0);
-                }
-                pool.push(buf);
+            if buf.capacity() < self.mtu {
+                continue;
             }
+            // Drop excess capacity instead of letting the pool grow without
+            // bound. iOS NetworkExtension is memory-budgeted (~50 MB), so a
+            // burst that briefly inflates the pool must not become a permanent
+            // RSS floor.
+            if pool.len() >= self.max_pool_size {
+                continue;
+            }
+            unsafe {
+                buf.set_len(0);
+            }
+            pool.push(buf);
         }
     }
 
@@ -498,28 +514,35 @@ impl TunDevice for AppleTunDevice {
         // Filter out anything we can't tag with an IP family up front so the
         // chunk loop below can skip past completed slots without skipping
         // around invalid entries.
-        let valid: Vec<Vec<u8>> = packets
+        let valid_vec: Vec<Vec<u8>> = packets
             .into_iter()
             .filter(|p| matches!(p.first().map(|b| b >> 4), Some(4) | Some(6)))
             .collect();
-        if valid.is_empty() {
+        if valid_vec.is_empty() {
             return Ok(());
         }
+        // RAII guard: regardless of how this scope exits — Ok return, Err
+        // return, panic from a poisoned mutex / sleep cancel / format-time
+        // OOM — the buffers we accepted into `valid` flow back through the
+        // pool. Without this, a panic in the loop below would let `valid`
+        // be dropped without recycling, breaking the pool's reuse contract
+        // and forcing the next `refill_rx` to allocate from scratch.
+        let valid = PoolReturn::new(self, valid_vec);
 
         let mut offset = 0;
         let mut max_chunk = usize::MAX;
         let mut backpressure_retries = 0;
-        let send_result = loop {
+        loop {
             if offset >= valid.len() {
-                break Ok::<(), HammerError>(());
+                return Ok(());
             }
             if self.closed.load(Ordering::SeqCst) {
-                break Err(HammerError::internal("apple TUN closed"));
+                return Err(HammerError::internal("apple TUN closed"));
             }
             let mut guard = match self.fd.writable().await {
                 Ok(guard) => guard,
                 Err(err) => {
-                    break Err(HammerError::internal(format!("apple TUN writable: {err}")));
+                    return Err(HammerError::internal(format!("apple TUN writable: {err}")));
                 }
             };
             let result = {
@@ -531,7 +554,7 @@ impl TunDevice for AppleTunDevice {
             };
             match result {
                 Ok((0, _)) => {
-                    break Err(HammerError::internal("sendmsg_x wrote zero packets"));
+                    return Err(HammerError::internal("sendmsg_x wrote zero packets"));
                 }
                 Ok((n_sent, staged)) => {
                     offset += n_sent;
@@ -559,7 +582,7 @@ impl TunDevice for AppleTunDevice {
                         (max_chunk / 2).max(1)
                     };
                     if backpressure_retries >= SEND_BACKPRESSURE_RETRY_LIMIT {
-                        break Err(HammerError::internal(format!(
+                        return Err(HammerError::internal(format!(
                             "apple TUN send backpressure exhausted after {backpressure_retries} retries: {err}; dropped {} packet(s)",
                             valid.len() - offset
                         )));
@@ -570,20 +593,49 @@ impl TunDevice for AppleTunDevice {
                     tokio::time::sleep(SEND_BACKPRESSURE_RETRY_DELAY).await;
                 }
                 Err((err, _)) => {
-                    break Err(HammerError::internal(format!("sendmsg_x: {err}")));
+                    return Err(HammerError::internal(format!("sendmsg_x: {err}")));
                 }
             }
-        };
-        // Recycle every buffer we accepted into `valid` regardless of send
-        // outcome — the data is already gone from the kernel's perspective
-        // for the slots that succeeded, and partial-write retries above
-        // covered the rest. Returning the allocations to the pool lets the
-        // next refill_rx reuse them instead of allocating fresh ones.
-        self.return_pool_buffers(valid);
-        send_result
+        }
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard that returns a batch of pool-borrowed buffers on drop. Used by
+/// [`AppleTunDevice::send_batch`] so that any unwind path — explicit return,
+/// `?` propagation, panic from a poisoned mutex / cancelled sleep / OOM
+/// formatter — still recycles the buffers instead of dropping them on the
+/// floor. Without this, panics broke the pool's reuse contract and forced
+/// the next `refill_rx` to allocate fresh.
+struct PoolReturn<'a> {
+    device: &'a AppleTunDevice,
+    bufs: Option<Vec<Vec<u8>>>,
+}
+
+impl<'a> PoolReturn<'a> {
+    fn new(device: &'a AppleTunDevice, bufs: Vec<Vec<u8>>) -> Self {
+        Self {
+            device,
+            bufs: Some(bufs),
+        }
+    }
+}
+
+impl std::ops::Deref for PoolReturn<'_> {
+    type Target = [Vec<u8>];
+
+    fn deref(&self) -> &Self::Target {
+        self.bufs.as_deref().unwrap_or(&[])
+    }
+}
+
+impl Drop for PoolReturn<'_> {
+    fn drop(&mut self) {
+        if let Some(bufs) = self.bufs.take() {
+            self.device.return_pool_buffers(bufs);
+        }
     }
 }

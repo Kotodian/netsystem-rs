@@ -1830,7 +1830,6 @@ async fn packet_loop(
     // single-packet recv() the batch is just `vec![pkt]` and the loop body
     // degrades to the previous behaviour.
     const RECV_BATCH_HINT: usize = 256;
-    let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
     loop {
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
@@ -1844,7 +1843,13 @@ async fn packet_loop(
             tokio::task::yield_now().await;
             continue;
         }
-        tcp_writeback.clear();
+        // Fresh per-iteration `Vec`s. Previously `tcp_writeback` lived outside
+        // the loop with a `Vec::with_capacity(RECV_BATCH_HINT)` prefix and a
+        // `clear()` per round — but `clear()` doesn't release capacity, so a
+        // single TCP burst raised the outer Vec capacity to the burst peak
+        // and held it for the lifetime of the packet loop. Allocating inside
+        // the loop lets the allocator return memory after each iteration.
+        let mut tcp_writeback: Vec<Vec<u8>> = Vec::new();
         let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
         let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
         // Pass 1: under one NAT mutex acquisition, rewrite every TCP packet
@@ -1902,8 +1907,7 @@ async fn packet_loop(
         // Pass 2: send the rewritten TCP batch in one syscall (Apple) or
         // sequentially (other targets, via the default send_batch impl).
         if !tcp_writeback.is_empty() {
-            let staged = std::mem::take(&mut tcp_writeback);
-            if let Err(err) = device.send_batch(staged).await {
+            if let Err(err) = device.send_batch(tcp_writeback).await {
                 metrics.counters.tcp_writeback_error_total.increment(1);
                 debug!("write system TCP packets: {err}");
             }
