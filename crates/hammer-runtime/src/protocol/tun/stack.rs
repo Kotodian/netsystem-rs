@@ -12,6 +12,7 @@ use hammer_adapter::{
     DnsQueryOptions, Network, OutboundManager as _, ProxyStream, RouteDecision, RouteMetadata,
     SocksAddr,
 };
+use hammer_core::config::normalize_domain;
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
@@ -2249,14 +2250,20 @@ fn route_destination(
 }
 
 fn normalize_destination_domain(domain: &str) -> String {
-    let domain = domain.trim().trim_end_matches('.');
-    if let Some((host, port)) = domain.rsplit_once(':')
+    // First peel off a trailing `:port` (sniffers/SNI sometimes pack it in)
+    // — `normalize_domain` would lowercase the digits but it can't tell
+    // host from port. Then run the shared canonicaliser so the produced
+    // string matches everything else metadata.domain compares against.
+    let trimmed = domain.trim().trim_end_matches('.');
+    let host = if let Some((host, port)) = trimmed.rsplit_once(':')
         && !host.contains(':')
         && port.chars().all(|c| c.is_ascii_digit())
     {
-        return host.to_owned();
-    }
-    domain.to_owned()
+        host
+    } else {
+        trimmed
+    };
+    normalize_domain(host)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2357,7 +2364,12 @@ fn sniff_http(packet: &mut TunPacket) {
         };
         if name.eq_ignore_ascii_case("host") {
             packet.metadata.protocol = "http".to_owned();
-            packet.metadata.domain = Some(value.trim().to_owned());
+            // Canonical-form metadata.domain so DomainMatcher / DnsRule can
+            // be a pure byte compare.
+            let normalized = normalize_domain(value);
+            if !normalized.is_empty() {
+                packet.metadata.domain = Some(normalized);
+            }
             return;
         }
     }
@@ -2389,7 +2401,10 @@ fn sniff_tls_sni(packet: &mut TunPacket) {
     }
     if let Some(domain) = parse_tls_sni(&packet.payload) {
         packet.metadata.protocol = "tls".to_owned();
-        packet.metadata.domain = Some(domain);
+        let normalized = normalize_domain(&domain);
+        if !normalized.is_empty() {
+            packet.metadata.domain = Some(normalized);
+        }
     }
 }
 

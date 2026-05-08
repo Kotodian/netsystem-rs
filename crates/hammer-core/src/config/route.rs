@@ -16,6 +16,7 @@ use super::constants as C;
 use super::dns::{DomainResolveOptions, DomainStrategy};
 use super::inbound::RawTunConfig;
 use super::raw_struct_with_default_check;
+use super::util::normalize_domain;
 
 raw_struct_with_default_check! {
     pub struct RawRouteConfig {
@@ -267,6 +268,16 @@ where
         .collect()
 }
 
+/// Apply `normalize_domain` across a vec; drops empties so the matcher's
+/// "any value matches" loop never has to short-circuit on blanks.
+fn normalize_domain_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|v| normalize_domain(&v))
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
 fn route_rule_from_text(idx: usize, raw: RawRouteRuleText) -> Result<RawRouteRule, String> {
     let RawRouteRuleText {
         inbound,
@@ -289,15 +300,18 @@ fn route_rule_from_text(idx: usize, raw: RawRouteRuleText) -> Result<RawRouteRul
     }
     if !domain.is_empty() {
         count += 1;
-        matcher = RuleMatcher::Domain(domain);
+        matcher = RuleMatcher::Domain(normalize_domain_values(domain));
     }
     if !domain_suffix.is_empty() {
         count += 1;
-        matcher = RuleMatcher::DomainSuffix(domain_suffix);
+        matcher = RuleMatcher::DomainSuffix(normalize_domain_values(domain_suffix));
     }
     if !domain_keyword.is_empty() {
         count += 1;
-        matcher = RuleMatcher::DomainKeyword(domain_keyword);
+        // Keyword is a substring search, not a label match. We still
+        // lowercase so case-insensitive substring contains works against
+        // sniff/reverse-DNS values that have already been normalised.
+        matcher = RuleMatcher::DomainKeyword(normalize_domain_values(domain_keyword));
     }
     if !ip_cidr.is_empty() {
         count += 1;

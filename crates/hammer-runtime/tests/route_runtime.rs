@@ -199,6 +199,59 @@ fn router_routes_domain_suffix_match_to_named_outbound() {
 }
 
 #[test]
+fn router_domain_match_is_case_insensitive_via_config_normalize() {
+    // Rule written in mixed case should still match the lowercase form
+    // that sniff_http / sniff_tls_sni / apply_reverse_dns_mapping write
+    // into metadata.domain.
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain = [\"Example.COM\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut metadata = metadata_with_domain("example.com");
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_domain_match_strips_trailing_dot_in_config() {
+    // Hickory-style FQDN ("ifconfig.so.") in the rule should match the
+    // bare form metadata always carries.
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain = [\"ifconfig.so.\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut metadata = metadata_with_domain("ifconfig.so");
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+}
+
+#[test]
+fn router_domain_suffix_match_is_case_insensitive_via_config_normalize() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"Google.COM\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+
+    let mut metadata = metadata_with_domain("www.google.com");
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            outbound: "hysteria2".to_owned()
+        }
+    );
+}
+
+#[test]
 fn router_domain_suffix_does_not_match_partial_label() {
     let opts = options_with_user_rules(
         "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n",

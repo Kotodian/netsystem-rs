@@ -8,6 +8,7 @@ mod inbound;
 mod log;
 mod outbound;
 mod route;
+mod util;
 
 pub use dns::*;
 #[cfg(feature = "endpoint")]
@@ -16,6 +17,7 @@ pub use inbound::*;
 pub use log::*;
 pub use outbound::*;
 pub use route::*;
+pub use util::*;
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
