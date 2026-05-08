@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hammer_adapter::{
@@ -9,11 +11,49 @@ use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, Rul
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters};
+use lru::LruCache;
 
 use crate::OutboundManager;
 use crate::impl_logging_lifecycle;
 
 const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Capacity of the metadata→decision LRU. Sized like `SYSTEM_UDP_FLOW_CAPACITY`
+/// (`tun/stack.rs`) so a sustained UDP flow set fits without thrashing while
+/// staying below ~100 KiB on the NetExt heap (each entry ≤ ~250 B with the
+/// owned `String` keys).
+const ROUTER_CACHE_CAPACITY: usize = 256;
+
+/// Subset of `RouteMetadata` that affects rule matching + the default-route
+/// fall-through. Anything *mutated* by non-terminal rules (Sniff / Resolve /
+/// RouteOptions) is excluded — by the time `match_route` runs, the dispatch
+/// path has already invoked `prepare_route_metadata`, so those fields are
+/// fully resolved and a cache hit can safely skip the second walk.
+///
+/// Only fields actually consumed by `matcher_matches` + `route_to_default`
+/// land here; src port / src IP / client / domain_strategy / mutation flags
+/// are intentionally absent.
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct MatchKey {
+    network: Network,
+    inbound: String,
+    protocol: String,
+    domain: Option<String>,
+    destination_host: Option<IpAddr>,
+}
+
+impl From<&RouteMetadata> for MatchKey {
+    #[inline]
+    fn from(metadata: &RouteMetadata) -> Self {
+        Self {
+            network: metadata.network,
+            inbound: metadata.inbound.clone(),
+            protocol: metadata.protocol.clone(),
+            domain: metadata.domain.clone(),
+            destination_host: metadata.destination.as_ref().map(|d| d.host),
+        }
+    }
+}
 
 /// `route.Router` — matches each connection against the configured rule set and
 /// returns a [`RouteDecision`]. Each rule has exactly one matcher; values inside
@@ -25,6 +65,21 @@ pub struct Router {
     outbound: Option<Arc<OutboundManager>>,
     default_outbound: String,
     metrics: RouterMetrics,
+    /// Per-(metadata-snapshot) cache of the terminal decision. UDP/ICMP
+    /// dispatch calls `match_route` on every packet; the same 5-tuple
+    /// repeats for the lifetime of a flow, so a small LRU collapses N
+    /// rule walks into a single hashmap lookup. TCP gets one match per
+    /// accepted connection so its hit rate is lower but still positive
+    /// for repeated dials to the same target.
+    cache: Mutex<LruCache<MatchKey, RouteDecision>>,
+}
+
+#[inline]
+fn new_router_cache() -> Mutex<LruCache<MatchKey, RouteDecision>> {
+    Mutex::new(LruCache::new(
+        NonZeroUsize::new(ROUTER_CACHE_CAPACITY)
+            .expect("router cache capacity must be non-zero"),
+    ))
 }
 
 impl Router {
@@ -35,6 +90,7 @@ impl Router {
             outbound: None,
             default_outbound: String::new(),
             metrics: RouterMetrics::new(&metrics, ""),
+            cache: new_router_cache(),
         }
     }
 
@@ -80,18 +136,45 @@ impl Router {
             outbound: Some(outbound),
             metrics: RouterMetrics::new(&scope, &options.final_),
             default_outbound: options.final_,
+            cache: new_router_cache(),
         })
     }
 
     pub fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
         let network = metadata.network;
+
+        // Cache the terminal decision keyed on the subset of metadata that
+        // actually drives matcher_matches + route_to_default. The dispatch
+        // path runs `prepare_route_metadata` first so all non-terminal
+        // mutations (Sniff override_destination, Resolve domain_strategy,
+        // RouteOptions udp_disable_domain_unmapping) are already applied
+        // by the time we land here — a hit can safely skip the second walk.
+        let key = MatchKey::from(&*metadata);
+        if let Some(cached) = self
+            .cache
+            .lock()
+            .expect("router cache poisoned")
+            .get(&key)
+            .cloned()
+        {
+            self.metrics.cache_hit_total.inc(network);
+            return Ok(cached);
+        }
+        self.metrics.cache_miss_total.inc(network);
+
         for rule in &self.rules {
             if !rule.matches(metadata) {
                 continue;
             }
             match rule.apply(metadata) {
                 Ok(RuleApply::Continue) => {}
-                Ok(RuleApply::Decision(decision)) => return Ok(decision),
+                Ok(RuleApply::Decision(decision)) => {
+                    self.cache
+                        .lock()
+                        .expect("router cache poisoned")
+                        .put(key, decision.clone());
+                    return Ok(decision);
+                }
                 Err(err) => {
                     self.metrics.error_total.inc(network);
                     rule.metrics.error_total.inc(network);
@@ -100,7 +183,13 @@ impl Router {
             }
         }
         match self.route_to_default(network) {
-            Ok(decision) => Ok(decision),
+            Ok(decision) => {
+                self.cache
+                    .lock()
+                    .expect("router cache poisoned")
+                    .put(key, decision.clone());
+                Ok(decision)
+            }
             Err(err) => {
                 self.metrics.error_total.inc(network);
                 Err(err)
@@ -173,20 +262,30 @@ impl_logging_lifecycle!(Router, "router");
 
 impl RouterTrait for Router {
     fn reset_network(&self) {
-        // No matchers currently depend on network state. When geoip / rule_set
-        // caching lands, invalidate them here.
+        // Network change can flip reverse-DNS state and (eventually) any
+        // network-aware matcher; flush the metadata→decision cache so the
+        // next packet picks up the new view. No matcher state needs
+        // resetting yet.
+        self.cache
+            .lock()
+            .expect("router cache poisoned")
+            .clear();
     }
 }
 
 #[derive(Clone)]
 struct RouterMetrics {
     error_total: NetworkCounters,
+    cache_hit_total: NetworkCounters,
+    cache_miss_total: NetworkCounters,
 }
 
 impl RouterMetrics {
     fn new(scope: &MetricsScope, _default_outbound: &str) -> Self {
         Self {
             error_total: NetworkCounters::new(scope, "error_total"),
+            cache_hit_total: NetworkCounters::new(scope, "cache_hit_total"),
+            cache_miss_total: NetworkCounters::new(scope, "cache_miss_total"),
         }
     }
 }

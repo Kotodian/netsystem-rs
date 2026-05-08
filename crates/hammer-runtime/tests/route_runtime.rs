@@ -199,6 +199,99 @@ fn router_routes_domain_suffix_match_to_named_outbound() {
 }
 
 #[test]
+fn router_caches_decision_for_repeated_metadata() {
+    // UDP/ICMP dispatch invokes match_route once per packet — same 5-tuple
+    // hits the cache so the second walk is a single hashmap lookup.
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n",
+    );
+    let metrics = MetricsRegistry::new();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let router = Router::from_options_with_metrics(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        Arc::clone(&metrics),
+    )
+    .expect("router");
+
+    let make_metadata = || metadata_with_domain("www.google.com");
+
+    // First call: miss + walk + insert.
+    let mut first = make_metadata();
+    let decision_first = router.match_route(&mut first).expect("first");
+
+    // Second call with semantically identical metadata: hit.
+    let mut second = make_metadata();
+    let decision_second = router.match_route(&mut second).expect("second");
+    assert_eq!(decision_first, decision_second);
+
+    let samples = metrics.snapshot();
+    let count = |name: &str| -> u64 {
+        samples
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.value as u64)
+            .sum()
+    };
+    assert_eq!(count("cache_hit_total"), 1, "samples = {samples:?}");
+    assert_eq!(count("cache_miss_total"), 1, "samples = {samples:?}");
+}
+
+#[test]
+fn router_reset_network_clears_cache() {
+    // reset_network is the runtime's hook for "network conditions changed";
+    // any cached decisions might be stale, so flushing keeps us correct
+    // when the dispatch path next asks.
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"google.com\"]\noutbound = \"hysteria2\"\n",
+    );
+    let metrics = MetricsRegistry::new();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let router = Router::from_options_with_metrics(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        Arc::clone(&metrics),
+    )
+    .expect("router");
+
+    let mut metadata = metadata_with_domain("www.google.com");
+    let _ = router.match_route(&mut metadata).expect("warm-up miss");
+
+    use hammer_adapter::Router as _; // bring `reset_network` into scope
+    router.reset_network();
+
+    let mut metadata = metadata_with_domain("www.google.com");
+    let _ = router.match_route(&mut metadata).expect("post-reset");
+
+    let samples = metrics.snapshot();
+    let count = |name: &str| -> u64 {
+        samples
+            .iter()
+            .filter(|s| s.name == name)
+            .map(|s| s.value as u64)
+            .sum()
+    };
+    assert_eq!(count("cache_hit_total"), 0, "samples = {samples:?}");
+    assert_eq!(count("cache_miss_total"), 2, "samples = {samples:?}");
+}
+
+#[test]
 fn router_domain_match_is_case_insensitive_via_config_normalize() {
     // Rule written in mixed case should still match the lowercase form
     // that sniff_http / sniff_tls_sni / apply_reverse_dns_mapping write
