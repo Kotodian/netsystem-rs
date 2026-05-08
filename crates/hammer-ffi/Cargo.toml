@@ -12,12 +12,31 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
 [features]
-default = ["hammer-runtime/default"]
+# The default feature set targets the iOS NetExt deployment: WireGuard outbound
+# plus the inbound/DNS/route plumbing the host actually needs at runtime.
+# Hysteria2 is opt-in via the `hysteria2` feature.
+default = ["wireguard"]
 # Enables generic endpoint config/service wiring.
 endpoint = ["hammer-core/endpoint", "hammer-runtime/endpoint"]
-# Enables the WireGuard endpoint stack across hammer-core + hammer-runtime.
-# Off by default; opt in at xcframework build time with `--features wireguard`.
-wireguard = ["endpoint", "hammer-core/wireguard", "hammer-runtime/wireguard"]
+# WireGuard endpoint stack plus everything required to ship it on iOS:
+# TUN inbound, the route engine's standard outbounds (direct/block/urltest),
+# DNS transports, and outbound probing.
+wireguard = [
+    "endpoint",
+    "hammer-core/wireguard",
+    "hammer-runtime/wireguard",
+    "hammer-runtime/inbound-tun",
+    "hammer-runtime/outbound-direct",
+    "hammer-runtime/outbound-block",
+    "hammer-runtime/outbound-urltest",
+    "hammer-runtime/dns-udp",
+    "hammer-runtime/dns-tcp",
+    "hammer-runtime/dns-hosts",
+    "hammer-runtime/dns-local",
+    "hammer-runtime/probe",
+]
+# Hysteria2 outbound, opt-in to keep the iOS xcframework slim.
+hysteria2 = ["hammer-runtime/outbound-hysteria2"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
