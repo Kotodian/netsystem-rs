@@ -26,6 +26,7 @@ default = [
 probe = ["dep:socket2"]
 inbound-tun = ["dep:libc", "dep:tun-rs"]
 outbound-hysteria2 = [
+    "hammer-core/outbound-hysteria2",
     "dep:base64",
     "dep:blake2",
     "dep:futures",

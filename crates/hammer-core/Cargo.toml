@@ -9,6 +9,10 @@ name = "hammer_core"
 
 [features]
 default = []
+# Enables Hysteria2 outbound config schema (`[hysteria2]` and
+# `type = "hysteria2"`). Off by default for slim builds that only need
+# direct/block/urltest config.
+outbound-hysteria2 = []
 # Enables the generic `[[endpoints]]` config section. Concrete endpoint
 # protocols opt into this parent feature.
 endpoint = []

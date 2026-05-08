@@ -85,6 +85,7 @@ pub(crate) use raw_struct_with_default_check;
 /// and the runtime. Submodules `use super::constants as C;` to access these.
 pub mod constants {
     pub const TYPE_TUN: &str = "tun";
+    #[cfg(feature = "outbound-hysteria2")]
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
@@ -110,12 +111,14 @@ pub mod constants {
     pub const NETWORK_STRATEGY_DEFAULT: &str = "default";
 
     pub const DEFAULT_TUN_ID: &str = "tun";
+    #[cfg(feature = "outbound-hysteria2")]
     pub const DEFAULT_HYSTERIA_ID: &str = "hysteria2";
     pub const DEFAULT_DIRECT_ID: &str = "direct";
     pub const DEFAULT_DNS_ID: &str = "default";
     pub const DEFAULT_TUN_STACK: &str = "system";
     pub const DEFAULT_TUN_MTU: u32 = 9000;
     pub const DEFAULT_DNS_PATH: &str = "/dns-query";
+    #[cfg(feature = "outbound-hysteria2")]
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
     /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
     #[cfg(feature = "wireguard")]
@@ -140,6 +143,7 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbounds: Vec<inbound::RawInbound>,
     /// Optional top-level Hysteria2 outbound section.
+    #[cfg(feature = "outbound-hysteria2")]
     #[serde(
         default,
         skip_serializing_if = "outbound::RawHysteria2Config::is_default"
@@ -243,7 +247,8 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         log: raw_log,
         tun: raw_tun,
         inbounds: raw_inbounds,
-        hysteria2: raw_hysteria,
+        #[cfg(feature = "outbound-hysteria2")]
+            hysteria2: raw_hysteria,
         outbounds: raw_outbounds,
         endpoints: raw_endpoints,
         dns: raw_dns,
@@ -254,7 +259,8 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         log: raw_log,
         tun: raw_tun,
         inbounds: raw_inbounds,
-        hysteria2: raw_hysteria,
+        #[cfg(feature = "outbound-hysteria2")]
+            hysteria2: raw_hysteria,
         outbounds: raw_outbounds,
         dns: raw_dns,
         route: raw_route,
@@ -280,11 +286,18 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     rules.extend(route::build_user_rules(&raw_route.rules)?);
 
     let (outbounds, default_route_final) = if raw_outbounds.is_empty() {
-        let (hysteria_options, hysteria_id) = outbound::build_hysteria_options(raw_hysteria)?;
-        (
-            outbound::build_outbounds(hysteria_options, hysteria_id.clone()),
-            hysteria_id,
-        )
+        #[cfg(feature = "outbound-hysteria2")]
+        {
+            let (hysteria_options, hysteria_id) = outbound::build_hysteria_options(raw_hysteria)?;
+            (
+                outbound::build_outbounds(hysteria_options, hysteria_id.clone()),
+                hysteria_id,
+            )
+        }
+        #[cfg(not(feature = "outbound-hysteria2"))]
+        {
+            outbound::build_default_outbounds()
+        }
     } else {
         let outbounds = outbound::build_declared_outbounds(raw_outbounds)?;
         let default = default_outbound_id(&outbounds)?;

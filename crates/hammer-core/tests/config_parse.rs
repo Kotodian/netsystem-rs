@@ -1,7 +1,10 @@
+#![cfg(feature = "outbound-hysteria2")]
+
 use std::time::Duration;
 
 #[cfg(feature = "wireguard")]
 use hammer_core::config::EndpointKind;
+
 use hammer_core::config::{
     self, DnsServerKind, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, InboundKind,
     OutboundKind, RuleActionKind, RuleMatcher, TunStack,

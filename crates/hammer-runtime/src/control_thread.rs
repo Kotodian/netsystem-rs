@@ -4,15 +4,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use hammer_core::error::HammerError;
-use hammer_core::log::{Formatter, Level, LogWriter};
-use hammer_core::metrics::{MetricCounter, MetricKind, MetricSample, MetricsRegistry};
+use hammer_core::log::{Level, LogWriter};
+use hammer_core::metrics::{MetricCounter, MetricsRegistry};
+#[cfg(test)]
+use hammer_core::metrics::{MetricKind, MetricSample};
 use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
 const LOG_QUEUE_CAPACITY: usize = 4096;
-const MIN_METRICS_INTERVAL: Duration = Duration::from_secs(1);
-
 /// Default ceiling for regular synchronous `call` round-trips. Lifecycle
 /// start/close is deliberately dispatched through `call_blocking` instead:
 /// those paths are synchronous and non-cancelable, so timing out the caller
@@ -221,19 +221,15 @@ pub(crate) struct ControlThread {
     log_rx: Receiver<LogRecord>,
     command_rx: UnboundedReceiver<ControlCommand>,
     inner: Arc<dyn LogWriter>,
-    metrics: Arc<MetricsRegistry>,
-    formatter: Formatter,
-    min_level: Level,
-    metrics_interval: Duration,
 }
 
 impl ControlThread {
     pub(crate) fn new(
-        base_time: Instant,
+        _base_time: Instant,
         inner: Arc<dyn LogWriter>,
         metrics: Arc<MetricsRegistry>,
-        metrics_interval: Duration,
-        min_level: Level,
+        _metrics_interval: Duration,
+        _min_level: Level,
     ) -> (Arc<ControlLogWriter>, Self) {
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(LOG_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -243,17 +239,11 @@ impl ControlThread {
             log_rx,
             command_rx,
             inner,
-            metrics,
-            formatter: Formatter::new(base_time),
-            min_level,
-            metrics_interval: metrics_interval.max(MIN_METRICS_INTERVAL),
         };
         (writer, thread)
     }
 
     pub(crate) async fn run(mut self) {
-        let mut metrics_tick = tokio::time::interval(self.metrics_interval);
-        metrics_tick.tick().await;
         // Once every `ControlLogWriter` is dropped, `log_rx.recv()` returns
         // `None` permanently. Disable that branch instead of `continue`-ing,
         // which would re-poll a ready-`None` future on every loop iteration
@@ -278,15 +268,6 @@ impl ControlThread {
                     self.inner.write_message(log.level, log.message);
                     self.drain_logs();
                 }
-                _ = metrics_tick.tick() => {
-                    dump_metrics(
-                        self.inner.as_ref(),
-                        &self.metrics,
-                        &self.formatter,
-                        self.min_level,
-                        false,
-                    );
-                }
             }
         }
     }
@@ -300,13 +281,6 @@ impl ControlThread {
             }
             ControlCommand::Shutdown(done) => {
                 self.drain_logs();
-                dump_metrics(
-                    self.inner.as_ref(),
-                    &self.metrics,
-                    &self.formatter,
-                    self.min_level,
-                    true,
-                );
                 let _ = done.send(());
                 true
             }
@@ -344,49 +318,20 @@ enum ControlCommand {
 }
 
 /// Prefix shared by single-line and chunked metric snapshot dumps.
+#[cfg(test)]
 const SNAPSHOT_LINE_PREFIX: &str = "metrics_snapshot";
 
 /// Conservative ceiling for a single snapshot log message. iOS unified
 /// logging truncates ~1024 bytes per private record; staying under 900 bytes
 /// leaves headroom for the formatter's timestamp/level/target prefix.
+#[cfg(test)]
 const SNAPSHOT_CHUNK_THRESHOLD: usize = 900;
-
-fn dump_metrics(
-    inner: &dyn LogWriter,
-    metrics: &MetricsRegistry,
-    formatter: &Formatter,
-    min_level: Level,
-    emit_idle: bool,
-) {
-    if !level_enabled(Level::Info, min_level) {
-        return;
-    }
-    let samples: Vec<_> = metrics.snapshot().into_iter().collect();
-    // Periodic idle ticks should stay quiet, but when a dump is emitted (for
-    // shutdown or because any counter/gauge is active) the full registered
-    // snapshot is rendered, including zero-valued counters.
-    if samples.is_empty()
-        || (!emit_idle
-            && !samples
-                .iter()
-                .any(|sample| sample.value > 0 || sample.kind == MetricKind::Gauge))
-    {
-        return;
-    }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    for body in build_snapshot_lines(&samples, ts) {
-        let line = formatter.format(None, Level::Info, "metrics", &body, Instant::now());
-        inner.write_message(Level::Info, line);
-    }
-}
 
 /// File-private rendering contract: how a metric sample becomes one entry in
 /// the snapshot line. Lives in this file (not on `MetricSample`) so the JSON
 /// wire format stays a control-thread presentation concern, not part of the
 /// metrics data model.
+#[cfg(test)]
 trait MetricLineRender {
     /// Append the fully-qualified flat key
     /// `{module}.{component_type}.{component_id}.{name}.{kind}[.{label_key}.{label_value}...]`
@@ -408,6 +353,7 @@ trait MetricLineRender {
     fn approx_render_size(&self) -> usize;
 }
 
+#[cfg(test)]
 impl MetricLineRender for MetricSample {
     fn write_flat_key(&self, out: &mut String) {
         escape_segment(out, &self.module);
@@ -454,6 +400,7 @@ impl MetricLineRender for MetricSample {
     }
 }
 
+#[cfg(test)]
 fn same_component(a: &MetricSample, b: &MetricSample) -> bool {
     a.module == b.module && a.component_type == b.component_type && a.component_id == b.component_id
 }
@@ -466,6 +413,7 @@ fn same_component(a: &MetricSample, b: &MetricSample) -> bool {
 ///   collapsing to `_`)
 /// This is reversible at the byte level and keeps the surrounding JSON string
 /// valid because the emitted form is ASCII-only.
+#[cfg(test)]
 fn escape_segment(out: &mut String, segment: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in segment.as_bytes() {
@@ -479,6 +427,7 @@ fn escape_segment(out: &mut String, segment: &str) {
     }
 }
 
+#[cfg(test)]
 fn escaped_segment_len(s: &str) -> usize {
     // Safe ASCII bytes stay 1:1; everything else becomes `~XX` (3 bytes).
     s.as_bytes()
@@ -493,6 +442,7 @@ fn escaped_segment_len(s: &str) -> usize {
         .sum()
 }
 
+#[cfg(test)]
 fn escape_json_string_fragment(out: &mut String, fragment: &str) {
     use std::fmt::Write as _;
 
@@ -512,6 +462,7 @@ fn escape_json_string_fragment(out: &mut String, fragment: &str) {
 /// Build one or more JSON snapshot lines, grouped by component. Each
 /// `(module, component_type, component_id)` gets its own line or chunk sequence.
 /// Caller must ensure `samples` is non-empty.
+#[cfg(test)]
 fn build_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<String> {
     debug_assert!(
         !samples.is_empty(),
@@ -529,6 +480,7 @@ fn build_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn build_component_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<String> {
     debug_assert!(
         !samples.is_empty(),
@@ -595,8 +547,10 @@ fn build_component_snapshot_lines(samples: &[MetricSample], ts: u64) -> Vec<Stri
 /// Maximum bytes of the flat key kept verbatim in an oversized warning line.
 /// 200 keeps the warning well under any practical oslog cap while preserving
 /// enough prefix to identify which metric blew up.
+#[cfg(test)]
 const OVERSIZED_KEY_HEAD: usize = 200;
 
+#[cfg(test)]
 fn build_oversized_line(sample: &MetricSample, ts: u64, component: &str) -> String {
     use std::fmt::Write as _;
 
@@ -632,6 +586,7 @@ fn build_oversized_line(sample: &MetricSample, ts: u64, component: &str) -> Stri
     s
 }
 
+#[cfg(test)]
 fn component_chunk_header_size(ts: u64, component: &str, max_chunks: usize) -> usize {
     // Each chunk carries at least one sample, so the caller's sample count is
     // a tight upper bound for both `idx` (range 0..total) and `total`. Padding
@@ -643,6 +598,7 @@ fn component_chunk_header_size(ts: u64, component: &str, max_chunks: usize) -> u
     s.len() + 1
 }
 
+#[cfg(test)]
 fn write_snapshot_prefix(
     out: &mut String,
     ts: u64,
@@ -666,6 +622,7 @@ fn write_snapshot_prefix(
     }
 }
 
+#[cfg(test)]
 fn write_snapshot_body<'a, I>(out: &mut String, samples: I)
 where
     I: IntoIterator<Item = &'a MetricSample>,
@@ -677,10 +634,6 @@ where
         out.push_str("\":");
         write!(out, "{}", sample.value).expect("string write");
     }
-}
-
-fn level_enabled(level: Level, min_level: Level) -> bool {
-    level as i32 <= min_level as i32
 }
 
 #[cfg(test)]
@@ -734,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn control_writer_dumps_registered_metrics() {
+    fn control_writer_does_not_dump_registered_metrics() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
@@ -755,18 +708,9 @@ mod tests {
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
-        let snapshot_line = lines
-            .iter()
-            .find(|line| line.contains("metrics_snapshot "))
-            .expect("expected metrics_snapshot line");
         assert!(
-            snapshot_line
-                .contains("\"outbound.outbound.direct.dial_error_total.counter.network.tcp\":1"),
-            "snapshot missing expected key, lines = {lines:?}"
-        );
-        assert!(
-            snapshot_line.contains("\"ts\":"),
-            "snapshot missing ts field, lines = {lines:?}"
+            !lines.iter().any(|line| line.contains("metrics_snapshot")),
+            "metrics are exposed through RuntimeService::metrics_snapshot, not control logs: {lines:?}"
         );
     }
 
@@ -899,8 +843,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_snapshot_suppresses_idle_periodic_ticks_but_shutdown_includes_builtin_zero_counters()
-    {
+    fn control_writer_shutdown_does_not_dump_idle_metrics() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let (writer, thread) = ControlThread::new(
@@ -917,25 +860,14 @@ mod tests {
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
-        let snapshot_lines: Vec<&String> = lines
-            .iter()
-            .filter(|line| line.contains("metrics_snapshot"))
-            .collect();
-        assert_eq!(
-            snapshot_lines.len(),
-            1,
-            "idle periodic ticks should stay quiet; shutdown emits one snapshot: {lines:?}"
-        );
         assert!(
-            snapshot_lines[0]
-                .contains("\"runtime.control_thread.hammer-main.log_dropped_total.counter\":0"),
-            "built-in zero-valued counters should remain visible: {lines:?}"
+            !lines.iter().any(|line| line.contains("metrics_snapshot")),
+            "control thread should not dump metrics on shutdown: {lines:?}"
         );
     }
 
     #[test]
     fn metrics_snapshot_emits_single_line_with_multiple_metrics() {
-        let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let scope = metrics.scope("outbound", "outbound", "direct");
         scope.counter("dial_error_total").inc();
@@ -947,23 +879,10 @@ mod tests {
                 [("network", "tcp"), ("family", "v4")],
             )
             .inc();
-        let (writer, thread) = ControlThread::new(
-            Instant::now(),
-            inner.clone(),
-            metrics,
-            Duration::from_millis(10),
-            Level::Info,
-        );
-        let handle = run_control_thread(thread);
-
-        std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
-        handle.join().expect("control thread join");
-
-        let lines = inner.lines.lock().unwrap();
+        let lines = build_snapshot_lines(&metrics.snapshot(), 1_715_059_200);
         let snapshot_line = lines
             .iter()
-            .find(|line| line.contains("metrics_snapshot "))
+            .find(|line| line.starts_with("metrics_snapshot "))
             .expect("expected single-line snapshot");
         for key in [
             "\"outbound.outbound.direct.dial_error_total.counter\":1",
@@ -982,7 +901,6 @@ mod tests {
 
     #[test]
     fn metrics_snapshot_chunks_when_oversized() {
-        let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let scope = metrics.scope("outbound", "outbound", "very-long-component-id-for-padding");
         // 50 counters with padded names easily exceed SNAPSHOT_CHUNK_THRESHOLD (900).
@@ -991,20 +909,8 @@ mod tests {
                 .counter(&format!("metric_with_padding_name_index_{i:02}_total"))
                 .inc();
         }
-        let (writer, thread) = ControlThread::new(
-            Instant::now(),
-            inner.clone(),
-            metrics,
-            Duration::from_millis(10),
-            Level::Info,
-        );
-        let handle = run_control_thread(thread);
 
-        std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
-        handle.join().expect("control thread join");
-
-        let lines = inner.lines.lock().unwrap();
+        let lines = build_snapshot_lines(&metrics.snapshot(), 1_715_059_200);
         let chunks: Vec<&String> = lines
             .iter()
             .filter(|line| line.contains("metrics_snapshot."))
@@ -1023,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_snapshot_dumped_on_shutdown() {
+    fn metrics_snapshot_not_dumped_on_shutdown() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
@@ -1045,47 +951,24 @@ mod tests {
 
         let lines = inner.lines.lock().unwrap();
         assert!(
-            lines.iter().any(|line| line.contains("metrics_snapshot ")
-                && line.contains("\"outbound.outbound.direct.dial_error_total.counter\":1")),
-            "shutdown should emit snapshot: {lines:?}"
+            !lines.iter().any(|line| line.contains("metrics_snapshot")),
+            "shutdown should not emit metrics; Swift callers pull service.metrics(): {lines:?}"
         );
     }
 
     #[test]
     fn metrics_snapshot_keeps_zero_valued_counters() {
-        let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
             .scope("outbound", "outbound", "direct")
             .counter("idle_total");
-        let (writer, thread) = ControlThread::new(
-            Instant::now(),
-            inner.clone(),
-            metrics,
-            Duration::from_millis(10),
-            Level::Info,
-        );
-        let handle = run_control_thread(thread);
 
-        std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
-        handle.join().expect("control thread join");
-
-        let lines = inner.lines.lock().unwrap();
-        let snapshot_lines: Vec<&String> = lines
-            .iter()
-            .filter(|line| line.contains("metrics_snapshot"))
-            .collect();
-        assert_eq!(
-            snapshot_lines.len(),
-            2,
-            "zero-only periodic ticks should stay quiet; shutdown emits one snapshot per component: {lines:?}"
-        );
+        let snapshot_lines = build_snapshot_lines(&metrics.snapshot(), 1_715_059_200);
         assert!(
             snapshot_lines
                 .iter()
                 .any(|line| line.contains("\"outbound.outbound.direct.idle_total.counter\":0")),
-            "zero-valued counter should remain visible: {lines:?}"
+            "zero-valued counter should remain visible: {snapshot_lines:?}"
         );
     }
 
