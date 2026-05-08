@@ -83,7 +83,7 @@ wireguard = [
 # Generic user-space TCP/IP stack on top of an arbitrary IP carrier. Currently
 # consumed only by the WireGuard outbound; the TUN inbound's smoltcp mode will
 # share it once it lands. Off by default to keep the iOS xcframework slim.
-ipstack = ["dep:smoltcp"]
+ipstack = ["dep:smoltcp", "dep:rustc-hash"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
@@ -118,6 +118,7 @@ tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
 libc = { workspace = true, optional = true }
 lru = { workspace = true }
+rustc-hash = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 rustls-platform-verifier = { workspace = true, optional = true }
@@ -125,3 +126,8 @@ rustls-platform-verifier = { workspace = true, optional = true }
 [dev-dependencies]
 indoc = { workspace = true }
 rcgen = { workspace = true }
+# `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
+# behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be
+# verified without sleeping for real seconds. Test-only — not pulled into
+# the iOS xcframework.
+tokio = { workspace = true, features = ["test-util"] }

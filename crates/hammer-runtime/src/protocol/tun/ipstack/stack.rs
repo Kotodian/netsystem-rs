@@ -12,7 +12,13 @@
 //! plain `UdpHandle` keyed on `SocketAddr` — translating `SocksAddr` /
 //! `ProxyPacketConn` is left to whichever outbound is wrapping us.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+// rustc-hash's `FxHashMap` is HashMap<K, V, BuildHasherDefault<FxHasher>> —
+// non-cryptographic hashing for internal maps where the keys are our own
+// `SocketHandle` indices, never user-controlled. The wg hot path lookups
+// here showed up at ~1.6% on the NetExt CPU profile under sustained video;
+// FxHasher is roughly 4× faster than the default SipHasher for small keys.
+use rustc_hash::FxHashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -46,14 +52,24 @@ const TCP_BUF: usize = 64 * 1024;
 /// keepalive windows so idle browser connections are recycled quickly while
 /// active streams stay alive.
 const TCP_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tighter idle timeout that kicks in once the user side has signalled EOF
+/// (`Ok(0)` from `read_buf`). After EOF the bridge is just draining the
+/// remaining inbound from smoltcp and waiting for the actor to reap the
+/// socket; on a slow peer FIN we'd otherwise sit on ~256 KiB per stream for
+/// the full 60 s active-keepalive window. Aligns with sing-box's generic
+/// `TCPTimeout = 15 s` (`constant/timeout.go`) so TLS shutdown / HTTP/2
+/// GOAWAY / application graceful-close still have room to finish.
+const TCP_BRIDGE_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Buffer between the actor and a TCP bridge task — small because we drain
 /// it immediately after every iface.poll cycle.
 const TCP_DATA_QUEUE: usize = 16;
 /// UDP payload buffer slots inside smoltcp.
 const UDP_PACKET_SLOTS: usize = 32;
-/// Largest IP datagram smoltcp will surface to a UDP socket. 64 KiB lets
-/// jumbograms through but caps the worst-case allocation per packet.
-const UDP_PAYLOAD_LIMIT: usize = 64 * 1024;
+/// Largest UDP datagram smoltcp will surface to a socket. Keep this aligned
+/// with the workspace smoltcp reassembly budget: large enough for the 4 KiB
+/// fragmented regression case, small enough that long video/QUIC sessions do
+/// not pin 128 KiB per WireGuard UDP flow.
+const UDP_PAYLOAD_LIMIT: usize = 8 * 1024;
 /// `tokio::io::duplex` capacity per direction for a TCP stream — 64 KiB so a
 /// single send_slice can fit even under bursty writes.
 const TCP_DUPLEX: usize = 64 * 1024;
@@ -277,8 +293,8 @@ pub(crate) fn spawn_ipstack(
         event_rx,
         event_tx,
         shutdown_rx,
-        tcp_bridges: HashMap::new(),
-        udp_bridges: HashMap::new(),
+        tcp_bridges: FxHashMap::default(),
+        udp_bridges: FxHashMap::default(),
         pending_accepts: Vec::new(),
         pending_dials: Vec::new(),
         next_port: EPHEMERAL_FLOOR,
@@ -335,6 +351,7 @@ struct PendingDial {
 /// Messages that the per-socket bridge tasks send back to the actor. Each
 /// carries the `SocketHandle` so the actor's single mpsc receiver can demux
 /// without a fan-in struct per socket.
+#[cfg_attr(test, derive(Debug))]
 enum SocketEvent {
     TcpWrite {
         handle: SocketHandle,
@@ -355,6 +372,7 @@ enum SocketEvent {
     },
 }
 
+#[cfg_attr(test, derive(Debug))]
 enum TcpCloseMode {
     /// The user closed its write half. Preserve already-accepted bytes and
     /// send a FIN once our user->socket queue drains.
@@ -400,8 +418,8 @@ struct StackInner {
     event_rx: mpsc::Receiver<SocketEvent>,
     event_tx: mpsc::Sender<SocketEvent>,
     shutdown_rx: oneshot::Receiver<()>,
-    tcp_bridges: HashMap<SocketHandle, TcpBridge>,
-    udp_bridges: HashMap<SocketHandle, UdpBridge>,
+    tcp_bridges: FxHashMap<SocketHandle, TcpBridge>,
+    udp_bridges: FxHashMap<SocketHandle, UdpBridge>,
     pending_accepts: Vec<PendingAccept>,
     pending_dials: Vec<PendingDial>,
     next_port: u16,
@@ -989,6 +1007,16 @@ async fn tcp_bridge_task(
     let mut buf = BytesMut::with_capacity(TCP_BUF);
     let mut user_write_open = true;
     loop {
+        // Once the user has signalled write-EOF the bridge is purely draining
+        // anything smoltcp still hands back (FIN_WAIT_2 tail data, peer-side
+        // late ACK packets) until the actor reaps the socket. Drop to the
+        // tighter drain timeout so a slow / unreachable peer can't hold us
+        // for the full active-keepalive window.
+        let idle_timeout = if user_write_open {
+            TCP_BRIDGE_IDLE_TIMEOUT
+        } else {
+            TCP_BRIDGE_DRAIN_IDLE_TIMEOUT
+        };
         tokio::select! {
             // User wrote -> we read from the actor stage and forward to socket.
             res = duplex.read_buf(&mut buf), if user_write_open => {
@@ -1036,10 +1064,10 @@ async fn tcp_bridge_task(
                 }
             }
             // Defensive idle backstop: if neither side has produced traffic
-            // in `TCP_BRIDGE_IDLE_TIMEOUT`, assume the upstream forgot the
+            // in the current idle window, assume the upstream forgot the
             // stream and let the bridge exit so the socket can be reaped.
-            _ = tokio::time::sleep(TCP_BRIDGE_IDLE_TIMEOUT) => {
-                tracing::debug!("ipstack tcp bridge idle timeout, closing");
+            _ = tokio::time::sleep(idle_timeout) => {
+                tracing::debug!(?idle_timeout, "ipstack tcp bridge idle timeout, closing");
                 let _ = send_tcp_close(&event_tx, handle, TcpCloseMode::Abort).await;
                 break;
             }
@@ -1137,6 +1165,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn udp_payload_buffer_limit_stays_within_mobile_memory_budget() {
+        assert!(
+            UDP_PAYLOAD_LIMIT <= 8 * 1024,
+            "each WireGuard UDP flow allocates one rx and one tx payload buffer"
+        );
+    }
+
     fn test_logger() -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger("ipstack-test")
     }
@@ -1181,5 +1217,70 @@ mod tests {
         );
 
         stack.signal_shutdown();
+    }
+
+    /// After the user signals write-EOF, the bridge enters drain mode and
+    /// must time out at `TCP_BRIDGE_DRAIN_IDLE_TIMEOUT` (15 s, sing-box
+    /// `TCPTimeout`) rather than the 60 s active-keepalive window. Without
+    /// this each graceful-close stream sits on ~256 KiB of bridge + smoltcp
+    /// buffers for the full minute, which is the dominant NetExt RSS-drift
+    /// source under sustained browsing (Bilibili infinite scroll etc.).
+    #[tokio::test(start_paused = true)]
+    async fn tcp_bridge_drain_timeout_fires_within_drain_window_after_user_eof() {
+        let (mut user_side, actor_side) = tokio::io::duplex(64 * 1024);
+        let (_data_tx, data_rx) = mpsc::channel::<Bytes>(16);
+        let (event_tx, mut event_rx) = mpsc::channel::<SocketEvent>(8);
+
+        let task = tokio::spawn(tcp_bridge_task(
+            SocketHandle::default(),
+            actor_side,
+            data_rx,
+            event_tx,
+        ));
+
+        // User-side EOF (write half closed) → bridge sends GracefulWriteEof
+        // and flips into drain mode. We hold `_data_tx` so the bridge keeps
+        // looping on `data_rx.recv()` (simulating an actor that has not yet
+        // observed the FIN and reaped the socket).
+        user_side.shutdown().await.expect("shutdown");
+
+        let first = event_rx.recv().await.expect("graceful event");
+        assert!(
+            matches!(
+                first,
+                SocketEvent::TcpClose {
+                    mode: TcpCloseMode::GracefulWriteEof,
+                    ..
+                }
+            ),
+            "expected GracefulWriteEof, got {first:?}"
+        );
+
+        // Just under the drain window: bridge must still be alive.
+        tokio::time::advance(Duration::from_secs(14)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "bridge exited before drain timeout elapsed"
+        );
+
+        // Cross the threshold; drain timeout must fire and abort.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let abort = event_rx.recv().await.expect("abort event");
+        assert!(
+            matches!(
+                abort,
+                SocketEvent::TcpClose {
+                    mode: TcpCloseMode::Abort,
+                    ..
+                }
+            ),
+            "expected Abort after drain timeout, got {abort:?}"
+        );
+        task.await.expect("bridge task joined");
+
+        // And the drain timeout must be strictly tighter than the active
+        // keepalive window — otherwise the whole point of the split is moot.
+        assert!(TCP_BRIDGE_DRAIN_IDLE_TIMEOUT < TCP_BRIDGE_IDLE_TIMEOUT);
     }
 }
