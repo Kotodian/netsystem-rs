@@ -37,6 +37,14 @@ use super::device::ChannelDevice;
 /// SO_RCVBUF default and is plenty for the bursty HTTP/QUIC payloads we expect
 /// to multiplex over an IP carrier.
 const TCP_BUF: usize = 64 * 1024;
+/// Hard ceiling on how long a TCP bridge task may sit completely idle (no
+/// user-side traffic and no inbound from smoltcp) before we tear it down.
+/// Defensive backstop against an upstream that forgot to drop a stream:
+/// without this each forgotten connection holds ~256 KiB (smoltcp rx/tx
+/// rings + the bridge's `BytesMut` + the duplex tail), which is what causes
+/// the NetExt to drift up under sustained traffic. 15 min is far longer
+/// than any sane keepalive and still bounds worst-case retention.
+const TCP_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Buffer between the actor and a TCP bridge task — small because we drain
 /// it immediately after every iface.poll cycle.
 const TCP_DATA_QUEUE: usize = 16;
@@ -846,10 +854,21 @@ impl StackInner {
                 !socket.is_active() && !socket.may_recv() && !socket.may_send()
             })
             .collect();
+        let reaped = stale_tcp.len();
         for handle in stale_tcp {
             self.fail_pending_tcp_writes(handle, "ipstack tcp: socket closed");
             self.sockets.remove(handle);
             self.tcp_bridges.remove(&handle);
+        }
+        if reaped > 0 {
+            tracing::debug!(
+                reaped,
+                tcp_bridges = self.tcp_bridges.len(),
+                pending_dials = self.pending_dials.len(),
+                pending_accepts = self.pending_accepts.len(),
+                udp_bridges = self.udp_bridges.len(),
+                "ipstack reap_dead_sockets"
+            );
         }
     }
 
@@ -922,6 +941,13 @@ async fn tcp_bridge_task(
                 if duplex.write_all(&data).await.is_err() {
                     break;
                 }
+            }
+            // Defensive idle backstop: if neither side has produced traffic
+            // in `TCP_BRIDGE_IDLE_TIMEOUT`, assume the upstream forgot the
+            // stream and let the bridge exit so the socket can be reaped.
+            _ = tokio::time::sleep(TCP_BRIDGE_IDLE_TIMEOUT) => {
+                tracing::debug!("ipstack tcp bridge idle timeout, closing");
+                break;
             }
         }
     }
