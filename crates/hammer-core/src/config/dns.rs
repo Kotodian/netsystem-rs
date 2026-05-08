@@ -6,12 +6,13 @@
 //! section is its primary configurer; `tun.domain_strategy` and
 //! `route.rules.*` reach into this module to reuse the same enum.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use url::Url;
 
 use crate::error::HammerError;
 
 use super::constants as C;
+use super::util::normalize_domain;
 use super::{raw_struct, raw_struct_with_default_check};
 
 raw_struct_with_default_check! {
@@ -33,7 +34,205 @@ raw_struct_with_default_check! {
         pub domain_resolver: String => "String::is_empty",
         /// Explicit DNS transport list.
         pub servers: Vec<RawDnsServer> => "Vec::is_empty",
+        /// Ordered DNS rules. Sniff'd / requested query name and (later)
+        /// query type drive these the same way `[[route.rules]]` drive the
+        /// proxy router; the first match wins.
+        #[serde(
+            deserialize_with = "deserialize_dns_rules",
+            serialize_with = "serialize_dns_rules"
+        )]
+        pub rules: Vec<RawDnsRule> => "Vec::is_empty",
     }
+}
+
+/// One entry in `[[dns.rules]]`. The matcher selects which queries the rule
+/// covers, the action says what to do — route to a server tag or reject.
+///
+/// Each rule supports exactly one matcher field, mirroring `RawRouteRule`
+/// (`route.rs`). Multiple matchers on a single rule were considered but
+/// rejected: AND vs OR semantics differ between sing-box and Clash and we
+/// don't want to commit early.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawDnsRule {
+    pub matcher: DnsRuleMatcher,
+    pub action: DnsRuleAction,
+}
+
+/// MVP matchers. Domain is the only kind we currently surface; query-type
+/// and rule-set are deliberately out of scope and would slot in here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRuleMatcher {
+    Domain(Vec<String>),
+    DomainSuffix(Vec<String>),
+    DomainKeyword(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsRuleAction {
+    /// Route to a configured `dns.servers` entry (id) instead of `final`.
+    Route { server: String },
+    /// Synthesise a fixed-rcode response without going to the wire. Used
+    /// for ad/tracker domains and HTTPS-record / AAAA suppression in the
+    /// future when query-type lands.
+    Reject { kind: RejectKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectKind {
+    /// RCODE 3 — domain doesn't exist. Browsers treat this as terminal.
+    #[default]
+    NxDomain,
+    /// RCODE 5 — server refuses. Some clients retry; useful when the user
+    /// wants the request to surface as an error rather than "no record".
+    Refused,
+}
+
+/// TOML-facing flat shape. Mirrors `RawRouteRuleText`; `route_rule_from_text`
+/// is the design template.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawDnsRuleText {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    domain: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    domain_suffix: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    domain_keyword: Vec<String>,
+    /// Action; defaults to "route" when omitted, which makes
+    /// `domain = [..]` + `server = ".."` the most compact happy path.
+    #[serde(default, skip_serializing_if = "DnsRuleActionTag::is_default")]
+    action: DnsRuleActionTag,
+    /// Server tag for `route`. Must be empty for `reject`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    server: String,
+    /// RCODE for `reject`. Defaults to NxDomain. Ignored for `route`.
+    #[serde(default, skip_serializing_if = "RejectKind::is_default")]
+    reject: RejectKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DnsRuleActionTag {
+    #[default]
+    Route,
+    Reject,
+}
+
+impl DnsRuleActionTag {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl RejectKind {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+fn deserialize_dns_rules<'de, D>(deserializer: D) -> Result<Vec<RawDnsRule>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<RawDnsRuleText>::deserialize(deserializer)?
+        .into_iter()
+        .enumerate()
+        .map(|(idx, raw)| dns_rule_from_text(idx, raw).map_err(de::Error::custom))
+        .collect()
+}
+
+fn serialize_dns_rules<S>(value: &[RawDnsRule], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value
+        .iter()
+        .map(dns_rule_to_text)
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn normalize_dns_rule_values(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|v| normalize_domain(&v))
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn dns_rule_from_text(idx: usize, raw: RawDnsRuleText) -> Result<RawDnsRule, String> {
+    let RawDnsRuleText {
+        domain,
+        domain_suffix,
+        domain_keyword,
+        action,
+        server,
+        reject,
+    } = raw;
+    let mut count = 0;
+    let mut matcher = DnsRuleMatcher::Domain(Vec::new());
+    if !domain.is_empty() {
+        count += 1;
+        matcher = DnsRuleMatcher::Domain(normalize_dns_rule_values(domain));
+    }
+    if !domain_suffix.is_empty() {
+        count += 1;
+        matcher = DnsRuleMatcher::DomainSuffix(normalize_dns_rule_values(domain_suffix));
+    }
+    if !domain_keyword.is_empty() {
+        count += 1;
+        matcher = DnsRuleMatcher::DomainKeyword(normalize_dns_rule_values(domain_keyword));
+    }
+    if count == 0 {
+        return Err(format!(
+            "dns.rules[{idx}] requires exactly one matcher (domain/domain_suffix/domain_keyword)",
+        ));
+    }
+    if count > 1 {
+        return Err(format!(
+            "dns.rules[{idx}] must contain exactly one matcher (domain/domain_suffix/domain_keyword)",
+        ));
+    }
+    let action = match action {
+        DnsRuleActionTag::Route => {
+            if server.is_empty() {
+                return Err(format!(
+                    "dns.rules[{idx}] action=\"route\" requires a non-empty server"
+                ));
+            }
+            DnsRuleAction::Route { server }
+        }
+        DnsRuleActionTag::Reject => {
+            if !server.is_empty() {
+                return Err(format!(
+                    "dns.rules[{idx}] action=\"reject\" must not set server"
+                ));
+            }
+            DnsRuleAction::Reject { kind: reject }
+        }
+    };
+    Ok(RawDnsRule { matcher, action })
+}
+
+fn dns_rule_to_text(rule: &RawDnsRule) -> RawDnsRuleText {
+    let mut text = RawDnsRuleText::default();
+    match &rule.matcher {
+        DnsRuleMatcher::Domain(values) => text.domain = values.clone(),
+        DnsRuleMatcher::DomainSuffix(values) => text.domain_suffix = values.clone(),
+        DnsRuleMatcher::DomainKeyword(values) => text.domain_keyword = values.clone(),
+    }
+    match &rule.action {
+        DnsRuleAction::Route { server } => {
+            text.action = DnsRuleActionTag::Route;
+            text.server = server.clone();
+        }
+        DnsRuleAction::Reject { kind } => {
+            text.action = DnsRuleActionTag::Reject;
+            text.reject = *kind;
+        }
+    }
+    text
 }
 
 raw_struct! {
@@ -92,6 +291,15 @@ pub struct DnsOptions {
     pub servers: Vec<DnsServer>,
     pub final_: String,
     pub strategy: DomainStrategy,
+    /// Order-preserved DNS rules. Empty means "always go via `final_`",
+    /// keeping configs that pre-date the feature working unchanged.
+    pub rules: Vec<DnsRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsRule {
+    pub matcher: DnsRuleMatcher,
+    pub action: DnsRuleAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -234,10 +442,12 @@ pub(super) fn build_dns_options(
     };
     let server = build_dns_server(raw, &via, &raw.domain_resolver)?;
     let final_id = server.id.clone();
+    let rules = build_dns_rules(&raw.rules, std::iter::once(server.id.as_str()))?;
     Ok(DnsOptions {
         servers: vec![server],
         final_: final_id,
         strategy: raw.strategy,
+        rules,
     })
 }
 
@@ -257,11 +467,37 @@ fn build_declared_dns_options(
     } else {
         raw.final_.clone()
     };
+    let rules = build_dns_rules(&raw.rules, servers.iter().map(|s| s.id.as_str()))?;
     Ok(DnsOptions {
         servers,
         final_,
         strategy: raw.strategy,
+        rules,
     })
+}
+
+/// Resolve `[[dns.rules]]` and verify each `route` action references a real
+/// declared server id. Mirrors `validate_route_rule_outbounds` in `mod.rs`.
+fn build_dns_rules<'a>(
+    raw_rules: &[RawDnsRule],
+    known_servers: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<DnsRule>, HammerError> {
+    let known: std::collections::HashSet<&str> = known_servers.into_iter().collect();
+    let mut rules = Vec::with_capacity(raw_rules.len());
+    for (idx, raw) in raw_rules.iter().enumerate() {
+        if let DnsRuleAction::Route { server } = &raw.action
+            && !known.contains(server.as_str())
+        {
+            return Err(HammerError::config_validation(format!(
+                "dns.rules[{idx}] server references unknown dns.server id: {server}"
+            )));
+        }
+        rules.push(DnsRule {
+            matcher: raw.matcher.clone(),
+            action: raw.action.clone(),
+        });
+    }
+    Ok(rules)
 }
 
 fn build_declared_dns_server(
@@ -464,5 +700,156 @@ fn build_dns_server_from_url(
         other => Err(HammerError::config_validation(format!(
             "unsupported dns.server scheme: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_rules(toml: &str) -> Result<Vec<RawDnsRule>, toml::de::Error> {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_dns_rules", default)]
+            rules: Vec<RawDnsRule>,
+        }
+        let wrapper: Wrapper = toml::from_str(toml)?;
+        Ok(wrapper.rules)
+    }
+
+    #[test]
+    fn dns_rule_parses_route_with_normalized_domain() {
+        let rules = parse_rules(
+            r#"
+[[rules]]
+domain = ["Example.COM"]
+server = "local"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].matcher,
+            DnsRuleMatcher::Domain(vec!["example.com".to_owned()])
+        );
+        assert_eq!(
+            rules[0].action,
+            DnsRuleAction::Route {
+                server: "local".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn dns_rule_parses_reject_with_default_nxdomain() {
+        let rules = parse_rules(
+            r#"
+[[rules]]
+domain_keyword = ["doubleclick"]
+action = "reject"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            rules[0].action,
+            DnsRuleAction::Reject {
+                kind: RejectKind::NxDomain
+            }
+        );
+    }
+
+    #[test]
+    fn dns_rule_parses_reject_refused() {
+        let rules = parse_rules(
+            r#"
+[[rules]]
+domain = ["denied.example"]
+action = "reject"
+reject = "refused"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            rules[0].action,
+            DnsRuleAction::Reject {
+                kind: RejectKind::Refused
+            }
+        );
+    }
+
+    #[test]
+    fn dns_rule_strips_trailing_dot_in_config() {
+        let rules = parse_rules(
+            r#"
+[[rules]]
+domain = ["ifconfig.so."]
+server = "local"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            rules[0].matcher,
+            DnsRuleMatcher::Domain(vec!["ifconfig.so".to_owned()])
+        );
+    }
+
+    #[test]
+    fn dns_rule_requires_exactly_one_matcher() {
+        let no_matcher = parse_rules(
+            r#"
+[[rules]]
+server = "local"
+"#,
+        );
+        assert!(no_matcher.is_err());
+
+        let two_matchers = parse_rules(
+            r#"
+[[rules]]
+domain = ["foo"]
+domain_suffix = ["bar"]
+server = "local"
+"#,
+        );
+        assert!(two_matchers.is_err());
+    }
+
+    #[test]
+    fn dns_rule_route_requires_server() {
+        let result = parse_rules(
+            r#"
+[[rules]]
+domain = ["foo"]
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn dns_rule_reject_must_omit_server() {
+        let result = parse_rules(
+            r#"
+[[rules]]
+domain = ["foo"]
+action = "reject"
+server = "local"
+"#,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_dns_rules_validates_server_id() {
+        let raw_rules = vec![RawDnsRule {
+            matcher: DnsRuleMatcher::Domain(vec!["foo".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "missing".to_owned(),
+            },
+        }];
+        let err = build_dns_rules(&raw_rules, ["local"]).expect_err("must error");
+        assert!(format!("{err}").contains("missing"));
+
+        let ok = build_dns_rules(&raw_rules, ["missing"]).expect("declared");
+        assert_eq!(ok.len(), 1);
     }
 }

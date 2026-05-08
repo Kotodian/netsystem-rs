@@ -10,7 +10,10 @@ use hammer_adapter::{
     DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
     DnsTransportManager as DnsTransportManagerTrait, Lifecycle, PlatformInterface, StartStage,
 };
-use hammer_core::config::{DnsOptions, DnsServer, DnsServerKind, DomainStrategy};
+use hammer_core::config::{
+    DnsOptions, DnsRule, DnsRuleAction, DnsRuleMatcher, DnsServer, DnsServerKind, DomainStrategy,
+    RejectKind, normalize_domain,
+};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -111,12 +114,18 @@ fn fqdn(domain: &str) -> Result<Name, HammerError> {
     Name::from_ascii(&name).map_err(|e| HammerError::internal(format!("invalid domain: {e}")))
 }
 
+/// Hot path on every DNS query. We avoid `.trim_end_matches('.').to_ascii_lowercase()`
+/// because that materialises two `String`s; instead we take the single
+/// `to_ascii()` allocation, truncate the trailing-dot run in place, then
+/// `make_ascii_lowercase()` in place. Functionally identical to
+/// `normalize_domain(&name.to_ascii())` but one allocation instead of two.
+#[inline]
 fn domain_from_name(name: &Name) -> String {
-    name.to_ascii().trim_end_matches('.').to_ascii_lowercase()
-}
-
-fn normalize_domain(domain: &str) -> String {
-    domain.trim_end_matches('.').to_ascii_lowercase()
+    let mut s = name.to_ascii();
+    let new_len = s.trim_end_matches('.').len();
+    s.truncate(new_len);
+    s.make_ascii_lowercase();
+    s
 }
 
 pub(in crate::dns) fn query_message(
@@ -131,6 +140,36 @@ pub(in crate::dns) fn query_message(
     });
     message.metadata.recursion_desired = true;
     Ok(message)
+}
+
+/// Match a single rule against an already-normalised query name. Mirrors
+/// `route::matcher_matches` for the three domain variants we surface. Hot
+/// path on every DNS query — `#[inline]` lets LLVM fold the enum match into
+/// the surrounding `match_rules` loop.
+#[inline]
+fn match_dns_rule(matcher: &DnsRuleMatcher, qname: &str) -> bool {
+    match matcher {
+        DnsRuleMatcher::Domain(values) => values.iter().any(|v| v == qname),
+        DnsRuleMatcher::DomainSuffix(values) => {
+            values.iter().any(|suffix| domain_suffix_matches(qname, suffix))
+        }
+        DnsRuleMatcher::DomainKeyword(values) => {
+            values.iter().any(|kw| qname.contains(kw.as_str()))
+        }
+    }
+}
+
+#[inline]
+fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return false;
+    }
+    if domain == suffix {
+        return true;
+    }
+    domain.len() > suffix.len()
+        && domain.ends_with(suffix)
+        && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
 }
 
 fn first_query(message: &Message) -> Result<&Query, HammerError> {
@@ -930,7 +969,32 @@ pub struct DnsRouter {
     transport: Arc<DnsTransportManager>,
     client: DnsClient,
     default_strategy: DomainStrategy,
+    /// Resolved `[[dns.rules]]`. Empty = default-only behaviour, the
+    /// pre-feature path. Populated once at construction; never mutated.
+    rules: Vec<ResolvedDnsRule>,
     reverse: Mutex<LruCache<IpAddr, ReverseValue>>,
+}
+
+/// Resolved form of a `DnsRule`: `Route` carries the actual transport
+/// reference (looked up at construction so the hot path is a single pointer
+/// clone) instead of an opaque server-id string. The matcher's domain
+/// strings are already normalised by `build_dns_rules` in hammer-core.
+struct ResolvedDnsRule {
+    matcher: DnsRuleMatcher,
+    action: ResolvedDnsAction,
+}
+
+enum ResolvedDnsAction {
+    Route(Arc<dyn DnsTransport>),
+    Reject(RejectKind),
+}
+
+/// Outcome of `match_rules`. `Default` means "no rule matched, fall
+/// through to the existing transport-resolution path".
+enum MatchedAction {
+    Route(Arc<dyn DnsTransport>),
+    Reject(RejectKind),
+    Default,
 }
 
 impl DnsRouter {
@@ -948,11 +1012,54 @@ impl DnsRouter {
             client: DnsClient::new(logger.clone()),
             transport,
             default_strategy,
+            rules: Vec::new(),
             reverse: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
                     .expect("DNS reverse cache capacity must be non-zero"),
             )),
         }
+    }
+
+    /// Install resolved rules, looking up each `Route` action's server tag
+    /// against the transport manager. Server-id existence has been
+    /// validated upstream in `build_dns_rules` (hammer-core); this lookup
+    /// only fails if the transport manager is racing initialisation, in
+    /// which case we surface an internal error rather than crashing.
+    pub fn with_rules(mut self, rules: &[DnsRule]) -> Result<Self, HammerError> {
+        let mut resolved = Vec::with_capacity(rules.len());
+        for (idx, rule) in rules.iter().enumerate() {
+            let action = match &rule.action {
+                DnsRuleAction::Route { server } => {
+                    let transport = self.transport.get(server).ok_or_else(|| {
+                        HammerError::internal(format!(
+                            "dns.rules[{idx}] server '{server}' missing from transport manager"
+                        ))
+                    })?;
+                    ResolvedDnsAction::Route(transport)
+                }
+                DnsRuleAction::Reject { kind } => ResolvedDnsAction::Reject(*kind),
+            };
+            resolved.push(ResolvedDnsRule {
+                matcher: rule.matcher.clone(),
+                action,
+            });
+        }
+        self.rules = resolved;
+        Ok(self)
+    }
+
+    #[inline]
+    fn match_rules(&self, qname: &str) -> MatchedAction {
+        for rule in &self.rules {
+            if !match_dns_rule(&rule.matcher, qname) {
+                continue;
+            }
+            return match &rule.action {
+                ResolvedDnsAction::Route(transport) => MatchedAction::Route(Arc::clone(transport)),
+                ResolvedDnsAction::Reject(kind) => MatchedAction::Reject(*kind),
+            };
+        }
+        MatchedAction::Default
     }
 
     pub async fn exchange(
@@ -961,6 +1068,39 @@ impl DnsRouter {
         mut options: DnsQueryOptions,
     ) -> Result<Message, HammerError> {
         let query_summary = dns_query_log_summary(&message);
+
+        // `[[dns.rules]]` matching takes precedence over the explicit
+        // `options.transport` override only when no override was set —
+        // callers that hand-pick a transport (`DnsRouter::lookup` for
+        // bootstrap, internal probes) should not be silently re-routed.
+        //
+        // Skip the qname allocation entirely on the rules-empty path
+        // (i.e. configs that pre-date `[[dns.rules]]`); `domain_from_name`
+        // costs one `String` alloc per call and runs on every query.
+        if !self.rules.is_empty() && options.transport.is_none() {
+            let qname = message
+                .queries
+                .first()
+                .map(|q| domain_from_name(q.name()))
+                .unwrap_or_default();
+            if !qname.is_empty() {
+                match self.match_rules(&qname) {
+                    MatchedAction::Route(transport) => {
+                        options.transport = Some(transport);
+                    }
+                    MatchedAction::Reject(kind) => {
+                        let code = match kind {
+                            RejectKind::NxDomain => FixedResponseCode::NXDomain,
+                            RejectKind::Refused => FixedResponseCode::Refused,
+                        };
+                        info!("reject query={query_summary} kind={kind:?}");
+                        return Ok(message.fixed_response(code));
+                    }
+                    MatchedAction::Default => {}
+                }
+            }
+        }
+
         let transport = self.resolve_transport(&options)?;
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
@@ -1136,6 +1276,269 @@ impl DnsRouterTrait for DnsRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hammer_core::error::CoreError;
+    use hammer_core::lifecycle::StartStage;
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    fn test_logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    /// Bare-bones DnsTransport that records how many times it was queried
+    /// and replies with a synthesised answer. Lets us prove which transport
+    /// the router picked without going through real UDP / DoH plumbing.
+    struct StubTransport {
+        id: String,
+        queries: AtomicUsize,
+        answer_addr: Ipv4Addr,
+    }
+
+    impl StubTransport {
+        fn arc(id: &str, answer_addr: Ipv4Addr) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_owned(),
+                queries: AtomicUsize::new(0),
+                answer_addr,
+            })
+        }
+    }
+
+    impl Lifecycle for StubTransport {
+        fn name(&self) -> &str {
+            &self.id
+        }
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl DnsTransport for StubTransport {
+        fn type_name(&self) -> &str {
+            "stub"
+        }
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+        fn reset(&self) {}
+        async fn exchange(&self, message: Message) -> Result<Message, CoreError> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let mut response = message.fixed_response(FixedResponseCode::NoError);
+            if let Some(query) = message.queries.first() {
+                response.add_answer(Record::from_rdata(
+                    query.name().clone(),
+                    60,
+                    RData::A(self.answer_addr.into()),
+                ));
+            }
+            Ok(response)
+        }
+    }
+
+    fn build_query(name: &str) -> Message {
+        let mut query = Message::new(7, MessageType::Query, OpCode::Query);
+        query.add_query({
+            let mut q =
+                Query::query(Name::from_ascii(name).expect("name"), RecordType::A);
+            q.set_query_class(DNSClass::IN);
+            q
+        });
+        query
+    }
+
+    fn manager_with(stubs: &[Arc<StubTransport>], default_id: &str) -> Arc<DnsTransportManager> {
+        let manager = Arc::new(DnsTransportManager::new(
+            test_logger("dns-transport"),
+            default_id.to_owned(),
+        ));
+        for stub in stubs {
+            manager.insert(Arc::clone(stub) as Arc<dyn DnsTransport>);
+        }
+        manager
+    }
+
+    fn router_with_rules(
+        manager: Arc<DnsTransportManager>,
+        rules: Vec<DnsRule>,
+    ) -> DnsRouter {
+        DnsRouter::new_with_manager(test_logger("dns-router"), manager, DomainStrategy::AsIs)
+            .with_rules(&rules)
+            .expect("with_rules")
+    }
+
+    #[tokio::test]
+    async fn dns_router_routes_domain_to_named_transport() {
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::Domain(vec!["ifconfig.so".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("ifconfig.so."), DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(local.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_routes_domain_suffix_to_named_transport() {
+        let cn = StubTransport::arc("cn", Ipv4Addr::new(223, 5, 5, 5));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&cn), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::DomainSuffix(vec!["cn".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "cn".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("Foo.CN."), DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(cn.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_rejects_with_nxdomain() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::DomainKeyword(vec!["doubleclick".to_owned()]),
+            action: DnsRuleAction::Reject {
+                kind: RejectKind::NxDomain,
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let query = build_query("ad.doubleclick.net.");
+        let query_id = query.metadata.id;
+        let response = router
+            .exchange(query, DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(response.metadata.id, query_id);
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        assert!(response.answers.is_empty());
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_rejects_with_refused() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::Domain(vec!["denied.example".to_owned()]),
+            action: DnsRuleAction::Reject {
+                kind: RejectKind::Refused,
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let response = router
+            .exchange(build_query("denied.example."), DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_falls_through_to_default_when_no_rule_matches() {
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::Domain(vec!["ifconfig.so".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("example.com."), DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(local.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_router_match_is_case_insensitive_after_normalize() {
+        // Rule strings are normalised at config-load (verified upstream);
+        // the *query* side is normalised at the exchange entry. This test
+        // proves the runtime normalisation path matches the config one.
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            // pre-normalised; mimics what `dns_rule_from_text` produces
+            matcher: DnsRuleMatcher::Domain(vec!["example.com".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("EXAMPLE.COM."), DnsQueryOptions::default())
+            .await
+            .expect("exchange");
+
+        assert_eq!(local.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_caller_supplied_transport_bypasses_rules() {
+        // Bootstrap / internal probes pre-pick a transport — rules must
+        // not silently re-route them.
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::Domain(vec!["ifconfig.so".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let mut options = DnsQueryOptions::default();
+        options.transport = Some(Arc::clone(&upstream) as Arc<dyn DnsTransport>);
+
+        let _ = router
+            .exchange(build_query("ifconfig.so."), options)
+            .await
+            .expect("exchange");
+
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(local.queries.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn dns_log_summary_includes_question_and_answers() {

@@ -190,11 +190,14 @@ impl RuntimeService {
             Arc::clone(&platform),
             default_domain_resolver,
         )?);
-        let dns_router = Arc::new(DnsRouter::new_with_manager(
-            new_logger(&log_factory, "dns-router"),
-            Arc::clone(&dns_transport),
-            options.dns.strategy,
-        ));
+        let dns_router = Arc::new(
+            DnsRouter::new_with_manager(
+                new_logger(&log_factory, "dns-router"),
+                Arc::clone(&dns_transport),
+                options.dns.strategy,
+            )
+            .with_rules(&options.dns.rules)?,
+        );
         let router = Arc::new(Router::from_options_with_metrics(
             new_logger(&log_factory, "router"),
             options.route.clone(),
