@@ -48,8 +48,8 @@ pub trait TunDevice: Send + Sync + 'static {
     /// Send a batch of packets back to the kernel. Apple's batched driver
     /// overrides this to coalesce them into one sendmsg_x syscall; everywhere
     /// else we fall back to a sequential `send` loop.
-    async fn send_batch(&self, packets: Vec<Vec<u8>>) -> Result<(), HammerError> {
-        for packet in packets {
+    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> Result<(), HammerError> {
+        for packet in packets.drain(..) {
             self.send(packet).await?;
         }
         Ok(())
@@ -1830,6 +1830,9 @@ async fn packet_loop(
     // single-packet recv() the batch is just `vec![pkt]` and the loop body
     // degrades to the previous behaviour.
     const RECV_BATCH_HINT: usize = 256;
+    let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
+    let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
     loop {
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
@@ -1843,15 +1846,9 @@ async fn packet_loop(
             tokio::task::yield_now().await;
             continue;
         }
-        // Fresh per-iteration `Vec`s. Previously `tcp_writeback` lived outside
-        // the loop with a `Vec::with_capacity(RECV_BATCH_HINT)` prefix and a
-        // `clear()` per round — but `clear()` doesn't release capacity, so a
-        // single TCP burst raised the outer Vec capacity to the burst peak
-        // and held it for the lifetime of the packet loop. Allocating inside
-        // the loop lets the allocator return memory after each iteration.
-        let mut tcp_writeback: Vec<Vec<u8>> = Vec::new();
-        let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
-        let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::new();
+        tcp_writeback.clear();
+        udp_pending.clear();
+        icmp_pending.clear();
         // Pass 1: under one NAT mutex acquisition, rewrite every TCP packet
         // in the batch and stash UDP packets for sequential post-processing.
         // The guard is released at the end of this scope before any I/O
@@ -1907,7 +1904,7 @@ async fn packet_loop(
         // Pass 2: send the rewritten TCP batch in one syscall (Apple) or
         // sequentially (other targets, via the default send_batch impl).
         if !tcp_writeback.is_empty() {
-            if let Err(err) = device.send_batch(tcp_writeback).await {
+            if let Err(err) = device.send_batch(&mut tcp_writeback).await {
                 metrics.counters.tcp_writeback_error_total.increment(1);
                 debug!("write system TCP packets: {err}");
             }
@@ -1915,7 +1912,7 @@ async fn packet_loop(
         // Pass 3: UDP / DNS handling stays sequential — these awaits would
         // serialise the loop anyway, and the volume is low enough that
         // batching them would not pay for itself.
-        for (packet, parsed) in udp_pending {
+        for (packet, parsed) in udp_pending.drain(..) {
             if let Err(err) = handle_system_udp_packet(
                 Arc::clone(&router),
                 Arc::clone(&dns_router),
@@ -1937,7 +1934,7 @@ async fn packet_loop(
         // a synchronous send/recv round-trip via `outbound.listen_icmp()`;
         // if the chosen outbound rejects ICMP, we synthesize a Destination
         // Unreachable and write it back into the tun.
-        for (packet, parsed) in icmp_pending {
+        for (packet, parsed) in icmp_pending.drain(..) {
             if let Err(err) = handle_system_icmp_packet(
                 Arc::clone(&router),
                 Arc::clone(&dns_router),

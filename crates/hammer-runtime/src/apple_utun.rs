@@ -341,9 +341,12 @@ impl AppleTunDevice {
         bufs
     }
 
-    fn return_pool_buffers(&self, mut bufs: Vec<Vec<u8>>) {
+    fn return_pool_buffers<I>(&self, bufs: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
         let mut pool = self.pool.lock().expect("apple TUN pool poisoned");
-        for mut buf in bufs.drain(..) {
+        for mut buf in bufs {
             if buf.capacity() < self.mtu {
                 continue;
             }
@@ -464,7 +467,8 @@ impl TunDevice for AppleTunDevice {
     }
 
     async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
-        self.send_batch(vec![packet]).await
+        let mut packets = vec![packet];
+        self.send_batch(&mut packets).await
     }
 
     async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
@@ -507,18 +511,15 @@ impl TunDevice for AppleTunDevice {
         }
     }
 
-    async fn send_batch(&self, packets: Vec<Vec<u8>>) -> Result<(), HammerError> {
+    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> Result<(), HammerError> {
         if packets.is_empty() {
             return Ok(());
         }
         // Filter out anything we can't tag with an IP family up front so the
         // chunk loop below can skip past completed slots without skipping
         // around invalid entries.
-        let valid_vec: Vec<Vec<u8>> = packets
-            .into_iter()
-            .filter(|p| matches!(p.first().map(|b| b >> 4), Some(4) | Some(6)))
-            .collect();
-        if valid_vec.is_empty() {
+        packets.retain(|p| matches!(p.first().map(|b| b >> 4), Some(4) | Some(6)));
+        if packets.is_empty() {
             return Ok(());
         }
         // RAII guard: regardless of how this scope exits — Ok return, Err
@@ -527,7 +528,7 @@ impl TunDevice for AppleTunDevice {
         // pool. Without this, a panic in the loop below would let `valid`
         // be dropped without recycling, breaking the pool's reuse contract
         // and forcing the next `refill_rx` to allocate from scratch.
-        let valid = PoolReturn::new(self, valid_vec);
+        let valid = PoolReturn::new(self, packets);
 
         let mut offset = 0;
         let mut max_chunk = usize::MAX;
@@ -612,15 +613,12 @@ impl TunDevice for AppleTunDevice {
 /// the next `refill_rx` to allocate fresh.
 struct PoolReturn<'a> {
     device: &'a AppleTunDevice,
-    bufs: Option<Vec<Vec<u8>>>,
+    bufs: &'a mut Vec<Vec<u8>>,
 }
 
 impl<'a> PoolReturn<'a> {
-    fn new(device: &'a AppleTunDevice, bufs: Vec<Vec<u8>>) -> Self {
-        Self {
-            device,
-            bufs: Some(bufs),
-        }
+    fn new(device: &'a AppleTunDevice, bufs: &'a mut Vec<Vec<u8>>) -> Self {
+        Self { device, bufs }
     }
 }
 
@@ -628,14 +626,12 @@ impl std::ops::Deref for PoolReturn<'_> {
     type Target = [Vec<u8>];
 
     fn deref(&self) -> &Self::Target {
-        self.bufs.as_deref().unwrap_or(&[])
+        self.bufs.as_slice()
     }
 }
 
 impl Drop for PoolReturn<'_> {
     fn drop(&mut self) {
-        if let Some(bufs) = self.bufs.take() {
-            self.device.return_pool_buffers(bufs);
-        }
+        self.device.return_pool_buffers(self.bufs.drain(..));
     }
 }
