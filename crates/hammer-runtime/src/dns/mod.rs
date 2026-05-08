@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -36,6 +37,11 @@ const DEFAULT_DNS_TTL: u32 = 600;
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_CLIENT_CACHE_MAX_ENTRIES: usize = 1024;
 const DNS_REVERSE_CACHE_MAX_ENTRIES: usize = 2048;
+/// Capacity of the per-qname rule-match LRU. Sized to mirror
+/// `ROUTER_CACHE_CAPACITY` (`route.rs`) — most flows share a small set of
+/// query names (CDN clusters, ad domains, the user's own resolver bootstrap)
+/// so 256 entries keep walks rare without bloating NetExt heap.
+const DNS_MATCH_CACHE_CAPACITY: usize = 256;
 
 pub type QueryType = RecordType;
 
@@ -973,6 +979,13 @@ pub struct DnsRouter {
     /// pre-feature path. Populated once at construction; never mutated.
     rules: Vec<ResolvedDnsRule>,
     reverse: Mutex<LruCache<IpAddr, ReverseValue>>,
+    /// Per-qname LRU of the rule-walk outcome. Same role as the
+    /// `Router::cache` for proxy routing — sustained traffic to the same
+    /// host hits the same set of qnames repeatedly, so a 256-entry LRU
+    /// collapses N rule walks into one hashmap lookup.
+    match_cache: Mutex<LruCache<String, MatchedAction>>,
+    match_cache_hits: AtomicU64,
+    match_cache_misses: AtomicU64,
 }
 
 /// Resolved form of a `DnsRule`: `Route` carries the actual transport
@@ -991,6 +1004,10 @@ enum ResolvedDnsAction {
 
 /// Outcome of `match_rules`. `Default` means "no rule matched, fall
 /// through to the existing transport-resolution path".
+///
+/// `Clone` so the per-qname LRU can hand out copies cheaply: `Route`
+/// clones an `Arc`, `Reject` is `Copy`, `Default` is unit.
+#[derive(Clone)]
 enum MatchedAction {
     Route(Arc<dyn DnsTransport>),
     Reject(RejectKind),
@@ -1017,6 +1034,12 @@ impl DnsRouter {
                 NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
                     .expect("DNS reverse cache capacity must be non-zero"),
             )),
+            match_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(DNS_MATCH_CACHE_CAPACITY)
+                    .expect("DNS match cache capacity must be non-zero"),
+            )),
+            match_cache_hits: AtomicU64::new(0),
+            match_cache_misses: AtomicU64::new(0),
         }
     }
 
@@ -1050,6 +1073,27 @@ impl DnsRouter {
 
     #[inline]
     fn match_rules(&self, qname: &str) -> MatchedAction {
+        if let Some(cached) = self
+            .match_cache
+            .lock()
+            .expect("DNS match cache poisoned")
+            .get(qname)
+            .cloned()
+        {
+            self.match_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return cached;
+        }
+        self.match_cache_misses.fetch_add(1, Ordering::Relaxed);
+
+        let action = self.compute_match(qname);
+        self.match_cache
+            .lock()
+            .expect("DNS match cache poisoned")
+            .put(qname.to_owned(), action.clone());
+        action
+    }
+
+    fn compute_match(&self, qname: &str) -> MatchedAction {
         for rule in &self.rules {
             if !match_dns_rule(&rule.matcher, qname) {
                 continue;
@@ -1060,6 +1104,16 @@ impl DnsRouter {
             };
         }
         MatchedAction::Default
+    }
+
+    #[cfg(test)]
+    pub(crate) fn match_cache_hits(&self) -> u64 {
+        self.match_cache_hits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn match_cache_misses(&self) -> u64 {
+        self.match_cache_misses.load(Ordering::Relaxed)
     }
 
     pub async fn exchange(
@@ -1153,6 +1207,14 @@ impl DnsRouter {
         self.reverse
             .lock()
             .expect("DnsRouter reverse poisoned")
+            .clear();
+        // Match-cache entries point at `Arc<dyn DnsTransport>` clones from
+        // the manager; on a network flip the underlying transports may
+        // have been replaced or reset, so drop the cache to force a fresh
+        // walk on the next query.
+        self.match_cache
+            .lock()
+            .expect("DNS match cache poisoned")
             .clear();
     }
 
@@ -1485,6 +1547,67 @@ mod tests {
 
         assert_eq!(local.queries.load(Ordering::SeqCst), 0);
         assert_eq!(upstream.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_router_caches_match_for_repeated_qname() {
+        // DnsRouter::match_rules is called on every query when [[dns.rules]]
+        // is non-empty. Same qname should hit the LRU and skip the rule
+        // walk; the StubTransport call count is irrelevant here because
+        // the DnsClient itself caches responses — we assert via the
+        // hits/misses counters that the per-qname cache fired.
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::DomainSuffix(vec!["ifconfig.so".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("ifconfig.so."), DnsQueryOptions::default())
+            .await
+            .expect("first exchange");
+        let _ = router
+            .exchange(build_query("ifconfig.so."), DnsQueryOptions::default())
+            .await
+            .expect("second exchange");
+
+        assert_eq!(router.match_cache_misses(), 1);
+        assert_eq!(router.match_cache_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_router_clear_cache_drops_match_cache() {
+        // clear_cache (also driven by reset_network) must invalidate the
+        // match LRU so transports refreshed on a network flip are picked
+        // up next time.
+        let local = StubTransport::arc("local", Ipv4Addr::new(127, 0, 0, 1));
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&local), Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::DomainSuffix(vec!["ifconfig.so".to_owned()]),
+            action: DnsRuleAction::Route {
+                server: "local".to_owned(),
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let _ = router
+            .exchange(build_query("ifconfig.so."), DnsQueryOptions::default())
+            .await
+            .expect("warm-up");
+        router.clear_cache();
+        let _ = router
+            .exchange(build_query("ifconfig.so."), DnsQueryOptions::default())
+            .await
+            .expect("post-clear");
+
+        assert_eq!(router.match_cache_misses(), 2);
+        assert_eq!(router.match_cache_hits(), 0);
     }
 
     #[tokio::test]
