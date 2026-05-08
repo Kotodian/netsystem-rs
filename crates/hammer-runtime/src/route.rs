@@ -9,7 +9,6 @@ use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, Rul
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters};
-use ipnet::IpNet;
 
 use crate::OutboundManager;
 use crate::impl_logging_lifecycle;
@@ -233,7 +232,7 @@ fn route_action_name(action: &RuleActionKind) -> &'static str {
 }
 
 struct RuntimeRule {
-    matcher: Box<dyn Matcher>,
+    matcher: RuleMatcher,
     action: RuleActionKind,
     metrics: RuntimeRuleMetrics,
 }
@@ -248,14 +247,15 @@ impl RuntimeRule {
             &action,
         );
         Self {
-            matcher: matcher_from_options(default.matcher),
+            matcher: default.matcher,
             action,
             metrics,
         }
     }
 
+    #[inline]
     fn matches(&self, metadata: &RouteMetadata) -> bool {
-        self.matcher.matches(metadata)
+        matcher_matches(&self.matcher, metadata)
     }
 
     fn apply(&self, metadata: &mut RouteMetadata) -> Result<RuleApply, HammerError> {
@@ -305,89 +305,34 @@ enum RuleApply {
     Decision(RouteDecision),
 }
 
-trait Matcher: Send + Sync {
-    fn matches(&self, metadata: &RouteMetadata) -> bool;
-}
-
-fn matcher_from_options(matcher: RuleMatcher) -> Box<dyn Matcher> {
+/// Match a `RuleMatcher` against connection metadata. Hot path — called per
+/// TCP/UDP/ICMP packet, once per rule walked. Static dispatch on the enum
+/// (not `Box<dyn Matcher>`) lets LLVM inline each arm with workspace
+/// `lto = "fat"`. The previous trait-object form ate one indirect call per
+/// rule; cumulative on every packet × every rule it added up to a real chunk
+/// of `Router::match_route` self-time on iOS NetExt.
+#[inline]
+fn matcher_matches(matcher: &RuleMatcher, metadata: &RouteMetadata) -> bool {
     match matcher {
-        RuleMatcher::Any => Box::new(AnyMatcher),
-        RuleMatcher::Inbound(values) => Box::new(InboundMatcher(values)),
-        RuleMatcher::Protocol(values) => Box::new(ProtocolMatcher(values)),
-        RuleMatcher::Domain(values) => Box::new(DomainMatcher(values)),
-        RuleMatcher::DomainSuffix(values) => Box::new(DomainSuffixMatcher(values)),
-        RuleMatcher::DomainKeyword(values) => Box::new(DomainKeywordMatcher(values)),
-        RuleMatcher::IpCidr(values) => Box::new(IpCidrMatcher(values)),
-    }
-}
-
-struct AnyMatcher;
-
-impl Matcher for AnyMatcher {
-    fn matches(&self, _metadata: &RouteMetadata) -> bool {
-        true
-    }
-}
-
-struct InboundMatcher(Vec<String>);
-
-impl Matcher for InboundMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        match_list(&self.0, &metadata.inbound)
-    }
-}
-
-struct ProtocolMatcher(Vec<String>);
-
-impl Matcher for ProtocolMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        match_list(&self.0, &metadata.protocol)
-    }
-}
-
-struct DomainMatcher(Vec<String>);
-
-impl Matcher for DomainMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        let Some(domain) = metadata.domain.as_deref() else {
-            return false;
-        };
-        self.0.iter().any(|value| value == domain)
-    }
-}
-
-struct DomainSuffixMatcher(Vec<String>);
-
-impl Matcher for DomainSuffixMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        let Some(domain) = metadata.domain.as_deref() else {
-            return false;
-        };
-        self.0
-            .iter()
-            .any(|suffix| domain_suffix_matches(domain, suffix))
-    }
-}
-
-struct DomainKeywordMatcher(Vec<String>);
-
-impl Matcher for DomainKeywordMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        let Some(domain) = metadata.domain.as_deref() else {
-            return false;
-        };
-        self.0.iter().any(|keyword| domain.contains(keyword))
-    }
-}
-
-struct IpCidrMatcher(Vec<IpNet>);
-
-impl Matcher for IpCidrMatcher {
-    fn matches(&self, metadata: &RouteMetadata) -> bool {
-        let Some(SocksAddr { host, .. }) = metadata.destination.as_ref() else {
-            return false;
-        };
-        self.0.iter().any(|net| net.contains(host))
+        RuleMatcher::Any => true,
+        RuleMatcher::Inbound(values) => match_list(values, &metadata.inbound),
+        RuleMatcher::Protocol(values) => match_list(values, &metadata.protocol),
+        RuleMatcher::Domain(values) => match metadata.domain.as_deref() {
+            Some(domain) => values.iter().any(|value| value == domain),
+            None => false,
+        },
+        RuleMatcher::DomainSuffix(values) => match metadata.domain.as_deref() {
+            Some(domain) => values.iter().any(|suffix| domain_suffix_matches(domain, suffix)),
+            None => false,
+        },
+        RuleMatcher::DomainKeyword(values) => match metadata.domain.as_deref() {
+            Some(domain) => values.iter().any(|keyword| domain.contains(keyword.as_str())),
+            None => false,
+        },
+        RuleMatcher::IpCidr(values) => match metadata.destination.as_ref() {
+            Some(SocksAddr { host, .. }) => values.iter().any(|net| net.contains(host)),
+            None => false,
+        },
     }
 }
 
