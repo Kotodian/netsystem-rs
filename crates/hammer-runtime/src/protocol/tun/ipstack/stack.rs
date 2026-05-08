@@ -543,7 +543,14 @@ impl StackInner {
                 if self.tcp_bridges.contains_key(&handle) {
                     self.fail_pending_tcp_writes(handle, "ipstack tcp: user stream closed");
                     let socket = self.sockets.get_mut::<tcp::Socket>(handle);
-                    socket.close();
+                    // The user side dropped its stream, so we don't owe the
+                    // far side a graceful FIN exchange. `abort()` sends a
+                    // single RST and transitions straight to CLOSED, dodging
+                    // the FIN_WAIT_1/FIN_WAIT_2 trap where smoltcp parks the
+                    // socket waiting for a peer ACK that may never arrive on
+                    // a userspace stack with no protocol-level retry budget.
+                    // The next `reap_dead_sockets` call frees the slot.
+                    socket.abort();
                 }
             }
             SocketEvent::UdpSend { handle, data, dst } => {
