@@ -12,4 +12,4 @@
 pub(crate) mod device;
 pub(crate) mod stack;
 
-pub(crate) use stack::{IpStackHandles, UdpHandle, spawn_ipstack};
+pub(crate) use stack::{IpStackHandles, IpStackInput, UdpHandle, spawn_ipstack};

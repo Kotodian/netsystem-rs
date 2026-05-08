@@ -37,7 +37,7 @@ use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
-use crate::protocol::tun::ipstack::{IpStackHandles, UdpHandle, spawn_ipstack};
+use crate::protocol::tun::ipstack::{IpStackHandles, IpStackInput, UdpHandle, spawn_ipstack};
 use crate::socket_protector::SocketProtector;
 
 use peer::Peer;
@@ -186,7 +186,7 @@ impl WireguardEndpoint {
                 // After hand-off the transport handle no longer needs to expose
                 // inbound_rx; replace with a sentinel closed channel so the type
                 // stays the same.
-                inbound_rx: tokio::sync::mpsc::channel(1).1,
+                inbound_rx: tokio::sync::mpsc::channel::<IpStackInput>(1).1,
                 local_addr: "0.0.0.0:0".parse().expect("sentinel addr"),
                 shutdown,
                 join,
@@ -783,10 +783,7 @@ mod tests {
         // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
         let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
         let payload = Bytes::from_static(b"hello over wireguard");
-        udp_a
-            .send(payload.clone(), dst)
-            .await
-            .expect("udp_a.send");
+        udp_a.send(payload.clone(), dst).await.expect("udp_a.send");
 
         // 5s is plenty: the boringtun handshake completes in <50 ms over
         // localhost even with the 250 ms timer driving retransmits.
@@ -890,10 +887,7 @@ mod tests {
             payload_vec.push((i % 251) as u8);
         }
         let payload = Bytes::from(payload_vec);
-        udp_a
-            .send(payload.clone(), dst)
-            .await
-            .expect("udp_a.send");
+        udp_a.send(payload.clone(), dst).await.expect("udp_a.send");
 
         let (recv_payload, src) = timeout(Duration::from_secs(5), udp_b.recv())
             .await

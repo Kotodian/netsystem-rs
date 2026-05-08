@@ -40,6 +40,7 @@ impl ChannelDevice {
     /// Push an IP packet (just received from the carrier) into the inbound
     /// queue. Drops the oldest packet when the backlog overflows so a stalled
     /// poll loop can't keep pulling memory.
+    #[inline]
     pub(crate) fn deliver(&mut self, packet: Bytes) {
         if self.inbound.len() >= INBOUND_BACKLOG {
             let _ = self.inbound.pop_front();
@@ -47,8 +48,24 @@ impl ChannelDevice {
         self.inbound.push_back(packet);
     }
 
+    /// Push a burst of IP packets into the inbound queue without forcing the
+    /// carrier adapter through one mpsc wakeup per packet. Ordering is
+    /// preserved, and the same oldest-drop policy applies across the batch.
+    #[inline]
+    pub(crate) fn deliver_batch(&mut self, packets: Vec<Bytes>) {
+        // If the batch alone would overflow the backlog, skip the prefix that
+        // `deliver`'s oldest-drop would pop right back out — saves a round of
+        // push_back/pop_front (and the matching `Bytes` clone bookkeeping) per
+        // dropped packet.
+        let skip = packets.len().saturating_sub(INBOUND_BACKLOG);
+        for packet in packets.into_iter().skip(skip) {
+            self.deliver(packet);
+        }
+    }
+
     /// `true` if the inbound queue is non-empty — caller can use this to skip
     /// poll() when there's nothing waiting.
+    #[inline]
     pub(crate) fn has_inbound(&self) -> bool {
         !self.inbound.is_empty()
     }
@@ -109,6 +126,7 @@ pub(crate) struct ChannelRxToken {
 }
 
 impl RxToken for ChannelRxToken {
+    #[inline]
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
@@ -122,6 +140,7 @@ pub(crate) struct ChannelTxToken {
 }
 
 impl TxToken for ChannelTxToken {
+    #[inline]
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
@@ -179,6 +198,36 @@ mod tests {
             dev.deliver(Bytes::from(vec![i as u8]));
         }
         // Oldest 5 must have been dropped — the next receive returns the 6th.
+        let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
+        rx.consume(|buf| assert_eq!(buf, &[5]));
+    }
+
+    #[test]
+    fn deliver_batch_preserves_packet_order() {
+        let (egress_tx, _egress_rx) = mpsc::unbounded_channel();
+        let mut dev = ChannelDevice::new(1408, egress_tx);
+        dev.deliver_batch(vec![
+            Bytes::from_static(&[1]),
+            Bytes::from_static(&[2]),
+            Bytes::from_static(&[3]),
+        ]);
+
+        for expected in 1..=3 {
+            let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
+            rx.consume(|buf| assert_eq!(buf, &[expected]));
+        }
+        assert!(dev.receive(Instant::from_millis(0)).is_none());
+    }
+
+    #[test]
+    fn deliver_batch_drops_oldest_when_backlog_overflows() {
+        let (egress_tx, _egress_rx) = mpsc::unbounded_channel();
+        let mut dev = ChannelDevice::new(1408, egress_tx);
+        let packets = (0..(INBOUND_BACKLOG + 5))
+            .map(|i| Bytes::from(vec![i as u8]))
+            .collect();
+        dev.deliver_batch(packets);
+
         let (rx, _tx) = dev.receive(Instant::from_millis(0)).expect("rx token");
         rx.consume(|buf| assert_eq!(buf, &[5]));
     }

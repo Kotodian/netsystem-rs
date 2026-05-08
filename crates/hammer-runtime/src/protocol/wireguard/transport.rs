@@ -33,6 +33,7 @@ use tokio::time::{self, MissedTickBehavior};
 use hammer_core::error::HammerError;
 use hammer_core::log::Logger;
 
+use crate::protocol::tun::ipstack::IpStackInput;
 use crate::socket_protector::SocketProtector;
 
 use super::WIREGUARD_OVERHEAD;
@@ -47,8 +48,14 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 /// MTU=1408 ≈ 90 KiB of headroom — keeps a brief stall on the encryption
 /// thread from immediately back-pressuring the smoltcp poll loop.
 const ENCRYPT_QUEUE: usize = 64;
-/// Same for the decrypted-inbound side.
-const INBOUND_QUEUE: usize = 64;
+/// Same for the decrypted-inbound side. Each message can carry up to
+/// `INBOUND_DRAIN_BATCH` packets, so effective in-flight headroom is
+/// `INBOUND_QUEUE * INBOUND_DRAIN_BATCH` ≈ 512 packets at MTU=1408 ≈ 720 KiB —
+/// kept small to fit inside the iOS NetExt memory budget.
+const INBOUND_QUEUE: usize = 16;
+/// After one UDP readiness wake, drain a small bounded burst so decrypted IP
+/// packets can cross into ipstack as one batch instead of one mpsc message each.
+const INBOUND_DRAIN_BATCH: usize = 32;
 
 /// Handles returned to the owner of a transport actor. Hold these for the
 /// lifetime of the endpoint; dropping `shutdown` is enough to stop the actor
@@ -59,7 +66,7 @@ pub(crate) struct TransportHandles {
     pub(crate) encrypt_tx: mpsc::Sender<Bytes>,
     /// Receive decrypted IP packets coming back from any peer. The smoltcp
     /// stack drains this in the actor that owns the `phy::Device`.
-    pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
+    pub(crate) inbound_rx: mpsc::Receiver<IpStackInput>,
     /// The address the OS bound the UDP socket to. Mostly useful for tests
     /// — production peers configure their endpoints out-of-band.
     pub(crate) local_addr: SocketAddr,
@@ -122,7 +129,7 @@ pub(crate) fn spawn_transport(
     info!("wireguard transport listening on {local_addr}");
 
     let (encrypt_tx, encrypt_rx) = mpsc::channel::<Bytes>(ENCRYPT_QUEUE);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<IpStackInput>(INBOUND_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let join = crate::spawn::spawn(run_actor(
@@ -244,7 +251,7 @@ async fn run_actor(
     peers: Arc<Vec<Peer>>,
     mtu: u32,
     mut encrypt_rx: mpsc::Receiver<Bytes>,
-    inbound_tx: mpsc::Sender<Bytes>,
+    inbound_tx: mpsc::Sender<IpStackInput>,
     mut shutdown_rx: oneshot::Receiver<()>,
 ) {
     // 65535 is the IPv4 datagram ceiling; boringtun's WG frames cap out at
@@ -271,11 +278,17 @@ async fn run_actor(
             res = recv_from_optional(sockets.ipv4.as_deref(), &mut udp_buf_v4), if sockets.ipv4.is_some() => {
                 match res {
                     Ok((n, src)) => {
-                        handle_inbound(
+                        let socket = sockets
+                            .ipv4
+                            .as_deref()
+                            .expect("ipv4 socket guarded by select arm");
+                        handle_inbound_ready(
                             &sockets,
                             &peers,
+                            socket,
                             src,
-                            &mut udp_buf_v4[..n],
+                            n,
+                            &mut udp_buf_v4,
                             crypto_cap,
                             &inbound_tx,
                         )
@@ -289,11 +302,17 @@ async fn run_actor(
             res = recv_from_optional(sockets.ipv6.as_deref(), &mut udp_buf_v6), if sockets.ipv6.is_some() => {
                 match res {
                     Ok((n, src)) => {
-                        handle_inbound(
+                        let socket = sockets
+                            .ipv6
+                            .as_deref()
+                            .expect("ipv6 socket guarded by select arm");
+                        handle_inbound_ready(
                             &sockets,
                             &peers,
+                            socket,
                             src,
-                            &mut udp_buf_v6[..n],
+                            n,
+                            &mut udp_buf_v6,
                             crypto_cap,
                             &inbound_tx,
                         )
@@ -328,13 +347,69 @@ async fn recv_from_optional(
     }
 }
 
-async fn handle_inbound(
+/// Handle one UDP readiness wake. Always processes the datagram the select arm
+/// already received, then opportunistically `try_recv_from`s up to
+/// `INBOUND_DRAIN_BATCH-1` more datagrams off the same socket without
+/// re-entering `select!`, so `flush_inbound_batch` can amortize one mpsc send
+/// across the whole burst.
+///
+/// The multi-packet drain path is exercised by the round-trip e2e test in this
+/// module under sustained load; we don't have a focused unit test for it
+/// because reliably triggering "≥2 datagrams ready in one wake" in-process
+/// requires racing two `send_to` calls before the first `recv_from` resolves —
+/// flaky enough that an integration-style test is the better tool.
+async fn handle_inbound_ready(
+    sockets: &TransportSockets,
+    peers: &[Peer],
+    udp_socket: &UdpSocket,
+    first_src: SocketAddr,
+    first_len: usize,
+    recv_buf: &mut [u8],
+    crypto_cap: usize,
+    inbound_tx: &mpsc::Sender<IpStackInput>,
+) {
+    let mut inbound_batch = Vec::with_capacity(INBOUND_DRAIN_BATCH);
+    handle_inbound_datagram(
+        sockets,
+        peers,
+        first_src,
+        &mut recv_buf[..first_len],
+        crypto_cap,
+        &mut inbound_batch,
+    )
+    .await;
+
+    for _ in 1..INBOUND_DRAIN_BATCH {
+        match udp_socket.try_recv_from(recv_buf) {
+            Ok((n, src)) => {
+                handle_inbound_datagram(
+                    sockets,
+                    peers,
+                    src,
+                    &mut recv_buf[..n],
+                    crypto_cap,
+                    &mut inbound_batch,
+                )
+                .await;
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) => {
+                warn!("wireguard udp recv: {err}");
+                break;
+            }
+        }
+    }
+
+    flush_inbound_batch(inbound_tx, inbound_batch);
+}
+
+async fn handle_inbound_datagram(
     sockets: &TransportSockets,
     peers: &[Peer],
     src: SocketAddr,
     datagram: &mut [u8],
     crypto_cap: usize,
-    inbound_tx: &mpsc::Sender<Bytes>,
+    inbound_batch: &mut Vec<Bytes>,
 ) {
     let Some(peer_idx) = peers.iter().position(|peer| peer.endpoint() == src) else {
         warn!(
@@ -356,7 +431,7 @@ async fn handle_inbound(
 
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
     let action = step_decapsulate(peer, Some(src.ip()), datagram, crypto_cap);
-    dispatch_action(sockets, peer, action, inbound_tx).await;
+    dispatch_action(sockets, peer, action, inbound_batch).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
@@ -366,7 +441,7 @@ async fn handle_inbound(
         if matches!(action, DecapAction::Idle) {
             break;
         }
-        dispatch_action(sockets, peer, action, inbound_tx).await;
+        dispatch_action(sockets, peer, action, inbound_batch).await;
     }
 }
 
@@ -383,8 +458,8 @@ enum DecapAction {
     /// already truncated to its real length; the WARP-reserved prefix gets
     /// stamped in place before the syscall.
     SendNetwork { buf: BytesMut, dst: SocketAddr },
-    /// Hand a plaintext IP packet to the inner stack via `inbound_tx`. Already
-    /// frozen into a `Bytes`, so the mpsc send is a zero-copy ownership move.
+    /// Stage a plaintext IP packet for the inner stack. Already frozen into a
+    /// `Bytes`, so the eventual mpsc send is a zero-copy ownership move.
     SendInbound(Bytes),
 }
 
@@ -392,7 +467,7 @@ async fn dispatch_action(
     sockets: &TransportSockets,
     peer: &Peer,
     action: DecapAction,
-    inbound_tx: &mpsc::Sender<Bytes>,
+    inbound_batch: &mut Vec<Bytes>,
 ) {
     match action {
         DecapAction::Idle => {}
@@ -407,10 +482,35 @@ async fn dispatch_action(
             }
         }
         DecapAction::SendInbound(bytes) => {
-            if inbound_tx.try_send(bytes).is_err() {
-                warn!("wireguard inbound queue full or closed; dropping packet");
-            }
+            inbound_batch.push(bytes);
         }
+    }
+}
+
+/// Hand the staged batch off to ipstack as a single mpsc message. The drop
+/// unit is `INBOUND_DRAIN_BATCH` packets in the worst case (vs. one packet
+/// pre-batching) — that's the deliberate trade: surface congestion at the
+/// transport boundary instead of silently piling into a deeper ipstack queue,
+/// at the cost of a coarser-grained drop when the inner stack stalls.
+fn flush_inbound_batch(inbound_tx: &mpsc::Sender<IpStackInput>, batch: Vec<Bytes>) {
+    let Some(input) = ipstack_input_from_batch(batch) else {
+        return;
+    };
+    let packets = match &input {
+        IpStackInput::Packet(_) => 1,
+        IpStackInput::Batch(packets) => packets.len(),
+    };
+    if inbound_tx.try_send(input).is_err() {
+        warn!("wireguard inbound queue full or closed; dropping {packets} packet(s)");
+    }
+}
+
+#[inline]
+fn ipstack_input_from_batch(mut batch: Vec<Bytes>) -> Option<IpStackInput> {
+    match batch.len() {
+        0 => None,
+        1 => Some(IpStackInput::Packet(batch.pop().expect("one packet"))),
+        _ => Some(IpStackInput::Batch(batch)),
     }
 }
 
@@ -537,6 +637,7 @@ async fn tick_timers(sockets: &TransportSockets, peers: &[Peer], crypto_cap: usi
 
 /// Stamp the WARP-style 3-byte reserved prefix into `packet[1..4]`. boringtun
 /// only writes the first byte (message type); the next three are ours.
+#[inline]
 fn stamp_reserved_in_place(packet: &mut [u8], reserved: [u8; 3]) {
     if reserved != [0u8; 3] && packet.len() >= 4 {
         packet[1..4].copy_from_slice(&reserved);
@@ -621,6 +722,34 @@ mod tests {
         pkt
     }
 
+    #[test]
+    fn flush_inbound_batch_sends_packet_input_for_one_packet() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let packet = Bytes::from_static(b"one");
+
+        flush_inbound_batch(&tx, vec![packet.clone()]);
+
+        match rx.try_recv().expect("one ipstack message") {
+            IpStackInput::Packet(received) => assert_eq!(received, packet),
+            other => panic!("unexpected ipstack input: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flush_inbound_batch_sends_single_batch_input_for_multiple_packets() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = Bytes::from_static(b"one");
+        let second = Bytes::from_static(b"two");
+
+        flush_inbound_batch(&tx, vec![first.clone(), second.clone()]);
+
+        match rx.try_recv().expect("one ipstack message") {
+            IpStackInput::Batch(packets) => assert_eq!(packets, vec![first, second]),
+            other => panic!("unexpected ipstack input: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
     /// End-to-end smoke test: two transport actors configured as each other's
     /// peer must complete the noise handshake over real UDP and surface a
     /// queued IP packet to the other side's `inbound_rx`.
@@ -671,6 +800,13 @@ mod tests {
             .await
             .expect("timed out waiting for inbound packet")
             .expect("inbound_rx closed before delivering");
+        let recovered = match recovered {
+            IpStackInput::Packet(packet) => packet,
+            IpStackInput::Batch(mut packets) if packets.len() == 1 => {
+                packets.pop().expect("one packet")
+            }
+            other => panic!("unexpected ipstack input: {other:?}"),
+        };
         assert_eq!(&recovered[..], payload.as_slice());
 
         // Dropping the handles closes both mpsc channels and the oneshot;

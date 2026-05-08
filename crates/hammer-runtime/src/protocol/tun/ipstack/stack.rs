@@ -193,6 +193,15 @@ impl UdpHandle {
     }
 }
 
+/// Carrier-to-stack input. Single packets keep the existing cheap path; batch
+/// messages let UDP-backed carriers amortize channel wakeups and smoltcp polls
+/// when several IP packets arrive in one readiness cycle.
+#[derive(Debug)]
+pub(crate) enum IpStackInput {
+    Packet(Bytes),
+    Batch(Vec<Bytes>),
+}
+
 /// Spin up the netstack actor. Synchronously builds the smoltcp interface
 /// (no I/O involved) so the caller has a fully-wired `IpStackHandles` before the
 /// task even runs its first iteration.
@@ -200,7 +209,7 @@ pub(crate) fn spawn_ipstack(
     logger: Logger,
     addresses: Vec<IpNet>,
     mtu: u32,
-    inbound_rx: mpsc::Receiver<Bytes>,
+    inbound_rx: mpsc::Receiver<IpStackInput>,
     encrypt_tx: mpsc::Sender<Bytes>,
 ) -> Result<IpStackHandles, HammerError> {
     if addresses.is_empty() {
@@ -343,7 +352,7 @@ struct StackInner {
     device: ChannelDevice,
     egress_rx: mpsc::UnboundedReceiver<Bytes>,
     encrypt_tx: mpsc::Sender<Bytes>,
-    inbound_rx: mpsc::Receiver<Bytes>,
+    inbound_rx: mpsc::Receiver<IpStackInput>,
     cmd_rx: mpsc::Receiver<StackCommand>,
     event_rx: mpsc::Receiver<SocketEvent>,
     event_tx: mpsc::Sender<SocketEvent>,
@@ -389,14 +398,21 @@ impl StackInner {
                 Some(cmd) = self.cmd_rx.recv() => {
                     self.handle_command(cmd).await;
                 }
-                Some(packet) = self.inbound_rx.recv() => {
-                    self.device.deliver(packet);
+                Some(input) = self.inbound_rx.recv() => {
+                    self.deliver_input(input);
                 }
                 Some(event) = self.event_rx.recv() => {
                     self.handle_event(event);
                 }
                 _ = sleep_until(next_at) => { /* time to poll */ }
             }
+        }
+    }
+
+    fn deliver_input(&mut self, input: IpStackInput) {
+        match input {
+            IpStackInput::Packet(packet) => self.device.deliver(packet),
+            IpStackInput::Batch(packets) => self.device.deliver_batch(packets),
         }
     }
 
