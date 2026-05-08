@@ -844,14 +844,28 @@ impl StackInner {
 
     /// Drop sockets whose user-side has fully closed (the bridge task has
     /// exited and the smoltcp socket is no longer active).
+    ///
+    /// We treat `TimeWait` as already reapable: smoltcp keeps a TIME-WAIT
+    /// socket around for 2×MSL (~4 min) before transitioning to `Closed`,
+    /// and `is_active()` reports `true` the entire time. Without an explicit
+    /// `TimeWait` opt-in the reap filter (`!is_active && !may_recv && !may_send`)
+    /// skips them, so a steady stream of short-lived HTTP/QUIC connections
+    /// piles up ~256 KiB each in the SocketSet for minutes — confirmed in the
+    /// field as the dominant contributor to NetExt RSS drift. The 2×MSL guard
+    /// exists to keep stray delayed segments from being misrouted to a new
+    /// connection that reuses the same 5-tuple, but on a userspace stack
+    /// where ephemeral ports are issued by `alloc_port()` and never collide
+    /// with a still-occupied tuple, the cost dominates the benefit.
     fn reap_dead_sockets(&mut self) {
+        use smoltcp::socket::tcp::State;
         let stale_tcp: Vec<SocketHandle> = self
             .tcp_bridges
             .keys()
             .copied()
             .filter(|handle| {
                 let socket = self.sockets.get::<tcp::Socket>(*handle);
-                !socket.is_active() && !socket.may_recv() && !socket.may_send()
+                socket.state() == State::TimeWait
+                    || (!socket.is_active() && !socket.may_recv() && !socket.may_send())
             })
             .collect();
         let reaped = stale_tcp.len();
