@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant as StdInstant;
@@ -365,14 +365,14 @@ impl Drop for SystemTcpNatLease {
 
 struct SystemTcpInboundGuard {
     stream: TcpStream,
-    abort_on_drop: bool,
+    close_on_drop: bool,
 }
 
 impl SystemTcpInboundGuard {
     fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            abort_on_drop: true,
+            close_on_drop: true,
         }
     }
 
@@ -381,14 +381,14 @@ impl SystemTcpInboundGuard {
     }
 
     fn disarm(&mut self) {
-        self.abort_on_drop = false;
+        self.close_on_drop = false;
     }
 }
 
 impl Drop for SystemTcpInboundGuard {
     fn drop(&mut self) {
-        if self.abort_on_drop {
-            abort_system_tcp_stream(&self.stream);
+        if self.close_on_drop {
+            close_system_tcp_stream(&self.stream);
         }
     }
 }
@@ -1497,9 +1497,16 @@ fn update_ipv6_udp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
     Ok(())
 }
 
-fn abort_system_tcp_stream(stream: &TcpStream) {
-    if let Err(err) = stream.set_zero_linger() {
-        debug!("set system TCP zero linger: {err}");
+fn close_system_tcp_stream(stream: &TcpStream) {
+    let ret = unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_RDWR) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if !matches!(
+            err.kind(),
+            std::io::ErrorKind::NotConnected | std::io::ErrorKind::InvalidInput
+        ) {
+            debug!("shutdown system TCP stream: {err}");
+        }
     }
 }
 
@@ -1509,7 +1516,7 @@ async fn bridge_system_tcp_streams(
 ) -> std::io::Result<(u64, u64)> {
     let result = copy_bidirectional(&mut *inbound, &mut *outbound_stream).await;
     if result.is_err() {
-        abort_system_tcp_stream(inbound);
+        close_system_tcp_stream(inbound);
     } else {
         let _ = inbound.shutdown().await;
         let _ = outbound_stream.shutdown().await;
@@ -1760,7 +1767,7 @@ async fn accept_tcp_loop(
         let Some(session) = session else {
             metrics.counters.tcp_unknown_nat_total.increment(1);
             debug!("unknown system TCP NAT session: {}", peer.port());
-            abort_system_tcp_stream(&inbound);
+            close_system_tcp_stream(&inbound);
             continue;
         };
         let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
@@ -2977,7 +2984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn system_tcp_bridge_abortively_closes_inbound_on_copy_error() {
+    async fn system_tcp_bridge_closes_inbound_on_copy_error_without_linger() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind listener");
@@ -3000,9 +3007,10 @@ mod tests {
             .expect_err("copy should surface outbound reset");
 
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
-        assert_eq!(
+        assert_ne!(
             inbound.linger().expect("read inbound linger"),
-            Some(Duration::ZERO)
+            Some(Duration::ZERO),
+            "system TUN close path should not rely on SO_LINGER=0; iOS rejects it with EINVAL"
         );
         let _ = client.await.expect("client task");
     }
