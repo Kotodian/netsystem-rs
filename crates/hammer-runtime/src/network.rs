@@ -68,7 +68,7 @@ impl NetworkManager {
     }
 
     pub fn set_need_wifi_state(&self, need: bool) {
-        self.need_wifi_state.store(need, Ordering::SeqCst);
+        self.need_wifi_state.store(need, Ordering::Relaxed);
     }
 
     pub fn default_network_interface(&self) -> Option<NetworkInterface> {
@@ -128,7 +128,7 @@ impl Lifecycle for NetworkManager {
                 }
             }
             StartStage::Started => {
-                self.started.store(true, Ordering::SeqCst);
+                self.started.store(true, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -157,7 +157,7 @@ impl NetworkManagerTrait for NetworkManager {
     }
 
     fn need_wifi_state(&self) -> bool {
-        self.need_wifi_state.load(Ordering::SeqCst)
+        self.need_wifi_state.load(Ordering::Relaxed)
     }
 
     fn update_wifi_state(&self) {
@@ -272,7 +272,7 @@ impl NetworkManager {
             "updated default interface {}, index {}",
             default.name, default.index
         );
-        if self.started.load(Ordering::SeqCst) {
+        if self.started.load(Ordering::Relaxed) {
             self.reset_network();
         }
     }

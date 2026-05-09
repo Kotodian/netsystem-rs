@@ -24,32 +24,37 @@ impl PauseManager {
         }
     }
 
+    // The two pause flags are independent state markers, not synchronization
+    // points. Visibility for callers waking from `wait_active` is delivered by
+    // `Notify` (which carries its own happens-before edges through tokio's
+    // task scheduler), not by these atomics. `Relaxed` is therefore sufficient
+    // and matches the standard idiom for atomic flags.
     pub fn device_pause(&self) {
-        self.device_paused.store(true, Ordering::SeqCst);
+        self.device_paused.store(true, Ordering::Relaxed);
     }
 
     pub fn device_wake(&self) {
-        if self.device_paused.swap(false, Ordering::SeqCst) {
+        if self.device_paused.swap(false, Ordering::Relaxed) {
             self.notify.notify_waiters();
         }
     }
 
     pub fn network_pause(&self) {
-        self.network_paused.store(true, Ordering::SeqCst);
+        self.network_paused.store(true, Ordering::Relaxed);
     }
 
     pub fn network_wake(&self) {
-        if self.network_paused.swap(false, Ordering::SeqCst) {
+        if self.network_paused.swap(false, Ordering::Relaxed) {
             self.notify.notify_waiters();
         }
     }
 
     pub fn is_device_paused(&self) -> bool {
-        self.device_paused.load(Ordering::SeqCst)
+        self.device_paused.load(Ordering::Relaxed)
     }
 
     pub fn is_network_paused(&self) -> bool {
-        self.network_paused.load(Ordering::SeqCst)
+        self.network_paused.load(Ordering::Relaxed)
     }
 
     pub fn is_paused(&self) -> bool {
