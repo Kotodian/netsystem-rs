@@ -212,7 +212,7 @@ impl MemoryTunDevice {
 #[async_trait]
 impl TunDevice for MemoryTunDevice {
     async fn recv(&self) -> Result<Vec<u8>, HammerError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("memory tun closed"));
         }
         self.input_rx
@@ -224,7 +224,7 @@ impl TunDevice for MemoryTunDevice {
     }
 
     async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("memory tun closed"));
         }
         self.output_tx
@@ -234,7 +234,7 @@ impl TunDevice for MemoryTunDevice {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.closed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -264,7 +264,7 @@ impl AsyncTunDevice {
 #[async_trait]
 impl TunDevice for AsyncTunDevice {
     async fn recv(&self) -> Result<Vec<u8>, HammerError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("TUN device closed"));
         }
         let mut packet = vec![0_u8; self.read_buffer_len];
@@ -278,7 +278,7 @@ impl TunDevice for AsyncTunDevice {
     }
 
     async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("TUN device closed"));
         }
         self.device
@@ -289,7 +289,7 @@ impl TunDevice for AsyncTunDevice {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.closed.store(true, Ordering::Relaxed);
     }
 }
 
@@ -618,7 +618,7 @@ impl SystemTunStack {
     }
 
     pub fn start(&self) -> Result<(), HammerError> {
-        if self.started.swap(true, Ordering::SeqCst) {
+        if self.started.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
         let addresses = StackAddresses::from_options(&self.options)?;
@@ -3454,7 +3454,7 @@ mod tests {
         fn reset(&self) {}
 
         async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
-            self.queries.fetch_add(1, Ordering::SeqCst);
+            self.queries.fetch_add(1, Ordering::Relaxed);
             let query = message.queries[0].clone();
             let mut response = message.fixed_response(FixedResponseCode::NoError);
             response.add_answer(Record::from_rdata(
@@ -3503,7 +3503,7 @@ mod tests {
         }
 
         async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
-            if self.closed.load(Ordering::SeqCst) {
+            if self.closed.load(Ordering::Relaxed) {
                 return Err(HammerError::internal("scripted tun closed"));
             }
             let mut batches = self.batches.lock().await;
@@ -3515,7 +3515,7 @@ mod tests {
         }
 
         fn close(&self) {
-            self.closed.store(true, Ordering::SeqCst);
+            self.closed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -3676,7 +3676,7 @@ final = "direct"
             )
             .await
             .expect("warm DNS cache");
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
 
         let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
         let queued = dns_query_packet("queued.example.com");
@@ -3717,7 +3717,7 @@ final = "direct"
         let response = dns_message_from_packet(&response_packet);
         assert_eq!(response.metadata.id, 0x1234);
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
-        assert_eq!(queries.load(Ordering::SeqCst), 1);
+        assert_eq!(queries.load(Ordering::Relaxed), 1);
     }
 
     struct ResetOnWriteStream;
