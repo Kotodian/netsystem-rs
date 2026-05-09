@@ -125,6 +125,10 @@ impl Hysteria2Client {
     pub fn close(&self, reason: &'static [u8]) {
         self.connection.close(0u32.into(), reason);
     }
+
+    fn is_closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
 }
 
 async fn connect_with_timeout(
@@ -466,11 +470,21 @@ impl Hysteria2Outbound {
     }
 
     fn cached_client(&self) -> Option<Arc<Hysteria2Client>> {
-        self.client_state
+        let mut state = self
+            .client_state
             .lock()
-            .expect("Hysteria2Outbound client poisoned")
-            .client
-            .clone()
+            .expect("Hysteria2Outbound client poisoned");
+        if let Some(client) = state.client.as_ref()
+            && client.is_closed()
+        {
+            debug!(
+                "hysteria2 outbound {} dropping closed cached client",
+                self.id
+            );
+            state.epoch = state.epoch.wrapping_add(1);
+            state.client = None;
+        }
+        state.client.clone()
     }
 
     fn client_epoch(&self) -> u64 {
@@ -1057,7 +1071,12 @@ fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use h3::server;
     use hammer_core::log::{DiscardWriter, Factory};
+    use http::Response;
+    use quinn::crypto::rustls::QuicServerConfig;
+    use rustls::pki_types::PrivateKeyDer;
+    use std::sync::atomic::AtomicUsize;
 
     fn logger(id: &str) -> Logger {
         Factory::new(std::time::Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -1102,6 +1121,136 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    struct AuthServer {
+        _endpoint: quinn::Endpoint,
+        port: u16,
+        auth_count: Arc<AtomicUsize>,
+    }
+
+    impl AuthServer {
+        async fn start(password: &str) -> Result<Self, HammerError> {
+            let endpoint = quinn::Endpoint::server(
+                auth_server_config()?,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            )
+            .map_err(|err| HammerError::internal(format!("start auth server: {err}")))?;
+            let port = endpoint
+                .local_addr()
+                .map_err(|err| HammerError::internal(format!("auth server addr: {err}")))?
+                .port();
+            let auth_count = Arc::new(AtomicUsize::new(0));
+            spawn_auth_accept(
+                endpoint.clone(),
+                password.to_owned(),
+                Arc::clone(&auth_count),
+            );
+            Ok(Self {
+                _endpoint: endpoint,
+                port,
+                auth_count,
+            })
+        }
+
+        fn port(&self) -> u16 {
+            self.port
+        }
+
+        fn auth_count(&self) -> usize {
+            self.auth_count.load(Ordering::SeqCst)
+        }
+    }
+
+    fn spawn_auth_accept(
+        endpoint: quinn::Endpoint,
+        password: String,
+        auth_count: Arc<AtomicUsize>,
+    ) {
+        crate::spawn::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let password = password.clone();
+                let auth_count = Arc::clone(&auth_count);
+                crate::spawn::spawn(async move {
+                    if let Ok(connection) = incoming.await {
+                        let _ = handle_auth_connection(connection, password, auth_count).await;
+                    }
+                });
+            }
+        });
+    }
+
+    async fn handle_auth_connection(
+        connection: quinn::Connection,
+        password: String,
+        auth_count: Arc<AtomicUsize>,
+    ) -> Result<(), HammerError> {
+        let h3_conn = h3_quinn::Connection::new(connection);
+        let mut incoming: server::Connection<_, Bytes> = server::Connection::new(h3_conn)
+            .await
+            .map_err(|err| HammerError::internal(format!("h3 auth server init: {err}")))?;
+        let resolver = incoming
+            .accept()
+            .await
+            .map_err(|err| HammerError::internal(format!("accept auth request: {err}")))?
+            .ok_or_else(|| HammerError::internal("missing auth request"))?;
+        let (request, mut stream) = resolver
+            .resolve_request()
+            .await
+            .map_err(|err| HammerError::internal(format!("resolve auth request: {err}")))?;
+        let auth = protocol::auth_request_from_headers(request.headers());
+        auth_count.fetch_add(1, Ordering::SeqCst);
+        let status = if auth.auth == password {
+            protocol::STATUS_AUTH_OK
+        } else {
+            401
+        };
+        let mut response = Response::builder()
+            .status(status)
+            .body(())
+            .map_err(|err| HammerError::internal(format!("build auth response: {err}")))?;
+        protocol::auth_response_to_headers(
+            response.headers_mut(),
+            &protocol::AuthResponse {
+                udp_enabled: true,
+                rx: 0,
+                rx_auto: false,
+            },
+        );
+        stream
+            .send_response(response)
+            .await
+            .map_err(|err| HammerError::internal(format!("send auth response: {err}")))?;
+        stream
+            .finish()
+            .await
+            .map_err(|err| HammerError::internal(format!("finish auth response: {err}")))?;
+        crate::spawn::spawn(async move {
+            let _incoming = incoming;
+            std::future::pending::<()>().await;
+        });
+        Ok(())
+    }
+
+    fn auth_server_config() -> Result<quinn::ServerConfig, HammerError> {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
+        let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.into()],
+            PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
+        )
+        .map_err(|err| HammerError::internal(format!("server certificate: {err}")))?;
+        crypto.alpn_protocols = vec![b"h3".to_vec()];
+        Ok(quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(crypto)
+                .map_err(|err| HammerError::internal(format!("server quic tls: {err}")))?,
+        )))
     }
 
     #[test]
@@ -1202,6 +1351,39 @@ mod tests {
         outbound.reset();
 
         assert_eq!(outbound.connect_backoff_remaining(), None);
+    }
+
+    #[tokio::test]
+    async fn outbound_reconnects_when_cached_client_is_closed() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start echo server");
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(server.port()),
+        );
+
+        let first = outbound
+            .client_with_timeout(Duration::from_secs(2))
+            .await
+            .expect("connect first client");
+        assert_eq!(server.auth_count(), 1);
+
+        first.close(b"simulate stale cached connection");
+        let _ = first.connection.closed().await;
+        assert!(first.is_closed());
+
+        let second = outbound
+            .client_with_timeout(Duration::from_secs(2))
+            .await
+            .expect("reconnect client");
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "closed cached Hysteria2 client must not be reused"
+        );
+        assert_eq!(server.auth_count(), 2);
     }
 
     #[tokio::test]
