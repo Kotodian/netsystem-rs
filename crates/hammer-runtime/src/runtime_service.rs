@@ -415,6 +415,12 @@ impl RuntimeService {
                 return;
             }
             inner.network.reset_network();
+            // Drop cached outbound clients (e.g. hysteria2 QUIC connections)
+            // alongside the inbound + DNS reset. Without this, sing-box-style
+            // `InterfaceUpdated` semantics never reach our outbounds, so a
+            // stale cached_client survives every network reset and the next
+            // dial blocks on the dead QUIC connection's max_idle_timeout.
+            inner.outbound.reset_network();
             inner.dns_router.reset_network();
             inner.outbound.ensure_connected();
         });

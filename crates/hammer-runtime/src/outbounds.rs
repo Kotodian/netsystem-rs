@@ -611,3 +611,101 @@ impl OutboundManagerTrait for OutboundManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    use hammer_adapter::Network;
+    use hammer_core::error::CoreError;
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    fn test_logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    /// Bare-bones Outbound that only counts how many times `reset` was called
+    /// so we can prove `OutboundManager::reset_network` actually fans out to
+    /// every registered outbound. Required because `runtime_service::reset_network`
+    /// previously skipped this fan-out, leaving cached hysteria2 clients stale
+    /// after iOS sleep/wake.
+    struct CountingOutbound {
+        id: String,
+        networks: Vec<Network>,
+        dependencies: Vec<String>,
+        resets: AtomicUsize,
+    }
+
+    impl CountingOutbound {
+        fn arc(id: &str) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_owned(),
+                networks: vec![Network::Tcp],
+                dependencies: Vec::new(),
+                resets: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Outbound for CountingOutbound {
+        fn type_name(&self) -> &str {
+            "counting"
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn networks(&self) -> &[Network] {
+            &self.networks
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &self.dependencies
+        }
+
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn dial(
+            &self,
+            _network: Network,
+            _destination: SocksAddr,
+            _initial_payload: &[u8],
+        ) -> Result<Box<dyn ProxyStream>, CoreError> {
+            Err(CoreError::internal("counting outbound: dial not supported"))
+        }
+
+        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, CoreError> {
+            Err(CoreError::internal(
+                "counting outbound: listen_packet not supported",
+            ))
+        }
+    }
+
+    #[test]
+    fn reset_network_invokes_reset_on_every_registered_outbound() {
+        let manager = OutboundManager::new(test_logger("outbound-test"), "default");
+        let a = CountingOutbound::arc("a");
+        let b = CountingOutbound::arc("b");
+        manager
+            .register_outbound("a".into(), a.clone() as Arc<dyn Outbound>)
+            .expect("register outbound a");
+        manager
+            .register_outbound("b".into(), b.clone() as Arc<dyn Outbound>)
+            .expect("register outbound b");
+
+        manager.reset_network();
+
+        assert_eq!(a.resets.load(Ordering::SeqCst), 1, "outbound a reset once");
+        assert_eq!(b.resets.load(Ordering::SeqCst), 1, "outbound b reset once");
+
+        manager.reset_network();
+        assert_eq!(a.resets.load(Ordering::SeqCst), 2, "second pass also fans");
+        assert_eq!(b.resets.load(Ordering::SeqCst), 2, "second pass also fans");
+    }
+}
