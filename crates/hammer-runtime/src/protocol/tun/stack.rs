@@ -524,16 +524,8 @@ type UdpFlowPayload = Vec<u8>;
 struct DnsHijackJob {
     packet: Vec<u8>,
     destination: SocksAddr,
-    payload: Range<usize>,
+    message: Message,
     options: DnsQueryOptions,
-}
-
-impl DnsHijackJob {
-    fn payload(&self) -> Result<&[u8], HammerError> {
-        self.packet
-            .get(self.payload.start..self.payload.end)
-            .ok_or_else(|| HammerError::internal("DNS hijack payload range is out of bounds"))
-    }
 }
 
 struct IcmpJob {
@@ -2289,14 +2281,33 @@ fn handle_system_udp_packet(
     };
     match decision {
         RouteDecision::HijackDns => {
-            enqueue_system_dns_hijack_packet(
-                dns_hijack_tx,
-                packet,
-                parsed.destination,
-                parsed.payload_range,
-                dns_query_options(&metadata),
-                &metrics,
-            );
+            let message = match <Message as MessageExt>::from_bytes(parsed.payload(&packet)?) {
+                Ok(message) => message,
+                Err(err) => {
+                    metrics.counters.udp_dns_error_total.increment(1);
+                    return Err(err);
+                }
+            };
+            let options = dns_query_options(&metadata);
+            let destination = parsed.destination;
+            match dns_router.try_exchange_fast(&message, options.clone())? {
+                Some(response) => {
+                    let response_bytes = MessageExt::to_bytes(&response)?;
+                    let response_packet =
+                        udp_response_packet(&packet, destination, &response_bytes)?;
+                    enqueue_tun_control_write(control_write_tx, response_packet, &metrics);
+                }
+                None => {
+                    enqueue_system_dns_hijack_packet(
+                        dns_hijack_tx,
+                        packet,
+                        destination,
+                        message,
+                        options,
+                        &metrics,
+                    );
+                }
+            }
         }
         RouteDecision::Reject { method } => {
             metrics.reject_total.inc(Network::Udp);
@@ -2402,14 +2413,14 @@ fn enqueue_system_dns_hijack_packet(
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
     packet: Vec<u8>,
     destination: SocksAddr,
-    payload: Range<usize>,
+    message: Message,
     options: DnsQueryOptions,
     metrics: &TunMetrics,
 ) {
     let job = DnsHijackJob {
         packet,
         destination,
-        payload,
+        message,
         options,
     };
     match dns_hijack_tx.try_send(job) {
@@ -2462,8 +2473,7 @@ async fn handle_system_dns_hijack_packet(
     device: Arc<dyn TunDevice>,
     job: DnsHijackJob,
 ) -> Result<(), HammerError> {
-    let message = <Message as MessageExt>::from_bytes(job.payload()?)?;
-    let response = dns_router.exchange(message, job.options).await?;
+    let response = dns_router.exchange(job.message, job.options).await?;
     let response_bytes = MessageExt::to_bytes(&response)?;
     let response_packet = udp_response_packet(&job.packet, job.destination, &response_bytes)?;
     device.send(response_packet).await
@@ -3246,10 +3256,12 @@ mod tests {
     use hammer_adapter::{DnsTransport, Lifecycle, StartStage};
     use hammer_core::config;
     use hammer_core::log::{DiscardWriter, Factory};
+    use hickory_proto::op::ResponseCode;
     use hickory_proto::rr::{RData, Record};
     use std::collections::VecDeque;
     use std::io;
     use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
     use tokio::sync::Notify;
@@ -3407,6 +3419,53 @@ mod tests {
         }
     }
 
+    struct CountingDnsTransport {
+        queries: Arc<AtomicUsize>,
+    }
+
+    impl Lifecycle for CountingDnsTransport {
+        fn name(&self) -> &str {
+            "counting-dns"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl DnsTransport for CountingDnsTransport {
+        fn type_name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "counting"
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+
+        fn reset(&self) {}
+
+        async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+            self.queries.fetch_add(1, Ordering::SeqCst);
+            let query = message.queries[0].clone();
+            let mut response = message.fixed_response(FixedResponseCode::NoError);
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                60,
+                RData::A(std::net::Ipv4Addr::new(203, 0, 113, 53).into()),
+            ));
+            Ok(response)
+        }
+    }
+
     struct ScriptedBatchTunDevice {
         batches: Mutex<VecDeque<Vec<Vec<u8>>>>,
         read_after_batches: Notify,
@@ -3483,6 +3542,12 @@ mod tests {
         packet
     }
 
+    fn dns_message_from_packet(packet: &[u8]) -> Message {
+        let parsed = parse_ip_packet_view(packet).expect("parse DNS packet");
+        <Message as MessageExt>::from_bytes(parsed.payload(packet).expect("DNS payload"))
+            .expect("parse DNS message")
+    }
+
     #[tokio::test]
     async fn packet_loop_does_not_wait_for_dns_hijack_before_reading_next_batch() {
         let options = config::parse_config(
@@ -3553,6 +3618,106 @@ final = "direct"
         .await
         .expect("packet loop should keep reading while DNS hijack is still pending");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_dns_hijack_uses_fastpath_when_slowpath_queue_is_full() {
+        let options = config::parse_config(
+            r#"
+[tun]
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+
+[dns]
+server = "hosts"
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[route]
+final = "direct"
+"#,
+        )
+        .expect("parse config");
+        let outbound = Arc::new(
+            OutboundManager::from_options(
+                test_logger("outbound"),
+                options.route.final_.clone(),
+                &options.outbounds,
+            )
+            .expect("outbound manager"),
+        );
+        let router = Arc::new(
+            Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
+                .expect("router"),
+        );
+        let dns_transport = Arc::new(DnsTransportManager::new(
+            test_logger("dns-transport"),
+            "counting",
+        ));
+        let queries = Arc::new(AtomicUsize::new(0));
+        dns_transport.insert(Arc::new(CountingDnsTransport {
+            queries: Arc::clone(&queries),
+        }));
+        let dns_router = Arc::new(DnsRouter::new_with_manager(
+            test_logger("dns-router"),
+            dns_transport,
+            config::DomainStrategy::AsIs,
+        ));
+
+        let request = dns_query_packet("example.com");
+        dns_router
+            .exchange(
+                dns_message_from_packet(&request),
+                DnsQueryOptions::default(),
+            )
+            .await
+            .expect("warm DNS cache");
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+
+        let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
+        let queued = dns_query_packet("queued.example.com");
+        let queued_parsed = parse_ip_packet_view(&queued).expect("queued DNS packet");
+        let queued_message = dns_message_from_packet(&queued);
+        dns_hijack_tx
+            .try_send(DnsHijackJob {
+                packet: queued,
+                destination: queued_parsed.destination,
+                message: queued_message,
+                options: DnsQueryOptions::default(),
+            })
+            .expect("fill DNS slowpath queue");
+
+        let (control_write_tx, mut control_write_rx) = mpsc::channel(1);
+        let parsed = parse_ip_packet_view(&request).expect("DNS packet");
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        handle_system_udp_packet(
+            router,
+            Arc::clone(&dns_router),
+            outbound,
+            "tun".to_owned(),
+            MemoryTunDevice::new() as Arc<dyn TunDevice>,
+            Arc::new(StdMutex::new(HashMap::new())),
+            &dns_hijack_tx,
+            &control_write_tx,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            request,
+            parsed,
+            metrics,
+        )
+        .expect("handle UDP DNS packet");
+
+        let response_packet = timeout(Duration::from_millis(50), control_write_rx.recv())
+            .await
+            .expect("cached DNS response should bypass slowpath queue")
+            .expect("cached DNS response packet");
+        let response = dns_message_from_packet(&response_packet);
+        assert_eq!(response.metadata.id, 0x1234);
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
     }
 
     struct ResetOnWriteStream;

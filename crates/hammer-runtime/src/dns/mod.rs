@@ -317,6 +317,38 @@ impl DnsClient {
         Ok(response)
     }
 
+    pub(crate) fn try_exchange_cached(
+        &self,
+        transport: Arc<dyn DnsTransport>,
+        message: &Message,
+        options: DnsQueryOptions,
+    ) -> Result<Option<Message>, HammerError> {
+        if message.queries.len() != 1 {
+            warn!("bad question size: {}", message.queries.len());
+            return Ok(Some(message.fixed_response(FixedResponseCode::FormatError)));
+        }
+        let query = first_query(message)?.clone();
+        if strategy_rejects(query.query_type(), options.strategy) {
+            return Ok(Some(message.fixed_response(FixedResponseCode::NoError)));
+        }
+        if options.disable_cache {
+            return Ok(None);
+        }
+        let key = CacheKey {
+            transport: transport.id().to_owned(),
+            name: query.name().to_ascii().to_ascii_lowercase(),
+            record_type: query.query_type(),
+        };
+        let Some(mut cached) = self.load_cache(&key) else {
+            return Ok(None);
+        };
+        cached.metadata.id = message.metadata.id;
+        if let Some(ttl) = options.rewrite_ttl {
+            normalize_ttl(&mut cached, ttl);
+        }
+        Ok(Some(cached))
+    }
+
     pub async fn lookup(
         &self,
         transport: Arc<dyn DnsTransport>,
@@ -1181,6 +1213,48 @@ impl DnsRouter {
         Ok(response)
     }
 
+    pub(crate) fn try_exchange_fast(
+        &self,
+        message: &Message,
+        mut options: DnsQueryOptions,
+    ) -> Result<Option<Message>, HammerError> {
+        if !self.rules.is_empty() && options.transport.is_none() {
+            let qname = message
+                .queries
+                .first()
+                .map(|q| domain_from_name(q.name()))
+                .unwrap_or_default();
+            if !qname.is_empty() {
+                match self.match_rules(&qname) {
+                    MatchedAction::Route(transport) => {
+                        options.transport = Some(transport);
+                    }
+                    MatchedAction::Reject(kind) => {
+                        let code = match kind {
+                            RejectKind::NxDomain => FixedResponseCode::NXDomain,
+                            RejectKind::Refused => FixedResponseCode::Refused,
+                        };
+                        return Ok(Some(message.fixed_response(code)));
+                    }
+                    MatchedAction::Default => {}
+                }
+            }
+        }
+
+        let transport = self.resolve_transport(&options)?;
+        if options.strategy == DomainStrategy::AsIs {
+            options.strategy = self.default_strategy;
+        }
+        let Some(response) = self
+            .client
+            .try_exchange_cached(transport, message, options)?
+        else {
+            return Ok(None);
+        };
+        self.save_reverse_mapping(&response);
+        Ok(Some(response))
+    }
+
     pub async fn lookup(
         &self,
         domain: &str,
@@ -1407,9 +1481,13 @@ mod tests {
     }
 
     fn build_query(name: &str) -> Message {
+        build_query_with_type(name, RecordType::A)
+    }
+
+    fn build_query_with_type(name: &str, record_type: RecordType) -> Message {
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
         query.add_query({
-            let mut q = Query::query(Name::from_ascii(name).expect("name"), RecordType::A);
+            let mut q = Query::query(Name::from_ascii(name).expect("name"), record_type);
             q.set_query_class(DNSClass::IN);
             q
         });
@@ -1629,6 +1707,92 @@ mod tests {
             .expect("exchange");
 
         assert_eq!(local.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_fastpath_returns_cached_response_without_transport_exchange() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let router =
+            DnsRouter::new_with_manager(test_logger("dns-router"), manager, DomainStrategy::AsIs);
+
+        let _ = router
+            .exchange(build_query("example.com."), DnsQueryOptions::default())
+            .await
+            .expect("warm cache");
+        let mut query = build_query("example.com.");
+        query.metadata.id = 99;
+        let response = router
+            .try_exchange_fast(&query, DnsQueryOptions::default())
+            .expect("fastpath")
+            .expect("cached response");
+
+        assert_eq!(response.metadata.id, 99);
+        assert_eq!(
+            response.addresses(),
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]
+        );
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_router_fastpath_returns_none_on_cache_miss_without_transport_exchange() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let router =
+            DnsRouter::new_with_manager(test_logger("dns-router"), manager, DomainStrategy::AsIs);
+
+        let query = build_query("example.com.");
+        let response = router
+            .try_exchange_fast(&query, DnsQueryOptions::default())
+            .expect("fastpath");
+
+        assert!(response.is_none());
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_fastpath_rejects_matching_rule_without_transport_exchange() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let rules = vec![DnsRule {
+            matcher: DnsRuleMatcher::DomainKeyword(vec!["doubleclick".to_owned()]),
+            action: DnsRuleAction::Reject {
+                kind: RejectKind::NxDomain,
+            },
+        }];
+        let router = router_with_rules(manager, rules);
+
+        let query = build_query("ad.doubleclick.net.");
+        let response = router
+            .try_exchange_fast(&query, DnsQueryOptions::default())
+            .expect("fastpath")
+            .expect("reject response");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_router_fastpath_applies_strategy_reject_without_transport_exchange() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let manager = manager_with(&[Arc::clone(&upstream)], "upstream");
+        let router =
+            DnsRouter::new_with_manager(test_logger("dns-router"), manager, DomainStrategy::AsIs);
+        let options = DnsQueryOptions {
+            strategy: DomainStrategy::Ipv4Only,
+            ..DnsQueryOptions::default()
+        };
+
+        let query = build_query_with_type("example.com.", RecordType::AAAA);
+        let response = router
+            .try_exchange_fast(&query, options)
+            .expect("fastpath")
+            .expect("strategy response");
+
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(response.answers.is_empty());
         assert_eq!(upstream.queries.load(Ordering::SeqCst), 0);
     }
 
