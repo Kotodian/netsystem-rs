@@ -583,6 +583,10 @@ impl Outbound for Hysteria2Outbound {
         self.clear_connect_backoff();
     }
 
+    async fn ensure_connected(&self) -> Result<(), HammerError> {
+        self.client().await.map(|_| ())
+    }
+
     #[cfg(feature = "probe")]
     async fn probe_latency(
         &self,
@@ -1394,6 +1398,71 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &second),
             "closed cached Hysteria2 client must not be reused"
+        );
+        assert_eq!(server.auth_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn outbound_ensure_connected_keeps_existing_client() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start echo server");
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(server.port()),
+        );
+
+        let first = outbound
+            .client_with_timeout(Duration::from_secs(2))
+            .await
+            .expect("connect first client");
+        assert_eq!(server.auth_count(), 1);
+
+        outbound
+            .ensure_connected()
+            .await
+            .expect("ensure outbound connected");
+
+        let current = outbound
+            .cached_client()
+            .expect("ensure_connected should keep cached client");
+        assert!(
+            Arc::ptr_eq(&first, &current),
+            "ensure_connected must not reconnect an already connected Hysteria2 client"
+        );
+        assert_eq!(server.auth_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn outbound_ensure_connected_warms_new_client_after_reset() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start echo server");
+        let outbound = Hysteria2Outbound::new(
+            logger("hysteria2"),
+            "hysteria2".to_owned(),
+            outbound_options_for_test(server.port()),
+        );
+
+        let first = outbound
+            .client_with_timeout(Duration::from_secs(2))
+            .await
+            .expect("connect first client");
+        assert_eq!(server.auth_count(), 1);
+
+        outbound.reset();
+        outbound
+            .ensure_connected()
+            .await
+            .expect("ensure outbound connected");
+
+        let second = outbound
+            .cached_client()
+            .expect("ensure_connected should cache the new client");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "ensure_connected after reset must replace the old Hysteria2 client"
         );
         assert_eq!(server.auth_count(), 2);
     }

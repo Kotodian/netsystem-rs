@@ -410,9 +410,12 @@ impl RuntimeService {
 
     pub fn reset_network(&self) {
         let _ = self.control_call(|inner| {
+            if inner.state != ServiceState::Running {
+                return;
+            }
             inner.network.reset_network();
             inner.dns_router.reset_network();
-            inner.outbound.reset_network();
+            inner.outbound.ensure_connected();
         });
     }
 

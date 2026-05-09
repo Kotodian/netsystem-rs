@@ -63,6 +63,13 @@ pub trait Outbound: Send + Sync + 'static {
     fn dependencies(&self) -> &[String];
     fn reset(&self) {}
 
+    /// Ensure this outbound has a live cached connection if it needs one.
+    /// Stateless outbounds keep the no-op; cached outbounds should return
+    /// immediately when already connected.
+    async fn ensure_connected(&self) -> Result<(), CoreError> {
+        Ok(())
+    }
+
     async fn dial(
         &self,
         network: Network,

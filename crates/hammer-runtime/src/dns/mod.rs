@@ -156,9 +156,9 @@ pub(in crate::dns) fn query_message(
 fn match_dns_rule(matcher: &DnsRuleMatcher, qname: &str) -> bool {
     match matcher {
         DnsRuleMatcher::Domain(values) => values.iter().any(|v| v == qname),
-        DnsRuleMatcher::DomainSuffix(values) => {
-            values.iter().any(|suffix| domain_suffix_matches(qname, suffix))
-        }
+        DnsRuleMatcher::DomainSuffix(values) => values
+            .iter()
+            .any(|suffix| domain_suffix_matches(qname, suffix)),
         DnsRuleMatcher::DomainKeyword(values) => {
             values.iter().any(|kw| qname.contains(kw.as_str()))
         }
@@ -1409,8 +1409,7 @@ mod tests {
     fn build_query(name: &str) -> Message {
         let mut query = Message::new(7, MessageType::Query, OpCode::Query);
         query.add_query({
-            let mut q =
-                Query::query(Name::from_ascii(name).expect("name"), RecordType::A);
+            let mut q = Query::query(Name::from_ascii(name).expect("name"), RecordType::A);
             q.set_query_class(DNSClass::IN);
             q
         });
@@ -1428,10 +1427,7 @@ mod tests {
         manager
     }
 
-    fn router_with_rules(
-        manager: Arc<DnsTransportManager>,
-        rules: Vec<DnsRule>,
-    ) -> DnsRouter {
+    fn router_with_rules(manager: Arc<DnsTransportManager>, rules: Vec<DnsRule>) -> DnsRouter {
         DnsRouter::new_with_manager(test_logger("dns-router"), manager, DomainStrategy::AsIs)
             .with_rules(&rules)
             .expect("with_rules")

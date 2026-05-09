@@ -32,6 +32,11 @@ const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
 const SYSTEM_UDP_FLOW_CAPACITY: usize = 256;
 const SYSTEM_UDP_CHANNEL_CAPACITY: usize = 64;
+const SYSTEM_DNS_HIJACK_QUEUE_CAPACITY: usize = 64;
+const SYSTEM_DNS_HIJACK_WORKERS: usize = 4;
+const SYSTEM_ICMP_QUEUE_CAPACITY: usize = 32;
+const SYSTEM_ICMP_WORKERS: usize = 2;
+const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -408,6 +413,18 @@ struct UdpFlowState {
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
+struct DnsHijackJob {
+    packet: Vec<u8>,
+    destination: SocksAddr,
+    payload: Vec<u8>,
+    options: DnsQueryOptions,
+}
+
+struct IcmpJob {
+    packet: Vec<u8>,
+    parsed: ParsedIpPacket,
+}
+
 #[derive(Clone)]
 struct TcpPendingDialLimiter {
     semaphore: Arc<Semaphore>,
@@ -438,7 +455,7 @@ pub struct SystemTunStack {
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
-    udp_flows: Arc<Mutex<UdpFlowMap>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
     tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
@@ -484,7 +501,7 @@ impl SystemTunStack {
             device,
             tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
             tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
-            udp_flows: Arc::new(Mutex::new(HashMap::new())),
+            udp_flows: Arc::new(StdMutex::new(HashMap::new())),
             tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
             started: AtomicBool::new(false),
@@ -622,6 +639,8 @@ struct TunCounters {
     udp_route_prepare_error_total: Counter,
     /// DNS hijack path errors (parse / exchange / serialize / write).
     udp_dns_error_total: Counter,
+    /// DNS hijack packets dropped because the background task budget is full.
+    udp_dns_drop_busy_total: Counter,
     /// Outbound `listen_packet()` errors when establishing a UDP flow.
     udp_listen_error_total: Counter,
     /// UDP flows evicted from the flow map because of capacity pressure.
@@ -636,6 +655,12 @@ struct TunCounters {
     udp_flow_response_write_error_total: Counter,
     /// UDP flows torn down by the idle timeout.
     udp_flow_timeout_total: Counter,
+    /// ICMP packets dropped because the background task budget is full.
+    icmp_drop_busy_total: Counter,
+    /// Control packets dropped because the TUN write queue is full.
+    control_write_drop_busy_total: Counter,
+    /// Control packet writes that failed after leaving the main packet loop.
+    control_write_error_total: Counter,
 }
 
 impl TunCounters {
@@ -661,6 +686,7 @@ impl TunCounters {
                 "udp_route_prepare_error_total",
             ),
             udp_dns_error_total: recorder_counter(&recorder, "udp_dns_error_total"),
+            udp_dns_drop_busy_total: recorder_counter(&recorder, "udp_dns_drop_busy_total"),
             udp_listen_error_total: recorder_counter(&recorder, "udp_listen_error_total"),
             udp_flow_evict_total: recorder_counter(&recorder, "udp_flow_evict_total"),
             udp_flow_drop_busy_total: recorder_counter(&recorder, "udp_flow_drop_busy_total"),
@@ -671,6 +697,12 @@ impl TunCounters {
                 "udp_flow_response_write_error_total",
             ),
             udp_flow_timeout_total: recorder_counter(&recorder, "udp_flow_timeout_total"),
+            icmp_drop_busy_total: recorder_counter(&recorder, "icmp_drop_busy_total"),
+            control_write_drop_busy_total: recorder_counter(
+                &recorder,
+                "control_write_drop_busy_total",
+            ),
+            control_write_error_total: recorder_counter(&recorder, "control_write_error_total"),
         }
     }
 }
@@ -1884,7 +1916,7 @@ async fn packet_loop(
     inbound_id: String,
     device: Arc<dyn TunDevice>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    udp_flows: Arc<Mutex<UdpFlowMap>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     udp_timeout: Duration,
     metrics: TunMetrics,
@@ -1898,6 +1930,25 @@ async fn packet_loop(
     let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
+    spawn_dns_hijack_workers(
+        Arc::clone(&dns_router),
+        Arc::clone(&device),
+        metrics.clone(),
+        dns_hijack_rx,
+    );
+    let (icmp_tx, icmp_rx) = mpsc::channel(SYSTEM_ICMP_QUEUE_CAPACITY);
+    spawn_icmp_workers(
+        Arc::clone(&router),
+        Arc::clone(&dns_router),
+        Arc::clone(&outbound),
+        inbound_id.clone(),
+        Arc::clone(&device),
+        icmp_rx,
+    );
+    let (control_write_tx, control_write_rx) =
+        mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
+    spawn_tun_control_writer(Arc::clone(&device), metrics.clone(), control_write_rx);
     loop {
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
@@ -1974,9 +2025,10 @@ async fn packet_loop(
                 debug!("write system TCP packets: {err}");
             }
         }
-        // Pass 3: UDP / DNS handling stays sequential — these awaits would
-        // serialise the loop anyway, and the volume is low enough that
-        // batching them would not pay for itself.
+        // Pass 3: UDP / DNS handling must not await in the TUN read loop.
+        // Route lookup and flow queueing stay cheap and synchronous; DNS
+        // hijack, outbound packet connection setup, and response writes run
+        // in background tasks owned by their business path.
         for (packet, parsed) in udp_pending.drain(..) {
             if let Err(err) = handle_system_udp_packet(
                 Arc::clone(&router),
@@ -1985,46 +2037,34 @@ async fn packet_loop(
                 inbound_id.clone(),
                 Arc::clone(&device),
                 Arc::clone(&udp_flows),
+                &dns_hijack_tx,
+                &control_write_tx,
                 udp_timeout,
                 packet,
                 parsed,
                 metrics.clone(),
-            )
-            .await
-            {
+            ) {
                 debug!("handle system UDP packet: {err}");
             }
         }
-        // Pass 4: ICMP echo handling, also sequential. Each ping flight is
-        // a synchronous send/recv round-trip via `outbound.listen_icmp()`;
-        // if the chosen outbound rejects ICMP, we synthesize a Destination
-        // Unreachable and write it back into the tun.
+        // Pass 4: ICMP echo handling also leaves the TUN read loop before
+        // touching outbound I/O.
         for (packet, parsed) in icmp_pending.drain(..) {
-            if let Err(err) = handle_system_icmp_packet(
-                Arc::clone(&router),
-                Arc::clone(&dns_router),
-                Arc::clone(&outbound),
-                inbound_id.clone(),
-                Arc::clone(&device),
-                packet,
-                parsed,
-            )
-            .await
-            {
-                debug!("handle system ICMP packet: {err}");
-            }
+            enqueue_system_icmp_packet(&icmp_tx, packet, parsed, &metrics);
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_system_udp_packet(
+fn handle_system_udp_packet(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
     device: Arc<dyn TunDevice>,
-    udp_flows: Arc<Mutex<UdpFlowMap>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
+    control_write_tx: &mpsc::Sender<Vec<u8>>,
     udp_timeout: Duration,
     packet: Vec<u8>,
     parsed: ParsedIpPacket,
@@ -2060,42 +2100,14 @@ async fn handle_system_udp_packet(
     };
     match decision {
         RouteDecision::HijackDns => {
-            let message = match <Message as MessageExt>::from_bytes(&tun_packet.payload) {
-                Ok(message) => message,
-                Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
-                    return Err(err);
-                }
-            };
-            let response = match dns_router
-                .exchange(message, dns_query_options(&tun_packet.metadata))
-                .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
-                    return Err(err);
-                }
-            };
-            let response_bytes = match MessageExt::to_bytes(&response) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    metrics.counters.udp_dns_error_total.increment(1);
-                    return Err(err);
-                }
-            };
-            let response_packet =
-                match udp_response_packet(&packet, parsed.destination, &response_bytes) {
-                    Ok(packet) => packet,
-                    Err(err) => {
-                        metrics.counters.udp_dns_error_total.increment(1);
-                        return Err(err);
-                    }
-                };
-            if let Err(err) = device.send(response_packet).await {
-                metrics.counters.udp_dns_error_total.increment(1);
-                return Err(err);
-            }
+            enqueue_system_dns_hijack_packet(
+                dns_hijack_tx,
+                packet,
+                parsed.destination,
+                tun_packet.payload,
+                dns_query_options(&tun_packet.metadata),
+                &metrics,
+            );
         }
         RouteDecision::Reject { method } => {
             metrics.reject_total.inc(Network::Udp);
@@ -2109,50 +2121,34 @@ async fn handle_system_udp_packet(
                 debug!("{}", message);
             }
             if let Ok(response) = udp_unreachable_packet(&packet) {
-                device.send(response).await?;
+                enqueue_tun_control_write(control_write_tx, response, &metrics);
             }
         }
         RouteDecision::Route {
             outbound: outbound_id,
         } => {
+            let Some(outbound_item) = outbound.get(&outbound_id) else {
+                metrics.outbound_missing_total.inc(Network::Udp);
+                return Err(HammerError::internal(format!(
+                    "outbound not found: {outbound_id}"
+                )));
+            };
+            let destination = route_destination(&tun_packet.metadata, Some(dns_router.as_ref()))?;
+            let template = UdpResponseTemplate::from_request(&packet)?;
             let key = UdpFlowKey {
                 outbound: outbound_id.clone(),
                 source: (parsed.source.host, parsed.source.port),
                 destination: (parsed.destination.host, parsed.destination.port),
             };
-            let sender = if let Some(sender) = {
-                let mut flows = udp_flows.lock().await;
-                if let Some(flow) = flows.get_mut(&key) {
-                    flow.last_active = Instant::now();
-                    Some(flow.sender.clone())
-                } else {
-                    None
-                }
-            } {
-                sender
-            } else {
-                let Some(outbound_item) = outbound.get(&outbound_id) else {
-                    metrics.outbound_missing_total.inc(Network::Udp);
-                    return Err(HammerError::internal(format!(
-                        "outbound not found: {outbound_id}"
-                    )));
-                };
-                let packet_conn = match outbound_item.listen_packet().await {
-                    Ok(packet_conn) => packet_conn,
-                    Err(err) => {
-                        metrics.counters.udp_listen_error_total.increment(1);
-                        return Err(err);
-                    }
-                };
-                let template = UdpResponseTemplate::from_request(&packet)?;
-                let (tx, rx) = mpsc::channel(SYSTEM_UDP_CHANNEL_CAPACITY);
-
-                let mut flows = udp_flows.lock().await;
+            let mut start_flow = None;
+            let sender = {
+                let mut flows = udp_flows.lock().expect("udp_flows poisoned");
                 if let Some(flow) = flows.get_mut(&key) {
                     flow.last_active = Instant::now();
                     flow.sender.clone()
                 } else {
                     evict_udp_flow_if_needed(&mut flows, &metrics);
+                    let (tx, rx) = mpsc::channel(SYSTEM_UDP_CHANNEL_CAPACITY);
                     flows.insert(
                         key.clone(),
                         UdpFlowState {
@@ -2160,12 +2156,12 @@ async fn handle_system_udp_packet(
                             last_active: Instant::now(),
                         },
                     );
-                    crate::spawn::spawn(system_udp_flow_loop(
+                    start_flow = Some((
                         Arc::clone(&device),
                         Arc::clone(&udp_flows),
-                        key,
-                        packet_conn,
-                        route_destination(&tun_packet.metadata, Some(dns_router.as_ref()))?,
+                        key.clone(),
+                        outbound_item,
+                        destination,
                         template,
                         udp_timeout,
                         rx,
@@ -2178,9 +2174,137 @@ async fn handle_system_udp_packet(
                 metrics.counters.udp_flow_drop_busy_total.increment(1);
                 debug!("drop UDP packet for busy system flow: {err}");
             }
+            if let Some((
+                device,
+                udp_flows,
+                key,
+                outbound_item,
+                destination,
+                template,
+                udp_timeout,
+                rx,
+                metrics,
+            )) = start_flow
+            {
+                crate::spawn::spawn(system_udp_flow_loop(
+                    device,
+                    udp_flows,
+                    key,
+                    outbound_item,
+                    destination,
+                    template,
+                    udp_timeout,
+                    rx,
+                    metrics,
+                ));
+            }
         }
     }
     Ok(())
+}
+
+fn enqueue_system_dns_hijack_packet(
+    dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
+    packet: Vec<u8>,
+    destination: SocksAddr,
+    payload: Vec<u8>,
+    options: DnsQueryOptions,
+    metrics: &TunMetrics,
+) {
+    let job = DnsHijackJob {
+        packet,
+        destination,
+        payload,
+        options,
+    };
+    match dns_hijack_tx.try_send(job) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics.counters.udp_dns_drop_busy_total.increment(1);
+            debug!("drop DNS hijack packet because DNS queue is full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            metrics.counters.udp_dns_drop_busy_total.increment(1);
+            debug!("drop DNS hijack packet because DNS queue is closed");
+        }
+    }
+}
+
+fn spawn_dns_hijack_workers(
+    dns_router: Arc<DnsRouter>,
+    device: Arc<dyn TunDevice>,
+    metrics: TunMetrics,
+    rx: mpsc::Receiver<DnsHijackJob>,
+) {
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..SYSTEM_DNS_HIJACK_WORKERS {
+        let dns_router = Arc::clone(&dns_router);
+        let device = Arc::clone(&device);
+        let metrics = metrics.clone();
+        let rx = Arc::clone(&rx);
+        crate::spawn::spawn(async move {
+            loop {
+                let Some(job) = rx.lock().await.recv().await else {
+                    break;
+                };
+                if let Err(err) = handle_system_dns_hijack_packet(
+                    Arc::clone(&dns_router),
+                    Arc::clone(&device),
+                    job,
+                )
+                .await
+                {
+                    metrics.counters.udp_dns_error_total.increment(1);
+                    debug!("handle system DNS hijack packet: {err}");
+                }
+            }
+        });
+    }
+}
+
+async fn handle_system_dns_hijack_packet(
+    dns_router: Arc<DnsRouter>,
+    device: Arc<dyn TunDevice>,
+    job: DnsHijackJob,
+) -> Result<(), HammerError> {
+    let message = <Message as MessageExt>::from_bytes(&job.payload)?;
+    let response = dns_router.exchange(message, job.options).await?;
+    let response_bytes = MessageExt::to_bytes(&response)?;
+    let response_packet = udp_response_packet(&job.packet, job.destination, &response_bytes)?;
+    device.send(response_packet).await
+}
+
+fn enqueue_tun_control_write(
+    control_write_tx: &mpsc::Sender<Vec<u8>>,
+    packet: Vec<u8>,
+    metrics: &TunMetrics,
+) {
+    match control_write_tx.try_send(packet) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics.counters.control_write_drop_busy_total.increment(1);
+            debug!("drop TUN control packet because write queue is full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            metrics.counters.control_write_drop_busy_total.increment(1);
+            debug!("drop TUN control packet because write queue is closed");
+        }
+    }
+}
+
+fn spawn_tun_control_writer(
+    device: Arc<dyn TunDevice>,
+    metrics: TunMetrics,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) {
+    crate::spawn::spawn(async move {
+        while let Some(packet) = rx.recv().await {
+            if let Err(err) = device.send(packet).await {
+                metrics.counters.control_write_error_total.increment(1);
+                debug!("write TUN control packet: {err}");
+            }
+        }
+    });
 }
 
 fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
@@ -2269,15 +2393,24 @@ fn normalize_destination_domain(domain: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn system_udp_flow_loop(
     device: Arc<dyn TunDevice>,
-    udp_flows: Arc<Mutex<UdpFlowMap>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
     key: UdpFlowKey,
-    mut packet_conn: Box<dyn hammer_adapter::ProxyPacketConn>,
+    outbound: Arc<dyn hammer_adapter::Outbound>,
     destination: SocksAddr,
     response_template: UdpResponseTemplate,
     udp_timeout: Duration,
     mut rx: mpsc::Receiver<Vec<u8>>,
     metrics: TunMetrics,
 ) {
+    let mut packet_conn = match outbound.listen_packet().await {
+        Ok(packet_conn) => packet_conn,
+        Err(err) => {
+            metrics.counters.udp_listen_error_total.increment(1);
+            debug!("listen system UDP outbound: {err}");
+            udp_flows.lock().expect("udp_flows poisoned").remove(&key);
+            return;
+        }
+    };
     let idle_timer = time::sleep(udp_timeout);
     tokio::pin!(idle_timer);
     loop {
@@ -2320,7 +2453,7 @@ async fn system_udp_flow_loop(
             }
         }
     }
-    udp_flows.lock().await.remove(&key);
+    udp_flows.lock().expect("udp_flows poisoned").remove(&key);
 }
 
 fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap, metrics: &TunMetrics) {
@@ -2678,6 +2811,65 @@ async fn handle_system_icmp_packet(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_icmp_workers(
+    router: Arc<Router>,
+    dns_router: Arc<DnsRouter>,
+    outbound: Arc<OutboundManager>,
+    inbound_id: String,
+    device: Arc<dyn TunDevice>,
+    rx: mpsc::Receiver<IcmpJob>,
+) {
+    let rx = Arc::new(Mutex::new(rx));
+    for _ in 0..SYSTEM_ICMP_WORKERS {
+        let router = Arc::clone(&router);
+        let dns_router = Arc::clone(&dns_router);
+        let outbound = Arc::clone(&outbound);
+        let inbound_id = inbound_id.clone();
+        let device = Arc::clone(&device);
+        let rx = Arc::clone(&rx);
+        crate::spawn::spawn(async move {
+            loop {
+                let Some(job) = rx.lock().await.recv().await else {
+                    break;
+                };
+                if let Err(err) = handle_system_icmp_packet(
+                    Arc::clone(&router),
+                    Arc::clone(&dns_router),
+                    Arc::clone(&outbound),
+                    inbound_id.clone(),
+                    Arc::clone(&device),
+                    job.packet,
+                    job.parsed,
+                )
+                .await
+                {
+                    debug!("handle system ICMP packet: {err}");
+                }
+            }
+        });
+    }
+}
+
+fn enqueue_system_icmp_packet(
+    icmp_tx: &mpsc::Sender<IcmpJob>,
+    packet: Vec<u8>,
+    parsed: ParsedIpPacket,
+    metrics: &TunMetrics,
+) {
+    match icmp_tx.try_send(IcmpJob { packet, parsed }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics.counters.icmp_drop_busy_total.increment(1);
+            debug!("drop ICMP packet because ICMP queue is full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            metrics.counters.icmp_drop_busy_total.increment(1);
+            debug!("drop ICMP packet because ICMP queue is closed");
+        }
+    }
+}
+
 /// Helper used by `dispatch_route` (the synchronous test/legacy path)
 /// to synthesize an ICMP Destination Unreachable when the chosen
 /// outbound rejects ICMP. The system loop path uses
@@ -2871,10 +3063,22 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DnsTransportManager;
+    use crate::dns::FixedResponseCode;
+    use hammer_adapter::{DnsTransport, Lifecycle, StartStage};
+    use hammer_core::config;
+    use hammer_core::log::{DiscardWriter, Factory};
+    use hickory_proto::rr::{RData, Record};
+    use std::collections::VecDeque;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+    use tokio::sync::Notify;
+
+    fn test_logger(id: &str) -> Logger {
+        Factory::new(StdInstant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
 
     #[test]
     fn tun_metrics_register_counters_under_scope_component_id() {
@@ -2978,6 +3182,199 @@ mod tests {
 
         drop(first);
         let _second = limiter.try_acquire().expect("permit released after drop");
+    }
+
+    struct DelayedDnsTransport;
+
+    impl Lifecycle for DelayedDnsTransport {
+        fn name(&self) -> &str {
+            "delayed-dns"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl DnsTransport for DelayedDnsTransport {
+        fn type_name(&self) -> &str {
+            "mock"
+        }
+
+        fn id(&self) -> &str {
+            "slow"
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+
+        fn reset(&self) {}
+
+        async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let query = message.queries[0].clone();
+            let mut response = message.fixed_response(FixedResponseCode::NoError);
+            response.add_answer(Record::from_rdata(
+                query.name().clone(),
+                60,
+                RData::A(std::net::Ipv4Addr::new(203, 0, 113, 53).into()),
+            ));
+            Ok(response)
+        }
+    }
+
+    struct ScriptedBatchTunDevice {
+        batches: Mutex<VecDeque<Vec<Vec<u8>>>>,
+        read_after_batches: Notify,
+        output_tx: mpsc::Sender<Vec<u8>>,
+        closed: AtomicBool,
+    }
+
+    impl ScriptedBatchTunDevice {
+        fn new(batches: Vec<Vec<Vec<u8>>>) -> Arc<Self> {
+            let (output_tx, _output_rx) = mpsc::channel(8);
+            Arc::new(Self {
+                batches: Mutex::new(VecDeque::from(batches)),
+                read_after_batches: Notify::new(),
+                output_tx,
+                closed: AtomicBool::new(false),
+            })
+        }
+
+        async fn wait_for_read_after_batches(&self) {
+            self.read_after_batches.notified().await;
+        }
+    }
+
+    #[async_trait]
+    impl TunDevice for ScriptedBatchTunDevice {
+        async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+            Err(HammerError::internal("scripted tun recv is not used"))
+        }
+
+        async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+            self.output_tx
+                .send(packet)
+                .await
+                .map_err(|_| HammerError::internal("scripted tun output closed"))
+        }
+
+        async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(HammerError::internal("scripted tun closed"));
+            }
+            let mut batches = self.batches.lock().await;
+            if let Some(batch) = batches.pop_front() {
+                return Ok(batch);
+            }
+            self.read_after_batches.notify_waiters();
+            Err(HammerError::internal("scripted tun done"))
+        }
+
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn dns_query_packet(name: &str) -> Vec<u8> {
+        let mut payload = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            payload.push(label.len() as u8);
+            payload.extend_from_slice(label.as_bytes());
+        }
+        payload.extend_from_slice(&[0, 0, 1, 0, 1]);
+
+        let total_len = 20 + 8 + payload.len();
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        packet[20..22].copy_from_slice(&5353_u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet[28..].copy_from_slice(&payload);
+        packet
+    }
+
+    #[tokio::test]
+    async fn packet_loop_does_not_wait_for_dns_hijack_before_reading_next_batch() {
+        let options = config::parse_config(
+            r#"
+[tun]
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+
+[dns]
+server = "hosts"
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[route]
+final = "direct"
+"#,
+        )
+        .expect("parse config");
+        let outbound = Arc::new(
+            OutboundManager::from_options(
+                test_logger("outbound"),
+                options.route.final_.clone(),
+                &options.outbounds,
+            )
+            .expect("outbound manager"),
+        );
+        let router = Arc::new(
+            Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
+                .expect("router"),
+        );
+        let dns_transport = Arc::new(DnsTransportManager::new(
+            test_logger("dns-transport"),
+            "slow",
+        ));
+        dns_transport.insert(Arc::new(DelayedDnsTransport));
+        let dns_router = Arc::new(DnsRouter::new_with_manager(
+            test_logger("dns-router"),
+            dns_transport,
+            config::DomainStrategy::AsIs,
+        ));
+        let device = ScriptedBatchTunDevice::new(vec![vec![dns_query_packet("example.com")]]);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        let task = crate::spawn::spawn(packet_loop(
+            test_logger("tun"),
+            router,
+            dns_router,
+            outbound,
+            "tun".to_owned(),
+            Arc::clone(&device) as Arc<dyn TunDevice>,
+            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                DEFAULT_SYSTEM_UDP_TIMEOUT,
+            ))),
+            Arc::new(StdMutex::new(HashMap::new())),
+            SystemStackRoutes::default(),
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            metrics,
+        ));
+
+        timeout(
+            Duration::from_millis(50),
+            device.wait_for_read_after_batches(),
+        )
+        .await
+        .expect("packet loop should keep reading while DNS hijack is still pending");
+        task.abort();
     }
 
     struct ResetOnWriteStream;

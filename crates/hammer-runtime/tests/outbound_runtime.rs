@@ -30,6 +30,7 @@ fn destination(addr: std::net::SocketAddr) -> SocksAddr {
 #[derive(Default)]
 struct ResettableOutbound {
     resets: AtomicUsize,
+    ensure_connected: AtomicUsize,
 }
 
 #[async_trait]
@@ -52,6 +53,11 @@ impl AdapterOutbound for ResettableOutbound {
 
     fn reset(&self) {
         self.resets.fetch_add(1, Ordering::SeqCst);
+    }
+
+    async fn ensure_connected(&self) -> Result<(), HammerError> {
+        self.ensure_connected.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn dial(
@@ -132,6 +138,32 @@ fn outbound_manager_reset_network_resets_registered_outbounds() {
     assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn outbound_manager_ensure_connected_warms_registered_outbounds_without_resetting() {
+    let manager = OutboundManager::new(logger("outbound"), "resettable");
+    let outbound = Arc::new(ResettableOutbound::default());
+    manager
+        .register_outbound(
+            "resettable".to_owned(),
+            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
+        )
+        .expect("register outbound");
+
+    manager.ensure_connected();
+
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            if outbound.ensure_connected.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background ensure_connected should run");
+    assert_eq!(outbound.resets.load(Ordering::SeqCst), 0);
+}
+
 #[test]
 fn outbound_manager_lifecycle_close_resets_registered_outbounds() {
     let manager = OutboundManager::new(logger("outbound"), "resettable");
@@ -146,6 +178,7 @@ fn outbound_manager_lifecycle_close_resets_registered_outbounds() {
     Lifecycle::close(&manager).expect("lifecycle close");
 
     assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
+    assert_eq!(outbound.ensure_connected.load(Ordering::SeqCst), 0);
 }
 
 #[test]

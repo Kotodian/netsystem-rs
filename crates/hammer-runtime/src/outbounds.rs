@@ -184,6 +184,10 @@ impl OutboundManager {
         }
     }
 
+    pub fn ensure_connected(&self) {
+        self.spawn_ensure_connected_hooks(self.list());
+    }
+
     /// Register an already-constructed outbound (e.g. an endpoint that lives
     /// in `EndpointManager`) so the router can resolve its id through the
     /// usual `OutboundManager::get` path. Mirrors sing-box, where every
@@ -268,6 +272,18 @@ impl OutboundManager {
             });
         }
     }
+
+    fn spawn_ensure_connected_hooks(&self, items: Vec<Arc<dyn Outbound>>) {
+        for outbound in items {
+            let id = outbound.id().to_owned();
+            let logger = self.logger.clone();
+            crate::spawn::spawn(async move {
+                if let Err(err) = outbound.ensure_connected().await {
+                    logger.warn(format!("outbound '{id}' ensure_connected: {err}"));
+                }
+            });
+        }
+    }
 }
 
 struct InstrumentedOutbound {
@@ -304,6 +320,16 @@ impl Outbound for InstrumentedOutbound {
 
     fn reset(&self) {
         self.inner.reset();
+    }
+
+    async fn ensure_connected(&self) -> Result<(), HammerError> {
+        match self.inner.ensure_connected().await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.metrics.ensure_connected_error_total.inc();
+                Err(err)
+            }
+        }
     }
 
     async fn dial(
@@ -398,6 +424,7 @@ struct OutboundMetrics {
     probe_latency_error_total: MetricCounter,
     probe_group_error_total: MetricCounter,
     post_start_error_total: MetricCounter,
+    ensure_connected_error_total: MetricCounter,
     stream_read_error_total: MetricCounter,
     stream_write_error_total: MetricCounter,
     packet_send_error_total: MetricCounter,
@@ -412,6 +439,7 @@ impl OutboundMetrics {
             probe_latency_error_total: scope.counter("probe_latency_error_total"),
             probe_group_error_total: scope.counter("probe_group_error_total"),
             post_start_error_total: scope.counter("post_start_error_total"),
+            ensure_connected_error_total: scope.counter("ensure_connected_error_total"),
             stream_read_error_total: scope.counter("stream_read_error_total"),
             stream_write_error_total: scope.counter("stream_write_error_total"),
             packet_send_error_total: scope.counter("packet_send_error_total"),

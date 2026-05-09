@@ -77,8 +77,7 @@ pub struct Router {
 #[inline]
 fn new_router_cache() -> Mutex<LruCache<MatchKey, RouteDecision>> {
     Mutex::new(LruCache::new(
-        NonZeroUsize::new(ROUTER_CACHE_CAPACITY)
-            .expect("router cache capacity must be non-zero"),
+        NonZeroUsize::new(ROUTER_CACHE_CAPACITY).expect("router cache capacity must be non-zero"),
     ))
 }
 
@@ -266,10 +265,7 @@ impl RouterTrait for Router {
         // network-aware matcher; flush the metadata→decision cache so the
         // next packet picks up the new view. No matcher state needs
         // resetting yet.
-        self.cache
-            .lock()
-            .expect("router cache poisoned")
-            .clear();
+        self.cache.lock().expect("router cache poisoned").clear();
     }
 }
 
@@ -421,11 +417,15 @@ fn matcher_matches(matcher: &RuleMatcher, metadata: &RouteMetadata) -> bool {
             None => false,
         },
         RuleMatcher::DomainSuffix(values) => match metadata.domain.as_deref() {
-            Some(domain) => values.iter().any(|suffix| domain_suffix_matches(domain, suffix)),
+            Some(domain) => values
+                .iter()
+                .any(|suffix| domain_suffix_matches(domain, suffix)),
             None => false,
         },
         RuleMatcher::DomainKeyword(values) => match metadata.domain.as_deref() {
-            Some(domain) => values.iter().any(|keyword| domain.contains(keyword.as_str())),
+            Some(domain) => values
+                .iter()
+                .any(|keyword| domain.contains(keyword.as_str())),
             None => false,
         },
         RuleMatcher::IpCidr(values) => match metadata.destination.as_ref() {
