@@ -16,6 +16,8 @@ pub use udp::UdpDnsTransport;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
 use std::sync::Arc;
+#[cfg(feature = "dns-udp")]
+use std::time::Duration;
 
 #[cfg(feature = "dns-udp")]
 use bytes::Bytes;
@@ -30,6 +32,8 @@ use tokio::io::AsyncReadExt;
 #[cfg(any(feature = "dns-tcp", feature = "dns-https"))]
 use tokio::net::{TcpSocket, TcpStream};
 #[cfg(feature = "dns-udp")]
+use tokio::time::timeout;
+#[cfg(feature = "dns-udp")]
 use tracing::debug;
 
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
@@ -38,6 +42,9 @@ use crate::OutboundManager;
 use crate::dns::MessageExt;
 #[cfg(any(feature = "dns-tcp", feature = "dns-https"))]
 use crate::socket_protector::SocketProtector;
+
+#[cfg(feature = "dns-udp")]
+const DNS_UDP_VIA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
 pub(super) async fn resolve_first(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
@@ -178,15 +185,45 @@ pub(super) async fn udp_exchange_via(
     destination: SocksAddr,
     payload: &[u8],
 ) -> Result<Bytes, HammerError> {
+    udp_exchange_via_with_timeout(
+        outbound,
+        via,
+        destination,
+        payload,
+        DNS_UDP_VIA_RESPONSE_TIMEOUT,
+    )
+    .await
+}
+
+#[cfg(feature = "dns-udp")]
+async fn udp_exchange_via_with_timeout(
+    outbound: Option<&Arc<OutboundManager>>,
+    via: &str,
+    destination: SocksAddr,
+    payload: &[u8],
+    response_timeout: Duration,
+) -> Result<Bytes, HammerError> {
     debug!(
         "dns udp via outbound={via} dest={destination} bytes={}",
         payload.len()
     );
-    let mut conn = outbound_by_id(outbound, via)?.listen_packet().await?;
+    let outbound_item = outbound_by_id(outbound, via)?;
+    let mut conn = outbound_item.listen_packet().await?;
     debug!("dns udp via outbound={via} packet conn ready");
     conn.send_to(destination.clone(), payload).await?;
     debug!("dns udp via outbound={via} sent dest={destination}");
-    let response = conn.recv_from().await?;
+    let response = match timeout(response_timeout, conn.recv_from()).await {
+        Ok(response) => response?,
+        Err(_) => {
+            debug!(
+                "dns udp via timeout outbound={via} dest={destination} elapsed={response_timeout:?}"
+            );
+            outbound_item.reset();
+            return Err(HammerError::internal(format!(
+                "dns udp via timed out after {response_timeout:?}: outbound={via} dest={destination}"
+            )));
+        }
+    };
     debug!(
         "dns udp via outbound={via} received from {} bytes={}",
         response.destination,
@@ -230,5 +267,102 @@ pub(super) fn host_header(server: &str, port: u16) -> String {
         server.to_owned()
     } else {
         format!("{server}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream};
+    use hammer_core::log::{DiscardWriter, Factory, Logger};
+
+    fn logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    #[derive(Default)]
+    struct HangingOutbound {
+        resets: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Outbound for HangingOutbound {
+        fn type_name(&self) -> &str {
+            "hanging"
+        }
+
+        fn id(&self) -> &str {
+            "proxy"
+        }
+
+        fn networks(&self) -> &[Network] {
+            &[Network::Udp]
+        }
+
+        fn dependencies(&self) -> &[String] {
+            &[]
+        }
+
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn dial(
+            &self,
+            _network: Network,
+            _destination: SocksAddr,
+            _initial_payload: &[u8],
+        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+            Err(HammerError::internal("hanging outbound does not dial"))
+        }
+
+        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+            Ok(Box::new(HangingPacketConn))
+        }
+    }
+
+    struct HangingPacketConn;
+
+    #[async_trait]
+    impl ProxyPacketConn for HangingPacketConn {
+        async fn send_to(
+            &mut self,
+            _destination: SocksAddr,
+            _payload: &[u8],
+        ) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+            future::pending::<()>().await;
+            unreachable!("pending future never returns")
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_exchange_via_times_out_and_resets_outbound() {
+        let manager = Arc::new(crate::OutboundManager::new(logger("outbound"), "proxy"));
+        let outbound = Arc::new(HangingOutbound::default());
+        manager
+            .register_outbound("proxy".to_owned(), outbound.clone() as Arc<dyn Outbound>)
+            .expect("register outbound");
+
+        let err = udp_exchange_via_with_timeout(
+            Some(&manager),
+            "proxy",
+            SocksAddr::ip(IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 53),
+            b"query",
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("hung UDP DNS exchange should time out");
+
+        assert!(err.to_string().contains("dns udp via timed out"));
+        assert_eq!(outbound.resets.load(Ordering::SeqCst), 1);
     }
 }

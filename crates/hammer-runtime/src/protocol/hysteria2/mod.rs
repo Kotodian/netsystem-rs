@@ -286,17 +286,28 @@ impl ProxyPacketConn for Hysteria2PacketConn {
     }
 
     async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
-        match self.rx.recv().await {
-            Some(datagram) => {
-                debug!(
-                    "hysteria2 UDP recv session={} addr={} bytes={}",
-                    self.session_id,
-                    datagram.destination,
-                    datagram.payload.len()
-                );
-                Ok(datagram)
+        let connection = self.connection.clone();
+        tokio::select! {
+            datagram = self.rx.recv() => {
+                match datagram {
+                    Some(datagram) => {
+                        debug!(
+                            "hysteria2 UDP recv session={} addr={} bytes={}",
+                            self.session_id,
+                            datagram.destination,
+                            datagram.payload.len()
+                        );
+                        Ok(datagram)
+                    }
+                    None => Err(HammerError::internal("hysteria2 UDP session closed")),
+                }
             }
-            None => Err(HammerError::internal("hysteria2 UDP session closed")),
+            reason = connection.closed() => {
+                self.sessions.lock().await.remove(&self.session_id);
+                Err(HammerError::internal(format!(
+                    "hysteria2 UDP connection closed: {reason}"
+                )))
+            }
         }
     }
 }
@@ -700,6 +711,7 @@ fn spawn_datagram_loop(client: Arc<Hysteria2Client>) {
                 Ok(datagram) => datagram,
                 Err(err) => {
                     error!("receive datagram: {err}");
+                    client.sessions.lock().await.clear();
                     return;
                 }
             };
@@ -1384,6 +1396,55 @@ mod tests {
             "closed cached Hysteria2 client must not be reused"
         );
         assert_eq!(server.auth_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn udp_recv_fails_fast_when_connection_closes() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start auth server");
+        let client = connect_with_timeout(
+            client_options_for_test(server.port()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("connect client");
+        let mut packet = client.listen_udp().await.expect("open UDP session");
+
+        client.close(b"simulate suspended connection loss");
+        let err = tokio::time::timeout(Duration::from_millis(200), packet.recv_from())
+            .await
+            .expect("closed QUIC connection should wake UDP recv")
+            .expect_err("UDP recv should report connection closure");
+
+        assert!(err.to_string().contains("hysteria2 UDP connection closed"));
+    }
+
+    #[tokio::test]
+    async fn datagram_loop_exit_clears_udp_sessions() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start auth server");
+        let client = connect_with_timeout(
+            client_options_for_test(server.port()),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("connect client");
+        let _packet = client.listen_udp().await.expect("open UDP session");
+        assert_eq!(client.sessions.lock().await.len(), 1);
+
+        client.close(b"simulate datagram loop exit");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if client.sessions.lock().await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("datagram loop exit should drop all UDP session senders");
     }
 
     #[tokio::test]
