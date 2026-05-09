@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
+use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -39,6 +40,95 @@ const SYSTEM_ICMP_WORKERS: usize = 2;
 const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
+const IPV4_HEADER_MIN_LEN: usize = 20;
+const IPV6_HEADER_LEN: usize = 40;
+const TCP_HEADER_MIN_LEN: usize = 20;
+const UDP_HEADER_LEN: usize = 8;
+const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
+const IPV4_TTL_OFFSET: usize = 8;
+const IPV4_PROTOCOL_OFFSET: usize = 9;
+const IPV4_CHECKSUM_OFFSET: usize = 10;
+const IPV4_SOURCE_OFFSET: usize = 12;
+const IPV4_DESTINATION_OFFSET: usize = 16;
+const IPV6_PAYLOAD_LEN_OFFSET: usize = 4;
+const IPV6_PROTOCOL_OFFSET: usize = 6;
+const IPV6_HOP_LIMIT_OFFSET: usize = 7;
+const IPV6_SOURCE_OFFSET: usize = 8;
+const IPV6_DESTINATION_OFFSET: usize = 24;
+const TCP_SOURCE_PORT_OFFSET: usize = 0;
+const TCP_DESTINATION_PORT_OFFSET: usize = 2;
+const TCP_DATA_OFFSET_OFFSET: usize = 12;
+const TCP_CHECKSUM_OFFSET: usize = 16;
+const UDP_SOURCE_PORT_OFFSET: usize = 0;
+const UDP_DESTINATION_PORT_OFFSET: usize = 2;
+const UDP_LENGTH_OFFSET: usize = 4;
+const UDP_CHECKSUM_OFFSET: usize = 6;
+const DEFAULT_PACKET_TTL: u8 = 64;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpVersion {
+    V4 = 4,
+    V6 = 6,
+}
+
+impl IpVersion {
+    fn wire_value(self) -> u8 {
+        self as u8
+    }
+
+    fn from_packet(packet: &[u8]) -> Result<Self, HammerError> {
+        let Some(first) = packet.first() else {
+            return Err(HammerError::internal("empty IP packet"));
+        };
+        Self::try_from(first >> 4)
+    }
+}
+
+impl TryFrom<u8> for IpVersion {
+    type Error = HammerError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            value if value == Self::V4.wire_value() => Ok(Self::V4),
+            value if value == Self::V6.wire_value() => Ok(Self::V6),
+            other => Err(HammerError::internal(format!(
+                "unsupported IP version: {other}"
+            ))),
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpProtocol {
+    Icmpv4 = 1,
+    Tcp = 6,
+    Udp = 17,
+    Icmpv6 = 58,
+}
+
+impl IpProtocol {
+    fn wire_value(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for IpProtocol {
+    type Error = HammerError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            value if value == Self::Icmpv4.wire_value() => Ok(Self::Icmpv4),
+            value if value == Self::Tcp.wire_value() => Ok(Self::Tcp),
+            value if value == Self::Udp.wire_value() => Ok(Self::Udp),
+            value if value == Self::Icmpv6.wire_value() => Ok(Self::Icmpv6),
+            other => Err(HammerError::internal(format!(
+                "unsupported transport protocol: {other}"
+            ))),
+        }
+    }
+}
 
 #[async_trait]
 pub trait TunDevice: Send + Sync + 'static {
@@ -225,6 +315,22 @@ pub struct ParsedIpPacket {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedIpPacketView {
+    network: Network,
+    source: SocksAddr,
+    destination: SocksAddr,
+    payload_range: Range<usize>,
+}
+
+impl ParsedIpPacketView {
+    fn payload<'a>(&self, packet: &'a [u8]) -> Result<&'a [u8], HammerError> {
+        packet
+            .get(self.payload_range.clone())
+            .ok_or_else(|| HammerError::internal("parsed packet payload range is out of bounds"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunPacket {
     pub metadata: RouteMetadata,
     pub payload: Vec<u8>,
@@ -407,22 +513,43 @@ struct UdpFlowKey {
 }
 
 struct UdpFlowState {
-    sender: mpsc::Sender<Vec<u8>>,
+    sender: mpsc::Sender<UdpFlowPayload>,
     last_active: Instant,
 }
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
+struct UdpFlowPayload {
+    packet: Vec<u8>,
+    payload: Range<usize>,
+}
+
+impl UdpFlowPayload {
+    fn payload(&self) -> Result<&[u8], HammerError> {
+        self.packet
+            .get(self.payload.start..self.payload.end)
+            .ok_or_else(|| HammerError::internal("UDP flow payload range is out of bounds"))
+    }
+}
+
 struct DnsHijackJob {
     packet: Vec<u8>,
     destination: SocksAddr,
-    payload: Vec<u8>,
+    payload: Range<usize>,
     options: DnsQueryOptions,
+}
+
+impl DnsHijackJob {
+    fn payload(&self) -> Result<&[u8], HammerError> {
+        self.packet
+            .get(self.payload.start..self.payload.end)
+            .ok_or_else(|| HammerError::internal("DNS hijack payload range is out of bounds"))
+    }
 }
 
 struct IcmpJob {
     packet: Vec<u8>,
-    parsed: ParsedIpPacket,
+    parsed: ParsedIpPacketView,
 }
 
 #[derive(Clone)]
@@ -753,10 +880,9 @@ struct SystemStackRoute {
 
 impl SystemStackRoutes {
     fn for_packet(&self, packet: &[u8]) -> Option<&SystemStackRoute> {
-        match packet.first().map(|byte| byte >> 4) {
-            Some(4) => self.v4.as_ref(),
-            Some(6) => self.v6.as_ref(),
-            _ => None,
+        match IpVersion::from_packet(packet).ok()? {
+            IpVersion::V4 => self.v4.as_ref(),
+            IpVersion::V6 => self.v6.as_ref(),
         }
     }
 }
@@ -905,15 +1031,21 @@ pub enum TunDispatch {
 
 #[inline]
 pub fn parse_ip_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
-    if packet.is_empty() {
-        return Err(HammerError::internal("empty IP packet"));
-    }
-    match packet[0] >> 4 {
-        4 => parse_ipv4_packet(packet),
-        6 => parse_ipv6_packet(packet),
-        version => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
+    let parsed = parse_ip_packet_view(packet)?;
+    let payload = parsed.payload(packet)?.to_vec();
+    Ok(ParsedIpPacket {
+        network: parsed.network,
+        source: parsed.source,
+        destination: parsed.destination,
+        payload,
+    })
+}
+
+#[inline]
+fn parse_ip_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+    match IpVersion::from_packet(packet)? {
+        IpVersion::V4 => parse_ipv4_packet_view(packet),
+        IpVersion::V6 => parse_ipv6_packet_view(packet),
     }
 }
 
@@ -924,13 +1056,13 @@ pub fn process_system_tcp_packet(
     nat_addr: IpAddr,
     listener_port: u16,
 ) -> Result<(), HammerError> {
-    match packet.first().map(|byte| byte >> 4) {
-        Some(4) => process_system_tcp_ipv4(packet, nat, listener_addr, nat_addr, listener_port),
-        Some(6) => process_system_tcp_ipv6(packet, nat, listener_addr, nat_addr, listener_port),
-        Some(version) => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
-        None => Err(HammerError::internal("empty IP packet")),
+    match IpVersion::from_packet(packet)? {
+        IpVersion::V4 => {
+            process_system_tcp_ipv4(packet, nat, listener_addr, nat_addr, listener_port)
+        }
+        IpVersion::V6 => {
+            process_system_tcp_ipv6(packet, nat, listener_addr, nat_addr, listener_port)
+        }
     }
 }
 
@@ -943,79 +1075,69 @@ pub fn udp_response_packet(
 }
 
 pub fn udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    match request.first().map(|byte| byte >> 4) {
-        Some(4) => ipv4_udp_unreachable_packet(request),
-        Some(6) => ipv6_udp_unreachable_packet(request),
-        Some(version) => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
-        None => Err(HammerError::internal("empty IP packet")),
+    match IpVersion::from_packet(request)? {
+        IpVersion::V4 => ipv4_udp_unreachable_packet(request),
+        IpVersion::V6 => ipv6_udp_unreachable_packet(request),
     }
 }
 
 pub fn tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    match request.first().map(|byte| byte >> 4) {
-        Some(4) => ipv4_tcp_reset_packet(request),
-        Some(6) => ipv6_tcp_reset_packet(request),
-        Some(version) => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
-        None => Err(HammerError::internal("empty IP packet")),
+    match IpVersion::from_packet(request)? {
+        IpVersion::V4 => ipv4_tcp_reset_packet(request),
+        IpVersion::V6 => ipv6_tcp_reset_packet(request),
     }
 }
 
 #[derive(Clone)]
 struct UdpResponseTemplate {
     header: Vec<u8>,
-    version: u8,
+    version: IpVersion,
     udp_offset: usize,
 }
 
 impl UdpResponseTemplate {
     fn from_request(request: &[u8]) -> Result<Self, HammerError> {
-        match request.first().map(|byte| byte >> 4) {
-            Some(4) => Self::from_ipv4_request(request),
-            Some(6) => Self::from_ipv6_request(request),
-            Some(version) => Err(HammerError::internal(format!(
-                "unsupported IP version: {version}"
-            ))),
-            None => Err(HammerError::internal("empty IP packet")),
+        match IpVersion::from_packet(request)? {
+            IpVersion::V4 => Self::from_ipv4_request(request),
+            IpVersion::V6 => Self::from_ipv6_request(request),
         }
     }
 
     fn from_ipv4_request(request: &[u8]) -> Result<Self, HammerError> {
-        if request.len() < 28 {
+        if request.len() < IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN {
             return Err(HammerError::internal("short IPv4 UDP packet"));
         }
         let ihl = ((request[0] & 0x0f) as usize) * 4;
-        if ihl < 20 || request.len() < ihl + 8 || request[9] != 17 {
+        if ihl < IPV4_HEADER_MIN_LEN
+            || request.len() < ihl + UDP_HEADER_LEN
+            || request[IPV4_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
+        {
             return Err(HammerError::internal("invalid IPv4 UDP packet"));
         }
         Ok(Self {
-            header: request[..ihl + 8].to_vec(),
-            version: 4,
+            header: request[..ihl + UDP_HEADER_LEN].to_vec(),
+            version: IpVersion::V4,
             udp_offset: ihl,
         })
     }
 
     fn from_ipv6_request(request: &[u8]) -> Result<Self, HammerError> {
-        if request.len() < 48 || request[6] != 17 {
+        if request.len() < IPV6_HEADER_LEN + UDP_HEADER_LEN
+            || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
+        {
             return Err(HammerError::internal("invalid IPv6 UDP packet"));
         }
         Ok(Self {
-            header: request[..48].to_vec(),
-            version: 6,
-            udp_offset: 40,
+            header: request[..IPV6_HEADER_LEN + UDP_HEADER_LEN].to_vec(),
+            version: IpVersion::V6,
+            udp_offset: IPV6_HEADER_LEN,
         })
     }
 
     fn build(&self, source: SocksAddr, payload: &[u8]) -> Result<Vec<u8>, HammerError> {
         match self.version {
-            4 => self.build_v4(source, payload),
-            6 => self.build_v6(source, payload),
-            version => Err(HammerError::internal(format!(
-                "unsupported IP version: {version}"
-            ))),
+            IpVersion::V4 => self.build_v4(source, payload),
+            IpVersion::V6 => self.build_v6(source, payload),
         }
     }
 
@@ -1037,7 +1159,11 @@ impl UdpResponseTemplate {
         let original_source_port = read_u16(&packet, self.udp_offset);
         write_u16(&mut packet, self.udp_offset, source.port);
         write_u16(&mut packet, self.udp_offset + 2, original_source_port);
-        write_u16(&mut packet, self.udp_offset + 4, (8 + payload.len()) as u16);
+        write_u16(
+            &mut packet,
+            self.udp_offset + UDP_LENGTH_OFFSET,
+            (UDP_HEADER_LEN + payload.len()) as u16,
+        );
         update_ipv4_udp_checksums(&mut packet, self.udp_offset)?;
         Ok(packet)
     }
@@ -1046,7 +1172,7 @@ impl UdpResponseTemplate {
         let IpAddr::V6(source_ip) = source.host else {
             return Err(HammerError::internal("IPv6 UDP response needs IPv6 source"));
         };
-        let payload_len = 8 + payload.len();
+        let payload_len = UDP_HEADER_LEN + payload.len();
         if payload_len > u16::MAX as usize {
             return Err(HammerError::internal("UDP response too large"));
         }
@@ -1060,7 +1186,11 @@ impl UdpResponseTemplate {
         let original_source_port = read_u16(&packet, self.udp_offset);
         write_u16(&mut packet, self.udp_offset, source.port);
         write_u16(&mut packet, self.udp_offset + 2, original_source_port);
-        write_u16(&mut packet, self.udp_offset + 4, payload_len as u16);
+        write_u16(
+            &mut packet,
+            self.udp_offset + UDP_LENGTH_OFFSET,
+            payload_len as u16,
+        );
         update_ipv6_udp_checksum(&mut packet)?;
         Ok(packet)
     }
@@ -1082,14 +1212,18 @@ pub fn sniff_stream(packet: &mut TunPacket) {
 }
 
 pub fn sniff_packet(packet: &mut TunPacket) {
-    if packet.metadata.protocol.is_empty() {
-        sniff_dns(packet);
+    sniff_packet_metadata(&mut packet.metadata, &packet.payload);
+}
+
+fn sniff_packet_metadata(metadata: &mut RouteMetadata, payload: &[u8]) {
+    if metadata.protocol.is_empty() {
+        sniff_dns_payload(metadata, payload);
     }
-    if packet.metadata.protocol.is_empty() {
-        sniff_quic(packet);
+    if metadata.protocol.is_empty() {
+        sniff_quic_payload(metadata, payload);
     }
-    if packet.metadata.protocol.is_empty() {
-        sniff_stun(packet);
+    if metadata.protocol.is_empty() {
+        sniff_stun_payload(metadata, payload);
     }
 }
 
@@ -1159,7 +1293,8 @@ impl SmoltcpTunStack {
     }
 
     fn packet_context(&self, packet: &[u8]) -> Result<TunPacket, HammerError> {
-        let parsed = parse_ip_packet(packet)?;
+        let parsed = parse_ip_packet_view(packet)?;
+        let payload = parsed.payload(packet)?.to_vec();
         let mut tun_packet = TunPacket {
             metadata: RouteMetadata {
                 inbound: self.inbound_id.clone(),
@@ -1172,7 +1307,7 @@ impl SmoltcpTunStack {
                 destination: Some(parsed.destination),
                 ..Default::default()
             },
-            payload: parsed.payload,
+            payload,
         };
         if self.router.should_sniff(&tun_packet.metadata) {
             match tun_packet.metadata.network {
@@ -1278,51 +1413,70 @@ impl SmoltcpTunStack {
     }
 }
 
-fn parse_ipv4_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
-    if packet.len() < 20 {
+fn parse_ipv4_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+    if packet.len() < IPV4_HEADER_MIN_LEN {
         return Err(HammerError::internal("short IPv4 packet"));
     }
     let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || packet.len() < ihl {
+    if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
         return Err(HammerError::internal("invalid IPv4 header length"));
     }
     let source = IpAddr::V4(Ipv4Addr::new(
-        packet[12], packet[13], packet[14], packet[15],
+        packet[IPV4_SOURCE_OFFSET],
+        packet[IPV4_SOURCE_OFFSET + 1],
+        packet[IPV4_SOURCE_OFFSET + 2],
+        packet[IPV4_SOURCE_OFFSET + 3],
     ));
     let destination = IpAddr::V4(Ipv4Addr::new(
-        packet[16], packet[17], packet[18], packet[19],
+        packet[IPV4_DESTINATION_OFFSET],
+        packet[IPV4_DESTINATION_OFFSET + 1],
+        packet[IPV4_DESTINATION_OFFSET + 2],
+        packet[IPV4_DESTINATION_OFFSET + 3],
     ));
-    parse_transport(packet[9], source, destination, &packet[ihl..])
+    parse_transport(
+        IpProtocol::try_from(packet[IPV4_PROTOCOL_OFFSET])?,
+        source,
+        destination,
+        packet,
+        ihl,
+    )
 }
 
-fn parse_ipv6_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
-    if packet.len() < 40 {
+fn parse_ipv6_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+    if packet.len() < IPV6_HEADER_LEN {
         return Err(HammerError::internal("short IPv6 packet"));
     }
     let source = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[8..24]).unwrap(),
+        <[u8; 16]>::try_from(&packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]).unwrap(),
     ));
     let destination = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[24..40]).unwrap(),
+        <[u8; 16]>::try_from(&packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]).unwrap(),
     ));
-    parse_transport(packet[6], source, destination, &packet[40..])
+    parse_transport(
+        IpProtocol::try_from(packet[IPV6_PROTOCOL_OFFSET])?,
+        source,
+        destination,
+        packet,
+        IPV6_HEADER_LEN,
+    )
 }
 
 #[inline]
 fn parse_transport(
-    protocol: u8,
+    protocol: IpProtocol,
     source: IpAddr,
     destination: IpAddr,
-    transport: &[u8],
-) -> Result<ParsedIpPacket, HammerError> {
+    packet: &[u8],
+    transport_offset: usize,
+) -> Result<ParsedIpPacketView, HammerError> {
+    let transport = packet
+        .get(transport_offset..)
+        .ok_or_else(|| HammerError::internal("transport offset out of bounds"))?;
     match protocol {
-        6 => parse_tcp(source, destination, transport),
-        17 => parse_udp(source, destination, transport),
-        1 => parse_icmpv4(source, destination, transport),
-        58 => parse_icmpv6(source, destination, transport),
-        other => Err(HammerError::internal(format!(
-            "unsupported transport protocol: {other}"
-        ))),
+        IpProtocol::Tcp => parse_tcp(source, destination, transport, transport_offset),
+        IpProtocol::Udp => parse_udp(source, destination, transport, transport_offset),
+        IpProtocol::Icmpv4 => parse_icmpv4(source, destination, transport, transport_offset),
+        IpProtocol::Icmpv6 => parse_icmpv6(source, destination, transport, transport_offset),
     }
 }
 
@@ -1330,21 +1484,22 @@ fn parse_tcp(
     source: IpAddr,
     destination: IpAddr,
     transport: &[u8],
-) -> Result<ParsedIpPacket, HammerError> {
-    if transport.len() < 20 {
+    transport_offset: usize,
+) -> Result<ParsedIpPacketView, HammerError> {
+    if transport.len() < TCP_HEADER_MIN_LEN {
         return Err(HammerError::internal("short TCP segment"));
     }
-    let source_port = u16::from_be_bytes([transport[0], transport[1]]);
-    let destination_port = u16::from_be_bytes([transport[2], transport[3]]);
-    let data_offset = ((transport[12] >> 4) as usize) * 4;
-    if data_offset < 20 || transport.len() < data_offset {
+    let source_port = read_u16(transport, TCP_SOURCE_PORT_OFFSET);
+    let destination_port = read_u16(transport, TCP_DESTINATION_PORT_OFFSET);
+    let data_offset = ((transport[TCP_DATA_OFFSET_OFFSET] >> 4) as usize) * 4;
+    if data_offset < TCP_HEADER_MIN_LEN || transport.len() < data_offset {
         return Err(HammerError::internal("invalid TCP data offset"));
     }
-    Ok(ParsedIpPacket {
+    Ok(ParsedIpPacketView {
         network: Network::Tcp,
         source: SocksAddr::ip(source, source_port),
         destination: SocksAddr::ip(destination, destination_port),
-        payload: transport[data_offset..].to_vec(),
+        payload_range: transport_offset + data_offset..transport_offset + transport.len(),
     })
 }
 
@@ -1352,21 +1507,22 @@ fn parse_udp(
     source: IpAddr,
     destination: IpAddr,
     transport: &[u8],
-) -> Result<ParsedIpPacket, HammerError> {
-    if transport.len() < 8 {
+    transport_offset: usize,
+) -> Result<ParsedIpPacketView, HammerError> {
+    if transport.len() < UDP_HEADER_LEN {
         return Err(HammerError::internal("short UDP datagram"));
     }
-    let source_port = u16::from_be_bytes([transport[0], transport[1]]);
-    let destination_port = u16::from_be_bytes([transport[2], transport[3]]);
-    let length = u16::from_be_bytes([transport[4], transport[5]]) as usize;
-    if length < 8 || transport.len() < length {
+    let source_port = read_u16(transport, UDP_SOURCE_PORT_OFFSET);
+    let destination_port = read_u16(transport, UDP_DESTINATION_PORT_OFFSET);
+    let length = read_u16(transport, UDP_LENGTH_OFFSET) as usize;
+    if length < UDP_HEADER_LEN || transport.len() < length {
         return Err(HammerError::internal("invalid UDP length"));
     }
-    Ok(ParsedIpPacket {
+    Ok(ParsedIpPacketView {
         network: Network::Udp,
         source: SocksAddr::ip(source, source_port),
         destination: SocksAddr::ip(destination, destination_port),
-        payload: transport[8..length].to_vec(),
+        payload_range: transport_offset + UDP_HEADER_LEN..transport_offset + length,
     })
 }
 
@@ -1377,18 +1533,27 @@ fn process_system_tcp_ipv4(
     nat_addr: IpAddr,
     listener_port: u16,
 ) -> Result<(), HammerError> {
-    if packet.len() < 40 {
+    if packet.len() < IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN {
         return Err(HammerError::internal("short IPv4 TCP packet"));
     }
     let ihl = ((packet[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || packet.len() < ihl + 20 || packet[9] != 6 {
+    if ihl < IPV4_HEADER_MIN_LEN
+        || packet.len() < ihl + TCP_HEADER_MIN_LEN
+        || packet[IPV4_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv4 TCP packet"));
     }
     let source_addr = IpAddr::V4(Ipv4Addr::new(
-        packet[12], packet[13], packet[14], packet[15],
+        packet[IPV4_SOURCE_OFFSET],
+        packet[IPV4_SOURCE_OFFSET + 1],
+        packet[IPV4_SOURCE_OFFSET + 2],
+        packet[IPV4_SOURCE_OFFSET + 3],
     ));
     let destination_addr = IpAddr::V4(Ipv4Addr::new(
-        packet[16], packet[17], packet[18], packet[19],
+        packet[IPV4_DESTINATION_OFFSET],
+        packet[IPV4_DESTINATION_OFFSET + 1],
+        packet[IPV4_DESTINATION_OFFSET + 2],
+        packet[IPV4_DESTINATION_OFFSET + 3],
     ));
     let tcp = ihl;
     let source_port = read_u16(packet, tcp);
@@ -1398,17 +1563,17 @@ fn process_system_tcp_ipv4(
         let session = nat.lookup_back(destination_port).ok_or_else(|| {
             HammerError::internal(format!("tcp NAT session not found: {destination_port}"))
         })?;
-        write_ip_addr(packet, 12, session.destination.host)?;
+        write_ip_addr(packet, IPV4_SOURCE_OFFSET, session.destination.host)?;
         write_u16(packet, tcp, session.destination.port);
-        write_ip_addr(packet, 16, session.source.host)?;
+        write_ip_addr(packet, IPV4_DESTINATION_OFFSET, session.source.host)?;
         write_u16(packet, tcp + 2, session.source.port);
     } else {
         let source = SocksAddr::ip(source_addr, source_port);
         let destination = SocksAddr::ip(destination_addr, destination_port);
         let nat_port = nat.lookup_or_insert(source, destination);
-        write_ip_addr(packet, 12, nat_addr)?;
+        write_ip_addr(packet, IPV4_SOURCE_OFFSET, nat_addr)?;
         write_u16(packet, tcp, nat_port);
-        write_ip_addr(packet, 16, listener_addr)?;
+        write_ip_addr(packet, IPV4_DESTINATION_OFFSET, listener_addr)?;
         write_u16(packet, tcp + 2, listener_port);
     }
     update_ipv4_tcp_checksums(packet, ihl)
@@ -1421,16 +1586,18 @@ fn process_system_tcp_ipv6(
     nat_addr: IpAddr,
     listener_port: u16,
 ) -> Result<(), HammerError> {
-    if packet.len() < 60 || packet[6] != 6 {
+    if packet.len() < IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN
+        || packet[IPV6_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv6 TCP packet"));
     }
     let source_addr = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[8..24]).unwrap(),
+        <[u8; 16]>::try_from(&packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]).unwrap(),
     ));
     let destination_addr = IpAddr::V6(Ipv6Addr::from(
-        <[u8; 16]>::try_from(&packet[24..40]).unwrap(),
+        <[u8; 16]>::try_from(&packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]).unwrap(),
     ));
-    let tcp = 40;
+    let tcp = IPV6_HEADER_LEN;
     let source_port = read_u16(packet, tcp);
     let destination_port = read_u16(packet, tcp + 2);
 
@@ -1438,68 +1605,68 @@ fn process_system_tcp_ipv6(
         let session = nat.lookup_back(destination_port).ok_or_else(|| {
             HammerError::internal(format!("tcp NAT session not found: {destination_port}"))
         })?;
-        write_ip_addr(packet, 8, session.destination.host)?;
+        write_ip_addr(packet, IPV6_SOURCE_OFFSET, session.destination.host)?;
         write_u16(packet, tcp, session.destination.port);
-        write_ip_addr(packet, 24, session.source.host)?;
+        write_ip_addr(packet, IPV6_DESTINATION_OFFSET, session.source.host)?;
         write_u16(packet, tcp + 2, session.source.port);
     } else {
         let source = SocksAddr::ip(source_addr, source_port);
         let destination = SocksAddr::ip(destination_addr, destination_port);
         let nat_port = nat.lookup_or_insert(source, destination);
-        write_ip_addr(packet, 8, nat_addr)?;
+        write_ip_addr(packet, IPV6_SOURCE_OFFSET, nat_addr)?;
         write_u16(packet, tcp, nat_port);
-        write_ip_addr(packet, 24, listener_addr)?;
+        write_ip_addr(packet, IPV6_DESTINATION_OFFSET, listener_addr)?;
         write_u16(packet, tcp + 2, listener_port);
     }
     update_ipv6_tcp_checksum(packet)
 }
 
 fn update_ipv4_tcp_checksums(packet: &mut [u8], ihl: usize) -> Result<(), HammerError> {
-    write_u16(packet, 10, 0);
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, 0);
     let ip_checksum = checksum(&packet[..ihl]);
-    write_u16(packet, 10, ip_checksum);
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
     let tcp_len = packet.len() - ihl;
-    write_u16(packet, ihl + 16, 0);
+    write_u16(packet, ihl + TCP_CHECKSUM_OFFSET, 0);
     let mut pseudo = Vec::with_capacity(12 + tcp_len);
-    pseudo.extend_from_slice(&packet[12..20]);
+    pseudo.extend_from_slice(&packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET + 4]);
     pseudo.push(0);
-    pseudo.push(6);
+    pseudo.push(IpProtocol::Tcp.wire_value());
     pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
     pseudo.extend_from_slice(&packet[ihl..]);
     let tcp_checksum = checksum(&pseudo);
-    write_u16(packet, ihl + 16, tcp_checksum);
+    write_u16(packet, ihl + TCP_CHECKSUM_OFFSET, tcp_checksum);
     Ok(())
 }
 
 fn update_ipv6_tcp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
-    let tcp_len = packet.len() - 40;
-    write_u16(packet, 40 + 16, 0);
-    let mut pseudo = Vec::with_capacity(40 + tcp_len);
-    pseudo.extend_from_slice(&packet[8..40]);
+    let tcp_len = packet.len() - IPV6_HEADER_LEN;
+    write_u16(packet, IPV6_HEADER_LEN + TCP_CHECKSUM_OFFSET, 0);
+    let mut pseudo = Vec::with_capacity(IPV6_HEADER_LEN + tcp_len);
+    pseudo.extend_from_slice(&packet[IPV6_SOURCE_OFFSET..IPV6_HEADER_LEN]);
     pseudo.extend_from_slice(&(tcp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 6]);
-    pseudo.extend_from_slice(&packet[40..]);
+    pseudo.extend_from_slice(&[0, 0, 0, IpProtocol::Tcp.wire_value()]);
+    pseudo.extend_from_slice(&packet[IPV6_HEADER_LEN..]);
     let tcp_checksum = checksum(&pseudo);
-    write_u16(packet, 40 + 16, tcp_checksum);
+    write_u16(packet, IPV6_HEADER_LEN + TCP_CHECKSUM_OFFSET, tcp_checksum);
     Ok(())
 }
 
 fn update_ipv4_udp_checksums(packet: &mut [u8], udp_offset: usize) -> Result<(), HammerError> {
-    write_u16(packet, 10, 0);
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, 0);
     let ip_checksum = checksum(&packet[..udp_offset]);
-    write_u16(packet, 10, ip_checksum);
-    write_u16(packet, udp_offset + 6, 0);
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
+    write_u16(packet, udp_offset + UDP_CHECKSUM_OFFSET, 0);
     let udp_len = packet.len() - udp_offset;
     let mut pseudo = Vec::with_capacity(12 + udp_len);
-    pseudo.extend_from_slice(&packet[12..20]);
+    pseudo.extend_from_slice(&packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET + 4]);
     pseudo.push(0);
-    pseudo.push(17);
+    pseudo.push(IpProtocol::Udp.wire_value());
     pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
     pseudo.extend_from_slice(&packet[udp_offset..]);
     let udp_checksum = checksum(&pseudo);
     write_u16(
         packet,
-        udp_offset + 6,
+        udp_offset + UDP_CHECKSUM_OFFSET,
         if udp_checksum == 0 {
             0xffff
         } else {
@@ -1510,17 +1677,17 @@ fn update_ipv4_udp_checksums(packet: &mut [u8], udp_offset: usize) -> Result<(),
 }
 
 fn update_ipv6_udp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
-    write_u16(packet, 46, 0);
-    let udp_len = packet.len() - 40;
-    let mut pseudo = Vec::with_capacity(40 + udp_len);
-    pseudo.extend_from_slice(&packet[8..40]);
+    write_u16(packet, IPV6_HEADER_LEN + UDP_CHECKSUM_OFFSET, 0);
+    let udp_len = packet.len() - IPV6_HEADER_LEN;
+    let mut pseudo = Vec::with_capacity(IPV6_HEADER_LEN + udp_len);
+    pseudo.extend_from_slice(&packet[IPV6_SOURCE_OFFSET..IPV6_HEADER_LEN]);
     pseudo.extend_from_slice(&(udp_len as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 17]);
-    pseudo.extend_from_slice(&packet[40..]);
+    pseudo.extend_from_slice(&[0, 0, 0, IpProtocol::Udp.wire_value()]);
+    pseudo.extend_from_slice(&packet[IPV6_HEADER_LEN..]);
     let udp_checksum = checksum(&pseudo);
     write_u16(
         packet,
-        46,
+        IPV6_HEADER_LEN + UDP_CHECKSUM_OFFSET,
         if udp_checksum == 0 {
             0xffff
         } else {
@@ -1558,74 +1725,99 @@ async fn bridge_system_tcp_streams(
 }
 
 fn ipv4_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    if request.len() < 28 || request[9] != 17 {
+    if request.len() < IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN
+        || request[IPV4_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv4 UDP packet"));
     }
     let ihl = ((request[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || request.len() < ihl + 8 {
+    if ihl < IPV4_HEADER_MIN_LEN || request.len() < ihl + UDP_HEADER_LEN {
         return Err(HammerError::internal("invalid IPv4 UDP header"));
     }
-    let quoted_len = request.len().min(ihl + 8);
-    let total_len = 20 + 8 + quoted_len;
+    let quoted_len = request.len().min(ihl + UDP_HEADER_LEN);
+    let total_len = IPV4_HEADER_MIN_LEN + 8 + quoted_len;
     let mut packet = vec![0_u8; total_len];
     packet[0] = 0x45;
-    write_u16(&mut packet, 2, total_len as u16);
-    packet[8] = 64;
-    packet[9] = 1;
-    packet[12..16].copy_from_slice(&request[16..20]);
-    packet[16..20].copy_from_slice(&request[12..16]);
-    packet[20] = 3;
-    packet[21] = 3;
+    write_u16(&mut packet, IPV4_TOTAL_LENGTH_OFFSET, total_len as u16);
+    packet[IPV4_TTL_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV4_PROTOCOL_OFFSET] = IpProtocol::Icmpv4.wire_value();
+    packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]
+        .copy_from_slice(&request[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]);
+    packet[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]
+        .copy_from_slice(&request[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]);
+    packet[IPV4_HEADER_MIN_LEN] = 3;
+    packet[IPV4_HEADER_MIN_LEN + 1] = 3;
     packet[28..].copy_from_slice(&request[..quoted_len]);
-    let ip_checksum = checksum(&packet[..20]);
-    write_u16(&mut packet, 10, ip_checksum);
-    let icmp_checksum = checksum(&packet[20..]);
-    write_u16(&mut packet, 22, icmp_checksum);
+    let ip_checksum = checksum(&packet[..IPV4_HEADER_MIN_LEN]);
+    write_u16(&mut packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
+    let icmp_checksum = checksum(&packet[IPV4_HEADER_MIN_LEN..]);
+    write_u16(&mut packet, IPV4_HEADER_MIN_LEN + 2, icmp_checksum);
     Ok(packet)
 }
 
 fn ipv6_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    if request.len() < 48 || request[6] != 17 {
+    if request.len() < IPV6_HEADER_LEN + UDP_HEADER_LEN
+        || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv6 UDP packet"));
     }
     let quoted_len = request.len().min(1232);
-    let payload_len = 8 + quoted_len;
-    let mut packet = vec![0_u8; 40 + payload_len];
+    let payload_len = UDP_HEADER_LEN + quoted_len;
+    let mut packet = vec![0_u8; IPV6_HEADER_LEN + payload_len];
     packet[0] = 0x60;
-    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
-    packet[6] = 58;
-    packet[7] = 64;
-    packet[8..24].copy_from_slice(&request[24..40]);
-    packet[24..40].copy_from_slice(&request[8..24]);
-    packet[40] = 1;
-    packet[41] = 4;
+    packet[IPV6_PAYLOAD_LEN_OFFSET..IPV6_PROTOCOL_OFFSET]
+        .copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[IPV6_PROTOCOL_OFFSET] = IpProtocol::Icmpv6.wire_value();
+    packet[IPV6_HOP_LIMIT_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]
+        .copy_from_slice(&request[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]);
+    packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]
+        .copy_from_slice(&request[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]);
+    packet[IPV6_HEADER_LEN] = 1;
+    packet[IPV6_HEADER_LEN + 1] = 4;
     packet[48..].copy_from_slice(&request[..quoted_len]);
     update_ipv6_icmp_checksum(&mut packet)?;
     Ok(packet)
 }
 
 fn ipv4_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    if request.len() < 40 || request[9] != 6 {
+    if request.len() < IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN
+        || request[IPV4_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv4 TCP packet"));
     }
     let ihl = ((request[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || request.len() < ihl + 20 {
+    if ihl < IPV4_HEADER_MIN_LEN || request.len() < ihl + TCP_HEADER_MIN_LEN {
         return Err(HammerError::internal("invalid IPv4 TCP header"));
     }
     let tcp_len = request.len() - ihl;
     let data_offset = ((request[ihl + 12] >> 4) as usize) * 4;
-    if data_offset < 20 || tcp_len < data_offset {
+    if data_offset < TCP_HEADER_MIN_LEN || tcp_len < data_offset {
         return Err(HammerError::internal("invalid TCP data offset"));
     }
-    let mut packet = vec![0_u8; 40];
+    let mut packet = vec![0_u8; IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN];
     packet[0] = 0x45;
-    write_u16(&mut packet, 2, 40);
-    packet[8] = 64;
-    packet[9] = 6;
-    packet[12..16].copy_from_slice(&request[16..20]);
-    packet[16..20].copy_from_slice(&request[12..16]);
-    write_u16(&mut packet, 20, read_u16(request, ihl + 2));
-    write_u16(&mut packet, 22, read_u16(request, ihl));
+    write_u16(
+        &mut packet,
+        IPV4_TOTAL_LENGTH_OFFSET,
+        (IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN) as u16,
+    );
+    packet[IPV4_TTL_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV4_PROTOCOL_OFFSET] = IpProtocol::Tcp.wire_value();
+    packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]
+        .copy_from_slice(&request[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]);
+    packet[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]
+        .copy_from_slice(&request[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]);
+    write_u16(
+        &mut packet,
+        IPV4_HEADER_MIN_LEN,
+        read_u16(request, ihl + TCP_DESTINATION_PORT_OFFSET),
+    );
+    write_u16(
+        &mut packet,
+        IPV4_HEADER_MIN_LEN + TCP_DESTINATION_PORT_OFFSET,
+        read_u16(request, ihl),
+    );
     let seq = read_u32(request, ihl + 4);
     let ack = read_u32(request, ihl + 8);
     let flags = request[ihl + 13];
@@ -1639,30 +1831,43 @@ fn ipv4_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
         write_u32(&mut packet, 28, seq.wrapping_add(increment));
         packet[33] = 0x14;
     }
-    packet[32] = 0x50;
-    update_ipv4_tcp_checksums(&mut packet, 20)?;
+    packet[IPV4_HEADER_MIN_LEN + TCP_DATA_OFFSET_OFFSET] = 0x50;
+    update_ipv4_tcp_checksums(&mut packet, IPV4_HEADER_MIN_LEN)?;
     Ok(packet)
 }
 
 fn ipv6_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    if request.len() < 60 || request[6] != 6 {
+    if request.len() < IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN
+        || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
+    {
         return Err(HammerError::internal("invalid IPv6 TCP packet"));
     }
-    let tcp = 40;
+    let tcp = IPV6_HEADER_LEN;
     let data_offset = ((request[tcp + 12] >> 4) as usize) * 4;
-    if data_offset < 20 || request.len() < tcp + data_offset {
+    if data_offset < TCP_HEADER_MIN_LEN || request.len() < tcp + data_offset {
         return Err(HammerError::internal("invalid TCP data offset"));
     }
     let tcp_len = request.len() - tcp;
-    let mut packet = vec![0_u8; 60];
+    let mut packet = vec![0_u8; IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN];
     packet[0] = 0x60;
-    packet[4..6].copy_from_slice(&20_u16.to_be_bytes());
-    packet[6] = 6;
-    packet[7] = 64;
-    packet[8..24].copy_from_slice(&request[24..40]);
-    packet[24..40].copy_from_slice(&request[8..24]);
-    write_u16(&mut packet, 40, read_u16(request, tcp + 2));
-    write_u16(&mut packet, 42, read_u16(request, tcp));
+    packet[IPV6_PAYLOAD_LEN_OFFSET..IPV6_PROTOCOL_OFFSET]
+        .copy_from_slice(&(TCP_HEADER_MIN_LEN as u16).to_be_bytes());
+    packet[IPV6_PROTOCOL_OFFSET] = IpProtocol::Tcp.wire_value();
+    packet[IPV6_HOP_LIMIT_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]
+        .copy_from_slice(&request[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]);
+    packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN]
+        .copy_from_slice(&request[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]);
+    write_u16(
+        &mut packet,
+        tcp,
+        read_u16(request, tcp + TCP_DESTINATION_PORT_OFFSET),
+    );
+    write_u16(
+        &mut packet,
+        tcp + TCP_DESTINATION_PORT_OFFSET,
+        read_u16(request, tcp),
+    );
     let seq = read_u32(request, tcp + 4);
     let ack = read_u32(request, tcp + 8);
     let flags = request[tcp + 13];
@@ -1676,7 +1881,7 @@ fn ipv6_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
         write_u32(&mut packet, 48, seq.wrapping_add(increment));
         packet[53] = 0x14;
     }
-    packet[52] = 0x50;
+    packet[tcp + TCP_DATA_OFFSET_OFFSET] = 0x50;
     update_ipv6_tcp_checksum(&mut packet)?;
     Ok(packet)
 }
@@ -1928,8 +2133,8 @@ async fn packet_loop(
     // degrades to the previous behaviour.
     const RECV_BATCH_HINT: usize = 256;
     let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
-    let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
-    let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacket)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
     let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
     spawn_dns_hijack_workers(
         Arc::clone(&dns_router),
@@ -1977,7 +2182,7 @@ async fn packet_loop(
                     metrics.counters.packet_drop_empty_total.increment(1);
                     continue;
                 }
-                let parsed = match parse_ip_packet(&packet) {
+                let parsed = match parse_ip_packet_view(&packet) {
                     Ok(parsed) => parsed,
                     Err(err) => {
                         metrics.counters.packet_parse_error_total.increment(1);
@@ -2067,31 +2272,26 @@ fn handle_system_udp_packet(
     control_write_tx: &mpsc::Sender<Vec<u8>>,
     udp_timeout: Duration,
     packet: Vec<u8>,
-    parsed: ParsedIpPacket,
+    parsed: ParsedIpPacketView,
     metrics: TunMetrics,
 ) -> Result<(), HammerError> {
-    let mut tun_packet = TunPacket {
-        metadata: RouteMetadata {
-            inbound: inbound_id,
-            network: Network::Udp,
-            source: Some(parsed.source.clone()),
-            destination: Some(parsed.destination.clone()),
-            ..Default::default()
-        },
-        payload: parsed.payload.clone(),
+    let mut metadata = RouteMetadata {
+        inbound: inbound_id,
+        network: Network::Udp,
+        source: Some(parsed.source.clone()),
+        destination: Some(parsed.destination.clone()),
+        ..Default::default()
     };
-    if router.should_sniff(&tun_packet.metadata) {
-        sniff_packet(&mut tun_packet);
+    if router.should_sniff(&metadata) {
+        sniff_packet_metadata(&mut metadata, parsed.payload(&packet)?);
     }
-    if let Err(err) = prepare_route_metadata(
-        router.as_ref(),
-        &mut tun_packet.metadata,
-        Some(dns_router.as_ref()),
-    ) {
+    if let Err(err) =
+        prepare_route_metadata(router.as_ref(), &mut metadata, Some(dns_router.as_ref()))
+    {
         metrics.counters.udp_route_prepare_error_total.increment(1);
         return Err(err);
     }
-    let decision = match router.match_route(&mut tun_packet.metadata) {
+    let decision = match router.match_route(&mut metadata) {
         Ok(decision) => decision,
         Err(err) => {
             metrics.route_error_total.inc(Network::Udp);
@@ -2104,8 +2304,8 @@ fn handle_system_udp_packet(
                 dns_hijack_tx,
                 packet,
                 parsed.destination,
-                tun_packet.payload,
-                dns_query_options(&tun_packet.metadata),
+                parsed.payload_range,
+                dns_query_options(&metadata),
                 &metrics,
             );
         }
@@ -2113,9 +2313,9 @@ fn handle_system_udp_packet(
             metrics.reject_total.inc(Network::Udp);
             let message = format!(
                 "drop UDP packet by reject rule: method={}, destination={}, protocol={}",
-                method, parsed.destination, tun_packet.metadata.protocol
+                method, parsed.destination, metadata.protocol
             );
-            if tun_packet.metadata.protocol == "quic" {
+            if metadata.protocol == "quic" {
                 trace!("{}", message);
             } else {
                 debug!("{}", message);
@@ -2133,7 +2333,7 @@ fn handle_system_udp_packet(
                     "outbound not found: {outbound_id}"
                 )));
             };
-            let destination = route_destination(&tun_packet.metadata, Some(dns_router.as_ref()))?;
+            let destination = route_destination(&metadata, Some(dns_router.as_ref()))?;
             let template = UdpResponseTemplate::from_request(&packet)?;
             let key = UdpFlowKey {
                 outbound: outbound_id.clone(),
@@ -2170,7 +2370,10 @@ fn handle_system_udp_packet(
                     tx
                 }
             };
-            if let Err(err) = sender.try_send(tun_packet.payload) {
+            if let Err(err) = sender.try_send(UdpFlowPayload {
+                packet,
+                payload: parsed.payload_range,
+            }) {
                 metrics.counters.udp_flow_drop_busy_total.increment(1);
                 debug!("drop UDP packet for busy system flow: {err}");
             }
@@ -2207,7 +2410,7 @@ fn enqueue_system_dns_hijack_packet(
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
     packet: Vec<u8>,
     destination: SocksAddr,
-    payload: Vec<u8>,
+    payload: Range<usize>,
     options: DnsQueryOptions,
     metrics: &TunMetrics,
 ) {
@@ -2267,7 +2470,7 @@ async fn handle_system_dns_hijack_packet(
     device: Arc<dyn TunDevice>,
     job: DnsHijackJob,
 ) -> Result<(), HammerError> {
-    let message = <Message as MessageExt>::from_bytes(&job.payload)?;
+    let message = <Message as MessageExt>::from_bytes(job.payload()?)?;
     let response = dns_router.exchange(message, job.options).await?;
     let response_bytes = MessageExt::to_bytes(&response)?;
     let response_packet = udp_response_packet(&job.packet, job.destination, &response_bytes)?;
@@ -2399,7 +2602,7 @@ async fn system_udp_flow_loop(
     destination: SocksAddr,
     response_template: UdpResponseTemplate,
     udp_timeout: Duration,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<UdpFlowPayload>,
     metrics: TunMetrics,
 ) {
     let mut packet_conn = match outbound.listen_packet().await {
@@ -2416,11 +2619,19 @@ async fn system_udp_flow_loop(
     loop {
         tokio::select! {
             next = rx.recv() => {
-                let Some(payload) = next else {
+                let Some(item) = next else {
                     break;
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                if let Err(err) = packet_conn.send_to(destination.clone(), &payload).await {
+                let payload = match item.payload() {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        metrics.counters.udp_flow_send_error_total.increment(1);
+                        debug!("read system UDP payload: {err}");
+                        break;
+                    }
+                };
+                if let Err(err) = packet_conn.send_to(destination.clone(), payload).await {
                     metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
@@ -2541,40 +2752,35 @@ fn sniff_tls_sni(packet: &mut TunPacket) {
     }
 }
 
-fn sniff_dns(packet: &mut TunPacket) {
-    if packet.payload.len() < 12 {
+fn sniff_dns_payload(metadata: &mut RouteMetadata, payload: &[u8]) {
+    if payload.len() < 12 {
         return;
     }
-    if packet.payload[2] & 0x80 != 0 {
+    if payload[2] & 0x80 != 0 {
         return;
     }
-    let questions = u16::from_be_bytes([packet.payload[4], packet.payload[5]]);
-    let answers = u16::from_be_bytes([packet.payload[6], packet.payload[7]]);
+    let questions = u16::from_be_bytes([payload[4], payload[5]]);
+    let answers = u16::from_be_bytes([payload[6], payload[7]]);
     if questions == 0 || answers != 0 {
         return;
     }
-    packet.metadata.protocol = "dns".to_owned();
+    metadata.protocol = "dns".to_owned();
 }
 
-fn sniff_quic(packet: &mut TunPacket) {
-    if packet.payload.len() < 7 || packet.payload[0] & 0xc0 != 0xc0 {
+fn sniff_quic_payload(metadata: &mut RouteMetadata, payload: &[u8]) {
+    if payload.len() < 7 || payload[0] & 0xc0 != 0xc0 {
         return;
     }
-    let version = u32::from_be_bytes([
-        packet.payload[1],
-        packet.payload[2],
-        packet.payload[3],
-        packet.payload[4],
-    ]);
+    let version = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
     if !matches!(version, 0x0000_0001 | 0x0000_0002 | 0xff00_001d) {
         return;
     }
-    packet.metadata.protocol = "quic".to_owned();
+    metadata.protocol = "quic".to_owned();
 }
 
-fn sniff_stun(packet: &mut TunPacket) {
-    if packet.payload.len() >= 20 && packet.payload[4..8] == [0x21, 0x12, 0xa4, 0x42] {
-        packet.metadata.protocol = "stun".to_owned();
+fn sniff_stun_payload(metadata: &mut RouteMetadata, payload: &[u8]) {
+    if payload.len() >= 20 && payload[4..8] == [0x21, 0x12, 0xa4, 0x42] {
+        metadata.protocol = "stun".to_owned();
     }
 }
 
@@ -2683,7 +2889,8 @@ fn parse_icmpv4(
     source: IpAddr,
     destination: IpAddr,
     transport: &[u8],
-) -> Result<ParsedIpPacket, HammerError> {
+    transport_offset: usize,
+) -> Result<ParsedIpPacketView, HammerError> {
     if transport.len() < 8 {
         return Err(HammerError::internal("short ICMPv4 packet"));
     }
@@ -2693,11 +2900,11 @@ fn parse_icmpv4(
             transport[0]
         )));
     }
-    Ok(ParsedIpPacket {
+    Ok(ParsedIpPacketView {
         network: Network::Icmp,
         source: SocksAddr::ip(source, 0),
         destination: SocksAddr::ip(destination, 0),
-        payload: transport.to_vec(),
+        payload_range: transport_offset..transport_offset + transport.len(),
     })
 }
 
@@ -2705,7 +2912,8 @@ fn parse_icmpv6(
     source: IpAddr,
     destination: IpAddr,
     transport: &[u8],
-) -> Result<ParsedIpPacket, HammerError> {
+    transport_offset: usize,
+) -> Result<ParsedIpPacketView, HammerError> {
     if transport.len() < 8 {
         return Err(HammerError::internal("short ICMPv6 packet"));
     }
@@ -2715,11 +2923,11 @@ fn parse_icmpv6(
             transport[0]
         )));
     }
-    Ok(ParsedIpPacket {
+    Ok(ParsedIpPacketView {
         network: Network::Icmp,
         source: SocksAddr::ip(source, 0),
         destination: SocksAddr::ip(destination, 0),
-        payload: transport.to_vec(),
+        payload_range: transport_offset..transport_offset + transport.len(),
     })
 }
 
@@ -2730,25 +2938,19 @@ async fn handle_system_icmp_packet(
     inbound_id: String,
     device: Arc<dyn TunDevice>,
     packet: Vec<u8>,
-    parsed: ParsedIpPacket,
+    parsed: ParsedIpPacketView,
 ) -> Result<(), HammerError> {
-    let mut tun_packet = TunPacket {
-        metadata: RouteMetadata {
-            inbound: inbound_id,
-            network: Network::Icmp,
-            source: Some(parsed.source.clone()),
-            destination: Some(parsed.destination.clone()),
-            protocol: icmp_protocol(parsed.destination.host).to_owned(),
-            ..Default::default()
-        },
-        payload: parsed.payload.clone(),
+    let payload = parsed.payload(&packet)?;
+    let mut metadata = RouteMetadata {
+        inbound: inbound_id,
+        network: Network::Icmp,
+        source: Some(parsed.source.clone()),
+        destination: Some(parsed.destination.clone()),
+        protocol: icmp_protocol(parsed.destination.host).to_owned(),
+        ..Default::default()
     };
-    prepare_route_metadata(
-        router.as_ref(),
-        &mut tun_packet.metadata,
-        Some(dns_router.as_ref()),
-    )?;
-    let decision = router.match_route(&mut tun_packet.metadata)?;
+    prepare_route_metadata(router.as_ref(), &mut metadata, Some(dns_router.as_ref()))?;
+    let decision = router.match_route(&mut metadata)?;
     match decision {
         RouteDecision::HijackDns => {
             // ICMP is not routable to the DNS hijack; this should not be
@@ -2789,7 +2991,7 @@ async fn handle_system_icmp_packet(
                 }
             };
             let dest_ip = parsed.destination.host;
-            conn.send_echo(dest_ip, &tun_packet.payload).await?;
+            conn.send_echo(dest_ip, payload).await?;
             let reply = match timeout(Duration::from_secs(2), conn.recv_reply()).await {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(err)) => {
@@ -2854,7 +3056,7 @@ fn spawn_icmp_workers(
 fn enqueue_system_icmp_packet(
     icmp_tx: &mpsc::Sender<IcmpJob>,
     packet: Vec<u8>,
-    parsed: ParsedIpPacket,
+    parsed: ParsedIpPacketView,
     metrics: &TunMetrics,
 ) {
     match icmp_tx.try_send(IcmpJob { packet, parsed }) {
@@ -2931,13 +3133,9 @@ fn synthesize_ip_packet(
 }
 
 pub fn icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
-    match request.first().map(|byte| byte >> 4) {
-        Some(4) => ipv4_icmp_unreachable_packet(request),
-        Some(6) => ipv6_icmp_unreachable_packet(request),
-        Some(version) => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
-        None => Err(HammerError::internal("empty IP packet")),
+    match IpVersion::from_packet(request)? {
+        IpVersion::V4 => ipv4_icmp_unreachable_packet(request),
+        IpVersion::V6 => ipv6_icmp_unreachable_packet(request),
     }
 }
 
@@ -2994,13 +3192,9 @@ fn ipv6_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> 
 /// type byte) into a tun-deliverable IP packet. We swap src/dst from
 /// the original echo request so the reply reaches the originating app.
 pub fn icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
-    match request.first().map(|byte| byte >> 4) {
-        Some(4) => ipv4_icmp_echo_reply_packet(request, reply_body),
-        Some(6) => ipv6_icmp_echo_reply_packet(request, reply_body),
-        Some(version) => Err(HammerError::internal(format!(
-            "unsupported IP version: {version}"
-        ))),
-        None => Err(HammerError::internal("empty IP packet")),
+    match IpVersion::from_packet(request)? {
+        IpVersion::V4 => ipv4_icmp_echo_reply_packet(request, reply_body),
+        IpVersion::V6 => ipv6_icmp_echo_reply_packet(request, reply_body),
     }
 }
 
