@@ -27,7 +27,7 @@ use hammer_adapter::ProbeReport;
 use std::time::Duration;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
-const DATA_WORKER_THREADS: usize = 2;
+const DATA_WORKER_THREADS: usize = 1;
 const DATA_WORKER_STACK_SIZE: usize = 512 * 1024;
 const DATA_MAX_BLOCKING_THREADS: usize = 4;
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -96,11 +96,11 @@ impl RuntimeService {
         let options = config::parse_config(config_content)?;
         let metrics = MetricsRegistry::new();
         let base_time = Instant::now();
-        // Data-plane runtime: hosts every business future. Keep at least two
-        // workers so bursty DNS/UDP work cannot monopolize TUN/TCP progress on
-        // older devices. The control plane (below) runs on its own dedicated
-        // current_thread runtime so worker stalls cannot delay log/metrics/
-        // command dispatch.
+        // Data-plane runtime: hosts every business future. Keep a single
+        // worker for iOS NetExt until we have device-side evidence that extra
+        // workers reduce latency; the control plane (below) runs on its own
+        // dedicated current_thread runtime so worker stalls cannot delay log/
+        // metrics/command dispatch.
         let data_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(DATA_WORKER_THREADS)
             .thread_name("hammer-data")
