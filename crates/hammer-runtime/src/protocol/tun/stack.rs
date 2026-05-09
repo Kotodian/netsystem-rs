@@ -519,18 +519,7 @@ struct UdpFlowState {
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
-struct UdpFlowPayload {
-    packet: Vec<u8>,
-    payload: Range<usize>,
-}
-
-impl UdpFlowPayload {
-    fn payload(&self) -> Result<&[u8], HammerError> {
-        self.packet
-            .get(self.payload.start..self.payload.end)
-            .ok_or_else(|| HammerError::internal("UDP flow payload range is out of bounds"))
-    }
-}
+type UdpFlowPayload = Vec<u8>;
 
 struct DnsHijackJob {
     packet: Vec<u8>,
@@ -2370,12 +2359,15 @@ fn handle_system_udp_packet(
                     tx
                 }
             };
-            if let Err(err) = sender.try_send(UdpFlowPayload {
-                packet,
-                payload: parsed.payload_range,
-            }) {
-                metrics.counters.udp_flow_drop_busy_total.increment(1);
-                debug!("drop UDP packet for busy system flow: {err}");
+            match sender.try_reserve() {
+                Ok(permit) => {
+                    let payload = parsed.payload(&packet)?.to_vec();
+                    permit.send(payload);
+                }
+                Err(err) => {
+                    metrics.counters.udp_flow_drop_busy_total.increment(1);
+                    debug!("drop UDP packet for busy system flow: {err}");
+                }
             }
             if let Some((
                 device,
@@ -2623,15 +2615,7 @@ async fn system_udp_flow_loop(
                     break;
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                let payload = match item.payload() {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        metrics.counters.udp_flow_send_error_total.increment(1);
-                        debug!("read system UDP payload: {err}");
-                        break;
-                    }
-                };
-                if let Err(err) = packet_conn.send_to(destination.clone(), payload).await {
+                if let Err(err) = packet_conn.send_to(destination.clone(), &item).await {
                     metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
