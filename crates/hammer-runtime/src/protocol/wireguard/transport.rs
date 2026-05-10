@@ -30,7 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, WithContext};
 use hammer_core::log::Logger;
 
 use crate::protocol::tun::ipstack::IpStackInput;
@@ -90,7 +90,7 @@ impl TransportSockets {
             .ok_or_else(|| HammerError::internal("wireguard transport has no UDP socket"))?;
         socket
             .local_addr()
-            .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))
+            .with_context(|| "wireguard udp local_addr")
     }
 
     fn send_socket(&self, destination: SocketAddr) -> Option<&UdpSocket> {
@@ -107,9 +107,7 @@ impl TransportHandles {
     #[allow(dead_code)]
     pub(crate) async fn shutdown(self) -> Result<(), HammerError> {
         let _ = self.shutdown.send(());
-        self.join
-            .await
-            .map_err(|err| HammerError::internal(format!("wireguard transport join: {err}")))
+        self.join.await.with_context(|| "wireguard transport join")
     }
 }
 
@@ -172,7 +170,7 @@ fn bind_transport_sockets(
         ipv6.as_ref()
             .expect("ipv6 socket just bound")
             .local_addr()
-            .map_err(|err| HammerError::internal(format!("wireguard udp local_addr: {err}")))?
+            .with_context(|| "wireguard udp local_addr")?
             .port()
     } else {
         listen_port
@@ -209,21 +207,20 @@ fn bind_udp_socket(
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
-        .map_err(|err| HammerError::internal(format!("wireguard udp socket {bind}: {err}")))?;
+        .with_context(|| format!("wireguard udp socket {bind}"))?;
     if bind.is_ipv6() {
         socket
             .set_only_v6(ipv6_only)
-            .map_err(|err| HammerError::internal(format!("wireguard udp set_only_v6: {err}")))?;
+            .with_context(|| "wireguard udp set_only_v6")?;
     }
     socket
         .bind(&bind.into())
-        .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
+        .with_context(|| format!("wireguard udp bind {bind}"))?;
     let std_socket: std::net::UdpSocket = socket.into();
     std_socket
         .set_nonblocking(true)
-        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
-    let socket = UdpSocket::from_std(std_socket)
-        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
+        .with_context(|| "wireguard udp set_nonblocking")?;
+    let socket = UdpSocket::from_std(std_socket).with_context(|| "wireguard udp from_std")?;
     protector.protect(&socket)?;
     Ok(Arc::new(socket))
 }
@@ -232,13 +229,12 @@ fn std_udp_socket(
     bind: SocketAddr,
     protector: &SocketProtector,
 ) -> Result<Arc<UdpSocket>, HammerError> {
-    let socket = std::net::UdpSocket::bind(bind)
-        .map_err(|err| HammerError::internal(format!("wireguard udp bind {bind}: {err}")))?;
+    let socket =
+        std::net::UdpSocket::bind(bind).with_context(|| format!("wireguard udp bind {bind}"))?;
     socket
         .set_nonblocking(true)
-        .map_err(|err| HammerError::internal(format!("wireguard udp set_nonblocking: {err}")))?;
-    let socket = UdpSocket::from_std(socket)
-        .map_err(|err| HammerError::internal(format!("wireguard udp from_std: {err}")))?;
+        .with_context(|| "wireguard udp set_nonblocking")?;
+    let socket = UdpSocket::from_std(socket).with_context(|| "wireguard udp from_std")?;
     protector.protect(&socket)?;
     Ok(Arc::new(socket))
 }

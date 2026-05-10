@@ -60,3 +60,92 @@ pub type CoreResult<T> = Result<T, CoreError>;
 // migration window. New code should use `CoreError` / `CoreResult` directly.
 pub type HammerError = CoreError;
 pub type HammerResult<T> = CoreResult<T>;
+
+/// Attach a string context to any `Result<T, E>` where `E: Display`,
+/// returning a `CoreError::Internal` whose message is `"{ctx}: {source}"`.
+/// Replaces the recurring
+/// `.map_err(|err| CoreError::internal(format!("xxx: {err}")))` pattern that
+/// shows up ~116 times across `hammer-runtime`.
+///
+/// The context closure is only invoked on the error path, so success-path
+/// callers pay no allocation cost.
+///
+/// # Example
+///
+/// ```
+/// use hammer_core::error::{CoreError, WithContext};
+///
+/// fn open(path: &str) -> Result<(), CoreError> {
+///     std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+///     Ok(())
+/// }
+///
+/// let err = open("/no/such/file").unwrap_err();
+/// assert!(err.to_string().starts_with("open /no/such/file: "));
+/// ```
+pub trait WithContext<T> {
+    fn with_context<F, S>(self, context: F) -> CoreResult<T>
+    where
+        F: FnOnce() -> S,
+        S: std::fmt::Display;
+}
+
+impl<T, E: std::fmt::Display> WithContext<T> for Result<T, E> {
+    fn with_context<F, S>(self, context: F) -> CoreResult<T>
+    where
+        F: FnOnce() -> S,
+        S: std::fmt::Display,
+    {
+        self.map_err(|err| CoreError::internal(format!("{}: {err}", context())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_context_passes_through_ok_without_invoking_closure() {
+        let mut called = false;
+        let result: Result<i32, std::io::Error> = Ok(42);
+        let mapped = result.with_context(|| {
+            called = true;
+            "should not run"
+        });
+        assert!(matches!(mapped, Ok(42)));
+        assert!(!called, "closure must be lazy on the success path");
+    }
+
+    #[test]
+    fn with_context_wraps_error_with_message_prefix() {
+        let result: Result<(), &str> = Err("inner failed");
+        let err = result.with_context(|| "outer step").unwrap_err();
+        assert_eq!(err.to_string(), "outer step: inner failed");
+        assert!(matches!(err, CoreError::Internal { .. }));
+    }
+
+    #[test]
+    fn with_context_accepts_any_display_context() {
+        // String, &str, and format!()-derived String all satisfy the
+        // `Display` bound, so callers can pick whichever fits.
+        let r1: Result<(), &str> = Err("boom");
+        let r2: Result<(), &str> = Err("boom");
+        let r3: Result<(), &str> = Err("boom");
+        assert_eq!(
+            r1.with_context(|| "static").unwrap_err().to_string(),
+            "static: boom"
+        );
+        assert_eq!(
+            r2.with_context(|| String::from("owned"))
+                .unwrap_err()
+                .to_string(),
+            "owned: boom"
+        );
+        assert_eq!(
+            r3.with_context(|| format!("formatted {}", 7))
+                .unwrap_err()
+                .to_string(),
+            "formatted 7: boom"
+        );
+    }
+}
