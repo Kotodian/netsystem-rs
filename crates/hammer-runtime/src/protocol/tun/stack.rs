@@ -10,8 +10,8 @@ use tracing::{debug, error, info, trace};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    DnsQueryOptions, Network, OutboundManager as _, ProxyStream, RouteDecision, RouteMetadata,
-    SocksAddr,
+    DnsQueryOptions, DnsRouter as DnsRouterTrait, Network, OutboundManager as OutboundManagerTrait,
+    ProxyStream, RouteDecision, RouteMetadata, Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::normalize_domain;
 use hammer_core::error::HammerError;
@@ -25,7 +25,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant, timeout};
 
 use crate::dns::MessageExt;
-use crate::{DnsRouter, OutboundManager, Router};
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
 use metrics::{Counter, Key, Metadata, Recorder};
 
@@ -553,11 +552,17 @@ impl TcpPendingDialLimiter {
     }
 }
 
-pub struct SystemTunStack<D: TunDevice> {
+pub struct SystemTunStack<D, R, Q, O>
+where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     logger: Logger,
-    router: Arc<Router>,
-    dns_router: Arc<DnsRouter>,
-    outbound: Arc<OutboundManager>,
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
     inbound_id: String,
     options: hammer_core::config::TunInboundOptions,
     device: Arc<D>,
@@ -570,15 +575,18 @@ pub struct SystemTunStack<D: TunDevice> {
     metrics: TunMetrics,
 }
 
-impl<D> SystemTunStack<D>
+impl<D, R, Q, O> SystemTunStack<D, R, Q, O>
 where
     D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
 {
     pub fn new(
         logger: Logger,
-        router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
-        outbound: Arc<OutboundManager>,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
         inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
         device: Arc<D>,
@@ -592,9 +600,9 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_interface_index(
         logger: Logger,
-        router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
-        outbound: Arc<OutboundManager>,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
         inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
         device: Arc<D>,
@@ -1211,15 +1219,25 @@ fn sniff_packet_metadata(metadata: &mut RouteMetadata, payload: &[u8]) {
     }
 }
 
-pub struct SmoltcpTunStack {
-    router: Arc<Router>,
-    dns_router: Option<Arc<DnsRouter>>,
-    outbound: Option<Arc<OutboundManager>>,
+pub struct SmoltcpTunStack<R, Q, O>
+where
+    R: RouterTrait,
+    Q: DnsRouterTrait,
+    O: OutboundManagerTrait,
+{
+    router: Arc<R>,
+    dns_router: Option<Arc<Q>>,
+    outbound: Option<Arc<O>>,
     inbound_id: String,
 }
 
-impl SmoltcpTunStack {
-    pub fn new(_logger: Logger, router: Arc<Router>, inbound_id: String) -> Self {
+impl<R, Q, O> SmoltcpTunStack<R, Q, O>
+where
+    R: RouterTrait,
+    Q: DnsRouterTrait,
+    O: OutboundManagerTrait,
+{
+    pub fn new(_logger: Logger, router: Arc<R>, inbound_id: String) -> Self {
         Self {
             router,
             dns_router: None,
@@ -1230,9 +1248,9 @@ impl SmoltcpTunStack {
 
     pub fn new_with_runtime(
         _logger: Logger,
-        router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
-        outbound: Arc<OutboundManager>,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
         inbound_id: String,
     ) -> Self {
         Self {
@@ -1963,16 +1981,19 @@ fn is_global_unicast(addr: IpAddr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn accept_tcp_loop(
+async fn accept_tcp_loop<R, O>(
     _logger: Logger,
-    router: Arc<Router>,
-    outbound: Arc<OutboundManager>,
+    router: Arc<R>,
+    outbound: Arc<O>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
     inbound_id: String,
     listener: TcpListener,
     metrics: TunMetrics,
-) {
+) where
+    R: RouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     loop {
         let (inbound, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -2054,7 +2075,7 @@ async fn accept_tcp_loop(
                 error!("outbound not found: {outbound_id}");
                 return;
             };
-            let destination = match route_destination(&metadata, None) {
+            let destination = match route_destination_without_dns(&metadata) {
                 Ok(destination) => destination,
                 Err(err) => {
                     metrics.counters.tcp_destination_error_total.increment(1);
@@ -2097,11 +2118,11 @@ async fn accept_tcp_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn packet_loop<D>(
+async fn packet_loop<D, R, Q, O>(
     _logger: Logger,
-    router: Arc<Router>,
-    dns_router: Arc<DnsRouter>,
-    outbound: Arc<OutboundManager>,
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
     inbound_id: String,
     device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
@@ -2111,6 +2132,9 @@ async fn packet_loop<D>(
     metrics: TunMetrics,
 ) where
     D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
 {
     info!("system packet loop started");
     // Pull packets in batches when the underlying device supports it (Apple's
@@ -2247,10 +2271,10 @@ async fn packet_loop<D>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_system_udp_packet<D>(
-    router: Arc<Router>,
-    dns_router: Arc<DnsRouter>,
-    outbound: Arc<OutboundManager>,
+fn handle_system_udp_packet<D, R, Q, O>(
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
     inbound_id: String,
     device: Arc<D>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
@@ -2263,6 +2287,9 @@ fn handle_system_udp_packet<D>(
 ) -> Result<(), HammerError>
 where
     D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
 {
     let mut metadata = RouteMetadata {
         inbound: inbound_id,
@@ -2444,13 +2471,14 @@ fn enqueue_system_dns_hijack_packet(
     }
 }
 
-fn spawn_dns_hijack_workers<D>(
-    dns_router: Arc<DnsRouter>,
+fn spawn_dns_hijack_workers<D, Q>(
+    dns_router: Arc<Q>,
     device: Arc<D>,
     metrics: TunMetrics,
     rx: mpsc::Receiver<DnsHijackJob>,
 ) where
     D: TunDevice,
+    Q: DnsRouterTrait + 'static,
 {
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..SYSTEM_DNS_HIJACK_WORKERS {
@@ -2478,13 +2506,14 @@ fn spawn_dns_hijack_workers<D>(
     }
 }
 
-async fn handle_system_dns_hijack_packet<D>(
-    dns_router: Arc<DnsRouter>,
+async fn handle_system_dns_hijack_packet<D, Q>(
+    dns_router: Arc<Q>,
     device: Arc<D>,
     job: DnsHijackJob,
 ) -> Result<(), HammerError>
 where
     D: TunDevice,
+    Q: DnsRouterTrait + 'static,
 {
     let response = dns_router.exchange(job.message, job.options).await?;
     let response_bytes = MessageExt::to_bytes(&response)?;
@@ -2531,17 +2560,24 @@ fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
     }
 }
 
-fn prepare_route_metadata(
-    router: &Router,
+fn prepare_route_metadata<R, Q>(
+    router: &R,
     metadata: &mut RouteMetadata,
-    dns_router: Option<&DnsRouter>,
-) -> Result<(), HammerError> {
+    dns_router: Option<&Q>,
+) -> Result<(), HammerError>
+where
+    R: RouterTrait + ?Sized,
+    Q: DnsRouterTrait + ?Sized,
+{
     router.prepare_route_metadata(metadata)?;
     apply_reverse_dns_mapping(metadata, dns_router);
     Ok(())
 }
 
-fn apply_reverse_dns_mapping(metadata: &mut RouteMetadata, dns_router: Option<&DnsRouter>) {
+fn apply_reverse_dns_mapping<Q>(metadata: &mut RouteMetadata, dns_router: Option<&Q>)
+where
+    Q: DnsRouterTrait + ?Sized,
+{
     if metadata.network != Network::Udp
         || metadata.udp_disable_domain_unmapping
         || metadata.domain.is_some()
@@ -2565,18 +2601,15 @@ fn apply_reverse_dns_mapping(metadata: &mut RouteMetadata, dns_router: Option<&D
     destination.domain = Some(domain);
 }
 
-fn route_destination(
+fn route_destination<Q>(
     metadata: &RouteMetadata,
-    dns_router: Option<&DnsRouter>,
-) -> Result<SocksAddr, HammerError> {
-    let mut destination = metadata
-        .destination
-        .clone()
-        .ok_or_else(|| HammerError::internal("TUN packet missing destination"))?;
-    if metadata.override_destination
-        && let Some(domain) = metadata.domain.as_deref()
-    {
-        destination.domain = Some(normalize_destination_domain(domain));
+    dns_router: Option<&Q>,
+) -> Result<SocksAddr, HammerError>
+where
+    Q: DnsRouterTrait + ?Sized,
+{
+    let mut destination = route_destination_without_dns(metadata)?;
+    if metadata.override_destination {
         return Ok(destination);
     }
     if metadata.network == Network::Udp
@@ -2586,6 +2619,19 @@ fn route_destination(
         && let Some(domain) = router.lookup_reverse_mapping(destination.host)
     {
         destination.domain = Some(normalize_destination_domain(&domain));
+    }
+    Ok(destination)
+}
+
+fn route_destination_without_dns(metadata: &RouteMetadata) -> Result<SocksAddr, HammerError> {
+    let mut destination = metadata
+        .destination
+        .clone()
+        .ok_or_else(|| HammerError::internal("TUN packet missing destination"))?;
+    if metadata.override_destination
+        && let Some(domain) = metadata.domain.as_deref()
+    {
+        destination.domain = Some(normalize_destination_domain(domain));
     }
     Ok(destination)
 }
@@ -2939,10 +2985,10 @@ fn parse_icmpv6(
     })
 }
 
-async fn handle_system_icmp_packet<D>(
-    router: Arc<Router>,
-    dns_router: Arc<DnsRouter>,
-    outbound: Arc<OutboundManager>,
+async fn handle_system_icmp_packet<D, R, Q, O>(
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
     inbound_id: String,
     device: Arc<D>,
     packet: Vec<u8>,
@@ -2950,6 +2996,9 @@ async fn handle_system_icmp_packet<D>(
 ) -> Result<(), HammerError>
 where
     D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
 {
     let payload = parsed.payload(&packet)?;
     let mut metadata = RouteMetadata {
@@ -3025,15 +3074,18 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_icmp_workers<D>(
-    router: Arc<Router>,
-    dns_router: Arc<DnsRouter>,
-    outbound: Arc<OutboundManager>,
+fn spawn_icmp_workers<D, R, Q, O>(
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
     inbound_id: String,
     device: Arc<D>,
     rx: mpsc::Receiver<IcmpJob>,
 ) where
     D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
 {
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..SYSTEM_ICMP_WORKERS {
@@ -3270,9 +3322,13 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DnsTransportManager;
     use crate::dns::FixedResponseCode;
-    use hammer_adapter::{DnsTransport, Lifecycle, StartStage};
+    use crate::{DnsRouter, DnsTransportManager, OutboundManager, Router};
+    use async_trait::async_trait;
+    use hammer_adapter::{
+        DnsRouter as AdapterDnsRouter, DnsTransport, Lifecycle,
+        OutboundManager as AdapterOutboundManager, Router as AdapterRouter, StartStage,
+    };
     use hammer_core::config;
     use hammer_core::log::{DiscardWriter, Factory};
     use hickory_proto::op::ResponseCode;
@@ -3291,7 +3347,140 @@ mod tests {
 
     #[test]
     fn system_tun_stack_type_carries_concrete_device() {
-        let _ = std::any::type_name::<SystemTunStack<MemoryTunDevice>>();
+        let _ = std::any::type_name::<
+            SystemTunStack<MemoryTunDevice, Router, DnsRouter, OutboundManager>,
+        >();
+    }
+
+    struct StubRouter;
+    struct StubDnsRouter;
+    struct StubOutboundManager;
+
+    impl Lifecycle for StubRouter {
+        fn name(&self) -> &str {
+            "stub-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    impl AdapterRouter for StubRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+            Ok(RouteDecision::Reject {
+                method: "default".to_owned(),
+            })
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+            None
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            false
+        }
+    }
+
+    impl Lifecycle for StubDnsRouter {
+        fn name(&self) -> &str {
+            "stub-dns-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AdapterDnsRouter for StubDnsRouter {
+        async fn exchange(
+            &self,
+            message: Message,
+            _options: DnsQueryOptions,
+        ) -> Result<Message, HammerError> {
+            Ok(message)
+        }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> Result<Vec<IpAddr>, HammerError> {
+            Ok(Vec::new())
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> Result<Option<Message>, HammerError> {
+            Ok(None)
+        }
+
+        fn clear_cache(&self) {}
+
+        fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        fn reset_network(&self) {}
+    }
+
+    impl Lifecycle for StubOutboundManager {
+        fn name(&self) -> &str {
+            "stub-outbound"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    impl AdapterOutboundManager for StubOutboundManager {
+        fn list(&self) -> Vec<Arc<dyn hammer_adapter::Outbound>> {
+            Vec::new()
+        }
+
+        fn get(&self, _id: &str) -> Option<Arc<dyn hammer_adapter::Outbound>> {
+            None
+        }
+
+        fn default(&self) -> Option<Arc<dyn hammer_adapter::Outbound>> {
+            None
+        }
+
+        fn remove(&self, _id: &str) -> Result<(), HammerError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tun_stack_types_accept_concrete_service_dependencies() {
+        let _ = std::any::type_name::<
+            SystemTunStack<MemoryTunDevice, StubRouter, StubDnsRouter, StubOutboundManager>,
+        >();
+        let _ = std::any::type_name::<
+            SmoltcpTunStack<StubRouter, StubDnsRouter, StubOutboundManager>,
+        >();
     }
 
     #[test]

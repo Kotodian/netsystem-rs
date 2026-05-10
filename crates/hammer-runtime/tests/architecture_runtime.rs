@@ -18,7 +18,7 @@ fn protocol_namespace_exposes_runtime_protocols() {
     let _ = std::any::type_name::<BlockOutbound>();
     let _ = std::any::type_name::<DirectOutbound>();
     let _ = std::any::type_name::<Hysteria2Outbound>();
-    let _ = std::any::type_name::<TunInbound>();
+    let _ = std::any::type_name::<TunInbound<Router, DnsRouter, OutboundManager>>();
 
     #[cfg(feature = "wireguard")]
     let _ = std::any::type_name::<WireguardEndpoint>();

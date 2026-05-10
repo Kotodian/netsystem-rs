@@ -196,7 +196,6 @@ impl Router {
         }
     }
 
-    #[cfg(feature = "inbound-tun")]
     pub(crate) fn prepare_route_metadata(
         &self,
         metadata: &mut RouteMetadata,
@@ -266,6 +265,22 @@ impl RouterTrait for Router {
         // next packet picks up the new view. No matcher state needs
         // resetting yet.
         self.cache.lock().expect("router cache poisoned").clear();
+    }
+
+    fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+        Router::match_route(self, metadata)
+    }
+
+    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+        Router::prepare_route_metadata(self, metadata)
+    }
+
+    fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        Router::sniff_timeout(self, metadata)
+    }
+
+    fn should_sniff(&self, metadata: &RouteMetadata) -> bool {
+        Router::should_sniff(self, metadata)
     }
 }
 

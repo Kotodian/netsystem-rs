@@ -21,6 +21,11 @@ pub trait DnsRouter: Lifecycle {
         domain: &str,
         options: DnsQueryOptions,
     ) -> Result<Vec<IpAddr>, CoreError>;
+    fn try_exchange_fast(
+        &self,
+        message: &Message,
+        options: DnsQueryOptions,
+    ) -> Result<Option<Message>, CoreError>;
     fn clear_cache(&self);
     fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String>;
     fn reset_network(&self);

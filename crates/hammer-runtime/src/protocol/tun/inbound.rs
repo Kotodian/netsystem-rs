@@ -3,7 +3,10 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
-use hammer_adapter::{Inbound, PlatformInterface, TunOptions};
+use hammer_adapter::{
+    DnsRouter as DnsRouterTrait, Inbound, OutboundManager as OutboundManagerTrait,
+    PlatformInterface, Router as RouterTrait, TunOptions,
+};
 use hammer_core::config::{InboundKind, TunInboundOptions, TunStack};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
@@ -20,25 +23,37 @@ type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 type PlatformTunDevice = AsyncTunDevice;
 
-pub struct TunInbound {
+type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
+
+pub struct TunInbound<R, Q, O>
+where
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     id: String,
     logger: Logger,
     options: TunInboundOptions,
-    router: Arc<Router>,
-    dns_router: Option<Arc<DnsRouter>>,
-    outbound: Option<Arc<OutboundManager>>,
+    router: Arc<R>,
+    dns_router: Option<Arc<Q>>,
+    outbound: Option<Arc<O>>,
     platform: Option<Arc<dyn PlatformInterface>>,
     metrics: Arc<MetricsRegistry>,
     tun_fd: Mutex<Option<i32>>,
-    system_stack: Mutex<Option<Arc<SystemTunStack<PlatformTunDevice>>>>,
+    system_stack: Mutex<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>>,
 }
 
-impl TunInbound {
+impl<R, Q, O> TunInbound<R, Q, O>
+where
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     pub fn new(
         id: impl Into<String>,
         logger: Logger,
         options: TunInboundOptions,
-        router: Arc<Router>,
+        router: Arc<R>,
     ) -> Self {
         Self {
             id: id.into(),
@@ -58,9 +73,9 @@ impl TunInbound {
         id: impl Into<String>,
         logger: Logger,
         options: TunInboundOptions,
-        router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
-        outbound: Arc<OutboundManager>,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
         platform: Arc<dyn PlatformInterface>,
     ) -> Self {
         Self::new_with_runtime_and_metrics(
@@ -80,9 +95,9 @@ impl TunInbound {
         id: impl Into<String>,
         logger: Logger,
         options: TunInboundOptions,
-        router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
-        outbound: Arc<OutboundManager>,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
         platform: Arc<dyn PlatformInterface>,
         metrics: Arc<MetricsRegistry>,
     ) -> Self {
@@ -131,7 +146,7 @@ impl TunInbound {
     fn build_system_stack(
         &self,
         fd: i32,
-    ) -> Result<Option<Arc<SystemTunStack<PlatformTunDevice>>>, HammerError> {
+    ) -> Result<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>, HammerError> {
         match self.options.stack {
             TunStack::Disabled => {
                 debug!("skip disabled TUN data path");
@@ -227,7 +242,7 @@ pub(crate) fn build_inbound(
         InboundKind::Tun(options) => {
             let inbound: Arc<dyn Inbound> = match (dns_router, outbound, platform) {
                 (Some(dns_router), Some(outbound), Some(platform)) => {
-                    Arc::new(TunInbound::new_with_runtime_and_metrics(
+                    Arc::new(RuntimeTunInbound::new_with_runtime_and_metrics(
                         id,
                         logger,
                         options.clone(),
@@ -238,14 +253,19 @@ pub(crate) fn build_inbound(
                         metrics,
                     ))
                 }
-                _ => Arc::new(TunInbound::new(id, logger, options.clone(), router)),
+                _ => Arc::new(RuntimeTunInbound::new(id, logger, options.clone(), router)),
             };
             Ok(inbound)
         }
     }
 }
 
-impl Lifecycle for TunInbound {
+impl<R, Q, O> Lifecycle for TunInbound<R, Q, O>
+where
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     fn name(&self) -> &str {
         "inbound"
     }
@@ -310,7 +330,12 @@ unsafe fn open_system_tun_device(
     Ok(device)
 }
 
-impl Inbound for TunInbound {
+impl<R, Q, O> Inbound for TunInbound<R, Q, O>
+where
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
     fn type_name(&self) -> &str {
         "tun"
     }

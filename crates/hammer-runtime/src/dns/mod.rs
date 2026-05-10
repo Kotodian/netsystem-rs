@@ -1410,6 +1410,14 @@ impl DnsRouterTrait for DnsRouter {
         self.lookup(domain, options).await
     }
 
+    fn try_exchange_fast(
+        &self,
+        message: &Message,
+        options: DnsQueryOptions,
+    ) -> Result<Option<Message>, HammerError> {
+        DnsRouter::try_exchange_fast(self, message, options)
+    }
+
     fn clear_cache(&self) {
         self.clear_cache();
     }

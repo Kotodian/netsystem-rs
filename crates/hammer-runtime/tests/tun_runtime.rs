@@ -24,6 +24,9 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record};
 use tokio::net::UdpSocket;
 
+type RuntimeSmoltcpTunStack = SmoltcpTunStack<Router, DnsRouter, OutboundManager>;
+type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
+
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
 }
@@ -69,7 +72,7 @@ fn router_from_options(options: &Options) -> Arc<Router> {
     )
 }
 
-fn runtime_stack(options: &Options, final_outbound: &str) -> SmoltcpTunStack {
+fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimeSmoltcpTunStack {
     let outbound = Arc::new(
         OutboundManager::from_options(logger("outbound"), final_outbound, &options.outbounds)
             .expect("outbound manager"),
@@ -255,7 +258,8 @@ outbound = "hysteria2"
     )
     .expect("parse config");
     let router = router_from_options(&options);
-    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimeSmoltcpTunStack =
+        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
     let packet = ipv4_udp_packet(
         [10, 0, 0, 2],
         [1, 1, 1, 1],
@@ -279,7 +283,8 @@ outbound = "hysteria2"
 fn smoltcp_stack_facade_routes_packets_through_router() {
     let options = options();
     let router = router_from_options(&options);
-    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimeSmoltcpTunStack =
+        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
     let packet = ipv4_udp_packet(
         [10, 0, 0, 2],
         [1, 1, 1, 1],
@@ -324,7 +329,8 @@ outbound = "hysteria2"
     )
     .expect("parse config");
     let router = router_from_options(&options);
-    let stack = SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimeSmoltcpTunStack =
+        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
 
     let ipv4 = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping");
     let flow = stack.handle_packet(&ipv4).expect("handle ipv4 icmp");
@@ -598,7 +604,7 @@ fn inbound_manager_registers_tun_inbound_from_options() {
 
     let inbound = manager.get("tun").expect("tun inbound registered");
     assert_eq!(inbound.type_name(), "tun");
-    assert!(inbound.as_any().is::<TunInbound>());
+    assert!(inbound.as_any().is::<RuntimeTunInbound>());
 }
 
 struct FixedDnsTransport;
