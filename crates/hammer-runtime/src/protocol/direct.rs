@@ -8,7 +8,7 @@ use hammer_adapter::{
     Network, Outbound, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::OutboundKind;
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, WithContext};
 use hammer_core::log::Logger;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpSocket, UdpSocket};
@@ -97,17 +97,17 @@ impl Outbound for DirectOutbound {
         } else {
             TcpSocket::new_v4()
         }
-        .map_err(|err| HammerError::internal(format!("create direct tcp socket: {err}")))?;
+        .with_context(|| "create direct tcp socket")?;
         self.protector.protect(&socket)?;
         let mut stream = socket
             .connect(target)
             .await
-            .map_err(|err| HammerError::internal(format!("direct tcp connect: {err}")))?;
+            .with_context(|| "direct tcp connect")?;
         if !initial_payload.is_empty() {
             stream
                 .write_all(initial_payload)
                 .await
-                .map_err(|err| HammerError::internal(format!("direct tcp write: {err}")))?;
+                .with_context(|| "direct tcp write")?;
         }
         Ok(Box::new(stream))
     }
@@ -162,7 +162,7 @@ impl ProxyPacketConn for DirectPacketConn {
         self.socket_for(target.ip())?
             .send_to(payload, target)
             .await
-            .map_err(|err| HammerError::internal(format!("direct udp send: {err}")))?;
+            .with_context(|| "direct udp send")?;
         Ok(())
     }
 
@@ -193,12 +193,11 @@ impl ProxyPacketConn for DirectPacketConn {
 
 fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> Result<UdpSocket, HammerError> {
     let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
-        .map_err(|err| HammerError::internal(format!("direct udp bind: {err}")))?;
+        .with_context(|| "direct udp bind")?;
     socket
         .set_nonblocking(true)
-        .map_err(|err| HammerError::internal(format!("direct udp set_nonblocking: {err}")))?;
-    let socket = UdpSocket::from_std(socket)
-        .map_err(|err| HammerError::internal(format!("direct udp from_std: {err}")))?;
+        .with_context(|| "direct udp set_nonblocking")?;
+    let socket = UdpSocket::from_std(socket).with_context(|| "direct udp from_std")?;
     protector.protect(&socket)?;
     Ok(socket)
 }
@@ -207,8 +206,7 @@ fn datagram_from_recv(
     result: std::io::Result<(usize, SocketAddr)>,
     mut buf: Vec<u8>,
 ) -> Result<ProxyDatagram, HammerError> {
-    let (len, source) =
-        result.map_err(|err| HammerError::internal(format!("direct udp recv: {err}")))?;
+    let (len, source) = result.with_context(|| "direct udp recv")?;
     buf.truncate(len);
     Ok(ProxyDatagram {
         destination: SocksAddr::ip(source.ip(), source.port()),
@@ -222,7 +220,7 @@ async fn resolve_destination(destination: &SocksAddr) -> Result<SocketAddr, Hamm
     };
     let mut addrs = tokio::net::lookup_host((domain, destination.port))
         .await
-        .map_err(|err| HammerError::internal(format!("direct resolve {domain}: {err}")))?;
+        .with_context(|| format!("direct resolve {domain}"))?;
     addrs
         .next()
         .ok_or_else(|| HammerError::internal(format!("direct resolve {domain}: empty result")))
