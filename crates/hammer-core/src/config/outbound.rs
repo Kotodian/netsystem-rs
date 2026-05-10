@@ -284,7 +284,6 @@ pub(super) fn build_outbounds(
     ]
 }
 
-#[cfg(not(feature = "outbound-hysteria2"))]
 pub(super) fn build_default_outbounds() -> (Vec<Outbound>, String) {
     let mut outbounds = Vec::new();
     ensure_direct_outbound(&mut outbounds);

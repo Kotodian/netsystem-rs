@@ -632,6 +632,56 @@ final = "auto"
     assert_eq!(urltest.outbounds, vec!["wg-out", "direct"]);
 }
 
+#[cfg(feature = "wireguard")]
+#[test]
+fn parse_config_accepts_endpoint_only_wireguard_without_legacy_hysteria() {
+    let cfg = format!(
+        r#"
+[log]
+level = "info"
+
+[[inbounds]]
+type = "tun"
+id = "tun"
+mtu = 1400
+stack = "system"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+sniff = true
+hijack_dns = true
+
+[dns]
+final = "default"
+strategy = "ipv4_only"
+
+[[dns.servers]]
+type = "udp"
+id = "default"
+server = "1.1.1.1"
+via = "wg-out"
+
+{}
+
+[route]
+final = "wg-out"
+auto_detect_interface = true
+"#,
+        wg_endpoint_block("")
+    );
+
+    let options = config::parse_config(&cfg).expect("endpoint-only wireguard config should parse");
+    assert_eq!(options.endpoints.len(), 1);
+    assert_eq!(options.endpoints[0].id, "wg-out");
+    assert_eq!(options.route.final_, "wg-out");
+    assert!(
+        options
+            .outbounds
+            .iter()
+            .any(|outbound| outbound.id == "direct"),
+        "endpoint-only configs should still synthesize direct outbound"
+    );
+}
+
 #[test]
 fn format_config_round_trips_and_strips_unknown() {
     let formatted = config::format_config(MINIMAL_CONFIG).expect("format");

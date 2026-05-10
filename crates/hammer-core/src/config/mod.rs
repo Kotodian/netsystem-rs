@@ -287,18 +287,32 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     validate_unique_ids("inbounds", inbounds.iter().map(|item| item.id.as_str()))?;
     rules.extend(route::build_user_rules(&raw_route.rules)?);
 
+    #[cfg(feature = "endpoint")]
+    let has_explicit_endpoints = !raw_endpoints.is_empty();
+    #[cfg(not(feature = "endpoint"))]
+    let has_explicit_endpoints = false;
+    #[cfg(feature = "outbound-hysteria2")]
+    let has_legacy_hysteria = !raw_hysteria.is_default();
+    #[cfg(not(feature = "outbound-hysteria2"))]
+    let has_legacy_hysteria = false;
+
     let (outbounds, default_route_final) = if raw_outbounds.is_empty() {
-        #[cfg(feature = "outbound-hysteria2")]
-        {
-            let (hysteria_options, hysteria_id) = outbound::build_hysteria_options(raw_hysteria)?;
-            (
-                outbound::build_outbounds(hysteria_options, hysteria_id.clone()),
-                hysteria_id,
-            )
-        }
-        #[cfg(not(feature = "outbound-hysteria2"))]
-        {
+        if has_explicit_endpoints && !has_legacy_hysteria {
             outbound::build_default_outbounds()
+        } else {
+            #[cfg(feature = "outbound-hysteria2")]
+            {
+                let (hysteria_options, hysteria_id) =
+                    outbound::build_hysteria_options(raw_hysteria)?;
+                (
+                    outbound::build_outbounds(hysteria_options, hysteria_id.clone()),
+                    hysteria_id,
+                )
+            }
+            #[cfg(not(feature = "outbound-hysteria2"))]
+            {
+                outbound::build_default_outbounds()
+            }
         }
     } else {
         let outbounds = outbound::build_declared_outbounds(raw_outbounds)?;
