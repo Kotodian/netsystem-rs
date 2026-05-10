@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use hammer_adapter::PlatformInterface;
+#[cfg(target_vendor = "apple")]
+use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
 use rustls::client::WantsClientCert;
 use rustls::pki_types::CertificateDer;
