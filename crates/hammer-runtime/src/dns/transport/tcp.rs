@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hammer_adapter::{DnsTransport, Lifecycle, Network, StartStage};
 use hammer_core::config::{DnsServerKind, RemoteDnsServer};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, WithContext};
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,7 +127,7 @@ pub(super) async fn tcp_exchange_direct(
 ) -> Result<Message, HammerError> {
     let mut stream = direct_tcp_connect(*server, protector)
         .await
-        .map_err(|e| HammerError::internal(format!("connect TCP DNS socket: {e}")))?;
+        .with_context(|| "connect TCP DNS socket")?;
     tcp_exchange_over_stream(&mut stream, message).await
 }
 
@@ -163,21 +163,21 @@ async fn tcp_exchange_over_stream<S: tokio::io::AsyncRead + tokio::io::AsyncWrit
     stream
         .write_all(&len.to_be_bytes())
         .await
-        .map_err(|e| HammerError::internal(format!("write TCP DNS length: {e}")))?;
+        .with_context(|| "write TCP DNS length")?;
     stream
         .write_all(&bytes)
         .await
-        .map_err(|e| HammerError::internal(format!("write TCP DNS request: {e}")))?;
+        .with_context(|| "write TCP DNS request")?;
     let mut len_buf = [0_u8; 2];
     stream
         .read_exact(&mut len_buf)
         .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS length: {e}")))?;
+        .with_context(|| "read TCP DNS length")?;
     let len = usize::from(u16::from_be_bytes(len_buf));
     let mut payload = vec![0_u8; len];
     stream
         .read_exact(&mut payload)
         .await
-        .map_err(|e| HammerError::internal(format!("read TCP DNS response: {e}")))?;
+        .with_context(|| "read TCP DNS response")?;
     <Message as MessageExt>::from_bytes(&payload)
 }

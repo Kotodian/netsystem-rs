@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use hammer_adapter::{DnsTransport, Lifecycle, OutboundManager as _, StartStage};
 use hammer_core::config::{DnsServerKind, RemoteDnsServer};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, WithContext};
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use tokio::net::UdpSocket;
@@ -159,21 +159,21 @@ impl DnsTransport for UdpDnsTransport {
         };
         let socket = UdpSocket::bind(bind)
             .await
-            .map_err(|e| HammerError::internal(format!("bind UDP DNS socket: {e}")))?;
+            .with_context(|| "bind UDP DNS socket")?;
         self.protector.protect(&socket)?;
         socket
             .connect(server)
             .await
-            .map_err(|e| HammerError::internal(format!("connect UDP DNS socket: {e}")))?;
+            .with_context(|| "connect UDP DNS socket")?;
         socket
             .send(&MessageExt::to_bytes(&message)?)
             .await
-            .map_err(|e| HammerError::internal(format!("write UDP DNS request: {e}")))?;
+            .with_context(|| "write UDP DNS request")?;
         let mut buf = vec![0_u8; 4096];
         let len = socket
             .recv(&mut buf)
             .await
-            .map_err(|e| HammerError::internal(format!("read UDP DNS response: {e}")))?;
+            .with_context(|| "read UDP DNS response")?;
         let response = <Message as MessageExt>::from_bytes(&buf[..len])?;
         if response.metadata.truncation {
             info!("response truncated, retrying with TCP");
