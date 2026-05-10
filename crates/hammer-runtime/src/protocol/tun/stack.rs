@@ -553,14 +553,14 @@ impl TcpPendingDialLimiter {
     }
 }
 
-pub struct SystemTunStack {
+pub struct SystemTunStack<D: TunDevice> {
     logger: Logger,
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
     options: hammer_core::config::TunInboundOptions,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
@@ -570,7 +570,10 @@ pub struct SystemTunStack {
     metrics: TunMetrics,
 }
 
-impl SystemTunStack {
+impl<D> SystemTunStack<D>
+where
+    D: TunDevice,
+{
     pub fn new(
         logger: Logger,
         router: Arc<Router>,
@@ -578,7 +581,7 @@ impl SystemTunStack {
         outbound: Arc<OutboundManager>,
         inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
-        device: Arc<dyn TunDevice>,
+        device: Arc<D>,
     ) -> Self {
         let metrics = MetricsRegistry::new().scope("inbound", "tun", inbound_id.clone());
         Self::new_with_interface_index(
@@ -594,7 +597,7 @@ impl SystemTunStack {
         outbound: Arc<OutboundManager>,
         inbound_id: String,
         options: hammer_core::config::TunInboundOptions,
-        device: Arc<dyn TunDevice>,
+        device: Arc<D>,
         tun_interface_index: Option<u32>,
         metrics: MetricsScope,
     ) -> Self {
@@ -2094,19 +2097,21 @@ async fn accept_tcp_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn packet_loop(
+async fn packet_loop<D>(
     _logger: Logger,
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     udp_timeout: Duration,
     metrics: TunMetrics,
-) {
+) where
+    D: TunDevice,
+{
     info!("system packet loop started");
     // Pull packets in batches when the underlying device supports it (Apple's
     // utun driver, currently). On platforms where recv_batch falls back to
@@ -2242,12 +2247,12 @@ async fn packet_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_system_udp_packet(
+fn handle_system_udp_packet<D>(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
     control_write_tx: &mpsc::Sender<Vec<u8>>,
@@ -2255,7 +2260,10 @@ fn handle_system_udp_packet(
     packet: Vec<u8>,
     parsed: ParsedIpPacketView,
     metrics: TunMetrics,
-) -> Result<(), HammerError> {
+) -> Result<(), HammerError>
+where
+    D: TunDevice,
+{
     let mut metadata = RouteMetadata {
         inbound: inbound_id,
         network: Network::Udp,
@@ -2436,12 +2444,14 @@ fn enqueue_system_dns_hijack_packet(
     }
 }
 
-fn spawn_dns_hijack_workers(
+fn spawn_dns_hijack_workers<D>(
     dns_router: Arc<DnsRouter>,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     metrics: TunMetrics,
     rx: mpsc::Receiver<DnsHijackJob>,
-) {
+) where
+    D: TunDevice,
+{
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..SYSTEM_DNS_HIJACK_WORKERS {
         let dns_router = Arc::clone(&dns_router);
@@ -2468,11 +2478,14 @@ fn spawn_dns_hijack_workers(
     }
 }
 
-async fn handle_system_dns_hijack_packet(
+async fn handle_system_dns_hijack_packet<D>(
     dns_router: Arc<DnsRouter>,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     job: DnsHijackJob,
-) -> Result<(), HammerError> {
+) -> Result<(), HammerError>
+where
+    D: TunDevice,
+{
     let response = dns_router.exchange(job.message, job.options).await?;
     let response_bytes = MessageExt::to_bytes(&response)?;
     let response_packet = udp_response_packet(&job.packet, job.destination, &response_bytes)?;
@@ -2497,11 +2510,10 @@ fn enqueue_tun_control_write(
     }
 }
 
-fn spawn_tun_control_writer(
-    device: Arc<dyn TunDevice>,
-    metrics: TunMetrics,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-) {
+fn spawn_tun_control_writer<D>(device: Arc<D>, metrics: TunMetrics, mut rx: mpsc::Receiver<Vec<u8>>)
+where
+    D: TunDevice,
+{
     crate::spawn::spawn(async move {
         while let Some(packet) = rx.recv().await {
             if let Err(err) = device.send(packet).await {
@@ -2596,8 +2608,8 @@ fn normalize_destination_domain(domain: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn system_udp_flow_loop(
-    device: Arc<dyn TunDevice>,
+async fn system_udp_flow_loop<D>(
+    device: Arc<D>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     key: UdpFlowKey,
     outbound: Arc<dyn hammer_adapter::Outbound>,
@@ -2606,7 +2618,9 @@ async fn system_udp_flow_loop(
     udp_timeout: Duration,
     mut rx: mpsc::Receiver<UdpFlowPayload>,
     metrics: TunMetrics,
-) {
+) where
+    D: TunDevice,
+{
     let mut packet_conn = match outbound.listen_packet().await {
         Ok(packet_conn) => packet_conn,
         Err(err) => {
@@ -2925,15 +2939,18 @@ fn parse_icmpv6(
     })
 }
 
-async fn handle_system_icmp_packet(
+async fn handle_system_icmp_packet<D>(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     packet: Vec<u8>,
     parsed: ParsedIpPacketView,
-) -> Result<(), HammerError> {
+) -> Result<(), HammerError>
+where
+    D: TunDevice,
+{
     let payload = parsed.payload(&packet)?;
     let mut metadata = RouteMetadata {
         inbound: inbound_id,
@@ -3008,14 +3025,16 @@ async fn handle_system_icmp_packet(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_icmp_workers(
+fn spawn_icmp_workers<D>(
     router: Arc<Router>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     inbound_id: String,
-    device: Arc<dyn TunDevice>,
+    device: Arc<D>,
     rx: mpsc::Receiver<IcmpJob>,
-) {
+) where
+    D: TunDevice,
+{
     let rx = Arc::new(Mutex::new(rx));
     for _ in 0..SYSTEM_ICMP_WORKERS {
         let router = Arc::clone(&router);
@@ -3268,6 +3287,11 @@ mod tests {
 
     fn test_logger(id: &str) -> Logger {
         Factory::new(StdInstant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    #[test]
+    fn system_tun_stack_type_carries_concrete_device() {
+        let _ = std::any::type_name::<SystemTunStack<MemoryTunDevice>>();
     }
 
     #[test]
@@ -3601,7 +3625,7 @@ final = "direct"
             dns_router,
             outbound,
             "tun".to_owned(),
-            Arc::clone(&device) as Arc<dyn TunDevice>,
+            Arc::clone(&device),
             Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
                 DEFAULT_SYSTEM_UDP_TIMEOUT,
             ))),
@@ -3699,7 +3723,7 @@ final = "direct"
             Arc::clone(&dns_router),
             outbound,
             "tun".to_owned(),
-            MemoryTunDevice::new() as Arc<dyn TunDevice>,
+            MemoryTunDevice::new(),
             Arc::new(StdMutex::new(HashMap::new())),
             &dns_hijack_tx,
             &control_write_tx,

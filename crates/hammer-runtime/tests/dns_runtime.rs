@@ -329,7 +329,7 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
 
     let first = client
         .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -340,7 +340,7 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
         .unwrap();
     let second = client
         .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -356,7 +356,7 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
     client.clear_cache();
     let _ = client
         .lookup(
-            transport.clone() as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -382,7 +382,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
 
     let first = client
         .exchange(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             query("rewrite-hit.test", RecordType::A),
             base_options.clone(),
         )
@@ -392,7 +392,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
 
     let cached = client
         .exchange(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             query("rewrite-hit.test", RecordType::A),
             DnsQueryOptions {
                 rewrite_ttl: Some(5),
@@ -421,52 +421,32 @@ async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
     for index in 0..1024 {
         let domain = format!("bounded-{index}.test");
         let _ = client
-            .lookup(
-                Arc::clone(&transport) as Arc<dyn DnsTransport>,
-                &domain,
-                options.clone(),
-            )
+            .lookup(transport.as_ref(), &domain, options.clone())
             .await
             .unwrap();
     }
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
 
     let _ = client
-        .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
-            "bounded-0.test",
-            options.clone(),
-        )
+        .lookup(transport.as_ref(), "bounded-0.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
 
     let _ = client
-        .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
-            "bounded-1024.test",
-            options.clone(),
-        )
+        .lookup(transport.as_ref(), "bounded-1024.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
 
     let _ = client
-        .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
-            "bounded-0.test",
-            options.clone(),
-        )
+        .lookup(transport.as_ref(), "bounded-0.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
 
     let _ = client
-        .lookup(
-            Arc::clone(&transport) as Arc<dyn DnsTransport>,
-            "bounded-1.test",
-            options,
-        )
+        .lookup(transport.as_ref(), "bounded-1.test", options)
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
@@ -482,7 +462,7 @@ async fn dns_client_applies_lookup_strategy_ordering() {
 
     let ipv4_only = client
         .lookup(
-            transport.clone() as Arc<dyn DnsTransport>,
+            transport.as_ref(),
             "strategy.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,

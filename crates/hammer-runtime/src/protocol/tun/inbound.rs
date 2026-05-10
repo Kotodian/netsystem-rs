@@ -14,6 +14,12 @@ use super::stack::*;
 
 use crate::{DnsRouter, OutboundManager, Router};
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+type PlatformTunDevice = AsyncTunDevice;
+
 pub struct TunInbound {
     id: String,
     logger: Logger,
@@ -24,7 +30,7 @@ pub struct TunInbound {
     platform: Option<Arc<dyn PlatformInterface>>,
     metrics: Arc<MetricsRegistry>,
     tun_fd: Mutex<Option<i32>>,
-    system_stack: Mutex<Option<Arc<SystemTunStack>>>,
+    system_stack: Mutex<Option<Arc<SystemTunStack<PlatformTunDevice>>>>,
 }
 
 impl TunInbound {
@@ -122,7 +128,10 @@ impl TunInbound {
         Ok(())
     }
 
-    fn build_system_stack(&self, fd: i32) -> Result<Option<Arc<SystemTunStack>>, HammerError> {
+    fn build_system_stack(
+        &self,
+        fd: i32,
+    ) -> Result<Option<Arc<SystemTunStack<PlatformTunDevice>>>, HammerError> {
         match self.options.stack {
             TunStack::Disabled => {
                 debug!("skip disabled TUN data path");
@@ -142,7 +151,7 @@ impl TunInbound {
         } else {
             debug!("TUN interface index unavailable; listener will not bind to TUN");
         }
-        let device: Arc<dyn TunDevice> = unsafe { open_system_tun_device(dup_fd, mtu)? };
+        let device = unsafe { open_system_tun_device(dup_fd, mtu)? };
         Ok(Some(Arc::new(SystemTunStack::new_with_interface_index(
             self.logger.clone(),
             Arc::clone(&self.router),
@@ -281,18 +290,24 @@ fn duplicate_fd(fd: i32) -> Result<i32, HammerError> {
 /// `fd` must be an exclusively-owned utun file descriptor; the returned device
 /// closes it on drop.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> Result<Arc<dyn TunDevice>, HammerError> {
+unsafe fn open_system_tun_device(
+    fd: i32,
+    mtu: usize,
+) -> Result<Arc<PlatformTunDevice>, HammerError> {
     let device = unsafe { crate::apple_utun::AppleTunDevice::from_fd(fd, mtu)? };
-    Ok(device as Arc<dyn TunDevice>)
+    Ok(device)
 }
 
 /// # Safety
 /// `fd` must be an exclusively-owned TUN file descriptor; the returned device
 /// closes it on drop.
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> Result<Arc<dyn TunDevice>, HammerError> {
+unsafe fn open_system_tun_device(
+    fd: i32,
+    mtu: usize,
+) -> Result<Arc<PlatformTunDevice>, HammerError> {
     let device = unsafe { AsyncTunDevice::from_fd(fd, mtu)? };
-    Ok(device as Arc<dyn TunDevice>)
+    Ok(device)
 }
 
 impl Inbound for TunInbound {

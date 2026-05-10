@@ -279,12 +279,15 @@ impl DnsClient {
         }
     }
 
-    pub async fn exchange(
+    pub async fn exchange<T>(
         &self,
-        transport: Arc<dyn DnsTransport>,
+        transport: &T,
         message: Message,
         options: DnsQueryOptions,
-    ) -> Result<Message, HammerError> {
+    ) -> Result<Message, HammerError>
+    where
+        T: DnsTransport + ?Sized,
+    {
         if message.queries.len() != 1 {
             warn!("bad question size: {}", message.queries.len());
             return Ok(message.fixed_response(FixedResponseCode::FormatError));
@@ -317,12 +320,15 @@ impl DnsClient {
         Ok(response)
     }
 
-    pub(crate) fn try_exchange_cached(
+    pub(crate) fn try_exchange_cached<T>(
         &self,
-        transport: Arc<dyn DnsTransport>,
+        transport: &T,
         message: &Message,
         options: DnsQueryOptions,
-    ) -> Result<Option<Message>, HammerError> {
+    ) -> Result<Option<Message>, HammerError>
+    where
+        T: DnsTransport + ?Sized,
+    {
         if message.queries.len() != 1 {
             warn!("bad question size: {}", message.queries.len());
             return Ok(Some(message.fixed_response(FixedResponseCode::FormatError)));
@@ -349,12 +355,15 @@ impl DnsClient {
         Ok(Some(cached))
     }
 
-    pub async fn lookup(
+    pub async fn lookup<T>(
         &self,
-        transport: Arc<dyn DnsTransport>,
+        transport: &T,
         domain: &str,
         options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError> {
+    ) -> Result<Vec<IpAddr>, HammerError>
+    where
+        T: DnsTransport + ?Sized,
+    {
         let strategy = if options.lookup_strategy == DomainStrategy::AsIs {
             options.strategy
         } else {
@@ -371,12 +380,7 @@ impl DnsClient {
             }
             _ => {
                 let v4 = self
-                    .lookup_type(
-                        Arc::clone(&transport),
-                        domain,
-                        RecordType::A,
-                        options.clone(),
-                    )
+                    .lookup_type(transport, domain, RecordType::A, options.clone())
                     .await
                     .unwrap_or_default();
                 let v6 = self
@@ -398,13 +402,16 @@ impl DnsClient {
         self.cache.lock().expect("DnsClient cache poisoned").clear();
     }
 
-    async fn lookup_type(
+    async fn lookup_type<T>(
         &self,
-        transport: Arc<dyn DnsTransport>,
+        transport: &T,
         domain: &str,
         record_type: RecordType,
         mut options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError> {
+    ) -> Result<Vec<IpAddr>, HammerError>
+    where
+        T: DnsTransport + ?Sized,
+    {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = match record_type {
                 RecordType::A => DomainStrategy::Ipv4Only,
@@ -1197,7 +1204,11 @@ impl DnsRouter {
             transport.id(),
             options.strategy
         );
-        let response = match self.client.exchange(transport, message, options).await {
+        let response = match self
+            .client
+            .exchange(transport.as_ref(), message, options)
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 warn!("exchange failed query={query_summary}: {err}");
@@ -1245,9 +1256,9 @@ impl DnsRouter {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        let Some(response) = self
-            .client
-            .try_exchange_cached(transport, message, options)?
+        let Some(response) =
+            self.client
+                .try_exchange_cached(transport.as_ref(), message, options)?
         else {
             return Ok(None);
         };
@@ -1265,7 +1276,10 @@ impl DnsRouter {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        let addresses = self.client.lookup(transport, domain, options).await?;
+        let addresses = self
+            .client
+            .lookup(transport.as_ref(), domain, options)
+            .await?;
         let expires_at = Instant::now() + Duration::from_secs(u64::from(DEFAULT_DNS_TTL));
         let domain = normalize_domain(domain);
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
@@ -1729,6 +1743,27 @@ mod tests {
             .expect("cached response");
 
         assert_eq!(response.metadata.id, 99);
+        assert_eq!(
+            response.addresses(),
+            vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]
+        );
+        assert_eq!(upstream.queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_client_accepts_concrete_transport_reference() {
+        let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let client = DnsClient::new(test_logger("dns-client"));
+
+        let response = client
+            .exchange(
+                upstream.as_ref(),
+                build_query("example.com."),
+                DnsQueryOptions::default(),
+            )
+            .await
+            .expect("exchange");
+
         assert_eq!(
             response.addresses(),
             vec![IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))]
