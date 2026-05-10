@@ -11,11 +11,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    Network, Outbound, OutboundManager as OutboundManagerTrait, ProbeReport, ProxyPacketConn,
-    ProxyStream, SocksAddr,
+    Network, Outbound, OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport,
+    ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::{OutboundKind, UrltestOutboundOptions};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 
 use crate::socket_protector::SocketProtector;
@@ -47,7 +47,7 @@ struct UrltestState {
 /// One probe report carried back to the FFI surface.
 pub struct UrltestSample {
     pub id: String,
-    pub result: Result<Duration, HammerError>,
+    pub result: HammerResult<Duration>,
 }
 
 /// Aggregate outbound that selects the lowest-latency child each probe
@@ -55,6 +55,13 @@ pub struct UrltestSample {
 /// outbound — children are looked up dynamically through the
 /// [`OutboundManager`](OutboundManagerTrait) the runtime binds in via
 /// [`Outbound::bind_resolver`].
+#[hammer_component_macros::hammer_component(
+    outbound,
+    name = "urltest",
+    builder = build_outbound,
+    dependencies = children_ids,
+    metrics = ("outbound", "outbound")
+)]
 pub struct UrltestOutbound {
     id: String,
     children_ids: Vec<String>,
@@ -73,8 +80,12 @@ impl UrltestOutbound {
         id: String,
         options: &UrltestOutboundOptions,
         protector: SocketProtector,
-    ) -> Result<Arc<Self>, HammerError> {
-        let probe = HttpUrltestProbe::new(options.url.clone(), protector.platform())?;
+    ) -> HammerResult<Arc<Self>> {
+        let probe = if let Some(platform) = protector.platform() {
+            HttpUrltestProbe::new_with_platform(options.url.clone(), platform)?
+        } else {
+            HttpUrltestProbe::new(options.url.clone())?
+        };
         Ok(Arc::new(Self {
             id,
             children_ids: options.outbounds.clone(),
@@ -94,7 +105,7 @@ impl UrltestOutbound {
         self.timeout
     }
 
-    fn resolver(&self) -> Result<Arc<dyn OutboundManagerTrait>, HammerError> {
+    fn resolver(&self) -> HammerResult<Arc<dyn OutboundManagerTrait>> {
         self.resolver.get().and_then(Weak::upgrade).ok_or_else(|| {
             HammerError::internal(format!(
                 "urltest '{}' is not bound to an OutboundManager",
@@ -117,10 +128,8 @@ impl UrltestOutbound {
             }
         };
 
-        let mut handles: Vec<(
-            String,
-            tokio::task::JoinHandle<Result<Duration, HammerError>>,
-        )> = Vec::with_capacity(self.children_ids.len());
+        let mut handles: Vec<(String, tokio::task::JoinHandle<HammerResult<Duration>>)> =
+            Vec::with_capacity(self.children_ids.len());
         let mut missing: Vec<String> = Vec::new();
         for child_id in &self.children_ids {
             let Some(child) = resolver.get(child_id) else {
@@ -221,7 +230,7 @@ impl UrltestOutbound {
             let Some(child) = resolver.get(child_id) else {
                 continue;
             };
-            if !child.networks().contains(&network) {
+            if !child.meta().networks().contains(&network) {
                 continue;
             }
             let Some(sample) = state.history.get(child_id) else {
@@ -246,13 +255,13 @@ impl UrltestOutbound {
                 .find(|id| {
                     resolver
                         .get(id)
-                        .is_some_and(|c| c.networks().contains(&network))
+                        .is_some_and(|c| c.meta().networks().contains(&network))
                 })
                 .cloned()
         })
     }
 
-    fn pick_for(&self, network: Network) -> Result<Arc<dyn Outbound>, HammerError> {
+    fn pick_for(&self, network: Network) -> HammerResult<OutboundComponent> {
         let resolver = self.resolver()?;
         let cached = {
             let state = self.state.lock().expect("urltest state poisoned");
@@ -312,22 +321,6 @@ impl UrltestOutbound {
 
 #[async_trait]
 impl Outbound for UrltestOutbound {
-    fn type_name(&self) -> &str {
-        hammer_core::config::constants::TYPE_URLTEST
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.children_ids
-    }
-
     fn reset(&self) {
         // Selected outbounds may carry stale connections after a network
         // flip; clear them so the next dial recomputes against the
@@ -342,35 +335,39 @@ impl Outbound for UrltestOutbound {
         network: Network,
         destination: SocksAddr,
         initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+    ) -> HammerResult<Box<dyn ProxyStream>> {
         let child = self.pick_for(network)?;
-        match child.dial(network, destination, initial_payload).await {
+        match child
+            .runtime()
+            .dial(network, destination, initial_payload)
+            .await
+        {
             Ok(stream) => Ok(stream),
             Err(err) => {
-                self.drop_child(child.id());
+                self.drop_child(child.meta().id());
                 Err(err)
             }
         }
     }
 
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+    async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
         let child = self.pick_for(Network::Udp)?;
-        match child.listen_packet().await {
+        match child.runtime().listen_packet().await {
             Ok(conn) => Ok(conn),
             Err(err) => {
-                self.drop_child(child.id());
+                self.drop_child(child.meta().id());
                 Err(err)
             }
         }
     }
 
-    async fn post_start(&self) -> Result<(), HammerError> {
+    async fn post_start(&self) -> HammerResult<()> {
         // The demo drives urltest explicitly from the UI. Do not warm or probe
         // during service startup; that can compete with the first real flow.
         Ok(())
     }
 
-    async fn probe_group(&self, timeout: Duration) -> Result<Vec<ProbeReport>, HammerError> {
+    async fn probe_group(&self, timeout: Duration) -> HammerResult<Vec<ProbeReport>> {
         let effective = self.probe_group_timeout(timeout);
         let samples = self.run_probe(effective).await;
         Ok(samples
@@ -410,55 +407,37 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
-) -> Result<Arc<dyn Outbound>, HammerError> {
+) -> HammerResult<Arc<UrltestOutbound>> {
     let OutboundKind::Urltest(options) = kind else {
         return Err(HammerError::internal(format!(
             "urltest builder invoked for non-urltest outbound: {id}"
         )));
     };
     let outbound = UrltestOutbound::new(logger, id, options, protector)?;
-    Ok(outbound as Arc<dyn Outbound>)
+    Ok(outbound)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_adapter::{ComponentMeta, RuntimeComponent};
     use hammer_core::log::{DiscardWriter, Factory};
     use url::Url;
 
-    struct LeafOutbound {
-        id: String,
-        networks: Vec<Network>,
-    }
+    struct LeafOutbound;
 
     #[async_trait]
     impl Outbound for LeafOutbound {
-        fn type_name(&self) -> &str {
-            "leaf-test"
-        }
-
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        fn networks(&self) -> &[Network] {
-            &self.networks
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
-
         async fn dial(
             &self,
             _network: Network,
             _destination: SocksAddr,
             _initial_payload: &[u8],
-        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        ) -> HammerResult<Box<dyn ProxyStream>> {
             Err(HammerError::internal("leaf-test: dial not used"))
         }
 
-        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
             Err(HammerError::internal("leaf-test: listen_packet not used"))
         }
     }
@@ -467,11 +446,20 @@ mod tests {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
-    fn leaf(id: &str) -> Arc<dyn Outbound> {
-        Arc::new(LeafOutbound {
-            id: id.to_owned(),
-            networks: vec![Network::Tcp],
-        })
+    fn leaf(id: &str) -> OutboundComponent {
+        let outbound = Arc::new(LeafOutbound);
+        let runtime: Arc<dyn Outbound> = outbound;
+        RuntimeComponent::new(
+            ComponentMeta::new(
+                "outbound",
+                "leaf-test",
+                id,
+                vec![Network::Tcp],
+                Vec::new(),
+                None,
+            ),
+            runtime,
+        )
     }
 
     #[test]
@@ -481,10 +469,10 @@ mod tests {
             "current",
         ));
         manager
-            .register_outbound("current".to_owned(), leaf("current"))
+            .register_outbound(leaf("current"))
             .expect("register current");
         manager
-            .register_outbound("candidate".to_owned(), leaf("candidate"))
+            .register_outbound(leaf("candidate"))
             .expect("register candidate");
         let resolver: Arc<dyn OutboundManagerTrait> = manager;
 

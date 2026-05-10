@@ -25,7 +25,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tracing::debug;
 
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 
 use crate::protocol::tun::TunDevice;
 use crate::protocol::tun::stack::{
@@ -194,7 +194,7 @@ impl AppleTunDevice {
     ///
     /// `fd` must be an exclusively-owned utun file descriptor; this device
     /// closes it on drop.
-    pub unsafe fn from_fd(fd: RawFd, mtu: usize) -> Result<Arc<Self>, HammerError> {
+    pub unsafe fn from_fd(fd: RawFd, mtu: usize) -> HammerResult<Arc<Self>> {
         if mtu == 0 {
             return Err(HammerError::internal("apple TUN MTU must be > 0"));
         }
@@ -421,7 +421,7 @@ impl AppleTunDevice {
 
 #[async_trait]
 impl TunDevice for AppleTunDevice {
-    async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+    async fn recv(&self) -> HammerResult<Vec<u8>> {
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(HammerError::internal("apple TUN closed"));
@@ -466,12 +466,12 @@ impl TunDevice for AppleTunDevice {
         }
     }
 
-    async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+    async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
         let mut packets = vec![packet];
         self.send_batch(&mut packets).await
     }
 
-    async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
+    async fn recv_batch(&self, _max: usize) -> HammerResult<Vec<Vec<u8>>> {
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(HammerError::internal("apple TUN closed"));
@@ -511,7 +511,7 @@ impl TunDevice for AppleTunDevice {
         }
     }
 
-    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> Result<(), HammerError> {
+    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> HammerResult<()> {
         if packets.is_empty() {
             return Ok(());
         }

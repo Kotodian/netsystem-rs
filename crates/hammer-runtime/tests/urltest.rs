@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    Lifecycle, Network, Outbound as AdapterOutbound, OutboundManager as _, ProxyPacketConn,
-    ProxyStream, SocksAddr,
+    ComponentMeta, Lifecycle, Network, Outbound as AdapterOutbound, OutboundComponent,
+    OutboundManager as _, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{Outbound, OutboundKind, UrltestOutboundOptions};
 use hammer_core::error::HammerError;
@@ -58,22 +58,6 @@ impl LatencyOutbound {
 
 #[async_trait]
 impl AdapterOutbound for LatencyOutbound {
-    fn type_name(&self) -> &str {
-        "latency-mock"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     async fn dial(
         &self,
         _network: Network,
@@ -124,6 +108,16 @@ impl AdapterOutbound for LatencyOutbound {
     }
 }
 
+fn latency_component(outbound: Arc<LatencyOutbound>) -> OutboundComponent {
+    let id = outbound.id.clone();
+    let networks = outbound.networks.clone();
+    let runtime: Arc<dyn AdapterOutbound> = outbound;
+    RuntimeComponent::new(
+        ComponentMeta::new("outbound", "latency-mock", id, networks, Vec::new(), None),
+        runtime,
+    )
+}
+
 /// Build an OutboundManager preloaded with a slice of leaf children plus a
 /// single urltest entry referencing them in declaration order.
 fn build_manager(
@@ -134,14 +128,11 @@ fn build_manager(
     let manager = OutboundManager::new(logger("outbound"), "auto");
     for child in &children {
         manager
-            .register_outbound(
-                child.id().to_owned(),
-                Arc::clone(child) as Arc<dyn AdapterOutbound>,
-            )
+            .register_outbound(latency_component(Arc::clone(child)))
             .expect("register child");
     }
     let urltest_options = UrltestOutboundOptions {
-        outbounds: children.iter().map(|c| c.id().to_owned()).collect(),
+        outbounds: children.iter().map(|c| c.id.clone()).collect(),
         url: Url::parse("http://urltest.example/probe").expect("valid url"),
         tolerance,
         timeout,

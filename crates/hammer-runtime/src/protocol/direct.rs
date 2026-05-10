@@ -8,7 +8,7 @@ use hammer_adapter::{
     Network, Outbound, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::OutboundKind;
-use hammer_core::error::{HammerError, WithContext};
+use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpSocket, UdpSocket};
@@ -16,6 +16,12 @@ use tokio::net::{TcpSocket, UdpSocket};
 use crate::protocol::icmp::IcmpSocketConn;
 use crate::socket_protector::SocketProtector;
 
+#[hammer_component_macros::hammer_component(
+    outbound,
+    name = "direct",
+    builder = build_outbound,
+    metrics = ("outbound", "outbound")
+)]
 pub struct DirectOutbound {
     id: String,
     networks: Vec<Network>,
@@ -52,7 +58,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
-) -> Result<Arc<dyn Outbound>, HammerError> {
+) -> HammerResult<Arc<DirectOutbound>> {
     match kind {
         OutboundKind::Direct(_) => Ok(Arc::new(DirectOutbound::new_with_protector(
             logger, id, protector,
@@ -65,28 +71,12 @@ pub(crate) fn build_outbound(
 
 #[async_trait]
 impl Outbound for DirectOutbound {
-    fn type_name(&self) -> &str {
-        "direct"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
     async fn dial(
         &self,
         network: Network,
         destination: SocksAddr,
         initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+    ) -> HammerResult<Box<dyn ProxyStream>> {
         if network != Network::Tcp {
             return Err(HammerError::internal("direct dial only supports tcp"));
         }
@@ -112,7 +102,7 @@ impl Outbound for DirectOutbound {
         Ok(Box::new(stream))
     }
 
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+    async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
         info!("outbound packet connection");
         Ok(Box::new(DirectPacketConn {
             protector: self.protector.clone(),
@@ -121,7 +111,7 @@ impl Outbound for DirectOutbound {
         }))
     }
 
-    async fn listen_icmp(&self) -> Result<Box<dyn ProxyIcmpConn>, HammerError> {
+    async fn listen_icmp(&self) -> HammerResult<Box<dyn ProxyIcmpConn>> {
         info!("outbound icmp connection");
         Ok(Box::new(IcmpSocketConn::new(self.protector.clone())))
     }
@@ -134,7 +124,7 @@ struct DirectPacketConn {
 }
 
 impl DirectPacketConn {
-    fn socket_for(&mut self, destination: IpAddr) -> Result<&UdpSocket, HammerError> {
+    fn socket_for(&mut self, destination: IpAddr) -> HammerResult<&UdpSocket> {
         if destination.is_ipv6() {
             if self.ipv6.is_none() {
                 self.ipv6 = Some(bind_udp_socket(
@@ -157,7 +147,7 @@ impl DirectPacketConn {
 
 #[async_trait]
 impl ProxyPacketConn for DirectPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
         let target = resolve_destination(&destination).await?;
         self.socket_for(target.ip())?
             .send_to(payload, target)
@@ -166,7 +156,7 @@ impl ProxyPacketConn for DirectPacketConn {
         Ok(())
     }
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
         match (self.ipv4.as_mut(), self.ipv6.as_mut()) {
             (Some(ipv4), Some(ipv6)) => {
                 let mut v4 = vec![0_u8; 64 * 1024];
@@ -191,7 +181,7 @@ impl ProxyPacketConn for DirectPacketConn {
     }
 }
 
-fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> Result<UdpSocket, HammerError> {
+fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> HammerResult<UdpSocket> {
     let socket = std::net::UdpSocket::bind(SocketAddr::new(bind_ip, 0))
         .with_context(|| "direct udp bind")?;
     socket
@@ -205,7 +195,7 @@ fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> Result<UdpSo
 fn datagram_from_recv(
     result: std::io::Result<(usize, SocketAddr)>,
     mut buf: Vec<u8>,
-) -> Result<ProxyDatagram, HammerError> {
+) -> HammerResult<ProxyDatagram> {
     let (len, source) = result.with_context(|| "direct udp recv")?;
     buf.truncate(len);
     Ok(ProxyDatagram {
@@ -214,7 +204,7 @@ fn datagram_from_recv(
     })
 }
 
-async fn resolve_destination(destination: &SocksAddr) -> Result<SocketAddr, HammerError> {
+async fn resolve_destination(destination: &SocksAddr) -> HammerResult<SocketAddr> {
     let Some(domain) = destination.domain.as_deref() else {
         return Ok(SocketAddr::new(destination.host, destination.port));
     };

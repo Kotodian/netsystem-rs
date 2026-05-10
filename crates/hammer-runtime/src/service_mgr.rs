@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{LifecycleService, ServiceManager as ServiceManagerTrait};
-use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
@@ -39,7 +39,7 @@ impl ServiceManagerTrait for ServiceManager {
             .cloned()
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("ServiceManager poisoned")

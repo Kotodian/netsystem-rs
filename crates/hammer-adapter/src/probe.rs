@@ -8,13 +8,15 @@
 //!
 //! V1 ships an ICMP echo probe for server-backed outbounds. Future
 //! HTTP / QUIC probes drop in by adding a new `impl ProbeProtocol`.
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use hammer_core::error::CoreError;
+use hammer_core::error::CoreResult;
 
-use crate::outbound::Outbound;
+use crate::RuntimeComponent;
+use crate::outbound::OutboundComponent;
+
+pub type ProbeProtocolComponent = RuntimeComponent<dyn ProbeProtocol>;
 
 /// One-shot latency probe. Implementations measure round-trip time to
 /// `outbound`'s own probe endpoint, returning the elapsed `Duration`
@@ -27,8 +29,6 @@ use crate::outbound::Outbound;
 pub trait ProbeProtocol: Send + Sync + 'static {
     /// Short identifier (`"tcp"`, `"icmp"`, …) used in `ProbeReport`
     /// and FFI surfaces. Must be a stable, machine-friendly slug.
-    fn name(&self) -> &'static str;
-
     /// Run one probe attempt against `outbound`. Implementations must
     /// honour `timeout` themselves (typically by wrapping their I/O in
     /// `tokio::time::timeout`); the manager does not enforce it on
@@ -36,9 +36,9 @@ pub trait ProbeProtocol: Send + Sync + 'static {
     /// transport.
     async fn measure(
         &self,
-        outbound: &Arc<dyn Outbound>,
+        outbound: &OutboundComponent,
         timeout: Duration,
-    ) -> Result<Duration, CoreError>;
+    ) -> CoreResult<Duration>;
 }
 
 /// Result of one probe attempt against one outbound.
@@ -52,5 +52,5 @@ pub trait ProbeProtocol: Send + Sync + 'static {
 pub struct ProbeReport {
     pub outbound_id: String,
     pub protocol: String,
-    pub result: Result<Duration, CoreError>,
+    pub result: CoreResult<Duration>,
 }

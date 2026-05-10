@@ -5,7 +5,7 @@ pub mod adapter {
     pub use hammer_adapter::*;
 }
 
-pub use hammer_core::error::HammerError;
+pub use hammer_core::error::{HammerError, HammerResult};
 
 /// Install the ring CryptoProvider as the rustls process-wide default.
 ///
@@ -32,6 +32,7 @@ pub fn install_default_crypto_provider() {
 pub fn install_default_crypto_provider() {}
 
 mod certificate;
+mod component_registry;
 mod connection;
 mod control_thread;
 pub mod dns;
@@ -79,7 +80,7 @@ pub mod wireguard {
 mod apple_utun;
 
 pub use certificate::{CertificateProviderManager, CertificateStore};
-pub use connection::ConnectionManager;
+pub use connection::{ConnectionManager, ConnectionRegistration};
 pub(crate) use control_thread::{ControlLogWriter, ControlThread};
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 #[cfg(feature = "endpoint")]
@@ -99,3 +100,4 @@ pub use protocol::tun::TunInbound;
 pub use route::Router;
 pub use runtime_service::RuntimeService;
 pub use service_mgr::ServiceManager;
+pub use socket_protector::RuntimePlatform;

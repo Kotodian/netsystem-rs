@@ -6,11 +6,11 @@ use hammer_adapter::{
     DefaultInterfaceUpdateListener, NetworkInterface, NetworkManager as NetworkManagerTrait,
     PlatformInterface, WifiState,
 };
-use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 
-use crate::{ConnectionManager, PauseManager};
+use crate::{ConnectionManager, PauseManager, RuntimePlatform};
 
 /// `route.NetworkManager` skeleton. The real interface monitor + autoDetect
 /// path land in M4 once the Platform.get_interfaces / start_default_interface_monitor
@@ -47,10 +47,11 @@ impl NetworkManager {
     pub fn with_platform(
         _logger: Logger,
         auto_detect_interface: bool,
-        platform: Arc<dyn PlatformInterface>,
+        platform: impl Into<RuntimePlatform>,
         pause: Arc<PauseManager>,
         connection: Arc<ConnectionManager>,
     ) -> Arc<Self> {
+        let platform = platform.into().into_inner();
         Arc::new_cyclic(|weak| Self {
             auto_detect_interface,
             need_wifi_state: AtomicBool::new(false),
@@ -92,7 +93,7 @@ impl NetworkManager {
             .clone()
     }
 
-    pub fn update_interfaces(&self) -> Result<(), HammerError> {
+    pub fn update_interfaces(&self) -> HammerResult<()> {
         let Some(platform) = &self.platform else {
             return Ok(());
         };
@@ -111,7 +112,7 @@ impl Lifecycle for NetworkManager {
         "network"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!("stage {}", stage.name());
         match stage {
             StartStage::Initialize => {
@@ -135,7 +136,7 @@ impl Lifecycle for NetworkManager {
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         if let (Some(platform), Some(listener)) = (
             self.platform.as_ref(),
             self.listener

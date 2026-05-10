@@ -2,20 +2,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hammer_adapter::{
-    Inbound, InboundManager as InboundManagerTrait, Lifecycle, PlatformInterface,
+    ComponentMetadata, Inbound, InboundComponent, InboundManager as InboundManagerTrait, Lifecycle,
+    PlatformInterface, RuntimeComponent,
 };
 use hammer_core::config::{Inbound as InboundOptions, InboundKind};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 use hammer_core::metrics::MetricsRegistry;
 use tracing::debug;
 
 #[cfg(feature = "inbound-tun")]
+use crate::component_registry::register_components;
+#[cfg(feature = "inbound-tun")]
 use crate::protocol::tun;
-use crate::{DnsRouter, OutboundManager, Router};
+use crate::{DnsRouter, OutboundManager, Router, RuntimePlatform};
 
-type InboundBuilder = fn(
+pub(crate) type InboundBuilder = fn(
     String,
     Logger,
     &InboundKind,
@@ -24,7 +27,7 @@ type InboundBuilder = fn(
     Option<Arc<OutboundManager>>,
     Option<Arc<dyn PlatformInterface>>,
     Arc<MetricsRegistry>,
-) -> Result<Arc<dyn Inbound>, HammerError>;
+) -> HammerResult<InboundComponent>;
 
 #[derive(Clone)]
 struct InboundFactorySet {
@@ -50,7 +53,7 @@ impl InboundFactorySet {
         outbound: Option<Arc<OutboundManager>>,
         platform: Option<Arc<dyn PlatformInterface>>,
         metrics: Arc<MetricsRegistry>,
-    ) -> Result<Arc<dyn Inbound>, HammerError> {
+    ) -> HammerResult<InboundComponent> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown inbound type: {type_name}"))
@@ -71,12 +74,31 @@ impl InboundFactorySet {
 #[allow(unused_variables)]
 fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, InboundBuilder>) {
     #[cfg(feature = "inbound-tun")]
-    builders.insert("tun", tun::build_inbound as InboundBuilder);
+    register_components!(inbound, builders, [tun::RuntimeTunInbound]);
 }
 
 pub struct InboundManager {
-    items: Mutex<HashMap<String, Arc<dyn Inbound>>>,
+    items: Mutex<HashMap<String, InboundComponent>>,
     factories: InboundFactorySet,
+}
+
+pub struct InboundRegistration(InboundComponent);
+
+impl From<InboundComponent> for InboundRegistration {
+    fn from(inbound: InboundComponent) -> Self {
+        Self(inbound)
+    }
+}
+
+impl<T> From<Arc<T>> for InboundRegistration
+where
+    T: Inbound + ComponentMetadata + 'static,
+{
+    fn from(inbound: Arc<T>) -> Self {
+        let meta = ComponentMetadata::component_meta(inbound.as_ref());
+        let runtime: Arc<dyn Inbound> = inbound;
+        Self(RuntimeComponent::new(meta, runtime))
+    }
 }
 
 impl InboundManager {
@@ -92,7 +114,7 @@ impl InboundManager {
         logger: Logger,
         options: &[InboundOptions],
         router: Arc<Router>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(
@@ -114,8 +136,8 @@ impl InboundManager {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
-        platform: Arc<dyn PlatformInterface>,
-    ) -> Result<Self, HammerError> {
+        platform: impl Into<RuntimePlatform>,
+    ) -> HammerResult<Self> {
         Self::from_options_with_runtime_and_metrics(
             logger,
             options,
@@ -133,9 +155,10 @@ impl InboundManager {
         router: Arc<Router>,
         dns_router: Arc<DnsRouter>,
         outbound: Arc<OutboundManager>,
-        platform: Arc<dyn PlatformInterface>,
+        platform: impl Into<RuntimePlatform>,
         metrics: Arc<MetricsRegistry>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
+        let platform = platform.into().into_inner();
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(
@@ -151,11 +174,13 @@ impl InboundManager {
         Ok(manager)
     }
 
-    pub fn register(&self, inbound: Arc<dyn Inbound>) {
+    pub fn register(&self, inbound: impl Into<InboundRegistration>) {
+        let inbound = inbound.into().0;
+        let id = inbound.meta().id().to_owned();
         self.items
             .lock()
             .expect("InboundManager poisoned")
-            .insert(inbound.id().to_owned(), inbound);
+            .insert(id, inbound);
     }
 }
 
@@ -164,20 +189,20 @@ impl Lifecycle for InboundManager {
         "inbound"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!("stage {}", stage.name());
         for inbound in self.list() {
-            inbound.start(stage)?;
+            inbound.runtime().start(stage)?;
         }
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         debug!("close");
         let mut errors = Vec::new();
         for inbound in self.list() {
-            if let Err(err) = inbound.close() {
-                errors.push(format!("{}: {}", inbound.id(), err));
+            if let Err(err) = inbound.runtime().close() {
+                errors.push(format!("{}: {}", inbound.meta().id(), err));
             }
         }
         if errors.is_empty() {
@@ -192,7 +217,7 @@ impl Lifecycle for InboundManager {
 }
 
 impl InboundManagerTrait for InboundManager {
-    fn list(&self) -> Vec<Arc<dyn Inbound>> {
+    fn list(&self) -> Vec<InboundComponent> {
         self.items
             .lock()
             .expect("InboundManager poisoned")
@@ -201,7 +226,7 @@ impl InboundManagerTrait for InboundManager {
             .collect()
     }
 
-    fn get(&self, id: &str) -> Option<Arc<dyn Inbound>> {
+    fn get(&self, id: &str) -> Option<InboundComponent> {
         self.items
             .lock()
             .expect("InboundManager poisoned")
@@ -209,7 +234,7 @@ impl InboundManagerTrait for InboundManager {
             .cloned()
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("InboundManager poisoned")

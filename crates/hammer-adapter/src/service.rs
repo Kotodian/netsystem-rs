@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use hammer_core::error::CoreError;
+use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::{Lifecycle, LifecycleService};
 
 /// `adapter.ServiceManager` — extra services that are neither inbound nor
@@ -9,5 +9,5 @@ use hammer_core::lifecycle::{Lifecycle, LifecycleService};
 pub trait ServiceManager: Lifecycle {
     fn list(&self) -> Vec<Arc<dyn LifecycleService>>;
     fn get(&self, id: &str) -> Option<Arc<dyn LifecycleService>>;
-    fn remove(&self, id: &str) -> Result<(), CoreError>;
+    fn remove(&self, id: &str) -> CoreResult<()>;
 }

@@ -15,11 +15,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    Outbound, OutboundManager as OutboundManagerTrait, ProbeProtocol, ProbeReport,
+    ComponentMetadata, OutboundComponent, OutboundManager as _, ProbeProtocol,
+    ProbeProtocolComponent, ProbeReport, RuntimeComponent,
 };
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 
 use crate::OutboundManager;
+use crate::component_registry::register_components;
+
+pub(crate) type ProbeProtocolBuilder = fn() -> ProbeProtocolComponent;
 
 /// Stateless orchestrator that runs a probe against one or every
 /// registered outbound. Lives next to the other runtime managers
@@ -27,6 +31,25 @@ use crate::OutboundManager;
 /// `LIFECYCLE_ORDER` — there is no background task to start or stop.
 pub struct ProbeManager {
     outbound: Arc<OutboundManager>,
+}
+
+pub struct ProbeProtocolRegistration(ProbeProtocolComponent);
+
+impl From<ProbeProtocolComponent> for ProbeProtocolRegistration {
+    fn from(probe: ProbeProtocolComponent) -> Self {
+        Self(probe)
+    }
+}
+
+impl<T> From<Arc<T>> for ProbeProtocolRegistration
+where
+    T: ProbeProtocol + ComponentMetadata + 'static,
+{
+    fn from(probe: Arc<T>) -> Self {
+        let meta = ComponentMetadata::component_meta(probe.as_ref());
+        let runtime: Arc<dyn ProbeProtocol> = probe;
+        Self(RuntimeComponent::new(meta, runtime))
+    }
 }
 
 impl ProbeManager {
@@ -40,15 +63,16 @@ impl ProbeManager {
     pub async fn probe(
         &self,
         outbound_id: &str,
-        probe: Arc<dyn ProbeProtocol>,
+        probe: impl Into<ProbeProtocolRegistration>,
         timeout: Duration,
-    ) -> Result<ProbeReport, HammerError> {
+    ) -> HammerResult<ProbeReport> {
+        let probe = probe.into().0;
         let outbound = self
             .outbound
             .get(outbound_id)
             .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
-        let protocol = probe.name().to_owned();
-        let result = probe.measure(&outbound, timeout).await;
+        let protocol = probe.meta().type_name().to_owned();
+        let result = probe.runtime().measure(&outbound, timeout).await;
         Ok(ProbeReport {
             outbound_id: outbound_id.to_owned(),
             protocol,
@@ -61,21 +85,22 @@ impl ProbeManager {
     /// `timeout` applies per outbound, not to the batch as a whole.
     pub async fn probe_all(
         &self,
-        probe: Arc<dyn ProbeProtocol>,
+        probe: impl Into<ProbeProtocolRegistration>,
         timeout: Duration,
     ) -> Vec<ProbeReport> {
+        let probe = probe.into().0;
         let outbounds = self.outbound.list();
         if outbounds.is_empty() {
             return Vec::new();
         }
-        let protocol = probe.name().to_owned();
+        let protocol = probe.meta().type_name().to_owned();
         let mut handles = Vec::with_capacity(outbounds.len());
         for outbound in outbounds {
-            let probe = Arc::clone(&probe);
-            let outbound_id = outbound.id().to_owned();
+            let probe = probe.clone();
+            let outbound_id = outbound.meta().id().to_owned();
             let protocol = protocol.clone();
             handles.push(crate::spawn::spawn(async move {
-                let result = probe.measure(&outbound, timeout).await;
+                let result = probe.runtime().measure(&outbound, timeout).await;
                 ProbeReport {
                     outbound_id,
                     protocol,
@@ -98,7 +123,31 @@ impl ProbeManager {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct ProbeProtocolFactorySet {
+    builders: Arc<std::collections::HashMap<&'static str, ProbeProtocolBuilder>>,
+}
+
+impl ProbeProtocolFactorySet {
+    pub(crate) fn standard() -> Self {
+        let mut builders = std::collections::HashMap::new();
+        register_components!(probe, &mut builders, [IcmpOutboundProbe]);
+        Self {
+            builders: Arc::new(builders),
+        }
+    }
+
+    pub(crate) fn build(&self, protocol: &str) -> HammerResult<ProbeProtocolComponent> {
+        let builder = self
+            .builders
+            .get(protocol)
+            .ok_or_else(|| HammerError::internal(format!("unknown probe protocol: {protocol}")))?;
+        Ok(builder())
+    }
+}
+
 /// Probe that measures latency to each outbound's own ICMP probe endpoint.
+#[hammer_component_macros::hammer_component(probe, name = "icmp", builder = build_icmp_probe)]
 #[derive(Default)]
 pub struct IcmpOutboundProbe;
 
@@ -108,18 +157,18 @@ impl IcmpOutboundProbe {
     }
 }
 
+fn build_icmp_probe() -> Arc<IcmpOutboundProbe> {
+    Arc::new(IcmpOutboundProbe::new())
+}
+
 #[async_trait]
 impl ProbeProtocol for IcmpOutboundProbe {
-    fn name(&self) -> &'static str {
-        "icmp"
-    }
-
     async fn measure(
         &self,
-        outbound: &Arc<dyn Outbound>,
+        outbound: &OutboundComponent,
         timeout: Duration,
-    ) -> Result<Duration, HammerError> {
-        outbound.probe_latency(self.name(), timeout).await
+    ) -> HammerResult<Duration> {
+        outbound.runtime().probe_latency("icmp", timeout).await
     }
 }
 
@@ -129,8 +178,10 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use hammer_adapter::{Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr};
-    use hammer_core::error::HammerError;
+    use hammer_adapter::{
+        ComponentMeta, Network, Outbound, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
+    };
+    use hammer_core::error::{HammerError, HammerResult};
 
     use super::*;
 
@@ -147,40 +198,20 @@ mod tests {
 
     #[async_trait]
     impl Outbound for ProbeOnlyOutbound {
-        fn type_name(&self) -> &str {
-            "probe-only"
-        }
-
-        fn id(&self) -> &str {
-            "probe-only"
-        }
-
-        fn networks(&self) -> &[Network] {
-            &[]
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
-
         async fn dial(
             &self,
             _network: Network,
             _destination: SocksAddr,
             _initial_payload: &[u8],
-        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        ) -> HammerResult<Box<dyn ProxyStream>> {
             Err(HammerError::internal("not used"))
         }
 
-        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
             Err(HammerError::internal("not used"))
         }
 
-        async fn probe_latency(
-            &self,
-            protocol: &str,
-            timeout: Duration,
-        ) -> Result<Duration, HammerError> {
+        async fn probe_latency(&self, protocol: &str, timeout: Duration) -> HammerResult<Duration> {
             self.calls
                 .lock()
                 .expect("calls lock")
@@ -192,11 +223,22 @@ mod tests {
     #[tokio::test]
     async fn icmp_probe_delegates_to_outbound_probe_latency() {
         let outbound = Arc::new(ProbeOnlyOutbound::default());
-        let erased = Arc::clone(&outbound) as Arc<dyn Outbound>;
+        let erased: Arc<dyn Outbound> = Arc::clone(&outbound) as Arc<dyn Outbound>;
+        let outbound_component = RuntimeComponent::new(
+            ComponentMeta::new(
+                "outbound",
+                "probe-only",
+                "probe-only",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            erased,
+        );
         let probe = IcmpOutboundProbe::new();
 
         let elapsed = probe
-            .measure(&erased, Duration::from_millis(250))
+            .measure(&outbound_component, Duration::from_millis(250))
             .await
             .expect("icmp probe should delegate");
 

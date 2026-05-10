@@ -3,10 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    DnsTransport, Lifecycle, Network, PlatformInterface, ProxyStream, StartStage,
+    DnsTransport, DnsTransportComponent, Lifecycle, Network, PlatformInterface, ProxyStream,
+    StartStage,
 };
 use hammer_core::config::{DnsServerKind, RemoteHttpsDnsServer};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::protocol::dns::MessageExt;
 use hickory_proto::op::Message;
 use http::Request;
 use http_body_util::{BodyExt, Full};
@@ -14,7 +16,6 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio_rustls::TlsConnector;
 
 use crate::OutboundManager;
-use crate::dns::MessageExt;
 use crate::socket_protector::SocketProtector;
 use crate::tls_support::client_verifier_builder;
 
@@ -25,6 +26,12 @@ use super::{
 
 const DOH_MIME_TYPE: &str = "application/dns-message";
 
+#[hammer_component_macros::hammer_component(
+    dns_transport,
+    name = "https",
+    builder = build_transport,
+    metrics = ("dns", "transport")
+)]
 pub struct HttpsDnsTransport {
     id: String,
     server: String,
@@ -34,7 +41,7 @@ pub struct HttpsDnsTransport {
     url: String,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
-    bootstrap: Option<Arc<dyn DnsTransport>>,
+    bootstrap: Option<DnsTransportComponent>,
     protector: SocketProtector,
     platform: Option<Arc<dyn PlatformInterface>>,
 }
@@ -48,7 +55,7 @@ impl HttpsDnsTransport {
         id: impl Into<String>,
         options: &RemoteHttpsDnsServer,
         outbound: Option<Arc<OutboundManager>>,
-        bootstrap: Option<Arc<dyn DnsTransport>>,
+        bootstrap: Option<DnsTransportComponent>,
         protector: SocketProtector,
     ) -> Self {
         let host = if options.server_port == 443 {
@@ -82,9 +89,9 @@ pub(crate) fn build_transport(
     kind: &DnsServerKind,
     _logger: hammer_core::log::Logger,
     outbound: Option<Arc<OutboundManager>>,
-    bootstrap: Option<Arc<dyn DnsTransport>>,
+    bootstrap: Option<DnsTransportComponent>,
     protector: SocketProtector,
-) -> Result<Arc<dyn DnsTransport>, HammerError> {
+) -> HammerResult<Arc<HttpsDnsTransport>> {
     match kind {
         DnsServerKind::Https(options) => Ok(Arc::new(HttpsDnsTransport::new_with_runtime(
             id, options, outbound, bootstrap, protector,
@@ -99,28 +106,19 @@ impl Lifecycle for HttpsDnsTransport {
     fn name(&self) -> &str {
         "dns/transport/https"
     }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, _stage: StartStage) -> HammerResult<()> {
         Ok(())
     }
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         Ok(())
     }
 }
 
 #[async_trait]
 impl DnsTransport for HttpsDnsTransport {
-    fn type_name(&self) -> &str {
-        "https"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
     fn reset(&self) {}
 
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+    async fn exchange(&self, message: Message) -> HammerResult<Message> {
         let server =
             destination_via_bootstrap(self.bootstrap.as_ref(), &self.server, self.port).await?;
         let payload = MessageExt::to_bytes(&message)?;
@@ -151,7 +149,7 @@ async fn doh_exchange_http2(
     payload: Vec<u8>,
     protector: &SocketProtector,
     platform: Option<Arc<dyn PlatformInterface>>,
-) -> Result<Bytes, HammerError> {
+) -> HammerResult<Bytes> {
     let host_name = server_name.to_owned();
     let stream: Box<dyn ProxyStream> = if via.is_empty() {
         let server = if let Some(server) = socks_to_socket_addr(&server) {
@@ -162,6 +160,7 @@ async fn doh_exchange_http2(
         Box::new(direct_tcp_connect(server, protector).await?)
     } else {
         outbound_by_id(outbound, via)?
+            .runtime()
             .dial(Network::Tcp, server.clone(), &[])
             .await?
     };

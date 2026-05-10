@@ -4,8 +4,26 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use hammer_adapter::{ConnectionHandle, ConnectionManager as ConnectionManagerTrait};
-use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
+
+pub struct ConnectionRegistration(Arc<dyn ConnectionHandle>);
+
+impl<H> From<Arc<H>> for ConnectionRegistration
+where
+    H: ConnectionHandle + 'static,
+{
+    fn from(handle: Arc<H>) -> Self {
+        let handle: Arc<dyn ConnectionHandle> = handle;
+        Self(handle)
+    }
+}
+
+impl From<Arc<dyn ConnectionHandle>> for ConnectionRegistration {
+    fn from(handle: Arc<dyn ConnectionHandle>) -> Self {
+        Self(handle)
+    }
+}
 
 pub struct ConnectionManager {
     next_id: AtomicU64,
@@ -26,8 +44,8 @@ impl ConnectionManager {
         }
     }
 
-    pub fn track(&self, handle: Arc<dyn ConnectionHandle>) -> u64 {
-        <Self as ConnectionManagerTrait>::track(self, handle)
+    pub fn track(&self, handle: impl Into<ConnectionRegistration>) -> u64 {
+        <Self as ConnectionManagerTrait>::track(self, handle.into().0)
     }
 
     pub fn remove(&self, id: u64) -> bool {
@@ -48,12 +66,12 @@ impl Lifecycle for ConnectionManager {
         "connection"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!(target: "connection", "stage {}", stage.name());
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         self.close_all();
         debug!(target: "connection", "close");
         Ok(())

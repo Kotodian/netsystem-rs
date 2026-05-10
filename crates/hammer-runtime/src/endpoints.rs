@@ -3,25 +3,31 @@ use std::sync::{Arc, Mutex};
 use tracing::debug;
 
 use hammer_adapter::PlatformInterface;
-use hammer_adapter::{Endpoint, EndpointManager as EndpointManagerTrait, Lifecycle, Outbound};
+use hammer_adapter::{
+    EndpointComponent, EndpointManager as EndpointManagerTrait, Lifecycle, OutboundComponent,
+};
 #[cfg(feature = "endpoint")]
 use hammer_core::config::Endpoint as EndpointOptions;
 #[cfg(feature = "wireguard")]
 use hammer_core::config::EndpointKind;
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
+use crate::RuntimePlatform;
 #[cfg(feature = "wireguard")]
-type EndpointViews = (Arc<dyn Endpoint>, Arc<dyn Outbound>);
+use crate::component_registry::register_components;
 
 #[cfg(feature = "wireguard")]
-type EndpointBuilder = fn(
+pub(crate) type EndpointViews = (EndpointComponent, OutboundComponent);
+
+#[cfg(feature = "wireguard")]
+pub(crate) type EndpointBuilder = fn(
     Logger,
     String,
     &EndpointKind,
     Option<Arc<dyn PlatformInterface>>,
-) -> Result<EndpointViews, HammerError>;
+) -> HammerResult<EndpointViews>;
 
 #[cfg(feature = "wireguard")]
 #[derive(Clone)]
@@ -33,10 +39,7 @@ struct EndpointFactorySet {
 impl EndpointFactorySet {
     fn standard() -> Self {
         let mut builders = HashMap::new();
-        builders.insert(
-            "wireguard",
-            crate::protocol::wireguard::build_endpoint_views as EndpointBuilder,
-        );
+        register_standard_endpoint_builders(&mut builders);
         Self {
             builders: Arc::new(builders),
         }
@@ -47,7 +50,7 @@ impl EndpointFactorySet {
         logger: Logger,
         option: &EndpointOptions,
         platform: Option<Arc<dyn PlatformInterface>>,
-    ) -> Result<EndpointViews, HammerError> {
+    ) -> HammerResult<EndpointViews> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown endpoint type: {type_name}"))
@@ -56,15 +59,24 @@ impl EndpointFactorySet {
     }
 }
 
+#[cfg(feature = "wireguard")]
+fn register_standard_endpoint_builders(builders: &mut HashMap<&'static str, EndpointBuilder>) {
+    register_components!(
+        endpoint,
+        builders,
+        [crate::protocol::wireguard::WireguardEndpoint]
+    );
+}
+
 pub struct EndpointManager {
     #[cfg_attr(not(feature = "wireguard"), allow(dead_code))]
     logger: Logger,
-    items: Mutex<HashMap<String, Arc<dyn Endpoint>>>,
+    items: Mutex<HashMap<String, EndpointComponent>>,
     /// Same set of endpoints as `items`, but viewed through their `Outbound`
     /// trait — sing-box keeps a single object behind both a `Endpoint` and an
     /// `Outbound` registration so the router can resolve the id through
     /// `OutboundManager::get` exactly like any other outbound.
-    outbound_view: Mutex<Vec<(String, Arc<dyn Outbound>)>>,
+    outbound_view: Mutex<Vec<OutboundComponent>>,
     #[cfg(feature = "wireguard")]
     factories: EndpointFactorySet,
 }
@@ -81,7 +93,7 @@ impl EndpointManager {
     }
 
     #[cfg(feature = "endpoint")]
-    pub fn from_options(logger: Logger, options: &[EndpointOptions]) -> Result<Self, HammerError> {
+    pub fn from_options(logger: Logger, options: &[EndpointOptions]) -> HammerResult<Self> {
         Self::build(logger, options, None)
     }
 
@@ -89,8 +101,9 @@ impl EndpointManager {
     pub fn from_options_with_platform(
         logger: Logger,
         options: &[EndpointOptions],
-        platform: Arc<dyn PlatformInterface>,
-    ) -> Result<Self, HammerError> {
+        platform: impl Into<RuntimePlatform>,
+    ) -> HammerResult<Self> {
+        let platform = platform.into().into_inner();
         Self::build(logger, options, Some(platform))
     }
 
@@ -99,7 +112,7 @@ impl EndpointManager {
         logger: Logger,
         options: &[EndpointOptions],
         platform: Option<Arc<dyn PlatformInterface>>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
         let manager = Self::new(logger);
         #[cfg(not(feature = "wireguard"))]
         for _ in options {
@@ -127,7 +140,7 @@ impl EndpointManager {
                 .outbound_view
                 .lock()
                 .expect("EndpointManager poisoned")
-                .push((option.id.clone(), outbound_view));
+                .push(outbound_view);
         }
         #[cfg(not(feature = "wireguard"))]
         let _ = platform;
@@ -137,7 +150,7 @@ impl EndpointManager {
     /// Snapshot of the (id, outbound-view) pairs so the assembler can register
     /// them with `OutboundManager` after both managers exist. Cloning the Arcs
     /// is cheap and the slice is only walked once at boot.
-    pub fn outbound_view(&self) -> Vec<(String, Arc<dyn Outbound>)> {
+    pub fn outbound_view(&self) -> Vec<OutboundComponent> {
         self.outbound_view
             .lock()
             .expect("EndpointManager poisoned")
@@ -150,9 +163,9 @@ impl Lifecycle for EndpointManager {
         "endpoint"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!("stage {}", stage.name());
-        let items: Vec<Arc<dyn Endpoint>> = self
+        let items: Vec<EndpointComponent> = self
             .items
             .lock()
             .expect("EndpointManager poisoned")
@@ -160,14 +173,14 @@ impl Lifecycle for EndpointManager {
             .cloned()
             .collect();
         for ep in items {
-            ep.start(stage)?;
+            ep.runtime().start(stage)?;
         }
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         debug!("close");
-        let items: Vec<Arc<dyn Endpoint>> = self
+        let items: Vec<EndpointComponent> = self
             .items
             .lock()
             .expect("EndpointManager poisoned")
@@ -176,8 +189,8 @@ impl Lifecycle for EndpointManager {
             .collect();
         let mut errors = Vec::new();
         for ep in items {
-            if let Err(err) = ep.close() {
-                errors.push(format!("{}: {}", ep.id(), err));
+            if let Err(err) = ep.runtime().close() {
+                errors.push(format!("{}: {}", ep.meta().id(), err));
             }
         }
         if errors.is_empty() {
@@ -192,7 +205,7 @@ impl Lifecycle for EndpointManager {
 }
 
 impl EndpointManagerTrait for EndpointManager {
-    fn list(&self) -> Vec<Arc<dyn Endpoint>> {
+    fn list(&self) -> Vec<EndpointComponent> {
         self.items
             .lock()
             .expect("EndpointManager poisoned")
@@ -201,7 +214,7 @@ impl EndpointManagerTrait for EndpointManager {
             .collect()
     }
 
-    fn get(&self, id: &str) -> Option<Arc<dyn Endpoint>> {
+    fn get(&self, id: &str) -> Option<EndpointComponent> {
         self.items
             .lock()
             .expect("EndpointManager poisoned")
@@ -209,7 +222,7 @@ impl EndpointManagerTrait for EndpointManager {
             .cloned()
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("EndpointManager poisoned")

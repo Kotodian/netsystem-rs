@@ -12,14 +12,17 @@ default = []
 # Enables Hysteria2 outbound config schema (`[hysteria2]` and
 # `type = "hysteria2"`). Off by default for slim builds that only need
 # direct/block/urltest config.
-outbound-hysteria2 = []
+outbound-hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
 # Enables the generic `[[endpoints]]` config section. Concrete endpoint
 # protocols opt into this parent feature.
 endpoint = []
 # Enables WireGuard endpoint config schema (`[[endpoints]]` with
 # `type = "wireguard"`). Off by default to keep iOS xcframework builds slim
 # for users who only need hysteria2; opt in with `--features wireguard`.
-wireguard = ["endpoint", "dep:serde_with", "serde_with/base64"]
+wireguard = ["endpoint", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
+# Generic user-space TCP/IP stack protocol machinery shared by runtime
+# components such as WireGuard.
+ipstack = ["dep:bytes", "dep:smoltcp", "dep:rustc-hash"]
 
 [dependencies]
 serde = { workspace = true }
@@ -34,6 +37,15 @@ tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 humantime-serde = { workspace = true }
 serde_with = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
+boringtun = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+hickory-proto = { workspace = true }
+http = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+rustc-hash = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 indoc = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

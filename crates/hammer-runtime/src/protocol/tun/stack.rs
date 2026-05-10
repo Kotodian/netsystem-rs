@@ -14,7 +14,7 @@ use hammer_adapter::{
     ProxyStream, RouteDecision, RouteMetadata, Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::normalize_domain;
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use ipnet::IpNet;
@@ -24,8 +24,8 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant, timeout};
 
-use crate::dns::MessageExt;
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
+use hammer_core::protocol::dns::MessageExt;
 use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
@@ -33,6 +33,7 @@ const MAX_TUN_PACKET_SIZE: usize = 65_535;
 const SYSTEM_UDP_FLOW_CAPACITY: usize = 256;
 const SYSTEM_UDP_CHANNEL_CAPACITY: usize = 64;
 const SYSTEM_DNS_HIJACK_QUEUE_CAPACITY: usize = 64;
+const SYSTEM_DNS_HIJACK_WORKER_QUEUE_CAPACITY: usize = 1;
 const SYSTEM_DNS_HIJACK_WORKERS: usize = 4;
 const SYSTEM_ICMP_QUEUE_CAPACITY: usize = 32;
 const SYSTEM_ICMP_WORKERS: usize = 2;
@@ -76,7 +77,7 @@ impl IpVersion {
         self as u8
     }
 
-    fn from_packet(packet: &[u8]) -> Result<Self, HammerError> {
+    fn from_packet(packet: &[u8]) -> HammerResult<Self> {
         let Some(first) = packet.first() else {
             return Err(HammerError::internal("empty IP packet"));
         };
@@ -131,12 +132,12 @@ impl TryFrom<u8> for IpProtocol {
 
 #[async_trait]
 pub trait TunDevice: Send + Sync + 'static {
-    async fn recv(&self) -> Result<Vec<u8>, HammerError>;
-    async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError>;
+    async fn recv(&self) -> HammerResult<Vec<u8>>;
+    async fn send(&self, packet: Vec<u8>) -> HammerResult<()>;
     /// Drain up to `max` packets from the device in one go. The default impl
     /// just calls `recv` once; Apple's batched driver overrides this to
     /// amortize the recvmsg_x syscall over many packets.
-    async fn recv_batch(&self, max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
+    async fn recv_batch(&self, max: usize) -> HammerResult<Vec<Vec<u8>>> {
         let _ = max;
         let packet = self.recv().await?;
         Ok(vec![packet])
@@ -144,7 +145,7 @@ pub trait TunDevice: Send + Sync + 'static {
     /// Send a batch of packets back to the kernel. Apple's batched driver
     /// overrides this to coalesce them into one sendmsg_x syscall; everywhere
     /// else we fall back to a sequential `send` loop.
-    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> Result<(), HammerError> {
+    async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> HammerResult<()> {
         for packet in packets.drain(..) {
             self.send(packet).await?;
         }
@@ -184,7 +185,7 @@ impl MemoryTunDevice {
         })
     }
 
-    pub async fn inject(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+    pub async fn inject(&self, packet: Vec<u8>) -> HammerResult<()> {
         self.input_tx
             .send(packet)
             .await
@@ -195,11 +196,11 @@ impl MemoryTunDevice {
         self.output_rx.lock().await.recv().await
     }
 
-    pub async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+    pub async fn recv(&self) -> HammerResult<Vec<u8>> {
         <Self as TunDevice>::recv(self).await
     }
 
-    pub async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+    pub async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
         <Self as TunDevice>::send(self, packet).await
     }
 
@@ -210,7 +211,7 @@ impl MemoryTunDevice {
 
 #[async_trait]
 impl TunDevice for MemoryTunDevice {
-    async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+    async fn recv(&self) -> HammerResult<Vec<u8>> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("memory tun closed"));
         }
@@ -222,7 +223,7 @@ impl TunDevice for MemoryTunDevice {
             .ok_or_else(|| HammerError::internal("memory tun input closed"))
     }
 
-    async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+    async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("memory tun closed"));
         }
@@ -248,7 +249,7 @@ impl AsyncTunDevice {
     ///
     /// `fd` must be an owned TUN/utun file descriptor. The returned device closes
     /// that descriptor when dropped.
-    pub unsafe fn from_fd(fd: RawFd, mtu: usize) -> Result<Arc<Self>, HammerError> {
+    pub unsafe fn from_fd(fd: RawFd, mtu: usize) -> HammerResult<Arc<Self>> {
         let read_buffer_len = tun_read_buffer_len(mtu)?;
         let device = unsafe { tun_rs::AsyncDevice::from_fd(fd) }
             .map_err(|err| HammerError::internal(format!("wrap TUN fd: {err}")))?;
@@ -262,7 +263,7 @@ impl AsyncTunDevice {
 
 #[async_trait]
 impl TunDevice for AsyncTunDevice {
-    async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+    async fn recv(&self) -> HammerResult<Vec<u8>> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("TUN device closed"));
         }
@@ -276,7 +277,7 @@ impl TunDevice for AsyncTunDevice {
         Ok(packet)
     }
 
-    async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+    async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
         if self.closed.load(Ordering::Relaxed) {
             return Err(HammerError::internal("TUN device closed"));
         }
@@ -292,7 +293,7 @@ impl TunDevice for AsyncTunDevice {
     }
 }
 
-fn tun_read_buffer_len(mtu: usize) -> Result<usize, HammerError> {
+fn tun_read_buffer_len(mtu: usize) -> HammerResult<usize> {
     if mtu == 0 {
         return Err(HammerError::internal("TUN MTU must be greater than zero"));
     }
@@ -322,7 +323,7 @@ struct ParsedIpPacketView {
 }
 
 impl ParsedIpPacketView {
-    fn payload<'a>(&self, packet: &'a [u8]) -> Result<&'a [u8], HammerError> {
+    fn payload<'a>(&self, packet: &'a [u8]) -> HammerResult<&'a [u8]> {
         packet
             .get(self.payload_range.clone())
             .ok_or_else(|| HammerError::internal("parsed packet payload range is out of bounds"))
@@ -506,14 +507,23 @@ impl Drop for SystemTcpInboundGuard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct UdpFlowKey {
-    outbound: String,
     source: (IpAddr, u16),
     destination: (IpAddr, u16),
+}
+
+impl UdpFlowKey {
+    fn from_parsed(parsed: &ParsedIpPacketView) -> Self {
+        Self {
+            source: (parsed.source.host, parsed.source.port),
+            destination: (parsed.destination.host, parsed.destination.port),
+        }
+    }
 }
 
 struct UdpFlowState {
     sender: mpsc::Sender<UdpFlowPayload>,
     last_active: Instant,
+    outbound: String,
 }
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
@@ -544,7 +554,7 @@ impl TcpPendingDialLimiter {
         }
     }
 
-    fn try_acquire(&self) -> Result<OwnedSemaphorePermit, HammerError> {
+    fn try_acquire(&self) -> HammerResult<OwnedSemaphorePermit> {
         self.semaphore
             .clone()
             .try_acquire_owned()
@@ -628,7 +638,7 @@ where
         }
     }
 
-    pub fn start(&self) -> Result<(), HammerError> {
+    pub fn start(&self) -> HammerResult<()> {
         if self.started.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
@@ -879,10 +889,7 @@ impl SystemStackRoutes {
     }
 }
 
-fn bind_system_listener(
-    addr: IpAddr,
-    interface_index: Option<u32>,
-) -> Result<TcpListener, HammerError> {
+fn bind_system_listener(addr: IpAddr, interface_index: Option<u32>) -> HammerResult<TcpListener> {
     let listener = StdTcpListener::bind(SocketAddr::new(addr, 0))
         .map_err(|err| HammerError::internal(format!("bind {addr}: {err}")))?;
     listener
@@ -900,7 +907,7 @@ fn bind_listener_to_tun_interface(
     listener: &StdTcpListener,
     addr: IpAddr,
     index: u32,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     use std::os::fd::AsRawFd;
     let (level, name) = match addr {
         IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
@@ -930,7 +937,7 @@ fn bind_listener_to_tun_interface(
     _listener: &StdTcpListener,
     _addr: IpAddr,
     _index: u32,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     Ok(())
 }
 
@@ -972,7 +979,7 @@ struct StackAddress<T> {
 }
 
 impl StackAddresses {
-    fn from_options(options: &hammer_core::config::TunInboundOptions) -> Result<Self, HammerError> {
+    fn from_options(options: &hammer_core::config::TunInboundOptions) -> HammerResult<Self> {
         let mut v4 = None;
         let mut v6 = None;
         for net in &options.address {
@@ -1022,7 +1029,7 @@ pub enum TunDispatch {
 }
 
 #[inline]
-pub fn parse_ip_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
+pub fn parse_ip_packet(packet: &[u8]) -> HammerResult<ParsedIpPacket> {
     let parsed = parse_ip_packet_view(packet)?;
     let payload = parsed.payload(packet)?.to_vec();
     Ok(ParsedIpPacket {
@@ -1034,7 +1041,7 @@ pub fn parse_ip_packet(packet: &[u8]) -> Result<ParsedIpPacket, HammerError> {
 }
 
 #[inline]
-fn parse_ip_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+fn parse_ip_packet_view(packet: &[u8]) -> HammerResult<ParsedIpPacketView> {
     match IpVersion::from_packet(packet)? {
         IpVersion::V4 => parse_ipv4_packet_view(packet),
         IpVersion::V6 => parse_ipv6_packet_view(packet),
@@ -1047,7 +1054,7 @@ pub fn process_system_tcp_packet(
     listener_addr: IpAddr,
     nat_addr: IpAddr,
     listener_port: u16,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     match IpVersion::from_packet(packet)? {
         IpVersion::V4 => {
             process_system_tcp_ipv4(packet, nat, listener_addr, nat_addr, listener_port)
@@ -1062,18 +1069,18 @@ pub fn udp_response_packet(
     request: &[u8],
     source: SocksAddr,
     payload: &[u8],
-) -> Result<Vec<u8>, HammerError> {
+) -> HammerResult<Vec<u8>> {
     UdpResponseTemplate::from_request(request)?.build(source, payload)
 }
 
-pub fn udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+pub fn udp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     match IpVersion::from_packet(request)? {
         IpVersion::V4 => ipv4_udp_unreachable_packet(request),
         IpVersion::V6 => ipv6_udp_unreachable_packet(request),
     }
 }
 
-pub fn tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+pub fn tcp_reset_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     match IpVersion::from_packet(request)? {
         IpVersion::V4 => ipv4_tcp_reset_packet(request),
         IpVersion::V6 => ipv6_tcp_reset_packet(request),
@@ -1088,14 +1095,14 @@ struct UdpResponseTemplate {
 }
 
 impl UdpResponseTemplate {
-    fn from_request(request: &[u8]) -> Result<Self, HammerError> {
+    fn from_request(request: &[u8]) -> HammerResult<Self> {
         match IpVersion::from_packet(request)? {
             IpVersion::V4 => Self::from_ipv4_request(request),
             IpVersion::V6 => Self::from_ipv6_request(request),
         }
     }
 
-    fn from_ipv4_request(request: &[u8]) -> Result<Self, HammerError> {
+    fn from_ipv4_request(request: &[u8]) -> HammerResult<Self> {
         if request.len() < IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN {
             return Err(HammerError::internal("short IPv4 UDP packet"));
         }
@@ -1113,7 +1120,7 @@ impl UdpResponseTemplate {
         })
     }
 
-    fn from_ipv6_request(request: &[u8]) -> Result<Self, HammerError> {
+    fn from_ipv6_request(request: &[u8]) -> HammerResult<Self> {
         if request.len() < IPV6_HEADER_LEN + UDP_HEADER_LEN
             || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
         {
@@ -1126,14 +1133,14 @@ impl UdpResponseTemplate {
         })
     }
 
-    fn build(&self, source: SocksAddr, payload: &[u8]) -> Result<Vec<u8>, HammerError> {
+    fn build(&self, source: SocksAddr, payload: &[u8]) -> HammerResult<Vec<u8>> {
         match self.version {
             IpVersion::V4 => self.build_v4(source, payload),
             IpVersion::V6 => self.build_v6(source, payload),
         }
     }
 
-    fn build_v4(&self, source: SocksAddr, payload: &[u8]) -> Result<Vec<u8>, HammerError> {
+    fn build_v4(&self, source: SocksAddr, payload: &[u8]) -> HammerResult<Vec<u8>> {
         let IpAddr::V4(source_ip) = source.host else {
             return Err(HammerError::internal("IPv4 UDP response needs IPv4 source"));
         };
@@ -1160,7 +1167,7 @@ impl UdpResponseTemplate {
         Ok(packet)
     }
 
-    fn build_v6(&self, source: SocksAddr, payload: &[u8]) -> Result<Vec<u8>, HammerError> {
+    fn build_v6(&self, source: SocksAddr, payload: &[u8]) -> HammerResult<Vec<u8>> {
         let IpAddr::V6(source_ip) = source.host else {
             return Err(HammerError::internal("IPv6 UDP response needs IPv6 source"));
         };
@@ -1261,7 +1268,7 @@ where
         }
     }
 
-    pub fn handle_packet(&self, packet: &[u8]) -> Result<PacketFlow, HammerError> {
+    pub fn handle_packet(&self, packet: &[u8]) -> HammerResult<PacketFlow> {
         let mut tun_packet = self.packet_context(packet)?;
         prepare_route_metadata(
             self.router.as_ref(),
@@ -1276,7 +1283,7 @@ where
         })
     }
 
-    pub async fn dispatch_packet(&self, packet: &[u8]) -> Result<TunDispatch, HammerError> {
+    pub async fn dispatch_packet(&self, packet: &[u8]) -> HammerResult<TunDispatch> {
         let mut tun_packet = self.packet_context(packet)?;
         prepare_route_metadata(
             self.router.as_ref(),
@@ -1294,7 +1301,7 @@ where
         }
     }
 
-    fn packet_context(&self, packet: &[u8]) -> Result<TunPacket, HammerError> {
+    fn packet_context(&self, packet: &[u8]) -> HammerResult<TunPacket> {
         let parsed = parse_ip_packet_view(packet)?;
         let payload = parsed.payload(packet)?.to_vec();
         let mut tun_packet = TunPacket {
@@ -1322,7 +1329,7 @@ where
         Ok(tun_packet)
     }
 
-    async fn dispatch_dns(&self, tun_packet: TunPacket) -> Result<TunDispatch, HammerError> {
+    async fn dispatch_dns(&self, tun_packet: TunPacket) -> HammerResult<TunDispatch> {
         let dns_router = self
             .dns_router
             .as_ref()
@@ -1341,7 +1348,7 @@ where
         &self,
         tun_packet: TunPacket,
         outbound_id: &str,
-    ) -> Result<TunDispatch, HammerError> {
+    ) -> HammerResult<TunDispatch> {
         let outbound_manager = self
             .outbound
             .as_ref()
@@ -1349,6 +1356,7 @@ where
         let outbound = outbound_manager
             .get(outbound_id)
             .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
+        let outbound = outbound.runtime();
         let destination = route_destination(&tun_packet.metadata, self.dns_router.as_deref())?;
         match tun_packet.metadata.network {
             Network::Tcp => {
@@ -1415,7 +1423,7 @@ where
     }
 }
 
-fn parse_ipv4_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+fn parse_ipv4_packet_view(packet: &[u8]) -> HammerResult<ParsedIpPacketView> {
     if packet.len() < IPV4_HEADER_MIN_LEN {
         return Err(HammerError::internal("short IPv4 packet"));
     }
@@ -1444,7 +1452,7 @@ fn parse_ipv4_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerErr
     )
 }
 
-fn parse_ipv6_packet_view(packet: &[u8]) -> Result<ParsedIpPacketView, HammerError> {
+fn parse_ipv6_packet_view(packet: &[u8]) -> HammerResult<ParsedIpPacketView> {
     if packet.len() < IPV6_HEADER_LEN {
         return Err(HammerError::internal("short IPv6 packet"));
     }
@@ -1470,7 +1478,7 @@ fn parse_transport(
     destination: IpAddr,
     packet: &[u8],
     transport_offset: usize,
-) -> Result<ParsedIpPacketView, HammerError> {
+) -> HammerResult<ParsedIpPacketView> {
     let transport = packet
         .get(transport_offset..)
         .ok_or_else(|| HammerError::internal("transport offset out of bounds"))?;
@@ -1487,7 +1495,7 @@ fn parse_tcp(
     destination: IpAddr,
     transport: &[u8],
     transport_offset: usize,
-) -> Result<ParsedIpPacketView, HammerError> {
+) -> HammerResult<ParsedIpPacketView> {
     if transport.len() < TCP_HEADER_MIN_LEN {
         return Err(HammerError::internal("short TCP segment"));
     }
@@ -1510,7 +1518,7 @@ fn parse_udp(
     destination: IpAddr,
     transport: &[u8],
     transport_offset: usize,
-) -> Result<ParsedIpPacketView, HammerError> {
+) -> HammerResult<ParsedIpPacketView> {
     if transport.len() < UDP_HEADER_LEN {
         return Err(HammerError::internal("short UDP datagram"));
     }
@@ -1534,7 +1542,7 @@ fn process_system_tcp_ipv4(
     listener_addr: IpAddr,
     nat_addr: IpAddr,
     listener_port: u16,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     if packet.len() < IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN {
         return Err(HammerError::internal("short IPv4 TCP packet"));
     }
@@ -1587,7 +1595,7 @@ fn process_system_tcp_ipv6(
     listener_addr: IpAddr,
     nat_addr: IpAddr,
     listener_port: u16,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     if packet.len() < IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN
         || packet[IPV6_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
     {
@@ -1623,7 +1631,7 @@ fn process_system_tcp_ipv6(
     update_ipv6_tcp_checksum(packet)
 }
 
-fn update_ipv4_tcp_checksums(packet: &mut [u8], ihl: usize) -> Result<(), HammerError> {
+fn update_ipv4_tcp_checksums(packet: &mut [u8], ihl: usize) -> HammerResult<()> {
     write_u16(packet, IPV4_CHECKSUM_OFFSET, 0);
     let ip_checksum = checksum(&packet[..ihl]);
     write_u16(packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
@@ -1640,7 +1648,7 @@ fn update_ipv4_tcp_checksums(packet: &mut [u8], ihl: usize) -> Result<(), Hammer
     Ok(())
 }
 
-fn update_ipv6_tcp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
+fn update_ipv6_tcp_checksum(packet: &mut [u8]) -> HammerResult<()> {
     let tcp_len = packet.len() - IPV6_HEADER_LEN;
     write_u16(packet, IPV6_HEADER_LEN + TCP_CHECKSUM_OFFSET, 0);
     let mut pseudo = Vec::with_capacity(IPV6_HEADER_LEN + tcp_len);
@@ -1653,7 +1661,7 @@ fn update_ipv6_tcp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
     Ok(())
 }
 
-fn update_ipv4_udp_checksums(packet: &mut [u8], udp_offset: usize) -> Result<(), HammerError> {
+fn update_ipv4_udp_checksums(packet: &mut [u8], udp_offset: usize) -> HammerResult<()> {
     write_u16(packet, IPV4_CHECKSUM_OFFSET, 0);
     let ip_checksum = checksum(&packet[..udp_offset]);
     write_u16(packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
@@ -1678,7 +1686,7 @@ fn update_ipv4_udp_checksums(packet: &mut [u8], udp_offset: usize) -> Result<(),
     Ok(())
 }
 
-fn update_ipv6_udp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
+fn update_ipv6_udp_checksum(packet: &mut [u8]) -> HammerResult<()> {
     write_u16(packet, IPV6_HEADER_LEN + UDP_CHECKSUM_OFFSET, 0);
     let udp_len = packet.len() - IPV6_HEADER_LEN;
     let mut pseudo = Vec::with_capacity(IPV6_HEADER_LEN + udp_len);
@@ -1726,7 +1734,7 @@ async fn bridge_system_tcp_streams(
     result
 }
 
-fn ipv4_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv4_udp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < IPV4_HEADER_MIN_LEN + UDP_HEADER_LEN
         || request[IPV4_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
     {
@@ -1757,7 +1765,7 @@ fn ipv4_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
     Ok(packet)
 }
 
-fn ipv6_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv6_udp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < IPV6_HEADER_LEN + UDP_HEADER_LEN
         || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Udp.wire_value()
     {
@@ -1782,7 +1790,7 @@ fn ipv6_udp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
     Ok(packet)
 }
 
-fn ipv4_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv4_tcp_reset_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN
         || request[IPV4_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
     {
@@ -1838,7 +1846,7 @@ fn ipv4_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
     Ok(packet)
 }
 
-fn ipv6_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv6_tcp_reset_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN
         || request[IPV6_PROTOCOL_OFFSET] != IpProtocol::Tcp.wire_value()
     {
@@ -1888,7 +1896,7 @@ fn ipv6_tcp_reset_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
     Ok(packet)
 }
 
-fn update_ipv6_icmp_checksum(packet: &mut [u8]) -> Result<(), HammerError> {
+fn update_ipv6_icmp_checksum(packet: &mut [u8]) -> HammerResult<()> {
     write_u16(packet, 42, 0);
     let icmp_len = packet.len() - 40;
     let mut pseudo = Vec::with_capacity(40 + icmp_len);
@@ -1941,7 +1949,7 @@ fn write_u32(packet: &mut [u8], offset: usize, value: u32) {
     packet[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
 
-fn write_ip_addr(packet: &mut [u8], offset: usize, addr: IpAddr) -> Result<(), HammerError> {
+fn write_ip_addr(packet: &mut [u8], offset: usize, addr: IpAddr) -> HammerResult<()> {
     match addr {
         IpAddr::V4(addr) => {
             let bytes = addr.octets();
@@ -2092,6 +2100,7 @@ async fn accept_tcp_loop<R, O>(
                 }
             };
             let mut outbound_stream = match outbound
+                .runtime()
                 .dial(Network::Tcp, destination, &initial_payload)
                 .await
             {
@@ -2145,10 +2154,12 @@ async fn packet_loop<D, R, Q, O>(
     let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let (tun_write_tx, tun_write_rx) = mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
+    spawn_tun_packet_writer(Arc::clone(&device), metrics.clone(), tun_write_rx);
     let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
     spawn_dns_hijack_workers(
         Arc::clone(&dns_router),
-        Arc::clone(&device),
+        tun_write_tx.clone(),
         metrics.clone(),
         dns_hijack_rx,
     );
@@ -2161,9 +2172,6 @@ async fn packet_loop<D, R, Q, O>(
         Arc::clone(&device),
         icmp_rx,
     );
-    let (control_write_tx, control_write_rx) =
-        mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
-    spawn_tun_control_writer(Arc::clone(&device), metrics.clone(), control_write_rx);
     loop {
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
@@ -2250,10 +2258,9 @@ async fn packet_loop<D, R, Q, O>(
                 Arc::clone(&dns_router),
                 Arc::clone(&outbound),
                 inbound_id.clone(),
-                Arc::clone(&device),
                 Arc::clone(&udp_flows),
                 &dns_hijack_tx,
-                &control_write_tx,
+                &tun_write_tx,
                 udp_timeout,
                 packet,
                 parsed,
@@ -2271,26 +2278,29 @@ async fn packet_loop<D, R, Q, O>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_system_udp_packet<D, R, Q, O>(
+fn handle_system_udp_packet<R, Q, O>(
     router: Arc<R>,
     dns_router: Arc<Q>,
     outbound: Arc<O>,
     inbound_id: String,
-    device: Arc<D>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
-    control_write_tx: &mpsc::Sender<Vec<u8>>,
+    tun_write_tx: &mpsc::Sender<Vec<u8>>,
     udp_timeout: Duration,
     packet: Vec<u8>,
     parsed: ParsedIpPacketView,
     metrics: TunMetrics,
-) -> Result<(), HammerError>
+) -> HammerResult<()>
 where
-    D: TunDevice,
     R: RouterTrait + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
+    let key = UdpFlowKey::from_parsed(&parsed);
+    if try_enqueue_existing_udp_flow(&udp_flows, &key, &packet, &parsed, &metrics)? {
+        return Ok(());
+    }
+
     let mut metadata = RouteMetadata {
         inbound: inbound_id,
         network: Network::Udp,
@@ -2330,7 +2340,7 @@ where
                     let response_bytes = MessageExt::to_bytes(&response)?;
                     let response_packet =
                         udp_response_packet(&packet, destination, &response_bytes)?;
-                    enqueue_tun_control_write(control_write_tx, response_packet, &metrics);
+                    enqueue_tun_packet_write(tun_write_tx, response_packet, &metrics);
                 }
                 None => {
                     enqueue_system_dns_hijack_packet(
@@ -2356,7 +2366,7 @@ where
                 debug!("{}", message);
             }
             if let Ok(response) = udp_unreachable_packet(&packet) {
-                enqueue_tun_control_write(control_write_tx, response, &metrics);
+                enqueue_tun_packet_write(tun_write_tx, response, &metrics);
             }
         }
         RouteDecision::Route {
@@ -2370,11 +2380,6 @@ where
             };
             let destination = route_destination(&metadata, Some(dns_router.as_ref()))?;
             let template = UdpResponseTemplate::from_request(&packet)?;
-            let key = UdpFlowKey {
-                outbound: outbound_id.clone(),
-                source: (parsed.source.host, parsed.source.port),
-                destination: (parsed.destination.host, parsed.destination.port),
-            };
             let mut start_flow = None;
             let sender = {
                 let mut flows = udp_flows.lock().expect("udp_flows poisoned");
@@ -2389,34 +2394,32 @@ where
                         UdpFlowState {
                             sender: tx.clone(),
                             last_active: Instant::now(),
+                            outbound: outbound_id.clone(),
                         },
                     );
                     start_flow = Some((
-                        Arc::clone(&device),
                         Arc::clone(&udp_flows),
                         key.clone(),
-                        outbound_item,
+                        Arc::clone(outbound_item.runtime()),
                         destination,
                         template,
                         udp_timeout,
                         rx,
+                        tun_write_tx.clone(),
                         metrics.clone(),
                     ));
                     tx
                 }
             };
-            match sender.try_reserve() {
-                Ok(permit) => {
-                    let payload = parsed.payload(&packet)?.to_vec();
-                    permit.send(payload);
-                }
-                Err(err) => {
-                    metrics.counters.udp_flow_drop_busy_total.increment(1);
-                    debug!("drop UDP packet for busy system flow: {err}");
+            match enqueue_udp_payload(&sender, &packet, &parsed, &metrics)? {
+                UdpPayloadEnqueueResult::Enqueued => {}
+                UdpPayloadEnqueueResult::Full => {}
+                UdpPayloadEnqueueResult::Closed => {
+                    udp_flows.lock().expect("udp_flows poisoned").remove(&key);
+                    debug!("drop UDP packet for closed system flow: outbound={outbound_id}");
                 }
             }
             if let Some((
-                device,
                 udp_flows,
                 key,
                 outbound_item,
@@ -2424,11 +2427,11 @@ where
                 template,
                 udp_timeout,
                 rx,
+                tun_write_tx,
                 metrics,
             )) = start_flow
             {
                 crate::spawn::spawn(system_udp_flow_loop(
-                    device,
                     udp_flows,
                     key,
                     outbound_item,
@@ -2436,12 +2439,68 @@ where
                     template,
                     udp_timeout,
                     rx,
+                    tun_write_tx,
                     metrics,
                 ));
             }
         }
     }
     Ok(())
+}
+
+enum UdpPayloadEnqueueResult {
+    Enqueued,
+    Full,
+    Closed,
+}
+
+fn try_enqueue_existing_udp_flow(
+    udp_flows: &StdMutex<UdpFlowMap>,
+    key: &UdpFlowKey,
+    packet: &[u8],
+    parsed: &ParsedIpPacketView,
+    metrics: &TunMetrics,
+) -> HammerResult<bool> {
+    let Some((sender, outbound)) = ({
+        let mut flows = udp_flows.lock().expect("udp_flows poisoned");
+        flows.get_mut(key).map(|flow| {
+            flow.last_active = Instant::now();
+            (flow.sender.clone(), flow.outbound.clone())
+        })
+    }) else {
+        return Ok(false);
+    };
+
+    match enqueue_udp_payload(&sender, packet, parsed, metrics)? {
+        UdpPayloadEnqueueResult::Enqueued => Ok(true),
+        UdpPayloadEnqueueResult::Full => Ok(true),
+        UdpPayloadEnqueueResult::Closed => {
+            udp_flows.lock().expect("udp_flows poisoned").remove(key);
+            debug!("remove closed system UDP flow before slow path: outbound={outbound}");
+            Ok(false)
+        }
+    }
+}
+
+fn enqueue_udp_payload(
+    sender: &mpsc::Sender<UdpFlowPayload>,
+    packet: &[u8],
+    parsed: &ParsedIpPacketView,
+    metrics: &TunMetrics,
+) -> HammerResult<UdpPayloadEnqueueResult> {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            let payload = parsed.payload(packet)?.to_vec();
+            permit.send(payload);
+            Ok(UdpPayloadEnqueueResult::Enqueued)
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics.counters.udp_flow_drop_busy_total.increment(1);
+            debug!("drop UDP packet for busy system flow");
+            Ok(UdpPayloadEnqueueResult::Full)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Ok(UdpPayloadEnqueueResult::Closed),
+    }
 }
 
 fn enqueue_system_dns_hijack_packet(
@@ -2471,86 +2530,191 @@ fn enqueue_system_dns_hijack_packet(
     }
 }
 
-fn spawn_dns_hijack_workers<D, Q>(
+fn spawn_dns_hijack_workers<Q>(
     dns_router: Arc<Q>,
-    device: Arc<D>,
+    tun_write_tx: mpsc::Sender<Vec<u8>>,
     metrics: TunMetrics,
     rx: mpsc::Receiver<DnsHijackJob>,
 ) where
-    D: TunDevice,
     Q: DnsRouterTrait + 'static,
 {
-    let rx = Arc::new(Mutex::new(rx));
+    let mut worker_txs = Vec::with_capacity(SYSTEM_DNS_HIJACK_WORKERS);
     for _ in 0..SYSTEM_DNS_HIJACK_WORKERS {
-        let dns_router = Arc::clone(&dns_router);
-        let device = Arc::clone(&device);
-        let metrics = metrics.clone();
-        let rx = Arc::clone(&rx);
-        crate::spawn::spawn(async move {
-            loop {
-                let Some(job) = rx.lock().await.recv().await else {
-                    break;
-                };
-                if let Err(err) = handle_system_dns_hijack_packet(
-                    Arc::clone(&dns_router),
-                    Arc::clone(&device),
-                    job,
-                )
-                .await
-                {
+        let (worker_tx, worker_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_WORKER_QUEUE_CAPACITY);
+        worker_txs.push(worker_tx);
+        spawn_dns_hijack_worker(
+            Arc::clone(&dns_router),
+            tun_write_tx.clone(),
+            metrics.clone(),
+            worker_rx,
+        );
+    }
+    spawn_dns_hijack_dispatcher(rx, worker_txs, metrics);
+}
+
+fn spawn_dns_hijack_dispatcher(
+    mut rx: mpsc::Receiver<DnsHijackJob>,
+    worker_txs: Vec<mpsc::Sender<DnsHijackJob>>,
+    metrics: TunMetrics,
+) -> JoinHandle<()> {
+    crate::spawn::spawn(async move {
+        let mut next_worker = 0usize;
+        while let Some(job) = rx.recv().await {
+            if let Some(job) = try_dispatch_dns_hijack_job(job, &worker_txs, &mut next_worker) {
+                wait_dispatch_dns_hijack_job(job, &worker_txs, &mut next_worker, &metrics).await;
+            }
+        }
+    })
+}
+
+fn try_dispatch_dns_hijack_job(
+    job: DnsHijackJob,
+    worker_txs: &[mpsc::Sender<DnsHijackJob>],
+    next_worker: &mut usize,
+) -> Option<DnsHijackJob> {
+    let len = worker_txs.len();
+    let mut pending = Some(job);
+    for _ in 0..len {
+        let index = *next_worker % len;
+        *next_worker = (*next_worker + 1) % len;
+        let job = pending.take().expect("pending DNS hijack job");
+        match worker_txs[index].try_send(job) {
+            Ok(()) => return None,
+            Err(mpsc::error::TrySendError::Full(job))
+            | Err(mpsc::error::TrySendError::Closed(job)) => {
+                pending = Some(job);
+            }
+        }
+    }
+    pending
+}
+
+async fn wait_dispatch_dns_hijack_job(
+    job: DnsHijackJob,
+    worker_txs: &[mpsc::Sender<DnsHijackJob>],
+    next_worker: &mut usize,
+    metrics: &TunMetrics,
+) {
+    let len = worker_txs.len();
+    let mut pending = Some(job);
+    for _ in 0..len {
+        let index = *next_worker % len;
+        *next_worker = (*next_worker + 1) % len;
+        let job = pending.take().expect("pending DNS hijack job");
+        match worker_txs[index].send(job).await {
+            Ok(()) => return,
+            Err(err) => {
+                pending = Some(err.0);
+            }
+        }
+    }
+    metrics.counters.udp_dns_drop_busy_total.increment(1);
+    debug!("drop DNS hijack packet because all DNS workers are closed");
+}
+
+fn spawn_dns_hijack_worker<Q>(
+    dns_router: Arc<Q>,
+    tun_write_tx: mpsc::Sender<Vec<u8>>,
+    metrics: TunMetrics,
+    mut rx: mpsc::Receiver<DnsHijackJob>,
+) -> JoinHandle<()>
+where
+    Q: DnsRouterTrait + 'static,
+{
+    crate::spawn::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            match build_system_dns_hijack_response(Arc::clone(&dns_router), job).await {
+                Ok(packet) => enqueue_tun_packet_write(&tun_write_tx, packet, &metrics),
+                Err(err) => {
                     metrics.counters.udp_dns_error_total.increment(1);
                     debug!("handle system DNS hijack packet: {err}");
                 }
             }
-        });
-    }
+        }
+    })
 }
 
-async fn handle_system_dns_hijack_packet<D, Q>(
+async fn build_system_dns_hijack_response<Q>(
     dns_router: Arc<Q>,
-    device: Arc<D>,
     job: DnsHijackJob,
-) -> Result<(), HammerError>
+) -> HammerResult<Vec<u8>>
 where
-    D: TunDevice,
     Q: DnsRouterTrait + 'static,
 {
     let response = dns_router.exchange(job.message, job.options).await?;
     let response_bytes = MessageExt::to_bytes(&response)?;
-    let response_packet = udp_response_packet(&job.packet, job.destination, &response_bytes)?;
-    device.send(response_packet).await
+    udp_response_packet(&job.packet, job.destination, &response_bytes)
 }
 
-fn enqueue_tun_control_write(
-    control_write_tx: &mpsc::Sender<Vec<u8>>,
+fn enqueue_tun_packet_write(
+    tun_write_tx: &mpsc::Sender<Vec<u8>>,
     packet: Vec<u8>,
     metrics: &TunMetrics,
 ) {
-    match control_write_tx.try_send(packet) {
+    match tun_write_tx.try_send(packet) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             metrics.counters.control_write_drop_busy_total.increment(1);
-            debug!("drop TUN control packet because write queue is full");
+            debug!("drop TUN packet because write queue is full");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             metrics.counters.control_write_drop_busy_total.increment(1);
-            debug!("drop TUN control packet because write queue is closed");
+            debug!("drop TUN packet because write queue is closed");
         }
     }
 }
 
-fn spawn_tun_control_writer<D>(device: Arc<D>, metrics: TunMetrics, mut rx: mpsc::Receiver<Vec<u8>>)
+fn enqueue_tun_udp_response_write(
+    tun_write_tx: &mpsc::Sender<Vec<u8>>,
+    packet: Vec<u8>,
+    metrics: &TunMetrics,
+) {
+    match tun_write_tx.try_send(packet) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            metrics
+                .counters
+                .udp_flow_response_write_error_total
+                .increment(1);
+            debug!("drop UDP response because TUN write queue is full");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            metrics
+                .counters
+                .udp_flow_response_write_error_total
+                .increment(1);
+            debug!("drop UDP response because TUN write queue is closed");
+        }
+    }
+}
+
+fn spawn_tun_packet_writer<D>(
+    device: Arc<D>,
+    metrics: TunMetrics,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) -> JoinHandle<()>
 where
     D: TunDevice,
 {
     crate::spawn::spawn(async move {
+        const WRITE_BATCH_HINT: usize = 64;
+        let mut batch = Vec::with_capacity(WRITE_BATCH_HINT);
         while let Some(packet) = rx.recv().await {
-            if let Err(err) = device.send(packet).await {
+            batch.push(packet);
+            while batch.len() < WRITE_BATCH_HINT {
+                match rx.try_recv() {
+                    Ok(packet) => batch.push(packet),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            if let Err(err) = device.send_batch(&mut batch).await {
                 metrics.counters.control_write_error_total.increment(1);
-                debug!("write TUN control packet: {err}");
+                debug!("write TUN packet batch: {err}");
+                batch.clear();
             }
         }
-    });
+    })
 }
 
 fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
@@ -2564,7 +2728,7 @@ fn prepare_route_metadata<R, Q>(
     router: &R,
     metadata: &mut RouteMetadata,
     dns_router: Option<&Q>,
-) -> Result<(), HammerError>
+) -> HammerResult<()>
 where
     R: RouterTrait + ?Sized,
     Q: DnsRouterTrait + ?Sized,
@@ -2601,10 +2765,7 @@ where
     destination.domain = Some(domain);
 }
 
-fn route_destination<Q>(
-    metadata: &RouteMetadata,
-    dns_router: Option<&Q>,
-) -> Result<SocksAddr, HammerError>
+fn route_destination<Q>(metadata: &RouteMetadata, dns_router: Option<&Q>) -> HammerResult<SocksAddr>
 where
     Q: DnsRouterTrait + ?Sized,
 {
@@ -2623,7 +2784,7 @@ where
     Ok(destination)
 }
 
-fn route_destination_without_dns(metadata: &RouteMetadata) -> Result<SocksAddr, HammerError> {
+fn route_destination_without_dns(metadata: &RouteMetadata) -> HammerResult<SocksAddr> {
     let mut destination = metadata
         .destination
         .clone()
@@ -2654,8 +2815,7 @@ fn normalize_destination_domain(domain: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn system_udp_flow_loop<D>(
-    device: Arc<D>,
+async fn system_udp_flow_loop(
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     key: UdpFlowKey,
     outbound: Arc<dyn hammer_adapter::Outbound>,
@@ -2663,10 +2823,9 @@ async fn system_udp_flow_loop<D>(
     response_template: UdpResponseTemplate,
     udp_timeout: Duration,
     mut rx: mpsc::Receiver<UdpFlowPayload>,
+    tun_write_tx: mpsc::Sender<Vec<u8>>,
     metrics: TunMetrics,
-) where
-    D: TunDevice,
-{
+) {
     let mut packet_conn = match outbound.listen_packet().await {
         Ok(packet_conn) => packet_conn,
         Err(err) => {
@@ -2703,11 +2862,7 @@ async fn system_udp_flow_loop<D>(
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
                 match response_template.build(response.destination, &response.payload) {
                     Ok(packet) => {
-                        if let Err(err) = device.send(packet).await {
-                            metrics.counters.udp_flow_response_write_error_total.increment(1);
-                            debug!("write system UDP response: {err}");
-                            break;
-                        }
+                        enqueue_tun_udp_response_write(&tun_write_tx, packet, &metrics);
                     }
                     Err(err) => debug!("build system UDP response: {err}"),
                 }
@@ -2944,7 +3099,7 @@ fn parse_icmpv4(
     destination: IpAddr,
     transport: &[u8],
     transport_offset: usize,
-) -> Result<ParsedIpPacketView, HammerError> {
+) -> HammerResult<ParsedIpPacketView> {
     if transport.len() < 8 {
         return Err(HammerError::internal("short ICMPv4 packet"));
     }
@@ -2967,7 +3122,7 @@ fn parse_icmpv6(
     destination: IpAddr,
     transport: &[u8],
     transport_offset: usize,
-) -> Result<ParsedIpPacketView, HammerError> {
+) -> HammerResult<ParsedIpPacketView> {
     if transport.len() < 8 {
         return Err(HammerError::internal("short ICMPv6 packet"));
     }
@@ -2993,7 +3148,7 @@ async fn handle_system_icmp_packet<D, R, Q, O>(
     device: Arc<D>,
     packet: Vec<u8>,
     parsed: ParsedIpPacketView,
-) -> Result<(), HammerError>
+) -> HammerResult<()>
 where
     D: TunDevice,
     R: RouterTrait + 'static,
@@ -3038,7 +3193,7 @@ where
                     "outbound not found: {outbound_id}"
                 )));
             };
-            let mut conn = match outbound_item.listen_icmp().await {
+            let mut conn = match outbound_item.runtime().listen_icmp().await {
                 Ok(conn) => conn,
                 Err(err) => {
                     debug!(
@@ -3143,10 +3298,7 @@ fn enqueue_system_icmp_packet(
 /// `icmp_unreachable_packet(&raw_packet)` directly because it has the
 /// full IP packet bytes; here we have only metadata + ICMP body so we
 /// reconstruct just enough of the IP header to feed the same builders.
-fn icmp_unreachable_response_for(
-    metadata: &RouteMetadata,
-    body: &[u8],
-) -> Result<Vec<u8>, HammerError> {
+fn icmp_unreachable_response_for(metadata: &RouteMetadata, body: &[u8]) -> HammerResult<Vec<u8>> {
     let source = metadata
         .source
         .as_ref()
@@ -3159,11 +3311,7 @@ fn icmp_unreachable_response_for(
     icmp_unreachable_packet(&synthetic)
 }
 
-fn synthesize_ip_packet(
-    source: IpAddr,
-    destination: IpAddr,
-    body: &[u8],
-) -> Result<Vec<u8>, HammerError> {
+fn synthesize_ip_packet(source: IpAddr, destination: IpAddr, body: &[u8]) -> HammerResult<Vec<u8>> {
     match (source, destination) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
             let total_len = 20 + body.len();
@@ -3197,14 +3345,14 @@ fn synthesize_ip_packet(
     }
 }
 
-pub fn icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+pub fn icmp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     match IpVersion::from_packet(request)? {
         IpVersion::V4 => ipv4_icmp_unreachable_packet(request),
         IpVersion::V6 => ipv6_icmp_unreachable_packet(request),
     }
 }
 
-fn ipv4_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv4_icmp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < 20 {
         return Err(HammerError::internal("invalid IPv4 packet"));
     }
@@ -3233,7 +3381,7 @@ fn ipv4_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> 
     Ok(packet)
 }
 
-fn ipv6_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv6_icmp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < 40 {
         return Err(HammerError::internal("invalid IPv6 packet"));
     }
@@ -3256,14 +3404,14 @@ fn ipv6_icmp_unreachable_packet(request: &[u8]) -> Result<Vec<u8>, HammerError> 
 /// Wrap the kernel-delivered ICMP reply body (starting at the ICMP
 /// type byte) into a tun-deliverable IP packet. We swap src/dst from
 /// the original echo request so the reply reaches the originating app.
-pub fn icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
+pub fn icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> HammerResult<Vec<u8>> {
     match IpVersion::from_packet(request)? {
         IpVersion::V4 => ipv4_icmp_echo_reply_packet(request, reply_body),
         IpVersion::V6 => ipv6_icmp_echo_reply_packet(request, reply_body),
     }
 }
 
-fn ipv4_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv4_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < 20 {
         return Err(HammerError::internal("invalid IPv4 packet"));
     }
@@ -3297,7 +3445,7 @@ fn ipv4_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<
     Ok(packet)
 }
 
-fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> Result<Vec<u8>, HammerError> {
+fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> HammerResult<Vec<u8>> {
     if request.len() < 48 {
         return Err(HammerError::internal("invalid IPv6 ICMP packet"));
     }
@@ -3326,8 +3474,9 @@ mod tests {
     use crate::{DnsRouter, DnsTransportManager, OutboundManager, Router};
     use async_trait::async_trait;
     use hammer_adapter::{
-        DnsRouter as AdapterDnsRouter, DnsTransport, Lifecycle,
-        OutboundManager as AdapterOutboundManager, Router as AdapterRouter, StartStage,
+        ComponentMeta, DnsRouter as AdapterDnsRouter, DnsTransport, DnsTransportComponent,
+        Lifecycle, OutboundManager as AdapterOutboundManager, Router as AdapterRouter,
+        RuntimeComponent, StartStage,
     };
     use hammer_core::config;
     use hammer_core::log::{DiscardWriter, Factory};
@@ -3345,6 +3494,21 @@ mod tests {
         Factory::new(StdInstant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
+    fn dns_transport_component<T>(
+        id: &str,
+        type_name: &'static str,
+        transport: Arc<T>,
+    ) -> DnsTransportComponent
+    where
+        T: DnsTransport + 'static,
+    {
+        let runtime: Arc<dyn DnsTransport> = transport;
+        RuntimeComponent::new(
+            ComponentMeta::new("dns_transport", type_name, id, Vec::new(), Vec::new(), None),
+            runtime,
+        )
+    }
+
     #[test]
     fn system_tun_stack_type_carries_concrete_device() {
         let _ = std::any::type_name::<
@@ -3355,17 +3519,36 @@ mod tests {
     struct StubRouter;
     struct StubDnsRouter;
     struct StubOutboundManager;
+    struct CountingRouter {
+        should_sniff_calls: AtomicUsize,
+        prepare_calls: AtomicUsize,
+        match_calls: AtomicUsize,
+        decision: RouteDecision,
+    }
+
+    impl CountingRouter {
+        fn rejecting() -> Arc<Self> {
+            Arc::new(Self {
+                should_sniff_calls: AtomicUsize::new(0),
+                prepare_calls: AtomicUsize::new(0),
+                match_calls: AtomicUsize::new(0),
+                decision: RouteDecision::Reject {
+                    method: "default".to_owned(),
+                },
+            })
+        }
+    }
 
     impl Lifecycle for StubRouter {
         fn name(&self) -> &str {
             "stub-router"
         }
 
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
 
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
@@ -3373,13 +3556,13 @@ mod tests {
     impl AdapterRouter for StubRouter {
         fn reset_network(&self) {}
 
-        fn match_route(&self, _metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
             Ok(RouteDecision::Reject {
                 method: "default".to_owned(),
             })
         }
 
-        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
             Ok(())
         }
 
@@ -3392,16 +3575,53 @@ mod tests {
         }
     }
 
+    impl Lifecycle for CountingRouter {
+        fn name(&self) -> &str {
+            "counting-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    impl AdapterRouter for CountingRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
+            self.match_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.decision.clone())
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
+            self.prepare_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+            None
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            self.should_sniff_calls.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
     impl Lifecycle for StubDnsRouter {
         fn name(&self) -> &str {
             "stub-dns-router"
         }
 
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
 
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
@@ -3412,7 +3632,7 @@ mod tests {
             &self,
             message: Message,
             _options: DnsQueryOptions,
-        ) -> Result<Message, HammerError> {
+        ) -> HammerResult<Message> {
             Ok(message)
         }
 
@@ -3420,7 +3640,7 @@ mod tests {
             &self,
             _domain: &str,
             _options: DnsQueryOptions,
-        ) -> Result<Vec<IpAddr>, HammerError> {
+        ) -> HammerResult<Vec<IpAddr>> {
             Ok(Vec::new())
         }
 
@@ -3428,7 +3648,7 @@ mod tests {
             &self,
             _message: &Message,
             _options: DnsQueryOptions,
-        ) -> Result<Option<Message>, HammerError> {
+        ) -> HammerResult<Option<Message>> {
             Ok(None)
         }
 
@@ -3446,29 +3666,29 @@ mod tests {
             "stub-outbound"
         }
 
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
 
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
 
     impl AdapterOutboundManager for StubOutboundManager {
-        fn list(&self) -> Vec<Arc<dyn hammer_adapter::Outbound>> {
+        fn list(&self) -> Vec<hammer_adapter::OutboundComponent> {
             Vec::new()
         }
 
-        fn get(&self, _id: &str) -> Option<Arc<dyn hammer_adapter::Outbound>> {
+        fn get(&self, _id: &str) -> Option<hammer_adapter::OutboundComponent> {
             None
         }
 
-        fn default(&self) -> Option<Arc<dyn hammer_adapter::Outbound>> {
+        fn default(&self) -> Option<hammer_adapter::OutboundComponent> {
             None
         }
 
-        fn remove(&self, _id: &str) -> Result<(), HammerError> {
+        fn remove(&self, _id: &str) -> HammerResult<()> {
             Ok(())
         }
     }
@@ -3594,32 +3814,20 @@ mod tests {
             "delayed-dns"
         }
 
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
 
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
 
     #[async_trait]
     impl DnsTransport for DelayedDnsTransport {
-        fn type_name(&self) -> &str {
-            "mock"
-        }
-
-        fn id(&self) -> &str {
-            "slow"
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
-
         fn reset(&self) {}
 
-        async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+        async fn exchange(&self, message: Message) -> HammerResult<Message> {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let query = message.queries[0].clone();
             let mut response = message.fixed_response(FixedResponseCode::NoError);
@@ -3636,37 +3844,32 @@ mod tests {
         queries: Arc<AtomicUsize>,
     }
 
+    struct BlockingDnsRouter {
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        started_tx: mpsc::UnboundedSender<()>,
+        release: Notify,
+    }
+
     impl Lifecycle for CountingDnsTransport {
         fn name(&self) -> &str {
             "counting-dns"
         }
 
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
 
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
 
     #[async_trait]
     impl DnsTransport for CountingDnsTransport {
-        fn type_name(&self) -> &str {
-            "mock"
-        }
-
-        fn id(&self) -> &str {
-            "counting"
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
-
         fn reset(&self) {}
 
-        async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+        async fn exchange(&self, message: Message) -> HammerResult<Message> {
             self.queries.fetch_add(1, Ordering::Relaxed);
             let query = message.queries[0].clone();
             let mut response = message.fixed_response(FixedResponseCode::NoError);
@@ -3677,6 +3880,71 @@ mod tests {
             ));
             Ok(response)
         }
+    }
+
+    impl BlockingDnsRouter {
+        fn new(started_tx: mpsc::UnboundedSender<()>) -> Arc<Self> {
+            Arc::new(Self {
+                in_flight: AtomicUsize::new(0),
+                max_in_flight: AtomicUsize::new(0),
+                started_tx,
+                release: Notify::new(),
+            })
+        }
+    }
+
+    impl Lifecycle for BlockingDnsRouter {
+        fn name(&self) -> &str {
+            "blocking-dns-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AdapterDnsRouter for BlockingDnsRouter {
+        async fn exchange(
+            &self,
+            message: Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Message> {
+            let current = self.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+            self.max_in_flight.fetch_max(current, Ordering::Relaxed);
+            let _ = self.started_tx.send(());
+            self.release.notified().await;
+            self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            Ok(message.fixed_response(FixedResponseCode::NoError))
+        }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Vec<IpAddr>> {
+            Ok(Vec::new())
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Option<Message>> {
+            Ok(None)
+        }
+
+        fn clear_cache(&self) {}
+
+        fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        fn reset_network(&self) {}
     }
 
     struct ScriptedBatchTunDevice {
@@ -3704,18 +3972,18 @@ mod tests {
 
     #[async_trait]
     impl TunDevice for ScriptedBatchTunDevice {
-        async fn recv(&self) -> Result<Vec<u8>, HammerError> {
+        async fn recv(&self) -> HammerResult<Vec<u8>> {
             Err(HammerError::internal("scripted tun recv is not used"))
         }
 
-        async fn send(&self, packet: Vec<u8>) -> Result<(), HammerError> {
+        async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
             self.output_tx
                 .send(packet)
                 .await
                 .map_err(|_| HammerError::internal("scripted tun output closed"))
         }
 
-        async fn recv_batch(&self, _max: usize) -> Result<Vec<Vec<u8>>, HammerError> {
+        async fn recv_batch(&self, _max: usize) -> HammerResult<Vec<Vec<u8>>> {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(HammerError::internal("scripted tun closed"));
             }
@@ -3730,6 +3998,43 @@ mod tests {
         fn close(&self) {
             self.closed.store(true, Ordering::Relaxed);
         }
+    }
+
+    struct BatchRecordingTunDevice {
+        batch_sizes: Mutex<Vec<usize>>,
+        packets: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl BatchRecordingTunDevice {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                batch_sizes: Mutex::new(Vec::new()),
+                packets: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl TunDevice for BatchRecordingTunDevice {
+        async fn recv(&self) -> HammerResult<Vec<u8>> {
+            Err(HammerError::internal(
+                "batch recording tun recv is not used",
+            ))
+        }
+
+        async fn send(&self, packet: Vec<u8>) -> HammerResult<()> {
+            self.batch_sizes.lock().await.push(1);
+            self.packets.lock().await.push(packet);
+            Ok(())
+        }
+
+        async fn send_batch(&self, packets: &mut Vec<Vec<u8>>) -> HammerResult<()> {
+            self.batch_sizes.lock().await.push(packets.len());
+            self.packets.lock().await.extend(packets.drain(..));
+            Ok(())
+        }
+
+        fn close(&self) {}
     }
 
     fn dns_query_packet(name: &str) -> Vec<u8> {
@@ -3755,10 +4060,38 @@ mod tests {
         packet
     }
 
+    fn udp_packet(source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+        let total_len = 20 + 8 + payload.len();
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        packet[16..20].copy_from_slice(&[1, 1, 1, 1]);
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet[28..].copy_from_slice(payload);
+        packet
+    }
+
     fn dns_message_from_packet(packet: &[u8]) -> Message {
         let parsed = parse_ip_packet_view(packet).expect("parse DNS packet");
         <Message as MessageExt>::from_bytes(parsed.payload(packet).expect("DNS payload"))
             .expect("parse DNS message")
+    }
+
+    fn dns_hijack_job(name: &str) -> DnsHijackJob {
+        let packet = dns_query_packet(name);
+        let parsed = parse_ip_packet_view(&packet).expect("parse DNS packet");
+        let message = dns_message_from_packet(&packet);
+        DnsHijackJob {
+            packet,
+            destination: parsed.destination,
+            message,
+            options: DnsQueryOptions::default(),
+        }
     }
 
     #[tokio::test]
@@ -3799,7 +4132,11 @@ final = "direct"
             test_logger("dns-transport"),
             "slow",
         ));
-        dns_transport.insert(Arc::new(DelayedDnsTransport));
+        dns_transport.insert(dns_transport_component(
+            "slow",
+            "mock",
+            Arc::new(DelayedDnsTransport),
+        ));
         let dns_router = Arc::new(DnsRouter::new_with_manager(
             test_logger("dns-router"),
             dns_transport,
@@ -3872,9 +4209,13 @@ final = "direct"
             "counting",
         ));
         let queries = Arc::new(AtomicUsize::new(0));
-        dns_transport.insert(Arc::new(CountingDnsTransport {
-            queries: Arc::clone(&queries),
-        }));
+        dns_transport.insert(dns_transport_component(
+            "counting",
+            "mock",
+            Arc::new(CountingDnsTransport {
+                queries: Arc::clone(&queries),
+            }),
+        ));
         let dns_router = Arc::new(DnsRouter::new_with_manager(
             test_logger("dns-router"),
             dns_transport,
@@ -3912,7 +4253,6 @@ final = "direct"
             Arc::clone(&dns_router),
             outbound,
             "tun".to_owned(),
-            MemoryTunDevice::new(),
             Arc::new(StdMutex::new(HashMap::new())),
             &dns_hijack_tx,
             &control_write_tx,
@@ -3931,6 +4271,242 @@ final = "direct"
         assert_eq!(response.metadata.id, 0x1234);
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
         assert_eq!(queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tun_packet_writer_batches_ready_packets() {
+        let device = BatchRecordingTunDevice::new();
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(vec![1]).expect("queue packet 1");
+        tx.try_send(vec![2]).expect("queue packet 2");
+        tx.try_send(vec![3]).expect("queue packet 3");
+        drop(tx);
+
+        let task = spawn_tun_packet_writer(Arc::clone(&device), metrics, rx);
+        timeout(Duration::from_millis(50), task)
+            .await
+            .expect("writer exits after sender closes")
+            .expect("writer task");
+
+        assert_eq!(*device.batch_sizes.lock().await, vec![3]);
+        assert_eq!(
+            *device.packets.lock().await,
+            vec![vec![1], vec![2], vec![3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_hijack_dispatcher_waits_for_worker_capacity_without_dropping_global_job() {
+        let (global_tx, global_rx) = mpsc::channel(1);
+        let (worker_tx, mut worker_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_WORKER_QUEUE_CAPACITY);
+        let queued = dns_hijack_job("queued.example.com");
+        let blocked = dns_hijack_job("blocked.example.com");
+        worker_tx.try_send(queued).expect("fill worker queue");
+        global_tx.try_send(blocked).expect("queue global DNS job");
+        drop(global_tx);
+
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let dispatcher = spawn_dns_hijack_dispatcher(global_rx, vec![worker_tx], metrics);
+        let first = worker_rx.recv().await.expect("first worker job");
+        assert_eq!(first.packet, dns_query_packet("queued.example.com"));
+
+        let second = timeout(Duration::from_millis(50), worker_rx.recv())
+            .await
+            .expect("dispatcher should wait for worker capacity")
+            .expect("second worker job");
+        assert_eq!(second.packet, dns_query_packet("blocked.example.com"));
+        timeout(Duration::from_millis(50), dispatcher)
+            .await
+            .expect("dispatcher exits after global queue closes")
+            .expect("dispatcher task");
+    }
+
+    #[tokio::test]
+    async fn dns_hijack_workers_process_slow_jobs_concurrently() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let dns_router = BlockingDnsRouter::new(started_tx);
+        let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
+        let (tun_write_tx, _tun_write_rx) = mpsc::channel(16);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        spawn_dns_hijack_workers(
+            Arc::clone(&dns_router),
+            tun_write_tx,
+            metrics,
+            dns_hijack_rx,
+        );
+        for name in [
+            "one.example.com",
+            "two.example.com",
+            "three.example.com",
+            "four.example.com",
+        ] {
+            dns_hijack_tx
+                .try_send(dns_hijack_job(name))
+                .expect("queue DNS hijack job");
+        }
+
+        timeout(Duration::from_millis(50), started_rx.recv())
+            .await
+            .expect("first DNS job starts")
+            .expect("first start event");
+        timeout(Duration::from_millis(50), started_rx.recv())
+            .await
+            .expect("second DNS job starts")
+            .expect("second start event");
+
+        assert!(
+            dns_router.max_in_flight.load(Ordering::Relaxed) >= 2,
+            "DNS workers should process slow exchanges concurrently"
+        );
+        dns_router.release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn existing_udp_flow_fastpath_bypasses_router_and_enqueues_payload() {
+        let packet = udp_packet(5353, 443, b"quic");
+        let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
+        let key = UdpFlowKey {
+            source: (parsed.source.host, parsed.source.port),
+            destination: (parsed.destination.host, parsed.destination.port),
+        };
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut flows = HashMap::new();
+        flows.insert(
+            key,
+            UdpFlowState {
+                sender: tx,
+                last_active: Instant::now(),
+                outbound: "hysteria2".to_owned(),
+            },
+        );
+        let udp_flows = Arc::new(StdMutex::new(flows));
+        let router = CountingRouter::rejecting();
+        let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
+        let (control_write_tx, _control_write_rx) = mpsc::channel(1);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        handle_system_udp_packet(
+            Arc::clone(&router),
+            Arc::new(StubDnsRouter),
+            Arc::new(StubOutboundManager),
+            "tun".to_owned(),
+            udp_flows,
+            &dns_hijack_tx,
+            &control_write_tx,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            packet,
+            parsed,
+            metrics,
+        )
+        .expect("existing flow packet");
+
+        assert_eq!(router.should_sniff_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(router.prepare_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .expect("flow payload")
+                .expect("flow payload"),
+            b"quic".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_udp_flow_full_queue_drops_without_fallback_route() {
+        let packet = udp_packet(5353, 443, b"late");
+        let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
+        let key = UdpFlowKey {
+            source: (parsed.source.host, parsed.source.port),
+            destination: (parsed.destination.host, parsed.destination.port),
+        };
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(b"queued".to_vec()).expect("fill flow queue");
+        let mut flows = HashMap::new();
+        flows.insert(
+            key,
+            UdpFlowState {
+                sender: tx,
+                last_active: Instant::now(),
+                outbound: "hysteria2".to_owned(),
+            },
+        );
+        let udp_flows = Arc::new(StdMutex::new(flows));
+        let router = CountingRouter::rejecting();
+        let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
+        let (control_write_tx, _control_write_rx) = mpsc::channel(1);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        handle_system_udp_packet(
+            Arc::clone(&router),
+            Arc::new(StubDnsRouter),
+            Arc::new(StubOutboundManager),
+            "tun".to_owned(),
+            udp_flows,
+            &dns_hijack_tx,
+            &control_write_tx,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            packet,
+            parsed,
+            metrics,
+        )
+        .expect("full flow queue packet is handled as drop");
+
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(rx.try_recv().expect("original queued payload"), b"queued");
+        assert!(
+            rx.try_recv().is_err(),
+            "full existing flow must not route or enqueue the dropped payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_udp_flow_is_removed_before_slowpath_route() {
+        let packet = udp_packet(5353, 443, b"retry");
+        let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
+        let key = UdpFlowKey {
+            source: (parsed.source.host, parsed.source.port),
+            destination: (parsed.destination.host, parsed.destination.port),
+        };
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut flows = HashMap::new();
+        flows.insert(
+            key.clone(),
+            UdpFlowState {
+                sender: tx,
+                last_active: Instant::now(),
+                outbound: "hysteria2".to_owned(),
+            },
+        );
+        let udp_flows = Arc::new(StdMutex::new(flows));
+        let router = CountingRouter::rejecting();
+        let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
+        let (control_write_tx, _control_write_rx) = mpsc::channel(1);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        handle_system_udp_packet(
+            Arc::clone(&router),
+            Arc::new(StubDnsRouter),
+            Arc::new(StubOutboundManager),
+            "tun".to_owned(),
+            Arc::clone(&udp_flows),
+            &dns_hijack_tx,
+            &control_write_tx,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            packet,
+            parsed,
+            metrics,
+        )
+        .expect("closed flow falls through to slow path");
+
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
+        assert!(
+            !udp_flows.lock().expect("udp flows").contains_key(&key),
+            "closed existing flow must be removed before slow path"
+        );
     }
 
     struct ResetOnWriteStream;

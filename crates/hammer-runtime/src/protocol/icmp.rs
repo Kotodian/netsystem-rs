@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{IcmpReply, ProxyIcmpConn};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -37,7 +37,7 @@ impl IcmpSocketConn {
         }
     }
 
-    fn socket_for(&mut self, destination: IpAddr) -> Result<&UdpSocket, HammerError> {
+    fn socket_for(&mut self, destination: IpAddr) -> HammerResult<&UdpSocket> {
         if destination.is_ipv6() {
             if self.ipv6.is_none() {
                 self.ipv6 = Some(bind_icmp_socket(
@@ -65,7 +65,7 @@ impl IcmpSocketConn {
 
 #[async_trait]
 impl ProxyIcmpConn for IcmpSocketConn {
-    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> Result<(), HammerError> {
+    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> HammerResult<()> {
         let target = SocketAddr::new(destination, 0);
         self.socket_for(destination)?
             .send_to(body, target)
@@ -74,7 +74,7 @@ impl ProxyIcmpConn for IcmpSocketConn {
         Ok(())
     }
 
-    async fn recv_reply(&mut self) -> Result<IcmpReply, HammerError> {
+    async fn recv_reply(&mut self) -> HammerResult<IcmpReply> {
         match (self.ipv4.as_mut(), self.ipv6.as_mut()) {
             (Some(ipv4), Some(ipv6)) => {
                 let mut v4 = vec![0_u8; 64 * 1024];
@@ -103,7 +103,7 @@ pub(crate) async fn probe_echo(
     destination: IpAddr,
     timeout_duration: Duration,
     protector: SocketProtector,
-) -> Result<Duration, HammerError> {
+) -> HammerResult<Duration> {
     let mut conn = IcmpSocketConn::new(protector);
     measure_echo(&mut conn, destination, timeout_duration).await
 }
@@ -112,7 +112,7 @@ async fn measure_echo(
     conn: &mut dyn ProxyIcmpConn,
     destination: IpAddr,
     timeout_duration: Duration,
-) -> Result<Duration, HammerError> {
+) -> HammerResult<Duration> {
     let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let token = next_probe_token();
     measure_echo_with_token(conn, destination, sequence, &token, timeout_duration).await
@@ -124,7 +124,7 @@ async fn measure_echo_with_token(
     sequence: u16,
     token: &[u8],
     timeout_duration: Duration,
-) -> Result<Duration, HammerError> {
+) -> HammerResult<Duration> {
     let request = echo_request_body(destination, sequence, token);
     let started = Instant::now();
     conn.send_echo(destination, &request).await?;
@@ -186,10 +186,7 @@ fn echo_reply_matches(
         && &reply.body[8..] == payload
 }
 
-fn bind_icmp_socket(
-    bind_ip: IpAddr,
-    protector: &SocketProtector,
-) -> Result<UdpSocket, HammerError> {
+fn bind_icmp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> HammerResult<UdpSocket> {
     let (domain, protocol) = match bind_ip {
         IpAddr::V4(_) => (Domain::IPV4, Protocol::ICMPV4),
         IpAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
@@ -217,7 +214,7 @@ fn bind_icmp_socket(
 fn icmp_reply_from_recv(
     result: std::io::Result<(usize, SocketAddr)>,
     mut buf: Vec<u8>,
-) -> Result<IcmpReply, HammerError> {
+) -> HammerResult<IcmpReply> {
     let (len, source) = result.map_err(|err| HammerError::internal(format!("icmp recv: {err}")))?;
     buf.truncate(len);
     let body = normalize_received_icmp_body(source.ip(), &buf);
@@ -337,12 +334,12 @@ mod tests {
 
     #[async_trait]
     impl ProxyIcmpConn for FakeIcmpConn {
-        async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> Result<(), HammerError> {
+        async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> HammerResult<()> {
             self.sent.push((destination, body.to_vec()));
             Ok(())
         }
 
-        async fn recv_reply(&mut self) -> Result<IcmpReply, HammerError> {
+        async fn recv_reply(&mut self) -> HammerResult<IcmpReply> {
             self.replies
                 .pop_front()
                 .ok_or_else(|| HammerError::internal("no reply"))

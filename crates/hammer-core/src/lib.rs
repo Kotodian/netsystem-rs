@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod log;
 pub mod metrics;
 pub mod network;
+pub mod protocol;
 pub mod registry;
 
 pub use error::{HammerError, HammerResult};

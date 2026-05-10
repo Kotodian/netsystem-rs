@@ -34,8 +34,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 
-use hammer_core::error::HammerError;
-use hammer_core::log::Logger;
+use crate::error::{HammerError, HammerResult};
+use crate::log::Logger;
 
 use super::device::ChannelDevice;
 
@@ -87,7 +87,7 @@ const IDLE_WAKEUP: Duration = Duration::from_secs(3600);
 /// parking an outbound dial forever.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) struct IpStackHandles {
+pub struct IpStackHandles {
     cmd_tx: mpsc::Sender<StackCommand>,
     /// Wrapped in a Mutex<Option<...>> so the consumer can call `&self`
     /// methods (clone an Arc<IpStackHandles> and `dial`) while still being
@@ -97,7 +97,7 @@ pub(crate) struct IpStackHandles {
 }
 
 impl IpStackHandles {
-    pub(crate) async fn dial_tcp(&self, dst: SocketAddr) -> Result<DuplexStream, HammerError> {
+    pub async fn dial_tcp(&self, dst: SocketAddr) -> HammerResult<DuplexStream> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(StackCommand::DialTcp {
@@ -111,7 +111,7 @@ impl IpStackHandles {
             .map_err(|_| HammerError::internal("ipstack: dial response dropped"))?
     }
 
-    pub(crate) async fn bind_udp(&self) -> Result<UdpHandle, HammerError> {
+    pub async fn bind_udp(&self) -> HammerResult<UdpHandle> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(StackCommand::BindUdp { reply: reply_tx })
@@ -126,7 +126,7 @@ impl IpStackHandles {
     /// is just a thin command sender — the actual smoltcp socket is created
     /// per-`accept()` call so the stack supports an unbounded series of
     /// inbound connections without juggling backlog state itself.
-    pub(crate) fn listen_tcp(&self, port: u16) -> TcpListener {
+    pub fn listen_tcp(&self, port: u16) -> TcpListener {
         TcpListener {
             cmd_tx: self.cmd_tx.clone(),
             port,
@@ -135,7 +135,7 @@ impl IpStackHandles {
 
     /// Tell the actor task to exit at its next select! poll. Idempotent —
     /// subsequent calls find the sender already taken.
-    pub(crate) fn signal_shutdown(&self) {
+    pub fn signal_shutdown(&self) {
         if let Some(tx) = self
             .shutdown
             .lock()
@@ -148,7 +148,7 @@ impl IpStackHandles {
 
     /// Force the actor task to drop without waiting. Pairs with
     /// `signal_shutdown` for the lifecycle close path.
-    pub(crate) fn abort(&self) {
+    pub fn abort(&self) {
         self.join.abort();
     }
 
@@ -175,17 +175,17 @@ impl IpStackHandles {
 /// stack actor, which spins up a fresh smoltcp listening socket on that port,
 /// and replies with a `DuplexStream` once the three-way handshake completes.
 /// Concurrent accepts are fine — each gets its own socket.
-pub(crate) struct TcpListener {
+pub struct TcpListener {
     cmd_tx: mpsc::Sender<StackCommand>,
     port: u16,
 }
 
 impl TcpListener {
-    pub(crate) fn port(&self) -> u16 {
+    pub fn port(&self) -> u16 {
         self.port
     }
 
-    pub(crate) async fn accept(&self) -> Result<DuplexStream, HammerError> {
+    pub async fn accept(&self) -> HammerResult<DuplexStream> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(StackCommand::AcceptTcp {
@@ -200,7 +200,7 @@ impl TcpListener {
     }
 }
 
-pub(crate) struct UdpHandle {
+pub struct UdpHandle {
     send_tx: mpsc::Sender<(Bytes, SocketAddr)>,
     recv_rx: AsyncMutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
     /// Port allocated by the actor inside the smoltcp Interface. Useful for
@@ -210,7 +210,7 @@ pub(crate) struct UdpHandle {
 }
 
 impl UdpHandle {
-    pub(crate) fn local_port(&self) -> u16 {
+    pub fn local_port(&self) -> u16 {
         self.local_port
     }
 
@@ -218,7 +218,7 @@ impl UdpHandle {
     /// resolved any domain destination to a concrete `SocketAddr` — translating
     /// outbound-layer addressing types (`SocksAddr`, etc.) into IP is not the
     /// stack's job.
-    pub(crate) async fn send(&self, payload: Bytes, dst: SocketAddr) -> Result<(), HammerError> {
+    pub async fn send(&self, payload: Bytes, dst: SocketAddr) -> HammerResult<()> {
         self.send_tx
             .send((payload, dst))
             .await
@@ -227,7 +227,7 @@ impl UdpHandle {
 
     /// Receive the next UDP datagram emitted by the stack, paired with the
     /// remote IP/port that sent it.
-    pub(crate) async fn recv(&self) -> Result<(Bytes, SocketAddr), HammerError> {
+    pub async fn recv(&self) -> HammerResult<(Bytes, SocketAddr)> {
         let mut rx = self.recv_rx.lock().await;
         rx.recv()
             .await
@@ -239,7 +239,7 @@ impl UdpHandle {
 /// messages let UDP-backed carriers amortize channel wakeups and smoltcp polls
 /// when several IP packets arrive in one readiness cycle.
 #[derive(Debug)]
-pub(crate) enum IpStackInput {
+pub enum IpStackInput {
     Packet(Bytes),
     Batch(Vec<Bytes>),
 }
@@ -247,13 +247,13 @@ pub(crate) enum IpStackInput {
 /// Spin up the netstack actor. Synchronously builds the smoltcp interface
 /// (no I/O involved) so the caller has a fully-wired `IpStackHandles` before the
 /// task even runs its first iteration.
-pub(crate) fn spawn_ipstack(
+pub fn spawn_ipstack(
     logger: Logger,
     addresses: Vec<IpNet>,
     mtu: u32,
     inbound_rx: mpsc::Receiver<IpStackInput>,
     encrypt_tx: mpsc::Sender<Bytes>,
-) -> Result<IpStackHandles, HammerError> {
+) -> HammerResult<IpStackHandles> {
     if addresses.is_empty() {
         return Err(HammerError::internal(
             "ipstack: at least one local IP address required",
@@ -304,7 +304,7 @@ pub(crate) fn spawn_ipstack(
         recv_scratch: vec![0u8; TCP_BUF.max(UDP_PAYLOAD_LIMIT)],
     };
 
-    let join = crate::spawn::spawn(inner.run());
+    let join = tokio::spawn(inner.run());
 
     Ok(IpStackHandles {
         cmd_tx,
@@ -316,14 +316,14 @@ pub(crate) fn spawn_ipstack(
 enum StackCommand {
     DialTcp {
         dst: SocketAddr,
-        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+        reply: oneshot::Sender<HammerResult<DuplexStream>>,
     },
     BindUdp {
-        reply: oneshot::Sender<Result<UdpHandle, HammerError>>,
+        reply: oneshot::Sender<HammerResult<UdpHandle>>,
     },
     AcceptTcp {
         port: u16,
-        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+        reply: oneshot::Sender<HammerResult<DuplexStream>>,
     },
     /// Inspect how many UDP sockets are currently parked in the smoltcp
     /// `SocketSet`. Test-only — the production code never needs to ask.
@@ -337,14 +337,14 @@ enum StackCommand {
 /// bridge task and reply to `oneshot` with the user-side `DuplexStream`.
 struct PendingAccept {
     handle: SocketHandle,
-    reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    reply: oneshot::Sender<HammerResult<DuplexStream>>,
 }
 
 /// One outbound TCP connect waiting for smoltcp to reach ESTABLISHED (or fail).
 struct PendingDial {
     handle: SocketHandle,
     dst: SocketAddr,
-    reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
+    reply: oneshot::Sender<HammerResult<DuplexStream>>,
     deadline: TokioInstant,
 }
 
@@ -356,7 +356,7 @@ enum SocketEvent {
     TcpWrite {
         handle: SocketHandle,
         data: Bytes,
-        ack: oneshot::Sender<Result<(), HammerError>>,
+        ack: oneshot::Sender<HammerResult<()>>,
     },
     TcpClose {
         handle: SocketHandle,
@@ -398,7 +398,7 @@ struct PendingTcpWrite {
     /// each partial `send_slice` succeeds; an empty `Bytes` means the write
     /// is fully drained and the matching `ack` can fire.
     data: Bytes,
-    ack: Option<oneshot::Sender<Result<(), HammerError>>>,
+    ack: Option<oneshot::Sender<HammerResult<()>>>,
 }
 
 struct UdpBridge {
@@ -656,11 +656,7 @@ impl StackInner {
     /// Park a fresh listening socket and remember the reply channel. The next
     /// poll cycle will notice when it transitions to ESTABLISHED and hand the
     /// caller a `DuplexStream`.
-    fn queue_accept(
-        &mut self,
-        port: u16,
-        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
-    ) {
+    fn queue_accept(&mut self, port: u16, reply: oneshot::Sender<HammerResult<DuplexStream>>) {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -674,11 +670,7 @@ impl StackInner {
         self.pending_accepts.push(PendingAccept { handle, reply });
     }
 
-    fn queue_dial(
-        &mut self,
-        dst: SocketAddr,
-        reply: oneshot::Sender<Result<DuplexStream, HammerError>>,
-    ) {
+    fn queue_dial(&mut self, dst: SocketAddr, reply: oneshot::Sender<HammerResult<DuplexStream>>) {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);
@@ -713,7 +705,7 @@ impl StackInner {
         let (user_side, actor_side) = tokio::io::duplex(TCP_DUPLEX);
         let (data_tx, data_rx) = mpsc::channel::<Bytes>(TCP_DATA_QUEUE);
         let event_tx = self.event_tx.clone();
-        crate::spawn::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
+        tokio::spawn(tcp_bridge_task(handle, actor_side, data_rx, event_tx));
         self.tcp_bridges.insert(
             handle,
             TcpBridge {
@@ -729,7 +721,7 @@ impl StackInner {
         &mut self,
         handle: SocketHandle,
         mut data: Bytes,
-        ack: oneshot::Sender<Result<(), HammerError>>,
+        ack: oneshot::Sender<HammerResult<()>>,
     ) {
         let Some(bridge) = self.tcp_bridges.get_mut(&handle) else {
             let _ = ack.send(Err(HammerError::internal("ipstack tcp: socket closed")));
@@ -804,7 +796,7 @@ impl StackInner {
         }
     }
 
-    fn bind_udp(&mut self) -> Result<UdpHandle, HammerError> {
+    fn bind_udp(&mut self) -> HammerResult<UdpHandle> {
         let rx_buf = udp::PacketBuffer::new(
             vec![udp::PacketMetadata::EMPTY; UDP_PACKET_SLOTS],
             vec![0u8; UDP_PAYLOAD_LIMIT],
@@ -826,7 +818,7 @@ impl StackInner {
         let (recv_user_tx, recv_user_rx) = mpsc::channel::<(Bytes, SocketAddr)>(UDP_QUEUE);
         let (send_user_tx, send_user_rx) = mpsc::channel::<(Bytes, SocketAddr)>(UDP_QUEUE);
         let event_tx = self.event_tx.clone();
-        crate::spawn::spawn(udp_bridge_task(handle, send_user_rx, event_tx));
+        tokio::spawn(udp_bridge_task(handle, send_user_rx, event_tx));
 
         self.udp_bridges.insert(
             handle,
@@ -1153,7 +1145,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use hammer_core::log::{DiscardWriter, Factory};
+    use crate::log::{DiscardWriter, Factory};
 
     use super::*;
 

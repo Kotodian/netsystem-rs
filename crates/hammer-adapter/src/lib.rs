@@ -1,4 +1,5 @@
 pub mod certificate;
+pub mod component;
 pub mod connection;
 pub mod dialer;
 pub mod dns;
@@ -20,21 +21,26 @@ pub use hammer_core::lifecycle::{
 // Re-exports used by the runtime crate so it doesn't have to know which
 // sub-module each trait lives in.
 pub use certificate::{CertificateProviderManager, CertificateProviderService, CertificateStore};
+pub use component::{
+    AsAnyComponent, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, RuntimeComponent,
+};
 pub use connection::{ConnectionHandle, ConnectionManager};
 pub use dialer::{Dialer, Network};
-pub use dns::{DnsQueryOptions, DnsRouter, DnsTransport, DnsTransportManager};
-pub use endpoint::{Endpoint, EndpointManager};
+pub use dns::{
+    DnsQueryOptions, DnsRouter, DnsTransport, DnsTransportComponent, DnsTransportManager,
+};
+pub use endpoint::{Endpoint, EndpointComponent, EndpointManager};
 pub use handler::{ConnectionHandler, PacketConnectionHandler};
-pub use inbound::{Inbound, InboundManager};
+pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use outbound::{
-    IcmpReply, Outbound, OutboundManager, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn,
-    ProxyStream,
+    IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyDatagram, ProxyIcmpConn,
+    ProxyPacketConn, ProxyStream,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
-pub use probe::{ProbeProtocol, ProbeReport};
+pub use probe::{ProbeProtocol, ProbeProtocolComponent, ProbeReport};
 pub use router::Router;
 pub use rule::{HeadlessRule, RouteDecision, RouteMetadata, Rule, SocksAddr};
 pub use service::ServiceManager;

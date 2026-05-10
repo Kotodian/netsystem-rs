@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{Level, LogWriter};
 use hammer_core::metrics::{MetricCounter, MetricsRegistry};
 #[cfg(test)]
@@ -80,7 +80,7 @@ impl ControlLogWriter {
 
     /// Dispatch `f` onto the control thread and block until it completes,
     /// using `DEFAULT_CONTROL_CALL_TIMEOUT` as the upper bound.
-    pub(crate) fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> Result<R, HammerError>
+    pub(crate) fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -91,14 +91,11 @@ impl ControlLogWriter {
     /// completes. Use this only for synchronous, non-cancelable state
     /// transitions where returning a timeout would leave background work
     /// continuing after the public API reported failure.
-    pub(crate) fn call_blocking<R>(
-        &self,
-        f: impl FnOnce() -> R + Send + 'static,
-    ) -> Result<R, HammerError>
+    pub(crate) fn call_blocking<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<Result<R, HammerError>>();
+        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
         self.command_tx
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -122,11 +119,11 @@ impl ControlLogWriter {
         &self,
         timeout: Duration,
         f: impl FnOnce() -> R + Send + 'static,
-    ) -> Result<R, HammerError>
+    ) -> HammerResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<Result<R, HammerError>>();
+        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
         self.command_tx
             .send(ControlCommand::Call(Box::new(move || {
                 let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
@@ -165,12 +162,12 @@ impl ControlLogWriter {
     pub(crate) fn call_async<R>(
         &self,
         timeout: Duration,
-        f: impl FnOnce(mpsc::Sender<Result<R, HammerError>>) -> Result<(), HammerError> + Send + 'static,
-    ) -> Result<R, HammerError>
+        f: impl FnOnce(mpsc::Sender<HammerResult<R>>) -> HammerResult<()> + Send + 'static,
+    ) -> HammerResult<R>
     where
         R: Send + 'static,
     {
-        let (done_tx, done_rx) = mpsc::channel::<Result<R, HammerError>>();
+        let (done_tx, done_rx) = mpsc::channel::<HammerResult<R>>();
         let dispatch_done_tx = done_tx.clone();
         self.command_tx
             .send(ControlCommand::AsyncCall(Box::new(move || {
@@ -760,7 +757,7 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        let panicked: Result<(), HammerError> =
+        let panicked: HammerResult<()> =
             writer.call_with_timeout(Duration::from_secs(1), || panic!("boom"));
         assert!(panicked.is_err(), "panicking closure should surface error");
 
@@ -803,8 +800,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let result: Result<(), HammerError> =
-            writer.call_with_timeout(Duration::from_millis(100), || ());
+        let result: HammerResult<()> = writer.call_with_timeout(Duration::from_millis(100), || ());
         let elapsed = start.elapsed();
         assert!(result.is_err(), "expected timeout, got Ok");
         assert!(

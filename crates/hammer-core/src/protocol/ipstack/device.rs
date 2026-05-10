@@ -22,14 +22,14 @@ use tokio::sync::mpsc::UnboundedSender;
 /// at MTU=1408 — a brief stall on the smoltcp poll loop won't snowball.
 const INBOUND_BACKLOG: usize = 256;
 
-pub(crate) struct ChannelDevice {
+pub struct ChannelDevice {
     inbound: VecDeque<Bytes>,
     egress: UnboundedSender<Bytes>,
     mtu: usize,
 }
 
 impl ChannelDevice {
-    pub(crate) fn new(mtu: u32, egress: UnboundedSender<Bytes>) -> Self {
+    pub fn new(mtu: u32, egress: UnboundedSender<Bytes>) -> Self {
         Self {
             inbound: VecDeque::new(),
             egress,
@@ -41,7 +41,7 @@ impl ChannelDevice {
     /// queue. Drops the oldest packet when the backlog overflows so a stalled
     /// poll loop can't keep pulling memory.
     #[inline]
-    pub(crate) fn deliver(&mut self, packet: Bytes) {
+    pub fn deliver(&mut self, packet: Bytes) {
         if self.inbound.len() >= INBOUND_BACKLOG {
             let _ = self.inbound.pop_front();
         }
@@ -52,7 +52,7 @@ impl ChannelDevice {
     /// carrier adapter through one mpsc wakeup per packet. Ordering is
     /// preserved, and the same oldest-drop policy applies across the batch.
     #[inline]
-    pub(crate) fn deliver_batch(&mut self, packets: Vec<Bytes>) {
+    pub fn deliver_batch(&mut self, packets: Vec<Bytes>) {
         // If the batch alone would overflow the backlog, skip the prefix that
         // `deliver`'s oldest-drop would pop right back out — saves a round of
         // push_back/pop_front (and the matching `Bytes` clone bookkeeping) per
@@ -66,7 +66,7 @@ impl ChannelDevice {
     /// `true` if the inbound queue is non-empty — caller can use this to skip
     /// poll() when there's nothing waiting.
     #[inline]
-    pub(crate) fn has_inbound(&self) -> bool {
+    pub fn has_inbound(&self) -> bool {
         !self.inbound.is_empty()
     }
 }
@@ -121,7 +121,7 @@ impl Device for ChannelDevice {
     }
 }
 
-pub(crate) struct ChannelRxToken {
+pub struct ChannelRxToken {
     packet: Bytes,
 }
 
@@ -135,7 +135,7 @@ impl RxToken for ChannelRxToken {
     }
 }
 
-pub(crate) struct ChannelTxToken {
+pub struct ChannelTxToken {
     egress: UnboundedSender<Bytes>,
 }
 
@@ -149,7 +149,16 @@ impl TxToken for ChannelTxToken {
         // a freshly-allocated `BytesMut`, freeze it, and ship the resulting
         // `Bytes` straight into the egress mpsc — zero memcpy across the
         // ownership transfer.
-        let mut buf = BytesMut::zeroed(len);
+        //
+        // SAFETY: smoltcp's `TxToken::consume(len, f)` contract requires `f`
+        // to write a complete `len`-byte packet — its IPv4 / TCP / UDP / ICMP
+        // assemblers all use `slice.copy_from_slice` / `byteorder` writes that
+        // cover the full range, never partial. The bytes we expose downstream
+        // are exactly those `f` wrote, so skipping the upfront `memset` saves
+        // ~MTU bytes of zero-init per egress IP packet (mirrors the same
+        // trick `transport::alloc_crypto_buf` uses for boringtun output).
+        let mut buf = BytesMut::with_capacity(len);
+        unsafe { buf.set_len(len) };
         let result = f(&mut buf);
         // If the receiver has been dropped (actor shutting down) the packet is
         // discarded. smoltcp has no notion of "tx failed" past consume(), so

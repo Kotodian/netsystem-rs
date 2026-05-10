@@ -979,16 +979,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-component-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "hammer-core"
 version = "0.1.0"
 dependencies = [
+ "blake2",
+ "boringtun",
+ "bytes",
+ "hickory-proto",
+ "http",
  "humantime-serde",
  "indoc",
  "ipnet",
  "metrics",
+ "rand 0.8.6",
+ "rustc-hash",
  "serde",
  "serde_path_to_error",
  "serde_with",
+ "smoltcp",
  "thiserror",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
@@ -1026,6 +1043,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "hammer-adapter",
+ "hammer-component-macros",
  "hammer-core",
  "hickory-proto",
  "http",
@@ -1042,11 +1060,9 @@ dependencies = [
  "quinn",
  "rand 0.8.6",
  "rcgen",
- "rustc-hash",
  "rustls",
  "rustls-native-certs",
  "rustls-platform-verifier",
- "smoltcp",
  "socket2",
  "tokio",
  "tokio-rustls",

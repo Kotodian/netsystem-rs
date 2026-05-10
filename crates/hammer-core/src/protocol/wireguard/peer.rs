@@ -5,7 +5,7 @@ use boringtun::noise::Tunn;
 use boringtun::x25519;
 use ipnet::IpNet;
 
-use hammer_core::config::WireguardPeerOptions;
+use crate::config::WireguardPeerOptions;
 
 /// One WireGuard peer — owns the boringtun `Tunn` state machine plus the
 /// metadata Hammer needs around it (resolved UDP endpoint, allowed_ips for
@@ -14,7 +14,7 @@ use hammer_core::config::WireguardPeerOptions;
 /// `Tunn` is interior-mutable but not `Sync`, so we lock it ourselves. boringtun
 /// expects single-threaded access per peer; the lock keeps multiple async tasks
 /// (rx loop, tx loop, timer tick) from clobbering session state.
-pub(crate) struct Peer {
+pub struct Peer {
     tunn: Mutex<Tunn>,
     allowed_ips: Vec<IpNet>,
     endpoint: SocketAddr,
@@ -22,7 +22,7 @@ pub(crate) struct Peer {
 }
 
 impl Peer {
-    pub(crate) fn new(
+    pub fn new(
         opts: WireguardPeerOptions,
         local_private: &x25519::StaticSecret,
         index: u32,
@@ -49,18 +49,18 @@ impl Peer {
         }
     }
 
-    pub(crate) fn endpoint(&self) -> SocketAddr {
+    pub fn endpoint(&self) -> SocketAddr {
         self.endpoint
     }
 
-    pub(crate) fn reserved(&self) -> [u8; 3] {
+    pub fn reserved(&self) -> [u8; 3] {
         self.reserved
     }
 
     /// Longest-prefix match against this peer's `allowed_ips`. Returns the
     /// matching prefix length so the caller can pick the most specific peer
     /// when multiple have overlapping ranges.
-    pub(crate) fn match_prefix(&self, dst: IpAddr) -> Option<u8> {
+    pub fn match_prefix(&self, dst: IpAddr) -> Option<u8> {
         self.allowed_ips
             .iter()
             .filter(|net| net.contains(&dst))
@@ -68,7 +68,7 @@ impl Peer {
             .max()
     }
 
-    pub(crate) fn lock_tunn(&self) -> std::sync::MutexGuard<'_, Tunn> {
+    pub fn lock_tunn(&self) -> std::sync::MutexGuard<'_, Tunn> {
         self.tunn.lock().expect("wireguard peer Tunn poisoned")
     }
 }
@@ -76,7 +76,7 @@ impl Peer {
 /// Pick the peer that has the longest matching `allowed_ips` prefix for `dst`.
 /// Returns the peer's index in the input slice — `None` when nothing matches,
 /// which the caller should surface as "no route" (drop the packet).
-pub(crate) fn route_outbound(peers: &[Peer], dst: IpAddr) -> Option<usize> {
+pub fn route_outbound(peers: &[Peer], dst: IpAddr) -> Option<usize> {
     peers
         .iter()
         .enumerate()

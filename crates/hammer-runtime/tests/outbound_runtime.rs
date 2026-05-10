@@ -5,9 +5,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener, Network, NetworkInterface, Outbound as AdapterOutbound,
-    OutboundManager as _, PlatformInterface, ProxyPacketConn, ProxyStream, SocksAddr, TunOptions,
-    WifiState,
+    ComponentMeta, ComponentMetadata, DefaultInterfaceUpdateListener, Network, NetworkInterface,
+    Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _, PlatformInterface,
+    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr, TunOptions, WifiState,
 };
 use hammer_core::config::{
     DirectOutboundOptions, Hysteria2OutboundOptions, Outbound, OutboundKind,
@@ -35,22 +35,6 @@ struct ResettableOutbound {
 
 #[async_trait]
 impl AdapterOutbound for ResettableOutbound {
-    fn type_name(&self) -> &str {
-        "resettable"
-    }
-
-    fn id(&self) -> &str {
-        "resettable"
-    }
-
-    fn networks(&self) -> &[Network] {
-        &[]
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     fn reset(&self) {
         self.resets.fetch_add(1, Ordering::SeqCst);
     }
@@ -72,6 +56,21 @@ impl AdapterOutbound for ResettableOutbound {
     async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
         Err(HammerError::internal("not implemented"))
     }
+}
+
+fn resettable_component(outbound: Arc<ResettableOutbound>) -> OutboundComponent {
+    let runtime: Arc<dyn AdapterOutbound> = outbound;
+    RuntimeComponent::new(
+        ComponentMeta::new(
+            "outbound",
+            "resettable",
+            "resettable",
+            vec![Network::Tcp],
+            Vec::new(),
+            None,
+        ),
+        runtime,
+    )
 }
 
 #[derive(Default)]
@@ -127,10 +126,7 @@ fn outbound_manager_reset_network_resets_registered_outbounds() {
     let manager = OutboundManager::new(logger("outbound"), "resettable");
     let outbound = Arc::new(ResettableOutbound::default());
     manager
-        .register_outbound(
-            "resettable".to_owned(),
-            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
-        )
+        .register_outbound(resettable_component(Arc::clone(&outbound)))
         .expect("register outbound");
 
     manager.reset_network();
@@ -143,10 +139,7 @@ async fn outbound_manager_ensure_connected_warms_registered_outbounds_without_re
     let manager = OutboundManager::new(logger("outbound"), "resettable");
     let outbound = Arc::new(ResettableOutbound::default());
     manager
-        .register_outbound(
-            "resettable".to_owned(),
-            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
-        )
+        .register_outbound(resettable_component(Arc::clone(&outbound)))
         .expect("register outbound");
 
     manager.ensure_connected();
@@ -169,10 +162,7 @@ fn outbound_manager_lifecycle_close_resets_registered_outbounds() {
     let manager = OutboundManager::new(logger("outbound"), "resettable");
     let outbound = Arc::new(ResettableOutbound::default());
     manager
-        .register_outbound(
-            "resettable".to_owned(),
-            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
-        )
+        .register_outbound(resettable_component(Arc::clone(&outbound)))
         .expect("register outbound");
 
     Lifecycle::close(&manager).expect("lifecycle close");
@@ -188,10 +178,7 @@ fn outbound_manager_registers_error_metrics_for_registered_outbounds() {
         OutboundManager::new_with_metrics(logger("outbound"), "resettable", Arc::clone(&metrics));
     let outbound = Arc::new(ResettableOutbound::default());
     manager
-        .register_outbound(
-            "resettable".to_owned(),
-            Arc::clone(&outbound) as Arc<dyn AdapterOutbound>,
-        )
+        .register_outbound(resettable_component(Arc::clone(&outbound)))
         .expect("register outbound");
 
     let samples = metrics.snapshot();
@@ -372,7 +359,7 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
             id: "direct".to_owned(),
             kind: OutboundKind::Direct(DirectOutboundOptions::default()),
         }],
-        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        Arc::clone(&platform),
     )
     .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
@@ -463,9 +450,12 @@ fn outbound_manager_rejects_duplicate_registered_endpoint_view_id() {
     )
     .expect("outbound manager");
     let duplicate = Arc::new(BlockOutbound::new(logger("block"), "direct"));
+    let duplicate_meta = duplicate.component_meta();
+    let duplicate_runtime: Arc<dyn AdapterOutbound> = duplicate;
+    let duplicate = RuntimeComponent::new(duplicate_meta, duplicate_runtime);
 
     let err = manager
-        .register_outbound("direct".to_owned(), duplicate)
+        .register_outbound(duplicate)
         .expect_err("duplicate endpoint outbound id must be rejected");
     assert!(
         err.to_string().contains("duplicate outbound id: direct"),

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -8,12 +9,14 @@ use hammer_adapter::{
     Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, RuleMatcher};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters};
+use ipnet::IpNet;
 use lru::LruCache;
 
 use crate::OutboundManager;
+use crate::component_registry::register_components;
 use crate::impl_logging_lifecycle;
 
 const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
@@ -30,7 +33,8 @@ const ROUTER_CACHE_CAPACITY: usize = 256;
 /// path has already invoked `prepare_route_metadata`, so those fields are
 /// fully resolved and a cache hit can safely skip the second walk.
 ///
-/// Only fields actually consumed by `matcher_matches` + `route_to_default`
+/// Only fields actually consumed by `RuntimeMatcher::matches` +
+/// `route_to_default`
 /// land here; src port / src IP / client / domain_strategy / mutation flags
 /// are intentionally absent.
 #[derive(Hash, PartialEq, Eq, Clone)]
@@ -60,6 +64,7 @@ impl From<&RouteMetadata> for MatchKey {
 /// that matcher are OR'd. The first rule that produces a terminal decision wins;
 /// non-terminal rules (sniff/resolve/route_options) mutate metadata and fall
 /// through.
+#[hammer_component_macros::hammer_component(router, name = "default", builder = build_router)]
 pub struct Router {
     rules: Vec<RuntimeRule>,
     outbound: Option<Arc<OutboundManager>>,
@@ -81,6 +86,167 @@ fn new_router_cache() -> Mutex<LruCache<MatchKey, RouteDecision>> {
     ))
 }
 
+pub(crate) type RouterBuilder =
+    fn(Logger, RouteOptions, Arc<OutboundManager>, Arc<MetricsRegistry>) -> HammerResult<Router>;
+pub(crate) type MatcherBuilder = fn(RuleMatcher) -> HammerResult<RuntimeMatcher>;
+
+#[derive(Clone)]
+struct RouterFactorySet {
+    builders: Arc<HashMap<&'static str, RouterBuilder>>,
+}
+
+impl RouterFactorySet {
+    fn standard() -> Self {
+        let mut builders = HashMap::new();
+        register_standard_router_builders(&mut builders);
+        Self {
+            builders: Arc::new(builders),
+        }
+    }
+
+    fn build_default(
+        &self,
+        logger: Logger,
+        options: RouteOptions,
+        outbound: Arc<OutboundManager>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> HammerResult<Router> {
+        self.build("default", logger, options, outbound, metrics)
+    }
+
+    fn build(
+        &self,
+        type_name: &str,
+        logger: Logger,
+        options: RouteOptions,
+        outbound: Arc<OutboundManager>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> HammerResult<Router> {
+        let builder = self.builders.get(type_name).ok_or_else(|| {
+            HammerError::config_validation(format!("unknown router type: {type_name}"))
+        })?;
+        builder(logger, options, outbound, metrics)
+    }
+}
+
+#[allow(unused_variables)]
+fn register_standard_router_builders(builders: &mut HashMap<&'static str, RouterBuilder>) {
+    register_components!(router, builders, [Router]);
+}
+
+#[derive(Clone)]
+struct RouteMatcherFactorySet {
+    builders: Arc<HashMap<&'static str, MatcherBuilder>>,
+}
+
+impl RouteMatcherFactorySet {
+    fn standard() -> Self {
+        let mut builders = HashMap::new();
+        register_standard_route_matcher_builders(&mut builders);
+        Self {
+            builders: Arc::new(builders),
+        }
+    }
+
+    fn build(&self, matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+        let type_name = route_matcher_type_name(&matcher);
+        self.build_with_type(type_name, matcher)
+    }
+
+    fn build_with_type(
+        &self,
+        type_name: &str,
+        matcher: RuleMatcher,
+    ) -> HammerResult<RuntimeMatcher> {
+        let builder = self.builders.get(type_name).ok_or_else(|| {
+            HammerError::config_validation(format!("unknown route matcher type: {type_name}"))
+        })?;
+        builder(matcher)
+    }
+}
+
+#[allow(unused_variables)]
+fn register_standard_route_matcher_builders(builders: &mut HashMap<&'static str, MatcherBuilder>) {
+    register_components!(
+        matcher,
+        builders,
+        [
+            AnyMatcher,
+            InboundMatcher,
+            ProtocolMatcher,
+            DomainMatcher,
+            DomainSuffixMatcher,
+            DomainKeywordMatcher,
+            IpCidrMatcher,
+        ]
+    );
+}
+
+fn route_matcher_type_name(matcher: &RuleMatcher) -> &'static str {
+    match matcher {
+        RuleMatcher::Any => {
+            <AnyMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::Inbound(_) => {
+            <InboundMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::Protocol(_) => {
+            <ProtocolMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::Domain(_) => {
+            <DomainMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::DomainSuffix(_) => {
+            <DomainSuffixMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::DomainKeyword(_) => {
+            <DomainKeywordMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+        RuleMatcher::IpCidr(_) => {
+            <IpCidrMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME
+        }
+    }
+}
+
+pub(crate) fn build_router(
+    _logger: Logger,
+    options: RouteOptions,
+    outbound: Arc<OutboundManager>,
+    metrics: Arc<MetricsRegistry>,
+) -> HammerResult<Router> {
+    let scope = metrics.scope("route", "router", "default");
+    let matcher_factories = RouteMatcherFactorySet::standard();
+    let rules: Vec<RuntimeRule> = options
+        .rules
+        .into_iter()
+        .enumerate()
+        .map(|(index, rule)| RuntimeRule::from_options(index, rule, &scope, &matcher_factories))
+        .collect::<HammerResult<Vec<_>>>()?;
+    for rule in &rules {
+        if let RuleActionKind::Route(action) = &rule.action
+            && outbound.get(&action.outbound).is_none()
+        {
+            return Err(HammerError::config_validation(format!(
+                "route.rules outbound {:?} is not declared",
+                action.outbound,
+            )));
+        }
+    }
+    if outbound.get(&options.final_).is_none() {
+        return Err(HammerError::config_validation(format!(
+            "route.final outbound {:?} is not declared",
+            options.final_
+        )));
+    }
+    Ok(Router {
+        rules,
+        outbound: Some(outbound),
+        metrics: RouterMetrics::new(&scope, &options.final_),
+        default_outbound: options.final_,
+        cache: new_router_cache(),
+    })
+}
+
 impl Router {
     pub fn new(_logger: Logger) -> Self {
         let metrics = MetricsRegistry::new().scope("route", "router", "default");
@@ -94,52 +260,23 @@ impl Router {
     }
 
     pub fn from_options(
-        _logger: Logger,
+        logger: Logger,
         options: RouteOptions,
         outbound: Arc<OutboundManager>,
-    ) -> Result<Self, HammerError> {
-        Self::from_options_with_metrics(_logger, options, outbound, MetricsRegistry::new())
+    ) -> HammerResult<Self> {
+        Self::from_options_with_metrics(logger, options, outbound, MetricsRegistry::new())
     }
 
     pub fn from_options_with_metrics(
-        _logger: Logger,
+        logger: Logger,
         options: RouteOptions,
         outbound: Arc<OutboundManager>,
         metrics: Arc<MetricsRegistry>,
-    ) -> Result<Self, HammerError> {
-        let scope = metrics.scope("route", "router", "default");
-        let rules: Vec<RuntimeRule> = options
-            .rules
-            .into_iter()
-            .enumerate()
-            .map(|(index, rule)| RuntimeRule::from_options(index, rule, &scope))
-            .collect();
-        for rule in &rules {
-            if let RuleActionKind::Route(action) = &rule.action
-                && outbound.get(&action.outbound).is_none()
-            {
-                return Err(HammerError::config_validation(format!(
-                    "route.rules outbound {:?} is not declared",
-                    action.outbound,
-                )));
-            }
-        }
-        if outbound.get(&options.final_).is_none() {
-            return Err(HammerError::config_validation(format!(
-                "route.final outbound {:?} is not declared",
-                options.final_
-            )));
-        }
-        Ok(Self {
-            rules,
-            outbound: Some(outbound),
-            metrics: RouterMetrics::new(&scope, &options.final_),
-            default_outbound: options.final_,
-            cache: new_router_cache(),
-        })
+    ) -> HammerResult<Self> {
+        RouterFactorySet::standard().build_default(logger, options, outbound, metrics)
     }
 
-    pub fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+    pub fn match_route(&self, metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
         let network = metadata.network;
 
         // Cache the terminal decision keyed on the subset of metadata that
@@ -196,10 +333,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn prepare_route_metadata(
-        &self,
-        metadata: &mut RouteMetadata,
-    ) -> Result<(), HammerError> {
+    pub(crate) fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> HammerResult<()> {
         for rule in &self.rules {
             if !rule.matches(metadata) {
                 continue;
@@ -228,7 +362,7 @@ impl Router {
         self.sniff_timeout(metadata).is_some()
     }
 
-    fn route_to_default(&self, network: Network) -> Result<RouteDecision, HammerError> {
+    fn route_to_default(&self, network: Network) -> HammerResult<RouteDecision> {
         let Some(outbound) = &self.outbound else {
             return Ok(RouteDecision::Route {
                 outbound: self.default_outbound.clone(),
@@ -244,14 +378,14 @@ impl Router {
         // simple `final = "hysteria2"` route (which only declares
         // Tcp/Udp) and still receive a clean ICMP reply rather than a
         // hard route engine error every time an app pings.
-        if network != Network::Icmp && !default.networks().contains(&network) {
+        if network != Network::Icmp && !default.meta().networks().contains(&network) {
             return Err(HammerError::internal(format!(
                 "{network} is not supported by default outbound: {}",
-                default.id()
+                default.meta().id()
             )));
         }
         Ok(RouteDecision::Route {
-            outbound: default.id().to_owned(),
+            outbound: default.meta().id().to_owned(),
         })
     }
 }
@@ -267,11 +401,11 @@ impl RouterTrait for Router {
         self.cache.lock().expect("router cache poisoned").clear();
     }
 
-    fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+    fn match_route(&self, metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
         Router::match_route(self, metadata)
     }
 
-    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> HammerResult<()> {
         Router::prepare_route_metadata(self, metadata)
     }
 
@@ -342,33 +476,39 @@ fn route_action_name(action: &RuleActionKind) -> &'static str {
 }
 
 struct RuntimeRule {
-    matcher: RuleMatcher,
+    matcher: RuntimeMatcher,
     action: RuleActionKind,
     metrics: RuntimeRuleMetrics,
 }
 
 impl RuntimeRule {
-    fn from_options(index: usize, options: RuleOptions, router_scope: &MetricsScope) -> Self {
+    fn from_options(
+        index: usize,
+        options: RuleOptions,
+        router_scope: &MetricsScope,
+        matcher_factories: &RouteMatcherFactorySet,
+    ) -> HammerResult<Self> {
         let default = options.default_options;
+        let matcher = matcher_factories.build(default.matcher)?;
         let action = default.action;
         let metrics = RuntimeRuleMetrics::new(
             &router_scope.child("rule", index.to_string()),
             index,
             &action,
         );
-        Self {
-            matcher: default.matcher,
+        Ok(Self {
+            matcher,
             action,
             metrics,
-        }
+        })
     }
 
     #[inline]
     fn matches(&self, metadata: &RouteMetadata) -> bool {
-        matcher_matches(&self.matcher, metadata)
+        self.matcher.matches(metadata)
     }
 
-    fn apply(&self, metadata: &mut RouteMetadata) -> Result<RuleApply, HammerError> {
+    fn apply(&self, metadata: &mut RouteMetadata) -> HammerResult<RuleApply> {
         match &self.action {
             RuleActionKind::Sniff(o) => {
                 if o.override_destination {
@@ -397,6 +537,225 @@ impl RuntimeRule {
     }
 }
 
+pub(crate) enum RuntimeMatcher {
+    Any(AnyMatcher),
+    Inbound(InboundMatcher),
+    Protocol(ProtocolMatcher),
+    Domain(DomainMatcher),
+    DomainSuffix(DomainSuffixMatcher),
+    DomainKeyword(DomainKeywordMatcher),
+    IpCidr(IpCidrMatcher),
+}
+
+impl RuntimeMatcher {
+    /// Hot path — called per TCP/UDP/ICMP packet, once per rule walked.
+    /// Static dispatch on this enum keeps the old `RuleMatcher` performance
+    /// property while letting construction go through the component registry.
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match self {
+            Self::Any(matcher) => matcher.matches(metadata),
+            Self::Inbound(matcher) => matcher.matches(metadata),
+            Self::Protocol(matcher) => matcher.matches(metadata),
+            Self::Domain(matcher) => matcher.matches(metadata),
+            Self::DomainSuffix(matcher) => matcher.matches(metadata),
+            Self::DomainKeyword(matcher) => matcher.matches(metadata),
+            Self::IpCidr(matcher) => matcher.matches(metadata),
+        }
+    }
+}
+
+#[hammer_component_macros::hammer_component(matcher, name = "any", builder = build_any_matcher)]
+pub(crate) struct AnyMatcher;
+
+impl AnyMatcher {
+    #[inline]
+    fn matches(&self, _metadata: &RouteMetadata) -> bool {
+        true
+    }
+}
+
+#[hammer_component_macros::hammer_component(matcher, name = "inbound", builder = build_inbound_matcher)]
+pub(crate) struct InboundMatcher {
+    values: Vec<String>,
+}
+
+impl InboundMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match_list(&self.values, &metadata.inbound)
+    }
+}
+
+#[hammer_component_macros::hammer_component(matcher, name = "protocol", builder = build_protocol_matcher)]
+pub(crate) struct ProtocolMatcher {
+    values: Vec<String>,
+}
+
+impl ProtocolMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match_list(&self.values, &metadata.protocol)
+    }
+}
+
+#[hammer_component_macros::hammer_component(matcher, name = "domain", builder = build_domain_matcher)]
+pub(crate) struct DomainMatcher {
+    values: Vec<String>,
+}
+
+impl DomainMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match metadata.domain.as_deref() {
+            Some(domain) => self.values.iter().any(|value| value == domain),
+            None => false,
+        }
+    }
+}
+
+#[hammer_component_macros::hammer_component(
+    matcher,
+    name = "domain_suffix",
+    builder = build_domain_suffix_matcher
+)]
+pub(crate) struct DomainSuffixMatcher {
+    values: Vec<String>,
+}
+
+impl DomainSuffixMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match metadata.domain.as_deref() {
+            Some(domain) => self
+                .values
+                .iter()
+                .any(|suffix| domain_suffix_matches(domain, suffix)),
+            None => false,
+        }
+    }
+}
+
+#[hammer_component_macros::hammer_component(
+    matcher,
+    name = "domain_keyword",
+    builder = build_domain_keyword_matcher
+)]
+pub(crate) struct DomainKeywordMatcher {
+    values: Vec<String>,
+}
+
+impl DomainKeywordMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match metadata.domain.as_deref() {
+            Some(domain) => self
+                .values
+                .iter()
+                .any(|keyword| domain.contains(keyword.as_str())),
+            None => false,
+        }
+    }
+}
+
+#[hammer_component_macros::hammer_component(matcher, name = "ip_cidr", builder = build_ip_cidr_matcher)]
+pub(crate) struct IpCidrMatcher {
+    values: Vec<IpNet>,
+}
+
+impl IpCidrMatcher {
+    #[inline]
+    fn matches(&self, metadata: &RouteMetadata) -> bool {
+        match metadata.destination.as_ref() {
+            Some(SocksAddr { host, .. }) => self.values.iter().any(|net| net.contains(host)),
+            None => false,
+        }
+    }
+}
+
+fn build_any_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::Any => Ok(RuntimeMatcher::Any(AnyMatcher)),
+        matcher => Err(wrong_matcher_builder(
+            <AnyMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_inbound_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::Inbound(values) => Ok(RuntimeMatcher::Inbound(InboundMatcher { values })),
+        matcher => Err(wrong_matcher_builder(
+            <InboundMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_protocol_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::Protocol(values) => Ok(RuntimeMatcher::Protocol(ProtocolMatcher { values })),
+        matcher => Err(wrong_matcher_builder(
+            <ProtocolMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_domain_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::Domain(values) => Ok(RuntimeMatcher::Domain(DomainMatcher { values })),
+        matcher => Err(wrong_matcher_builder(
+            <DomainMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_domain_suffix_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::DomainSuffix(values) => {
+            Ok(RuntimeMatcher::DomainSuffix(DomainSuffixMatcher { values }))
+        }
+        matcher => Err(wrong_matcher_builder(
+            <DomainSuffixMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_domain_keyword_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::DomainKeyword(values) => {
+            Ok(RuntimeMatcher::DomainKeyword(DomainKeywordMatcher {
+                values,
+            }))
+        }
+        matcher => Err(wrong_matcher_builder(
+            <DomainKeywordMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn build_ip_cidr_matcher(matcher: RuleMatcher) -> HammerResult<RuntimeMatcher> {
+    match matcher {
+        RuleMatcher::IpCidr(values) => Ok(RuntimeMatcher::IpCidr(IpCidrMatcher { values })),
+        matcher => Err(wrong_matcher_builder(
+            <IpCidrMatcher as crate::component_registry::RouteMatcherComponentDeclaration>::TYPE_NAME,
+            &matcher,
+        )),
+    }
+}
+
+fn wrong_matcher_builder(expected: &str, actual: &RuleMatcher) -> HammerError {
+    HammerError::internal(format!(
+        "{expected} route matcher factory received {} options",
+        route_matcher_type_name(actual)
+    ))
+}
+
 #[inline]
 fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
     if suffix.is_empty() {
@@ -415,42 +774,175 @@ enum RuleApply {
     Decision(RouteDecision),
 }
 
-/// Match a `RuleMatcher` against connection metadata. Hot path — called per
-/// TCP/UDP/ICMP packet, once per rule walked. Static dispatch on the enum
-/// (not `Box<dyn Matcher>`) lets LLVM inline each arm with workspace
-/// `lto = "fat"`. The previous trait-object form ate one indirect call per
-/// rule; cumulative on every packet × every rule it added up to a real chunk
-/// of `Router::match_route` self-time on iOS NetExt.
-#[inline]
-fn matcher_matches(matcher: &RuleMatcher, metadata: &RouteMetadata) -> bool {
-    match matcher {
-        RuleMatcher::Any => true,
-        RuleMatcher::Inbound(values) => match_list(values, &metadata.inbound),
-        RuleMatcher::Protocol(values) => match_list(values, &metadata.protocol),
-        RuleMatcher::Domain(values) => match metadata.domain.as_deref() {
-            Some(domain) => values.iter().any(|value| value == domain),
-            None => false,
-        },
-        RuleMatcher::DomainSuffix(values) => match metadata.domain.as_deref() {
-            Some(domain) => values
-                .iter()
-                .any(|suffix| domain_suffix_matches(domain, suffix)),
-            None => false,
-        },
-        RuleMatcher::DomainKeyword(values) => match metadata.domain.as_deref() {
-            Some(domain) => values
-                .iter()
-                .any(|keyword| domain.contains(keyword.as_str())),
-            None => false,
-        },
-        RuleMatcher::IpCidr(values) => match metadata.destination.as_ref() {
-            Some(SocksAddr { host, .. }) => values.iter().any(|net| net.contains(host)),
-            None => false,
-        },
-    }
-}
-
 #[inline]
 fn match_list(values: &[String], actual: &str) -> bool {
     values.is_empty() || values.iter().any(|value| value == actual)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use async_trait::async_trait;
+    use hammer_adapter::{
+        ComponentMeta, Outbound, OutboundComponent, ProxyPacketConn, ProxyStream, RuntimeComponent,
+    };
+    use hammer_core::error::{CoreError, CoreResult};
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    struct StubOutbound;
+
+    impl StubOutbound {
+        fn component(id: &str) -> OutboundComponent {
+            let runtime: Arc<dyn Outbound> = Arc::new(Self);
+            RuntimeComponent::new(
+                ComponentMeta::new(
+                    "outbound",
+                    "stub",
+                    id,
+                    vec![Network::Tcp, Network::Udp],
+                    Vec::new(),
+                    None,
+                ),
+                runtime,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Outbound for StubOutbound {
+        async fn dial(
+            &self,
+            _network: Network,
+            _destination: SocksAddr,
+            _initial_payload: &[u8],
+        ) -> CoreResult<Box<dyn ProxyStream>> {
+            Err(CoreError::internal("stub outbound: dial not supported"))
+        }
+
+        async fn listen_packet(&self) -> CoreResult<Box<dyn ProxyPacketConn>> {
+            Err(CoreError::internal(
+                "stub outbound: listen_packet not supported",
+            ))
+        }
+    }
+
+    fn test_logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    fn route_options() -> RouteOptions {
+        RouteOptions {
+            final_: "final".to_owned(),
+            auto_detect_interface: true,
+            rules: Vec::new(),
+            default_domain_resolver: None,
+        }
+    }
+
+    fn outbound_manager() -> Arc<OutboundManager> {
+        let manager = OutboundManager::new(test_logger("outbound"), "final");
+        manager
+            .register_outbound(StubOutbound::component("final"))
+            .expect("register stub outbound");
+        Arc::new(manager)
+    }
+
+    #[test]
+    fn router_factory_registers_default_router_component() {
+        let router = RouterFactorySet::standard()
+            .build_default(
+                test_logger("router"),
+                route_options(),
+                outbound_manager(),
+                MetricsRegistry::new(),
+            )
+            .expect("build default router");
+        let mut metadata = RouteMetadata {
+            network: Network::Tcp,
+            ..Default::default()
+        };
+
+        let decision = router.match_route(&mut metadata).expect("match route");
+
+        assert_eq!(
+            decision,
+            RouteDecision::Route {
+                outbound: "final".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn router_factory_rejects_unknown_router_type() {
+        let result = RouterFactorySet::standard().build(
+            "missing",
+            test_logger("router"),
+            route_options(),
+            outbound_manager(),
+            MetricsRegistry::new(),
+        );
+        let err = match result {
+            Ok(_) => panic!("unknown router type unexpectedly built"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("unknown router type: missing"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn route_matcher_factory_registers_domain_suffix_matcher() {
+        let matcher = RouteMatcherFactorySet::standard()
+            .build(RuleMatcher::DomainSuffix(vec!["example.com".to_owned()]))
+            .expect("build domain suffix matcher");
+        let matching = RouteMetadata {
+            domain: Some("api.example.com".to_owned()),
+            ..Default::default()
+        };
+        let unrelated = RouteMetadata {
+            domain: Some("example.org".to_owned()),
+            ..Default::default()
+        };
+
+        assert!(matcher.matches(&matching));
+        assert!(!matcher.matches(&unrelated));
+    }
+
+    #[test]
+    fn route_matcher_factory_rejects_unknown_matcher_type() {
+        let result =
+            RouteMatcherFactorySet::standard().build_with_type("missing", RuleMatcher::Any);
+        let err = match result {
+            Ok(_) => panic!("unknown route matcher type unexpectedly built"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("unknown route matcher type: missing"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn route_matcher_builder_rejects_wrong_rule_matcher_variant() {
+        let result = RouteMatcherFactorySet::standard().build_with_type(
+            "domain_suffix",
+            RuleMatcher::Domain(vec!["example.com".to_owned()]),
+        );
+        let err = match result {
+            Ok(_) => panic!("wrong route matcher variant unexpectedly built"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("domain_suffix route matcher factory received domain options"),
+            "err = {err}"
+        );
+    }
 }

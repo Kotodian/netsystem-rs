@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use hammer_adapter::PlatformInterface;
-use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use rustls::client::WantsClientCert;
 use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier};
@@ -10,7 +10,7 @@ use rustls::{ClientConfig, ConfigBuilder, RootCertStore, WantsVerifier};
 pub(crate) fn client_verifier_builder(
     builder: ConfigBuilder<ClientConfig, WantsVerifier>,
     platform: Option<Arc<dyn PlatformInterface>>,
-) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, HammerError> {
+) -> HammerResult<ConfigBuilder<ClientConfig, WantsClientCert>> {
     client_verifier_builder_for_platform(builder, platform)
 }
 
@@ -18,7 +18,7 @@ pub(crate) fn client_verifier_builder(
 fn client_verifier_builder_for_platform(
     builder: ConfigBuilder<ClientConfig, WantsVerifier>,
     platform: Option<Arc<dyn PlatformInterface>>,
-) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, HammerError> {
+) -> HammerResult<ConfigBuilder<ClientConfig, WantsClientCert>> {
     let extra_roots = platform_root_certificates(platform);
     if extra_roots.is_empty() {
         use rustls_platform_verifier::BuilderVerifierExt;
@@ -40,7 +40,7 @@ fn client_verifier_builder_for_platform(
 fn client_verifier_builder_for_platform(
     builder: ConfigBuilder<ClientConfig, WantsVerifier>,
     platform: Option<Arc<dyn PlatformInterface>>,
-) -> Result<ConfigBuilder<ClientConfig, WantsClientCert>, HammerError> {
+) -> HammerResult<ConfigBuilder<ClientConfig, WantsClientCert>> {
     Ok(builder.with_root_certificates(root_cert_store(platform_root_certificates(platform))))
 }
 

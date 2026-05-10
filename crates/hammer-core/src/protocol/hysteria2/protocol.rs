@@ -1,7 +1,7 @@
 use std::io::{Cursor, Read};
 
+use crate::error::{HammerError, HammerResult};
 use bytes::{BufMut, Bytes, BytesMut};
-use hammer_core::error::HammerError;
 use http::HeaderMap;
 use rand::{Rng, distributions::Alphanumeric};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -80,7 +80,7 @@ impl UdpMessage {
         out.freeze()
     }
 
-    pub fn decode(input: Bytes) -> Result<Self, HammerError> {
+    pub fn decode(input: Bytes) -> HammerResult<Self> {
         let bytes = input.as_ref();
         if bytes.len() < 8 {
             return Err(HammerError::internal("short UDP message"));
@@ -165,7 +165,7 @@ pub fn encode_tcp_request(destination: &str, payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-pub fn decode_tcp_request(input: Bytes) -> Result<TcpRequest, HammerError> {
+pub fn decode_tcp_request(input: Bytes) -> HammerResult<TcpRequest> {
     let mut cursor = Cursor::new(input.as_ref());
     let frame_type = read_varint(&mut cursor)?;
     if frame_type != FRAME_TYPE_TCP_REQUEST {
@@ -204,7 +204,7 @@ pub fn encode_tcp_response(ok: bool, message: &str, payload: &[u8]) -> Bytes {
     out.freeze()
 }
 
-pub fn decode_tcp_response(input: Bytes) -> Result<TcpResponse, HammerError> {
+pub fn decode_tcp_response(input: Bytes) -> HammerResult<TcpResponse> {
     if input.is_empty() {
         return Err(HammerError::internal("short TCP response"));
     }
@@ -221,7 +221,7 @@ pub fn decode_tcp_response(input: Bytes) -> Result<TcpResponse, HammerError> {
 
 pub async fn read_tcp_request_header<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<TcpRequestHeader, HammerError> {
+) -> HammerResult<TcpRequestHeader> {
     let frame_type = read_varint_async(reader).await?;
     if frame_type != FRAME_TYPE_TCP_REQUEST {
         return Err(HammerError::internal(format!(
@@ -235,7 +235,7 @@ pub async fn read_tcp_request_header<R: AsyncRead + Unpin>(
 
 pub async fn read_tcp_response_header<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<TcpResponseHeader, HammerError> {
+) -> HammerResult<TcpResponseHeader> {
     let mut status = [0; 1];
     reader
         .read_exact(&mut status)
@@ -249,7 +249,7 @@ pub async fn read_tcp_response_header<R: AsyncRead + Unpin>(
     })
 }
 
-fn read_vstring(reader: &mut Cursor<&[u8]>) -> Result<String, HammerError> {
+fn read_vstring(reader: &mut Cursor<&[u8]>) -> HammerResult<String> {
     read_vstring_with_limit(reader, MAX_ADDRESS_LENGTH, false)
 }
 
@@ -257,7 +257,7 @@ fn read_vstring_with_limit(
     reader: &mut Cursor<&[u8]>,
     max: u64,
     allow_empty: bool,
-) -> Result<String, HammerError> {
+) -> HammerResult<String> {
     let len = read_varint(reader)?;
     if (!allow_empty && len == 0) || len > max {
         return Err(HammerError::internal("invalid string length"));
@@ -277,7 +277,7 @@ async fn read_vstring_async<R: AsyncRead + Unpin>(
     reader: &mut R,
     max: u64,
     allow_empty: bool,
-) -> Result<String, HammerError> {
+) -> HammerResult<String> {
     let len = read_varint_async(reader).await?;
     if (!allow_empty && len == 0) || len > max {
         return Err(HammerError::internal("invalid string length"));
@@ -290,7 +290,7 @@ async fn read_vstring_async<R: AsyncRead + Unpin>(
     String::from_utf8(buf).map_err(|err| HammerError::internal(format!("utf8 string: {err}")))
 }
 
-fn skip_padding(reader: &mut Cursor<&[u8]>) -> Result<(), HammerError> {
+fn skip_padding(reader: &mut Cursor<&[u8]>) -> HammerResult<()> {
     let len = read_varint(reader)?;
     if len > MAX_PADDING_LENGTH {
         return Err(HammerError::internal("invalid padding length"));
@@ -303,7 +303,7 @@ fn skip_padding(reader: &mut Cursor<&[u8]>) -> Result<(), HammerError> {
     Ok(())
 }
 
-async fn skip_padding_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), HammerError> {
+async fn skip_padding_async<R: AsyncRead + Unpin>(reader: &mut R) -> HammerResult<()> {
     let len = read_varint_async(reader).await?;
     if len > MAX_PADDING_LENGTH {
         return Err(HammerError::internal("invalid padding length"));
@@ -316,7 +316,7 @@ async fn skip_padding_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(), 
     Ok(())
 }
 
-fn read_varint(reader: &mut Cursor<&[u8]>) -> Result<u64, HammerError> {
+fn read_varint(reader: &mut Cursor<&[u8]>) -> HammerResult<u64> {
     let mut first = [0; 1];
     Read::read_exact(reader, &mut first)
         .map_err(|err| HammerError::internal(format!("read varint: {err}")))?;
@@ -331,7 +331,7 @@ fn read_varint(reader: &mut Cursor<&[u8]>) -> Result<u64, HammerError> {
     Ok(u64::from_be_bytes(bytes) >> ((8 - len) * 8))
 }
 
-async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<u64, HammerError> {
+async fn read_varint_async<R: AsyncRead + Unpin>(reader: &mut R) -> HammerResult<u64> {
     let mut first = [0; 1];
     reader
         .read_exact(&mut first)

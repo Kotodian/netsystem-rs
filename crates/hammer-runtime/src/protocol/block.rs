@@ -3,10 +3,16 @@ use tracing::info;
 use async_trait::async_trait;
 use hammer_adapter::{Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr};
 use hammer_core::config::OutboundKind;
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use std::sync::Arc;
 
+#[hammer_component_macros::hammer_component(
+    outbound,
+    name = "block",
+    builder = build_outbound,
+    metrics = ("outbound", "outbound")
+)]
 pub struct BlockOutbound {
     id: String,
     networks: Vec<Network>,
@@ -28,7 +34,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     _protector: crate::socket_protector::SocketProtector,
-) -> Result<Arc<dyn Outbound>, HammerError> {
+) -> HammerResult<Arc<BlockOutbound>> {
     match kind {
         OutboundKind::Block => Ok(Arc::new(BlockOutbound::new(logger, id))),
         _ => Err(HammerError::internal(
@@ -39,35 +45,19 @@ pub(crate) fn build_outbound(
 
 #[async_trait]
 impl Outbound for BlockOutbound {
-    fn type_name(&self) -> &str {
-        "block"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
     async fn dial(
         &self,
         _network: Network,
         destination: SocksAddr,
         _initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+    ) -> HammerResult<Box<dyn ProxyStream>> {
         info!("blocked connection to {destination}");
         Err(HammerError::internal(format!(
             "blocked connection to {destination}"
         )))
     }
 
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+    async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
         info!("blocked packet connection");
         Err(HammerError::internal("blocked packet connection"))
     }

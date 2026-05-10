@@ -5,17 +5,25 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hammer_adapter::{
-    IcmpReply, Lifecycle, Network, Outbound, OutboundManager as OutboundManagerTrait,
-    PlatformInterface, ProbeReport, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
-    SocksAddr,
+    ComponentMeta, ComponentMetadata, IcmpReply, Lifecycle, Network, Outbound, OutboundComponent,
+    OutboundManager as OutboundManagerTrait, ProbeReport, ProxyDatagram, ProxyIcmpConn,
+    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricCounter, MetricsRegistry, MetricsScope, NetworkCounters};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::RuntimePlatform;
+#[cfg(any(
+    feature = "outbound-hysteria2",
+    feature = "outbound-direct",
+    feature = "outbound-block",
+    feature = "outbound-urltest"
+))]
+use crate::component_registry::register_components;
 use crate::socket_protector::SocketProtector;
 
 #[cfg(feature = "outbound-block")]
@@ -23,8 +31,27 @@ pub use crate::protocol::block::BlockOutbound;
 #[cfg(feature = "outbound-direct")]
 pub use crate::protocol::direct::DirectOutbound;
 
-type OutboundBuilder =
-    fn(Logger, String, &OutboundKind, SocketProtector) -> Result<Arc<dyn Outbound>, HammerError>;
+pub(crate) type OutboundBuilder =
+    fn(Logger, String, &OutboundKind, SocketProtector) -> HammerResult<OutboundComponent>;
+
+pub struct OutboundRegistration(OutboundComponent);
+
+impl From<OutboundComponent> for OutboundRegistration {
+    fn from(outbound: OutboundComponent) -> Self {
+        Self(outbound)
+    }
+}
+
+impl<T> From<Arc<T>> for OutboundRegistration
+where
+    T: Outbound + ComponentMetadata + 'static,
+{
+    fn from(outbound: Arc<T>) -> Self {
+        let meta = ComponentMetadata::component_meta(outbound.as_ref());
+        let runtime: Arc<dyn Outbound> = outbound;
+        Self(RuntimeComponent::new(meta, runtime))
+    }
+}
 
 #[derive(Clone)]
 struct OutboundFactorySet {
@@ -45,7 +72,7 @@ impl OutboundFactorySet {
         logger: Logger,
         option: &OutboundOptions,
         protector: SocketProtector,
-    ) -> Result<Arc<dyn Outbound>, HammerError> {
+    ) -> HammerResult<OutboundComponent> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown outbound type: {type_name}"))
@@ -57,32 +84,30 @@ impl OutboundFactorySet {
 #[allow(unused_variables)]
 fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, OutboundBuilder>) {
     #[cfg(feature = "outbound-hysteria2")]
-    builders.insert(
-        "hysteria2",
-        crate::protocol::hysteria2::build_outbound as OutboundBuilder,
+    register_components!(
+        outbound,
+        builders,
+        [crate::protocol::hysteria2::Hysteria2Outbound]
     );
     #[cfg(feature = "outbound-direct")]
-    builders.insert(
-        "direct",
-        crate::protocol::direct::build_outbound as OutboundBuilder,
+    register_components!(
+        outbound,
+        builders,
+        [crate::protocol::direct::DirectOutbound]
     );
     #[cfg(feature = "outbound-block")]
-    builders.insert(
-        "block",
-        crate::protocol::block::build_outbound as OutboundBuilder,
-    );
+    register_components!(outbound, builders, [crate::protocol::block::BlockOutbound]);
     #[cfg(feature = "outbound-urltest")]
-    builders.insert(
-        "urltest",
-        crate::protocol::urltest::build_outbound as OutboundBuilder,
+    register_components!(
+        outbound,
+        builders,
+        [crate::protocol::urltest::UrltestOutbound]
     );
 }
 
-/// `out.Manager` port. DNS is routed through DnsRouter/DnsTransport instead of
-/// a dialable outbound.
 pub struct OutboundManager {
     logger: Logger,
-    items: Mutex<HashMap<String, Arc<dyn Outbound>>>,
+    items: Mutex<HashMap<String, OutboundComponent>>,
     default_id: String,
     factories: OutboundFactorySet,
     metrics: Arc<MetricsRegistry>,
@@ -111,7 +136,7 @@ impl OutboundManager {
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
         Self::from_options_with_protector(logger, default_id, options, SocketProtector::default())
     }
 
@@ -119,13 +144,13 @@ impl OutboundManager {
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
-        platform: Arc<dyn PlatformInterface>,
-    ) -> Result<Self, HammerError> {
+        platform: impl Into<RuntimePlatform>,
+    ) -> HammerResult<Self> {
         Self::from_options_with_protector(
             logger,
             default_id,
             options,
-            SocketProtector::new(platform),
+            SocketProtector::from(platform.into()),
         )
     }
 
@@ -133,14 +158,14 @@ impl OutboundManager {
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
-        platform: Arc<dyn PlatformInterface>,
+        platform: impl Into<RuntimePlatform>,
         metrics: Arc<MetricsRegistry>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
         Self::from_options_with_protector_and_metrics(
             logger,
             default_id,
             options,
-            SocketProtector::new(platform),
+            SocketProtector::from(platform.into()),
             metrics,
         )
     }
@@ -149,8 +174,8 @@ impl OutboundManager {
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
-        protector: SocketProtector,
-    ) -> Result<Self, HammerError> {
+        protector: impl Into<SocketProtector>,
+    ) -> HammerResult<Self> {
         Self::from_options_with_protector_and_metrics(
             logger,
             default_id,
@@ -164,9 +189,10 @@ impl OutboundManager {
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
-        protector: SocketProtector,
+        protector: impl Into<SocketProtector>,
         metrics: Arc<MetricsRegistry>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
+        let protector = protector.into();
         let manager = Self::new_with_metrics(logger, default_id, metrics);
         for option in options {
             manager.register_descriptor_with_protector(option, protector.clone())?;
@@ -174,13 +200,13 @@ impl OutboundManager {
         Ok(manager)
     }
 
-    pub fn register_descriptor(&self, option: &OutboundOptions) -> Result<(), HammerError> {
+    pub fn register_descriptor(&self, option: &OutboundOptions) -> HammerResult<()> {
         self.register_descriptor_with_protector(option, SocketProtector::default())
     }
 
     pub fn reset_network(&self) {
         for outbound in self.list() {
-            outbound.reset();
+            outbound.runtime().reset();
         }
     }
 
@@ -195,16 +221,17 @@ impl OutboundManager {
     /// two views.
     pub fn register_outbound(
         &self,
-        id: String,
-        descriptor: Arc<dyn Outbound>,
-    ) -> Result<(), HammerError> {
+        component: impl Into<OutboundRegistration>,
+    ) -> HammerResult<()> {
+        let component = component.into().0;
+        let id = component.meta().id().to_owned();
         let mut items = self.items.lock().expect("OutboundManager poisoned");
         if items.contains_key(&id) {
             return Err(HammerError::config_validation(format!(
                 "duplicate outbound id: {id}"
             )));
         }
-        let wrapped = self.wrap_outbound(&id, descriptor);
+        let wrapped = self.wrap_outbound(component.meta().clone(), component.into_runtime());
         items.insert(id, wrapped);
         Ok(())
     }
@@ -212,8 +239,9 @@ impl OutboundManager {
     fn register_descriptor_with_protector(
         &self,
         option: &OutboundOptions,
-        protector: SocketProtector,
-    ) -> Result<(), HammerError> {
+        protector: impl Into<SocketProtector>,
+    ) -> HammerResult<()> {
+        let protector = protector.into();
         let descriptor = self
             .factories
             .build(self.logger.clone(), option, protector)?;
@@ -224,16 +252,21 @@ impl OutboundManager {
                 option.id
             )));
         }
-        let descriptor = self.wrap_outbound(&option.id, descriptor);
+        let descriptor = self.wrap_outbound(descriptor.meta().clone(), descriptor.into_runtime());
         items.insert(option.id.clone(), descriptor);
         Ok(())
     }
 
-    fn wrap_outbound(&self, id: &str, outbound: Arc<dyn Outbound>) -> Arc<dyn Outbound> {
-        Arc::new(InstrumentedOutbound::new(
+    fn wrap_outbound(&self, meta: ComponentMeta, outbound: Arc<dyn Outbound>) -> OutboundComponent {
+        let metrics = meta.metrics();
+        let module = metrics.map_or("outbound", |m| m.module);
+        let component_type = metrics.map_or("outbound", |m| m.component_type);
+        let id = meta.id().to_owned();
+        let runtime: Arc<dyn Outbound> = Arc::new(InstrumentedOutbound::new(
             outbound,
-            self.metrics.scope("outbound", "outbound", id),
-        ))
+            self.metrics.scope(module, component_type, id),
+        ));
+        RuntimeComponent::new(meta, runtime)
     }
 
     /// Inject this manager (as a `Weak<dyn OutboundManager>`) into every
@@ -250,12 +283,12 @@ impl OutboundManager {
         let resolver: Weak<dyn OutboundManagerTrait> = weak;
         let items = self.items.lock().expect("OutboundManager poisoned");
         for outbound in items.values() {
-            outbound.bind_resolver(resolver.clone());
+            outbound.runtime().bind_resolver(resolver.clone());
         }
     }
 
     fn spawn_post_start_hooks(&self) {
-        let items: Vec<Arc<dyn Outbound>> = self
+        let items: Vec<OutboundComponent> = self
             .items
             .lock()
             .expect("OutboundManager poisoned")
@@ -263,22 +296,24 @@ impl OutboundManager {
             .cloned()
             .collect();
         for outbound in items {
-            let id = outbound.id().to_owned();
+            let id = outbound.meta().id().to_owned();
+            let runtime = Arc::clone(outbound.runtime());
             let logger = self.logger.clone();
             crate::spawn::spawn(async move {
-                if let Err(err) = outbound.post_start().await {
+                if let Err(err) = runtime.post_start().await {
                     logger.warn(format!("outbound '{id}' post_start: {err}"));
                 }
             });
         }
     }
 
-    fn spawn_ensure_connected_hooks(&self, items: Vec<Arc<dyn Outbound>>) {
+    fn spawn_ensure_connected_hooks(&self, items: Vec<OutboundComponent>) {
         for outbound in items {
-            let id = outbound.id().to_owned();
+            let id = outbound.meta().id().to_owned();
+            let runtime = Arc::clone(outbound.runtime());
             let logger = self.logger.clone();
             crate::spawn::spawn(async move {
-                if let Err(err) = outbound.ensure_connected().await {
+                if let Err(err) = runtime.ensure_connected().await {
                     logger.warn(format!("outbound '{id}' ensure_connected: {err}"));
                 }
             });
@@ -302,27 +337,11 @@ impl InstrumentedOutbound {
 
 #[async_trait::async_trait]
 impl Outbound for InstrumentedOutbound {
-    fn type_name(&self) -> &str {
-        self.inner.type_name()
-    }
-
-    fn id(&self) -> &str {
-        self.inner.id()
-    }
-
-    fn networks(&self) -> &[Network] {
-        self.inner.networks()
-    }
-
-    fn dependencies(&self) -> &[String] {
-        self.inner.dependencies()
-    }
-
     fn reset(&self) {
         self.inner.reset();
     }
 
-    async fn ensure_connected(&self) -> Result<(), HammerError> {
+    async fn ensure_connected(&self) -> HammerResult<()> {
         match self.inner.ensure_connected().await {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -337,7 +356,7 @@ impl Outbound for InstrumentedOutbound {
         network: Network,
         destination: SocksAddr,
         initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+    ) -> HammerResult<Box<dyn ProxyStream>> {
         match self.inner.dial(network, destination, initial_payload).await {
             Ok(stream) => Ok(Box::new(InstrumentedProxyStream::new(
                 stream,
@@ -350,7 +369,7 @@ impl Outbound for InstrumentedOutbound {
         }
     }
 
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+    async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
         match self.inner.listen_packet().await {
             Ok(conn) => Ok(Box::new(InstrumentedPacketConn {
                 inner: conn,
@@ -363,18 +382,14 @@ impl Outbound for InstrumentedOutbound {
         }
     }
 
-    async fn listen_icmp(&self) -> Result<Box<dyn ProxyIcmpConn>, HammerError> {
+    async fn listen_icmp(&self) -> HammerResult<Box<dyn ProxyIcmpConn>> {
         match self.inner.listen_icmp().await {
             Ok(conn) => Ok(Box::new(InstrumentedIcmpConn { inner: conn })),
             Err(err) => Err(err),
         }
     }
 
-    async fn probe_latency(
-        &self,
-        protocol: &str,
-        timeout: Duration,
-    ) -> Result<Duration, HammerError> {
+    async fn probe_latency(&self, protocol: &str, timeout: Duration) -> HammerResult<Duration> {
         match self.inner.probe_latency(protocol, timeout).await {
             Ok(duration) => Ok(duration),
             Err(err) => {
@@ -384,7 +399,7 @@ impl Outbound for InstrumentedOutbound {
         }
     }
 
-    async fn post_start(&self) -> Result<(), HammerError> {
+    async fn post_start(&self) -> HammerResult<()> {
         match self.inner.post_start().await {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -406,7 +421,7 @@ impl Outbound for InstrumentedOutbound {
         self.inner.bind_resolver(resolver);
     }
 
-    async fn probe_group(&self, timeout: Duration) -> Result<Vec<ProbeReport>, HammerError> {
+    async fn probe_group(&self, timeout: Duration) -> HammerResult<Vec<ProbeReport>> {
         match self.inner.probe_group(timeout).await {
             Ok(reports) => Ok(reports),
             Err(err) => {
@@ -512,7 +527,7 @@ struct InstrumentedPacketConn {
 
 #[async_trait::async_trait]
 impl ProxyPacketConn for InstrumentedPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
         match self.inner.send_to(destination, payload).await {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -522,7 +537,7 @@ impl ProxyPacketConn for InstrumentedPacketConn {
         }
     }
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
         match self.inner.recv_from().await {
             Ok(datagram) => Ok(datagram),
             Err(err) => {
@@ -539,18 +554,14 @@ struct InstrumentedIcmpConn {
 
 #[async_trait::async_trait]
 impl ProxyIcmpConn for InstrumentedIcmpConn {
-    async fn send_echo(
-        &mut self,
-        destination: std::net::IpAddr,
-        body: &[u8],
-    ) -> Result<(), HammerError> {
+    async fn send_echo(&mut self, destination: std::net::IpAddr, body: &[u8]) -> HammerResult<()> {
         match self.inner.send_echo(destination, body).await {
             Ok(()) => Ok(()),
             Err(err) => Err(err),
         }
     }
 
-    async fn recv_reply(&mut self) -> Result<IcmpReply, HammerError> {
+    async fn recv_reply(&mut self) -> HammerResult<IcmpReply> {
         match self.inner.recv_reply().await {
             Ok(reply) => Ok(reply),
             Err(err) => Err(err),
@@ -563,7 +574,7 @@ impl Lifecycle for OutboundManager {
         "outbound"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         tracing::debug!(target: "outbound", "stage {}", stage.name());
         if stage == StartStage::PostStart {
             self.spawn_post_start_hooks();
@@ -571,7 +582,7 @@ impl Lifecycle for OutboundManager {
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         self.reset_network();
         tracing::debug!(target: "outbound", "close");
         Ok(())
@@ -579,7 +590,7 @@ impl Lifecycle for OutboundManager {
 }
 
 impl OutboundManagerTrait for OutboundManager {
-    fn list(&self) -> Vec<Arc<dyn Outbound>> {
+    fn list(&self) -> Vec<OutboundComponent> {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
@@ -588,7 +599,7 @@ impl OutboundManagerTrait for OutboundManager {
             .collect()
     }
 
-    fn get(&self, id: &str) -> Option<Arc<dyn Outbound>> {
+    fn get(&self, id: &str) -> Option<OutboundComponent> {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
@@ -596,14 +607,14 @@ impl OutboundManagerTrait for OutboundManager {
             .cloned()
     }
 
-    fn default(&self) -> Option<Arc<dyn Outbound>> {
+    fn default(&self) -> Option<OutboundComponent> {
         if self.default_id.is_empty() {
             return None;
         }
         self.get(&self.default_id)
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("OutboundManager poisoned")
@@ -618,12 +629,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
-    use hammer_adapter::Network;
-    use hammer_core::error::CoreError;
+    use hammer_adapter::{ComponentMeta, Network, RuntimeComponent};
+    use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::log::{DiscardWriter, Factory};
 
     fn test_logger(id: &str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    #[cfg(feature = "outbound-direct")]
+    #[test]
+    fn register_outbound_accepts_concrete_component_arc() {
+        let manager = OutboundManager::new(test_logger("outbound-manager"), "direct-arc");
+        let outbound = Arc::new(crate::protocol::direct::DirectOutbound::new(
+            test_logger("direct"),
+            "direct-arc",
+        ));
+
+        manager
+            .register_outbound(Arc::clone(&outbound))
+            .expect("register concrete outbound");
+
+        let registered = manager.get("direct-arc").expect("registered outbound");
+        assert_eq!(registered.type_name(), "direct");
     }
 
     /// Bare-bones Outbound that only counts how many times `reset` was called
@@ -632,41 +660,35 @@ mod tests {
     /// previously skipped this fan-out, leaving cached hysteria2 clients stale
     /// after iOS sleep/wake.
     struct CountingOutbound {
-        id: String,
-        networks: Vec<Network>,
-        dependencies: Vec<String>,
         resets: AtomicUsize,
     }
 
     impl CountingOutbound {
         fn arc(id: &str) -> Arc<Self> {
+            let _ = id;
             Arc::new(Self {
-                id: id.to_owned(),
-                networks: vec![Network::Tcp],
-                dependencies: Vec::new(),
                 resets: AtomicUsize::new(0),
             })
+        }
+
+        fn component(id: &str, outbound: Arc<Self>) -> OutboundComponent {
+            let runtime: Arc<dyn Outbound> = outbound;
+            RuntimeComponent::new(
+                ComponentMeta::new(
+                    "outbound",
+                    "counting",
+                    id,
+                    vec![Network::Tcp],
+                    Vec::new(),
+                    None,
+                ),
+                runtime,
+            )
         }
     }
 
     #[async_trait::async_trait]
     impl Outbound for CountingOutbound {
-        fn type_name(&self) -> &str {
-            "counting"
-        }
-
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        fn networks(&self) -> &[Network] {
-            &self.networks
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &self.dependencies
-        }
-
         fn reset(&self) {
             self.resets.fetch_add(1, Ordering::SeqCst);
         }
@@ -676,11 +698,11 @@ mod tests {
             _network: Network,
             _destination: SocksAddr,
             _initial_payload: &[u8],
-        ) -> Result<Box<dyn ProxyStream>, CoreError> {
+        ) -> CoreResult<Box<dyn ProxyStream>> {
             Err(CoreError::internal("counting outbound: dial not supported"))
         }
 
-        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, CoreError> {
+        async fn listen_packet(&self) -> CoreResult<Box<dyn ProxyPacketConn>> {
             Err(CoreError::internal(
                 "counting outbound: listen_packet not supported",
             ))
@@ -693,10 +715,10 @@ mod tests {
         let a = CountingOutbound::arc("a");
         let b = CountingOutbound::arc("b");
         manager
-            .register_outbound("a".into(), a.clone() as Arc<dyn Outbound>)
+            .register_outbound(CountingOutbound::component("a", Arc::clone(&a)))
             .expect("register outbound a");
         manager
-            .register_outbound("b".into(), b.clone() as Arc<dyn Outbound>)
+            .register_outbound(CountingOutbound::component("b", Arc::clone(&b)))
             .expect("register outbound b");
 
         manager.reset_network();

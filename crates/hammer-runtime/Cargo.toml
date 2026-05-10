@@ -83,11 +83,12 @@ wireguard = [
 # Generic user-space TCP/IP stack on top of an arbitrary IP carrier. Currently
 # consumed only by the WireGuard outbound; the TUN inbound's smoltcp mode will
 # share it once it lands. Off by default to keep the iOS xcframework slim.
-ipstack = ["dep:smoltcp", "dep:rustc-hash"]
+ipstack = ["hammer-core/ipstack"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
+hammer-component-macros = { path = "../hammer-component-macros" }
 async-trait = { workspace = true }
 boringtun = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
@@ -112,13 +113,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-derive = { workspace = true }
-smoltcp = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
 libc = { workspace = true, optional = true }
 lru = { workspace = true }
-rustc-hash = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 rustls-platform-verifier = { workspace = true, optional = true }

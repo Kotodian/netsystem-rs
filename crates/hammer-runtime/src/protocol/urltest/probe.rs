@@ -12,14 +12,15 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{Network, Outbound, PlatformInterface, ProxyStream, SocksAddr};
-use hammer_core::error::HammerError;
+use hammer_adapter::{Network, OutboundComponent, PlatformInterface, ProxyStream, SocksAddr};
+use hammer_core::error::{HammerError, HammerResult};
 use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 use url::Url;
 
+use crate::RuntimePlatform;
 use crate::tls_support::client_verifier_builder;
 
 /// Maximum bytes of response head we will buffer before bailing — gstatic and
@@ -45,10 +46,15 @@ impl HttpUrltestProbe {
     /// Build a probe targeting `url`. `https://` URLs build a `ClientConfig`
     /// up-front so every call reuses the same root store; `http://` URLs
     /// skip the TLS plumbing entirely.
-    pub fn new(
-        url: Url,
-        platform: Option<Arc<dyn PlatformInterface>>,
-    ) -> Result<Self, HammerError> {
+    pub fn new(url: Url) -> HammerResult<Self> {
+        Self::build(url, None)
+    }
+
+    pub fn new_with_platform(url: Url, platform: impl Into<RuntimePlatform>) -> HammerResult<Self> {
+        Self::build(url, Some(platform.into().into_inner()))
+    }
+
+    fn build(url: Url, platform: Option<Arc<dyn PlatformInterface>>) -> HammerResult<Self> {
         let scheme = url.scheme();
         let use_tls = match scheme {
             "https" => true,
@@ -104,9 +110,9 @@ impl HttpUrltestProbe {
     /// parsed; on any I/O error returns `Err` carrying the underlying cause.
     pub async fn measure(
         &self,
-        outbound: &Arc<dyn Outbound>,
+        outbound: &OutboundComponent,
         timeout: Duration,
-    ) -> Result<Duration, HammerError> {
+    ) -> HammerResult<Duration> {
         let work = async {
             let start = Instant::now();
             // The fallback IP is a sentinel; outbounds that honor `domain`
@@ -114,7 +120,7 @@ impl HttpUrltestProbe {
             // resolves via the OS resolver). 0.0.0.0 is never routable.
             let dest =
                 SocksAddr::domain(self.host.clone(), Ipv4Addr::UNSPECIFIED.into(), self.port);
-            let stream = outbound.dial(Network::Tcp, dest, &[]).await?;
+            let stream = outbound.runtime().dial(Network::Tcp, dest, &[]).await?;
             self.run_http_head(stream).await?;
             Ok::<Duration, HammerError>(start.elapsed())
         };
@@ -122,12 +128,12 @@ impl HttpUrltestProbe {
             Ok(result) => result,
             Err(_) => Err(HammerError::internal(format!(
                 "urltest probe timed out for outbound: {}",
-                outbound.id()
+                outbound.meta().id()
             ))),
         }
     }
 
-    async fn run_http_head(&self, stream: Box<dyn ProxyStream>) -> Result<(), HammerError> {
+    async fn run_http_head(&self, stream: Box<dyn ProxyStream>) -> HammerResult<()> {
         if self.use_tls {
             let connector =
                 TlsConnector::from(self.tls.clone().expect("tls config present on https probe"));
@@ -145,7 +151,7 @@ impl HttpUrltestProbe {
         }
     }
 
-    async fn exchange_head<S>(&self, mut stream: S) -> Result<(), HammerError>
+    async fn exchange_head<S>(&self, mut stream: S) -> HammerResult<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
@@ -237,8 +243,10 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use hammer_adapter::{Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr};
-    use hammer_core::error::HammerError;
+    use hammer_adapter::{
+        ComponentMeta, Network, Outbound, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
+    };
+    use hammer_core::error::{HammerError, HammerResult};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
     use super::*;
@@ -259,28 +267,12 @@ mod tests {
 
     #[async_trait]
     impl Outbound for ScriptedOutbound {
-        fn type_name(&self) -> &str {
-            "scripted"
-        }
-
-        fn id(&self) -> &str {
-            "scripted"
-        }
-
-        fn networks(&self) -> &[Network] {
-            &[Network::Tcp]
-        }
-
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
-
         async fn dial(
             &self,
             _network: Network,
             _destination: SocksAddr,
             _initial_payload: &[u8],
-        ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        ) -> HammerResult<Box<dyn ProxyStream>> {
             self.client_half
                 .lock()
                 .await
@@ -288,21 +280,33 @@ mod tests {
                 .ok_or_else(|| HammerError::internal("scripted outbound dialed twice"))
         }
 
-        async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
             Err(HammerError::internal("scripted outbound: udp unsupported"))
         }
+    }
+
+    fn scripted_component(outbound: Arc<dyn Outbound>) -> OutboundComponent {
+        RuntimeComponent::new(
+            ComponentMeta::new(
+                "outbound",
+                "scripted",
+                "scripted",
+                vec![Network::Tcp],
+                Vec::new(),
+                None,
+            ),
+            outbound,
+        )
     }
 
     #[tokio::test]
     async fn measure_parses_status_line_and_returns_elapsed() {
         let (client_side, mut test_side) = duplex(4096);
-        let outbound: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new(Box::new(client_side)));
+        let outbound = scripted_component(Arc::new(ScriptedOutbound::new(Box::new(client_side))));
 
-        let probe = HttpUrltestProbe::new(
-            Url::parse("http://example.test/probe").expect("valid url"),
-            None,
-        )
-        .expect("plain http probe builds");
+        let probe =
+            HttpUrltestProbe::new(Url::parse("http://example.test/probe").expect("valid url"))
+                .expect("plain http probe builds");
 
         let measure = tokio::spawn(async move {
             probe
@@ -337,11 +341,10 @@ mod tests {
     #[tokio::test]
     async fn measure_rejects_5xx_status() {
         let (client_side, mut test_side) = duplex(4096);
-        let outbound: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new(Box::new(client_side)));
+        let outbound = scripted_component(Arc::new(ScriptedOutbound::new(Box::new(client_side))));
 
-        let probe =
-            HttpUrltestProbe::new(Url::parse("http://example.test/").expect("valid url"), None)
-                .expect("plain http probe builds");
+        let probe = HttpUrltestProbe::new(Url::parse("http://example.test/").expect("valid url"))
+            .expect("plain http probe builds");
 
         let measure =
             tokio::spawn(async move { probe.measure(&outbound, Duration::from_secs(2)).await });

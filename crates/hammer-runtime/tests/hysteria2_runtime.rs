@@ -270,7 +270,7 @@ async fn outbound_reset_during_initial_connect_discards_stale_client() {
     .expect("outbound manager");
 
     let outbound = manager.get("hysteria2").expect("hysteria2 outbound");
-    let dial_outbound = Arc::clone(&outbound);
+    let dial_outbound = outbound.clone();
     let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)), 80);
     let dial = tokio::spawn(async move {
         dial_outbound

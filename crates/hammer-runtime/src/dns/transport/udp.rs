@@ -2,16 +2,18 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hammer_adapter::{DnsTransport, Lifecycle, OutboundManager as _, StartStage};
+use hammer_adapter::{
+    DnsTransport, DnsTransportComponent, Lifecycle, OutboundManager as _, StartStage,
+};
 use hammer_core::config::{DnsServerKind, RemoteDnsServer};
-use hammer_core::error::{HammerError, WithContext};
+use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
+use hammer_core::protocol::dns::MessageExt;
 use hickory_proto::op::Message;
 use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 use crate::OutboundManager;
-use crate::dns::MessageExt;
 use crate::socket_protector::SocketProtector;
 
 use super::tcp::{tcp_exchange_direct, tcp_exchange_via_or_direct};
@@ -19,6 +21,12 @@ use super::{
     dependency_with_bootstrap, destination_via_bootstrap, resolve_first, udp_exchange_via,
 };
 
+#[hammer_component_macros::hammer_component(
+    dns_transport,
+    name = "udp",
+    builder = build_transport,
+    metrics = ("dns", "transport")
+)]
 pub struct UdpDnsTransport {
     id: String,
     server: String,
@@ -26,7 +34,7 @@ pub struct UdpDnsTransport {
     via: String,
     dependencies: Vec<String>,
     outbound: Option<Arc<OutboundManager>>,
-    bootstrap: Option<Arc<dyn DnsTransport>>,
+    bootstrap: Option<DnsTransportComponent>,
     protector: SocketProtector,
 }
 
@@ -49,7 +57,7 @@ impl UdpDnsTransport {
         options: &RemoteDnsServer,
         _logger: Logger,
         outbound: Option<Arc<OutboundManager>>,
-        bootstrap: Option<Arc<dyn DnsTransport>>,
+        bootstrap: Option<DnsTransportComponent>,
         protector: SocketProtector,
     ) -> Self {
         Self {
@@ -70,9 +78,9 @@ pub(crate) fn build_transport(
     kind: &DnsServerKind,
     logger: Logger,
     outbound: Option<Arc<OutboundManager>>,
-    bootstrap: Option<Arc<dyn DnsTransport>>,
+    bootstrap: Option<DnsTransportComponent>,
     protector: SocketProtector,
-) -> Result<Arc<dyn DnsTransport>, HammerError> {
+) -> HammerResult<Arc<UdpDnsTransport>> {
     match kind {
         DnsServerKind::Udp(options) => Ok(Arc::new(UdpDnsTransport::new_with_runtime(
             id, options, logger, outbound, bootstrap, protector,
@@ -87,7 +95,7 @@ impl Lifecycle for UdpDnsTransport {
     fn name(&self) -> &str {
         "dns/transport/udp"
     }
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         if stage != StartStage::Start || self.via.is_empty() {
             return Ok(());
         }
@@ -101,32 +109,23 @@ impl Lifecycle for UdpDnsTransport {
                 debug!("dns udp warm-up skipped server={id} via={via}: outbound not found");
                 return;
             };
-            match outbound.listen_packet().await {
+            match outbound.runtime().listen_packet().await {
                 Ok(_conn) => debug!("dns udp warm-up ready server={id} via={via}"),
                 Err(err) => debug!("dns udp warm-up failed server={id} via={via}: {err}"),
             }
         });
         Ok(())
     }
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         Ok(())
     }
 }
 
 #[async_trait]
 impl DnsTransport for UdpDnsTransport {
-    fn type_name(&self) -> &str {
-        "udp"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
     fn reset(&self) {}
 
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+    async fn exchange(&self, message: Message) -> HammerResult<Message> {
         if !self.via.is_empty() {
             let server =
                 destination_via_bootstrap(self.bootstrap.as_ref(), &self.server, self.port).await?;

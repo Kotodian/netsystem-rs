@@ -6,9 +6,10 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport, Lifecycle, Network,
-    NetworkInterface, Outbound as AdapterOutbound, OutboundManager as _, PlatformInterface,
-    ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr, StartStage, TunOptions, WifiState,
+    ComponentMeta, DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport,
+    DnsTransportComponent, Lifecycle, Network, NetworkInterface, Outbound as AdapterOutbound,
+    OutboundComponent, OutboundManager as _, PlatformInterface, ProxyDatagram, ProxyPacketConn,
+    ProxyStream, RuntimeComponent, SocksAddr, StartStage, TunOptions, WifiState,
 };
 use hammer_core::config::{self, DomainStrategy};
 use hammer_core::error::HammerError;
@@ -24,6 +25,37 @@ use tokio::net::{TcpListener, UdpSocket};
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+fn dns_transport_component<T>(
+    id: &str,
+    type_name: &'static str,
+    transport: Arc<T>,
+) -> DnsTransportComponent
+where
+    T: DnsTransport + 'static,
+{
+    let runtime: Arc<dyn DnsTransport> = transport;
+    RuntimeComponent::new(
+        ComponentMeta::new("dns_transport", type_name, id, Vec::new(), Vec::new(), None),
+        runtime,
+    )
+}
+
+fn outbound_component<T>(
+    id: &str,
+    type_name: &'static str,
+    networks: Vec<Network>,
+    outbound: Arc<T>,
+) -> OutboundComponent
+where
+    T: AdapterOutbound + 'static,
+{
+    let runtime: Arc<dyn AdapterOutbound> = outbound;
+    RuntimeComponent::new(
+        ComponentMeta::new("outbound", type_name, id, networks, Vec::new(), None),
+        runtime,
+    )
 }
 
 fn query(name: &str, record_type: RecordType) -> Message {
@@ -158,18 +190,6 @@ impl Lifecycle for IndexedTransport {
 
 #[async_trait]
 impl DnsTransport for IndexedTransport {
-    fn type_name(&self) -> &str {
-        "mock"
-    }
-
-    fn id(&self) -> &str {
-        "indexed"
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
@@ -213,22 +233,6 @@ struct CapturingPacketConn {
 
 #[async_trait]
 impl AdapterOutbound for CapturingOutbound {
-    fn type_name(&self) -> &str {
-        "capture"
-    }
-
-    fn id(&self) -> &str {
-        "proxy"
-    }
-
-    fn networks(&self) -> &[hammer_adapter::Network] {
-        &[Network::Udp]
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     async fn dial(
         &self,
         _network: Network,
@@ -269,18 +273,6 @@ impl ProxyPacketConn for CapturingPacketConn {
 
 #[async_trait]
 impl DnsTransport for CountingTransport {
-    fn type_name(&self) -> &str {
-        "mock"
-    }
-
-    fn id(&self) -> &str {
-        "mock"
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
@@ -325,11 +317,12 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
         60,
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
     ));
+    let transport_component = dns_transport_component("mock", "mock", Arc::clone(&transport));
     let client = DnsClient::new(logger("dns"));
 
     let first = client
         .lookup(
-            transport.as_ref(),
+            &transport_component,
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -340,7 +333,7 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
         .unwrap();
     let second = client
         .lookup(
-            transport.as_ref(),
+            &transport_component,
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -356,7 +349,7 @@ async fn dns_client_caches_by_transport_question_and_normalizes_ttl() {
     client.clear_cache();
     let _ = client
         .lookup(
-            transport.as_ref(),
+            &transport_component,
             "cached.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -374,6 +367,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
         60,
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 12)),
     ));
+    let transport_component = dns_transport_component("mock", "mock", Arc::clone(&transport));
     let client = DnsClient::new(logger("dns"));
     let base_options = DnsQueryOptions {
         lookup_strategy: DomainStrategy::Ipv4Only,
@@ -382,7 +376,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
 
     let first = client
         .exchange(
-            transport.as_ref(),
+            &transport_component,
             query("rewrite-hit.test", RecordType::A),
             base_options.clone(),
         )
@@ -392,7 +386,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
 
     let cached = client
         .exchange(
-            transport.as_ref(),
+            &transport_component,
             query("rewrite-hit.test", RecordType::A),
             DnsQueryOptions {
                 rewrite_ttl: Some(5),
@@ -412,6 +406,7 @@ async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
         60,
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
     ));
+    let transport_component = dns_transport_component("mock", "mock", Arc::clone(&transport));
     let client = DnsClient::new(logger("dns"));
     let options = DnsQueryOptions {
         lookup_strategy: DomainStrategy::Ipv4Only,
@@ -421,32 +416,32 @@ async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
     for index in 0..1024 {
         let domain = format!("bounded-{index}.test");
         let _ = client
-            .lookup(transport.as_ref(), &domain, options.clone())
+            .lookup(&transport_component, &domain, options.clone())
             .await
             .unwrap();
     }
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
 
     let _ = client
-        .lookup(transport.as_ref(), "bounded-0.test", options.clone())
+        .lookup(&transport_component, "bounded-0.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1024);
 
     let _ = client
-        .lookup(transport.as_ref(), "bounded-1024.test", options.clone())
+        .lookup(&transport_component, "bounded-1024.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
 
     let _ = client
-        .lookup(transport.as_ref(), "bounded-0.test", options.clone())
+        .lookup(&transport_component, "bounded-0.test", options.clone())
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
 
     let _ = client
-        .lookup(transport.as_ref(), "bounded-1.test", options)
+        .lookup(&transport_component, "bounded-1.test", options)
         .await
         .unwrap();
     assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
@@ -458,11 +453,12 @@ async fn dns_client_applies_lookup_strategy_ordering() {
         60,
         IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
     ));
+    let transport_component = dns_transport_component("mock", "mock", Arc::clone(&transport));
     let client = DnsClient::new(logger("dns"));
 
     let ipv4_only = client
         .lookup(
-            transport.as_ref(),
+            &transport_component,
             "strategy.test",
             DnsQueryOptions {
                 lookup_strategy: DomainStrategy::Ipv4Only,
@@ -601,7 +597,7 @@ final = "direct"
             logger("outbound"),
             options.route.final_.clone(),
             &options.outbounds,
-            Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+            Arc::clone(&platform),
         )
         .expect("outbound manager"),
     );
@@ -609,7 +605,7 @@ final = "direct"
         logger("dns-transport"),
         &options.dns,
         outbound,
-        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        Arc::clone(&platform),
         None,
     )
     .expect("dns manager");
@@ -661,18 +657,20 @@ final = "proxy"
     );
     outbound.remove("proxy").expect("remove block outbound");
     outbound
-        .register_outbound(
-            "proxy".to_owned(),
+        .register_outbound(outbound_component(
+            "proxy",
+            "capture",
+            vec![Network::Udp],
             Arc::new(CapturingOutbound {
                 destinations: Arc::clone(&destinations),
             }),
-        )
+        ))
         .expect("register capture outbound");
     let manager = DnsTransportManager::from_options_with_runtime(
         logger("dns-transport"),
         &options.dns,
         outbound,
-        Arc::new(ProtectPlatform::default()) as Arc<dyn PlatformInterface>,
+        Arc::new(ProtectPlatform::default()),
         None,
     )
     .expect("dns manager");
@@ -723,10 +721,14 @@ server = "hosts"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_lookup_uses_default_transport_and_tracks_reverse_mapping() {
     let manager = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
-    manager.insert(Arc::new(CountingTransport::new(
-        60,
-        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22)),
-    )));
+    manager.insert(dns_transport_component(
+        "mock",
+        "mock",
+        Arc::new(CountingTransport::new(
+            60,
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 22)),
+        )),
+    ));
     let router = DnsRouter::new_with_manager(logger("dns"), manager, DomainStrategy::AsIs);
 
     let addrs = router
@@ -744,7 +746,11 @@ async fn router_lookup_uses_default_transport_and_tracks_reverse_mapping() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn router_reverse_cache_bounds_and_promotes_touched_lru_mapping() {
     let manager = Arc::new(DnsTransportManager::new(logger("dns-transport"), "indexed"));
-    manager.insert(Arc::new(IndexedTransport::new(60)));
+    manager.insert(dns_transport_component(
+        "indexed",
+        "mock",
+        Arc::new(IndexedTransport::new(60)),
+    ));
     let router = DnsRouter::new_with_manager(logger("dns"), manager, DomainStrategy::AsIs);
     let options = DnsQueryOptions {
         lookup_strategy: DomainStrategy::Ipv4Only,

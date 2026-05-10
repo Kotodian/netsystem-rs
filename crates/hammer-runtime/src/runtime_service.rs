@@ -5,24 +5,24 @@ use std::time::Instant;
 
 use hammer_adapter::{Lifecycle, NetworkManager as _, OutboundManager as _, PlatformInterface};
 use hammer_core::config::{self, Options};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 
 #[cfg(feature = "endpoint")]
 use crate::EndpointManager;
+#[cfg(feature = "probe")]
+use crate::ProbeManager;
 use crate::spawn::DataRuntimeContext;
 use crate::{
     CertificateProviderManager, CertificateStore, ConnectionManager, ControlLogWriter,
     ControlThread, DnsRouter, DnsTransportManager, InboundManager, MetricSample, MetricsRegistry,
     NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
-#[cfg(feature = "probe")]
-use crate::{IcmpOutboundProbe, ProbeManager};
 
 #[cfg(feature = "probe")]
-use hammer_adapter::ProbeProtocol;
+use hammer_adapter::ProbeProtocolComponent;
 use hammer_adapter::ProbeReport;
 use std::time::Duration;
 
@@ -46,6 +46,27 @@ const DATA_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// the control thread, so the inner future has a chance to time out
 /// cleanly and report a result before the outer wait gives up.
 const CONTROL_ASYNC_BUFFER: Duration = Duration::from_secs(5);
+
+fn debug_assert_lifecycle_order(lifecycles: &[Arc<dyn Lifecycle>]) {
+    let mut previous = None;
+    for lifecycle in lifecycles {
+        let name = lifecycle.name();
+        let Some(index) = LIFECYCLE_ORDER
+            .iter()
+            .position(|expected| *expected == name)
+        else {
+            debug_assert!(false, "unknown lifecycle '{name}'");
+            continue;
+        };
+        if let Some(previous) = previous {
+            debug_assert!(
+                previous <= index,
+                "Service lifecycles must follow LIFECYCLE_ORDER"
+            );
+        }
+        previous = Some(index);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceState {
@@ -90,7 +111,7 @@ impl RuntimeService {
         config_content: &str,
         platform: Arc<dyn PlatformInterface>,
         writer: Arc<dyn LogWriter>,
-    ) -> Result<Arc<Self>, HammerError> {
+    ) -> HammerResult<Arc<Self>> {
         crate::install_default_crypto_provider();
 
         let options = config::parse_config(config_content)?;
@@ -147,11 +168,15 @@ impl RuntimeService {
             "certificate-provider",
         )));
         #[cfg(feature = "endpoint")]
-        let endpoint = Arc::new(EndpointManager::from_options_with_platform(
-            new_logger(&log_factory, "endpoint"),
-            &options.endpoints,
-            Arc::clone(&platform),
-        )?);
+        let endpoint = if options.endpoints.is_empty() {
+            None
+        } else {
+            Some(Arc::new(EndpointManager::from_options_with_platform(
+                new_logger(&log_factory, "endpoint"),
+                &options.endpoints,
+                Arc::clone(&platform),
+            )?))
+        };
         let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
             new_logger(&log_factory, "network"),
@@ -169,8 +194,10 @@ impl RuntimeService {
         )?);
         #[cfg(feature = "endpoint")]
         {
-            for (id, view) in endpoint.outbound_view() {
-                outbound.register_outbound(id, view)?;
+            if let Some(endpoint) = &endpoint {
+                for view in endpoint.outbound_view() {
+                    outbound.register_outbound(view)?;
+                }
             }
         }
         // Aggregate outbounds (urltest) need a `Weak<dyn OutboundManager>`
@@ -219,7 +246,9 @@ impl RuntimeService {
         registry.set::<CertificateStore>(Arc::clone(&cert_store));
         registry.set::<CertificateProviderManager>(Arc::clone(&cert_provider));
         #[cfg(feature = "endpoint")]
-        registry.set::<EndpointManager>(Arc::clone(&endpoint));
+        if let Some(endpoint) = &endpoint {
+            registry.set::<EndpointManager>(Arc::clone(endpoint));
+        }
         registry.set::<NetworkManager>(Arc::clone(&network));
         registry.set::<DnsTransportManager>(Arc::clone(&dns_transport));
         registry.set::<OutboundManager>(Arc::clone(&outbound));
@@ -236,7 +265,9 @@ impl RuntimeService {
             cert_provider as Arc<dyn Lifecycle>,
         ];
         #[cfg(feature = "endpoint")]
-        lifecycles.push(endpoint as Arc<dyn Lifecycle>);
+        if let Some(endpoint) = endpoint {
+            lifecycles.push(endpoint as Arc<dyn Lifecycle>);
+        }
         lifecycles.extend([
             Arc::clone(&network) as Arc<dyn Lifecycle>,
             dns_transport as Arc<dyn Lifecycle>,
@@ -248,11 +279,7 @@ impl RuntimeService {
             connection as Arc<dyn Lifecycle>,
         ]);
 
-        debug_assert_eq!(
-            lifecycles.iter().map(|lc| lc.name()).collect::<Vec<_>>(),
-            LIFECYCLE_ORDER.to_vec(),
-            "Service lifecycles must match LIFECYCLE_ORDER",
-        );
+        debug_assert_lifecycle_order(&lifecycles);
 
         #[cfg(feature = "probe")]
         let probe = Arc::new(ProbeManager::new(Arc::clone(&outbound)));
@@ -294,7 +321,7 @@ impl RuntimeService {
         &self,
         protocol: &str,
         timeout: Duration,
-    ) -> Result<Vec<ProbeReport>, HammerError> {
+    ) -> HammerResult<Vec<ProbeReport>> {
         let protocol = protocol.to_owned();
         let outer_timeout = timeout.saturating_add(CONTROL_ASYNC_BUFFER);
         self.control_async_call(outer_timeout, move |inner, done| {
@@ -320,7 +347,10 @@ impl RuntimeService {
             if inner.state == ServiceState::Closed {
                 return None;
             }
-            inner.outbound.get(&outbound_id).and_then(|o| o.now())
+            inner
+                .outbound
+                .get(&outbound_id)
+                .and_then(|o| o.runtime().now())
         })
         .ok()
         .flatten()
@@ -333,11 +363,7 @@ impl RuntimeService {
     ///
     /// `timeout` is forwarded to each per-child probe. A zero value
     /// means "use the value baked into the outbound config".
-    pub fn urltest(
-        &self,
-        outbound_id: &str,
-        timeout: Duration,
-    ) -> Result<Vec<ProbeReport>, HammerError> {
+    pub fn urltest(&self, outbound_id: &str, timeout: Duration) -> HammerResult<Vec<ProbeReport>> {
         let timeout_outbound_id = outbound_id.to_owned();
         let effective_timeout = self.control_call(move |inner| {
             if inner.state == ServiceState::Closed {
@@ -348,7 +374,7 @@ impl RuntimeService {
                     "outbound '{timeout_outbound_id}' is not registered"
                 ))
             })?;
-            Ok(outbound.probe_group_timeout(timeout))
+            Ok(outbound.runtime().probe_group_timeout(timeout))
         })??;
 
         let outbound_id = outbound_id.to_owned();
@@ -363,14 +389,14 @@ impl RuntimeService {
                 ))
             })?;
             crate::spawn::spawn(async move {
-                let reports = outbound.probe_group(timeout).await;
+                let reports = outbound.runtime().probe_group(timeout).await;
                 let _ = done.send(reports);
             });
             Ok(())
         })
     }
 
-    pub fn start(&self) -> Result<(), HammerError> {
+    pub fn start(&self) -> HammerResult<()> {
         let result = self.control_blocking_call(start_inner)?;
         if result.is_err() {
             let _ = self.close();
@@ -378,7 +404,7 @@ impl RuntimeService {
         result
     }
 
-    pub fn close(&self) -> Result<(), HammerError> {
+    pub fn close(&self) -> HammerResult<()> {
         let needs_lifecycle_close =
             { self.inner.lock().expect("service mutex poisoned").state != ServiceState::Closed };
         let result = if needs_lifecycle_close {
@@ -447,7 +473,7 @@ impl RuntimeService {
     fn control_call<R>(
         &self,
         f: impl FnOnce(&mut ServiceInner) -> R + Send + 'static,
-    ) -> Result<R, HammerError>
+    ) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -464,7 +490,7 @@ impl RuntimeService {
     fn control_blocking_call<R>(
         &self,
         f: impl FnOnce(&mut ServiceInner) -> R + Send + 'static,
-    ) -> Result<R, HammerError>
+    ) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -481,13 +507,10 @@ impl RuntimeService {
     fn control_async_call<R>(
         &self,
         timeout: Duration,
-        f: impl FnOnce(
-            &mut ServiceInner,
-            std::sync::mpsc::Sender<Result<R, HammerError>>,
-        ) -> Result<(), HammerError>
+        f: impl FnOnce(&mut ServiceInner, std::sync::mpsc::Sender<HammerResult<R>>) -> HammerResult<()>
         + Send
         + 'static,
-    ) -> Result<R, HammerError>
+    ) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -514,7 +537,7 @@ fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
 }
 
-fn start_inner(inner: &mut ServiceInner) -> Result<(), HammerError> {
+fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {
     match inner.state {
         ServiceState::Closed => return Err(HammerError::service_closed()),
         ServiceState::Running => return Ok(()),
@@ -541,7 +564,7 @@ fn start_inner(inner: &mut ServiceInner) -> Result<(), HammerError> {
     Ok(())
 }
 
-fn close_inner(inner: &mut ServiceInner) -> Result<(), HammerError> {
+fn close_inner(inner: &mut ServiceInner) -> HammerResult<()> {
     if inner.state == ServiceState::Closed {
         Ok(())
     } else {
@@ -550,7 +573,7 @@ fn close_inner(inner: &mut ServiceInner) -> Result<(), HammerError> {
     }
 }
 
-fn close_lifecycles(lifecycles: &[Arc<dyn Lifecycle>]) -> Result<(), HammerError> {
+fn close_lifecycles(lifecycles: &[Arc<dyn Lifecycle>]) -> HammerResult<()> {
     let mut errors = Vec::new();
     for lc in lifecycles.iter().rev() {
         if let Err(err) = lc.close() {
@@ -566,8 +589,8 @@ fn close_lifecycles(lifecycles: &[Arc<dyn Lifecycle>]) -> Result<(), HammerError
 
 fn finish_close(
     inner: &Arc<Mutex<ServiceInner>>,
-    close_result: Result<(), HammerError>,
-) -> Result<(), HammerError> {
+    close_result: HammerResult<()>,
+) -> HammerResult<()> {
     // Lifecycles have already been closed on hammer-main, so worker-owned tasks
     // have had a chance to emit their shutdown logs while the control writer was
     // still open. The Tokio runtime itself must outlive this step because the
@@ -642,7 +665,7 @@ fn finish_close(
     result
 }
 
-fn spawn_control_thread(control_loop: ControlThread) -> Result<JoinHandle<()>, HammerError> {
+fn spawn_control_thread(control_loop: ControlThread) -> HammerResult<JoinHandle<()>> {
     // Build the control-plane runtime on the caller's thread so a build
     // failure surfaces synchronously as `HammerError`. Doing it inside
     // the spawned closure would force a panic on a background thread,
@@ -695,10 +718,7 @@ impl fmt::Display for JoinControlThreadError {
     }
 }
 
-fn combine_close_error(
-    result: Result<(), HammerError>,
-    message: impl Into<String>,
-) -> Result<(), HammerError> {
+fn combine_close_error(result: HammerResult<()>, message: impl Into<String>) -> HammerResult<()> {
     let message = message.into();
     match result {
         Ok(()) => Err(HammerError::internal(message)),
@@ -707,13 +727,8 @@ fn combine_close_error(
 }
 
 #[cfg(feature = "probe")]
-fn build_probe_protocol(protocol: &str) -> Result<Arc<dyn ProbeProtocol>, HammerError> {
-    match protocol {
-        "icmp" => Ok(Arc::new(IcmpOutboundProbe::new())),
-        other => Err(HammerError::internal(format!(
-            "unknown probe protocol: {other}"
-        ))),
-    }
+fn build_probe_protocol(protocol: &str) -> HammerResult<ProbeProtocolComponent> {
+    crate::probe::ProbeProtocolFactorySet::standard().build(protocol)
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
+use crate::error::{HammerError, HammerResult};
 use blake2::{Blake2b512, Digest};
-use hammer_core::error::HammerError;
 use rand::RngCore;
 
 const SALT_LEN: usize = 8;
@@ -30,7 +30,7 @@ impl Salamander {
         out
     }
 
-    pub fn open(&self, packet: &[u8]) -> Result<Vec<u8>, HammerError> {
+    pub fn open(&self, packet: &[u8]) -> HammerResult<Vec<u8>> {
         if packet.len() <= SALT_LEN {
             return Err(HammerError::internal("short salamander packet"));
         }

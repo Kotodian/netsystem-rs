@@ -532,8 +532,8 @@ fn connection_manager_tracks_removes_and_closes_connections() {
     let first = Arc::new(FakeHandle::default());
     let second = Arc::new(FakeHandle::default());
 
-    let first_id = manager.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
-    let second_id = manager.track(Arc::clone(&second) as Arc<dyn ConnectionHandle>);
+    let first_id = manager.track(Arc::clone(&first));
+    let second_id = manager.track(Arc::clone(&second));
 
     assert_eq!(manager.count(), 2);
     assert!(manager.remove(first_id));
@@ -554,8 +554,8 @@ fn connection_manager_lifecycle_close_closes_all_connections() {
     let first = Arc::new(FakeHandle::default());
     let second = Arc::new(FakeHandle::default());
 
-    manager.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
-    manager.track(Arc::clone(&second) as Arc<dyn ConnectionHandle>);
+    manager.track(Arc::clone(&first));
+    manager.track(Arc::clone(&second));
 
     Lifecycle::close(&manager).expect("lifecycle close");
 
@@ -645,11 +645,11 @@ fn network_manager_tracks_platform_default_interface_and_pause_state() {
     let pause = Arc::new(PauseManager::new());
     let connection = Arc::new(ConnectionManager::new());
     let tracked = Arc::new(FakeHandle::default());
-    connection.track(Arc::clone(&tracked) as Arc<dyn ConnectionHandle>);
+    connection.track(Arc::clone(&tracked));
     let network = NetworkManager::with_platform(
         logger("network"),
         true,
-        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        Arc::clone(&platform),
         Arc::clone(&pause),
         Arc::clone(&connection),
     );
@@ -685,11 +685,11 @@ fn network_manager_ignores_duplicate_default_interface_updates() {
     let pause = Arc::new(PauseManager::new());
     let connection = Arc::new(ConnectionManager::new());
     let first = Arc::new(FakeHandle::default());
-    connection.track(Arc::clone(&first) as Arc<dyn ConnectionHandle>);
+    connection.track(Arc::clone(&first));
     let network = NetworkManager::with_platform(
         logger("network"),
         true,
-        Arc::clone(&platform) as Arc<dyn PlatformInterface>,
+        Arc::clone(&platform),
         Arc::clone(&pause),
         Arc::clone(&connection),
     );
@@ -703,7 +703,7 @@ fn network_manager_ignores_duplicate_default_interface_updates() {
     assert!(first.closed.load(Ordering::SeqCst));
 
     let duplicate_guard = Arc::new(FakeHandle::default());
-    connection.track(Arc::clone(&duplicate_guard) as Arc<dyn ConnectionHandle>);
+    connection.track(Arc::clone(&duplicate_guard));
     platform.emit("en0", 7, true, false);
 
     assert!(

@@ -19,7 +19,7 @@ use hammer_core::config::{
     Hysteria2BbrProfile, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
     Hysteria2OutboundOptions, OutboundKind,
 };
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
@@ -29,8 +29,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 
 pub mod bbr;
-pub mod obfs;
-pub mod protocol;
+mod outbound;
+pub use hammer_core::protocol::hysteria2::{obfs, protocol};
+#[cfg(test)]
+use outbound::ConnectBackoff;
+pub use outbound::Hysteria2Outbound;
 
 use bbr::{BbrProfile, CongestionControlHandle, apply_transport_config_with_handle};
 use obfs::Salamander;
@@ -80,7 +83,7 @@ pub struct Hysteria2Client {
 }
 
 impl Hysteria2Client {
-    pub async fn connect(options: ClientOptions) -> Result<Arc<Self>, HammerError> {
+    pub async fn connect(options: ClientOptions) -> HammerResult<Arc<Self>> {
         connect_with_timeout(options, HYSTERIA2_CONNECT_TIMEOUT).await
     }
 
@@ -88,7 +91,7 @@ impl Hysteria2Client {
         &self,
         destination: SocksAddr,
         initial_payload: &[u8],
-    ) -> Result<Hysteria2Stream, HammerError> {
+    ) -> HammerResult<Hysteria2Stream> {
         let (mut send, mut recv) = self
             .connection
             .open_bi()
@@ -109,7 +112,7 @@ impl Hysteria2Client {
         Ok(Hysteria2Stream { send, recv })
     }
 
-    pub async fn listen_udp(&self) -> Result<Hysteria2PacketConn, HammerError> {
+    pub async fn listen_udp(&self) -> HammerResult<Hysteria2PacketConn> {
         let session_id = self.next_session.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel(64);
         self.sessions.lock().await.insert(session_id, tx);
@@ -134,7 +137,7 @@ impl Hysteria2Client {
 async fn connect_with_timeout(
     options: ClientOptions,
     connect_timeout: Duration,
-) -> Result<Arc<Hysteria2Client>, HammerError> {
+) -> HammerResult<Arc<Hysteria2Client>> {
     let server = format!("{}:{}", options.server, effective_port(options.server_port));
     debug!("hysteria2 resolving server {server}");
     let address = resolve_server(&options.server, options.server_port).await?;
@@ -199,7 +202,7 @@ pub struct Hysteria2Stream {
 }
 
 impl Hysteria2Stream {
-    pub async fn read_to_end(&mut self) -> Result<Vec<u8>, HammerError> {
+    pub async fn read_to_end(&mut self) -> HammerResult<Vec<u8>> {
         let mut bytes = Vec::new();
         AsyncReadExt::read_to_end(self, &mut bytes)
             .await
@@ -245,22 +248,18 @@ pub struct Hysteria2PacketConn {
 }
 
 impl Hysteria2PacketConn {
-    pub async fn send_to(
-        &mut self,
-        destination: SocksAddr,
-        payload: &[u8],
-    ) -> Result<(), HammerError> {
+    pub async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
         <Self as ProxyPacketConn>::send_to(self, destination, payload).await
     }
 
-    pub async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+    pub async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
         <Self as ProxyPacketConn>::recv_from(self).await
     }
 }
 
 #[async_trait]
 impl ProxyPacketConn for Hysteria2PacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
         if payload.len() > protocol::MAX_UDP_SIZE {
             return Err(HammerError::internal("UDP packet too large"));
         }
@@ -285,7 +284,7 @@ impl ProxyPacketConn for Hysteria2PacketConn {
             .map_err(|err| HammerError::internal(format!("send hysteria2 datagram: {err}")))
     }
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
         let connection = self.connection.clone();
         tokio::select! {
             datagram = self.rx.recv() => {
@@ -319,339 +318,6 @@ impl Drop for Hysteria2PacketConn {
         crate::spawn::spawn(async move {
             sessions.lock().await.remove(&session_id);
         });
-    }
-}
-
-pub struct Hysteria2Outbound {
-    id: String,
-    options: Hysteria2OutboundOptions,
-    networks: Vec<Network>,
-    dependencies: Vec<String>,
-    client_state: StdMutex<ClientState>,
-    connect_backoff: StdMutex<ConnectBackoff>,
-    client_init: Mutex<()>,
-    protector: SocketProtector,
-}
-
-struct ClientState {
-    epoch: u64,
-    client: Option<Arc<Hysteria2Client>>,
-}
-
-#[derive(Debug, Default)]
-struct ConnectBackoff {
-    current_delay: Duration,
-    next_allowed: Option<StdInstant>,
-}
-
-impl ConnectBackoff {
-    fn remaining(&self, now: StdInstant) -> Option<Duration> {
-        let next_allowed = self.next_allowed?;
-        if now >= next_allowed {
-            None
-        } else {
-            Some(next_allowed.duration_since(now))
-        }
-    }
-
-    fn record_failure(&mut self, now: StdInstant) {
-        self.current_delay = if self.current_delay.is_zero() {
-            HYSTERIA2_CONNECT_BACKOFF_INITIAL
-        } else {
-            (self.current_delay * 2).min(HYSTERIA2_CONNECT_BACKOFF_MAX)
-        };
-        self.next_allowed = Some(now + self.current_delay);
-    }
-
-    fn reset(&mut self) {
-        self.current_delay = Duration::ZERO;
-        self.next_allowed = None;
-    }
-
-    #[cfg(test)]
-    fn current_delay(&self) -> Duration {
-        self.current_delay
-    }
-}
-
-impl Hysteria2Outbound {
-    pub fn new(logger: Logger, id: String, options: Hysteria2OutboundOptions) -> Self {
-        Self::new_with_protector(logger, id, options, SocketProtector::default())
-    }
-
-    pub(crate) fn new_with_protector(
-        _logger: Logger,
-        id: String,
-        options: Hysteria2OutboundOptions,
-        protector: SocketProtector,
-    ) -> Self {
-        let networks = adapter_networks(&options.network);
-        Self {
-            id,
-            options,
-            networks,
-            dependencies: Vec::new(),
-            client_state: StdMutex::new(ClientState {
-                epoch: 0,
-                client: None,
-            }),
-            connect_backoff: StdMutex::new(ConnectBackoff::default()),
-            client_init: Mutex::new(()),
-            protector,
-        }
-    }
-
-    async fn client(&self) -> Result<Arc<Hysteria2Client>, HammerError> {
-        self.client_with_timeout(HYSTERIA2_CONNECT_TIMEOUT).await
-    }
-
-    async fn client_with_timeout(
-        &self,
-        connect_timeout: Duration,
-    ) -> Result<Arc<Hysteria2Client>, HammerError> {
-        if let Some(client) = self.cached_client() {
-            return Ok(client);
-        }
-        loop {
-            let _guard = self.client_init.lock().await;
-            if let Some(client) = self.cached_client() {
-                return Ok(client);
-            }
-            if let Some(remaining) = self.connect_backoff_remaining() {
-                return Err(HammerError::internal(format!(
-                    "hysteria2 outbound {} connect backing off for {} after recent failure",
-                    self.id,
-                    duration_label(remaining)
-                )));
-            }
-            let epoch = self.client_epoch();
-            let options = self.client_options()?;
-            debug!("hysteria2 outbound {} initializing client", self.id);
-            let client = match connect_with_timeout(options, connect_timeout).await {
-                Ok(client) => client,
-                Err(err) => {
-                    if self.client_epoch() != epoch {
-                        debug!(
-                            "hysteria2 outbound {} stale connect failed after reset: {err}",
-                            self.id
-                        );
-                        continue;
-                    }
-                    self.record_connect_failure();
-                    error!("hysteria2 outbound {} connect failed: {err}", self.id);
-                    return Err(err);
-                }
-            };
-            let mut state = self
-                .client_state
-                .lock()
-                .expect("Hysteria2Outbound client poisoned");
-            if state.epoch != epoch {
-                drop(state);
-                client.close(b"network reset during connect");
-                continue;
-            }
-            state.client = Some(Arc::clone(&client));
-            drop(state);
-            self.clear_connect_backoff();
-            debug!("hysteria2 outbound {} client ready", self.id);
-            return Ok(client);
-        }
-    }
-
-    fn connect_backoff_remaining(&self) -> Option<Duration> {
-        self.connect_backoff
-            .lock()
-            .expect("Hysteria2Outbound connect backoff poisoned")
-            .remaining(StdInstant::now())
-    }
-
-    fn record_connect_failure(&self) {
-        self.connect_backoff
-            .lock()
-            .expect("Hysteria2Outbound connect backoff poisoned")
-            .record_failure(StdInstant::now());
-    }
-
-    fn clear_connect_backoff(&self) {
-        self.connect_backoff
-            .lock()
-            .expect("Hysteria2Outbound connect backoff poisoned")
-            .reset();
-    }
-
-    fn cached_client(&self) -> Option<Arc<Hysteria2Client>> {
-        let mut state = self
-            .client_state
-            .lock()
-            .expect("Hysteria2Outbound client poisoned");
-        if let Some(client) = state.client.as_ref()
-            && client.is_closed()
-        {
-            debug!(
-                "hysteria2 outbound {} dropping closed cached client",
-                self.id
-            );
-            state.epoch = state.epoch.wrapping_add(1);
-            state.client = None;
-        }
-        state.client.clone()
-    }
-
-    fn client_epoch(&self) -> u64 {
-        self.client_state
-            .lock()
-            .expect("Hysteria2Outbound client poisoned")
-            .epoch
-    }
-
-    fn client_options(&self) -> Result<ClientOptions, HammerError> {
-        Ok(ClientOptions {
-            server: self.options.server.clone(),
-            server_port: self.options.server_port,
-            password: self.options.password.clone(),
-            server_name: self.options.tls.server_name.clone(),
-            insecure: self.options.tls.insecure,
-            udp_enabled: self.networks.contains(&Network::Udp),
-            bbr_profile: runtime_bbr_profile(self.options.bbr_profile),
-            disable_path_mtu_discovery: self.options.disable_path_mtu_discovery,
-            initial_packet_size: self.options.initial_packet_size,
-            idle_timeout: self.options.idle_timeout,
-            keep_alive_period: self.options.keep_alive_period,
-            send_bps: mbps_to_bps(self.options.up_mbps)?,
-            receive_bps: mbps_to_bps(self.options.down_mbps)?,
-            brutal_debug: self.options.brutal_debug,
-            obfs: self.options.obfs.clone(),
-            platform: self.protector.platform(),
-        })
-    }
-
-    async fn resolve_probe_server(&self) -> Result<SocketAddr, HammerError> {
-        resolve_server(&self.options.server, self.options.server_port).await
-    }
-}
-
-pub(crate) fn build_outbound(
-    logger: Logger,
-    id: String,
-    kind: &OutboundKind,
-    protector: SocketProtector,
-) -> Result<Arc<dyn Outbound>, HammerError> {
-    match kind {
-        OutboundKind::Hysteria2(options) => Ok(Arc::new(Hysteria2Outbound::new_with_protector(
-            logger,
-            id,
-            options.clone(),
-            protector,
-        ))),
-        _ => Err(HammerError::internal(
-            "hysteria2 factory received wrong options",
-        )),
-    }
-}
-
-#[async_trait]
-impl Outbound for Hysteria2Outbound {
-    fn type_name(&self) -> &str {
-        "hysteria2"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn networks(&self) -> &[Network] {
-        &self.networks
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
-
-    fn reset(&self) {
-        let client = {
-            let mut state = self
-                .client_state
-                .lock()
-                .expect("Hysteria2Outbound client poisoned");
-            state.epoch = state.epoch.wrapping_add(1);
-            state.client.take()
-        };
-        if let Some(client) = client {
-            client.close(b"network reset");
-        }
-        self.clear_connect_backoff();
-    }
-
-    async fn ensure_connected(&self) -> Result<(), HammerError> {
-        self.client().await.map(|_| ())
-    }
-
-    #[cfg(feature = "probe")]
-    async fn probe_latency(
-        &self,
-        protocol: &str,
-        timeout_duration: Duration,
-    ) -> Result<Duration, HammerError> {
-        if protocol != "icmp" {
-            return Err(HammerError::internal(format!(
-                "{protocol} probe not supported by outbound: {}",
-                self.id
-            )));
-        }
-
-        let protector = self.protector.clone();
-        let probe = async {
-            let server = self.resolve_probe_server().await?;
-            icmp::probe_echo(server.ip(), timeout_duration, protector).await
-        };
-
-        match tokio::time::timeout(timeout_duration, probe).await {
-            Ok(result) => result,
-            Err(_) => Err(HammerError::internal(format!(
-                "icmp probe timed out after {}",
-                duration_label(timeout_duration)
-            ))),
-        }
-    }
-
-    async fn dial(
-        &self,
-        network: Network,
-        destination: SocksAddr,
-        initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, HammerError> {
-        if !self.networks.contains(&network) {
-            return Err(HammerError::internal(format!(
-                "{network} is not supported by outbound: {}",
-                self.id
-            )));
-        }
-        match network {
-            Network::Tcp => Ok(Box::new(
-                self.client()
-                    .await?
-                    .dial_tcp(destination, initial_payload)
-                    .await?,
-            )),
-            Network::Udp => Err(HammerError::internal("use listen_packet for hysteria2 UDP")),
-            // Unreachable in practice: `self.networks` only ever
-            // contains Tcp/Udp (see `adapter_networks`), so the guard
-            // above already filters Icmp out. Kept for exhaustiveness.
-            Network::Icmp => Err(HammerError::internal(
-                "icmp not supported by hysteria2 outbound",
-            )),
-        }
-    }
-
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
-        if !self.networks.contains(&Network::Udp) {
-            return Err(HammerError::internal(format!(
-                "udp is not supported by outbound: {}",
-                self.id
-            )));
-        }
-        Ok(Box::new(self.client().await?.listen_udp().await?))
     }
 }
 
@@ -726,7 +392,7 @@ fn spawn_datagram_loop(client: Arc<Hysteria2Client>) {
     });
 }
 
-async fn handle_datagram(client: &Hysteria2Client, data: Bytes) -> Result<(), HammerError> {
+async fn handle_datagram(client: &Hysteria2Client, data: Bytes) -> HammerResult<()> {
     let message = protocol::UdpMessage::decode(data)?;
     let destination = parse_destination(&message.destination);
     let sender = {
@@ -754,7 +420,7 @@ fn client_endpoint(
     options: &ClientOptions,
     server_addr: SocketAddr,
     congestion: CongestionControlHandle,
-) -> Result<quinn::Endpoint, HammerError> {
+) -> HammerResult<quinn::Endpoint> {
     let bind_addr = if server_addr.is_ipv6() {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
@@ -787,7 +453,7 @@ fn client_endpoint(
 fn client_config(
     options: &ClientOptions,
     congestion: CongestionControlHandle,
-) -> Result<quinn::ClientConfig, HammerError> {
+) -> HammerResult<quinn::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -874,7 +540,7 @@ fn duration_label(duration: Duration) -> String {
 fn wrap_obfs_socket(
     socket: Arc<dyn quinn::AsyncUdpSocket>,
     obfs: Option<&Hysteria2Obfs>,
-) -> Result<Arc<dyn quinn::AsyncUdpSocket>, HammerError> {
+) -> HammerResult<Arc<dyn quinn::AsyncUdpSocket>> {
     let Some(obfs) = obfs else {
         return Ok(socket);
     };
@@ -950,7 +616,7 @@ impl quinn::AsyncUdpSocket for SalamanderUdpSocket {
     }
 }
 
-async fn resolve_server(server: &str, port: u16) -> Result<SocketAddr, HammerError> {
+async fn resolve_server(server: &str, port: u16) -> HammerResult<SocketAddr> {
     let port = effective_port(port);
     if let Ok(ip) = server.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
@@ -966,7 +632,7 @@ fn effective_port(port: u16) -> u16 {
     if port == 0 { 443 } else { port }
 }
 
-fn mbps_to_bps(mbps: i64) -> Result<u64, HammerError> {
+fn mbps_to_bps(mbps: i64) -> HammerResult<u64> {
     if mbps < 0 {
         return Err(HammerError::internal(
             "hysteria2 bandwidth must be non-negative",
@@ -1075,7 +741,7 @@ impl ServerCertVerifier for SkipServerVerification {
     }
 }
 
-fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> Result<(), HammerError> {
+fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> HammerResult<()> {
     if let Some(obfs) = obfs {
         match obfs.type_ {
             Hysteria2ObfsType::Salamander => {}
@@ -1146,7 +812,7 @@ mod tests {
     }
 
     impl AuthServer {
-        async fn start(password: &str) -> Result<Self, HammerError> {
+        async fn start(password: &str) -> HammerResult<Self> {
             let endpoint = quinn::Endpoint::server(
                 auth_server_config()?,
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -1200,7 +866,7 @@ mod tests {
         connection: quinn::Connection,
         password: String,
         auth_count: Arc<AtomicUsize>,
-    ) -> Result<(), HammerError> {
+    ) -> HammerResult<()> {
         let h3_conn = h3_quinn::Connection::new(connection);
         let mut incoming: server::Connection<_, Bytes> = server::Connection::new(h3_conn)
             .await
@@ -1248,7 +914,7 @@ mod tests {
         Ok(())
     }
 
-    fn auth_server_config() -> Result<quinn::ServerConfig, HammerError> {
+    fn auth_server_config() -> HammerResult<quinn::ServerConfig> {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
         let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -8,22 +8,34 @@ use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
-    DnsTransportManager as DnsTransportManagerTrait, Lifecycle, PlatformInterface, StartStage,
+    ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
+    DnsTransportComponent, DnsTransportManager as DnsTransportManagerTrait, Lifecycle,
+    RuntimeComponent, StartStage,
 };
 use hammer_core::config::{
     DnsOptions, DnsRule, DnsRuleAction, DnsRuleMatcher, DnsServer, DnsServerKind, DomainStrategy,
     RejectKind, normalize_domain,
 };
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
-use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinDecoder, BinEncodable, BinEncoder};
+pub use hammer_core::protocol::dns::{
+    FixedResponseCode, MessageExt, domain_from_name, fixed_address_response, parse_hosts,
+    query_message, record_addr,
+};
+use hickory_proto::op::{Message, Query, ResponseCode};
+use hickory_proto::rr::RecordType;
 use lru::LruCache;
 
-use crate::OutboundManager;
+#[cfg(any(
+    feature = "dns-udp",
+    feature = "dns-tcp",
+    feature = "dns-https",
+    feature = "dns-hosts",
+    feature = "dns-local"
+))]
+use crate::component_registry::register_components;
 use crate::socket_protector::SocketProtector;
+use crate::{OutboundManager, RuntimePlatform};
 
 mod transport;
 #[cfg(feature = "dns-https")]
@@ -44,109 +56,6 @@ const DNS_REVERSE_CACHE_MAX_ENTRIES: usize = 2048;
 const DNS_MATCH_CACHE_CAPACITY: usize = 256;
 
 pub type QueryType = RecordType;
-
-#[derive(Clone, Copy)]
-pub enum FixedResponseCode {
-    NoError,
-    NXDomain,
-    FormatError,
-    Refused,
-}
-
-impl FixedResponseCode {
-    fn response_code(self) -> ResponseCode {
-        match self {
-            Self::NoError => ResponseCode::NoError,
-            Self::NXDomain => ResponseCode::NXDomain,
-            Self::FormatError => ResponseCode::FormErr,
-            Self::Refused => ResponseCode::Refused,
-        }
-    }
-}
-
-pub trait MessageExt {
-    fn from_bytes(bytes: &[u8]) -> Result<Message, HammerError>;
-    fn to_bytes(&self) -> Result<Vec<u8>, HammerError>;
-    fn fixed_response(&self, code: FixedResponseCode) -> Message;
-    fn addresses(&self) -> Vec<IpAddr>;
-}
-
-impl MessageExt for Message {
-    fn from_bytes(bytes: &[u8]) -> Result<Message, HammerError> {
-        let mut decoder = BinDecoder::new(bytes);
-        Message::read(&mut decoder)
-            .map_err(|e| HammerError::internal(format!("decode DNS message: {e}")))
-    }
-
-    fn to_bytes(&self) -> Result<Vec<u8>, HammerError> {
-        let mut bytes = Vec::with_capacity(512);
-        let mut encoder = BinEncoder::new(&mut bytes);
-        self.emit(&mut encoder)
-            .map_err(|e| HammerError::internal(format!("encode DNS message: {e}")))?;
-        Ok(bytes)
-    }
-
-    fn fixed_response(&self, code: FixedResponseCode) -> Message {
-        let mut response = Message::new(self.metadata.id, MessageType::Response, OpCode::Query);
-        response.metadata.authoritative = true;
-        response.metadata.recursion_desired = true;
-        response.metadata.recursion_available = true;
-        response.metadata.response_code = code.response_code();
-        for query in &self.queries {
-            response.add_query(query.clone());
-        }
-        response
-    }
-
-    fn addresses(&self) -> Vec<IpAddr> {
-        self.answers.iter().filter_map(record_addr).collect()
-    }
-}
-
-fn record_addr(record: &Record) -> Option<IpAddr> {
-    match &record.data {
-        RData::A(addr) => Some(IpAddr::V4(Ipv4Addr::from(*addr))),
-        RData::AAAA(addr) => Some(IpAddr::V6(Ipv6Addr::from(*addr))),
-        _ => None,
-    }
-}
-
-fn fqdn(domain: &str) -> Result<Name, HammerError> {
-    let name = if domain.ends_with('.') {
-        domain.to_owned()
-    } else {
-        format!("{domain}.")
-    };
-    Name::from_ascii(&name).map_err(|e| HammerError::internal(format!("invalid domain: {e}")))
-}
-
-/// Hot path on every DNS query. We avoid `.trim_end_matches('.').to_ascii_lowercase()`
-/// because that materialises two `String`s; instead we take the single
-/// `to_ascii()` allocation, truncate the trailing-dot run in place, then
-/// `make_ascii_lowercase()` in place. Functionally identical to
-/// `normalize_domain(&name.to_ascii())` but one allocation instead of two.
-#[inline]
-fn domain_from_name(name: &Name) -> String {
-    let mut s = name.to_ascii();
-    let new_len = s.trim_end_matches('.').len();
-    s.truncate(new_len);
-    s.make_ascii_lowercase();
-    s
-}
-
-pub(in crate::dns) fn query_message(
-    domain: &str,
-    record_type: RecordType,
-) -> Result<Message, HammerError> {
-    let mut message = Message::new(0, MessageType::Query, OpCode::Query);
-    message.add_query({
-        let mut query = Query::query(fqdn(domain)?, record_type);
-        query.set_query_class(DNSClass::IN);
-        query
-    });
-    message.metadata.recursion_desired = true;
-    Ok(message)
-}
 
 /// Match a single rule against an already-normalised query name. Mirrors
 /// `route::matcher_matches` for the three domain variants we surface. Hot
@@ -178,7 +87,7 @@ fn domain_suffix_matches(domain: &str, suffix: &str) -> bool {
         && domain.as_bytes()[domain.len() - suffix.len() - 1] == b'.'
 }
 
-fn first_query(message: &Message) -> Result<&Query, HammerError> {
+fn first_query(message: &Message) -> HammerResult<&Query> {
     message
         .queries
         .first()
@@ -279,15 +188,12 @@ impl DnsClient {
         }
     }
 
-    pub async fn exchange<T>(
+    pub async fn exchange(
         &self,
-        transport: &T,
+        transport: &DnsTransportComponent,
         message: Message,
         options: DnsQueryOptions,
-    ) -> Result<Message, HammerError>
-    where
-        T: DnsTransport + ?Sized,
-    {
+    ) -> HammerResult<Message> {
         if message.queries.len() != 1 {
             warn!("bad question size: {}", message.queries.len());
             return Ok(message.fixed_response(FixedResponseCode::FormatError));
@@ -297,7 +203,7 @@ impl DnsClient {
             return Ok(message.fixed_response(FixedResponseCode::NoError));
         }
         let key = CacheKey {
-            transport: transport.id().to_owned(),
+            transport: transport.meta().id().to_owned(),
             name: query.name().to_ascii().to_ascii_lowercase(),
             record_type: query.query_type(),
         };
@@ -310,7 +216,7 @@ impl DnsClient {
             }
             return Ok(cached);
         }
-        let mut response = tokio::time::timeout(DNS_TIMEOUT, transport.exchange(message))
+        let mut response = tokio::time::timeout(DNS_TIMEOUT, transport.runtime().exchange(message))
             .await
             .map_err(|_| HammerError::internal("dns query timed out"))??;
         let ttl = apply_response_options(&mut response, &options);
@@ -320,15 +226,12 @@ impl DnsClient {
         Ok(response)
     }
 
-    pub(crate) fn try_exchange_cached<T>(
+    pub(crate) fn try_exchange_cached(
         &self,
-        transport: &T,
+        transport: &DnsTransportComponent,
         message: &Message,
         options: DnsQueryOptions,
-    ) -> Result<Option<Message>, HammerError>
-    where
-        T: DnsTransport + ?Sized,
-    {
+    ) -> HammerResult<Option<Message>> {
         if message.queries.len() != 1 {
             warn!("bad question size: {}", message.queries.len());
             return Ok(Some(message.fixed_response(FixedResponseCode::FormatError)));
@@ -341,7 +244,7 @@ impl DnsClient {
             return Ok(None);
         }
         let key = CacheKey {
-            transport: transport.id().to_owned(),
+            transport: transport.meta().id().to_owned(),
             name: query.name().to_ascii().to_ascii_lowercase(),
             record_type: query.query_type(),
         };
@@ -355,15 +258,12 @@ impl DnsClient {
         Ok(Some(cached))
     }
 
-    pub async fn lookup<T>(
+    pub async fn lookup(
         &self,
-        transport: &T,
+        transport: &DnsTransportComponent,
         domain: &str,
         options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError>
-    where
-        T: DnsTransport + ?Sized,
-    {
+    ) -> HammerResult<Vec<IpAddr>> {
         let strategy = if options.lookup_strategy == DomainStrategy::AsIs {
             options.strategy
         } else {
@@ -402,16 +302,13 @@ impl DnsClient {
         self.cache.lock().expect("DnsClient cache poisoned").clear();
     }
 
-    async fn lookup_type<T>(
+    async fn lookup_type(
         &self,
-        transport: &T,
+        transport: &DnsTransportComponent,
         domain: &str,
         record_type: RecordType,
         mut options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError>
-    where
-        T: DnsTransport + ?Sized,
-    {
+    ) -> HammerResult<Vec<IpAddr>> {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = match record_type {
                 RecordType::A => DomainStrategy::Ipv4Only,
@@ -487,6 +384,12 @@ fn strategy_rejects(record_type: RecordType, strategy: DomainStrategy) -> bool {
 }
 
 #[cfg(feature = "dns-hosts")]
+#[hammer_component_macros::hammer_component(
+    dns_transport,
+    name = "hosts",
+    builder = build_hosts_transport,
+    metrics = ("dns", "transport")
+)]
 pub struct HostsTransport {
     id: String,
     dependencies: Vec<String>,
@@ -522,33 +425,14 @@ impl HostsTransport {
 }
 
 #[cfg(feature = "dns-hosts")]
-fn parse_hosts(content: &str) -> Vec<(String, IpAddr)> {
-    let mut entries = Vec::new();
-    for line in content.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut fields = line.split_whitespace();
-        let Some(addr) = fields.next().and_then(|v| v.parse::<IpAddr>().ok()) else {
-            continue;
-        };
-        for domain in fields {
-            entries.push((domain.to_owned(), addr));
-        }
-    }
-    entries
-}
-
-#[cfg(feature = "dns-hosts")]
 impl Lifecycle for HostsTransport {
     fn name(&self) -> &str {
         "dns/transport/hosts"
     }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, _stage: StartStage) -> HammerResult<()> {
         Ok(())
     }
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         Ok(())
     }
 }
@@ -556,18 +440,9 @@ impl Lifecycle for HostsTransport {
 #[async_trait]
 #[cfg(feature = "dns-hosts")]
 impl DnsTransport for HostsTransport {
-    fn type_name(&self) -> &str {
-        "hosts"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
     fn reset(&self) {}
 
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+    async fn exchange(&self, message: Message) -> HammerResult<Message> {
         let query = first_query(&message)?.clone();
         let domain = domain_from_name(query.name());
         let addresses = self.predefined.get(&domain).cloned().unwrap_or_default();
@@ -584,6 +459,12 @@ impl DnsTransport for HostsTransport {
 }
 
 #[cfg(feature = "dns-local")]
+#[hammer_component_macros::hammer_component(
+    dns_transport,
+    name = "local",
+    builder = build_local_transport,
+    metrics = ("dns", "transport")
+)]
 pub struct LocalDnsTransport {
     id: String,
     dependencies: Vec<String>,
@@ -604,10 +485,10 @@ impl Lifecycle for LocalDnsTransport {
     fn name(&self) -> &str {
         "dns/transport/local"
     }
-    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, _stage: StartStage) -> HammerResult<()> {
         Ok(())
     }
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         Ok(())
     }
 }
@@ -615,18 +496,9 @@ impl Lifecycle for LocalDnsTransport {
 #[async_trait]
 #[cfg(feature = "dns-local")]
 impl DnsTransport for LocalDnsTransport {
-    fn type_name(&self) -> &str {
-        "local"
-    }
-    fn id(&self) -> &str {
-        &self.id
-    }
-    fn dependencies(&self) -> &[String] {
-        &self.dependencies
-    }
     fn reset(&self) {}
 
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+    async fn exchange(&self, message: Message) -> HammerResult<Message> {
         let query = first_query(&message)?.clone();
         if !matches!(query.query_type(), RecordType::A | RecordType::AAAA) {
             return Ok(message.fixed_response(FixedResponseCode::NXDomain));
@@ -655,50 +527,39 @@ impl DnsTransport for LocalDnsTransport {
     }
 }
 
-#[cfg(any(feature = "dns-hosts", feature = "dns-local"))]
-fn fixed_address_response(
-    request: &Message,
-    query: &Query,
-    addresses: Vec<IpAddr>,
-    ttl: u32,
-) -> Message {
-    let mut response = request.fixed_response(FixedResponseCode::NoError);
-    for address in addresses {
-        match (query.query_type(), address) {
-            (RecordType::A, IpAddr::V4(ip)) => {
-                response.add_answer(Record::from_rdata(
-                    query.name().clone(),
-                    ttl,
-                    RData::A(ip.into()),
-                ));
-            }
-            (RecordType::AAAA, IpAddr::V6(ip)) => {
-                response.add_answer(Record::from_rdata(
-                    query.name().clone(),
-                    ttl,
-                    RData::AAAA(ip.into()),
-                ));
-            }
-            _ => {}
-        }
-    }
-    response
-}
-
 pub struct DnsTransportManager {
-    items: Mutex<HashMap<String, Arc<dyn DnsTransport>>>,
+    items: Mutex<HashMap<String, DnsTransportComponent>>,
     default_id: String,
     factories: DnsTransportFactorySet,
 }
 
-type DnsTransportBuilder = fn(
+pub struct DnsTransportRegistration(DnsTransportComponent);
+
+impl From<DnsTransportComponent> for DnsTransportRegistration {
+    fn from(transport: DnsTransportComponent) -> Self {
+        Self(transport)
+    }
+}
+
+impl<T> From<Arc<T>> for DnsTransportRegistration
+where
+    T: DnsTransport + ComponentMetadata + 'static,
+{
+    fn from(transport: Arc<T>) -> Self {
+        let meta = ComponentMetadata::component_meta(transport.as_ref());
+        let runtime: Arc<dyn DnsTransport> = transport;
+        Self(RuntimeComponent::new(meta, runtime))
+    }
+}
+
+pub(crate) type DnsTransportBuilder = fn(
     String,
     &DnsServerKind,
     Logger,
     Option<Arc<OutboundManager>>,
-    Option<Arc<dyn DnsTransport>>,
+    Option<DnsTransportComponent>,
     SocketProtector,
-) -> Result<Arc<dyn DnsTransport>, HammerError>;
+) -> HammerResult<DnsTransportComponent>;
 
 #[derive(Clone)]
 struct DnsTransportFactorySet {
@@ -719,9 +580,9 @@ impl DnsTransportFactorySet {
         server: &DnsServer,
         logger: &Logger,
         outbound: Option<Arc<OutboundManager>>,
-        bootstrap: Option<Arc<dyn DnsTransport>>,
+        bootstrap: Option<DnsTransportComponent>,
         protector: SocketProtector,
-    ) -> Result<Arc<dyn DnsTransport>, HammerError> {
+    ) -> HammerResult<DnsTransportComponent> {
         let type_name = server.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown DNS transport type: {type_name}"))
@@ -742,24 +603,15 @@ fn register_standard_dns_transport_builders(
     builders: &mut HashMap<&'static str, DnsTransportBuilder>,
 ) {
     #[cfg(feature = "dns-udp")]
-    builders.insert(
-        "udp",
-        transport::udp::build_transport as DnsTransportBuilder,
-    );
+    register_components!(dns_transport, builders, [transport::udp::UdpDnsTransport]);
     #[cfg(feature = "dns-tcp")]
-    builders.insert(
-        "tcp",
-        transport::tcp::build_transport as DnsTransportBuilder,
-    );
+    register_components!(dns_transport, builders, [transport::tcp::TcpDnsTransport]);
     #[cfg(feature = "dns-https")]
-    builders.insert(
-        "https",
-        transport::doh::build_transport as DnsTransportBuilder,
-    );
+    register_components!(dns_transport, builders, [transport::doh::HttpsDnsTransport]);
     #[cfg(feature = "dns-hosts")]
-    builders.insert("hosts", build_hosts_transport as DnsTransportBuilder);
+    register_components!(dns_transport, builders, [HostsTransport]);
     #[cfg(feature = "dns-local")]
-    builders.insert("local", build_local_transport as DnsTransportBuilder);
+    register_components!(dns_transport, builders, [LocalDnsTransport]);
 }
 
 impl DnsTransportManager {
@@ -771,7 +623,7 @@ impl DnsTransportManager {
         }
     }
 
-    pub fn from_options(logger: Logger, options: &DnsOptions) -> Result<Self, HammerError> {
+    pub fn from_options(logger: Logger, options: &DnsOptions) -> HammerResult<Self> {
         Self::from_options_inner(logger, options, None, None, SocketProtector::default())
     }
 
@@ -779,15 +631,15 @@ impl DnsTransportManager {
         logger: Logger,
         options: &DnsOptions,
         outbound: Arc<OutboundManager>,
-        platform: Arc<dyn PlatformInterface>,
+        platform: impl Into<RuntimePlatform>,
         default_domain_resolver: Option<&str>,
-    ) -> Result<Self, HammerError> {
+    ) -> HammerResult<Self> {
         Self::from_options_inner(
             logger,
             options,
             Some(outbound),
             default_domain_resolver,
-            SocketProtector::new(platform),
+            SocketProtector::from(platform.into()),
         )
     }
 
@@ -799,8 +651,9 @@ impl DnsTransportManager {
         options: &DnsOptions,
         outbound: Option<Arc<OutboundManager>>,
         default_domain_resolver: Option<&str>,
-        protector: SocketProtector,
-    ) -> Result<Self, HammerError> {
+        protector: impl Into<SocketProtector>,
+    ) -> HammerResult<Self> {
+        let protector = protector.into();
         let manager = Self::new(logger.clone(), options.final_.clone());
         let order = topo_sort_dns_servers(&options.servers, default_domain_resolver)?;
         for server in order {
@@ -817,14 +670,16 @@ impl DnsTransportManager {
         Ok(manager)
     }
 
-    pub fn insert(&self, transport: Arc<dyn DnsTransport>) {
+    pub fn insert(&self, transport: impl Into<DnsTransportRegistration>) {
+        let transport = transport.into().0;
+        let id = transport.meta().id().to_owned();
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
-            .insert(transport.id().to_owned(), transport);
+            .insert(id, transport);
     }
 
-    pub fn list(&self) -> Vec<Arc<dyn DnsTransport>> {
+    pub fn list(&self) -> Vec<DnsTransportComponent> {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
@@ -833,7 +688,7 @@ impl DnsTransportManager {
             .collect()
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<dyn DnsTransport>> {
+    pub fn get(&self, id: &str) -> Option<DnsTransportComponent> {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
@@ -841,7 +696,7 @@ impl DnsTransportManager {
             .cloned()
     }
 
-    pub fn default(&self) -> Option<Arc<dyn DnsTransport>> {
+    pub fn default(&self) -> Option<DnsTransportComponent> {
         self.get(&self.default_id)
     }
 }
@@ -877,7 +732,7 @@ fn effective_runtime_bootstrap<'a>(
 fn topo_sort_dns_servers<'a>(
     servers: &'a [DnsServer],
     default: Option<&'a str>,
-) -> Result<Vec<&'a DnsServer>, HammerError> {
+) -> HammerResult<Vec<&'a DnsServer>> {
     let by_id: HashMap<&str, &DnsServer> = servers.iter().map(|s| (s.id.as_str(), s)).collect();
     let mut visited: HashMap<&str, u8> = HashMap::new();
     let mut order: Vec<&DnsServer> = Vec::new();
@@ -893,7 +748,7 @@ fn topo_visit_dns<'a>(
     default: Option<&'a str>,
     visited: &mut HashMap<&'a str, u8>,
     order: &mut Vec<&'a DnsServer>,
-) -> Result<(), HammerError> {
+) -> HammerResult<()> {
     match visited.get(node).copied().unwrap_or(0) {
         2 => return Ok(()),
         1 => {
@@ -924,9 +779,9 @@ fn build_hosts_transport(
     kind: &DnsServerKind,
     _logger: Logger,
     _outbound: Option<Arc<OutboundManager>>,
-    _bootstrap: Option<Arc<dyn DnsTransport>>,
+    _bootstrap: Option<DnsTransportComponent>,
     _protector: SocketProtector,
-) -> Result<Arc<dyn DnsTransport>, HammerError> {
+) -> HammerResult<Arc<HostsTransport>> {
     match kind {
         DnsServerKind::Hosts => Ok(Arc::new(HostsTransport::system(id))),
         _ => Err(HammerError::internal(
@@ -941,9 +796,9 @@ fn build_local_transport(
     kind: &DnsServerKind,
     _logger: Logger,
     _outbound: Option<Arc<OutboundManager>>,
-    _bootstrap: Option<Arc<dyn DnsTransport>>,
+    _bootstrap: Option<DnsTransportComponent>,
     _protector: SocketProtector,
-) -> Result<Arc<dyn DnsTransport>, HammerError> {
+) -> HammerResult<Arc<LocalDnsTransport>> {
     match kind {
         DnsServerKind::Local => Ok(Arc::new(LocalDnsTransport::new(id))),
         _ => Err(HammerError::internal(
@@ -957,7 +812,7 @@ impl Lifecycle for DnsTransportManager {
         "dns-transport"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!("stage {}", stage.name());
         if stage != StartStage::Start {
             return Ok(());
@@ -969,34 +824,34 @@ impl Lifecycle for DnsTransportManager {
             )));
         }
         for transport in self.list() {
-            transport.start(stage)?;
+            transport.runtime().start(stage)?;
         }
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         debug!("close");
         for transport in self.list() {
-            transport.close()?;
+            transport.runtime().close()?;
         }
         Ok(())
     }
 }
 
 impl DnsTransportManagerTrait for DnsTransportManager {
-    fn list(&self) -> Vec<Arc<dyn DnsTransport>> {
+    fn list(&self) -> Vec<DnsTransportComponent> {
         self.list()
     }
 
-    fn get(&self, id: &str) -> Option<Arc<dyn DnsTransport>> {
+    fn get(&self, id: &str) -> Option<DnsTransportComponent> {
         self.get(id)
     }
 
-    fn default(&self) -> Option<Arc<dyn DnsTransport>> {
+    fn default(&self) -> Option<DnsTransportComponent> {
         self.default()
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("DnsTransportManager poisoned")
@@ -1037,7 +892,7 @@ struct ResolvedDnsRule {
 }
 
 enum ResolvedDnsAction {
-    Route(Arc<dyn DnsTransport>),
+    Route(DnsTransportComponent),
     Reject(RejectKind),
 }
 
@@ -1048,7 +903,7 @@ enum ResolvedDnsAction {
 /// clones an `Arc`, `Reject` is `Copy`, `Default` is unit.
 #[derive(Clone)]
 enum MatchedAction {
-    Route(Arc<dyn DnsTransport>),
+    Route(DnsTransportComponent),
     Reject(RejectKind),
     Default,
 }
@@ -1087,7 +942,7 @@ impl DnsRouter {
     /// validated upstream in `build_dns_rules` (hammer-core); this lookup
     /// only fails if the transport manager is racing initialisation, in
     /// which case we surface an internal error rather than crashing.
-    pub fn with_rules(mut self, rules: &[DnsRule]) -> Result<Self, HammerError> {
+    pub fn with_rules(mut self, rules: &[DnsRule]) -> HammerResult<Self> {
         let mut resolved = Vec::with_capacity(rules.len());
         for (idx, rule) in rules.iter().enumerate() {
             let action = match &rule.action {
@@ -1138,7 +993,7 @@ impl DnsRouter {
                 continue;
             }
             return match &rule.action {
-                ResolvedDnsAction::Route(transport) => MatchedAction::Route(Arc::clone(transport)),
+                ResolvedDnsAction::Route(transport) => MatchedAction::Route(transport.clone()),
                 ResolvedDnsAction::Reject(kind) => MatchedAction::Reject(*kind),
             };
         }
@@ -1159,7 +1014,7 @@ impl DnsRouter {
         &self,
         message: Message,
         mut options: DnsQueryOptions,
-    ) -> Result<Message, HammerError> {
+    ) -> HammerResult<Message> {
         let query_summary = dns_query_log_summary(&message);
 
         // `[[dns.rules]]` matching takes precedence over the explicit
@@ -1201,14 +1056,10 @@ impl DnsRouter {
         info!(
             "exchange query={} server={} strategy={:?}",
             query_summary,
-            transport.id(),
+            transport.meta().id(),
             options.strategy
         );
-        let response = match self
-            .client
-            .exchange(transport.as_ref(), message, options)
-            .await
-        {
+        let response = match self.client.exchange(&transport, message, options).await {
             Ok(response) => response,
             Err(err) => {
                 warn!("exchange failed query={query_summary}: {err}");
@@ -1228,7 +1079,7 @@ impl DnsRouter {
         &self,
         message: &Message,
         mut options: DnsQueryOptions,
-    ) -> Result<Option<Message>, HammerError> {
+    ) -> HammerResult<Option<Message>> {
         if !self.rules.is_empty() && options.transport.is_none() {
             let qname = message
                 .queries
@@ -1256,9 +1107,9 @@ impl DnsRouter {
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        let Some(response) =
-            self.client
-                .try_exchange_cached(transport.as_ref(), message, options)?
+        let Some(response) = self
+            .client
+            .try_exchange_cached(&transport, message, options)?
         else {
             return Ok(None);
         };
@@ -1270,16 +1121,13 @@ impl DnsRouter {
         &self,
         domain: &str,
         mut options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError> {
+    ) -> HammerResult<Vec<IpAddr>> {
         debug!("lookup domain {}", normalize_domain(domain));
         let transport = self.resolve_transport(&options)?;
         if options.strategy == DomainStrategy::AsIs {
             options.strategy = self.default_strategy;
         }
-        let addresses = self
-            .client
-            .lookup(transport.as_ref(), domain, options)
-            .await?;
+        let addresses = self.client.lookup(&transport, domain, options).await?;
         let expires_at = Instant::now() + Duration::from_secs(u64::from(DEFAULT_DNS_TTL));
         let domain = normalize_domain(domain);
         let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
@@ -1319,16 +1167,13 @@ impl DnsRouter {
     pub fn reset_network(&self) {
         self.clear_cache();
         for transport in self.transport.list() {
-            transport.reset();
+            transport.runtime().reset();
         }
     }
 
-    fn resolve_transport(
-        &self,
-        options: &DnsQueryOptions,
-    ) -> Result<Arc<dyn DnsTransport>, HammerError> {
+    fn resolve_transport(&self, options: &DnsQueryOptions) -> HammerResult<DnsTransportComponent> {
         if let Some(transport) = &options.transport {
-            return Ok(Arc::clone(transport));
+            return Ok(transport.clone());
         }
         self.transport
             .default()
@@ -1380,12 +1225,12 @@ impl Lifecycle for DnsRouter {
         "dns-router"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         debug!("stage {}", stage.name());
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         debug!("close");
         self.clear_cache();
         Ok(())
@@ -1394,19 +1239,11 @@ impl Lifecycle for DnsRouter {
 
 #[async_trait]
 impl DnsRouterTrait for DnsRouter {
-    async fn exchange(
-        &self,
-        message: Message,
-        options: DnsQueryOptions,
-    ) -> Result<Message, HammerError> {
+    async fn exchange(&self, message: Message, options: DnsQueryOptions) -> HammerResult<Message> {
         self.exchange(message, options).await
     }
 
-    async fn lookup(
-        &self,
-        domain: &str,
-        options: DnsQueryOptions,
-    ) -> Result<Vec<IpAddr>, HammerError> {
+    async fn lookup(&self, domain: &str, options: DnsQueryOptions) -> HammerResult<Vec<IpAddr>> {
         self.lookup(domain, options).await
     }
 
@@ -1414,7 +1251,7 @@ impl DnsRouterTrait for DnsRouter {
         &self,
         message: &Message,
         options: DnsQueryOptions,
-    ) -> Result<Option<Message>, HammerError> {
+    ) -> HammerResult<Option<Message>> {
         DnsRouter::try_exchange_fast(self, message, options)
     }
 
@@ -1437,9 +1274,13 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use hammer_core::error::CoreError;
+    use hammer_adapter::{ComponentMeta, RuntimeComponent};
+    use hammer_core::error::CoreResult;
     use hammer_core::lifecycle::StartStage;
     use hammer_core::log::{DiscardWriter, Factory};
+    use hickory_proto::op::{MessageType, OpCode};
+    use hickory_proto::rr::{DNSClass, Name, RData, Record};
+    use std::net::Ipv4Addr;
 
     fn test_logger(id: &str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -1468,27 +1309,18 @@ mod tests {
         fn name(&self) -> &str {
             &self.id
         }
-        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
             Ok(())
         }
-        fn close(&self) -> Result<(), HammerError> {
+        fn close(&self) -> HammerResult<()> {
             Ok(())
         }
     }
 
     #[async_trait]
     impl DnsTransport for StubTransport {
-        fn type_name(&self) -> &str {
-            "stub"
-        }
-        fn id(&self) -> &str {
-            &self.id
-        }
-        fn dependencies(&self) -> &[String] {
-            &[]
-        }
         fn reset(&self) {}
-        async fn exchange(&self, message: Message) -> Result<Message, CoreError> {
+        async fn exchange(&self, message: Message) -> CoreResult<Message> {
             self.queries.fetch_add(1, Ordering::SeqCst);
             let mut response = message.fixed_response(FixedResponseCode::NoError);
             if let Some(query) = message.queries.first() {
@@ -1522,9 +1354,30 @@ mod tests {
             default_id.to_owned(),
         ));
         for stub in stubs {
-            manager.insert(Arc::clone(stub) as Arc<dyn DnsTransport>);
+            manager.insert(stub_transport_component(Arc::clone(stub)));
         }
         manager
+    }
+
+    #[cfg(feature = "dns-local")]
+    #[test]
+    fn dns_transport_manager_insert_accepts_concrete_component_arc() {
+        let manager = DnsTransportManager::new(test_logger("dns-transport"), "local-arc");
+        let transport = Arc::new(LocalDnsTransport::new("local-arc"));
+
+        manager.insert(Arc::clone(&transport));
+
+        let registered = manager.get("local-arc").expect("registered transport");
+        assert_eq!(registered.type_name(), "local");
+    }
+
+    fn stub_transport_component(stub: Arc<StubTransport>) -> DnsTransportComponent {
+        let id = stub.id.clone();
+        let runtime: Arc<dyn DnsTransport> = stub;
+        RuntimeComponent::new(
+            ComponentMeta::new("dns_transport", "stub", id, Vec::new(), Vec::new(), None),
+            runtime,
+        )
     }
 
     fn router_with_rules(manager: Arc<DnsTransportManager>, rules: Vec<DnsRule>) -> DnsRouter {
@@ -1761,11 +1614,12 @@ mod tests {
     #[tokio::test]
     async fn dns_client_accepts_concrete_transport_reference() {
         let upstream = StubTransport::arc("upstream", Ipv4Addr::new(8, 8, 8, 8));
+        let upstream_component = stub_transport_component(Arc::clone(&upstream));
         let client = DnsClient::new(test_logger("dns-client"));
 
         let response = client
             .exchange(
-                upstream.as_ref(),
+                &upstream_component,
                 build_query("example.com."),
                 DnsQueryOptions::default(),
             )
@@ -1855,7 +1709,7 @@ mod tests {
         let router = router_with_rules(manager, rules);
 
         let mut options = DnsQueryOptions::default();
-        options.transport = Some(Arc::clone(&upstream) as Arc<dyn DnsTransport>);
+        options.transport = Some(stub_transport_component(Arc::clone(&upstream)));
 
         let _ = router
             .exchange(build_query("ifconfig.so."), options)

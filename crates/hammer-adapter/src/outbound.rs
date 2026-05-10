@@ -1,15 +1,18 @@
 use std::net::IpAddr;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use hammer_core::error::CoreError;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::RuntimeComponent;
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
+
+pub type OutboundComponent = RuntimeComponent<dyn Outbound>;
 
 pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
@@ -23,8 +26,8 @@ pub struct ProxyDatagram {
 
 #[async_trait]
 pub trait ProxyPacketConn: Send + Sync + 'static {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), CoreError>;
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, CoreError>;
+    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> CoreResult<()>;
+    async fn recv_from(&mut self) -> CoreResult<ProxyDatagram>;
 }
 
 /// One inbound ICMP echo reply observed on a `ProxyIcmpConn`.
@@ -48,8 +51,8 @@ pub struct IcmpReply {
 /// send.
 #[async_trait]
 pub trait ProxyIcmpConn: Send + Sync + 'static {
-    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> Result<(), CoreError>;
-    async fn recv_reply(&mut self) -> Result<IcmpReply, CoreError>;
+    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> CoreResult<()>;
+    async fn recv_reply(&mut self) -> CoreResult<IcmpReply>;
 }
 
 /// `adapter.Outbound` in Go — represents a single dialable egress
@@ -57,16 +60,12 @@ pub trait ProxyIcmpConn: Send + Sync + 'static {
 /// instead of pretending to be a normal outbound.
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
-    fn type_name(&self) -> &str;
-    fn id(&self) -> &str;
-    fn networks(&self) -> &[Network];
-    fn dependencies(&self) -> &[String];
     fn reset(&self) {}
 
     /// Ensure this outbound has a live cached connection if it needs one.
     /// Stateless outbounds keep the no-op; cached outbounds should return
     /// immediately when already connected.
-    async fn ensure_connected(&self) -> Result<(), CoreError> {
+    async fn ensure_connected(&self) -> CoreResult<()> {
         Ok(())
     }
 
@@ -75,33 +74,27 @@ pub trait Outbound: Send + Sync + 'static {
         network: Network,
         destination: SocksAddr,
         initial_payload: &[u8],
-    ) -> Result<Box<dyn ProxyStream>, CoreError>;
+    ) -> CoreResult<Box<dyn ProxyStream>>;
 
-    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, CoreError>;
+    async fn listen_packet(&self) -> CoreResult<Box<dyn ProxyPacketConn>>;
 
     /// Open an ICMP echo conduit on this outbound. The default impl
     /// reports unsupported, so only outbounds that genuinely carry ICMP
     /// (today: `direct`) override; the tun stack converts the resulting
     /// `Err` into an ICMP Destination Unreachable response written back
     /// to the client.
-    async fn listen_icmp(&self) -> Result<Box<dyn ProxyIcmpConn>, CoreError> {
+    async fn listen_icmp(&self) -> CoreResult<Box<dyn ProxyIcmpConn>> {
         Err(CoreError::internal(format!(
-            "icmp not supported by outbound: {}",
-            self.id()
+            "icmp not supported by outbound"
         )))
     }
 
     /// Measure latency to this outbound's own probe endpoint for the
     /// requested protocol. The default reports unsupported; server-backed
     /// outbounds can override without forcing probe code to downcast.
-    async fn probe_latency(
-        &self,
-        protocol: &str,
-        _timeout: Duration,
-    ) -> Result<Duration, CoreError> {
+    async fn probe_latency(&self, protocol: &str, _timeout: Duration) -> CoreResult<Duration> {
         Err(CoreError::internal(format!(
-            "{protocol} probe not supported by outbound: {}",
-            self.id()
+            "{protocol} probe not supported by outbound"
         )))
     }
 
@@ -111,7 +104,7 @@ pub trait Outbound: Send + Sync + 'static {
     ///
     /// Returning `Err` is logged but does not abort service startup —
     /// callers treat the hook as fire-and-forget.
-    async fn post_start(&self) -> Result<(), CoreError> {
+    async fn post_start(&self) -> CoreResult<()> {
         Ok(())
     }
 
@@ -140,22 +133,16 @@ pub trait Outbound: Send + Sync + 'static {
     /// land in declaration order with `outbound_id` set to each child's
     /// id and `protocol` to a sweep-kind tag (e.g. `"urltest"`). Leaf
     /// outbounds reject the call by default since they have no children.
-    async fn probe_group(
-        &self,
-        _timeout: Duration,
-    ) -> Result<Vec<crate::probe::ProbeReport>, CoreError> {
-        Err(CoreError::internal(format!(
-            "outbound '{}' has no group probe",
-            self.id()
-        )))
+    async fn probe_group(&self, _timeout: Duration) -> CoreResult<Vec<crate::probe::ProbeReport>> {
+        Err(CoreError::internal(format!("outbound has no group probe")))
     }
 }
 
 /// `adapter.OutboundManager` — owns the live set of outbounds and a default
 /// fallback (used when a route rule has no explicit outbound match).
 pub trait OutboundManager: Lifecycle {
-    fn list(&self) -> Vec<Arc<dyn Outbound>>;
-    fn get(&self, id: &str) -> Option<Arc<dyn Outbound>>;
-    fn default(&self) -> Option<Arc<dyn Outbound>>;
-    fn remove(&self, id: &str) -> Result<(), CoreError>;
+    fn list(&self) -> Vec<OutboundComponent>;
+    fn get(&self, id: &str) -> Option<OutboundComponent>;
+    fn default(&self) -> Option<OutboundComponent>;
+    fn remove(&self, id: &str) -> CoreResult<()>;
 }

@@ -5,7 +5,7 @@ use hammer_adapter::{
     CertificateProviderManager as CertificateProviderManagerTrait, CertificateProviderService,
     CertificateStore as CertificateStoreTrait,
 };
-use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
@@ -62,7 +62,7 @@ impl CertificateProviderManagerTrait for CertificateProviderManager {
             .cloned()
     }
 
-    fn remove(&self, id: &str) -> Result<(), HammerError> {
+    fn remove(&self, id: &str) -> HammerResult<()> {
         self.items
             .lock()
             .expect("CertificateProviderManager poisoned")

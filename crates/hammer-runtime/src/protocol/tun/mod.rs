@@ -8,7 +8,7 @@
 //!   the TUN inbound's smoltcp mode will share it once it lands.
 
 #[cfg(feature = "ipstack")]
-pub(crate) mod ipstack;
+pub use hammer_core::protocol::ipstack;
 
 #[cfg(feature = "inbound-tun")]
 pub mod stack;

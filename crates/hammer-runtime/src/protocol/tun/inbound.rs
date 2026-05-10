@@ -1,14 +1,13 @@
-use std::any::Any;
 use std::io;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
 use hammer_adapter::{
-    DnsRouter as DnsRouterTrait, Inbound, OutboundManager as OutboundManagerTrait,
-    PlatformInterface, Router as RouterTrait, TunOptions,
+    ComponentMetadata, DnsRouter as DnsRouterTrait, Inbound,
+    OutboundManager as OutboundManagerTrait, PlatformInterface, Router as RouterTrait, TunOptions,
 };
 use hammer_core::config::{InboundKind, TunInboundOptions, TunStack};
-use hammer_core::error::HammerError;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 use hammer_core::metrics::MetricsRegistry;
@@ -23,8 +22,15 @@ type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 type PlatformTunDevice = AsyncTunDevice;
 
-type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
+pub(crate) type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
 
+#[hammer_component_macros::hammer_component(
+    inbound,
+    name = "tun",
+    builder = build_inbound,
+    runtime = RuntimeTunInbound,
+    metrics = ("inbound", "tun")
+)]
 pub struct TunInbound<R, Q, O>
 where
     R: RouterTrait + 'static,
@@ -119,7 +125,7 @@ where
         self.options.mtu
     }
 
-    fn open_tun(&self) -> Result<(), HammerError> {
+    fn open_tun(&self) -> HammerResult<()> {
         if self
             .tun_fd
             .lock()
@@ -146,7 +152,7 @@ where
     fn build_system_stack(
         &self,
         fd: i32,
-    ) -> Result<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>, HammerError> {
+    ) -> HammerResult<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>> {
         match self.options.stack {
             TunStack::Disabled => {
                 debug!("skip disabled TUN data path");
@@ -176,11 +182,18 @@ where
             self.options.clone(),
             device,
             tun_interface_index,
-            self.metrics.scope("inbound", "tun", self.id.clone()),
+            {
+                let meta = self.component_meta();
+                let metrics = meta
+                    .metrics()
+                    .expect("TunInbound component macro must declare metrics");
+                self.metrics
+                    .scope(metrics.module, metrics.component_type, meta.id().to_owned())
+            },
         ))))
     }
 
-    fn start_system_stack(&self) -> Result<(), HammerError> {
+    fn start_system_stack(&self) -> HammerResult<()> {
         let stack = self
             .system_stack
             .lock()
@@ -192,7 +205,7 @@ where
         Ok(())
     }
 
-    fn platform_options(&self) -> Result<TunOptions, HammerError> {
+    fn platform_options(&self) -> HammerResult<TunOptions> {
         let mtu = i32::try_from(self.options.mtu)
             .map_err(|_| HammerError::internal("TUN MTU does not fit in i32"))?;
         let name = if self.options.interface_name.is_empty() {
@@ -237,10 +250,10 @@ pub(crate) fn build_inbound(
     outbound: Option<Arc<OutboundManager>>,
     platform: Option<Arc<dyn PlatformInterface>>,
     metrics: Arc<MetricsRegistry>,
-) -> Result<Arc<dyn Inbound>, HammerError> {
+) -> HammerResult<Arc<RuntimeTunInbound>> {
     match kind {
         InboundKind::Tun(options) => {
-            let inbound: Arc<dyn Inbound> = match (dns_router, outbound, platform) {
+            let inbound: Arc<RuntimeTunInbound> = match (dns_router, outbound, platform) {
                 (Some(dns_router), Some(outbound), Some(platform)) => {
                     Arc::new(RuntimeTunInbound::new_with_runtime_and_metrics(
                         id,
@@ -270,7 +283,7 @@ where
         "inbound"
     }
 
-    fn start(&self, stage: StartStage) -> Result<(), HammerError> {
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
         if matches!(stage, StartStage::Start) {
             self.open_tun()?;
         }
@@ -280,7 +293,7 @@ where
         Ok(())
     }
 
-    fn close(&self) -> Result<(), HammerError> {
+    fn close(&self) -> HammerResult<()> {
         if let Some(stack) = self
             .system_stack
             .lock()
@@ -295,7 +308,7 @@ where
     }
 }
 
-fn duplicate_fd(fd: i32) -> Result<i32, HammerError> {
+fn duplicate_fd(fd: i32) -> HammerResult<i32> {
     let dup_fd = unsafe { libc::dup(fd) };
     if dup_fd < 0 {
         return Err(HammerError::internal(format!(
@@ -310,10 +323,7 @@ fn duplicate_fd(fd: i32) -> Result<i32, HammerError> {
 /// `fd` must be an exclusively-owned utun file descriptor; the returned device
 /// closes it on drop.
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-unsafe fn open_system_tun_device(
-    fd: i32,
-    mtu: usize,
-) -> Result<Arc<PlatformTunDevice>, HammerError> {
+unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> HammerResult<Arc<PlatformTunDevice>> {
     let device = unsafe { crate::apple_utun::AppleTunDevice::from_fd(fd, mtu)? };
     Ok(device)
 }
@@ -322,10 +332,7 @@ unsafe fn open_system_tun_device(
 /// `fd` must be an exclusively-owned TUN file descriptor; the returned device
 /// closes it on drop.
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-unsafe fn open_system_tun_device(
-    fd: i32,
-    mtu: usize,
-) -> Result<Arc<PlatformTunDevice>, HammerError> {
+unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> HammerResult<Arc<PlatformTunDevice>> {
     let device = unsafe { AsyncTunDevice::from_fd(fd, mtu)? };
     Ok(device)
 }
@@ -336,15 +343,4 @@ where
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
-    fn type_name(&self) -> &str {
-        "tun"
-    }
-
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }

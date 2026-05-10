@@ -4,7 +4,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    DnsTransport, InboundManager as _, Lifecycle, Network, RouteDecision, SocksAddr,
+    ComponentMeta, DnsTransport, DnsTransportComponent, InboundManager as _, Lifecycle, Network,
+    RouteDecision, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
@@ -29,6 +30,21 @@ type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+fn dns_transport_component<T>(
+    id: &str,
+    type_name: &'static str,
+    transport: Arc<T>,
+) -> DnsTransportComponent
+where
+    T: DnsTransport + 'static,
+{
+    let runtime: Arc<dyn DnsTransport> = transport;
+    RuntimeComponent::new(
+        ComponentMeta::new("dns_transport", type_name, id, Vec::new(), Vec::new(), None),
+        runtime,
+    )
 }
 
 fn options() -> Options {
@@ -86,7 +102,11 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimeSmoltcpTunSt
             .expect("router"),
     );
     let dns_transport = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
-    dns_transport.insert(Arc::new(FixedDnsTransport));
+    dns_transport.insert(dns_transport_component(
+        "mock",
+        "mock",
+        Arc::new(FixedDnsTransport),
+    ));
     let dns_router = Arc::new(DnsRouter::new_with_manager(
         logger("dns-router"),
         dns_transport,
@@ -607,6 +627,26 @@ fn inbound_manager_registers_tun_inbound_from_options() {
     assert!(inbound.as_any().is::<RuntimeTunInbound>());
 }
 
+#[test]
+fn inbound_manager_register_accepts_concrete_component_arc() {
+    let options = options();
+    let router = router_from_options(&options);
+    let config::InboundKind::Tun(tun_options) = &options.inbounds[0].kind;
+    let inbound = Arc::new(RuntimeTunInbound::new(
+        "tun-arc",
+        logger("tun"),
+        tun_options.clone(),
+        router,
+    ));
+    let manager = InboundManager::new(logger("inbound"));
+
+    manager.register(Arc::clone(&inbound));
+
+    let registered = manager.get("tun-arc").expect("registered inbound");
+    assert_eq!(registered.type_name(), "tun");
+    assert!(registered.as_any().is::<RuntimeTunInbound>());
+}
+
 struct FixedDnsTransport;
 
 impl Lifecycle for FixedDnsTransport {
@@ -625,18 +665,6 @@ impl Lifecycle for FixedDnsTransport {
 
 #[async_trait]
 impl DnsTransport for FixedDnsTransport {
-    fn type_name(&self) -> &str {
-        "mock"
-    }
-
-    fn id(&self) -> &str {
-        "mock"
-    }
-
-    fn dependencies(&self) -> &[String] {
-        &[]
-    }
-
     fn reset(&self) {}
 
     async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
