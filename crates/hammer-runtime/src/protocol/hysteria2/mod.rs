@@ -178,11 +178,21 @@ async fn connect_with_timeout(
     let (h3_sender, auth_response) = authenticate(&connection, &options)
         .await
         .map_err(|err| HammerError::internal(format!("hysteria2 auth failed {context}: {err}")))?;
-    debug!("hysteria2 authenticated udp={}", options.udp_enabled);
     let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
-    if !auth_response.rx_auto && actual_tx > 0 {
+    let congestion_mode = if !auth_response.rx_auto && actual_tx > 0 {
         congestion.use_brutal(actual_tx);
-    }
+        "brutal"
+    } else {
+        "bbr"
+    };
+    debug!(
+        "hysteria2 authenticated udp={} rx_auto={} server_rx={} send_bps={} congestion={}",
+        options.udp_enabled,
+        auth_response.rx_auto,
+        auth_response.rx,
+        options.send_bps,
+        congestion_mode
+    );
     let client = Arc::new(Hysteria2Client {
         connection,
         _endpoint: endpoint,

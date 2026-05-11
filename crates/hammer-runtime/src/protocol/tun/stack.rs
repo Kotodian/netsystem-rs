@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
@@ -18,7 +19,7 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use ipnet::IpNet;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -39,6 +40,7 @@ const SYSTEM_ICMP_QUEUE_CAPACITY: usize = 32;
 const SYSTEM_ICMP_WORKERS: usize = 2;
 const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
+const SYSTEM_TCP_BRIDGE_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
@@ -1726,7 +1728,13 @@ async fn bridge_system_tcp_streams(
     inbound: &mut TcpStream,
     outbound_stream: &mut dyn ProxyStream,
 ) -> std::io::Result<(u64, u64)> {
-    let result = copy_bidirectional(&mut *inbound, &mut *outbound_stream).await;
+    let result = copy_bidirectional_with_sizes(
+        &mut *inbound,
+        &mut *outbound_stream,
+        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
+        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
+    )
+    .await;
     if result.is_err() {
         close_system_tcp_stream(inbound);
     } else {
@@ -2040,7 +2048,7 @@ async fn accept_tcp_loop<R, O>(
                 ..Default::default()
             };
             let mut initial_payload = Vec::new();
-            if let Some(sniff_timeout) = router.sniff_timeout(&metadata) {
+            if let Some(sniff_timeout) = router.tcp_sniff_timeout(&metadata) {
                 let mut buf = [0_u8; 4096];
                 match timeout(sniff_timeout, inbound.stream_mut().read(&mut buf)).await {
                     Ok(Ok(0)) => {
@@ -2062,6 +2070,22 @@ async fn accept_tcp_loop<R, O>(
                         return;
                     }
                     Err(_) => {}
+                }
+            } else {
+                let mut buf = [0_u8; 4096];
+                match inbound.stream_mut().try_read(&mut buf) {
+                    Ok(0) => {
+                        inbound.disarm();
+                        return;
+                    }
+                    Ok(n) => {
+                        initial_payload.extend_from_slice(&buf[..n]);
+                    }
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+                    Err(err) => {
+                        debug!("read TCP initial payload: {err}");
+                        return;
+                    }
                 }
             }
             let decision = match router.match_route(&mut metadata) {

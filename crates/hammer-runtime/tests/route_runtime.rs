@@ -45,6 +45,32 @@ final = "hysteria2"
     .expect("parse config")
 }
 
+fn demo_like_options_without_tcp_sniff_rules() -> Options {
+    config::parse_config(
+        r#"
+[tun]
+address = ["172.19.0.1/30"]
+sniff = true
+hijack_dns = true
+block_quic = true
+domain_strategy = "prefer_ipv4"
+udp_disable_domain_unmapping = true
+
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "hysteria2"
+"#,
+    )
+    .expect("parse config")
+}
+
 fn router_from_options(options: &Options) -> Router {
     let outbound = Arc::new(
         OutboundManager::from_options(
@@ -129,6 +155,58 @@ fn router_rejects_quic_with_default_method() {
             method: "default".to_owned()
         }
     );
+}
+
+#[test]
+fn router_skips_tcp_sniff_wait_when_no_tcp_rule_needs_sniffed_metadata() {
+    let router = router_from_options(&demo_like_options_without_tcp_sniff_rules());
+    let metadata = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        destination: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)),
+        ..Default::default()
+    };
+
+    assert!(
+        router.sniff_timeout(&metadata).is_some(),
+        "generic sniff stays enabled for UDP DNS/QUIC handling"
+    );
+    assert_eq!(router.tcp_sniff_timeout(&metadata), None);
+}
+
+#[test]
+fn router_keeps_tcp_sniff_wait_for_domain_route_rules() {
+    let opts = options_with_user_rules(
+        "[[route.rules]]\ndomain_suffix = [\"example.com\"]\noutbound = \"hysteria2\"\n",
+    );
+    let router = router_from_options(&opts);
+    let metadata = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        destination: Some(SocksAddr::ip(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            443,
+        )),
+        ..Default::default()
+    };
+
+    assert!(router.tcp_sniff_timeout(&metadata).is_some());
+}
+
+#[test]
+fn router_keeps_tcp_sniff_wait_when_sniff_overrides_destination() {
+    let router = router_from_options(&options());
+    let metadata = RouteMetadata {
+        inbound: "tun".to_owned(),
+        network: Network::Tcp,
+        destination: Some(SocksAddr::ip(
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)),
+            443,
+        )),
+        ..Default::default()
+    };
+
+    assert!(router.tcp_sniff_timeout(&metadata).is_some());
 }
 
 fn options_with_user_rules(rules_block: &str) -> Options {

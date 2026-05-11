@@ -358,6 +358,38 @@ impl Router {
         })
     }
 
+    pub fn tcp_sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        if metadata.network != Network::Tcp {
+            return self.sniff_timeout(metadata);
+        }
+
+        let mut sniff_timeout = None;
+        for rule in &self.rules {
+            if sniff_timeout.is_none() {
+                if !rule.matches(metadata) {
+                    continue;
+                }
+                let RuleActionKind::Sniff(options) = &rule.action else {
+                    continue;
+                };
+                let timeout = options.timeout.unwrap_or(DEFAULT_SNIFF_TIMEOUT);
+                if options.override_destination {
+                    return Some(timeout);
+                }
+                sniff_timeout = Some(timeout);
+                continue;
+            }
+
+            if rule.decides_without_sniffed_tcp_metadata(metadata) {
+                return None;
+            }
+            if rule.needs_sniffed_tcp_metadata() {
+                return sniff_timeout;
+            }
+        }
+        None
+    }
+
     pub fn should_sniff(&self, metadata: &RouteMetadata) -> bool {
         self.sniff_timeout(metadata).is_some()
     }
@@ -411,6 +443,10 @@ impl RouterTrait for Router {
 
     fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
         Router::sniff_timeout(self, metadata)
+    }
+
+    fn tcp_sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        Router::tcp_sniff_timeout(self, metadata)
     }
 
     fn should_sniff(&self, metadata: &RouteMetadata) -> bool {
@@ -535,6 +571,24 @@ impl RuntimeRule {
             })),
         }
     }
+
+    #[inline]
+    fn needs_sniffed_tcp_metadata(&self) -> bool {
+        self.matcher.needs_sniffed_tcp_metadata()
+    }
+
+    #[inline]
+    fn decides_without_sniffed_tcp_metadata(&self, metadata: &RouteMetadata) -> bool {
+        self.is_terminal() && self.matches(metadata)
+    }
+
+    #[inline]
+    fn is_terminal(&self) -> bool {
+        matches!(
+            &self.action,
+            RuleActionKind::HijackDns | RuleActionKind::Reject(_) | RuleActionKind::Route(_)
+        )
+    }
 }
 
 pub(crate) enum RuntimeMatcher {
@@ -561,6 +615,15 @@ impl RuntimeMatcher {
             Self::DomainSuffix(matcher) => matcher.matches(metadata),
             Self::DomainKeyword(matcher) => matcher.matches(metadata),
             Self::IpCidr(matcher) => matcher.matches(metadata),
+        }
+    }
+
+    #[inline]
+    fn needs_sniffed_tcp_metadata(&self) -> bool {
+        match self {
+            Self::Protocol(matcher) => matcher.needs_sniffed_tcp_metadata(),
+            Self::Domain(_) | Self::DomainSuffix(_) | Self::DomainKeyword(_) => true,
+            Self::Any(_) | Self::Inbound(_) | Self::IpCidr(_) => false,
         }
     }
 }
@@ -596,6 +659,13 @@ impl ProtocolMatcher {
     #[inline]
     fn matches(&self, metadata: &RouteMetadata) -> bool {
         match_list(&self.values, &metadata.protocol)
+    }
+
+    #[inline]
+    fn needs_sniffed_tcp_metadata(&self) -> bool {
+        self.values
+            .iter()
+            .any(|value| !matches!(value.as_str(), "dns" | "quic" | "stun"))
     }
 }
 

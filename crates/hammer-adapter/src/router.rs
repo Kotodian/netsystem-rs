@@ -11,5 +11,8 @@ pub trait Router: Lifecycle {
     fn match_route(&self, metadata: &mut RouteMetadata) -> CoreResult<RouteDecision>;
     fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> CoreResult<()>;
     fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration>;
+    fn tcp_sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        self.sniff_timeout(metadata)
+    }
     fn should_sniff(&self, metadata: &RouteMetadata) -> bool;
 }
