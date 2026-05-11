@@ -5,4 +5,6 @@ pub mod stack;
 #[cfg(feature = "ipstack-wireguard")]
 pub mod wireguard;
 
-pub use stack::{IpStackHandles, IpStackInput, TcpListener, UdpHandle, spawn_ipstack};
+pub use stack::{
+    AcceptedTcpStream, IpStackHandles, IpStackInput, TcpListener, UdpHandle, spawn_ipstack,
+};

@@ -879,6 +879,15 @@ fn parse_config_default_endpoints_is_empty() {
     );
 }
 
+#[cfg(feature = "ipstack")]
+#[test]
+fn parse_config_accepts_smoltcp_tun_stack() {
+    let cfg = MINIMAL_CONFIG.replace("stack = \"system\"", "stack = \"smoltcp\"");
+    let options = config::parse_config(&cfg).expect("parse smoltcp stack");
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind;
+    assert_eq!(tun.stack, TunStack::Smoltcp);
+}
+
 /// Two-server fixture used by the domain_resolver suite below. Bootstrap is
 /// an IP-literal UDP server on `direct`; remote is a domain UDP server whose
 /// `domain_resolver` (or the route-level fallback) decides who resolves it.

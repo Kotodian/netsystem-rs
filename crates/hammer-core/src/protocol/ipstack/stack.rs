@@ -175,9 +175,15 @@ impl IpStackHandles {
 /// stack actor, which spins up a fresh smoltcp listening socket on that port,
 /// and replies with a `DuplexStream` once the three-way handshake completes.
 /// Concurrent accepts are fine — each gets its own socket.
+#[derive(Clone)]
 pub struct TcpListener {
     cmd_tx: mpsc::Sender<StackCommand>,
     port: u16,
+}
+
+pub struct AcceptedTcpStream {
+    pub stream: DuplexStream,
+    pub remote: SocketAddr,
 }
 
 impl TcpListener {
@@ -186,6 +192,10 @@ impl TcpListener {
     }
 
     pub async fn accept(&self) -> HammerResult<DuplexStream> {
+        Ok(self.accept_with_remote().await?.stream)
+    }
+
+    pub async fn accept_with_remote(&self) -> HammerResult<AcceptedTcpStream> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(StackCommand::AcceptTcp {
@@ -324,7 +334,7 @@ enum StackCommand {
     },
     AcceptTcp {
         port: u16,
-        reply: oneshot::Sender<HammerResult<DuplexStream>>,
+        reply: oneshot::Sender<HammerResult<AcceptedTcpStream>>,
     },
     /// Inspect how many UDP sockets are currently parked in the smoltcp
     /// `SocketSet`. Test-only — the production code never needs to ask.
@@ -338,7 +348,7 @@ enum StackCommand {
 /// bridge task and reply to `oneshot` with the user-side `DuplexStream`.
 struct PendingAccept {
     handle: SocketHandle,
-    reply: oneshot::Sender<HammerResult<DuplexStream>>,
+    reply: oneshot::Sender<HammerResult<AcceptedTcpStream>>,
 }
 
 /// One outbound TCP connect waiting for smoltcp to reach ESTABLISHED (or fail).
@@ -530,8 +540,21 @@ impl StackInner {
                 | State::LastAck => {
                     // Connection is up (or already half-closing — let the
                     // bridge surface that to the caller).
+                    let remote = socket.remote_endpoint().map(ip_endpoint_to_socket);
                     let user_side = self.start_tcp_bridge(accept.handle);
-                    let _ = accept.reply.send(Ok(user_side));
+                    match remote {
+                        Some(remote) => {
+                            let _ = accept.reply.send(Ok(AcceptedTcpStream {
+                                stream: user_side,
+                                remote,
+                            }));
+                        }
+                        None => {
+                            let _ = accept.reply.send(Err(HammerError::internal(
+                                "ipstack tcp accept missing remote endpoint",
+                            )));
+                        }
+                    }
                 }
                 State::Closed | State::TimeWait => {
                     // Listening socket aborted (RST) or completed and closed
@@ -660,7 +683,7 @@ impl StackInner {
     /// Park a fresh listening socket and remember the reply channel. The next
     /// poll cycle will notice when it transitions to ESTABLISHED and hand the
     /// caller a `DuplexStream`.
-    fn queue_accept(&mut self, port: u16, reply: oneshot::Sender<HammerResult<DuplexStream>>) {
+    fn queue_accept(&mut self, port: u16, reply: oneshot::Sender<HammerResult<AcceptedTcpStream>>) {
         let rx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let tx_buf = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut socket = tcp::Socket::new(rx_buf, tx_buf);

@@ -108,6 +108,7 @@ pub struct TunInboundOptions {
 pub enum TunStack {
     #[default]
     System,
+    Smoltcp,
     Disabled,
 }
 
@@ -115,6 +116,7 @@ impl TunStack {
     pub fn name(self) -> &'static str {
         match self {
             Self::System => "system",
+            Self::Smoltcp => "smoltcp",
             Self::Disabled => "disabled",
         }
     }

@@ -19,7 +19,9 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hickory_proto::op::Message;
 use ipnet::IpNet;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional_with_sizes};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional_with_sizes,
+};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -27,6 +29,10 @@ use tokio::time::{self, Duration, Instant, timeout};
 
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
 use hammer_core::protocol::dns::MessageExt;
+#[cfg(feature = "ipstack")]
+use hammer_core::protocol::ipstack::{
+    IpStackHandles, IpStackInput, TcpListener as IpStackTcpListener, spawn_ipstack,
+};
 use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
@@ -42,6 +48,14 @@ const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const SYSTEM_TCP_BRIDGE_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "ipstack")]
+const SMOLTCP_TUN_STACK_INPUT_QUEUE_CAPACITY: usize = 256;
+#[cfg(feature = "ipstack")]
+const SMOLTCP_TUN_TCP_LISTENER_PORT_V4: u16 = 10_000;
+#[cfg(feature = "ipstack")]
+const SMOLTCP_TUN_TCP_LISTENER_PORT_V6: u16 = 10_001;
+#[cfg(feature = "ipstack")]
+const SMOLTCP_TUN_TCP_ACCEPT_WORKERS: usize = 16;
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -728,6 +742,208 @@ where
             .tasks
             .lock()
             .expect("SystemTunStack tasks poisoned")
+            .drain(..)
+        {
+            task.abort();
+        }
+        if let Ok(mut flows) = self.udp_flows.try_lock() {
+            flows.clear();
+        }
+    }
+}
+
+#[cfg(feature = "ipstack")]
+pub struct SmoltcpTunDataStack<D, R, Q, O>
+where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    logger: Logger,
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
+    inbound_id: String,
+    options: hammer_core::config::TunInboundOptions,
+    device: Arc<D>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    tcp_pending_dials: TcpPendingDialLimiter,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    ipstack: StdMutex<Option<Arc<IpStackHandles>>>,
+    tasks: StdMutex<Vec<JoinHandle<()>>>,
+    started: AtomicBool,
+    metrics: TunMetrics,
+}
+
+#[cfg(feature = "ipstack")]
+impl<D, R, Q, O> SmoltcpTunDataStack<D, R, Q, O>
+where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    pub fn new(
+        logger: Logger,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
+        inbound_id: String,
+        options: hammer_core::config::TunInboundOptions,
+        device: Arc<D>,
+    ) -> Self {
+        let metrics = MetricsRegistry::new().scope("inbound", "tun", inbound_id.clone());
+        Self::new_with_metrics(
+            logger, router, dns_router, outbound, inbound_id, options, device, metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_metrics(
+        logger: Logger,
+        router: Arc<R>,
+        dns_router: Arc<Q>,
+        outbound: Arc<O>,
+        inbound_id: String,
+        options: hammer_core::config::TunInboundOptions,
+        device: Arc<D>,
+        metrics: MetricsScope,
+    ) -> Self {
+        let udp_timeout = options.udp_timeout.unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
+        Self {
+            logger,
+            router,
+            dns_router,
+            outbound,
+            inbound_id,
+            options,
+            device,
+            tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
+            tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
+            udp_flows: Arc::new(StdMutex::new(HashMap::new())),
+            ipstack: StdMutex::new(None),
+            tasks: StdMutex::new(Vec::new()),
+            started: AtomicBool::new(false),
+            metrics: TunMetrics::new(metrics),
+        }
+    }
+
+    pub fn start(&self) -> HammerResult<()> {
+        if self.started.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+        let addresses = StackAddresses::from_options(&self.options)?;
+        let (ipstack_in_tx, ipstack_in_rx) = mpsc::channel(SMOLTCP_TUN_STACK_INPUT_QUEUE_CAPACITY);
+        let (ipstack_out_tx, ipstack_out_rx) =
+            mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
+        let ipstack = Arc::new(spawn_ipstack(
+            self.logger.clone(),
+            self.options.address.clone(),
+            self.options.mtu,
+            ipstack_in_rx,
+            ipstack_out_tx,
+        )?);
+        let mut handles = Vec::new();
+        let mut routes = SystemStackRoutes::default();
+        if let Some(v4) = addresses.v4 {
+            let listener = ipstack.listen_tcp(SMOLTCP_TUN_TCP_LISTENER_PORT_V4);
+            info!(
+                "smoltcp stack TCP listener {}:{}",
+                v4.listener, SMOLTCP_TUN_TCP_LISTENER_PORT_V4
+            );
+            for _ in 0..SMOLTCP_TUN_TCP_ACCEPT_WORKERS {
+                handles.push(crate::spawn::spawn(accept_smoltcp_tcp_loop(
+                    self.logger.clone(),
+                    Arc::clone(&self.router),
+                    Arc::clone(&self.outbound),
+                    Arc::clone(&self.tcp_nat),
+                    self.tcp_pending_dials.clone(),
+                    self.inbound_id.clone(),
+                    listener.clone(),
+                    self.metrics.clone(),
+                )));
+            }
+            routes.v4 = Some(SystemStackRoute {
+                listener_addr: IpAddr::V4(v4.listener),
+                nat_addr: IpAddr::V4(v4.next),
+                listener_port: SMOLTCP_TUN_TCP_LISTENER_PORT_V4,
+            });
+        }
+        if let Some(v6) = addresses.v6 {
+            let listener = ipstack.listen_tcp(SMOLTCP_TUN_TCP_LISTENER_PORT_V6);
+            info!(
+                "smoltcp stack TCP listener [{}]:{}",
+                v6.listener, SMOLTCP_TUN_TCP_LISTENER_PORT_V6
+            );
+            for _ in 0..SMOLTCP_TUN_TCP_ACCEPT_WORKERS {
+                handles.push(crate::spawn::spawn(accept_smoltcp_tcp_loop(
+                    self.logger.clone(),
+                    Arc::clone(&self.router),
+                    Arc::clone(&self.outbound),
+                    Arc::clone(&self.tcp_nat),
+                    self.tcp_pending_dials.clone(),
+                    self.inbound_id.clone(),
+                    listener.clone(),
+                    self.metrics.clone(),
+                )));
+            }
+            routes.v6 = Some(SystemStackRoute {
+                listener_addr: IpAddr::V6(v6.listener),
+                nat_addr: IpAddr::V6(v6.next),
+                listener_port: SMOLTCP_TUN_TCP_LISTENER_PORT_V6,
+            });
+        }
+        handles.push(crate::spawn::spawn(smoltcp_ipstack_output_loop(
+            Arc::clone(&self.device),
+            Arc::clone(&self.tcp_nat),
+            routes.clone(),
+            ipstack_out_rx,
+            self.metrics.clone(),
+        )));
+        handles.push(crate::spawn::spawn(smoltcp_packet_loop(
+            self.logger.clone(),
+            Arc::clone(&self.router),
+            Arc::clone(&self.dns_router),
+            Arc::clone(&self.outbound),
+            self.inbound_id.clone(),
+            Arc::clone(&self.device),
+            Arc::clone(&self.tcp_nat),
+            Arc::clone(&self.udp_flows),
+            routes,
+            ipstack_in_tx,
+            self.options
+                .udp_timeout
+                .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT),
+            self.metrics.clone(),
+        )));
+        *self
+            .ipstack
+            .lock()
+            .expect("SmoltcpTunDataStack ipstack poisoned") = Some(Arc::clone(&ipstack));
+        self.tasks
+            .lock()
+            .expect("SmoltcpTunDataStack tasks poisoned")
+            .extend(handles);
+        info!("smoltcp stack started");
+        Ok(())
+    }
+
+    pub fn close(&self) {
+        self.device.close();
+        if let Some(ipstack) = self
+            .ipstack
+            .lock()
+            .expect("SmoltcpTunDataStack ipstack poisoned")
+            .take()
+        {
+            ipstack.signal_shutdown();
+            ipstack.abort();
+        }
+        for task in self
+            .tasks
+            .lock()
+            .expect("SmoltcpTunDataStack tasks poisoned")
             .drain(..)
         {
             task.abort();
@@ -1728,13 +1944,7 @@ async fn bridge_system_tcp_streams(
     inbound: &mut TcpStream,
     outbound_stream: &mut dyn ProxyStream,
 ) -> std::io::Result<(u64, u64)> {
-    let result = copy_bidirectional_with_sizes(
-        &mut *inbound,
-        &mut *outbound_stream,
-        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
-        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
-    )
-    .await;
+    let result = bridge_proxy_streams(inbound, outbound_stream).await;
     if result.is_err() {
         close_system_tcp_stream(inbound);
     } else {
@@ -1742,6 +1952,22 @@ async fn bridge_system_tcp_streams(
         let _ = outbound_stream.shutdown().await;
     }
     result
+}
+
+async fn bridge_proxy_streams<I>(
+    inbound: &mut I,
+    outbound_stream: &mut dyn ProxyStream,
+) -> std::io::Result<(u64, u64)>
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+{
+    copy_bidirectional_with_sizes(
+        inbound,
+        &mut *outbound_stream,
+        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
+        SYSTEM_TCP_BRIDGE_BUFFER_SIZE,
+    )
+    .await
 }
 
 fn ipv4_udp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
@@ -2152,6 +2378,187 @@ async fn accept_tcp_loop<R, O>(
     }
 }
 
+#[cfg(feature = "ipstack")]
+#[allow(clippy::too_many_arguments)]
+async fn accept_smoltcp_tcp_loop<R, O>(
+    _logger: Logger,
+    router: Arc<R>,
+    outbound: Arc<O>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    tcp_pending_dials: TcpPendingDialLimiter,
+    inbound_id: String,
+    listener: IpStackTcpListener,
+    metrics: TunMetrics,
+) where
+    R: RouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    loop {
+        let accepted = match listener.accept_with_remote().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                metrics.counters.tcp_accept_error_total.increment(1);
+                debug!("smoltcp TCP listener closed: {err}");
+                return;
+            }
+        };
+        let peer = accepted.remote;
+        let session = {
+            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
+            nat.claim_active(peer.port())
+        };
+        let Some(session) = session else {
+            metrics.counters.tcp_unknown_nat_total.increment(1);
+            debug!("unknown smoltcp TCP NAT session: {}", peer.port());
+            continue;
+        };
+        let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
+        let router = Arc::clone(&router);
+        let outbound = Arc::clone(&outbound);
+        let tcp_pending_dials = tcp_pending_dials.clone();
+        let inbound_id = inbound_id.clone();
+        let metrics = metrics.clone();
+        crate::spawn::spawn(async move {
+            let _nat_lease = nat_lease;
+            let mut inbound = accepted.stream;
+            let mut metadata = RouteMetadata {
+                inbound: inbound_id,
+                network: Network::Tcp,
+                source: Some(session.source.clone()),
+                destination: Some(session.destination.clone()),
+                ..Default::default()
+            };
+            let mut initial_payload = Vec::new();
+            if let Some(sniff_timeout) = router.tcp_sniff_timeout(&metadata) {
+                let mut buf = [0_u8; 4096];
+                match timeout(sniff_timeout, inbound.read(&mut buf)).await {
+                    Ok(Ok(0)) => return,
+                    Ok(Ok(n)) => {
+                        initial_payload.extend_from_slice(&buf[..n]);
+                        let mut packet = TunPacket {
+                            metadata,
+                            payload: initial_payload,
+                        };
+                        sniff_stream(&mut packet);
+                        metadata = packet.metadata;
+                        initial_payload = packet.payload;
+                    }
+                    Ok(Err(err)) => {
+                        debug!("read smoltcp TCP sniff payload: {err}");
+                        return;
+                    }
+                    Err(_) => {}
+                }
+            }
+            let decision = match router.match_route(&mut metadata) {
+                Ok(decision) => decision,
+                Err(err) => {
+                    metrics.route_error_total.inc(Network::Tcp);
+                    debug!("route smoltcp TCP connection: {err}");
+                    return;
+                }
+            };
+            let RouteDecision::Route {
+                outbound: outbound_id,
+            } = decision
+            else {
+                metrics.reject_total.inc(Network::Tcp);
+                debug!("smoltcp TCP connection rejected");
+                return;
+            };
+            let Some(outbound) = outbound.get(&outbound_id) else {
+                metrics.outbound_missing_total.inc(Network::Tcp);
+                error!("outbound not found: {outbound_id}");
+                return;
+            };
+            let destination = match route_destination_without_dns(&metadata) {
+                Ok(destination) => destination,
+                Err(err) => {
+                    metrics.counters.tcp_destination_error_total.increment(1);
+                    debug!("build smoltcp TCP destination: {err}");
+                    return;
+                }
+            };
+            let dial_permit = match tcp_pending_dials.try_acquire() {
+                Ok(permit) => permit,
+                Err(err) => {
+                    metrics.counters.tcp_dial_dropped_total.increment(1);
+                    debug!("drop smoltcp TCP connection before outbound dial: {err}");
+                    return;
+                }
+            };
+            let mut outbound_stream = match outbound
+                .runtime()
+                .dial(Network::Tcp, destination, &initial_payload)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    metrics.counters.tcp_dial_error_total.increment(1);
+                    debug!("dial smoltcp TCP outbound: {err}");
+                    return;
+                }
+            };
+            drop(dial_permit);
+            match bridge_proxy_streams(&mut inbound, &mut *outbound_stream).await {
+                Ok((from_inbound, from_outbound)) => {
+                    let _ = inbound.shutdown().await;
+                    let _ = outbound_stream.shutdown().await;
+                    debug!("smoltcp TCP copied {from_inbound}/{from_outbound} bytes")
+                }
+                Err(err) => {
+                    metrics.counters.tcp_copy_error_total.increment(1);
+                    debug!("copy smoltcp TCP: {err}")
+                }
+            }
+        });
+    }
+}
+
+enum TunPacketLoopMode<D>
+where
+    D: TunDevice,
+{
+    System {
+        device: Arc<D>,
+    },
+    #[cfg(feature = "ipstack")]
+    Smoltcp {
+        ipstack_in_tx: mpsc::Sender<IpStackInput>,
+    },
+}
+
+impl<D> TunPacketLoopMode<D>
+where
+    D: TunDevice,
+{
+    fn name(&self) -> &'static str {
+        match self {
+            Self::System { .. } => "system",
+            #[cfg(feature = "ipstack")]
+            Self::Smoltcp { .. } => "smoltcp",
+        }
+    }
+
+    async fn write_tcp_packets(&self, packets: &mut Vec<Vec<u8>>, metrics: &TunMetrics) {
+        if packets.is_empty() {
+            return;
+        }
+        match self {
+            Self::System { device } => {
+                if let Err(err) = device.send_batch(packets).await {
+                    metrics.counters.tcp_writeback_error_total.increment(1);
+                    debug!("write {} TCP packets: {err}", self.name());
+                }
+            }
+            #[cfg(feature = "ipstack")]
+            Self::Smoltcp { ipstack_in_tx } => {
+                enqueue_smoltcp_tcp_packets(ipstack_in_tx, packets, metrics);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn packet_loop<D, R, Q, O>(
     _logger: Logger,
@@ -2171,7 +2578,43 @@ async fn packet_loop<D, R, Q, O>(
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
-    info!("system packet loop started");
+    packet_loop_with_tcp_sink(
+        router,
+        dns_router,
+        outbound,
+        inbound_id,
+        Arc::clone(&device),
+        tcp_nat,
+        udp_flows,
+        routes,
+        TunPacketLoopMode::System { device },
+        udp_timeout,
+        metrics,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn packet_loop_with_tcp_sink<D, R, Q, O>(
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
+    inbound_id: String,
+    device: Arc<D>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    routes: SystemStackRoutes,
+    mode: TunPacketLoopMode<D>,
+    udp_timeout: Duration,
+    metrics: TunMetrics,
+) where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    let stack_name = mode.name();
+    info!("{stack_name} packet loop started");
     // Pull packets in batches when the underlying device supports it (Apple's
     // utun driver, currently). On platforms where recv_batch falls back to
     // single-packet recv() the batch is just `vec![pkt]` and the loop body
@@ -2203,7 +2646,7 @@ async fn packet_loop<D, R, Q, O>(
             Ok(packets) => packets,
             Err(err) => {
                 metrics.counters.packet_recv_error_total.increment(1);
-                debug!("read TUN packet loop stopped: {err}");
+                debug!("read {stack_name} TUN packet loop stopped: {err}");
                 return;
             }
         };
@@ -2241,7 +2684,7 @@ async fn packet_loop<D, R, Q, O>(
                 match parsed.network {
                     Network::Tcp => {
                         let Some(route) = routes.for_packet(&packet) else {
-                            debug!("missing system TCP route for packet family");
+                            debug!("missing {stack_name} TCP route for packet family");
                             continue;
                         };
                         let rewrite_result = process_system_tcp_packet(
@@ -2252,7 +2695,7 @@ async fn packet_loop<D, R, Q, O>(
                             route.listener_port,
                         );
                         if let Err(err) = rewrite_result {
-                            debug!("rewrite system TCP packet: {err}");
+                            debug!("rewrite {stack_name} TCP packet: {err}");
                             continue;
                         }
                         tcp_writeback.push(packet);
@@ -2266,14 +2709,9 @@ async fn packet_loop<D, R, Q, O>(
                 }
             }
         }
-        // Pass 2: send the rewritten TCP batch in one syscall (Apple) or
-        // sequentially (other targets, via the default send_batch impl).
-        if !tcp_writeback.is_empty() {
-            if let Err(err) = device.send_batch(&mut tcp_writeback).await {
-                metrics.counters.tcp_writeback_error_total.increment(1);
-                debug!("write system TCP packets: {err}");
-            }
-        }
+        // Pass 2: send the rewritten TCP batch either to the system TUN fd
+        // or directly into smoltcp, depending on the selected stack.
+        mode.write_tcp_packets(&mut tcp_writeback, &metrics).await;
         // Pass 3: UDP / DNS handling must not await in the TUN read loop.
         // Route lookup and flow queueing stay cheap and synchronous; DNS
         // hijack, outbound packet connection setup, and response writes run
@@ -2292,7 +2730,7 @@ async fn packet_loop<D, R, Q, O>(
                 parsed,
                 metrics.clone(),
             ) {
-                debug!("handle system UDP packet: {err}");
+                debug!("handle {stack_name} UDP packet: {err}");
             }
         }
         // Pass 4: ICMP echo handling also leaves the TUN read loop before
@@ -2301,6 +2739,129 @@ async fn packet_loop<D, R, Q, O>(
             enqueue_system_icmp_packet(&icmp_tx, packet, parsed, &metrics);
         }
     }
+}
+
+#[cfg(feature = "ipstack")]
+#[allow(clippy::too_many_arguments)]
+async fn smoltcp_packet_loop<D, R, Q, O>(
+    _logger: Logger,
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
+    inbound_id: String,
+    device: Arc<D>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    routes: SystemStackRoutes,
+    ipstack_in_tx: mpsc::Sender<IpStackInput>,
+    udp_timeout: Duration,
+    metrics: TunMetrics,
+) where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    packet_loop_with_tcp_sink(
+        router,
+        dns_router,
+        outbound,
+        inbound_id,
+        device,
+        tcp_nat,
+        udp_flows,
+        routes,
+        TunPacketLoopMode::Smoltcp { ipstack_in_tx },
+        udp_timeout,
+        metrics,
+    )
+    .await
+}
+
+#[cfg(feature = "ipstack")]
+fn enqueue_smoltcp_tcp_packets(
+    ipstack_in_tx: &mpsc::Sender<IpStackInput>,
+    packets: &mut Vec<Vec<u8>>,
+    metrics: &TunMetrics,
+) {
+    let input = match packets.len() {
+        0 => return,
+        1 => IpStackInput::Packet(Bytes::from(packets.pop().expect("one TCP packet"))),
+        _ => IpStackInput::Batch(packets.drain(..).map(Bytes::from).collect()),
+    };
+    if let Err(err) = ipstack_in_tx.try_send(input) {
+        metrics.counters.tcp_writeback_error_total.increment(1);
+        debug!("drop smoltcp TCP packets because ipstack queue is full: {err}");
+    }
+}
+
+#[cfg(feature = "ipstack")]
+async fn smoltcp_ipstack_output_loop<D>(
+    device: Arc<D>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    routes: SystemStackRoutes,
+    mut ipstack_out_rx: mpsc::Receiver<Bytes>,
+    metrics: TunMetrics,
+) where
+    D: TunDevice,
+{
+    const WRITE_BATCH_HINT: usize = 64;
+    let mut batch = Vec::with_capacity(WRITE_BATCH_HINT);
+    while let Some(packet) = ipstack_out_rx.recv().await {
+        push_smoltcp_output_packet(packet, &tcp_nat, &routes, &metrics, &mut batch);
+        while batch.len() < WRITE_BATCH_HINT {
+            match ipstack_out_rx.try_recv() {
+                Ok(packet) => {
+                    push_smoltcp_output_packet(packet, &tcp_nat, &routes, &metrics, &mut batch);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        if let Err(err) = device.send_batch(&mut batch).await {
+            metrics.counters.tcp_writeback_error_total.increment(1);
+            debug!("write smoltcp TCP packets to TUN: {err}");
+            batch.clear();
+        }
+    }
+}
+
+#[cfg(feature = "ipstack")]
+fn push_smoltcp_output_packet(
+    packet: Bytes,
+    tcp_nat: &StdMutex<SystemTcpNat>,
+    routes: &SystemStackRoutes,
+    metrics: &TunMetrics,
+    batch: &mut Vec<Vec<u8>>,
+) {
+    let mut packet = packet.to_vec();
+    if let Ok(parsed) = parse_ip_packet_view(&packet)
+        && parsed.network == Network::Tcp
+    {
+        let Some(route) = routes.for_packet(&packet) else {
+            debug!("missing smoltcp TCP return route for packet family");
+            return;
+        };
+        let rewrite_result = {
+            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
+            process_system_tcp_packet(
+                &mut packet,
+                &mut nat,
+                route.listener_addr,
+                route.nat_addr,
+                route.listener_port,
+            )
+        };
+        if let Err(err) = rewrite_result {
+            metrics.counters.tcp_writeback_error_total.increment(1);
+            debug!("rewrite smoltcp TCP return packet: {err}");
+            return;
+        }
+    }
+    batch.push(packet);
 }
 
 #[allow(clippy::too_many_arguments)]

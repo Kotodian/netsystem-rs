@@ -47,6 +47,8 @@ where
     metrics: Arc<MetricsRegistry>,
     tun_fd: Mutex<Option<i32>>,
     system_stack: Mutex<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>>,
+    #[cfg(feature = "ipstack")]
+    smoltcp_stack: Mutex<Option<Arc<SmoltcpTunDataStack<PlatformTunDevice, R, Q, O>>>>,
 }
 
 impl<R, Q, O> TunInbound<R, Q, O>
@@ -72,6 +74,8 @@ where
             metrics: MetricsRegistry::new(),
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
+            #[cfg(feature = "ipstack")]
+            smoltcp_stack: Mutex::new(None),
         }
     }
 
@@ -118,6 +122,8 @@ where
             metrics,
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
+            #[cfg(feature = "ipstack")]
+            smoltcp_stack: Mutex::new(None),
         }
     }
 
@@ -138,13 +144,28 @@ where
         let Some(platform) = &self.platform else {
             return Ok(());
         };
+        #[cfg(not(feature = "ipstack"))]
+        if matches!(self.options.stack, TunStack::Smoltcp) {
+            return Err(HammerError::internal(
+                "TUN stack \"smoltcp\" requires hammer-runtime ipstack feature",
+            ));
+        }
 
         let options = self.platform_options()?;
         info!("opening TUN {}, mtu {}", options.name, options.mtu);
         let fd = platform.open_tun(options)?;
-        let stack = self.build_system_stack(fd)?;
+        let system_stack = self.build_system_stack(fd)?;
+        #[cfg(feature = "ipstack")]
+        let smoltcp_stack = self.build_smoltcp_stack(fd)?;
         *self.tun_fd.lock().expect("TunInbound fd poisoned") = Some(fd);
-        *self.system_stack.lock().expect("TunInbound stack poisoned") = stack;
+        *self.system_stack.lock().expect("TunInbound stack poisoned") = system_stack;
+        #[cfg(feature = "ipstack")]
+        {
+            *self
+                .smoltcp_stack
+                .lock()
+                .expect("TunInbound smoltcp stack poisoned") = smoltcp_stack;
+        }
         info!("opened TUN fd {fd}");
         Ok(())
     }
@@ -159,6 +180,7 @@ where
                 return Ok(None);
             }
             TunStack::System => {}
+            TunStack::Smoltcp => return Ok(None),
         }
         let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
             return Ok(None);
@@ -193,7 +215,42 @@ where
         ))))
     }
 
-    fn start_system_stack(&self) -> HammerResult<()> {
+    #[cfg(feature = "ipstack")]
+    fn build_smoltcp_stack(
+        &self,
+        fd: i32,
+    ) -> HammerResult<Option<Arc<SmoltcpTunDataStack<PlatformTunDevice, R, Q, O>>>> {
+        match self.options.stack {
+            TunStack::Disabled | TunStack::System => return Ok(None),
+            TunStack::Smoltcp => {}
+        }
+        let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
+            return Ok(None);
+        };
+        let dup_fd = duplicate_fd(fd)?;
+        let mtu = usize::try_from(self.options.mtu)
+            .map_err(|_| HammerError::internal("TUN MTU does not fit in usize"))?;
+        let device = unsafe { open_system_tun_device(dup_fd, mtu)? };
+        Ok(Some(Arc::new(SmoltcpTunDataStack::new_with_metrics(
+            self.logger.clone(),
+            Arc::clone(&self.router),
+            Arc::clone(dns_router),
+            Arc::clone(outbound),
+            self.id.clone(),
+            self.options.clone(),
+            device,
+            {
+                let meta = self.component_meta();
+                let metrics = meta
+                    .metrics()
+                    .expect("TunInbound component macro must declare metrics");
+                self.metrics
+                    .scope(metrics.module, metrics.component_type, meta.id().to_owned())
+            },
+        ))))
+    }
+
+    fn start_data_stack(&self) -> HammerResult<()> {
         let stack = self
             .system_stack
             .lock()
@@ -201,6 +258,17 @@ where
             .clone();
         if let Some(stack) = stack {
             stack.start()?;
+        }
+        #[cfg(feature = "ipstack")]
+        {
+            let stack = self
+                .smoltcp_stack
+                .lock()
+                .expect("TunInbound smoltcp stack poisoned")
+                .clone();
+            if let Some(stack) = stack {
+                stack.start()?;
+            }
         }
         Ok(())
     }
@@ -288,7 +356,7 @@ where
             self.open_tun()?;
         }
         if matches!(stage, StartStage::PostStart) {
-            self.start_system_stack()?;
+            self.start_data_stack()?;
         }
         Ok(())
     }
@@ -298,6 +366,15 @@ where
             .system_stack
             .lock()
             .expect("TunInbound stack poisoned")
+            .take()
+        {
+            stack.close();
+        }
+        #[cfg(feature = "ipstack")]
+        if let Some(stack) = self
+            .smoltcp_stack
+            .lock()
+            .expect("TunInbound smoltcp stack poisoned")
             .take()
         {
             stack.close();
