@@ -299,6 +299,7 @@ pub fn spawn_ipstack(
         pending_dials: Vec::new(),
         next_port: EPHEMERAL_FLOOR,
         started,
+        handle_scratch: Vec::new(),
         // One alloc + bzero for the lifetime of the actor; large enough to
         // catch the worst case of either drain path.
         recv_scratch: vec![0u8; TCP_BUF.max(UDP_PAYLOAD_LIMIT)],
@@ -424,6 +425,9 @@ struct StackInner {
     pending_dials: Vec<PendingDial>,
     next_port: u16,
     started: TokioInstant,
+    /// Reused by drain loops that need a stable handle snapshot before
+    /// mutating `SocketSet`.
+    handle_scratch: Vec<SocketHandle>,
     /// Reused across every `drain_tcp_recv` / `drain_udp_recv` call so we
     /// don't allocate-and-bzero a 64 KiB BytesMut per inbound packet just to
     /// truncate it down to a 1.5 KiB IP frame. `Bytes::copy_from_slice` then
@@ -835,8 +839,10 @@ impl StackInner {
     }
 
     fn drain_tcp_recv(&mut self) {
-        let handles: Vec<SocketHandle> = self.tcp_bridges.keys().copied().collect();
-        for handle in handles {
+        self.handle_scratch.clear();
+        self.handle_scratch.extend(self.tcp_bridges.keys().copied());
+        for idx in 0..self.handle_scratch.len() {
+            let handle = self.handle_scratch[idx];
             let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             while socket.can_recv() {
                 let data_tx = match self.tcp_bridges.get(&handle) {
@@ -858,8 +864,10 @@ impl StackInner {
     }
 
     fn retry_pending_tcp_writes(&mut self) {
-        let handles: Vec<SocketHandle> = self.tcp_bridges.keys().copied().collect();
-        for handle in handles {
+        self.handle_scratch.clear();
+        self.handle_scratch.extend(self.tcp_bridges.keys().copied());
+        for idx in 0..self.handle_scratch.len() {
+            let handle = self.handle_scratch[idx];
             let bridge = match self.tcp_bridges.get_mut(&handle) {
                 Some(b) => b,
                 None => continue,
@@ -898,8 +906,10 @@ impl StackInner {
     }
 
     fn drain_udp_recv(&mut self) {
-        let handles: Vec<SocketHandle> = self.udp_bridges.keys().copied().collect();
-        for handle in handles {
+        self.handle_scratch.clear();
+        self.handle_scratch.extend(self.udp_bridges.keys().copied());
+        for idx in 0..self.handle_scratch.len() {
+            let handle = self.handle_scratch[idx];
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             while socket.can_recv() {
                 match socket.recv_slice(&mut self.recv_scratch[..UDP_PAYLOAD_LIMIT]) {

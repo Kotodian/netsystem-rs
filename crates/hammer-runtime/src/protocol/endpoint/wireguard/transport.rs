@@ -276,8 +276,14 @@ async fn run_actor(
     //   * `inbound_batch` — staging Vec for `handle_inbound_ready`. Cleared
     //     and refilled on every UDP readiness wake; capacity persists across
     //     wakes so we stop re-allocating a 32-slot Vec per recv.
+    //   * `outbound_batch` / `outbound_routed` — staging Vecs for encrypt
+    //     bursts. Keep them actor-owned so every select wake doesn't touch
+    //     the allocator before it can send the first packet.
     let mut tick_buf = BytesMut::with_capacity(crypto_cap);
     let mut inbound_batch: Vec<Bytes> = Vec::with_capacity(INBOUND_DRAIN_BATCH);
+    let mut outbound_batch: Vec<Bytes> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
+    let mut outbound_routed: Vec<(usize, Bytes)> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
+    let mut outbound_send_buf = BytesMut::with_capacity(crypto_cap);
 
     let mut timer = time::interval(TIMER_TICK);
     timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -351,6 +357,9 @@ async fn run_actor(
                     first,
                     &mut encrypt_rx,
                     crypto_cap,
+                    &mut outbound_batch,
+                    &mut outbound_routed,
+                    &mut outbound_send_buf,
                 )
                 .await;
             }
@@ -623,25 +632,28 @@ enum DecapOutcome {
 }
 
 /// Drain up to `OUTBOUND_DRAIN_BATCH` plaintext IP packets off the encrypt
-/// channel after one `select!` wake, then encapsulate per-peer under a single
-/// Tunn lock per run of consecutive same-peer packets. The single-peer case
-/// (typical iOS client with one `0.0.0.0/0` peer) collapses to one lock
-/// acquisition for the whole burst.
+/// channel after one `select!` wake. The actor owns the staging Vecs and
+/// crypto output buffer so the common egress path does not allocate before it
+/// can send the first packet.
 ///
 /// Lock discipline: `Tunn::encapsulate` runs under `peer.lock_tunn()` which is
 /// blocking; `socket.send_to` is async and must not be called while holding
-/// the lock. We split the work in two phases — encapsulate-only inside the
-/// lock to a Vec of staged frames, then drop the lock and `await` send_to in
-/// order.
+/// the lock. We lock per packet, release immediately after encapsulation, then
+/// await `send_to` with the reusable buffer. That trades one cheap uncontended
+/// lock per packet for lower latency and less allocator pressure than staging
+/// a second Vec of encrypted frames.
 async fn handle_outbound_batch(
     sockets: &TransportSockets,
     peers: &[Peer],
     first: Bytes,
     encrypt_rx: &mut mpsc::Receiver<Bytes>,
     crypto_cap: usize,
+    batch: &mut Vec<Bytes>,
+    routed: &mut Vec<(usize, Bytes)>,
+    send_buf: &mut BytesMut,
 ) {
     // Step 1: collect raw batch off the channel without re-entering select!.
-    let mut batch: Vec<Bytes> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
+    batch.clear();
     batch.push(first);
     for _ in 1..OUTBOUND_DRAIN_BATCH {
         match encrypt_rx.try_recv() {
@@ -652,35 +664,40 @@ async fn handle_outbound_batch(
 
     // Step 2: route each packet to its peer; drop malformed / unrouted ones now
     // so the per-peer encrypt loop doesn't have to re-check.
-    let mut routed: Vec<(usize, Bytes)> = Vec::with_capacity(batch.len());
-    for packet in batch {
+    routed.clear();
+    for packet in batch.drain(..) {
         let Some(dst_ip) = first_hop_destination(&packet) else {
             warn!("wireguard outbound: malformed IP packet, dropping");
             continue;
         };
-        let Some(peer_idx) = peer::route_outbound(peers, dst_ip) else {
+        let Some(peer_idx) = route_outbound_peer(peers, dst_ip) else {
             warn!("wireguard outbound: no peer covers {dst_ip}, dropping");
             continue;
         };
         routed.push((peer_idx, packet));
     }
 
-    // Step 3: walk routed in order, grouping runs of consecutive same-peer
-    // packets. Each run takes the Tunn lock once, encapsulates every packet
-    // into its own BytesMut, then releases the lock before any await. Order is
-    // preserved (we never reorder across peers).
+    // Step 3: walk routed in order, grouping consecutive same-peer packets
+    // only to reuse endpoint/socket metadata. Packet order is preserved.
     let mut i = 0;
     while i < routed.len() {
         let peer_idx = routed[i].0;
         let peer = &peers[peer_idx];
         let dst = peer.endpoint();
         let reserved = peer.reserved();
-        let mut staged: Vec<BytesMut> = Vec::new();
-        {
-            let mut tunn = peer.lock_tunn();
+        let Some(socket) = sockets.send_socket(dst) else {
+            warn!("wireguard udp has no socket for {dst}");
             while i < routed.len() && routed[i].0 == peer_idx {
-                let mut buf = alloc_crypto_buf(crypto_cap);
-                let len = match tunn.encapsulate(&routed[i].1, &mut buf[..]) {
+                i += 1;
+            }
+            continue;
+        };
+
+        while i < routed.len() && routed[i].0 == peer_idx {
+            let len = {
+                unsafe { send_buf.set_len(crypto_cap) };
+                let mut tunn = peer.lock_tunn();
+                match tunn.encapsulate(&routed[i].1, &mut send_buf[..]) {
                     TunnResult::WriteToNetwork(out) => Some(out.len()),
                     TunnResult::Done => None,
                     TunnResult::Err(err) => {
@@ -689,30 +706,27 @@ async fn handle_outbound_batch(
                     }
                     // encapsulate never returns WriteToTunnel*, but match exhaustively.
                     TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
-                };
-                if let Some(len) = len {
-                    buf.truncate(len);
-                    staged.push(buf);
                 }
-                i += 1;
-            }
-        } // tunn lock released here
-
-        // Step 4: send the staged frames for this peer in order. send_to is
-        // async; doing it outside the lock means another task waiting on the
-        // same Tunn (e.g. the timer tick or an inbound decapsulate) can make
-        // progress between bursts.
-        let Some(socket) = sockets.send_socket(dst) else {
-            warn!("wireguard udp has no socket for {dst}");
-            continue;
-        };
-        for mut buf in staged {
-            stamp_reserved_in_place(&mut buf, reserved);
-            if let Err(err) = socket.send_to(&buf, dst).await {
+            };
+            i += 1;
+            let Some(len) = len else {
+                continue;
+            };
+            send_buf.truncate(len);
+            stamp_reserved_in_place(send_buf, reserved);
+            if let Err(err) = socket.send_to(&send_buf, dst).await {
                 warn!("wireguard udp send_to {dst}: {err}");
             }
         }
     }
+}
+
+#[inline]
+fn route_outbound_peer(peers: &[Peer], dst: IpAddr) -> Option<usize> {
+    if peers.len() == 1 && peers[0].match_prefix(dst).is_some() {
+        return Some(0);
+    }
+    peer::route_outbound(peers, dst)
 }
 
 /// Drive `Tunn::update_timers` for every peer, using a single shared scratch

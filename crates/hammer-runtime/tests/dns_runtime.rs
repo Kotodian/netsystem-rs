@@ -252,12 +252,12 @@ impl AdapterOutbound for CapturingOutbound {
 
 #[async_trait]
 impl ProxyPacketConn for CapturingPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> Result<(), HammerError> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> Result<(), HammerError> {
         self.destinations
             .lock()
             .expect("capture destinations poisoned")
             .push(destination.to_string());
-        let request = <Message as MessageExt>::from_bytes(payload)?;
+        let request = <Message as MessageExt>::from_bytes(&payload)?;
         let response = response_for(&request, 60, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 31)));
         self.response = Some(Bytes::from(MessageExt::to_bytes(&response)?));
         Ok(())

@@ -189,7 +189,7 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
 
     let mut packet = client.listen_udp().await.expect("listen udp");
     packet
-        .send_to(destination, b"dns-query")
+        .send_to(destination, Bytes::from_static(b"dns-query"))
         .await
         .expect("send udp");
     let received = packet.recv_from().await.expect("recv udp");

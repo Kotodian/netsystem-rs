@@ -26,7 +26,7 @@ pub struct ProxyDatagram {
 
 #[async_trait]
 pub trait ProxyPacketConn: Send + Sync + 'static {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> CoreResult<()>;
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> CoreResult<()>;
     async fn recv_from(&mut self) -> CoreResult<ProxyDatagram>;
 }
 
@@ -145,4 +145,38 @@ pub trait OutboundManager: Lifecycle {
     fn get(&self, id: &str) -> Option<OutboundComponent>;
     fn default(&self) -> Option<OutboundComponent>;
     fn remove(&self, id: &str) -> CoreResult<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CapturePacketConn {
+        last: Option<Bytes>,
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for CapturePacketConn {
+        async fn send_to(&mut self, _destination: SocksAddr, payload: Bytes) -> CoreResult<()> {
+            self.last = Some(payload);
+            Ok(())
+        }
+
+        async fn recv_from(&mut self) -> CoreResult<ProxyDatagram> {
+            panic!("recv_from is not used in this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_conn_send_to_accepts_owned_bytes() {
+        let payload = Bytes::from_static(b"owned udp payload");
+        let expected = payload.clone();
+        let mut conn = CapturePacketConn { last: None };
+
+        conn.send_to(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53), payload)
+            .await
+            .expect("send owned payload");
+
+        assert_eq!(conn.last, Some(expected));
+    }
 }

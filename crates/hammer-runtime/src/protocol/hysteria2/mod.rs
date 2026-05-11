@@ -248,7 +248,7 @@ pub struct Hysteria2PacketConn {
 }
 
 impl Hysteria2PacketConn {
-    pub async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
+    pub async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         <Self as ProxyPacketConn>::send_to(self, destination, payload).await
     }
 
@@ -259,7 +259,7 @@ impl Hysteria2PacketConn {
 
 #[async_trait]
 impl ProxyPacketConn for Hysteria2PacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         if payload.len() > protocol::MAX_UDP_SIZE {
             return Err(HammerError::internal("UDP packet too large"));
         }
@@ -277,7 +277,7 @@ impl ProxyPacketConn for Hysteria2PacketConn {
             fragment_id: 0,
             fragment_total: 1,
             destination: destination.to_string(),
-            payload: Bytes::copy_from_slice(payload),
+            payload,
         };
         self.connection
             .send_datagram(message.encode())

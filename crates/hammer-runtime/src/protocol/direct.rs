@@ -147,10 +147,10 @@ impl DirectPacketConn {
 
 #[async_trait]
 impl ProxyPacketConn for DirectPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         let target = resolve_destination(&destination).await?;
         self.socket_for(target.ip())?
-            .send_to(payload, target)
+            .send_to(&payload, target)
             .await
             .with_context(|| "direct udp send")?;
         Ok(())

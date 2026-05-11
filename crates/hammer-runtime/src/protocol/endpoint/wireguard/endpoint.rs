@@ -389,12 +389,9 @@ struct WireguardUdp(UdpHandle);
 
 #[async_trait]
 impl ProxyPacketConn for WireguardUdp {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         let dst = wireguard_destination_socket_addr(&destination)?;
-        // ProxyPacketConn hands us `&[u8]`; one copy here is unavoidable
-        // unless the trait itself starts speaking `Bytes`. `copy_from_slice`
-        // makes the cost explicit at the call site.
-        self.0.send(Bytes::copy_from_slice(payload), dst).await
+        self.0.send(payload, dst).await
     }
 
     async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {

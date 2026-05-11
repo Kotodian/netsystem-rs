@@ -528,7 +528,7 @@ struct UdpFlowState {
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
-type UdpFlowPayload = Vec<u8>;
+type UdpFlowPayload = Bytes;
 
 struct DnsHijackJob {
     packet: Vec<u8>,
@@ -1375,7 +1375,9 @@ where
             }
             Network::Udp => {
                 let mut packet = outbound.listen_packet().await?;
-                packet.send_to(destination, &tun_packet.payload).await?;
+                packet
+                    .send_to(destination, Bytes::from(tun_packet.payload))
+                    .await?;
                 let response = timeout(Duration::from_secs(2), packet.recv_from())
                     .await
                     .map_err(|_| HammerError::internal("TUN routed UDP response timed out"))??;
@@ -2490,7 +2492,7 @@ fn enqueue_udp_payload(
 ) -> HammerResult<UdpPayloadEnqueueResult> {
     match sender.try_reserve() {
         Ok(permit) => {
-            let payload = parsed.payload(packet)?.to_vec();
+            let payload = Bytes::copy_from_slice(parsed.payload(packet)?);
             permit.send(payload);
             Ok(UdpPayloadEnqueueResult::Enqueued)
         }
@@ -2844,7 +2846,7 @@ async fn system_udp_flow_loop(
                     break;
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                if let Err(err) = packet_conn.send_to(destination.clone(), &item).await {
+                if let Err(err) = packet_conn.send_to(destination.clone(), item).await {
                     metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
@@ -4423,7 +4425,8 @@ final = "direct"
             destination: (parsed.destination.host, parsed.destination.port),
         };
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(b"queued".to_vec()).expect("fill flow queue");
+        tx.try_send(Bytes::from_static(b"queued"))
+            .expect("fill flow queue");
         let mut flows = HashMap::new();
         flows.insert(
             key,
@@ -4455,7 +4458,10 @@ final = "direct"
         .expect("full flow queue packet is handled as drop");
 
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(rx.try_recv().expect("original queued payload"), b"queued");
+        assert_eq!(
+            rx.try_recv().expect("original queued payload").as_ref(),
+            b"queued"
+        );
         assert!(
             rx.try_recv().is_err(),
             "full existing flow must not route or enqueue the dropped payload"

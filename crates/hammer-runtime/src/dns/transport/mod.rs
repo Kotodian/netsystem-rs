@@ -201,7 +201,8 @@ async fn udp_exchange_via_with_timeout(
     let outbound_item = outbound_by_id(outbound, via)?;
     let mut conn = outbound_item.runtime().listen_packet().await?;
     debug!("dns udp via outbound={via} packet conn ready");
-    conn.send_to(destination.clone(), payload).await?;
+    conn.send_to(destination.clone(), Bytes::copy_from_slice(payload))
+        .await?;
     debug!("dns udp via outbound={via} sent dest={destination}");
     let response = match timeout(response_timeout, conn.recv_from()).await {
         Ok(response) => response?,
@@ -279,7 +280,7 @@ mod tests {
 
     #[async_trait]
     impl ProxyPacketConn for HangingPacketConn {
-        async fn send_to(&mut self, _destination: SocksAddr, _payload: &[u8]) -> HammerResult<()> {
+        async fn send_to(&mut self, _destination: SocksAddr, _payload: Bytes) -> HammerResult<()> {
             Ok(())
         }
 

@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use hammer_adapter::{
     ComponentMeta, ComponentMetadata, DefaultInterfaceUpdateListener, Network, NetworkInterface,
     Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _, PlatformInterface,
@@ -294,7 +295,7 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
     let outbound = manager.get("direct").expect("direct outbound");
     let mut packet = outbound.listen_packet().await.expect("listen direct udp");
     packet
-        .send_to(destination(addr), b"dns")
+        .send_to(destination(addr), Bytes::from_static(b"dns"))
         .await
         .expect("send direct udp");
 
@@ -326,7 +327,7 @@ async fn direct_outbound_sends_and_receives_ipv6_udp_datagrams() {
     let outbound = manager.get("direct").expect("direct outbound");
     let mut packet = outbound.listen_packet().await.expect("listen direct udp");
     packet
-        .send_to(destination(addr), b"dns6")
+        .send_to(destination(addr), Bytes::from_static(b"dns6"))
         .await
         .expect("send direct ipv6 udp");
 
@@ -376,7 +377,7 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
         .await
         .expect("listen protected udp");
     packet
-        .send_to(destination(udp_addr), b"x")
+        .send_to(destination(udp_addr), Bytes::from_static(b"x"))
         .await
         .expect("send protected udp");
     assert_eq!(packet.recv_from().await.unwrap().payload.as_ref(), b"x");

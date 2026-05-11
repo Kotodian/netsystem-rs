@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
 use hammer_adapter::{
     ComponentMeta, ComponentMetadata, IcmpReply, Lifecycle, Network, Outbound, OutboundComponent,
     OutboundManager as OutboundManagerTrait, ProbeReport, ProxyDatagram, ProxyIcmpConn,
@@ -527,7 +528,7 @@ struct InstrumentedPacketConn {
 
 #[async_trait::async_trait]
 impl ProxyPacketConn for InstrumentedPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: &[u8]) -> HammerResult<()> {
+    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         match self.inner.send_to(destination, payload).await {
             Ok(()) => Ok(()),
             Err(err) => {
