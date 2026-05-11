@@ -11,7 +11,7 @@ use hammer_runtime::{
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointManager;
 #[cfg(feature = "wireguard")]
-use hammer_runtime::protocol::ipstack::wireguard::WireguardEndpoint;
+use hammer_runtime::protocol::endpoint::wireguard::WireguardEndpoint;
 
 #[test]
 fn protocol_namespace_exposes_runtime_protocols() {

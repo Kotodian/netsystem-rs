@@ -70,7 +70,7 @@ pub mod tun {
 
 #[cfg(feature = "wireguard")]
 pub mod wireguard {
-    pub use crate::protocol::ipstack::wireguard::*;
+    pub use crate::protocol::endpoint::wireguard::*;
 }
 
 #[cfg(all(

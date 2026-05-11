@@ -64,7 +64,7 @@ fn register_standard_endpoint_builders(builders: &mut HashMap<&'static str, Endp
     register_components!(
         endpoint,
         builders,
-        [crate::protocol::ipstack::wireguard::WireguardEndpoint]
+        [crate::protocol::endpoint::wireguard::WireguardEndpoint]
     );
 }
 

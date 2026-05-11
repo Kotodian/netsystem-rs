@@ -7,7 +7,7 @@ pub mod hysteria2;
 #[cfg(any(feature = "outbound-direct", feature = "probe"))]
 pub(crate) mod icmp;
 #[cfg(feature = "ipstack")]
-pub mod ipstack;
+pub mod endpoint;
 #[cfg(any(feature = "inbound-tun", feature = "ipstack"))]
 pub mod tun;
 #[cfg(feature = "outbound-urltest")]
