@@ -39,11 +39,12 @@ use crate::log::Logger;
 
 use super::device::ChannelDevice;
 
-/// Per-TCP-socket smoltcp ring buffer size. This is the advertised TCP window,
-/// so 64 KiB caps one flow at roughly 10 Mbps over a 50 ms path. 256 KiB keeps
-/// iOS memory use bounded while giving mobile/WG paths enough window to reach
-/// the native-WireGuard range without requiring many parallel streams.
-const TCP_BUF: usize = 256 * 1024;
+/// Per-TCP-socket smoltcp ring buffer size. This is also the receive window
+/// advertised to remote TCP peers, so it must cover the path BDP: 256 KiB only
+/// reaches about 15 Mbps over a 140 ms mobile/WG path. 1 MiB keeps a single
+/// flow above the native-WireGuard target range while still bounding NetExt
+/// memory by active TCP connection count.
+const TCP_BUF: usize = 1024 * 1024;
 /// Bridge-side read chunk. Keep it smaller than the TCP ring so larger socket
 /// windows do not pin an extra 256 KiB BytesMut in every bridge task.
 const TCP_BRIDGE_READ_BUF: usize = 64 * 1024;
@@ -1197,8 +1198,8 @@ mod tests {
     #[test]
     fn tcp_socket_window_supports_mobile_wireguard_throughput() {
         assert!(
-            TCP_BUF >= 256 * 1024,
-            "smoltcp's advertised TCP window is the single-flow throughput cap"
+            TCP_BUF >= 1024 * 1024,
+            "smoltcp's advertised TCP window must cover mobile/WG path BDP"
         );
         assert!(
             TCP_BRIDGE_READ_BUF <= 64 * 1024,
