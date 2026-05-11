@@ -13,15 +13,11 @@ default = []
 # `type = "hysteria2"`). The runtime outbound component has its own
 # `outbound-hysteria2` feature.
 hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
-# Enables WireGuard protocol/config schema on top of the IP stack
-# (`[[endpoints]]` with `type = "wireguard"`). The runtime endpoint component
-# has its own `endpoint-wireguard` feature.
-ipstack-wireguard = ["ipstack", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
-# Generic user-space TCP/IP stack protocol machinery shared by runtime
-# components such as WireGuard. Also gates the core `[[endpoints]]` config
-# shape that feeds IP-stack protocols; endpoint lifecycle/manager wiring lives
-# in hammer-runtime.
-ipstack = ["dep:bytes", "dep:smoltcp", "dep:rustc-hash"]
+# Enables the WireGuard peer state machine + config schema (`[[endpoints]]`
+# with `type = "wireguard"`). The runtime endpoint component has its own
+# `endpoint-wireguard` feature; this one carries the protocol primitives
+# (boringtun `Tunn`, peer struct, `WIREGUARD_OVERHEAD`) the runtime relies on.
+wireguard = ["dep:bytes", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
 
 [dependencies]
 serde = { workspace = true }
@@ -42,8 +38,6 @@ bytes = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
 http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-rustc-hash = { workspace = true, optional = true }
-smoltcp = { workspace = true, optional = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

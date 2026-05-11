@@ -1,49 +1,38 @@
 //! WireGuard endpoint.
 //!
-//! Mirrors sing-box's split between an outer WireGuard endpoint
-//! (which the router dials into via `DialContext`) and an inner
-//! `transport/wireguard` device that owns the gVisor stack + wireguard-go
-//! runtime. Hammer's stack equivalent is `ipstack` (smoltcp) +
-//! `ipstack::wireguard::transport` (boringtun + UDP); this module ties them together
-//! into the public `Outbound`/`Endpoint` surface and the lifecycle.
-//!
-//! A handful of helpers (mtu/peers/route_outbound/encapsulate_buffer) are only
-//! reachable from `#[cfg(test)]` until commit 5 wires the endpoint into
-//! `OutboundManager` and the router can actually invoke `dial`. The mod-level
-//! `allow(dead_code)` suppresses the warnings during the staged rollout.
+//! Owns the boringtun + UDP transport actor and exposes a pure L3 surface
+//! (`Endpoint::ip_send_clone` / `Endpoint::ip_recv_take`) so the TUN packet
+//! loop can forward raw IP packets without any L4 reassembly. The old
+//! double user-space-IP-stack data path is gone: WG sits next to outbounds,
+//! not under them.
 #![allow(dead_code)]
 
-use std::net::{IpAddr, SocketAddr};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tracing::{error, info};
-
-use async_trait::async_trait;
 use boringtun::x25519;
 use bytes::Bytes;
 use ipnet::IpNet;
-use tokio::io::AsyncWriteExt;
+use std::net::IpAddr;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
-use hammer_adapter::{
-    Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn,
-    ProxyStream, SocksAddr,
-};
+use hammer_adapter::{Endpoint, Lifecycle, Network, PlatformInterface};
 use hammer_core::config::{Endpoint as EndpointOptions, EndpointKind, WireguardEndpointOptions};
-use hammer_core::error::{HammerError, HammerResult};
+#[cfg(test)]
+use hammer_core::error::HammerError;
+use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
-use hammer_core::protocol::ipstack::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::ipstack::wireguard::peer::{self, Peer};
-use hammer_core::protocol::ipstack::{IpStackHandles, IpStackInput, UdpHandle, spawn_ipstack};
+use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
+use hammer_core::protocol::wireguard::peer::{self, Peer};
 
 use super::transport::{self, TransportHandles};
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 
-/// Endpoint backed by WireGuard. Its `Tunn` state machines and smoltcp stack
-/// are inert until the lifecycle reaches `Start`; before that, calls to
-/// `dial`/`listen_packet` fail with a clear error.
+/// L3 WireGuard endpoint. `Tunn` state machines and the UDP transport actor
+/// are inert until lifecycle reaches `Start`; before that, `ip_send_clone`
+/// hands out a closed sender and `ip_recv_take` returns `None`.
 #[hammer_component_macros::hammer_component(
     endpoint,
     name = "wireguard",
@@ -67,7 +56,12 @@ pub struct WireguardEndpoint {
 
 struct WireguardRuntime {
     transport: TransportHandles,
-    stack: Arc<IpStackHandles>,
+    /// Cloneable hot-path sender so `ip_send_clone` doesn't have to mutex-walk
+    /// for every packet.
+    encrypt_tx: mpsc::Sender<Bytes>,
+    /// One-shot inbound receiver. Taken by the TUN packet-loop fan-in at
+    /// start-up; subsequent calls return `None`.
+    ip_recv_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
 }
 
 enum WireguardState {
@@ -110,12 +104,10 @@ impl WireguardEndpoint {
         }
     }
 
-    /// Largest IP packet the inner stack should hand to `encapsulate`.
     pub(crate) fn mtu(&self) -> u32 {
         self.mtu
     }
 
-    /// Pick the peer that owns `dst` according to longest-prefix `allowed_ips`.
     pub(crate) fn route_outbound(&self, dst: IpAddr) -> Option<&Peer> {
         peer::route_outbound(&self.peers, dst).map(|idx| &self.peers[idx])
     }
@@ -128,9 +120,10 @@ impl WireguardEndpoint {
         vec![0u8; self.mtu as usize + WIREGUARD_OVERHEAD]
     }
 
-    /// Bring up the transport + stack actors. Idempotent within a single
-    /// lifecycle Start sequence (the runtime guarantees `Start` only fires
-    /// once per stage anyway, but defensively no-op on re-entry).
+    pub(crate) fn addresses(&self) -> &[IpNet] {
+        &self.addresses
+    }
+
     fn boot(&self) -> HammerResult<()> {
         {
             let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
@@ -163,40 +156,31 @@ impl WireguardEndpoint {
             self.protector.clone(),
         )?;
 
-        // The transport's `inbound_rx` is only useful to the stack actor, so we
-        // destructure here and hand it straight over.
+        let encrypt_tx_clone = transport.encrypt_tx.clone();
         let TransportHandles {
             encrypt_tx,
             inbound_rx,
-            local_addr: _,
+            local_addr,
             shutdown,
+            reset_tx,
             join,
         } = transport;
-
-        let stack = spawn_ipstack(
-            self.logger.clone(),
-            self.addresses.clone(),
-            self.mtu,
-            inbound_rx,
-            encrypt_tx.clone(),
-        )?;
 
         Ok(WireguardRuntime {
             transport: TransportHandles {
                 encrypt_tx,
-                // After hand-off the transport handle no longer needs to expose
-                // inbound_rx; replace with a sentinel closed channel so the type
-                // stays the same.
-                inbound_rx: tokio::sync::mpsc::channel::<IpStackInput>(1).1,
-                local_addr: "0.0.0.0:0".parse().expect("sentinel addr"),
+                // Sentinel — the live receiver has moved into `ip_recv_rx`.
+                inbound_rx: mpsc::channel::<Bytes>(1).1,
+                local_addr,
                 shutdown,
+                reset_tx,
                 join,
             },
-            stack: Arc::new(stack),
+            encrypt_tx: encrypt_tx_clone,
+            ip_recv_rx: Mutex::new(Some(inbound_rx)),
         })
     }
 
-    /// Cancel the actors. Safe to call multiple times.
     fn shutdown(&self) {
         let runtime = {
             let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
@@ -210,75 +194,10 @@ impl WireguardEndpoint {
         }
     }
 
-    /// Restart the actors after an outer network change. Unlike `close`, this
-    /// keeps the endpoint usable and replaces the UDP socket + smoltcp stack.
     fn restart(&self) {
-        if self.listen_port == 0 {
-            self.restart_ephemeral();
-            return;
-        }
-
-        let runtime = {
-            let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            match std::mem::replace(&mut *inner, WireguardState::Idle) {
-                WireguardState::Running(rt) => Some(rt),
-                WireguardState::Idle => None,
-                WireguardState::Closed => {
-                    *inner = WireguardState::Closed;
-                    None
-                }
-            }
-        };
-        let Some(rt) = runtime else {
-            return;
-        };
-        stop_runtime(rt);
-        if let Err(err) = self.boot() {
-            error!("restart wireguard endpoint {}: {err}", self.id);
-        }
-    }
-
-    fn restart_ephemeral(&self) {
-        {
-            let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            if !matches!(*inner, WireguardState::Running(_)) {
-                return;
-            }
-        }
-
-        let new_runtime = match self.start_runtime() {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                error!("restart wireguard endpoint {}: {err}", self.id);
-                return;
-            }
-        };
-        let old_runtime = {
-            let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            match std::mem::replace(&mut *inner, WireguardState::Running(new_runtime)) {
-                WireguardState::Running(rt) => Some(rt),
-                WireguardState::Idle => {
-                    let WireguardState::Running(rt) =
-                        std::mem::replace(&mut *inner, WireguardState::Idle)
-                    else {
-                        unreachable!("new runtime was just installed")
-                    };
-                    stop_runtime(rt);
-                    None
-                }
-                WireguardState::Closed => {
-                    let WireguardState::Running(rt) =
-                        std::mem::replace(&mut *inner, WireguardState::Closed)
-                    else {
-                        unreachable!("new runtime was just installed")
-                    };
-                    stop_runtime(rt);
-                    None
-                }
-            }
-        };
-        if let Some(rt) = old_runtime {
-            stop_runtime(rt);
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        if let WireguardState::Running(rt) = &*inner {
+            rt.transport.reset();
         }
     }
 
@@ -287,39 +206,20 @@ impl WireguardEndpoint {
         self.fail_next_start.store(true, Ordering::SeqCst);
     }
 
-    fn stack_handle(&self) -> HammerResult<Arc<IpStackHandles>> {
-        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-        match &*inner {
-            WireguardState::Running(rt) => Ok(Arc::clone(&rt.stack)),
-            WireguardState::Idle => {
-                Err(HammerError::internal("wireguard endpoint not started yet"))
-            }
-            WireguardState::Closed => Err(HammerError::internal("wireguard endpoint is closed")),
-        }
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        matches!(
+            *self.inner.lock().expect("WireguardEndpoint poisoned"),
+            WireguardState::Running(_)
+        )
     }
 }
 
 fn stop_runtime(rt: WireguardRuntime) {
     let _ = rt.transport.shutdown.send(());
     rt.transport.join.abort();
-    rt.stack.signal_shutdown();
-    rt.stack.abort();
-}
-
-fn wireguard_destination_socket_addr(destination: &SocksAddr) -> HammerResult<SocketAddr> {
-    if destination.domain.is_some() && is_unspecified_ip(destination.host) {
-        return Err(HammerError::internal(
-            "wireguard endpoint requires an IP destination or resolved fallback",
-        ));
-    }
-    Ok(SocketAddr::new(destination.host, destination.port))
-}
-
-fn is_unspecified_ip(addr: IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(addr) => addr.is_unspecified(),
-        IpAddr::V6(addr) => addr.is_unspecified(),
-    }
+    drop(rt.encrypt_tx);
+    drop(rt.ip_recv_rx);
 }
 
 impl Lifecycle for WireguardEndpoint {
@@ -328,8 +228,6 @@ impl Lifecycle for WireguardEndpoint {
     }
 
     fn start(&self, stage: StartStage) -> HammerResult<()> {
-        // The actor needs to exist by the time the router/inbounds touch us,
-        // and our dependencies (the platform protector) are ready by `Start`.
         if matches!(stage, StartStage::Start) {
             self.boot()?;
         }
@@ -342,70 +240,64 @@ impl Lifecycle for WireguardEndpoint {
     }
 }
 
-#[async_trait]
-impl Outbound for WireguardEndpoint {
+impl Endpoint for WireguardEndpoint {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn ip_send_clone(&self) -> mpsc::Sender<Bytes> {
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        match &*inner {
+            WireguardState::Running(rt) => rt.encrypt_tx.clone(),
+            // Endpoint not started yet — hand out a sentinel sender whose
+            // receiver is immediately dropped, so `try_send` reports the
+            // channel as closed. The TUN packet loop only resolves a route
+            // to this endpoint after lifecycle Start has completed, so this
+            // branch is reachable only in tests / mid-restart races.
+            WireguardState::Idle | WireguardState::Closed => mpsc::channel::<Bytes>(1).0,
+        }
+    }
+
+    fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>> {
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        match &*inner {
+            WireguardState::Running(rt) => rt
+                .ip_recv_rx
+                .lock()
+                .expect("ip_recv_rx mutex poisoned")
+                .take(),
+            _ => None,
+        }
+    }
+
+    fn ip_packet_mtu(&self) -> Option<usize> {
+        Some(self.mtu as usize)
+    }
+
+    fn allowed_destinations(&self) -> Vec<IpNet> {
+        // Union of every peer's allowed_ips — the L3 fast path uses this to
+        // build a longest-prefix table mapping packet dst IP to the WG
+        // encrypt channel. Sorted longest-prefix-first so consumers doing a
+        // linear walk see the most specific match first.
+        let mut nets: Vec<IpNet> = self
+            .peers
+            .iter()
+            .flat_map(|p| p.allowed_ips().iter().copied())
+            .collect();
+        nets.sort_by(|a, b| b.prefix_len().cmp(&a.prefix_len()));
+        nets.dedup();
+        nets
+    }
+
+    fn interface_addresses(&self) -> Vec<IpNet> {
+        self.addresses.clone()
+    }
+
     fn reset(&self) {
         self.restart();
     }
-
-    async fn dial(
-        &self,
-        network: Network,
-        destination: SocksAddr,
-        initial_payload: &[u8],
-    ) -> HammerResult<Box<dyn ProxyStream>> {
-        if network != Network::Tcp {
-            return Err(HammerError::internal(
-                "wireguard endpoint dial only supports TCP — UDP goes through listen_packet",
-            ));
-        }
-        let stack = self.stack_handle()?;
-        let dst = wireguard_destination_socket_addr(&destination)?;
-        info!("wireguard dial -> {dst}");
-        let mut stream = stack.dial_tcp(dst).await?;
-        if !initial_payload.is_empty() {
-            stream
-                .write_all(initial_payload)
-                .await
-                .map_err(|err| HammerError::internal(format!("wireguard initial write: {err}")))?;
-        }
-        Ok(Box::new(stream))
-    }
-
-    async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
-        let stack = self.stack_handle()?;
-        let handle = stack.bind_udp().await?;
-        Ok(Box::new(WireguardUdp(handle)))
-    }
 }
 
-impl Endpoint for WireguardEndpoint {}
-
-/// Adapter from the carrier-agnostic `ipstack::UdpHandle` (which only knows
-/// `SocketAddr`) onto `ProxyPacketConn` (which speaks `SocksAddr`). Translating
-/// SOCKS-style addressing into a concrete IP is a wireguard-outbound concern,
-/// so it lives here instead of in the shared stack.
-struct WireguardUdp(UdpHandle);
-
-#[async_trait]
-impl ProxyPacketConn for WireguardUdp {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        let dst = wireguard_destination_socket_addr(&destination)?;
-        self.0.send(payload, dst).await
-    }
-
-    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
-        let (payload, src) = self.0.recv().await?;
-        Ok(ProxyDatagram {
-            destination: SocksAddr::ip(src.ip(), src.port()),
-            payload,
-        })
-    }
-}
-
-/// Helper used by tests + EndpointManager: build an endpoint with a
-/// no-platform protector. Production callers go through
-/// `WireguardEndpoint::new` with a real protector.
 #[cfg(test)]
 fn endpoint_for_test(
     logger: Logger,
@@ -424,7 +316,6 @@ fn endpoint_for_test(
     )
 }
 
-/// Convenience constructor used by `EndpointManager::from_options_with_platform`.
 pub(crate) fn build_with_platform(
     logger: Logger,
     options: EndpointRuntimeOptions<WireguardEndpointOptions>,
@@ -501,56 +392,28 @@ mod tests {
         )
     }
 
-    #[test]
-    fn domain_destination_with_ip_fallback_routes_by_fallback_ip() {
-        let destination = SocksAddr::domain(
-            "resolver.example",
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 53)),
-            53,
-        );
-
-        assert_eq!(
-            wireguard_destination_socket_addr(&destination).expect("fallback ip"),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 53)), 53),
-        );
-    }
-
-    #[test]
-    fn unresolved_domain_destination_is_rejected_by_wireguard() {
-        let destination =
-            SocksAddr::domain("resolver.example", IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53);
-
-        let err = wireguard_destination_socket_addr(&destination)
-            .expect_err("unresolved domain must not route to 0.0.0.0");
-        assert!(
-            err.to_string().contains("requires an IP destination"),
-            "unexpected error: {err}",
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restart_keeps_existing_runtime_when_reboot_fails() {
+    async fn restart_keeps_existing_runtime_and_sender() {
         let a_priv = [3u8; 32];
         let b_pub = x25519_public([4u8; 32]);
         let endpoint = make_endpoint("wg-restart", a_priv, b_pub);
         endpoint.boot().expect("boot endpoint");
-        let old_stack = endpoint.stack_handle().expect("old stack");
+        assert!(endpoint.is_running());
 
-        endpoint.fail_next_start_for_test();
+        let before = endpoint.ip_send_clone();
         endpoint.restart();
 
-        let current_stack = endpoint.stack_handle().expect("runtime should survive");
-        assert!(
-            Arc::ptr_eq(&old_stack, &current_stack),
-            "failed restart must keep the old runtime instead of dropping to Idle",
-        );
+        assert!(endpoint.is_running(), "reset must keep the endpoint live");
+        before
+            .try_send(Bytes::from_static(b"stable"))
+            .expect("pre-reset sender must remain attached");
         endpoint.shutdown();
     }
 
     /// Two `WireguardEndpoint`s configured as each other's peer must complete
     /// the noise handshake, after which an IP packet sent through one comes
     /// out byte-for-byte at the other. This is the smoke test that proves the
-    /// boringtun + Peer wiring is correct independently of the smoltcp actor.
+    /// boringtun + Peer wiring is correct independently of any data path.
     #[test]
     fn boringtun_round_trip_recovers_ip_packet() {
         let a_priv = [1u8; 32];
@@ -563,33 +426,27 @@ mod tests {
         let a_peer = &a.peers()[0];
         let b_peer = &b.peers()[0];
 
-        // A.encapsulate(empty) emits a handshake_init because no session exists.
         let mut buf1 = vec![0u8; 2048];
         let init = match a_peer.lock_tunn().encapsulate(&[], &mut buf1) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("A: expected handshake_init, got {other:?}"),
         };
 
-        // B receives handshake_init -> emits handshake_response.
         let mut buf2 = vec![0u8; 2048];
         let response = match b_peer.lock_tunn().decapsulate(None, &init, &mut buf2) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("B: expected handshake_response, got {other:?}"),
         };
 
-        // A consumes handshake_response. boringtun queues a keepalive packet
-        // back onto the network at this side, so we accept either Done or
-        // WriteToNetwork.
         let mut buf3 = vec![0u8; 2048];
         match a_peer.lock_tunn().decapsulate(None, &response, &mut buf3) {
             TunnResult::Done | TunnResult::WriteToNetwork(_) => {}
             other => panic!("A: handshake_response result {other:?}"),
         }
 
-        // Sessions are now live on both ends. Encrypt an IP packet from A to B.
         let mut ip_packet = vec![0u8; 60];
-        ip_packet[0] = 0x45; // IPv4 / IHL=5
-        ip_packet[3] = 60; // total length
+        ip_packet[0] = 0x45;
+        ip_packet[3] = 60;
 
         let mut enc_buf = vec![0u8; 2048];
         let encrypted = match a_peer.lock_tunn().encapsulate(&ip_packet, &mut enc_buf) {
@@ -607,9 +464,6 @@ mod tests {
         }
     }
 
-    /// Multi-peer routing: a wider `allowed_ips` peer must lose to a more
-    /// specific peer when the destination falls inside both — sing-box does
-    /// the same longest-prefix match (`route/peers.go::matchAddress`).
     #[test]
     fn route_outbound_picks_longest_prefix_peer() {
         let local_priv = [3u8; 32];
@@ -691,545 +545,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn endpoint_reset_restarts_transport_and_stack() {
+    async fn endpoint_reset_preserves_packet_channels() {
         let priv_key = [12u8; 32];
         let peer_pub = x25519_public([13u8; 32]);
         let ep = make_endpoint("wg-reset", priv_key, peer_pub);
 
         ep.boot().expect("boot endpoint");
-        let before = ep.stack_handle().expect("stack before reset");
+        assert!(ep.is_running());
 
-        ep.reset();
+        let before = ep.ip_send_clone();
+        let inbound = ep.ip_recv_take().expect("first inbound receiver");
+        ep.restart();
+        assert!(ep.is_running(), "reset must keep the endpoint live");
 
-        let after = ep.stack_handle().expect("stack after reset");
+        before
+            .try_send(Bytes::from_static(b"still-live"))
+            .expect("pre-reset sender must remain usable");
         assert!(
-            !Arc::ptr_eq(&before, &after),
-            "reset must replace the running WireGuard transport/stack"
+            ep.ip_recv_take().is_none(),
+            "reset must not swap in an unattached inbound receiver"
         );
+        drop(inbound);
+
+        let after = ep.ip_send_clone();
+        after
+            .try_send(Bytes::from_static(b"fresh"))
+            .expect("post-reset sender must accept a packet");
 
         ep.shutdown();
-    }
-
-    /// End-to-end tunnel smoke: stand up two `WireguardEndpoint`s configured
-    /// as each other's peer, drive lifecycle Start so the transport + smoltcp
-    /// actors are live, bind a UDP socket on each side, then push a payload
-    /// from A's in-tunnel address to B's. The packet has to traverse:
-    ///
-    ///   A.dial(UDP) → smoltcp tx → boringtun.encapsulate → real UDP → B
-    ///   → boringtun.decapsulate → smoltcp rx → B.recv_from
-    ///
-    /// This exercises every layer that landed in commits 3 → 4b in one pass.
-    /// We don't try TCP yet because the stack only exposes `dial`, not
-    /// `listen` — closing the loop on inbound TCP is a future follow-up.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tunnel_udp_round_trip_end_to_end() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        // Pick two ephemeral ports for the outer UDP sockets. Bind+drop is the
-        // standard "ask the OS for a free port" trick — fine on localhost.
-        fn ephemeral_port() -> u16 {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
-
-        let a_priv = [33u8; 32];
-        let b_priv = [44u8; 32];
-        let a_pub = x25519_public(a_priv);
-        let b_pub = x25519_public(b_priv);
-
-        let port_a = ephemeral_port();
-        let port_b = ephemeral_port();
-        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-
-        let a_options = WireguardEndpointOptions {
-            private_key: a_priv,
-            listen_port: port_a,
-            peers: vec![WireguardPeerOptions {
-                public_key: b_pub,
-                pre_shared_key: None,
-                endpoint: outer_b,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-        let b_options = WireguardEndpointOptions {
-            private_key: b_priv,
-            listen_port: port_b,
-            peers: vec![WireguardPeerOptions {
-                public_key: a_pub,
-                pre_shared_key: None,
-                endpoint: outer_a,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-
-        let a = endpoint_for_test(
-            logger("wg-a"),
-            "wg-a".to_owned(),
-            test_interface("10.0.0.1/32"),
-            a_options,
-        );
-        let b = endpoint_for_test(
-            logger("wg-b"),
-            "wg-b".to_owned(),
-            test_interface("10.0.0.2/32"),
-            b_options,
-        );
-        a.boot().expect("boot a");
-        b.boot().expect("boot b");
-
-        let stack_a = a.stack_handle().expect("stack a ready");
-        let stack_b = b.stack_handle().expect("stack b ready");
-
-        let udp_a = stack_a.bind_udp().await.expect("bind udp a");
-        let udp_b = stack_b.bind_udp().await.expect("bind udp b");
-        let port_b_inside = udp_b.local_port();
-
-        // A's in-tunnel address is 10.0.0.1 ← bound by the smoltcp Interface;
-        // we want to *send to* B's in-tunnel address (10.0.0.2:<udp_b port>).
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
-        let payload = Bytes::from_static(b"hello over wireguard");
-        udp_a.send(payload.clone(), dst).await.expect("udp_a.send");
-
-        // 5s is plenty: the boringtun handshake completes in <50 ms over
-        // localhost even with the 250 ms timer driving retransmits.
-        let (recv_payload, src) = timeout(Duration::from_secs(5), udp_b.recv())
-            .await
-            .expect("timed out waiting for tunnel UDP")
-            .expect("udp_b.recv");
-        assert_eq!(recv_payload, payload);
-        assert_eq!(
-            src.ip(),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            "src must be A's in-tunnel address"
-        );
-
-        // Aborting actors via shutdown — Drop order is undefined across the two
-        // endpoints' Mutex guards, so do it explicitly.
-        a.shutdown();
-        b.shutdown();
-    }
-
-    /// Same shape as `tunnel_udp_round_trip_end_to_end` but with a UDP payload
-    /// that's well over a single MTU (4 KiB vs MTU 1408). On the sender's
-    /// stack, smoltcp has to break the IPv4 datagram into multiple fragments;
-    /// on the receiver's stack, smoltcp has to reassemble them before the
-    /// `UdpHandle` can hand the bytes back. If the workspace's smoltcp
-    /// fragmentation cargo features (`reassembly-buffer-size-8192` /
-    /// `reassembly-buffer-count-4`) regress to defaults (1500 / 1) the
-    /// receiver will never see a complete datagram and this test will time out.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tunnel_udp_fragmented_round_trip_end_to_end() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        fn ephemeral_port() -> u16 {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
-
-        let a_priv = [55u8; 32];
-        let b_priv = [66u8; 32];
-        let a_pub = x25519_public(a_priv);
-        let b_pub = x25519_public(b_priv);
-
-        let port_a = ephemeral_port();
-        let port_b = ephemeral_port();
-        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-
-        let a_options = WireguardEndpointOptions {
-            private_key: a_priv,
-            listen_port: port_a,
-            peers: vec![WireguardPeerOptions {
-                public_key: b_pub,
-                pre_shared_key: None,
-                endpoint: outer_b,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-        let b_options = WireguardEndpointOptions {
-            private_key: b_priv,
-            listen_port: port_b,
-            peers: vec![WireguardPeerOptions {
-                public_key: a_pub,
-                pre_shared_key: None,
-                endpoint: outer_a,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-
-        let a = endpoint_for_test(
-            logger("wg-a-frag"),
-            "wg-a-frag".to_owned(),
-            test_interface("10.0.0.1/32"),
-            a_options,
-        );
-        let b = endpoint_for_test(
-            logger("wg-b-frag"),
-            "wg-b-frag".to_owned(),
-            test_interface("10.0.0.2/32"),
-            b_options,
-        );
-        a.boot().expect("boot a");
-        b.boot().expect("boot b");
-
-        let stack_a = a.stack_handle().expect("stack a ready");
-        let stack_b = b.stack_handle().expect("stack b ready");
-
-        let udp_a = stack_a.bind_udp().await.expect("bind udp a");
-        let udp_b = stack_b.bind_udp().await.expect("bind udp b");
-        let port_b_inside = udp_b.local_port();
-
-        // 4 KiB UDP payload + 8 byte UDP + 20 byte IPv4 header = 4124 byte
-        // total IP packet, well over the 1408 MTU. smoltcp on A must split
-        // this into 3 IPv4 fragments; smoltcp on B must reassemble them.
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), port_b_inside);
-        let mut payload_vec = Vec::with_capacity(4096);
-        for i in 0..4096 {
-            // Non-trivial pattern so a partial / mis-ordered reassembly
-            // would show up as a content mismatch, not a length match.
-            payload_vec.push((i % 251) as u8);
-        }
-        let payload = Bytes::from(payload_vec);
-        udp_a.send(payload.clone(), dst).await.expect("udp_a.send");
-
-        let (recv_payload, src) = timeout(Duration::from_secs(5), udp_b.recv())
-            .await
-            .expect("timed out waiting for fragmented tunnel UDP")
-            .expect("udp_b.recv");
-        assert_eq!(
-            recv_payload, payload,
-            "reassembled payload must match the 4 KiB pattern byte-for-byte"
-        );
-        assert_eq!(
-            src.ip(),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            "src must be A's in-tunnel address"
-        );
-
-        a.shutdown();
-        b.shutdown();
-    }
-
-    /// End-to-end TCP: B listens inside the tunnel, A dials it, both ends
-    /// exchange a payload in each direction. Touches everything UDP doesn't:
-    /// smoltcp `tcp::Socket` connect/listen, the SYN/ACK + handshake driving
-    /// `may_send`/`may_recv` transitions, partial-write retries on the actor
-    /// side, and bidirectional `DuplexStream` plumbing through bridges on
-    /// both endpoints.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tunnel_tcp_round_trip_end_to_end() {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::timeout;
-
-        fn ephemeral_port() -> u16 {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
-
-        let a_priv = [55u8; 32];
-        let b_priv = [66u8; 32];
-        let a_pub = x25519_public(a_priv);
-        let b_pub = x25519_public(b_priv);
-
-        let port_a = ephemeral_port();
-        let port_b = ephemeral_port();
-        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-
-        let a_options = WireguardEndpointOptions {
-            private_key: a_priv,
-            listen_port: port_a,
-            peers: vec![WireguardPeerOptions {
-                public_key: b_pub,
-                pre_shared_key: None,
-                endpoint: outer_b,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-        let b_options = WireguardEndpointOptions {
-            private_key: b_priv,
-            listen_port: port_b,
-            peers: vec![WireguardPeerOptions {
-                public_key: a_pub,
-                pre_shared_key: None,
-                endpoint: outer_a,
-                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-
-        let a = endpoint_for_test(
-            logger("wg-tcp-a"),
-            "wg-a".to_owned(),
-            test_interface("10.0.0.1/32"),
-            a_options,
-        );
-        let b = endpoint_for_test(
-            logger("wg-tcp-b"),
-            "wg-b".to_owned(),
-            test_interface("10.0.0.2/32"),
-            b_options,
-        );
-        a.boot().expect("boot a");
-        b.boot().expect("boot b");
-
-        let stack_a = a.stack_handle().expect("stack a ready");
-        let stack_b = b.stack_handle().expect("stack b ready");
-
-        const PORT: u16 = 8080;
-        let listener = stack_b.listen_tcp(PORT);
-        // Park the accept stage first so the listening socket is in SocketSet
-        // before A's SYN arrives — otherwise smoltcp would RST it.
-        let accept_task = crate::spawn::spawn(async move { listener.accept().await });
-
-        // A dials B's in-tunnel address.
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), PORT);
-        let mut stream_a = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
-            .await
-            .expect("dial timed out")
-            .expect("dial_tcp");
-
-        let mut stream_b = timeout(Duration::from_secs(5), accept_task)
-            .await
-            .expect("accept timed out")
-            .expect("accept join")
-            .expect("accept");
-
-        // A → B
-        stream_a.write_all(b"ping from A").await.expect("write A");
-        stream_a.flush().await.expect("flush A");
-        let mut buf = [0u8; 11];
-        timeout(Duration::from_secs(5), stream_b.read_exact(&mut buf))
-            .await
-            .expect("read B timed out")
-            .expect("read B");
-        assert_eq!(&buf, b"ping from A");
-
-        // B → A
-        stream_b.write_all(b"pong from B").await.expect("write B");
-        stream_b.flush().await.expect("flush B");
-        let mut buf = [0u8; 11];
-        timeout(Duration::from_secs(5), stream_a.read_exact(&mut buf))
-            .await
-            .expect("read A timed out")
-            .expect("read A");
-        assert_eq!(&buf, b"pong from B");
-
-        drop(stream_a);
-        drop(stream_b);
-        a.shutdown();
-        b.shutdown();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tunnel_tcp_preserves_large_backpressured_stream() {
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::time::{sleep, timeout};
-
-        fn ephemeral_port() -> u16 {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
-
-        let a_priv = [77u8; 32];
-        let b_priv = [88u8; 32];
-        let a_pub = x25519_public(a_priv);
-        let b_pub = x25519_public(b_priv);
-
-        let port_a = ephemeral_port();
-        let port_b = ephemeral_port();
-        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-
-        let a_options = WireguardEndpointOptions {
-            private_key: a_priv,
-            listen_port: port_a,
-            peers: vec![WireguardPeerOptions {
-                public_key: b_pub,
-                pre_shared_key: None,
-                endpoint: outer_b,
-                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-        let b_options = WireguardEndpointOptions {
-            private_key: b_priv,
-            listen_port: port_b,
-            peers: vec![WireguardPeerOptions {
-                public_key: a_pub,
-                pre_shared_key: None,
-                endpoint: outer_a,
-                allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-
-        let a = endpoint_for_test(
-            logger("wg-big-a"),
-            "wg-a".to_owned(),
-            test_interface("10.0.1.1/32"),
-            a_options,
-        );
-        let b = endpoint_for_test(
-            logger("wg-big-b"),
-            "wg-b".to_owned(),
-            test_interface("10.0.1.2/32"),
-            b_options,
-        );
-        a.boot().expect("boot a");
-        b.boot().expect("boot b");
-
-        let stack_a = a.stack_handle().expect("stack a ready");
-        let stack_b = b.stack_handle().expect("stack b ready");
-
-        const PORT: u16 = 8081;
-        let listener = stack_b.listen_tcp(PORT);
-        let accept_task = crate::spawn::spawn(async move { listener.accept().await });
-
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)), PORT);
-        let mut stream_a = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
-            .await
-            .expect("dial timed out")
-            .expect("dial_tcp");
-        let mut stream_b = timeout(Duration::from_secs(5), accept_task)
-            .await
-            .expect("accept timed out")
-            .expect("accept join")
-            .expect("accept");
-
-        let payload = (0..(512 * 1024))
-            .map(|idx| (idx % 251) as u8)
-            .collect::<Vec<_>>();
-        let expected = payload.clone();
-        let writer = crate::spawn::spawn(async move {
-            for chunk in payload.chunks(4096) {
-                stream_a.write_all(chunk).await.expect("write payload");
-            }
-            stream_a.shutdown().await.expect("shutdown stream");
-        });
-
-        // Let B's user-side reader lag so the actor-to-bridge channel and
-        // DuplexStream hit backpressure before we drain them.
-        sleep(Duration::from_millis(200)).await;
-
-        let mut received = vec![0u8; expected.len()];
-        timeout(Duration::from_secs(10), stream_b.read_exact(&mut received))
-            .await
-            .expect("read timed out")
-            .expect("read_exact");
-        writer.await.expect("writer join");
-
-        assert_eq!(received, expected);
-
-        a.shutdown();
-        b.shutdown();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tunnel_tcp_dial_fails_when_remote_port_is_closed() {
-        use std::time::Duration;
-        use tokio::time::timeout;
-
-        fn ephemeral_port() -> u16 {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        }
-
-        let a_priv = [99u8; 32];
-        let b_priv = [111u8; 32];
-        let a_pub = x25519_public(a_priv);
-        let b_pub = x25519_public(b_priv);
-
-        let port_a = ephemeral_port();
-        let port_b = ephemeral_port();
-        let outer_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
-        let outer_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
-
-        let a_options = WireguardEndpointOptions {
-            private_key: a_priv,
-            listen_port: port_a,
-            peers: vec![WireguardPeerOptions {
-                public_key: b_pub,
-                pre_shared_key: None,
-                endpoint: outer_b,
-                allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-        let b_options = WireguardEndpointOptions {
-            private_key: b_priv,
-            listen_port: port_b,
-            peers: vec![WireguardPeerOptions {
-                public_key: a_pub,
-                pre_shared_key: None,
-                endpoint: outer_a,
-                allowed_ips: vec!["10.0.2.0/24".parse().unwrap()],
-                persistent_keepalive: None,
-                reserved: [0; 3],
-            }],
-        };
-
-        let a = endpoint_for_test(
-            logger("wg-closed-a"),
-            "wg-a".to_owned(),
-            test_interface("10.0.2.1/32"),
-            a_options,
-        );
-        let b = endpoint_for_test(
-            logger("wg-closed-b"),
-            "wg-b".to_owned(),
-            test_interface("10.0.2.2/32"),
-            b_options,
-        );
-        a.boot().expect("boot a");
-        b.boot().expect("boot b");
-
-        let stack_a = a.stack_handle().expect("stack a ready");
-        let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2)), 9099);
-        let err = timeout(Duration::from_secs(5), stack_a.dial_tcp(dst))
-            .await
-            .expect("dial should resolve")
-            .expect_err("dial to closed remote port must fail");
-        assert!(
-            err.to_string().contains("ipstack tcp connect failed"),
-            "unexpected error: {err}"
-        );
-
-        a.shutdown();
-        b.shutdown();
     }
 }

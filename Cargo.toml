@@ -55,6 +55,7 @@ humantime-serde = "1.1"
 serde_with = { version = "3.18", default-features = false, features = ["std"] }
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 bytes = "1.11"
+etherparse = "0.20.1"
 http = "1.4"
 hyper = { version = "1.9", default-features = false, features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -70,20 +71,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 blake2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
-smoltcp = { version = "0.13", features = [
-    # IPv4 reassembly is in smoltcp's default features but the fallback
-    # REASSEMBLY_BUFFER_SIZE / COUNT consts (1500 / 1) make it a no-op —
-    # bumping to 8 KiB × 4 lets us actually reassemble fragmented packets
-    # (DNS-over-UDP large responses, QUIC initial jumbo, etc.). IPv6
-    # reassembly isn't in default at all; iOS NetExt traffic needs it.
-    # Outbound fragmentation buffer kept in sync for symmetry — current
-    # ChannelDevice MTU caps smoltcp's tx side so this rarely fires, but
-    # leaves the door open for future paths that send large datagrams.
-    "proto-ipv6-fragmentation",
-    "reassembly-buffer-size-8192",
-    "reassembly-buffer-count-4",
-    "fragmentation-buffer-size-8192",
-] }
 socket2 = "0.6"
 boringtun = { version = "0.7", default-features = false }
 lru = { version = "0.18", default-features = false }

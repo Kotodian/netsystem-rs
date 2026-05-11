@@ -10,9 +10,15 @@ use tracing::{debug, error, info, trace};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "endpoint")]
+use etherparse::{
+    Icmpv4Header, Icmpv4Type, Icmpv6Header, Icmpv6Type, IpNumber, Ipv4HeaderSlice, icmpv4,
+};
+#[cfg(feature = "endpoint")]
+use hammer_adapter::Endpoint as EndpointTrait;
 use hammer_adapter::{
     DnsQueryOptions, DnsRouter as DnsRouterTrait, Network, OutboundManager as OutboundManagerTrait,
-    ProxyStream, RouteDecision, RouteMetadata, Router as RouterTrait, SocksAddr,
+    ProxyStream, RouteDecision, RouteMetadata, RouteTarget, Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::normalize_domain;
 use hammer_core::error::{HammerError, HammerResult};
@@ -29,10 +35,6 @@ use tokio::time::{self, Duration, Instant, timeout};
 
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters, RegistryRecorder};
 use hammer_core::protocol::dns::MessageExt;
-#[cfg(feature = "ipstack")]
-use hammer_core::protocol::ipstack::{
-    IpStackHandles, IpStackInput, TcpListener as IpStackTcpListener, spawn_ipstack,
-};
 use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
@@ -48,14 +50,6 @@ const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const SYSTEM_TCP_BRIDGE_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(feature = "ipstack")]
-const SMOLTCP_TUN_STACK_INPUT_QUEUE_CAPACITY: usize = 256;
-#[cfg(feature = "ipstack")]
-const SMOLTCP_TUN_TCP_LISTENER_PORT_V4: u16 = 10_000;
-#[cfg(feature = "ipstack")]
-const SMOLTCP_TUN_TCP_LISTENER_PORT_V6: u16 = 10_001;
-#[cfg(feature = "ipstack")]
-const SMOLTCP_TUN_TCP_ACCEPT_WORKERS: usize = 16;
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -64,6 +58,8 @@ const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
 const IPV4_TTL_OFFSET: usize = 8;
 const IPV4_PROTOCOL_OFFSET: usize = 9;
 const IPV4_CHECKSUM_OFFSET: usize = 10;
+#[cfg(feature = "endpoint")]
+const IPV4_FLAGS_FRAGMENT_OFFSET: usize = 6;
 const IPV4_SOURCE_OFFSET: usize = 12;
 const IPV4_DESTINATION_OFFSET: usize = 16;
 const IPV6_PAYLOAD_LEN_OFFSET: usize = 4;
@@ -546,6 +542,32 @@ type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 
 type UdpFlowPayload = Bytes;
 
+#[cfg(feature = "endpoint")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TcpEndpointFlowKey {
+    source: (IpAddr, u16),
+    destination: (IpAddr, u16),
+}
+
+#[cfg(feature = "endpoint")]
+impl TcpEndpointFlowKey {
+    fn from_parsed(parsed: &ParsedIpPacketView) -> Self {
+        Self {
+            source: (parsed.source.host, parsed.source.port),
+            destination: (parsed.destination.host, parsed.destination.port),
+        }
+    }
+}
+
+#[cfg(feature = "endpoint")]
+struct TcpEndpointFlowState {
+    endpoint: String,
+    last_active: Instant,
+}
+
+#[cfg(feature = "endpoint")]
+type TcpEndpointFlowMap = HashMap<TcpEndpointFlowKey, TcpEndpointFlowState>;
+
 struct DnsHijackJob {
     packet: Vec<u8>,
     destination: SocksAddr,
@@ -578,6 +600,345 @@ impl TcpPendingDialLimiter {
     }
 }
 
+/// L3 fast path dispatcher.
+///
+/// Each registered `Endpoint` (today: WireGuard) exposes the IP prefixes it
+/// owns via `Endpoint::allowed_destinations`. The TUN packet loop builds a
+/// longest-prefix table from those at start-up and consults it before the
+/// system NAT pass: when the packet's destination IP falls inside one of the
+/// prefixes, the raw IP packet is shipped straight into that endpoint's
+/// encrypt channel — no NAT rewrite, no listener round-trip.
+///
+/// The inbound IP packet streams (decapsulated by the endpoint) are taken at
+/// start-up and fanned into the TUN writer by a dedicated task per stream.
+#[cfg(feature = "endpoint")]
+#[derive(Clone, Copy)]
+struct L3AddressRewrite {
+    tun: IpAddr,
+    endpoint: IpAddr,
+}
+
+#[cfg(feature = "endpoint")]
+#[derive(Clone, Copy, Default)]
+struct L3AddressRewrites {
+    v4: Option<L3AddressRewrite>,
+    v6: Option<L3AddressRewrite>,
+}
+
+#[cfg(feature = "endpoint")]
+struct L3EndpointRoute {
+    id: String,
+    allowed: Vec<IpNet>,
+    tx: mpsc::Sender<Bytes>,
+    rewrite: L3AddressRewrites,
+    mtu: Option<usize>,
+}
+
+#[cfg(feature = "endpoint")]
+struct L3InboundReceiver {
+    rx: mpsc::Receiver<Bytes>,
+    rewrite: L3AddressRewrites,
+}
+
+#[cfg(feature = "endpoint")]
+pub(crate) struct L3DispatchTable {
+    endpoints: Vec<L3EndpointRoute>,
+    inbound: StdMutex<Vec<L3InboundReceiver>>,
+}
+
+#[cfg(feature = "endpoint")]
+impl L3DispatchTable {
+    fn from_endpoints(eps: &[Arc<dyn EndpointTrait>], addresses: &StackAddresses) -> Self {
+        let mut endpoints = Vec::new();
+        let mut inbound = Vec::new();
+        for ep in eps {
+            let rewrite = L3AddressRewrites::from_endpoint(addresses, &ep.interface_addresses());
+            let tx = ep.ip_send_clone();
+            let mtu = ep.ip_packet_mtu();
+            let mut allowed = ep.allowed_destinations();
+            allowed.sort_by(|a, b| b.prefix_len().cmp(&a.prefix_len()));
+            allowed.dedup();
+            if !allowed.is_empty() {
+                endpoints.push(L3EndpointRoute {
+                    id: ep.id().to_owned(),
+                    allowed,
+                    tx,
+                    rewrite,
+                    mtu,
+                });
+            }
+            if let Some(rx) = ep.ip_recv_take() {
+                inbound.push(L3InboundReceiver { rx, rewrite });
+            }
+        }
+        Self {
+            endpoints,
+            inbound: StdMutex::new(inbound),
+        }
+    }
+
+    #[inline]
+    fn match_endpoint(&self, id: &str, dst: IpAddr) -> Option<&L3EndpointRoute> {
+        self.endpoints.iter().find(|endpoint| {
+            endpoint.id == id && endpoint.allowed.iter().any(|net| net.contains(&dst))
+        })
+    }
+
+    fn take_inbound_receivers(&self) -> Vec<L3InboundReceiver> {
+        std::mem::take(
+            &mut *self
+                .inbound
+                .lock()
+                .expect("L3DispatchTable inbound poisoned"),
+        )
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
+            && self
+                .inbound
+                .lock()
+                .expect("L3DispatchTable inbound poisoned")
+                .is_empty()
+    }
+}
+
+#[cfg(feature = "endpoint")]
+impl L3AddressRewrites {
+    fn from_endpoint(addresses: &StackAddresses, endpoint_addresses: &[IpNet]) -> Self {
+        let v4 = addresses.v4.as_ref().and_then(|tun| {
+            first_endpoint_ip(endpoint_addresses, IpVersion::V4).map(|endpoint| L3AddressRewrite {
+                tun: IpAddr::V4(tun.listener),
+                endpoint,
+            })
+        });
+        let v6 = addresses.v6.as_ref().and_then(|tun| {
+            first_endpoint_ip(endpoint_addresses, IpVersion::V6).map(|endpoint| L3AddressRewrite {
+                tun: IpAddr::V6(tun.listener),
+                endpoint,
+            })
+        });
+        Self { v4, v6 }
+    }
+
+    fn for_addr(&self, addr: IpAddr) -> Option<L3AddressRewrite> {
+        match addr {
+            IpAddr::V4(_) => self.v4,
+            IpAddr::V6(_) => self.v6,
+        }
+    }
+
+    fn rewrite_egress(&self, packet: &mut [u8], parsed: &ParsedIpPacketView) -> HammerResult<()> {
+        let Some(rewrite) = self.for_addr(parsed.source.host) else {
+            return Ok(());
+        };
+        rewrite_l3_packet_source(packet, rewrite.tun, rewrite.endpoint)
+    }
+
+    fn rewrite_ingress(&self, packet: &mut [u8]) -> HammerResult<()> {
+        let destination = l3_packet_addr(packet, false)?;
+        let Some(rewrite) = self.for_addr(destination) else {
+            return Ok(());
+        };
+        rewrite_l3_packet_destination(packet, rewrite.endpoint, rewrite.tun)
+    }
+}
+
+#[cfg(feature = "endpoint")]
+impl L3EndpointRoute {
+    fn dispatch(
+        &self,
+        packet: Vec<u8>,
+        parsed: &ParsedIpPacketView,
+        tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+        metrics: &TunMetrics,
+    ) -> HammerResult<()> {
+        if let Some(mtu) = self.mtu {
+            if packet.len() > mtu {
+                return self.dispatch_oversized(packet, parsed, mtu, tun_write_tx, metrics);
+            }
+        }
+        self.dispatch_rewritten(packet, parsed)
+    }
+
+    fn dispatch_rewritten(
+        &self,
+        mut packet: Vec<u8>,
+        parsed: &ParsedIpPacketView,
+    ) -> HammerResult<()> {
+        self.rewrite.rewrite_egress(&mut packet, parsed)?;
+        self.send_packet(packet)
+    }
+
+    fn dispatch_oversized(
+        &self,
+        packet: Vec<u8>,
+        parsed: &ParsedIpPacketView,
+        mtu: usize,
+        tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+        metrics: &TunMetrics,
+    ) -> HammerResult<()> {
+        match IpVersion::from_packet(&packet)? {
+            IpVersion::V4 if ipv4_dont_fragment(&packet)? => {
+                let response = ipv4_packet_too_big_packet(&packet, mtu)?;
+                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)
+            }
+            IpVersion::V4 => {
+                let mut packet = packet;
+                self.rewrite.rewrite_egress(&mut packet, parsed)?;
+                for fragment in fragment_ipv4_packet(&packet, mtu)? {
+                    self.send_packet(fragment)?;
+                }
+                Ok(())
+            }
+            IpVersion::V6 => {
+                let response = ipv6_packet_too_big_packet(&packet, mtu)?;
+                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)
+            }
+        }
+    }
+
+    fn send_packet(&self, packet: Vec<u8>) -> HammerResult<()> {
+        self.tx
+            .try_send(Bytes::from(packet))
+            .map_err(|err| HammerError::internal(format!("endpoint L3 dispatch failed: {err}")))
+    }
+}
+
+#[cfg(feature = "endpoint")]
+fn dispatch_endpoint_l3_packet(
+    dispatch: &L3DispatchTable,
+    endpoint_id: &str,
+    packet: Vec<u8>,
+    parsed: &ParsedIpPacketView,
+    metrics: &TunMetrics,
+    tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+) -> bool {
+    if let Some(endpoint) = dispatch.match_endpoint(endpoint_id, parsed.destination.host) {
+        match endpoint.dispatch(packet, parsed, tun_write_tx, metrics) {
+            Ok(()) => {
+                metrics.counters.endpoint_dispatch_total.increment(1);
+            }
+            Err(err) => {
+                metrics.counters.endpoint_dispatch_drop_total.increment(1);
+                debug!("dispatch endpoint L3 packet: {err}");
+            }
+        }
+        true
+    } else {
+        metrics.counters.endpoint_dispatch_drop_total.increment(1);
+        debug!(
+            "endpoint route {endpoint_id} does not accept {}",
+            parsed.destination.host
+        );
+        false
+    }
+}
+
+#[cfg(feature = "endpoint")]
+fn enqueue_endpoint_pmtu_response(
+    tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+    response: Vec<u8>,
+    metrics: &TunMetrics,
+) -> HammerResult<()> {
+    let Some(tun_write_tx) = tun_write_tx else {
+        return Err(HammerError::internal(
+            "endpoint L3 packet needs PMTU response but TUN writer is unavailable",
+        ));
+    };
+    enqueue_tun_packet_write(tun_write_tx, response, metrics);
+    Ok(())
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv4_header_slice(packet: &[u8]) -> HammerResult<Ipv4HeaderSlice<'_>> {
+    let header = Ipv4HeaderSlice::from_slice(packet)
+        .map_err(|err| HammerError::internal(format!("invalid IPv4 packet: {err}")))?;
+    let total_len = header.total_len() as usize;
+    if packet.len() < total_len {
+        return Err(HammerError::internal("short IPv4 packet"));
+    }
+    header
+        .payload_len()
+        .map_err(|err| HammerError::internal(format!("invalid IPv4 packet length: {err}")))?;
+    Ok(header)
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv4_dont_fragment(packet: &[u8]) -> HammerResult<bool> {
+    Ok(ipv4_header_slice(packet)?.dont_fragment())
+}
+
+#[cfg(feature = "endpoint")]
+fn fragment_ipv4_packet(packet: &[u8], mtu: usize) -> HammerResult<Vec<Vec<u8>>> {
+    let header = ipv4_header_slice(packet)?;
+    let ihl = header.slice().len();
+    let total_len = header.total_len() as usize;
+    if total_len <= mtu {
+        return Ok(vec![packet[..total_len].to_vec()]);
+    }
+    if mtu <= ihl {
+        return Err(HammerError::internal(format!(
+            "endpoint MTU {mtu} cannot fit IPv4 header length {ihl}"
+        )));
+    }
+    let max_payload = ((mtu - ihl) / 8) * 8;
+    if max_payload == 0 {
+        return Err(HammerError::internal(format!(
+            "endpoint MTU {mtu} cannot fit an IPv4 fragment payload"
+        )));
+    }
+
+    let payload = &packet[ihl..total_len];
+    if payload.is_empty() {
+        return Ok(vec![packet[..total_len].to_vec()]);
+    }
+
+    let original_flags = read_u16(packet, IPV4_FLAGS_FRAGMENT_OFFSET);
+    let reserved_flag = original_flags & 0x8000;
+    let original_more_fragments = original_flags & 0x2000 != 0;
+    let base_fragment_offset = original_flags & 0x1fff;
+    let mut fragments = Vec::with_capacity(payload.len().div_ceil(max_payload));
+    let mut offset = 0;
+
+    while offset < payload.len() {
+        let remaining = payload.len() - offset;
+        let take = remaining.min(max_payload);
+        let last = offset + take == payload.len();
+        let fragment_offset = base_fragment_offset
+            .checked_add((offset / 8) as u16)
+            .filter(|offset| *offset <= 0x1fff)
+            .ok_or_else(|| HammerError::internal("IPv4 fragment offset overflow"))?;
+        let flags = reserved_flag
+            | if original_more_fragments || !last {
+                0x2000
+            } else {
+                0
+            }
+            | fragment_offset;
+        let fragment_len = ihl + take;
+        let mut fragment = Vec::with_capacity(fragment_len);
+        fragment.extend_from_slice(&packet[..ihl]);
+        fragment.extend_from_slice(&payload[offset..offset + take]);
+        write_u16(&mut fragment, IPV4_TOTAL_LENGTH_OFFSET, fragment_len as u16);
+        write_u16(&mut fragment, IPV4_FLAGS_FRAGMENT_OFFSET, flags);
+        update_ipv4_header_checksum(&mut fragment, ihl);
+        fragments.push(fragment);
+        offset += take;
+    }
+
+    Ok(fragments)
+}
+
+#[cfg(feature = "endpoint")]
+fn first_endpoint_ip(addresses: &[IpNet], version: IpVersion) -> Option<IpAddr> {
+    addresses.iter().find_map(|net| match (version, *net) {
+        (IpVersion::V4, IpNet::V4(net)) => Some(IpAddr::V4(net.addr())),
+        (IpVersion::V6, IpNet::V6(net)) => Some(IpAddr::V6(net.addr())),
+        _ => None,
+    })
+}
+
 pub struct SystemTunStack<D, R, Q, O>
 where
     D: TunDevice,
@@ -595,6 +956,11 @@ where
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    /// L3 endpoints (WireGuard today) registered for the fast path. The
+    /// service builder injects these via `set_endpoints` before `start`
+    /// so the packet loop can build its dispatch table.
+    #[cfg(feature = "endpoint")]
+    endpoints: StdMutex<Vec<Arc<dyn EndpointTrait>>>,
     tun_interface_index: Option<u32>,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
@@ -647,11 +1013,24 @@ where
             tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
             tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
             udp_flows: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(feature = "endpoint")]
+            endpoints: StdMutex::new(Vec::new()),
             tun_interface_index,
             tasks: StdMutex::new(Vec::new()),
             started: AtomicBool::new(false),
             metrics: TunMetrics::new(metrics),
         }
+    }
+
+    /// Register L3 endpoints whose `allowed_destinations` should bypass the
+    /// system NAT/listener path. Must be called before `start`; calling after
+    /// `start` has no effect (the dispatch table is built at start time).
+    #[cfg(feature = "endpoint")]
+    pub fn set_endpoints(&self, endpoints: Vec<Arc<dyn EndpointTrait>>) {
+        *self
+            .endpoints
+            .lock()
+            .expect("SystemTunStack endpoints poisoned") = endpoints;
     }
 
     pub fn start(&self) -> HammerResult<()> {
@@ -713,6 +1092,23 @@ where
                 listener_port: port,
             });
         }
+        #[cfg(feature = "endpoint")]
+        let endpoint_dispatch = {
+            let eps = self
+                .endpoints
+                .lock()
+                .expect("SystemTunStack endpoints poisoned");
+            if eps.is_empty() {
+                None
+            } else {
+                let table = L3DispatchTable::from_endpoints(&eps, &addresses);
+                if table.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(table))
+                }
+            }
+        };
         handles.push(crate::spawn::spawn(packet_loop(
             self.logger.clone(),
             Arc::clone(&self.router),
@@ -723,6 +1119,8 @@ where
             Arc::clone(&self.tcp_nat),
             Arc::clone(&self.udp_flows),
             routes,
+            #[cfg(feature = "endpoint")]
+            endpoint_dispatch,
             self.options
                 .udp_timeout
                 .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT),
@@ -742,208 +1140,6 @@ where
             .tasks
             .lock()
             .expect("SystemTunStack tasks poisoned")
-            .drain(..)
-        {
-            task.abort();
-        }
-        if let Ok(mut flows) = self.udp_flows.try_lock() {
-            flows.clear();
-        }
-    }
-}
-
-#[cfg(feature = "ipstack")]
-pub struct SmoltcpTunDataStack<D, R, Q, O>
-where
-    D: TunDevice,
-    R: RouterTrait + 'static,
-    Q: DnsRouterTrait + 'static,
-    O: OutboundManagerTrait + 'static,
-{
-    logger: Logger,
-    router: Arc<R>,
-    dns_router: Arc<Q>,
-    outbound: Arc<O>,
-    inbound_id: String,
-    options: hammer_core::config::TunInboundOptions,
-    device: Arc<D>,
-    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    tcp_pending_dials: TcpPendingDialLimiter,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
-    ipstack: StdMutex<Option<Arc<IpStackHandles>>>,
-    tasks: StdMutex<Vec<JoinHandle<()>>>,
-    started: AtomicBool,
-    metrics: TunMetrics,
-}
-
-#[cfg(feature = "ipstack")]
-impl<D, R, Q, O> SmoltcpTunDataStack<D, R, Q, O>
-where
-    D: TunDevice,
-    R: RouterTrait + 'static,
-    Q: DnsRouterTrait + 'static,
-    O: OutboundManagerTrait + 'static,
-{
-    pub fn new(
-        logger: Logger,
-        router: Arc<R>,
-        dns_router: Arc<Q>,
-        outbound: Arc<O>,
-        inbound_id: String,
-        options: hammer_core::config::TunInboundOptions,
-        device: Arc<D>,
-    ) -> Self {
-        let metrics = MetricsRegistry::new().scope("inbound", "tun", inbound_id.clone());
-        Self::new_with_metrics(
-            logger, router, dns_router, outbound, inbound_id, options, device, metrics,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_metrics(
-        logger: Logger,
-        router: Arc<R>,
-        dns_router: Arc<Q>,
-        outbound: Arc<O>,
-        inbound_id: String,
-        options: hammer_core::config::TunInboundOptions,
-        device: Arc<D>,
-        metrics: MetricsScope,
-    ) -> Self {
-        let udp_timeout = options.udp_timeout.unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
-        Self {
-            logger,
-            router,
-            dns_router,
-            outbound,
-            inbound_id,
-            options,
-            device,
-            tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
-            tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
-            udp_flows: Arc::new(StdMutex::new(HashMap::new())),
-            ipstack: StdMutex::new(None),
-            tasks: StdMutex::new(Vec::new()),
-            started: AtomicBool::new(false),
-            metrics: TunMetrics::new(metrics),
-        }
-    }
-
-    pub fn start(&self) -> HammerResult<()> {
-        if self.started.swap(true, Ordering::Relaxed) {
-            return Ok(());
-        }
-        let addresses = StackAddresses::from_options(&self.options)?;
-        let (ipstack_in_tx, ipstack_in_rx) = mpsc::channel(SMOLTCP_TUN_STACK_INPUT_QUEUE_CAPACITY);
-        let (ipstack_out_tx, ipstack_out_rx) =
-            mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
-        let ipstack = Arc::new(spawn_ipstack(
-            self.logger.clone(),
-            self.options.address.clone(),
-            self.options.mtu,
-            ipstack_in_rx,
-            ipstack_out_tx,
-        )?);
-        let mut handles = Vec::new();
-        let mut routes = SystemStackRoutes::default();
-        if let Some(v4) = addresses.v4 {
-            let listener = ipstack.listen_tcp(SMOLTCP_TUN_TCP_LISTENER_PORT_V4);
-            info!(
-                "smoltcp stack TCP listener {}:{}",
-                v4.listener, SMOLTCP_TUN_TCP_LISTENER_PORT_V4
-            );
-            for _ in 0..SMOLTCP_TUN_TCP_ACCEPT_WORKERS {
-                handles.push(crate::spawn::spawn(accept_smoltcp_tcp_loop(
-                    self.logger.clone(),
-                    Arc::clone(&self.router),
-                    Arc::clone(&self.outbound),
-                    Arc::clone(&self.tcp_nat),
-                    self.tcp_pending_dials.clone(),
-                    self.inbound_id.clone(),
-                    listener.clone(),
-                    self.metrics.clone(),
-                )));
-            }
-            routes.v4 = Some(SystemStackRoute {
-                listener_addr: IpAddr::V4(v4.listener),
-                nat_addr: IpAddr::V4(v4.next),
-                listener_port: SMOLTCP_TUN_TCP_LISTENER_PORT_V4,
-            });
-        }
-        if let Some(v6) = addresses.v6 {
-            let listener = ipstack.listen_tcp(SMOLTCP_TUN_TCP_LISTENER_PORT_V6);
-            info!(
-                "smoltcp stack TCP listener [{}]:{}",
-                v6.listener, SMOLTCP_TUN_TCP_LISTENER_PORT_V6
-            );
-            for _ in 0..SMOLTCP_TUN_TCP_ACCEPT_WORKERS {
-                handles.push(crate::spawn::spawn(accept_smoltcp_tcp_loop(
-                    self.logger.clone(),
-                    Arc::clone(&self.router),
-                    Arc::clone(&self.outbound),
-                    Arc::clone(&self.tcp_nat),
-                    self.tcp_pending_dials.clone(),
-                    self.inbound_id.clone(),
-                    listener.clone(),
-                    self.metrics.clone(),
-                )));
-            }
-            routes.v6 = Some(SystemStackRoute {
-                listener_addr: IpAddr::V6(v6.listener),
-                nat_addr: IpAddr::V6(v6.next),
-                listener_port: SMOLTCP_TUN_TCP_LISTENER_PORT_V6,
-            });
-        }
-        handles.push(crate::spawn::spawn(smoltcp_ipstack_output_loop(
-            Arc::clone(&self.device),
-            Arc::clone(&self.tcp_nat),
-            routes.clone(),
-            ipstack_out_rx,
-            self.metrics.clone(),
-        )));
-        handles.push(crate::spawn::spawn(smoltcp_packet_loop(
-            self.logger.clone(),
-            Arc::clone(&self.router),
-            Arc::clone(&self.dns_router),
-            Arc::clone(&self.outbound),
-            self.inbound_id.clone(),
-            Arc::clone(&self.device),
-            Arc::clone(&self.tcp_nat),
-            Arc::clone(&self.udp_flows),
-            routes,
-            ipstack_in_tx,
-            self.options
-                .udp_timeout
-                .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT),
-            self.metrics.clone(),
-        )));
-        *self
-            .ipstack
-            .lock()
-            .expect("SmoltcpTunDataStack ipstack poisoned") = Some(Arc::clone(&ipstack));
-        self.tasks
-            .lock()
-            .expect("SmoltcpTunDataStack tasks poisoned")
-            .extend(handles);
-        info!("smoltcp stack started");
-        Ok(())
-    }
-
-    pub fn close(&self) {
-        self.device.close();
-        if let Some(ipstack) = self
-            .ipstack
-            .lock()
-            .expect("SmoltcpTunDataStack ipstack poisoned")
-            .take()
-        {
-            ipstack.signal_shutdown();
-            ipstack.abort();
-        }
-        for task in self
-            .tasks
-            .lock()
-            .expect("SmoltcpTunDataStack tasks poisoned")
             .drain(..)
         {
             task.abort();
@@ -1008,6 +1204,17 @@ struct TunCounters {
     control_write_drop_busy_total: Counter,
     /// Control packet writes that failed after leaving the main packet loop.
     control_write_error_total: Counter,
+    /// IP packets dispatched to an L3 endpoint (WireGuard) via the fast path.
+    #[cfg(feature = "endpoint")]
+    endpoint_dispatch_total: Counter,
+    /// IP packets dropped because the L3 endpoint's encrypt channel was full
+    /// (back-pressure from boringtun) or already closed.
+    #[cfg(feature = "endpoint")]
+    endpoint_dispatch_drop_total: Counter,
+    /// Decrypted IP packets received from an L3 endpoint and forwarded back
+    /// to the TUN device.
+    #[cfg(feature = "endpoint")]
+    endpoint_inbound_total: Counter,
 }
 
 impl TunCounters {
@@ -1050,6 +1257,15 @@ impl TunCounters {
                 "control_write_drop_busy_total",
             ),
             control_write_error_total: recorder_counter(&recorder, "control_write_error_total"),
+            #[cfg(feature = "endpoint")]
+            endpoint_dispatch_total: recorder_counter(&recorder, "endpoint_dispatch_total"),
+            #[cfg(feature = "endpoint")]
+            endpoint_dispatch_drop_total: recorder_counter(
+                &recorder,
+                "endpoint_dispatch_drop_total",
+            ),
+            #[cfg(feature = "endpoint")]
+            endpoint_inbound_total: recorder_counter(&recorder, "endpoint_inbound_total"),
         }
     }
 }
@@ -1186,11 +1402,13 @@ pub fn tun_interface_index_from_fd(_fd: RawFd) -> Option<u32> {
     None
 }
 
+#[derive(Clone, Copy)]
 struct StackAddresses {
     v4: Option<StackAddress<Ipv4Addr>>,
     v6: Option<StackAddress<Ipv6Addr>>,
 }
 
+#[derive(Clone, Copy)]
 struct StackAddress<T> {
     listener: T,
     next: T,
@@ -1444,7 +1662,7 @@ fn sniff_packet_metadata(metadata: &mut RouteMetadata, payload: &[u8]) {
     }
 }
 
-pub struct SmoltcpTunStack<R, Q, O>
+pub struct PacketTunStack<R, Q, O>
 where
     R: RouterTrait,
     Q: DnsRouterTrait,
@@ -1456,7 +1674,7 @@ where
     inbound_id: String,
 }
 
-impl<R, Q, O> SmoltcpTunStack<R, Q, O>
+impl<R, Q, O> PacketTunStack<R, Q, O>
 where
     R: RouterTrait,
     Q: DnsRouterTrait,
@@ -1515,7 +1733,15 @@ where
                 metadata: tun_packet.metadata,
                 reason: format!("reject: {method}"),
             }),
-            RouteDecision::Route { outbound } => self.dispatch_route(tun_packet, &outbound).await,
+            RouteDecision::Route {
+                target: RouteTarget::Outbound(outbound),
+            } => self.dispatch_route(tun_packet, &outbound).await,
+            RouteDecision::Route {
+                target: RouteTarget::Endpoint(endpoint),
+            } => Ok(TunDispatch::Dropped {
+                metadata: tun_packet.metadata,
+                reason: format!("endpoint route requires L3 dispatch: {endpoint}"),
+            }),
         }
     }
 
@@ -1927,6 +2153,310 @@ fn update_ipv6_udp_checksum(packet: &mut [u8]) -> HammerResult<()> {
     Ok(())
 }
 
+#[cfg(feature = "endpoint")]
+fn rewrite_l3_packet_source(
+    packet: &mut [u8],
+    expected: IpAddr,
+    replacement: IpAddr,
+) -> HammerResult<()> {
+    rewrite_l3_packet_addr(packet, expected, replacement, true)
+}
+
+#[cfg(feature = "endpoint")]
+fn rewrite_l3_packet_destination(
+    packet: &mut [u8],
+    expected: IpAddr,
+    replacement: IpAddr,
+) -> HammerResult<()> {
+    rewrite_l3_packet_addr(packet, expected, replacement, false)
+}
+
+#[cfg(feature = "endpoint")]
+fn rewrite_l3_packet_addr(
+    packet: &mut [u8],
+    expected: IpAddr,
+    replacement: IpAddr,
+    source: bool,
+) -> HammerResult<()> {
+    if l3_packet_addr(packet, source)? != expected || expected == replacement {
+        return Ok(());
+    }
+    match (IpVersion::from_packet(packet)?, replacement) {
+        (IpVersion::V4, IpAddr::V4(new_addr)) => rewrite_ipv4_addr(packet, new_addr, source),
+        (IpVersion::V6, IpAddr::V6(new_addr)) => rewrite_ipv6_addr(packet, new_addr, source),
+        _ => Err(HammerError::internal(
+            "endpoint L3 address rewrite family mismatch",
+        )),
+    }
+}
+
+// RFC 1624-style incremental checksum update for L3 NAT-style address
+// rewrites. Real reassembly is out of scope on iOS NetExt (memory tight,
+// fragments are uncommon on the WG-tunneled inner link); the incremental
+// path lets the first fragment's transport checksum stay valid after we
+// change the addresses, while non-initial fragments skip the transport
+// step entirely since they carry no transport header.
+#[cfg(feature = "endpoint")]
+fn rewrite_ipv4_addr(packet: &mut [u8], new_addr: Ipv4Addr, source: bool) -> HammerResult<()> {
+    if packet.len() < IPV4_HEADER_MIN_LEN {
+        return Err(HammerError::internal("short IPv4 packet"));
+    }
+    let ihl = ((packet[0] & 0x0f) as usize) * 4;
+    if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
+        return Err(HammerError::internal("invalid IPv4 header length"));
+    }
+    let fragment_offset = read_u16(packet, IPV4_FLAGS_FRAGMENT_OFFSET) & 0x1fff;
+    let protocol = packet[IPV4_PROTOCOL_OFFSET];
+    // Validate transport length *before* touching the packet so that a
+    // malformed datagram is rejected without leaving half-rewritten bytes
+    // behind (matches the previous validate-then-rewrite contract).
+    if fragment_offset == 0 {
+        ipv4_validate_transport_for_delta(packet, ihl, protocol)?;
+    }
+
+    let addr_offset = if source {
+        IPV4_SOURCE_OFFSET
+    } else {
+        IPV4_DESTINATION_OFFSET
+    };
+    let mut old_bytes = [0_u8; 4];
+    old_bytes.copy_from_slice(&packet[addr_offset..addr_offset + 4]);
+    let new_bytes = new_addr.octets();
+    let delta = checksum_pair_delta(&old_bytes, &new_bytes);
+
+    packet[addr_offset..addr_offset + 4].copy_from_slice(&new_bytes);
+    apply_checksum_delta_at(packet, IPV4_CHECKSUM_OFFSET, delta, false);
+
+    if fragment_offset == 0 {
+        ipv4_apply_transport_delta(packet, ihl, protocol, delta);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "endpoint")]
+fn rewrite_ipv6_addr(packet: &mut [u8], new_addr: Ipv6Addr, source: bool) -> HammerResult<()> {
+    if packet.len() < IPV6_HEADER_LEN {
+        return Err(HammerError::internal("short IPv6 packet"));
+    }
+    let next_header = packet[IPV6_PROTOCOL_OFFSET];
+    let (transport_offset, transport_proto, later_fragment) =
+        ipv6_transport_location(packet, next_header)?;
+    if !later_fragment {
+        ipv6_validate_transport_for_delta(packet, transport_offset, transport_proto)?;
+    }
+
+    let addr_offset = if source {
+        IPV6_SOURCE_OFFSET
+    } else {
+        IPV6_DESTINATION_OFFSET
+    };
+    let mut old_bytes = [0_u8; 16];
+    old_bytes.copy_from_slice(&packet[addr_offset..addr_offset + 16]);
+    let new_bytes = new_addr.octets();
+    let delta = checksum_pair_delta(&old_bytes, &new_bytes);
+
+    packet[addr_offset..addr_offset + 16].copy_from_slice(&new_bytes);
+    // IPv6 has no header checksum to update.
+
+    if !later_fragment {
+        ipv6_apply_transport_delta(packet, transport_offset, transport_proto, delta);
+    }
+    Ok(())
+}
+
+// IPv6 Fragment Header (next-header 44, RFC 8200 §4.5): if present, the
+// fragment offset (top 13 bits of the second u16) tells us whether the
+// transport header is in this packet (offset == 0, first fragment) or
+// missing (offset != 0, later fragment).
+#[cfg(feature = "endpoint")]
+const IPV6_FRAGMENT_NEXT_HEADER: u8 = 44;
+#[cfg(feature = "endpoint")]
+const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
+
+#[cfg(feature = "endpoint")]
+fn ipv6_transport_location(
+    packet: &[u8],
+    next_header: u8,
+) -> HammerResult<(usize, u8, bool)> {
+    if next_header == IPV6_FRAGMENT_NEXT_HEADER {
+        if packet.len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
+            return Err(HammerError::internal("short IPv6 fragment header"));
+        }
+        let inner_proto = packet[IPV6_HEADER_LEN];
+        let frag_word = read_u16(packet, IPV6_HEADER_LEN + 2);
+        // Fragment Offset is the upper 13 bits scaled by 8 bytes; we only
+        // care whether the first fragment carries the transport header, so
+        // a non-zero fragment offset means "later fragment, skip transport".
+        let later = (frag_word & 0xfff8) != 0;
+        Ok((
+            IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
+            inner_proto,
+            later,
+        ))
+    } else {
+        Ok((IPV6_HEADER_LEN, next_header, false))
+    }
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv4_validate_transport_for_delta(
+    packet: &[u8],
+    ihl: usize,
+    protocol: u8,
+) -> HammerResult<()> {
+    if protocol == IpProtocol::Tcp.wire_value() {
+        if packet.len() < ihl + TCP_CHECKSUM_OFFSET + 2 {
+            return Err(HammerError::internal("short TCP segment"));
+        }
+    } else if protocol == IpProtocol::Udp.wire_value() {
+        if packet.len() < ihl + UDP_HEADER_LEN {
+            return Err(HammerError::internal("short UDP datagram"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv6_validate_transport_for_delta(
+    packet: &[u8],
+    transport_offset: usize,
+    protocol: u8,
+) -> HammerResult<()> {
+    if protocol == IpProtocol::Tcp.wire_value() {
+        if packet.len() < transport_offset + TCP_CHECKSUM_OFFSET + 2 {
+            return Err(HammerError::internal("short TCP segment"));
+        }
+    } else if protocol == IpProtocol::Udp.wire_value() {
+        if packet.len() < transport_offset + UDP_HEADER_LEN {
+            return Err(HammerError::internal("short UDP datagram"));
+        }
+    } else if protocol == IpProtocol::Icmpv6.wire_value()
+        && packet.len() < transport_offset + 4
+    {
+        return Err(HammerError::internal("short ICMPv6 packet"));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv4_apply_transport_delta(packet: &mut [u8], ihl: usize, protocol: u8, delta: u32) {
+    if protocol == IpProtocol::Tcp.wire_value() {
+        apply_checksum_delta_at(packet, ihl + TCP_CHECKSUM_OFFSET, delta, false);
+    } else if protocol == IpProtocol::Udp.wire_value() {
+        let off = ihl + UDP_CHECKSUM_OFFSET;
+        // RFC 768: a zero checksum in IPv4 UDP means "no checksum, do not
+        // verify". Don't manufacture one out of nowhere just because we
+        // changed addresses.
+        if read_u16(packet, off) != 0 {
+            apply_checksum_delta_at(packet, off, delta, true);
+        }
+    }
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv6_apply_transport_delta(
+    packet: &mut [u8],
+    transport_offset: usize,
+    protocol: u8,
+    delta: u32,
+) {
+    if protocol == IpProtocol::Tcp.wire_value() {
+        apply_checksum_delta_at(packet, transport_offset + TCP_CHECKSUM_OFFSET, delta, false);
+    } else if protocol == IpProtocol::Udp.wire_value() {
+        // IPv6 UDP checksum is mandatory and a wire value of zero is
+        // forbidden; if the incremental result lands on zero we rewrite it
+        // to 0xffff (the canonical "all-ones" representation that hashes
+        // the same under one's-complement arithmetic).
+        apply_checksum_delta_at(packet, transport_offset + UDP_CHECKSUM_OFFSET, delta, true);
+    } else if protocol == IpProtocol::Icmpv6.wire_value() {
+        // ICMPv6 checksum offset is 2 bytes into the header (Type, Code,
+        // then 2-byte checksum) and includes a pseudo-header derived from
+        // the IPv6 source/destination, so address rewrites need the same
+        // delta applied to it.
+        apply_checksum_delta_at(packet, transport_offset + 2, delta, false);
+    }
+}
+
+// Compute Σ(~m + m') over 16-bit words (RFC 1624 Eq 3 delta term). Caller
+// guarantees old.len() == new.len() and an even length; one's-complement
+// arithmetic does not care about alignment of the individual words to the
+// packet, only that we sum the same bytes that contribute to the
+// underlying internet checksum.
+#[cfg(feature = "endpoint")]
+fn checksum_pair_delta(old: &[u8], new: &[u8]) -> u32 {
+    debug_assert_eq!(old.len(), new.len());
+    debug_assert_eq!(old.len() % 2, 0);
+    let mut delta: u32 = 0;
+    let mut i = 0;
+    while i + 1 < old.len() {
+        let m = u16::from_be_bytes([old[i], old[i + 1]]) as u32;
+        let m_prime = u16::from_be_bytes([new[i], new[i + 1]]) as u32;
+        delta = delta.wrapping_add((!m) & 0xffff).wrapping_add(m_prime);
+        i += 2;
+    }
+    delta
+}
+
+// Apply HC' = ~(~HC + delta) at offset, folding 32-bit overflow back into
+// 16 bits. `udp_zero_to_ffff` keeps IPv6 / explicit-checksum UDP datagrams
+// legal when the incremental update would otherwise produce a wire-zero
+// value (forbidden by RFC 2460 / RFC 768).
+#[cfg(feature = "endpoint")]
+fn apply_checksum_delta_at(packet: &mut [u8], offset: usize, delta: u32, udp_zero_to_ffff: bool) {
+    let hc = read_u16(packet, offset) as u32;
+    let mut sum = ((!hc) & 0xffff).wrapping_add(delta);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let mut new_hc = ((!sum) & 0xffff) as u16;
+    if udp_zero_to_ffff && new_hc == 0 {
+        new_hc = 0xffff;
+    }
+    write_u16(packet, offset, new_hc);
+}
+
+#[cfg(feature = "endpoint")]
+fn l3_packet_addr(packet: &[u8], source: bool) -> HammerResult<IpAddr> {
+    match IpVersion::from_packet(packet)? {
+        IpVersion::V4 => {
+            if packet.len() < IPV4_HEADER_MIN_LEN {
+                return Err(HammerError::internal("short IPv4 packet"));
+            }
+            let offset = if source {
+                IPV4_SOURCE_OFFSET
+            } else {
+                IPV4_DESTINATION_OFFSET
+            };
+            Ok(IpAddr::V4(Ipv4Addr::new(
+                packet[offset],
+                packet[offset + 1],
+                packet[offset + 2],
+                packet[offset + 3],
+            )))
+        }
+        IpVersion::V6 => {
+            if packet.len() < IPV6_HEADER_LEN {
+                return Err(HammerError::internal("short IPv6 packet"));
+            }
+            let offset = if source {
+                IPV6_SOURCE_OFFSET
+            } else {
+                IPV6_DESTINATION_OFFSET
+            };
+            Ok(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&packet[offset..offset + 16]).unwrap(),
+            )))
+        }
+    }
+}
+
+#[cfg(feature = "endpoint")]
+fn update_ipv4_header_checksum(packet: &mut [u8], ihl: usize) {
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, 0);
+    let ip_checksum = checksum(&packet[..ihl]);
+    write_u16(packet, IPV4_CHECKSUM_OFFSET, ip_checksum);
+}
+
 fn close_system_tcp_stream(stream: &TcpStream) {
     let ret = unsafe { libc::shutdown(stream.as_raw_fd(), libc::SHUT_RDWR) };
     if ret != 0 {
@@ -2322,13 +2852,22 @@ async fn accept_tcp_loop<R, O>(
                     return;
                 }
             };
-            let RouteDecision::Route {
-                outbound: outbound_id,
-            } = decision
-            else {
-                metrics.reject_total.inc(Network::Tcp);
-                debug!("system TCP connection rejected");
-                return;
+            let outbound_id = match decision {
+                RouteDecision::Route {
+                    target: RouteTarget::Outbound(outbound_id),
+                } => outbound_id,
+                RouteDecision::Route {
+                    target: RouteTarget::Endpoint(endpoint_id),
+                } => {
+                    metrics.reject_total.inc(Network::Tcp);
+                    debug!("system TCP connection cannot use L3 endpoint route: {endpoint_id}");
+                    return;
+                }
+                _ => {
+                    metrics.reject_total.inc(Network::Tcp);
+                    debug!("system TCP connection rejected");
+                    return;
+                }
             };
             let Some(outbound) = outbound.get(&outbound_id) else {
                 metrics.outbound_missing_total.inc(Network::Tcp);
@@ -2378,154 +2917,11 @@ async fn accept_tcp_loop<R, O>(
     }
 }
 
-#[cfg(feature = "ipstack")]
-#[allow(clippy::too_many_arguments)]
-async fn accept_smoltcp_tcp_loop<R, O>(
-    _logger: Logger,
-    router: Arc<R>,
-    outbound: Arc<O>,
-    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    tcp_pending_dials: TcpPendingDialLimiter,
-    inbound_id: String,
-    listener: IpStackTcpListener,
-    metrics: TunMetrics,
-) where
-    R: RouterTrait + 'static,
-    O: OutboundManagerTrait + 'static,
-{
-    loop {
-        let accepted = match listener.accept_with_remote().await {
-            Ok(accepted) => accepted,
-            Err(err) => {
-                metrics.counters.tcp_accept_error_total.increment(1);
-                debug!("smoltcp TCP listener closed: {err}");
-                return;
-            }
-        };
-        let peer = accepted.remote;
-        let session = {
-            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
-            nat.claim_active(peer.port())
-        };
-        let Some(session) = session else {
-            metrics.counters.tcp_unknown_nat_total.increment(1);
-            debug!("unknown smoltcp TCP NAT session: {}", peer.port());
-            continue;
-        };
-        let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
-        let router = Arc::clone(&router);
-        let outbound = Arc::clone(&outbound);
-        let tcp_pending_dials = tcp_pending_dials.clone();
-        let inbound_id = inbound_id.clone();
-        let metrics = metrics.clone();
-        crate::spawn::spawn(async move {
-            let _nat_lease = nat_lease;
-            let mut inbound = accepted.stream;
-            let mut metadata = RouteMetadata {
-                inbound: inbound_id,
-                network: Network::Tcp,
-                source: Some(session.source.clone()),
-                destination: Some(session.destination.clone()),
-                ..Default::default()
-            };
-            let mut initial_payload = Vec::new();
-            if let Some(sniff_timeout) = router.tcp_sniff_timeout(&metadata) {
-                let mut buf = [0_u8; 4096];
-                match timeout(sniff_timeout, inbound.read(&mut buf)).await {
-                    Ok(Ok(0)) => return,
-                    Ok(Ok(n)) => {
-                        initial_payload.extend_from_slice(&buf[..n]);
-                        let mut packet = TunPacket {
-                            metadata,
-                            payload: initial_payload,
-                        };
-                        sniff_stream(&mut packet);
-                        metadata = packet.metadata;
-                        initial_payload = packet.payload;
-                    }
-                    Ok(Err(err)) => {
-                        debug!("read smoltcp TCP sniff payload: {err}");
-                        return;
-                    }
-                    Err(_) => {}
-                }
-            }
-            let decision = match router.match_route(&mut metadata) {
-                Ok(decision) => decision,
-                Err(err) => {
-                    metrics.route_error_total.inc(Network::Tcp);
-                    debug!("route smoltcp TCP connection: {err}");
-                    return;
-                }
-            };
-            let RouteDecision::Route {
-                outbound: outbound_id,
-            } = decision
-            else {
-                metrics.reject_total.inc(Network::Tcp);
-                debug!("smoltcp TCP connection rejected");
-                return;
-            };
-            let Some(outbound) = outbound.get(&outbound_id) else {
-                metrics.outbound_missing_total.inc(Network::Tcp);
-                error!("outbound not found: {outbound_id}");
-                return;
-            };
-            let destination = match route_destination_without_dns(&metadata) {
-                Ok(destination) => destination,
-                Err(err) => {
-                    metrics.counters.tcp_destination_error_total.increment(1);
-                    debug!("build smoltcp TCP destination: {err}");
-                    return;
-                }
-            };
-            let dial_permit = match tcp_pending_dials.try_acquire() {
-                Ok(permit) => permit,
-                Err(err) => {
-                    metrics.counters.tcp_dial_dropped_total.increment(1);
-                    debug!("drop smoltcp TCP connection before outbound dial: {err}");
-                    return;
-                }
-            };
-            let mut outbound_stream = match outbound
-                .runtime()
-                .dial(Network::Tcp, destination, &initial_payload)
-                .await
-            {
-                Ok(stream) => stream,
-                Err(err) => {
-                    metrics.counters.tcp_dial_error_total.increment(1);
-                    debug!("dial smoltcp TCP outbound: {err}");
-                    return;
-                }
-            };
-            drop(dial_permit);
-            match bridge_proxy_streams(&mut inbound, &mut *outbound_stream).await {
-                Ok((from_inbound, from_outbound)) => {
-                    let _ = inbound.shutdown().await;
-                    let _ = outbound_stream.shutdown().await;
-                    debug!("smoltcp TCP copied {from_inbound}/{from_outbound} bytes")
-                }
-                Err(err) => {
-                    metrics.counters.tcp_copy_error_total.increment(1);
-                    debug!("copy smoltcp TCP: {err}")
-                }
-            }
-        });
-    }
-}
-
 enum TunPacketLoopMode<D>
 where
     D: TunDevice,
 {
-    System {
-        device: Arc<D>,
-    },
-    #[cfg(feature = "ipstack")]
-    Smoltcp {
-        ipstack_in_tx: mpsc::Sender<IpStackInput>,
-    },
+    System { device: Arc<D> },
 }
 
 impl<D> TunPacketLoopMode<D>
@@ -2535,8 +2931,6 @@ where
     fn name(&self) -> &'static str {
         match self {
             Self::System { .. } => "system",
-            #[cfg(feature = "ipstack")]
-            Self::Smoltcp { .. } => "smoltcp",
         }
     }
 
@@ -2551,12 +2945,111 @@ where
                     debug!("write {} TCP packets: {err}", self.name());
                 }
             }
-            #[cfg(feature = "ipstack")]
-            Self::Smoltcp { ipstack_in_tx } => {
-                enqueue_smoltcp_tcp_packets(ipstack_in_tx, packets, metrics);
-            }
         }
     }
+}
+
+#[cfg(feature = "endpoint")]
+fn endpoint_fast_path_decision<R, Q>(
+    router: &R,
+    dns_router: &Q,
+    inbound_id: &str,
+    packet: &[u8],
+    parsed: &ParsedIpPacketView,
+) -> HammerResult<RouteDecision>
+where
+    R: RouterTrait + ?Sized,
+    Q: DnsRouterTrait + ?Sized,
+{
+    let mut metadata = RouteMetadata {
+        inbound: inbound_id.to_owned(),
+        network: parsed.network,
+        protocol: match parsed.network {
+            Network::Icmp => icmp_protocol(parsed.destination.host).to_owned(),
+            _ => String::new(),
+        },
+        source: Some(parsed.source.clone()),
+        destination: Some(parsed.destination.clone()),
+        ..Default::default()
+    };
+    match parsed.network {
+        Network::Tcp if router.tcp_sniff_timeout(&metadata).is_some() => {
+            let payload = parsed.payload(packet)?;
+            let mut tun_packet = TunPacket {
+                metadata,
+                payload: payload.to_vec(),
+            };
+            sniff_stream(&mut tun_packet);
+            metadata = tun_packet.metadata;
+        }
+        _ if router.should_sniff(&metadata) => match parsed.network {
+            Network::Tcp => {}
+            Network::Udp => sniff_packet_metadata(&mut metadata, parsed.payload(packet)?),
+            Network::Icmp => {}
+        },
+        _ => {}
+    }
+    prepare_route_metadata(router, &mut metadata, Some(dns_router))?;
+    router.match_route(&mut metadata)
+}
+
+#[cfg(feature = "endpoint")]
+fn cleanup_tcp_endpoint_flows(flows: &mut TcpEndpointFlowMap, timeout: Duration) {
+    let now = Instant::now();
+    flows.retain(|_, flow| now.duration_since(flow.last_active) <= timeout);
+}
+
+#[cfg(feature = "endpoint")]
+fn pinned_tcp_endpoint(
+    flows: &mut TcpEndpointFlowMap,
+    key: &TcpEndpointFlowKey,
+    timeout: Duration,
+) -> Option<String> {
+    cleanup_tcp_endpoint_flows(flows, timeout);
+    let flow = flows.get_mut(key)?;
+    flow.last_active = Instant::now();
+    Some(flow.endpoint.clone())
+}
+
+#[cfg(feature = "endpoint")]
+fn pin_tcp_endpoint_flow(
+    flows: &mut TcpEndpointFlowMap,
+    key: TcpEndpointFlowKey,
+    endpoint: String,
+) {
+    flows.insert(
+        key,
+        TcpEndpointFlowState {
+            endpoint,
+            last_active: Instant::now(),
+        },
+    );
+}
+
+#[cfg(feature = "endpoint")]
+fn tcp_packet_closes_flow(packet: &[u8]) -> bool {
+    let Some(flags) = tcp_flags(packet) else {
+        return false;
+    };
+    flags & 0x05 != 0
+}
+
+#[cfg(feature = "endpoint")]
+fn tcp_flags(packet: &[u8]) -> Option<u8> {
+    let transport_offset = match IpVersion::from_packet(packet).ok()? {
+        IpVersion::V4 => {
+            if packet.len() < IPV4_HEADER_MIN_LEN {
+                return None;
+            }
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            if ihl < IPV4_HEADER_MIN_LEN {
+                return None;
+            }
+            ihl
+        }
+        IpVersion::V6 => IPV6_HEADER_LEN,
+    };
+    packet.get(transport_offset + 13).copied()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2570,6 +3063,7 @@ async fn packet_loop<D, R, Q, O>(
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
+    #[cfg(feature = "endpoint")] endpoint_dispatch: Option<Arc<L3DispatchTable>>,
     udp_timeout: Duration,
     metrics: TunMetrics,
 ) where
@@ -2588,6 +3082,8 @@ async fn packet_loop<D, R, Q, O>(
         udp_flows,
         routes,
         TunPacketLoopMode::System { device },
+        #[cfg(feature = "endpoint")]
+        endpoint_dispatch,
         udp_timeout,
         metrics,
     )
@@ -2605,6 +3101,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     mode: TunPacketLoopMode<D>,
+    #[cfg(feature = "endpoint")] endpoint_dispatch: Option<Arc<L3DispatchTable>>,
     udp_timeout: Duration,
     metrics: TunMetrics,
 ) where
@@ -2623,6 +3120,8 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
     let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
     let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
+    #[cfg(feature = "endpoint")]
+    let mut tcp_endpoint_flows: TcpEndpointFlowMap = HashMap::new();
     let (tun_write_tx, tun_write_rx) = mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
     spawn_tun_packet_writer(Arc::clone(&device), metrics.clone(), tun_write_rx);
     let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
@@ -2641,6 +3140,37 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
         Arc::clone(&device),
         icmp_rx,
     );
+    // L3 fast path fan-in: each registered Endpoint exposes a stream of
+    // decapsulated inbound IP packets; pipe every packet straight to the
+    // TUN writer so the kernel sees the same IP bytes the peer sent.
+    #[cfg(feature = "endpoint")]
+    if let Some(dispatch) = &endpoint_dispatch {
+        for mut inbound in dispatch.take_inbound_receivers() {
+            let tun_tx = tun_write_tx.clone();
+            let metrics_clone = metrics.clone();
+            crate::spawn::spawn(async move {
+                while let Some(packet) = inbound.rx.recv().await {
+                    let mut packet = packet.to_vec();
+                    if let Err(err) = inbound.rewrite.rewrite_ingress(&mut packet) {
+                        metrics_clone
+                            .counters
+                            .endpoint_dispatch_drop_total
+                            .increment(1);
+                        debug!("rewrite endpoint inbound packet: {err}");
+                        continue;
+                    }
+                    if tun_tx.send(packet).await.is_err() {
+                        metrics_clone
+                            .counters
+                            .tcp_writeback_error_total
+                            .increment(1);
+                        break;
+                    }
+                    metrics_clone.counters.endpoint_inbound_total.increment(1);
+                }
+            });
+        }
+    }
     loop {
         let packets = match device.recv_batch(RECV_BATCH_HINT).await {
             Ok(packets) => packets,
@@ -2681,6 +3211,99 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                     metrics.counters.packet_drop_non_global_total.increment(1);
                     continue;
                 }
+                // L3 fast path must be selected by the router, not just by
+                // allowed_ips. DNS hijack/reject/direct rules still get the
+                // same policy decision before raw endpoint dispatch.
+                #[cfg(feature = "endpoint")]
+                if let Some(dispatch) = endpoint_dispatch.as_deref() {
+                    if parsed.network == Network::Udp {
+                        let key = UdpFlowKey::from_parsed(&parsed);
+                        match try_enqueue_existing_udp_flow(
+                            &udp_flows, &key, &packet, &parsed, &metrics,
+                        ) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(err) => {
+                                debug!(
+                                    "enqueue existing system UDP flow before endpoint route: {err}"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let tcp_flow_key = if parsed.network == Network::Tcp {
+                        Some(TcpEndpointFlowKey::from_parsed(&parsed))
+                    } else {
+                        None
+                    };
+                    if let Some(key) = tcp_flow_key.as_ref() {
+                        if let Some(endpoint_id) =
+                            pinned_tcp_endpoint(&mut tcp_endpoint_flows, key, udp_timeout)
+                        {
+                            let closes = tcp_packet_closes_flow(&packet);
+                            let dispatched = dispatch_endpoint_l3_packet(
+                                dispatch,
+                                &endpoint_id,
+                                packet,
+                                &parsed,
+                                &metrics,
+                                Some(&tun_write_tx),
+                            );
+                            if closes || !dispatched {
+                                tcp_endpoint_flows.remove(key);
+                            }
+                            continue;
+                        }
+                    }
+                    match endpoint_fast_path_decision(
+                        router.as_ref(),
+                        dns_router.as_ref(),
+                        &inbound_id,
+                        &packet,
+                        &parsed,
+                    ) {
+                        Ok(RouteDecision::Route {
+                            target: RouteTarget::Endpoint(endpoint_id),
+                        }) => {
+                            if let Some(key) = tcp_flow_key {
+                                let closes = tcp_packet_closes_flow(&packet);
+                                let dispatched = dispatch_endpoint_l3_packet(
+                                    dispatch,
+                                    &endpoint_id,
+                                    packet,
+                                    &parsed,
+                                    &metrics,
+                                    Some(&tun_write_tx),
+                                );
+                                if dispatched && !closes {
+                                    pin_tcp_endpoint_flow(
+                                        &mut tcp_endpoint_flows,
+                                        key,
+                                        endpoint_id.clone(),
+                                    );
+                                } else {
+                                    tcp_endpoint_flows.remove(&key);
+                                }
+                            } else {
+                                let _ = dispatch_endpoint_l3_packet(
+                                    dispatch,
+                                    &endpoint_id,
+                                    packet,
+                                    &parsed,
+                                    &metrics,
+                                    Some(&tun_write_tx),
+                                );
+                            }
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            metrics.route_error_total.inc(parsed.network);
+                            debug!("route endpoint L3 packet: {err}");
+                            continue;
+                        }
+                    }
+                }
                 match parsed.network {
                     Network::Tcp => {
                         let Some(route) = routes.for_packet(&packet) else {
@@ -2710,7 +3333,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
             }
         }
         // Pass 2: send the rewritten TCP batch either to the system TUN fd
-        // or directly into smoltcp, depending on the selected stack.
+        // or directly into an endpoint fast path, depending on the selected route.
         mode.write_tcp_packets(&mut tcp_writeback, &metrics).await;
         // Pass 3: UDP / DNS handling must not await in the TUN read loop.
         // Route lookup and flow queueing stay cheap and synchronous; DNS
@@ -2739,129 +3362,6 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
             enqueue_system_icmp_packet(&icmp_tx, packet, parsed, &metrics);
         }
     }
-}
-
-#[cfg(feature = "ipstack")]
-#[allow(clippy::too_many_arguments)]
-async fn smoltcp_packet_loop<D, R, Q, O>(
-    _logger: Logger,
-    router: Arc<R>,
-    dns_router: Arc<Q>,
-    outbound: Arc<O>,
-    inbound_id: String,
-    device: Arc<D>,
-    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
-    routes: SystemStackRoutes,
-    ipstack_in_tx: mpsc::Sender<IpStackInput>,
-    udp_timeout: Duration,
-    metrics: TunMetrics,
-) where
-    D: TunDevice,
-    R: RouterTrait + 'static,
-    Q: DnsRouterTrait + 'static,
-    O: OutboundManagerTrait + 'static,
-{
-    packet_loop_with_tcp_sink(
-        router,
-        dns_router,
-        outbound,
-        inbound_id,
-        device,
-        tcp_nat,
-        udp_flows,
-        routes,
-        TunPacketLoopMode::Smoltcp { ipstack_in_tx },
-        udp_timeout,
-        metrics,
-    )
-    .await
-}
-
-#[cfg(feature = "ipstack")]
-fn enqueue_smoltcp_tcp_packets(
-    ipstack_in_tx: &mpsc::Sender<IpStackInput>,
-    packets: &mut Vec<Vec<u8>>,
-    metrics: &TunMetrics,
-) {
-    let input = match packets.len() {
-        0 => return,
-        1 => IpStackInput::Packet(Bytes::from(packets.pop().expect("one TCP packet"))),
-        _ => IpStackInput::Batch(packets.drain(..).map(Bytes::from).collect()),
-    };
-    if let Err(err) = ipstack_in_tx.try_send(input) {
-        metrics.counters.tcp_writeback_error_total.increment(1);
-        debug!("drop smoltcp TCP packets because ipstack queue is full: {err}");
-    }
-}
-
-#[cfg(feature = "ipstack")]
-async fn smoltcp_ipstack_output_loop<D>(
-    device: Arc<D>,
-    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    routes: SystemStackRoutes,
-    mut ipstack_out_rx: mpsc::Receiver<Bytes>,
-    metrics: TunMetrics,
-) where
-    D: TunDevice,
-{
-    const WRITE_BATCH_HINT: usize = 64;
-    let mut batch = Vec::with_capacity(WRITE_BATCH_HINT);
-    while let Some(packet) = ipstack_out_rx.recv().await {
-        push_smoltcp_output_packet(packet, &tcp_nat, &routes, &metrics, &mut batch);
-        while batch.len() < WRITE_BATCH_HINT {
-            match ipstack_out_rx.try_recv() {
-                Ok(packet) => {
-                    push_smoltcp_output_packet(packet, &tcp_nat, &routes, &metrics, &mut batch);
-                }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        if batch.is_empty() {
-            continue;
-        }
-        if let Err(err) = device.send_batch(&mut batch).await {
-            metrics.counters.tcp_writeback_error_total.increment(1);
-            debug!("write smoltcp TCP packets to TUN: {err}");
-            batch.clear();
-        }
-    }
-}
-
-#[cfg(feature = "ipstack")]
-fn push_smoltcp_output_packet(
-    packet: Bytes,
-    tcp_nat: &StdMutex<SystemTcpNat>,
-    routes: &SystemStackRoutes,
-    metrics: &TunMetrics,
-    batch: &mut Vec<Vec<u8>>,
-) {
-    let mut packet = packet.to_vec();
-    if let Ok(parsed) = parse_ip_packet_view(&packet)
-        && parsed.network == Network::Tcp
-    {
-        let Some(route) = routes.for_packet(&packet) else {
-            debug!("missing smoltcp TCP return route for packet family");
-            return;
-        };
-        let rewrite_result = {
-            let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
-            process_system_tcp_packet(
-                &mut packet,
-                &mut nat,
-                route.listener_addr,
-                route.nat_addr,
-                route.listener_port,
-            )
-        };
-        if let Err(err) = rewrite_result {
-            metrics.counters.tcp_writeback_error_total.increment(1);
-            debug!("rewrite smoltcp TCP return packet: {err}");
-            return;
-        }
-    }
-    batch.push(packet);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2957,7 +3457,7 @@ where
             }
         }
         RouteDecision::Route {
-            outbound: outbound_id,
+            target: RouteTarget::Outbound(outbound_id),
         } => {
             let Some(outbound_item) = outbound.get(&outbound_id) else {
                 metrics.outbound_missing_total.inc(Network::Udp);
@@ -3030,6 +3530,14 @@ where
                     metrics,
                 ));
             }
+        }
+        RouteDecision::Route {
+            target: RouteTarget::Endpoint(endpoint_id),
+        } => {
+            metrics.outbound_missing_total.inc(Network::Udp);
+            return Err(HammerError::internal(format!(
+                "endpoint route requires L3 dispatch: {endpoint_id}"
+            )));
         }
     }
     Ok(())
@@ -3773,7 +4281,7 @@ where
             }
         }
         RouteDecision::Route {
-            outbound: outbound_id,
+            target: RouteTarget::Outbound(outbound_id),
         } => {
             let Some(outbound_item) = outbound.get(&outbound_id) else {
                 return Err(HammerError::internal(format!(
@@ -3810,6 +4318,14 @@ where
             };
             let response_packet = icmp_echo_reply_packet(&packet, &reply.body)?;
             device.send(response_packet).await?;
+        }
+        RouteDecision::Route {
+            target: RouteTarget::Endpoint(endpoint_id),
+        } => {
+            debug!("drop ICMP packet for L3 endpoint route outside fast path: {endpoint_id}");
+            if let Ok(response) = icmp_unreachable_packet(&packet) {
+                device.send(response).await?;
+            }
         }
     }
     Ok(())
@@ -3937,6 +4453,71 @@ pub fn icmp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
         IpVersion::V4 => ipv4_icmp_unreachable_packet(request),
         IpVersion::V6 => ipv6_icmp_unreachable_packet(request),
     }
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv4_packet_too_big_packet(request: &[u8], mtu: usize) -> HammerResult<Vec<u8>> {
+    let header = ipv4_header_slice(request)?;
+    let ihl = header.slice().len();
+    let total_len = header.total_len() as usize;
+    let quoted_len = total_len.min(ihl + Icmpv4Header::MIN_LEN);
+    let icmp_header = Icmpv4Header::with_checksum(
+        Icmpv4Type::DestinationUnreachable(icmpv4::DestUnreachableHeader::FragmentationNeeded {
+            next_hop_mtu: mtu.min(u16::MAX as usize) as u16,
+        }),
+        &request[..quoted_len],
+    );
+    let total_len = IPV4_HEADER_MIN_LEN + Icmpv4Header::MIN_LEN + quoted_len;
+    let mut packet = vec![0_u8; total_len];
+    packet[0] = 0x45;
+    write_u16(&mut packet, IPV4_TOTAL_LENGTH_OFFSET, total_len as u16);
+    packet[IPV4_TTL_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV4_PROTOCOL_OFFSET] = u8::from(IpNumber::ICMP);
+    packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]
+        .copy_from_slice(&request[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]);
+    packet[IPV4_DESTINATION_OFFSET..IPV4_HEADER_MIN_LEN]
+        .copy_from_slice(&request[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET]);
+    packet[IPV4_HEADER_MIN_LEN..IPV4_HEADER_MIN_LEN + Icmpv4Header::MIN_LEN]
+        .copy_from_slice(icmp_header.to_bytes().as_slice());
+    packet[IPV4_HEADER_MIN_LEN + Icmpv4Header::MIN_LEN..].copy_from_slice(&request[..quoted_len]);
+    update_ipv4_header_checksum(&mut packet, IPV4_HEADER_MIN_LEN);
+    Ok(packet)
+}
+
+#[cfg(feature = "endpoint")]
+fn ipv6_packet_too_big_packet(request: &[u8], mtu: usize) -> HammerResult<Vec<u8>> {
+    if request.len() < IPV6_HEADER_LEN {
+        return Err(HammerError::internal("invalid IPv6 packet"));
+    }
+    const IPV6_MIN_MTU: usize = 1280;
+    let quoted_len = request
+        .len()
+        .min(IPV6_MIN_MTU - IPV6_HEADER_LEN - Icmpv6Header::MIN_LEN);
+    let payload_len = Icmpv6Header::MIN_LEN + quoted_len;
+    let source = <[u8; 16]>::try_from(&request[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN])
+        .expect("IPv6 destination slice length");
+    let destination = <[u8; 16]>::try_from(&request[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET])
+        .expect("IPv6 source slice length");
+    let icmp_header = Icmpv6Header::with_checksum(
+        Icmpv6Type::PacketTooBig {
+            mtu: mtu.min(u32::MAX as usize) as u32,
+        },
+        source,
+        destination,
+        &request[..quoted_len],
+    )
+    .map_err(|err| HammerError::internal(format!("ICMPv6 packet too big checksum: {err}")))?;
+    let mut packet = vec![0_u8; IPV6_HEADER_LEN + payload_len];
+    packet[0] = 0x60;
+    write_u16(&mut packet, IPV6_PAYLOAD_LEN_OFFSET, payload_len as u16);
+    packet[IPV6_PROTOCOL_OFFSET] = u8::from(IpNumber::IPV6_ICMP);
+    packet[IPV6_HOP_LIMIT_OFFSET] = DEFAULT_PACKET_TTL;
+    packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET].copy_from_slice(&source);
+    packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN].copy_from_slice(&destination);
+    packet[IPV6_HEADER_LEN..IPV6_HEADER_LEN + Icmpv6Header::MIN_LEN]
+        .copy_from_slice(icmp_header.to_bytes().as_slice());
+    packet[IPV6_HEADER_LEN + Icmpv6Header::MIN_LEN..].copy_from_slice(&request[..quoted_len]);
+    Ok(packet)
 }
 
 fn ipv4_icmp_unreachable_packet(request: &[u8]) -> HammerResult<Vec<u8>> {
@@ -4112,6 +4693,19 @@ mod tests {
         match_calls: AtomicUsize,
         decision: RouteDecision,
     }
+    #[cfg(feature = "endpoint")]
+    struct EndpointThenRejectRouter {
+        match_calls: AtomicUsize,
+    }
+    #[cfg(feature = "endpoint")]
+    struct TcpSniffWaitRouter {
+        match_calls: AtomicUsize,
+    }
+    #[cfg(feature = "endpoint")]
+    struct RecordingEndpoint {
+        tx: mpsc::Sender<Bytes>,
+        mtu: Option<usize>,
+    }
 
     impl CountingRouter {
         fn rejecting() -> Arc<Self> {
@@ -4196,6 +4790,134 @@ mod tests {
         fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
             self.should_sniff_calls.fetch_add(1, Ordering::Relaxed);
             false
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl Lifecycle for EndpointThenRejectRouter {
+        fn name(&self) -> &str {
+            "endpoint-then-reject-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl AdapterRouter for EndpointThenRejectRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
+            if self.match_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(RouteDecision::Route {
+                    target: RouteTarget::Endpoint("wg-out".to_owned()),
+                })
+            } else {
+                Ok(RouteDecision::Reject {
+                    method: "default".to_owned(),
+                })
+            }
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+            None
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            false
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl Lifecycle for TcpSniffWaitRouter {
+        fn name(&self) -> &str {
+            "tcp-sniff-wait-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl AdapterRouter for TcpSniffWaitRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
+            self.match_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(RouteDecision::Route {
+                target: RouteTarget::Endpoint("wg-out".to_owned()),
+            })
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+            Some(Duration::from_millis(1))
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            true
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl Lifecycle for RecordingEndpoint {
+        fn name(&self) -> &str {
+            "recording-endpoint"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl EndpointTrait for RecordingEndpoint {
+        fn id(&self) -> &str {
+            "wg-out"
+        }
+
+        fn ip_send_clone(&self) -> mpsc::Sender<Bytes> {
+            self.tx.clone()
+        }
+
+        fn ip_packet_mtu(&self) -> Option<usize> {
+            self.mtu
+        }
+
+        fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>> {
+            None
+        }
+
+        fn allowed_destinations(&self) -> Vec<IpNet> {
+            vec![
+                "0.0.0.0/0".parse().expect("default IPv4 route"),
+                "::/0".parse().expect("default IPv6 route"),
+            ]
+        }
+
+        fn interface_addresses(&self) -> Vec<IpNet> {
+            vec!["10.66.0.2/32".parse().expect("endpoint address")]
         }
     }
 
@@ -4285,9 +5007,8 @@ mod tests {
         let _ = std::any::type_name::<
             SystemTunStack<MemoryTunDevice, StubRouter, StubDnsRouter, StubOutboundManager>,
         >();
-        let _ = std::any::type_name::<
-            SmoltcpTunStack<StubRouter, StubDnsRouter, StubOutboundManager>,
-        >();
+        let _ =
+            std::any::type_name::<PacketTunStack<StubRouter, StubDnsRouter, StubOutboundManager>>();
     }
 
     #[test]
@@ -4663,10 +5384,515 @@ mod tests {
         packet
     }
 
+    #[cfg(feature = "endpoint")]
+    fn udp_packet_with_source(
+        source: [u8; 4],
+        destination: [u8; 4],
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total_len = 20 + 8 + payload.len();
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        packet[28..].copy_from_slice(payload);
+        update_ipv4_header_checksum(&mut packet, IPV4_HEADER_MIN_LEN);
+        update_ipv4_udp_checksums(&mut packet, IPV4_HEADER_MIN_LEN).expect("udp checksum");
+        packet
+    }
+
+    #[cfg(feature = "endpoint")]
+    fn ipv6_udp_packet(payload: &[u8]) -> Vec<u8> {
+        let payload_len = UDP_HEADER_LEN + payload.len();
+        let mut packet = vec![0u8; IPV6_HEADER_LEN + payload_len];
+        packet[0] = 0x60;
+        packet[IPV6_PAYLOAD_LEN_OFFSET..IPV6_PAYLOAD_LEN_OFFSET + 2]
+            .copy_from_slice(&(payload_len as u16).to_be_bytes());
+        packet[IPV6_PROTOCOL_OFFSET] = IpProtocol::Udp.wire_value();
+        packet[IPV6_HOP_LIMIT_OFFSET] = DEFAULT_PACKET_TTL;
+        packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET]
+            .copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        packet[IPV6_DESTINATION_OFFSET..IPV6_DESTINATION_OFFSET + 16]
+            .copy_from_slice(&Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111).octets());
+        let udp = IPV6_HEADER_LEN;
+        write_u16(&mut packet, udp + UDP_SOURCE_PORT_OFFSET, 5353);
+        write_u16(&mut packet, udp + UDP_DESTINATION_PORT_OFFSET, 443);
+        write_u16(&mut packet, udp + UDP_LENGTH_OFFSET, payload_len as u16);
+        packet[udp + UDP_HEADER_LEN..].copy_from_slice(payload);
+        update_ipv6_udp_checksum(&mut packet).expect("udp checksum");
+        packet
+    }
+
+    #[cfg(feature = "endpoint")]
+    fn tcp_packet(source_port: u16, destination_port: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let total_len = IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN + payload.len();
+        let mut packet = vec![0u8; total_len];
+        packet[0] = 0x45;
+        packet[IPV4_TTL_OFFSET] = DEFAULT_PACKET_TTL;
+        packet[IPV4_PROTOCOL_OFFSET] = IpProtocol::Tcp.wire_value();
+        packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET].copy_from_slice(&[172, 19, 0, 1]);
+        packet[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4].copy_from_slice(&[1, 1, 1, 1]);
+        write_u16(&mut packet, IPV4_TOTAL_LENGTH_OFFSET, total_len as u16);
+        let tcp = IPV4_HEADER_MIN_LEN;
+        write_u16(&mut packet, tcp + TCP_SOURCE_PORT_OFFSET, source_port);
+        write_u16(
+            &mut packet,
+            tcp + TCP_DESTINATION_PORT_OFFSET,
+            destination_port,
+        );
+        packet[tcp + TCP_DATA_OFFSET_OFFSET] = 0x50;
+        packet[tcp + 13] = flags;
+        packet[tcp + TCP_HEADER_MIN_LEN..].copy_from_slice(payload);
+        update_ipv4_header_checksum(&mut packet, IPV4_HEADER_MIN_LEN);
+        update_ipv4_tcp_checksums(&mut packet, IPV4_HEADER_MIN_LEN).expect("tcp checksum");
+        packet
+    }
+
     fn dns_message_from_packet(packet: &[u8]) -> Message {
         let parsed = parse_ip_packet_view(packet).expect("parse DNS packet");
         <Message as MessageExt>::from_bytes(parsed.payload(packet).expect("DNS payload"))
             .expect("parse DNS message")
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn l3_endpoint_egress_rewrites_tun_source_to_endpoint_address() {
+        let mut packet = udp_packet(5353, 53, b"hello");
+        rewrite_l3_packet_source(
+            &mut packet,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
+        )
+        .expect("rewrite source");
+
+        let parsed = parse_ip_packet_view(&packet).expect("parse rewritten packet");
+        assert_eq!(parsed.source.host, IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)));
+        assert_ne!(read_u16(&packet, IPV4_CHECKSUM_OFFSET), 0);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn l3_endpoint_rewrite_rejects_truncated_udp_without_mutating_packet() {
+        let mut packet = vec![0_u8; IPV4_HEADER_MIN_LEN];
+        packet[0] = 0x45;
+        packet[IPV4_TTL_OFFSET] = DEFAULT_PACKET_TTL;
+        packet[IPV4_PROTOCOL_OFFSET] = IpProtocol::Udp.wire_value();
+        packet[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET].copy_from_slice(&[10, 0, 0, 2]);
+        packet[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4]
+            .copy_from_slice(&[10, 66, 0, 2]);
+        write_u16(
+            &mut packet,
+            IPV4_TOTAL_LENGTH_OFFSET,
+            IPV4_HEADER_MIN_LEN as u16,
+        );
+        update_ipv4_header_checksum(&mut packet, IPV4_HEADER_MIN_LEN);
+        let before = packet.clone();
+
+        let err = rewrite_l3_packet_destination(
+            &mut packet,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        )
+        .expect_err("truncated UDP must be rejected");
+
+        assert!(
+            err.to_string().contains("short UDP datagram"),
+            "error = {err:?}"
+        );
+        assert_eq!(packet, before);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn l3_endpoint_ingress_rewrites_initial_ipv4_fragment_checksum_delta() {
+        let packet =
+            udp_packet_with_source([8, 8, 8, 8], [10, 66, 0, 2], 5353, 443, &vec![0x42; 96]);
+        let mut expected = packet.clone();
+        rewrite_l3_packet_destination(
+            &mut expected,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        )
+        .expect("full packet rewrite");
+        let fragments = fragment_ipv4_packet(&packet, 68).expect("fragments");
+        let mut first = fragments[0].clone();
+
+        rewrite_l3_packet_destination(
+            &mut first,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        )
+        .expect("initial fragment rewrite");
+
+        assert_eq!(
+            &first[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4],
+            &[172, 19, 0, 1]
+        );
+        assert_eq!(checksum(&first[..IPV4_HEADER_MIN_LEN]), 0);
+        assert_eq!(
+            read_u16(&first, IPV4_HEADER_MIN_LEN + UDP_CHECKSUM_OFFSET),
+            read_u16(&expected, IPV4_HEADER_MIN_LEN + UDP_CHECKSUM_OFFSET)
+        );
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn l3_endpoint_ingress_rewrites_non_initial_ipv4_fragment_without_transport_header() {
+        let packet =
+            udp_packet_with_source([8, 8, 8, 8], [10, 66, 0, 2], 5353, 443, &vec![0x42; 96]);
+        let fragments = fragment_ipv4_packet(&packet, 68).expect("fragments");
+        let mut later = fragments[1].clone();
+
+        rewrite_l3_packet_destination(
+            &mut later,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
+            IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+        )
+        .expect("non-initial fragment rewrite");
+
+        assert_eq!(
+            &later[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4],
+            &[172, 19, 0, 1]
+        );
+        assert_eq!(checksum(&later[..IPV4_HEADER_MIN_LEN]), 0);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[tokio::test]
+    async fn l3_endpoint_dispatch_fragments_oversized_ipv4_packets() {
+        let payload = vec![0x42; 96];
+        let packet = udp_packet_with_source([172, 19, 0, 1], [1, 1, 1, 1], 5353, 443, &payload);
+        let parsed = parse_ip_packet_view(&packet).expect("parse packet");
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: Some(68),
+        });
+        let addresses = StackAddresses {
+            v4: Some(StackAddress {
+                listener: Ipv4Addr::new(172, 19, 0, 1),
+                next: Ipv4Addr::new(172, 19, 0, 2),
+            }),
+            v6: None,
+        };
+        let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        assert!(dispatch_endpoint_l3_packet(
+            &dispatch, "wg-out", packet, &parsed, &metrics, None,
+        ));
+
+        let first = timeout(Duration::from_millis(50), endpoint_rx.recv())
+            .await
+            .expect("first fragment")
+            .expect("first fragment");
+        let second = timeout(Duration::from_millis(50), endpoint_rx.recv())
+            .await
+            .expect("second fragment")
+            .expect("second fragment");
+        assert!(first.len() <= 68);
+        assert!(second.len() <= 68);
+        assert_eq!(
+            read_u16(&first, IPV4_TOTAL_LENGTH_OFFSET) as usize,
+            first.len()
+        );
+        assert_eq!(
+            &first[IPV4_SOURCE_OFFSET..IPV4_DESTINATION_OFFSET],
+            &[10, 66, 0, 2]
+        );
+        assert_eq!(read_u16(&first, 6) & 0x2000, 0x2000);
+        assert_eq!(read_u16(&second, 6) & 0x1fff, 6);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[tokio::test]
+    async fn l3_endpoint_dispatch_returns_icmpv4_packet_too_big_for_df_packets() {
+        let payload = vec![0x42; 96];
+        let mut packet = udp_packet_with_source([172, 19, 0, 1], [1, 1, 1, 1], 5353, 443, &payload);
+        write_u16(&mut packet, 6, 0x4000);
+        update_ipv4_header_checksum(&mut packet, IPV4_HEADER_MIN_LEN);
+        let parsed = parse_ip_packet_view(&packet).expect("parse packet");
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: Some(68),
+        });
+        let addresses = StackAddresses {
+            v4: Some(StackAddress {
+                listener: Ipv4Addr::new(172, 19, 0, 1),
+                next: Ipv4Addr::new(172, 19, 0, 2),
+            }),
+            v6: None,
+        };
+        let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        assert!(dispatch_endpoint_l3_packet(
+            &dispatch,
+            "wg-out",
+            packet,
+            &parsed,
+            &metrics,
+            Some(&tun_write_tx),
+        ));
+
+        assert!(endpoint_rx.try_recv().is_err());
+        let response = timeout(Duration::from_millis(50), tun_write_rx.recv())
+            .await
+            .expect("icmp response")
+            .expect("icmp response");
+        assert_eq!(
+            response[IPV4_PROTOCOL_OFFSET],
+            IpProtocol::Icmpv4.wire_value()
+        );
+        assert_eq!(response[20], 3);
+        assert_eq!(response[21], 4);
+        assert_eq!(read_u16(&response, 26), 68);
+        drop(tun_write_tx);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[tokio::test]
+    async fn l3_endpoint_dispatch_returns_icmpv6_packet_too_big_for_oversized_ipv6() {
+        let packet = ipv6_udp_packet(&vec![0x42; 96]);
+        let parsed = parse_ip_packet_view(&packet).expect("parse packet");
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: Some(68),
+        });
+        let addresses = StackAddresses {
+            v4: None,
+            v6: Some(StackAddress {
+                listener: Ipv6Addr::LOCALHOST,
+                next: Ipv6Addr::LOCALHOST,
+            }),
+        };
+        let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(4);
+
+        assert!(dispatch_endpoint_l3_packet(
+            &dispatch,
+            "wg-out",
+            packet,
+            &parsed,
+            &metrics,
+            Some(&tun_write_tx),
+        ));
+
+        assert!(endpoint_rx.try_recv().is_err());
+        let response = timeout(Duration::from_millis(50), tun_write_rx.recv())
+            .await
+            .expect("icmp response")
+            .expect("icmp response");
+        assert_eq!(
+            response[IPV6_PROTOCOL_OFFSET],
+            IpProtocol::Icmpv6.wire_value()
+        );
+        assert_eq!(response[IPV6_HEADER_LEN], 2);
+        assert_eq!(read_u32(&response, IPV6_HEADER_LEN + 4), 68);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn endpoint_fast_path_decision_uses_router_policy() {
+        let router = CountingRouter::rejecting();
+        let dns_router = StubDnsRouter;
+        let packet = udp_packet(5353, 53, b"hello");
+        let parsed = parse_ip_packet_view(&packet).expect("parse packet");
+
+        let decision =
+            endpoint_fast_path_decision(router.as_ref(), &dns_router, "tun-in", &packet, &parsed)
+                .expect("route");
+
+        assert!(matches!(decision, RouteDecision::Reject { .. }));
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn endpoint_fast_path_routes_empty_tcp_when_sniff_wait_is_needed() {
+        let router = TcpSniffWaitRouter {
+            match_calls: AtomicUsize::new(0),
+        };
+        let dns_router = StubDnsRouter;
+        let packet = tcp_packet(50000, 443, 0x02, b"");
+        let parsed = parse_ip_packet_view(&packet).expect("parse tcp packet");
+
+        let decision =
+            endpoint_fast_path_decision(&router, &dns_router, "tun-in", &packet, &parsed)
+                .expect("route");
+
+        assert!(matches!(
+            decision,
+            RouteDecision::Route {
+                target: RouteTarget::Endpoint(_)
+            }
+        ));
+        assert_eq!(
+            router.match_calls.load(Ordering::Relaxed),
+            1,
+            "empty SYN cannot fall through to the system TCP listener for endpoint routing"
+        );
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[tokio::test]
+    async fn tcp_endpoint_flow_pin_bypasses_later_sniff_route_changes() {
+        let router = Arc::new(EndpointThenRejectRouter {
+            match_calls: AtomicUsize::new(0),
+        });
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(4);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: None,
+        });
+        let addresses = StackAddresses {
+            v4: Some(StackAddress {
+                listener: Ipv4Addr::new(172, 19, 0, 1),
+                next: Ipv4Addr::new(172, 19, 0, 2),
+            }),
+            v6: None,
+        };
+        let dispatch = Some(Arc::new(L3DispatchTable::from_endpoints(
+            &[endpoint],
+            &addresses,
+        )));
+        let device = ScriptedBatchTunDevice::new(vec![vec![
+            tcp_packet(50000, 443, 0x02, b""),
+            tcp_packet(50000, 443, 0x18, b"later-sniffed-payload"),
+        ]]);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        let task = crate::spawn::spawn(packet_loop(
+            test_logger("tun"),
+            router.clone(),
+            Arc::new(StubDnsRouter),
+            Arc::new(StubOutboundManager),
+            "tun".to_owned(),
+            Arc::clone(&device),
+            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                DEFAULT_SYSTEM_UDP_TIMEOUT,
+            ))),
+            Arc::new(StdMutex::new(HashMap::new())),
+            SystemStackRoutes::default(),
+            dispatch,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            metrics,
+        ));
+
+        let first = timeout(Duration::from_millis(50), endpoint_rx.recv())
+            .await
+            .expect("first endpoint packet")
+            .expect("first endpoint packet");
+        let second = timeout(Duration::from_millis(50), endpoint_rx.recv())
+            .await
+            .expect("second endpoint packet")
+            .expect("second endpoint packet");
+
+        assert_eq!(
+            parse_ip_packet_view(&first).expect("first").source.host,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2))
+        );
+        assert_eq!(
+            parse_ip_packet_view(&second).expect("second").source.host,
+            IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2))
+        );
+        assert_eq!(
+            router.match_calls.load(Ordering::Relaxed),
+            1,
+            "second packet in the same TCP flow must use the endpoint pin"
+        );
+        task.abort();
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[tokio::test]
+    async fn existing_udp_flow_bypasses_endpoint_fast_path() {
+        let router = Arc::new(CountingRouter {
+            should_sniff_calls: AtomicUsize::new(0),
+            prepare_calls: AtomicUsize::new(0),
+            match_calls: AtomicUsize::new(0),
+            decision: RouteDecision::Route {
+                target: RouteTarget::Endpoint("wg-out".to_owned()),
+            },
+        });
+        let packet = udp_packet(5353, 443, b"quic-late");
+        let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
+        let key = UdpFlowKey::from_parsed(&parsed);
+        let (flow_tx, mut flow_rx) = mpsc::channel(4);
+        let mut flows = HashMap::new();
+        flows.insert(
+            key,
+            UdpFlowState {
+                sender: flow_tx,
+                last_active: Instant::now(),
+                outbound: "direct".to_owned(),
+            },
+        );
+        let udp_flows = Arc::new(StdMutex::new(flows));
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(4);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: None,
+        });
+        let addresses = StackAddresses {
+            v4: Some(StackAddress {
+                listener: Ipv4Addr::new(172, 19, 0, 1),
+                next: Ipv4Addr::new(172, 19, 0, 2),
+            }),
+            v6: None,
+        };
+        let dispatch = Some(Arc::new(L3DispatchTable::from_endpoints(
+            &[endpoint],
+            &addresses,
+        )));
+        let device = ScriptedBatchTunDevice::new(vec![vec![packet]]);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        let task = crate::spawn::spawn(packet_loop(
+            test_logger("tun"),
+            router.clone(),
+            Arc::new(StubDnsRouter),
+            Arc::new(StubOutboundManager),
+            "tun".to_owned(),
+            Arc::clone(&device),
+            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                DEFAULT_SYSTEM_UDP_TIMEOUT,
+            ))),
+            udp_flows,
+            SystemStackRoutes::default(),
+            dispatch,
+            DEFAULT_SYSTEM_UDP_TIMEOUT,
+            metrics,
+        ));
+
+        assert_eq!(
+            timeout(Duration::from_millis(50), flow_rx.recv())
+                .await
+                .expect("system flow payload")
+                .expect("system flow payload"),
+            Bytes::from_static(b"quic-late")
+        );
+        if let Ok(Some(packet)) = timeout(Duration::from_millis(20), endpoint_rx.recv()).await {
+            panic!(
+                "existing system UDP flow must not be diverted into endpoint dispatch: {} bytes",
+                packet.len()
+            );
+        }
+        assert_eq!(router.should_sniff_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
+        task.abort();
     }
 
     fn dns_hijack_job(name: &str) -> DnsHijackJob {
@@ -4744,6 +5970,8 @@ final = "direct"
             ))),
             Arc::new(StdMutex::new(HashMap::new())),
             SystemStackRoutes::default(),
+            #[cfg(feature = "endpoint")]
+            None,
             DEFAULT_SYSTEM_UDP_TIMEOUT,
             metrics,
         ));

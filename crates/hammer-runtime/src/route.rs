@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hammer_adapter::{
-    Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata,
+    Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata, RouteTarget,
     Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, RuleMatcher};
@@ -68,7 +68,7 @@ impl From<&RouteMetadata> for MatchKey {
 pub struct Router {
     rules: Vec<RuntimeRule>,
     outbound: Option<Arc<OutboundManager>>,
-    default_outbound: String,
+    default_target: RouteTarget,
     metrics: RouterMetrics,
     /// Per-(metadata-snapshot) cache of the terminal decision. UDP/ICMP
     /// dispatch calls `match_route` on every packet; the same 5-tuple
@@ -214,37 +214,63 @@ pub(crate) fn build_router(
     outbound: Arc<OutboundManager>,
     metrics: Arc<MetricsRegistry>,
 ) -> HammerResult<Router> {
+    build_router_with_endpoint_ids(options, outbound, metrics, std::iter::empty::<String>())
+}
+
+fn build_router_with_endpoint_ids(
+    options: RouteOptions,
+    outbound: Arc<OutboundManager>,
+    metrics: Arc<MetricsRegistry>,
+    endpoint_ids: impl IntoIterator<Item = String>,
+) -> HammerResult<Router> {
     let scope = metrics.scope("route", "router", "default");
     let matcher_factories = RouteMatcherFactorySet::standard();
+    let endpoint_ids: HashSet<String> = endpoint_ids.into_iter().collect();
     let rules: Vec<RuntimeRule> = options
         .rules
         .into_iter()
         .enumerate()
-        .map(|(index, rule)| RuntimeRule::from_options(index, rule, &scope, &matcher_factories))
+        .map(|(index, rule)| {
+            RuntimeRule::from_options(
+                index,
+                rule,
+                &scope,
+                &matcher_factories,
+                outbound.as_ref(),
+                &endpoint_ids,
+            )
+        })
         .collect::<HammerResult<Vec<_>>>()?;
-    for rule in &rules {
-        if let RuleActionKind::Route(action) = &rule.action
-            && outbound.get(&action.outbound).is_none()
-        {
-            return Err(HammerError::config_validation(format!(
-                "route.rules outbound {:?} is not declared",
-                action.outbound,
-            )));
-        }
-    }
-    if outbound.get(&options.final_).is_none() {
-        return Err(HammerError::config_validation(format!(
-            "route.final outbound {:?} is not declared",
-            options.final_
-        )));
-    }
+    let default_target = resolve_route_target(
+        outbound.as_ref(),
+        &endpoint_ids,
+        &options.final_,
+        "route.final outbound",
+    )?;
     Ok(Router {
         rules,
         outbound: Some(outbound),
         metrics: RouterMetrics::new(&scope, &options.final_),
-        default_outbound: options.final_,
+        default_target,
         cache: new_router_cache(),
     })
+}
+
+fn resolve_route_target(
+    outbound: &OutboundManager,
+    endpoint_ids: &HashSet<String>,
+    id: &str,
+    field: &str,
+) -> HammerResult<RouteTarget> {
+    if outbound.get(id).is_some() {
+        return Ok(RouteTarget::Outbound(id.to_owned()));
+    }
+    if endpoint_ids.contains(id) {
+        return Ok(RouteTarget::Endpoint(id.to_owned()));
+    }
+    Err(HammerError::config_validation(format!(
+        "{field} {id:?} is not declared"
+    )))
 }
 
 impl Router {
@@ -253,7 +279,7 @@ impl Router {
         Self {
             rules: Vec::new(),
             outbound: None,
-            default_outbound: String::new(),
+            default_target: RouteTarget::Outbound(String::new()),
             metrics: RouterMetrics::new(&metrics, ""),
             cache: new_router_cache(),
         }
@@ -274,6 +300,17 @@ impl Router {
         metrics: Arc<MetricsRegistry>,
     ) -> HammerResult<Self> {
         RouterFactorySet::standard().build_default(logger, options, outbound, metrics)
+    }
+
+    #[cfg(feature = "endpoint")]
+    pub fn from_options_with_metrics_and_endpoint_ids(
+        _logger: Logger,
+        options: RouteOptions,
+        outbound: Arc<OutboundManager>,
+        metrics: Arc<MetricsRegistry>,
+        endpoint_ids: impl IntoIterator<Item = String>,
+    ) -> HammerResult<Self> {
+        build_router_with_endpoint_ids(options, outbound, metrics, endpoint_ids)
     }
 
     pub fn match_route(&self, metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
@@ -397,11 +434,18 @@ impl Router {
     fn route_to_default(&self, network: Network) -> HammerResult<RouteDecision> {
         let Some(outbound) = &self.outbound else {
             return Ok(RouteDecision::Route {
-                outbound: self.default_outbound.clone(),
+                target: self.default_target.clone(),
             });
         };
-        let Some(default) = outbound.default() else {
-            return Err(HammerError::internal("default outbound not found"));
+        let RouteTarget::Outbound(default_id) = &self.default_target else {
+            return Ok(RouteDecision::Route {
+                target: self.default_target.clone(),
+            });
+        };
+        let Some(default) = outbound.get(default_id) else {
+            return Err(HammerError::internal(format!(
+                "default outbound not found: {default_id}"
+            )));
         };
         // ICMP is treated as a soft-supported network: the dispatch
         // path detects an outbound that lacks ICMP via `listen_icmp()`
@@ -417,7 +461,7 @@ impl Router {
             )));
         }
         Ok(RouteDecision::Route {
-            outbound: default.meta().id().to_owned(),
+            target: self.default_target.clone(),
         })
     }
 }
@@ -514,6 +558,7 @@ fn route_action_name(action: &RuleActionKind) -> &'static str {
 struct RuntimeRule {
     matcher: RuntimeMatcher,
     action: RuleActionKind,
+    route_target: Option<RouteTarget>,
     metrics: RuntimeRuleMetrics,
 }
 
@@ -523,10 +568,21 @@ impl RuntimeRule {
         options: RuleOptions,
         router_scope: &MetricsScope,
         matcher_factories: &RouteMatcherFactorySet,
+        outbound: &OutboundManager,
+        endpoint_ids: &HashSet<String>,
     ) -> HammerResult<Self> {
         let default = options.default_options;
         let matcher = matcher_factories.build(default.matcher)?;
         let action = default.action;
+        let route_target = match &action {
+            RuleActionKind::Route(action) => Some(resolve_route_target(
+                outbound,
+                endpoint_ids,
+                &action.outbound,
+                "route.rules outbound",
+            )?),
+            _ => None,
+        };
         let metrics = RuntimeRuleMetrics::new(
             &router_scope.child("rule", index.to_string()),
             index,
@@ -535,6 +591,7 @@ impl RuntimeRule {
         Ok(Self {
             matcher,
             action,
+            route_target,
             metrics,
         })
     }
@@ -566,8 +623,11 @@ impl RuntimeRule {
                 }
                 Ok(RuleApply::Continue)
             }
-            RuleActionKind::Route(o) => Ok(RuleApply::Decision(RouteDecision::Route {
-                outbound: o.outbound.clone(),
+            RuleActionKind::Route(_) => Ok(RuleApply::Decision(RouteDecision::Route {
+                target: self
+                    .route_target
+                    .clone()
+                    .ok_or_else(|| HammerError::internal("missing runtime route target"))?,
             })),
         }
     }
@@ -939,7 +999,7 @@ mod tests {
         assert_eq!(
             decision,
             RouteDecision::Route {
-                outbound: "final".to_owned()
+                target: RouteTarget::Outbound("final".to_owned())
             }
         );
     }

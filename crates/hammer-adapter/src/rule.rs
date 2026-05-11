@@ -63,9 +63,32 @@ pub struct RouteMetadata {
     pub override_destination: bool,
 }
 
+/// Where a `RouteDecision::Route` points. Outbounds and endpoints live in
+/// parallel namespaces with different data paths — L4 stream (`dial /
+/// listen_packet`) for `Outbound`, L3 IP packet (`ip_send / ip_recv`) for
+/// `Endpoint`. The router tags the decision so the TUN dispatch layer can
+/// pick the right code path without re-querying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteTarget {
+    Outbound(String),
+    Endpoint(String),
+}
+
+impl RouteTarget {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Outbound(name) | Self::Endpoint(name) => name,
+        }
+    }
+
+    pub fn is_endpoint(&self) -> bool {
+        matches!(self, Self::Endpoint(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteDecision {
-    Route { outbound: String },
+    Route { target: RouteTarget },
     HijackDns,
     Reject { method: String },
 }

@@ -5,17 +5,17 @@ use std::time::Instant;
 use async_trait::async_trait;
 use hammer_adapter::{
     ComponentMeta, DnsTransport, DnsTransportComponent, InboundManager as _, Lifecycle, Network,
-    RouteDecision, RuntimeComponent, SocksAddr,
+    RouteDecision, RouteTarget, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{
-    DnsRouter, DnsTransportManager, InboundManager, OutboundManager, Router,
+    DnsRouter, DnsTransportManager, EndpointManager, InboundManager, OutboundManager, Router,
     dns::{FixedResponseCode, MessageExt},
     tun::{
-        MemoryTunDevice, SmoltcpTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
+        MemoryTunDevice, PacketTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
         icmp_echo_reply_packet, icmp_unreachable_packet, parse_ip_packet,
         process_system_tcp_packet, sniff_packet, sniff_stream, tcp_reset_packet,
         udp_response_packet, udp_unreachable_packet,
@@ -25,8 +25,8 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record};
 use tokio::net::UdpSocket;
 
-type RuntimeSmoltcpTunStack = SmoltcpTunStack<Router, DnsRouter, OutboundManager>;
-type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
+type RuntimePacketTunStack = PacketTunStack<Router, DnsRouter, OutboundManager>;
+type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -88,7 +88,7 @@ fn router_from_options(options: &Options) -> Arc<Router> {
     )
 }
 
-fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimeSmoltcpTunStack {
+fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimePacketTunStack {
     let outbound = Arc::new(
         OutboundManager::from_options(logger("outbound"), final_outbound, &options.outbounds)
             .expect("outbound manager"),
@@ -112,7 +112,7 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimeSmoltcpTunSt
         dns_transport,
         hammer_core::config::DomainStrategy::AsIs,
     ));
-    SmoltcpTunStack::new_with_runtime(
+    PacketTunStack::new_with_runtime(
         logger("tun"),
         router,
         dns_router,
@@ -174,7 +174,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 }
@@ -278,8 +278,7 @@ outbound = "hysteria2"
     )
     .expect("parse config");
     let router = router_from_options(&options);
-    let stack: RuntimeSmoltcpTunStack =
-        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimePacketTunStack = PacketTunStack::new(logger("tun"), router, "tun".to_owned());
     let packet = ipv4_udp_packet(
         [10, 0, 0, 2],
         [1, 1, 1, 1],
@@ -294,17 +293,16 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            outbound: "direct".to_owned()
+            target: RouteTarget::Outbound("direct".to_owned())
         }
     );
 }
 
 #[test]
-fn smoltcp_stack_facade_routes_packets_through_router() {
+fn packet_stack_facade_routes_packets_through_router() {
     let options = options();
     let router = router_from_options(&options);
-    let stack: RuntimeSmoltcpTunStack =
-        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimePacketTunStack = PacketTunStack::new(logger("tun"), router, "tun".to_owned());
     let packet = ipv4_udp_packet(
         [10, 0, 0, 2],
         [1, 1, 1, 1],
@@ -321,7 +319,7 @@ fn smoltcp_stack_facade_routes_packets_through_router() {
 }
 
 #[test]
-fn smoltcp_stack_facade_sets_icmp_protocol_metadata_for_routing() {
+fn packet_stack_facade_sets_icmp_protocol_metadata_for_routing() {
     let options = config::parse_config(
         r#"
 [tun]
@@ -349,8 +347,7 @@ outbound = "hysteria2"
     )
     .expect("parse config");
     let router = router_from_options(&options);
-    let stack: RuntimeSmoltcpTunStack =
-        SmoltcpTunStack::new(logger("tun"), router, "tun".to_owned());
+    let stack: RuntimePacketTunStack = PacketTunStack::new(logger("tun"), router, "tun".to_owned());
 
     let ipv4 = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping");
     let flow = stack.handle_packet(&ipv4).expect("handle ipv4 icmp");
@@ -358,7 +355,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 
@@ -374,7 +371,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 }

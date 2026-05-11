@@ -12,8 +12,8 @@
 //!   * a 250 ms tick that calls `Tunn::update_timers` per peer so handshakes,
 //!     keepalives, and rekeys make progress without external prodding.
 //!
-//! The smoltcp actor owns the inner IP stack; this actor only moves encrypted
-//! UDP frames between peers and the stack-facing queues.
+//! This actor only moves encrypted UDP frames between peers and the
+//! stack-facing queues.
 
 use std::future;
 use std::io;
@@ -32,9 +32,8 @@ use tokio::time::{self, MissedTickBehavior};
 
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
-use hammer_core::protocol::ipstack::IpStackInput;
-use hammer_core::protocol::ipstack::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::ipstack::wireguard::peer::{self, Peer};
+use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
+use hammer_core::protocol::wireguard::peer::{self, Peer};
 
 use crate::socket_protector::SocketProtector;
 
@@ -45,15 +44,17 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 
 /// Channel buffer for IP packets waiting to be encrypted. 64 packets at
 /// MTU=1408 ≈ 90 KiB of headroom — keeps a brief stall on the encryption
-/// thread from immediately back-pressuring the smoltcp poll loop.
+/// thread from immediately back-pressuring the TUN packet loop.
 const ENCRYPT_QUEUE: usize = 64;
-/// Same for the decrypted-inbound side. Each message can carry up to
-/// `INBOUND_DRAIN_BATCH` packets, so effective in-flight headroom is
-/// `INBOUND_QUEUE * INBOUND_DRAIN_BATCH` ≈ 512 packets at MTU=1408 ≈ 720 KiB —
-/// kept small to fit inside the iOS NetExt memory budget.
-const INBOUND_QUEUE: usize = 16;
-/// After one UDP readiness wake, drain a small bounded burst so decrypted IP
-/// packets can cross into ipstack as one batch instead of one mpsc message each.
+/// Same for the decrypted-inbound side. Now that each decrypted packet is
+/// pushed as its own `Bytes` (the old `IpStackInput::Batch` enum is gone), the
+/// queue holds one packet per slot.
+/// 256 × MTU 1408 ≈ 360 KiB worst case, comfortably inside NetExt budget; the
+/// queue almost never fills because the TUN writer drains it line-rate.
+const INBOUND_QUEUE: usize = 256;
+/// After one UDP readiness wake, drain a small bounded burst so we keep the
+/// boringtun decap loop hot before re-entering `select!`. Each packet is then
+/// pushed individually to `inbound_tx`.
 const INBOUND_DRAIN_BATCH: usize = 32;
 /// Mirror on the egress side: after `encrypt_rx.recv()` returns the first
 /// packet, opportunistically `try_recv` up to `OUTBOUND_DRAIN_BATCH-1` more so
@@ -70,15 +71,19 @@ pub(crate) struct TransportHandles {
     /// Push IP packets into here to have them encapsulated and shipped to
     /// whichever peer's `allowed_ips` matches the destination.
     pub(crate) encrypt_tx: mpsc::Sender<Bytes>,
-    /// Receive decrypted IP packets coming back from any peer. The smoltcp
-    /// stack drains this in the actor that owns the `phy::Device`.
-    pub(crate) inbound_rx: mpsc::Receiver<IpStackInput>,
+    /// Receive decrypted IP packets coming back from any peer. The endpoint
+    /// (now an `adapter::Endpoint`, not an `Outbound`) hands this stream
+    /// straight to the TUN packet-loop fan-in.
+    pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
     /// The address the OS bound the UDP socket to. Mostly useful for tests
     /// — production peers configure their endpoints out-of-band.
     #[allow(dead_code)]
     pub(crate) local_addr: SocketAddr,
     /// Send `()` (or drop) to ask the actor to exit promptly.
     pub(crate) shutdown: oneshot::Sender<()>,
+    /// Ask the actor to rebind/reprotect its UDP sockets while keeping the
+    /// packet channels stable for the TUN fast path.
+    pub(crate) reset_tx: mpsc::Sender<()>,
     /// Join handle in case the caller wants to await actor termination.
     pub(crate) join: JoinHandle<()>,
 }
@@ -110,6 +115,18 @@ impl TransportSockets {
 }
 
 impl TransportHandles {
+    pub(crate) fn reset(&self) {
+        match self.reset_tx.try_send(()) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("wireguard transport reset already queued");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                debug!("wireguard transport reset requested after actor closed");
+            }
+        }
+    }
+
     /// Send the cancellation signal and await the actor finishing.
     #[allow(dead_code)]
     pub(crate) async fn shutdown(self) -> HammerResult<()> {
@@ -134,16 +151,20 @@ pub(crate) fn spawn_transport(
     info!("wireguard transport listening on {local_addr}");
 
     let (encrypt_tx, encrypt_rx) = mpsc::channel::<Bytes>(ENCRYPT_QUEUE);
-    let (inbound_tx, inbound_rx) = mpsc::channel::<IpStackInput>(INBOUND_QUEUE);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
 
     let join = crate::spawn::spawn(run_actor(
         sockets,
         peers,
+        listen_port,
         mtu,
+        protector,
         encrypt_rx,
         inbound_tx,
         shutdown_rx,
+        reset_rx,
     ));
 
     Ok(TransportHandles {
@@ -151,6 +172,7 @@ pub(crate) fn spawn_transport(
         inbound_rx,
         local_addr,
         shutdown: shutdown_tx,
+        reset_tx,
         join,
     })
 }
@@ -200,6 +222,35 @@ fn bind_transport_sockets(
     })
 }
 
+fn reset_transport_sockets_with<F>(
+    sockets: &mut TransportSockets,
+    listen_port: u16,
+    bind: F,
+) -> HammerResult<SocketAddr>
+where
+    F: FnOnce() -> HammerResult<TransportSockets>,
+{
+    if listen_port == 0 {
+        let new_sockets = bind()?;
+        let local_addr = new_sockets.local_addr()?;
+        *sockets = new_sockets;
+        return Ok(local_addr);
+    }
+
+    let old_sockets = std::mem::replace(
+        sockets,
+        TransportSockets {
+            ipv4: None,
+            ipv6: None,
+        },
+    );
+    drop(old_sockets);
+    let new_sockets = bind()?;
+    let local_addr = new_sockets.local_addr()?;
+    *sockets = new_sockets;
+    Ok(local_addr)
+}
+
 fn bind_udp_socket(
     bind: SocketAddr,
     ipv6_only: bool,
@@ -247,12 +298,15 @@ fn std_udp_socket(bind: SocketAddr, protector: &SocketProtector) -> HammerResult
 /// fairly easy to reason about; backpressure on either mpsc is handled by
 /// dropping packets after a warn-log because wg is best-effort at L3 anyway.
 async fn run_actor(
-    sockets: TransportSockets,
+    mut sockets: TransportSockets,
     peers: Arc<Vec<Peer>>,
+    listen_port: u16,
     mtu: u32,
+    protector: SocketProtector,
     mut encrypt_rx: mpsc::Receiver<Bytes>,
-    inbound_tx: mpsc::Sender<IpStackInput>,
+    inbound_tx: mpsc::Sender<Bytes>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    mut reset_rx: mpsc::Receiver<()>,
 ) {
     // Capacity for every encap/decap output buffer the actor will allocate.
     // Each step allocates its own BytesMut so the result can be `freeze()`d
@@ -295,6 +349,19 @@ async fn run_actor(
             _ = &mut shutdown_rx => {
                 debug!("wireguard transport: shutdown");
                 break;
+            }
+            reset = reset_rx.recv() => {
+                if reset.is_none() {
+                    continue;
+                }
+                match reset_transport_sockets_with(&mut sockets, listen_port, || {
+                    bind_transport_sockets(&peers, listen_port, &protector)
+                }) {
+                    Ok(local_addr) => info!("wireguard transport rebound on {local_addr}"),
+                    Err(err) => {
+                        warn!("wireguard transport reset bind failed: {err}");
+                    }
+                }
             }
             res = recv_from_optional(sockets.ipv4.as_deref(), &mut udp_buf_v4), if sockets.ipv4.is_some() => {
                 match res {
@@ -399,7 +466,7 @@ async fn handle_inbound_ready(
     first_len: usize,
     recv_buf: &mut [u8],
     crypto_cap: usize,
-    inbound_tx: &mpsc::Sender<IpStackInput>,
+    inbound_tx: &mpsc::Sender<Bytes>,
     inbound_batch: &mut Vec<Bytes>,
 ) {
     // Re-use the actor-owned Vec; capacity (>= INBOUND_DRAIN_BATCH) survives
@@ -523,38 +590,23 @@ async fn dispatch_action(
     }
 }
 
-/// Hand the staged batch off to ipstack as a single mpsc message. The drop
-/// unit is `INBOUND_DRAIN_BATCH` packets in the worst case (vs. one packet
-/// pre-batching) — that's the deliberate trade: surface congestion at the
-/// transport boundary instead of silently piling into a deeper ipstack queue,
-/// at the cost of a coarser-grained drop when the inner stack stalls.
-///
-/// `batch` is borrowed: the actor reuses the same Vec across readiness wakes
-/// so its capacity persists. Anything we hand to `IpStackInput::Batch` has to
-/// be its own owned Vec, but `drain(..).collect()` only allocates the exact
-/// `len` slots needed (not the full 32-slot capacity), and leaves the source
-/// Vec empty-but-allocated for the next wake.
-fn flush_inbound_batch(inbound_tx: &mpsc::Sender<IpStackInput>, batch: &mut Vec<Bytes>) {
-    let Some(input) = ipstack_input_from_batch(batch) else {
+/// Hand the staged batch off to the endpoint's ingress receiver. Each `Bytes`
+/// goes in as its own mpsc message — the channel is sized (`INBOUND_QUEUE =
+/// 256`) so a 32-packet readiness drain never has to block, and per-packet
+/// granularity makes congestion drops localised instead of taking the whole
+/// burst down. `batch` is reused across wakes; `drain(..)` keeps capacity.
+fn flush_inbound_batch(inbound_tx: &mpsc::Sender<Bytes>, batch: &mut Vec<Bytes>) {
+    if batch.is_empty() {
         return;
-    };
-    let packets = match &input {
-        IpStackInput::Packet(_) => 1,
-        IpStackInput::Batch(packets) => packets.len(),
-    };
-    if inbound_tx.try_send(input).is_err() {
-        warn!("wireguard inbound queue full or closed; dropping {packets} packet(s)");
     }
-}
-
-#[inline]
-fn ipstack_input_from_batch(batch: &mut Vec<Bytes>) -> Option<IpStackInput> {
-    match batch.len() {
-        0 => None,
-        1 => Some(IpStackInput::Packet(batch.pop().expect("one packet"))),
-        // `drain(..).collect()` produces an owned Vec sized to `len` and
-        // leaves `batch` empty with its existing capacity intact.
-        _ => Some(IpStackInput::Batch(batch.drain(..).collect())),
+    let mut dropped = 0usize;
+    for pkt in batch.drain(..) {
+        if inbound_tx.try_send(pkt).is_err() {
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        warn!("wireguard inbound queue full or closed; dropped {dropped} packet(s)");
     }
 }
 
@@ -666,6 +718,14 @@ async fn handle_outbound_batch(
     // so the per-peer encrypt loop doesn't have to re-check.
     routed.clear();
     for packet in batch.drain(..) {
+        if packet.len() > crypto_cap.saturating_sub(WIREGUARD_OVERHEAD) {
+            warn!(
+                "wireguard outbound: IP packet length {} exceeds endpoint MTU {}, dropping",
+                packet.len(),
+                crypto_cap.saturating_sub(WIREGUARD_OVERHEAD)
+            );
+            continue;
+        }
         let Some(dst_ip) = first_hop_destination(&packet) else {
             warn!("wireguard outbound: malformed IP packet, dropping");
             continue;
@@ -856,23 +916,22 @@ mod tests {
     }
 
     #[test]
-    fn flush_inbound_batch_sends_packet_input_for_one_packet() {
+    fn flush_inbound_batch_sends_one_packet() {
         let (tx, mut rx) = mpsc::channel(1);
         let packet = Bytes::from_static(b"one");
         let mut batch = vec![packet.clone()];
 
         flush_inbound_batch(&tx, &mut batch);
 
-        match rx.try_recv().expect("one ipstack message") {
-            IpStackInput::Packet(received) => assert_eq!(received, packet),
-            other => panic!("unexpected ipstack input: {other:?}"),
-        }
+        let received = rx.try_recv().expect("one inbound message");
+        assert_eq!(received, packet);
+        assert!(rx.try_recv().is_err(), "only one packet pushed");
         assert!(batch.is_empty(), "batch must be drained for the next wake");
     }
 
     #[test]
-    fn flush_inbound_batch_sends_single_batch_input_for_multiple_packets() {
-        let (tx, mut rx) = mpsc::channel(1);
+    fn flush_inbound_batch_pushes_each_packet_separately() {
+        let (tx, mut rx) = mpsc::channel(4);
         let first = Bytes::from_static(b"one");
         let second = Bytes::from_static(b"two");
         let mut batch = vec![first.clone(), second.clone()];
@@ -880,10 +939,10 @@ mod tests {
 
         flush_inbound_batch(&tx, &mut batch);
 
-        match rx.try_recv().expect("one ipstack message") {
-            IpStackInput::Batch(packets) => assert_eq!(packets, vec![first, second]),
-            other => panic!("unexpected ipstack input: {other:?}"),
-        }
+        // L3 fast path: each decap'd packet is pushed individually so the
+        // TUN-writer fan-in sees them in order without an enum hop.
+        assert_eq!(rx.try_recv().expect("first packet"), first);
+        assert_eq!(rx.try_recv().expect("second packet"), second);
         assert!(rx.try_recv().is_err());
         assert!(batch.is_empty(), "batch must be drained for reuse");
         assert!(
@@ -943,13 +1002,6 @@ mod tests {
             .await
             .expect("timed out waiting for inbound packet")
             .expect("inbound_rx closed before delivering");
-        let recovered = match recovered {
-            IpStackInput::Packet(packet) => packet,
-            IpStackInput::Batch(mut packets) if packets.len() == 1 => {
-                packets.pop().expect("one packet")
-            }
-            other => panic!("unexpected ipstack input: {other:?}"),
-        };
         assert_eq!(&recovered[..], payload.as_slice());
 
         // Dropping the handles closes both mpsc channels and the oneshot;
@@ -958,11 +1010,9 @@ mod tests {
 
     /// Push a burst of IP packets through `encrypt_tx` in quick succession so
     /// the actor's `try_recv`-driven `handle_outbound_batch` path is exercised.
-    /// All packets must reach the peer's `inbound_rx`. The point isn't to
-    /// detect a specific number of `IpStackInput::Batch` messages (timing
-    /// dependent) but to prove the batched encrypt path doesn't drop or
-    /// reorder under concurrent submission, including across the noise
-    /// handshake boundary.
+    /// All packets must reach the peer's `inbound_rx`. The point is to prove
+    /// the batched encrypt path doesn't drop or reorder under concurrent
+    /// submission, including across the noise handshake boundary.
     ///
     /// `worker_threads = 2` keeps the test cheap when cargo runs the wireguard
     /// suite in parallel — each tokio::test starts its own runtime, so an
@@ -1020,20 +1070,79 @@ mod tests {
                 .await
                 .expect("timed out waiting for inbound burst packets")
                 .expect("inbound_rx closed before delivering all burst packets");
-            match next {
-                IpStackInput::Packet(packet) => {
-                    assert_eq!(&packet[..], payload.as_slice());
-                    received += 1;
-                }
-                IpStackInput::Batch(packets) => {
-                    for packet in packets {
-                        assert_eq!(&packet[..], payload.as_slice());
-                        received += 1;
-                    }
-                }
-            }
+            assert_eq!(&next[..], payload.as_slice());
+            received += 1;
         }
         assert_eq!(received, BURST);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_drops_plain_packet_larger_than_endpoint_mtu() {
+        let a_priv = [55u8; 32];
+        let b_pub = x25519_public([66u8; 32]);
+        let peer = make_peer(
+            b_pub,
+            a_priv,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
+            0,
+        );
+        let peers = vec![peer];
+        let sockets =
+            bind_transport_sockets(&peers, 0, &SocketProtector::default()).expect("bind sockets");
+        let (_tx, mut encrypt_rx) = mpsc::channel(1);
+        let mut batch = Vec::new();
+        let mut routed = Vec::new();
+        let mut send_buf = BytesMut::with_capacity(64 + WIREGUARD_OVERHEAD);
+        let mut packet = dummy_ipv4_packet();
+        packet.resize(65, 0);
+
+        handle_outbound_batch(
+            &sockets,
+            &peers,
+            Bytes::from(packet),
+            &mut encrypt_rx,
+            64 + WIREGUARD_OVERHEAD,
+            &mut batch,
+            &mut routed,
+            &mut send_buf,
+        )
+        .await;
+
+        assert!(
+            routed.is_empty(),
+            "oversized packet must be dropped before encapsulation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ephemeral_reset_bind_failure_keeps_existing_sockets() {
+        let local_priv = [67u8; 32];
+        let peer_pub = x25519_public([68u8; 32]);
+        let peer = make_peer(
+            peer_pub,
+            local_priv,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
+            0,
+        );
+        let peers = vec![peer];
+        let mut sockets =
+            bind_transport_sockets(&peers, 0, &SocketProtector::default()).expect("bind sockets");
+        let before = sockets.local_addr().expect("local addr before reset");
+
+        let err = reset_transport_sockets_with(&mut sockets, 0, || {
+            Err(HammerError::internal("injected bind failure"))
+        })
+        .expect_err("reset bind should fail");
+
+        assert!(
+            err.to_string().contains("injected bind failure"),
+            "error = {err:?}"
+        );
+        assert_eq!(
+            sockets.local_addr().expect("local addr after reset"),
+            before,
+            "failed ephemeral reset must keep the running socket"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

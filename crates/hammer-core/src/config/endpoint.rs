@@ -3,25 +3,25 @@
 //! Mirrors sing-box 1.11+'s endpoint concept: an outbound that also has
 //! Lifecycle state. Adding a new endpoint protocol drops in another
 //! `RawEndpoint::*` variant behind its own sub-feature without breaking
-//! existing TOML files. The core endpoint config shape is gated on
-//! `feature = "ipstack"` from mod.rs; concrete IP-stack protocols add their
-//! own item-level `#[cfg]` annotations.
+//! existing TOML files. The core endpoint config shape is gated on the
+//! endpoint protocol feature from mod.rs; concrete protocols add their own
+//! item-level `#[cfg]` annotations.
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use std::net::{IpAddr, SocketAddr};
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use std::time::Duration;
 
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use serde_with::{As, base64::Base64};
 
 use crate::error::HammerError;
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use super::constants as C;
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use super::raw_struct;
 
 /// Outer endpoint variant — sing-box style `[[endpoints]]` entries with a
@@ -31,11 +31,11 @@ use super::raw_struct;
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
 pub enum RawEndpoint {
     /// WireGuard endpoint entry.
-    #[cfg(feature = "ipstack-wireguard")]
+    #[cfg(feature = "wireguard")]
     Wireguard(RawWireguardEndpoint),
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 raw_struct! {
     pub struct RawWireguardEndpoint {
         /// Endpoint id used by route rules and lifecycle managers.
@@ -53,7 +53,7 @@ raw_struct! {
     }
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 raw_struct! {
     pub struct RawWireguardPeer {
         /// Base64-encoded peer public key.
@@ -73,12 +73,12 @@ raw_struct! {
     }
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct RawWireguardKey(#[serde(with = "As::<Base64>")] [u8; 32]);
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 impl RawWireguardKey {
     fn into_bytes(self) -> [u8; 32] {
         self.0
@@ -98,11 +98,11 @@ pub struct Endpoint {
 
 impl Endpoint {
     pub fn type_name(&self) -> &'static str {
-        #[cfg(feature = "ipstack-wireguard")]
+        #[cfg(feature = "wireguard")]
         match &self.kind {
             EndpointKind::Wireguard(_) => C::TYPE_WIREGUARD,
         }
-        #[cfg(not(feature = "ipstack-wireguard"))]
+        #[cfg(not(feature = "wireguard"))]
         match &self.kind {
             _ => unreachable!("endpoint feature has no enabled endpoint protocols"),
         }
@@ -119,11 +119,11 @@ pub struct EndpointInterfaceOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointKind {
-    #[cfg(feature = "ipstack-wireguard")]
+    #[cfg(feature = "wireguard")]
     Wireguard(WireguardEndpointOptions),
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardEndpointOptions {
     /// Static private key (Curve25519, 32 bytes).
@@ -133,7 +133,7 @@ pub struct WireguardEndpointOptions {
     pub peers: Vec<WireguardPeerOptions>,
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireguardPeerOptions {
     /// Peer static public key (Curve25519, 32 bytes).
@@ -155,13 +155,13 @@ pub(super) fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, Ha
     raw.into_iter()
         .enumerate()
         .map(|(idx, item)| {
-            #[cfg(feature = "ipstack-wireguard")]
+            #[cfg(feature = "wireguard")]
             {
                 match item {
                     RawEndpoint::Wireguard(wg) => build_wireguard_endpoint(idx, wg),
                 }
             }
-            #[cfg(not(feature = "ipstack-wireguard"))]
+            #[cfg(not(feature = "wireguard"))]
             {
                 let _ = idx;
                 match item {}
@@ -170,7 +170,7 @@ pub(super) fn build_endpoints(raw: Vec<RawEndpoint>) -> Result<Vec<Endpoint>, Ha
         .collect()
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 fn build_wireguard_endpoint(
     idx: usize,
     mut raw: RawWireguardEndpoint,
@@ -215,7 +215,7 @@ fn build_wireguard_endpoint(
     })
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 fn build_wireguard_peer(
     endpoint_idx: usize,
     peer_idx: usize,
@@ -260,7 +260,7 @@ fn build_wireguard_peer(
 /// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
 /// literal; hostname endpoints would need lifecycle-time DNS resolution
 /// which is not wired up yet.
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
     if port == 0 {
         return Err(HammerError::config_validation(format!(
@@ -275,7 +275,7 @@ fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, H
     Ok(SocketAddr::new(ip, port))
 }
 
-#[cfg(all(test, feature = "ipstack-wireguard"))]
+#[cfg(all(test, feature = "wireguard"))]
 mod tests {
     use super::*;
 

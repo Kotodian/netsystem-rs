@@ -215,11 +215,9 @@ impl OutboundManager {
         self.spawn_ensure_connected_hooks(self.list());
     }
 
-    /// Register an already-constructed outbound (e.g. an endpoint that lives
-    /// in `EndpointManager`) so the router can resolve its id through the
-    /// usual `OutboundManager::get` path. Mirrors sing-box, where every
-    /// endpoint shows up as both an Endpoint *and* an Outbound — same Arc,
-    /// two views.
+    /// Register an already-constructed outbound. This is for tests and future
+    /// embedders that need to supply a runtime outbound directly; L3 endpoints
+    /// are routed through `RouteTarget::Endpoint`, not registered here.
     pub fn register_outbound(
         &self,
         component: impl Into<OutboundRegistration>,
@@ -276,8 +274,7 @@ impl OutboundManager {
     /// default no-op `bind_resolver` and don't care; aggregates ignore
     /// duplicate calls.
     ///
-    /// Must be called **after** all outbounds (including endpoint-derived
-    /// ones registered via `register_outbound`) are in place, otherwise
+    /// Must be called **after** all outbounds are in place, otherwise
     /// late-registered children would be invisible to the aggregate.
     pub fn bind_aggregates(self: &Arc<Self>) {
         let weak: Weak<Self> = Arc::downgrade(self);

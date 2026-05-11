@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use hammer_adapter::{
-    ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata, SocksAddr,
+    ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata, RouteTarget,
+    SocksAddr,
 };
 use hammer_core::config::{self, DomainStrategy, Options, RuleActionKind};
 use hammer_core::error::HammerError;
@@ -263,7 +264,7 @@ fn router_routes_domain_suffix_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut hit).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 
@@ -271,7 +272,7 @@ fn router_routes_domain_suffix_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut miss).expect("match"),
         RouteDecision::Route {
-            outbound: "direct".to_owned()
+            target: RouteTarget::Outbound("direct".to_owned())
         }
     );
 }
@@ -383,7 +384,7 @@ fn router_domain_match_is_case_insensitive_via_config_normalize() {
     assert_eq!(
         router.match_route(&mut metadata).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 }
@@ -401,7 +402,7 @@ fn router_domain_match_strips_trailing_dot_in_config() {
     assert_eq!(
         router.match_route(&mut metadata).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 }
@@ -417,7 +418,7 @@ fn router_domain_suffix_match_is_case_insensitive_via_config_normalize() {
     assert_eq!(
         router.match_route(&mut metadata).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 }
@@ -434,7 +435,7 @@ fn router_domain_suffix_does_not_match_partial_label() {
     assert_eq!(
         router.match_route(&mut metadata).expect("match"),
         RouteDecision::Route {
-            outbound: "direct".to_owned()
+            target: RouteTarget::Outbound("direct".to_owned())
         }
     );
 }
@@ -450,7 +451,7 @@ fn router_routes_ipv4_cidr_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut hit).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 
@@ -458,7 +459,7 @@ fn router_routes_ipv4_cidr_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut miss).expect("match"),
         RouteDecision::Route {
-            outbound: "direct".to_owned()
+            target: RouteTarget::Outbound("direct".to_owned())
         }
     );
 }
@@ -475,7 +476,7 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut hit).expect("match"),
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
 
@@ -484,7 +485,7 @@ fn router_routes_ipv6_cidr_match_to_named_outbound() {
     assert_eq!(
         router.match_route(&mut miss).expect("match"),
         RouteDecision::Route {
-            outbound: "direct".to_owned()
+            target: RouteTarget::Outbound("direct".to_owned())
         }
     );
 }
@@ -545,6 +546,88 @@ fn router_rejects_unknown_default_outbound_at_construction() {
     );
 }
 
+#[cfg(feature = "endpoint")]
+#[test]
+fn router_marks_endpoint_default_target() {
+    let mut opts = options();
+    opts.route.final_ = "wg-out".to_owned();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let router = Router::from_options_with_metrics_and_endpoint_ids(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        MetricsRegistry::new(),
+        vec!["wg-out".to_owned()],
+    )
+    .expect("router");
+
+    let mut metadata = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            target: RouteTarget::Endpoint("wg-out".to_owned())
+        }
+    );
+}
+
+#[cfg(feature = "endpoint")]
+#[test]
+fn router_marks_endpoint_rule_target() {
+    let mut opts = options_with_user_rules(
+        "[[route.rules]]\nip_cidr = [\"1.1.1.1/32\"]\noutbound = \"direct\"\n",
+    );
+    let RuleActionKind::Route(action) = &mut opts
+        .route
+        .rules
+        .last_mut()
+        .expect("user route rule")
+        .default_options
+        .action
+    else {
+        panic!("last rule should be a route action");
+    };
+    action.outbound = "wg-out".to_owned();
+    let outbound = Arc::new(
+        OutboundManager::from_options(
+            logger("outbound"),
+            opts.route.final_.clone(),
+            &opts.outbounds,
+        )
+        .expect("outbound manager"),
+    );
+    let router = Router::from_options_with_metrics_and_endpoint_ids(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        MetricsRegistry::new(),
+        vec!["wg-out".to_owned()],
+    )
+    .expect("router");
+
+    let mut hit = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    assert_eq!(
+        router.match_route(&mut hit).expect("match"),
+        RouteDecision::Route {
+            target: RouteTarget::Endpoint("wg-out".to_owned())
+        }
+    );
+
+    let mut miss = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+    assert_eq!(
+        router.match_route(&mut miss).expect("match"),
+        RouteDecision::Route {
+            target: RouteTarget::Outbound("direct".to_owned())
+        }
+    );
+}
+
 #[test]
 fn router_applies_non_terminal_actions_then_uses_default_outbound() {
     let router = router_from_options(&options());
@@ -560,7 +643,7 @@ fn router_applies_non_terminal_actions_then_uses_default_outbound() {
     assert_eq!(
         decision,
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
     assert_eq!(metadata.domain_strategy, Some(DomainStrategy::PreferIpv4));
@@ -587,7 +670,7 @@ fn router_applies_sniff_override_destination_option() {
     assert_eq!(
         decision,
         RouteDecision::Route {
-            outbound: "hysteria2".to_owned()
+            target: RouteTarget::Outbound("hysteria2".to_owned())
         }
     );
     assert!(metadata.override_destination);

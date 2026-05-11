@@ -36,7 +36,6 @@ mod component_registry;
 mod connection;
 mod control_thread;
 pub mod dns;
-#[cfg(feature = "endpoint")]
 pub mod endpoints;
 pub mod inbounds;
 mod macros;
@@ -83,7 +82,6 @@ pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use connection::{ConnectionManager, ConnectionRegistration};
 pub(crate) use control_thread::{ControlLogWriter, ControlThread};
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
-#[cfg(feature = "endpoint")]
 pub use endpoints::EndpointManager;
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,

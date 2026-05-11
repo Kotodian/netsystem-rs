@@ -65,7 +65,7 @@ pub(crate) trait EndpointComponentDeclaration {
         logger: hammer_core::log::Logger,
         option: &hammer_core::config::Endpoint,
         platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
-    ) -> hammer_core::error::HammerResult<crate::endpoints::EndpointViews>;
+    ) -> hammer_core::error::HammerResult<hammer_adapter::EndpointComponent>;
 }
 
 #[cfg(feature = "endpoint-wireguard")]

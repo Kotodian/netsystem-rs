@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 use hammer_core::config::EndpointKind;
 
 use hammer_core::config::{
@@ -578,7 +578,7 @@ fn parse_config_rejects_unknown_dns_via() {
     );
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
     let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
@@ -591,9 +591,9 @@ fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
     );
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
-fn parse_config_accepts_urltest_child_that_is_endpoint_id() {
+fn parse_config_rejects_urltest_child_that_is_endpoint_id() {
     let cfg = format!(
         r#"
 [tun]
@@ -619,20 +619,15 @@ final = "auto"
 "#,
         wg_endpoint_block("")
     );
-    let options = config::parse_config(&cfg).expect("endpoint child should be valid");
-    assert_eq!(options.endpoints.len(), 1);
-    let urltest = options
-        .outbounds
-        .iter()
-        .find(|outbound| outbound.id == "auto")
-        .expect("auto outbound");
-    let OutboundKind::Urltest(urltest) = &urltest.kind else {
-        panic!("auto is not urltest");
-    };
-    assert_eq!(urltest.outbounds, vec!["wg-out", "direct"]);
+    let err = config::parse_config(&cfg).expect_err("urltest child must be an outbound id");
+    assert!(
+        err.to_string()
+            .contains("urltest 'auto' references unknown outbound id: wg-out"),
+        "error = {err:?}"
+    );
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_accepts_endpoint_only_wireguard_without_legacy_hysteria() {
     let cfg = format!(
@@ -658,7 +653,7 @@ strategy = "ipv4_only"
 type = "udp"
 id = "default"
 server = "1.1.1.1"
-via = "wg-out"
+via = "direct"
 
 {}
 
@@ -697,19 +692,19 @@ fn assert_rule_action(action: &RuleActionKind, want: &'static str) {
 }
 
 // `BASE64(0x01 * 32)` — placeholder Curve25519 private key for parser tests.
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 const TEST_WG_PRIVATE_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 // `BASE64(0x02 * 32)` — placeholder peer public key.
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 const TEST_WG_PEER_PUBLIC_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
 // `BASE64(0x03 * 32)` — placeholder pre-shared key.
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 const TEST_WG_PSK: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=";
 
 // `extra` is appended after the built-in peer so that callers can tack on
 // further `[[endpoints.peers]]` blocks without violating TOML's "table headers
 // terminate the previous table" rule.
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 fn wg_endpoint_block(extra: &str) -> String {
     format!(
         r#"
@@ -731,7 +726,7 @@ persistent_keepalive_interval = 25
     )
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_accepts_wireguard_endpoint() {
     let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
@@ -757,7 +752,7 @@ fn parse_config_accepts_wireguard_endpoint() {
     assert_eq!(peer.reserved, [0, 0, 0]);
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_supports_multi_peer_wireguard() {
     let cfg = format!(
@@ -780,7 +775,7 @@ allowed_ips = ["192.168.0.0/16", "fd00::/8"]
     assert!(wg.peers[1].persistent_keepalive.is_none());
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_round_trips_wireguard_pre_shared_key_and_reserved() {
     let cfg = format!(
@@ -813,7 +808,7 @@ reserved = [255, 0, 128]
     assert_eq!(wg.peers[0].reserved, [255, 0, 128]);
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_without_id() {
     let cfg = format!(
@@ -823,7 +818,7 @@ fn parse_config_rejects_wireguard_without_id() {
     assert!(err.to_string().contains("endpoints[0].id"), "got {err:?}");
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_without_peers() {
     let cfg = format!(
@@ -836,7 +831,7 @@ fn parse_config_rejects_wireguard_without_peers() {
     );
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_invalid_base64_key() {
     let cfg = format!(
@@ -846,7 +841,7 @@ fn parse_config_rejects_wireguard_invalid_base64_key() {
     assert!(err.to_string().contains("endpoints[0]"), "got {err:?}");
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_peer_with_hostname_endpoint() {
     let cfg = format!(
@@ -856,7 +851,7 @@ fn parse_config_rejects_wireguard_peer_with_hostname_endpoint() {
     assert!(err.to_string().contains("IP literal"), "got {err:?}");
 }
 
-#[cfg(feature = "ipstack-wireguard")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_peer_with_zero_port() {
     let cfg = format!(
@@ -869,7 +864,7 @@ fn parse_config_rejects_wireguard_peer_with_zero_port() {
     );
 }
 
-#[cfg(feature = "ipstack")]
+#[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_default_endpoints_is_empty() {
     let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
@@ -879,13 +874,11 @@ fn parse_config_default_endpoints_is_empty() {
     );
 }
 
-#[cfg(feature = "ipstack")]
 #[test]
-fn parse_config_accepts_smoltcp_tun_stack() {
+fn parse_config_rejects_smoltcp_tun_stack() {
     let cfg = MINIMAL_CONFIG.replace("stack = \"system\"", "stack = \"smoltcp\"");
-    let options = config::parse_config(&cfg).expect("parse smoltcp stack");
-    let InboundKind::Tun(tun) = &options.inbounds[0].kind;
-    assert_eq!(tun.stack, TunStack::Smoltcp);
+    let err = config::parse_config(&cfg).expect_err("smoltcp stack is no longer supported");
+    assert!(err.to_string().contains("smoltcp"), "got {err:?}");
 }
 
 /// Two-server fixture used by the domain_resolver suite below. Bootstrap is
@@ -924,6 +917,22 @@ final = "remote"
 [route]
 final = "direct"
 "#;
+
+#[cfg(feature = "wireguard")]
+#[test]
+fn parse_config_rejects_dns_via_endpoint_id() {
+    let cfg = format!(
+        "{}\n{}",
+        DOMAIN_RESOLVER_FIXTURE.replace("via = \"direct\"", "via = \"wg-out\""),
+        wg_endpoint_block("")
+    );
+    let err = config::parse_config(&cfg).expect_err("dns via must point to an outbound");
+    assert!(
+        err.to_string()
+            .contains("dns.server via references unknown outbound id: wg-out"),
+        "got {err:?}"
+    );
+}
 
 #[test]
 fn parse_config_round_trips_dns_server_domain_resolver() {

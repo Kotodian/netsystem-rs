@@ -1,27 +1,29 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "endpoint")]
+use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::debug;
 
+#[cfg(feature = "endpoint")]
 use hammer_adapter::PlatformInterface;
-use hammer_adapter::{
-    EndpointComponent, EndpointManager as EndpointManagerTrait, Lifecycle, OutboundComponent,
-};
+use hammer_adapter::{EndpointComponent, EndpointManager as EndpointManagerTrait, Lifecycle};
 #[cfg(feature = "endpoint")]
 use hammer_core::config::Endpoint as EndpointOptions;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
+#[cfg(feature = "endpoint")]
 use crate::RuntimePlatform;
 #[cfg(feature = "endpoint-wireguard")]
 use crate::component_registry::register_components;
 
 #[cfg(feature = "endpoint-wireguard")]
-pub(crate) type EndpointViews = (EndpointComponent, OutboundComponent);
-
-#[cfg(feature = "endpoint-wireguard")]
-pub(crate) type EndpointBuilder =
-    fn(Logger, &EndpointOptions, Option<Arc<dyn PlatformInterface>>) -> HammerResult<EndpointViews>;
+pub(crate) type EndpointBuilder = fn(
+    Logger,
+    &EndpointOptions,
+    Option<Arc<dyn PlatformInterface>>,
+) -> HammerResult<EndpointComponent>;
 
 #[cfg(feature = "endpoint-wireguard")]
 #[derive(Clone)]
@@ -44,7 +46,7 @@ impl EndpointFactorySet {
         logger: Logger,
         option: &EndpointOptions,
         platform: Option<Arc<dyn PlatformInterface>>,
-    ) -> HammerResult<EndpointViews> {
+    ) -> HammerResult<EndpointComponent> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown endpoint type: {type_name}"))
@@ -66,11 +68,6 @@ pub struct EndpointManager {
     #[cfg_attr(not(feature = "endpoint-wireguard"), allow(dead_code))]
     logger: Logger,
     items: Mutex<HashMap<String, EndpointComponent>>,
-    /// Same set of endpoints as `items`, but viewed through their `Outbound`
-    /// trait — sing-box keeps a single object behind both a `Endpoint` and an
-    /// `Outbound` registration so the router can resolve the id through
-    /// `OutboundManager::get` exactly like any other outbound.
-    outbound_view: Mutex<Vec<OutboundComponent>>,
     #[cfg(feature = "endpoint-wireguard")]
     factories: EndpointFactorySet,
 }
@@ -80,7 +77,6 @@ impl EndpointManager {
         Self {
             logger,
             items: Mutex::new(HashMap::new()),
-            outbound_view: Mutex::new(Vec::new()),
             #[cfg(feature = "endpoint-wireguard")]
             factories: EndpointFactorySet::standard(),
         }
@@ -116,7 +112,7 @@ impl EndpointManager {
         }
         #[cfg(feature = "endpoint-wireguard")]
         for option in options {
-            let (endpoint_view, outbound_view) = manager.factories.build(
+            let endpoint = manager.factories.build(
                 manager.logger.clone(),
                 option,
                 platform.as_ref().map(Arc::clone),
@@ -128,27 +124,17 @@ impl EndpointManager {
                     option.id
                 )));
             }
-            items.insert(option.id.clone(), endpoint_view);
-            drop(items);
-            manager
-                .outbound_view
-                .lock()
-                .expect("EndpointManager poisoned")
-                .push(outbound_view);
+            items.insert(option.id.clone(), endpoint);
         }
         #[cfg(not(feature = "endpoint-wireguard"))]
         let _ = platform;
         Ok(manager)
     }
 
-    /// Snapshot of the (id, outbound-view) pairs so the assembler can register
-    /// them with `OutboundManager` after both managers exist. Cloning the Arcs
-    /// is cheap and the slice is only walked once at boot.
-    pub fn outbound_view(&self) -> Vec<OutboundComponent> {
-        self.outbound_view
-            .lock()
-            .expect("EndpointManager poisoned")
-            .clone()
+    pub fn reset_network(&self) {
+        for endpoint in self.list() {
+            endpoint.runtime().reset();
+        }
     }
 }
 
@@ -222,5 +208,87 @@ impl EndpointManagerTrait for EndpointManager {
             .expect("EndpointManager poisoned")
             .remove(id);
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "endpoint"))]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant as StdInstant;
+
+    use bytes::Bytes;
+    use hammer_adapter::{ComponentMeta, Endpoint, RuntimeComponent};
+    use hammer_core::lifecycle::StartStage;
+    use hammer_core::log::{DiscardWriter, Factory};
+    use tokio::sync::mpsc;
+
+    use super::*;
+
+    struct ResetEndpoint {
+        sender: mpsc::Sender<Bytes>,
+        resets: Arc<AtomicUsize>,
+    }
+
+    impl Lifecycle for ResetEndpoint {
+        fn name(&self) -> &str {
+            "reset-endpoint"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    impl Endpoint for ResetEndpoint {
+        fn id(&self) -> &str {
+            "wg-out"
+        }
+
+        fn ip_send_clone(&self) -> mpsc::Sender<Bytes> {
+            self.sender.clone()
+        }
+
+        fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>> {
+            None
+        }
+
+        fn reset(&self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn test_logger() -> Logger {
+        Factory::new(StdInstant::now(), Arc::new(DiscardWriter)).new_logger("endpoint-test")
+    }
+
+    #[test]
+    fn reset_network_resets_registered_endpoints() {
+        let manager = EndpointManager::new(test_logger());
+        let (sender, _receiver) = mpsc::channel(1);
+        let resets = Arc::new(AtomicUsize::new(0));
+        let runtime: Arc<dyn Endpoint> = Arc::new(ResetEndpoint {
+            sender,
+            resets: Arc::clone(&resets),
+        });
+        manager
+            .items
+            .lock()
+            .expect("EndpointManager poisoned")
+            .insert(
+                "wg-out".to_owned(),
+                RuntimeComponent::new(
+                    ComponentMeta::new("endpoint", "test", "wg-out", Vec::new(), Vec::new(), None),
+                    runtime,
+                ),
+            );
+
+        manager.reset_network();
+
+        assert_eq!(resets.load(Ordering::Relaxed), 1);
     }
 }

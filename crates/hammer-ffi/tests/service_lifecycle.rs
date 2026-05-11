@@ -20,14 +20,10 @@ auto_route = false
 strict_route = true
 mtu = 1400
 stack = "disabled"
-[hysteria2]
-server = "example.com"
-password = "x"
-sni = "example.com"
 [dns]
 server = "udp://1.1.1.1"
 [route]
-final = "hysteria2"
+final = "direct"
 "#;
 
 #[derive(Default)]
@@ -267,14 +263,10 @@ address = ["172.19.0.1/30"]
 route_address = ["0.0.0.0/0"]
 mtu = 1400
 stack = "disabled"
-[hysteria2]
-server = "example.com"
-password = "x"
-sni = "example.com"
 [dns]
 server = "udp://1.1.1.1"
 [route]
-final = "hysteria2"
+final = "direct"
 
 [[endpoints]]
 type = "wireguard"
@@ -304,6 +296,65 @@ allowed_ips = ["0.0.0.0/0"]
     );
     assert_eq!(count(&lines, "stage post-start"), lifecycle_count);
     assert_eq!(count(&lines, "stage started"), lifecycle_count);
+}
+
+#[cfg(feature = "wireguard")]
+#[test]
+fn service_rejects_multiple_system_tuns_with_wireguard_endpoint() {
+    const PLACEHOLDER_PRIVATE: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    const PLACEHOLDER_PEER: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
+    let toml = format!(
+        r#"
+[log]
+level = "debug"
+
+[[inbounds]]
+type = "tun"
+id = "tun-a"
+interface_name = "utun-a"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+mtu = 1400
+stack = "system"
+
+[[inbounds]]
+type = "tun"
+id = "tun-b"
+interface_name = "utun-b"
+address = ["172.20.0.1/30"]
+route_address = ["0.0.0.0/0"]
+mtu = 1400
+stack = "system"
+
+[dns]
+server = "udp://1.1.1.1"
+[route]
+final = "direct"
+
+[[endpoints]]
+type = "wireguard"
+id = "wg-out"
+private_key = "{PLACEHOLDER_PRIVATE}"
+address = ["10.66.0.2/32"]
+
+[[endpoints.peers]]
+public_key = "{PLACEHOLDER_PEER}"
+address = "1.2.3.4"
+port = 51820
+allowed_ips = ["0.0.0.0/0"]
+"#,
+    );
+    let platform = Arc::new(CapturePlatform::default());
+    let err = match HammerService::new(&toml, Arc::clone(&platform) as Arc<dyn HammerPlatform>) {
+        Ok(_) => panic!("multiple endpoint-enabled TUN inbounds must be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("multiple system TUN inbounds cannot share endpoints"),
+        "error = {err:?}"
+    );
 }
 
 #[test]

@@ -2,7 +2,7 @@
 // The previous `raw.rs` / `options.rs` / `build.rs` umbrellas are gone — see
 // /home/lqk/.claude/plans/cosmic-popping-wall.md for the migration plan.
 mod dns;
-#[cfg(feature = "ipstack")]
+#[cfg(feature = "wireguard")]
 mod endpoint;
 mod inbound;
 mod log;
@@ -11,7 +11,7 @@ mod route;
 mod util;
 
 pub use dns::*;
-#[cfg(feature = "ipstack")]
+#[cfg(feature = "wireguard")]
 pub use endpoint::*;
 pub use inbound::*;
 pub use log::*;
@@ -92,7 +92,7 @@ pub mod constants {
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
     pub const TYPE_URLTEST: &str = "urltest";
-    #[cfg(feature = "ipstack-wireguard")]
+    #[cfg(feature = "wireguard")]
     pub const TYPE_WIREGUARD: &str = "wireguard";
 
     /// Default URL probed by the urltest outbound when the user does not
@@ -123,7 +123,7 @@ pub mod constants {
     #[cfg(feature = "hysteria2")]
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
     /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
-    #[cfg(feature = "ipstack-wireguard")]
+    #[cfg(feature = "wireguard")]
     pub const DEFAULT_WIREGUARD_MTU: u32 = 1408;
     pub const DNS_TYPE_HOSTS: &str = "hosts";
     pub const DNS_TYPE_LOCAL: &str = "local";
@@ -155,7 +155,7 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbounds: Vec<outbound::RawOutbound>,
     /// Optional sing-box style endpoint list.
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<endpoint::RawEndpoint>,
     /// Optional DNS transport section.
@@ -172,7 +172,7 @@ pub struct Options {
     pub dns: dns::DnsOptions,
     pub inbounds: Vec<inbound::Inbound>,
     pub outbounds: Vec<outbound::Outbound>,
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     pub endpoints: Vec<endpoint::Endpoint>,
     pub route: route::RouteOptions,
 }
@@ -244,7 +244,7 @@ fn extract_unknown_field(msg: &str) -> Option<String> {
 /// resolve the cross-domain pieces (route final defaulting to the
 /// hysteria id, default_domain_resolver pointing at the dns id, etc.).
 fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     let RawConfig {
         log: raw_log,
         tun: raw_tun,
@@ -256,7 +256,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         dns: raw_dns,
         route: raw_route,
     } = raw;
-    #[cfg(not(feature = "ipstack"))]
+    #[cfg(not(feature = "wireguard"))]
     let RawConfig {
         log: raw_log,
         tun: raw_tun,
@@ -287,9 +287,9 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     validate_unique_ids("inbounds", inbounds.iter().map(|item| item.id.as_str()))?;
     rules.extend(route::build_user_rules(&raw_route.rules)?);
 
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     let has_explicit_endpoints = !raw_endpoints.is_empty();
-    #[cfg(not(feature = "ipstack"))]
+    #[cfg(not(feature = "wireguard"))]
     let has_explicit_endpoints = false;
     #[cfg(feature = "hysteria2")]
     let has_legacy_hysteria = !raw_hysteria.is_default();
@@ -321,11 +321,11 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     };
     validate_unique_ids("outbounds", outbounds.iter().map(|item| item.id.as_str()))?;
 
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     let endpoints = endpoint::build_endpoints(raw_endpoints)?;
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     validate_unique_ids("endpoints", endpoints.iter().map(|item| item.id.as_str()))?;
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     validate_unique_ids(
         "outbound/endpoint",
         outbounds
@@ -334,21 +334,18 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             .chain(endpoints.iter().map(|item| item.id.as_str())),
     )?;
 
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     outbound::validate_urltest_dependencies(
         &outbounds,
-        outbounds
-            .iter()
-            .map(|item| item.id.as_str())
-            .chain(endpoints.iter().map(|item| item.id.as_str())),
+        outbounds.iter().map(|item| item.id.as_str()),
     )?;
-    #[cfg(not(feature = "ipstack"))]
+    #[cfg(not(feature = "wireguard"))]
     outbound::validate_urltest_dependencies(
         &outbounds,
         outbounds.iter().map(|item| item.id.as_str()),
     )?;
 
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     validate_route_rule_outbounds(
         &rules,
         outbounds
@@ -356,7 +353,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             .map(|item| item.id.as_str())
             .chain(endpoints.iter().map(|item| item.id.as_str())),
     )?;
-    #[cfg(not(feature = "ipstack"))]
+    #[cfg(not(feature = "wireguard"))]
     validate_route_rule_outbounds(&rules, outbounds.iter().map(|item| item.id.as_str()))?;
 
     let route_final = if raw_route.final_.is_empty() {
@@ -364,7 +361,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
     } else {
         raw_route.final_.clone()
     };
-    #[cfg(feature = "ipstack")]
+    #[cfg(feature = "wireguard")]
     validate_known_id_kind(
         "route.final",
         &route_final,
@@ -374,7 +371,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
             .map(|item| item.id.as_str())
             .chain(endpoints.iter().map(|item| item.id.as_str())),
     )?;
-    #[cfg(not(feature = "ipstack"))]
+    #[cfg(not(feature = "wireguard"))]
     validate_known_id_kind(
         "route.final",
         &route_final,
@@ -393,15 +390,6 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         &dns_options.final_,
         dns_options.servers.iter().map(|item| item.id.as_str()),
     )?;
-    #[cfg(feature = "ipstack")]
-    validate_dns_server_via(
-        &dns_options.servers,
-        outbounds
-            .iter()
-            .map(|item| item.id.as_str())
-            .chain(endpoints.iter().map(|item| item.id.as_str())),
-    )?;
-    #[cfg(not(feature = "ipstack"))]
     validate_dns_server_via(
         &dns_options.servers,
         outbounds.iter().map(|item| item.id.as_str()),
@@ -429,7 +417,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         dns: dns_options,
         inbounds,
         outbounds,
-        #[cfg(feature = "ipstack")]
+        #[cfg(feature = "wireguard")]
         endpoints,
         route: route_options,
     })

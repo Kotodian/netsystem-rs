@@ -1,10 +1,15 @@
 use std::io;
+#[cfg(not(feature = "endpoint"))]
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
 
+#[cfg(feature = "endpoint")]
+use hammer_adapter::Endpoint as EndpointTrait;
 use hammer_adapter::{
-    ComponentMetadata, DnsRouter as DnsRouterTrait, Inbound,
-    OutboundManager as OutboundManagerTrait, PlatformInterface, Router as RouterTrait, TunOptions,
+    ComponentMetadata, DnsRouter as DnsRouterTrait, EndpointManager as EndpointManagerTrait,
+    Inbound, OutboundManager as OutboundManagerTrait, PlatformInterface, Router as RouterTrait,
+    TunOptions,
 };
 use hammer_core::config::{InboundKind, TunInboundOptions, TunStack};
 use hammer_core::error::{HammerError, HammerResult};
@@ -14,7 +19,7 @@ use hammer_core::metrics::MetricsRegistry;
 
 use super::stack::*;
 
-use crate::{DnsRouter, OutboundManager, Router};
+use crate::{DnsRouter, EndpointManager, OutboundManager, Router};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
@@ -22,7 +27,7 @@ type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 type PlatformTunDevice = AsyncTunDevice;
 
-pub(crate) type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager>;
+pub(crate) type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
 
 #[hammer_component_macros::hammer_component(
     inbound,
@@ -31,11 +36,12 @@ pub(crate) type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManage
     runtime = RuntimeTunInbound,
     metrics = ("inbound", "tun")
 )]
-pub struct TunInbound<R, Q, O>
+pub struct TunInbound<R, Q, O, E>
 where
     R: RouterTrait + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
+    E: EndpointManagerTrait + 'static,
 {
     id: String,
     logger: Logger,
@@ -47,15 +53,27 @@ where
     metrics: Arc<MetricsRegistry>,
     tun_fd: Mutex<Option<i32>>,
     system_stack: Mutex<Option<Arc<SystemTunStack<PlatformTunDevice, R, Q, O>>>>,
-    #[cfg(feature = "ipstack")]
-    smoltcp_stack: Mutex<Option<Arc<SmoltcpTunDataStack<PlatformTunDevice, R, Q, O>>>>,
+    /// L3 endpoints registered for the TUN fast path. Populated by the
+    /// service builder via `set_endpoint_manager` before `start`. The
+    /// generic `E` matches the rest of the manager-injection style on this
+    /// component (`R / Q / O`) — `RuntimeTunInbound` fixes it to
+    /// `EndpointManager`, monomorphizing the dispatch.
+    #[cfg(feature = "endpoint")]
+    endpoint_manager: Mutex<Option<Arc<E>>>,
+    /// When the `endpoint` feature is off there's no endpoint manager to
+    /// store, but the generic `E` is still on the struct so callers don't
+    /// have to flip type parameters on a feature switch. `PhantomData`
+    /// keeps the compiler happy without consuming any space.
+    #[cfg(not(feature = "endpoint"))]
+    _endpoint_marker: PhantomData<E>,
 }
 
-impl<R, Q, O> TunInbound<R, Q, O>
+impl<R, Q, O, E> TunInbound<R, Q, O, E>
 where
     R: RouterTrait + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
+    E: EndpointManagerTrait + 'static,
 {
     pub fn new(
         id: impl Into<String>,
@@ -74,8 +92,10 @@ where
             metrics: MetricsRegistry::new(),
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
-            #[cfg(feature = "ipstack")]
-            smoltcp_stack: Mutex::new(None),
+            #[cfg(feature = "endpoint")]
+            endpoint_manager: Mutex::new(None),
+            #[cfg(not(feature = "endpoint"))]
+            _endpoint_marker: PhantomData,
         }
     }
 
@@ -122,13 +142,35 @@ where
             metrics,
             tun_fd: Mutex::new(None),
             system_stack: Mutex::new(None),
-            #[cfg(feature = "ipstack")]
-            smoltcp_stack: Mutex::new(None),
+            #[cfg(feature = "endpoint")]
+            endpoint_manager: Mutex::new(None),
+            #[cfg(not(feature = "endpoint"))]
+            _endpoint_marker: PhantomData,
         }
     }
 
     pub fn mtu(&self) -> u32 {
         self.options.mtu
+    }
+
+    /// Reports whether this TUN inbound runs the system stack (and would
+    /// therefore drain `Endpoint::ip_recv_take`). Used by the runtime
+    /// service to detect the unsupported "multiple system TUNs share one
+    /// endpoint" configuration without reaching into private fields.
+    #[cfg(feature = "endpoint")]
+    pub fn uses_system_stack(&self) -> bool {
+        matches!(self.options.stack, TunStack::System)
+    }
+
+    /// Inject the L3 endpoint manager. The TUN packet loop consults the
+    /// manager's `list()` at stack-start time to build its L3 fast path
+    /// (`L3DispatchTable`). Must be called before `start` to take effect.
+    #[cfg(feature = "endpoint")]
+    pub fn set_endpoint_manager(&self, manager: Arc<E>) {
+        *self
+            .endpoint_manager
+            .lock()
+            .expect("TunInbound endpoint_manager poisoned") = Some(manager);
     }
 
     fn open_tun(&self) -> HammerResult<()> {
@@ -144,28 +186,12 @@ where
         let Some(platform) = &self.platform else {
             return Ok(());
         };
-        #[cfg(not(feature = "ipstack"))]
-        if matches!(self.options.stack, TunStack::Smoltcp) {
-            return Err(HammerError::internal(
-                "TUN stack \"smoltcp\" requires hammer-runtime ipstack feature",
-            ));
-        }
-
         let options = self.platform_options()?;
         info!("opening TUN {}, mtu {}", options.name, options.mtu);
         let fd = platform.open_tun(options)?;
         let system_stack = self.build_system_stack(fd)?;
-        #[cfg(feature = "ipstack")]
-        let smoltcp_stack = self.build_smoltcp_stack(fd)?;
         *self.tun_fd.lock().expect("TunInbound fd poisoned") = Some(fd);
         *self.system_stack.lock().expect("TunInbound stack poisoned") = system_stack;
-        #[cfg(feature = "ipstack")]
-        {
-            *self
-                .smoltcp_stack
-                .lock()
-                .expect("TunInbound smoltcp stack poisoned") = smoltcp_stack;
-        }
         info!("opened TUN fd {fd}");
         Ok(())
     }
@@ -180,7 +206,6 @@ where
                 return Ok(None);
             }
             TunStack::System => {}
-            TunStack::Smoltcp => return Ok(None),
         }
         let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
             return Ok(None);
@@ -195,7 +220,7 @@ where
             debug!("TUN interface index unavailable; listener will not bind to TUN");
         }
         let device = unsafe { open_system_tun_device(dup_fd, mtu)? };
-        Ok(Some(Arc::new(SystemTunStack::new_with_interface_index(
+        let stack = SystemTunStack::new_with_interface_index(
             self.logger.clone(),
             Arc::clone(&self.router),
             Arc::clone(dns_router),
@@ -212,42 +237,28 @@ where
                 self.metrics
                     .scope(metrics.module, metrics.component_type, meta.id().to_owned())
             },
-        ))))
-    }
-
-    #[cfg(feature = "ipstack")]
-    fn build_smoltcp_stack(
-        &self,
-        fd: i32,
-    ) -> HammerResult<Option<Arc<SmoltcpTunDataStack<PlatformTunDevice, R, Q, O>>>> {
-        match self.options.stack {
-            TunStack::Disabled | TunStack::System => return Ok(None),
-            TunStack::Smoltcp => {}
+        );
+        // Wire in any L3 endpoints registered through the service builder.
+        // `set_endpoints` is a no-op on an empty list, and the dispatch table
+        // is built lazily inside `SystemTunStack::start`, so calling here
+        // before the stack is started is the correct sequencing.
+        #[cfg(feature = "endpoint")]
+        if let Some(manager) = self
+            .endpoint_manager
+            .lock()
+            .expect("TunInbound endpoint_manager poisoned")
+            .as_ref()
+        {
+            let endpoints: Vec<Arc<dyn EndpointTrait>> = manager
+                .list()
+                .into_iter()
+                .map(|comp| Arc::clone(comp.runtime()))
+                .collect();
+            if !endpoints.is_empty() {
+                stack.set_endpoints(endpoints);
+            }
         }
-        let (Some(dns_router), Some(outbound)) = (&self.dns_router, &self.outbound) else {
-            return Ok(None);
-        };
-        let dup_fd = duplicate_fd(fd)?;
-        let mtu = usize::try_from(self.options.mtu)
-            .map_err(|_| HammerError::internal("TUN MTU does not fit in usize"))?;
-        let device = unsafe { open_system_tun_device(dup_fd, mtu)? };
-        Ok(Some(Arc::new(SmoltcpTunDataStack::new_with_metrics(
-            self.logger.clone(),
-            Arc::clone(&self.router),
-            Arc::clone(dns_router),
-            Arc::clone(outbound),
-            self.id.clone(),
-            self.options.clone(),
-            device,
-            {
-                let meta = self.component_meta();
-                let metrics = meta
-                    .metrics()
-                    .expect("TunInbound component macro must declare metrics");
-                self.metrics
-                    .scope(metrics.module, metrics.component_type, meta.id().to_owned())
-            },
-        ))))
+        Ok(Some(Arc::new(stack)))
     }
 
     fn start_data_stack(&self) -> HammerResult<()> {
@@ -258,17 +269,6 @@ where
             .clone();
         if let Some(stack) = stack {
             stack.start()?;
-        }
-        #[cfg(feature = "ipstack")]
-        {
-            let stack = self
-                .smoltcp_stack
-                .lock()
-                .expect("TunInbound smoltcp stack poisoned")
-                .clone();
-            if let Some(stack) = stack {
-                stack.start()?;
-            }
         }
         Ok(())
     }
@@ -341,11 +341,12 @@ pub(crate) fn build_inbound(
     }
 }
 
-impl<R, Q, O> Lifecycle for TunInbound<R, Q, O>
+impl<R, Q, O, E> Lifecycle for TunInbound<R, Q, O, E>
 where
     R: RouterTrait + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
+    E: EndpointManagerTrait + 'static,
 {
     fn name(&self) -> &str {
         "inbound"
@@ -366,15 +367,6 @@ where
             .system_stack
             .lock()
             .expect("TunInbound stack poisoned")
-            .take()
-        {
-            stack.close();
-        }
-        #[cfg(feature = "ipstack")]
-        if let Some(stack) = self
-            .smoltcp_stack
-            .lock()
-            .expect("TunInbound smoltcp stack poisoned")
             .take()
         {
             stack.close();
@@ -414,10 +406,11 @@ unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> HammerResult<Arc<Platfo
     Ok(device)
 }
 
-impl<R, Q, O> Inbound for TunInbound<R, Q, O>
+impl<R, Q, O, E> Inbound for TunInbound<R, Q, O, E>
 where
     R: RouterTrait + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
+    E: EndpointManagerTrait + 'static,
 {
 }

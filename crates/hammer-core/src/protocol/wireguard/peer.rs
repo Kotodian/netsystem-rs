@@ -57,6 +57,10 @@ impl Peer {
         self.reserved
     }
 
+    pub fn allowed_ips(&self) -> &[IpNet] {
+        &self.allowed_ips
+    }
+
     /// Longest-prefix match against this peer's `allowed_ips`. Returns the
     /// matching prefix length so the caller can pick the most specific peer
     /// when multiple have overlapping ranges.

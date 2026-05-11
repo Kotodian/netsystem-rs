@@ -1,5 +1,8 @@
+#[cfg(feature = "endpoint-wireguard")]
+use hammer_runtime::protocol::endpoint::wireguard::WireguardEndpoint;
 use hammer_runtime::{
     dns::{DnsRouter, DnsTransportManager},
+    endpoints::EndpointManager,
     inbounds::InboundManager,
     outbounds::OutboundManager,
     protocol::{
@@ -8,17 +11,13 @@ use hammer_runtime::{
     route::Router,
 };
 
-#[cfg(feature = "endpoint")]
-use hammer_runtime::endpoints::EndpointManager;
-#[cfg(feature = "endpoint-wireguard")]
-use hammer_runtime::protocol::endpoint::wireguard::WireguardEndpoint;
-
 #[test]
 fn protocol_namespace_exposes_runtime_protocols() {
     let _ = std::any::type_name::<BlockOutbound>();
     let _ = std::any::type_name::<DirectOutbound>();
     let _ = std::any::type_name::<Hysteria2Outbound>();
-    let _ = std::any::type_name::<TunInbound<Router, DnsRouter, OutboundManager>>();
+    let _ =
+        std::any::type_name::<TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>>();
 
     #[cfg(feature = "endpoint-wireguard")]
     let _ = std::any::type_name::<WireguardEndpoint>();

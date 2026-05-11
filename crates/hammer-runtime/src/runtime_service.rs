@@ -14,12 +14,16 @@ use hammer_core::registry::RuntimeRegistry;
 use crate::EndpointManager;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
+#[cfg(feature = "endpoint")]
+use crate::protocol::tun::RuntimeTunInbound;
 use crate::spawn::DataRuntimeContext;
 use crate::{
     CertificateProviderManager, CertificateStore, ConnectionManager, ControlLogWriter,
     ControlThread, DnsRouter, DnsTransportManager, InboundManager, MetricSample, MetricsRegistry,
     NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
+#[cfg(feature = "endpoint")]
+use hammer_adapter::{EndpointManager as _, InboundManager as _};
 
 #[cfg(feature = "probe")]
 use hammer_adapter::ProbeProtocolComponent;
@@ -94,6 +98,8 @@ struct ServiceInner {
     network: Arc<NetworkManager>,
     dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
+    #[cfg(feature = "endpoint")]
+    endpoint: Arc<EndpointManager>,
     #[cfg(feature = "probe")]
     probe: Arc<ProbeManager>,
     /// Data-plane runtime that hosts every business future spawned via
@@ -168,15 +174,11 @@ impl RuntimeService {
             "certificate-provider",
         )));
         #[cfg(feature = "endpoint")]
-        let endpoint = if options.endpoints.is_empty() {
-            None
-        } else {
-            Some(Arc::new(EndpointManager::from_options_with_platform(
-                new_logger(&log_factory, "endpoint"),
-                &options.endpoints,
-                Arc::clone(&platform),
-            )?))
-        };
+        let endpoint = Arc::new(EndpointManager::from_options_with_platform(
+            new_logger(&log_factory, "endpoint"),
+            &options.endpoints,
+            Arc::clone(&platform),
+        )?);
         let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
             new_logger(&log_factory, "network"),
@@ -192,19 +194,11 @@ impl RuntimeService {
             Arc::clone(&platform),
             Arc::clone(&metrics),
         )?);
-        #[cfg(feature = "endpoint")]
-        {
-            if let Some(endpoint) = &endpoint {
-                for view in endpoint.outbound_view() {
-                    outbound.register_outbound(view)?;
-                }
-            }
-        }
         // Aggregate outbounds (urltest) need a `Weak<dyn OutboundManager>`
         // before any children can be looked up. Bind once here, after every
-        // potential child — including endpoint-backed outbounds above — has
-        // been registered, so the urltest's first dial / probe can resolve
-        // every declared id without races.
+        // declared outbound has been registered, so the urltest's first dial /
+        // probe can resolve every outbound child without races. Endpoint ids
+        // are route targets, not outbound views.
         outbound.bind_aggregates();
         let default_domain_resolver = options
             .route
@@ -226,6 +220,15 @@ impl RuntimeService {
             )
             .with_rules(&options.dns.rules)?,
         );
+        #[cfg(feature = "endpoint")]
+        let router = Arc::new(Router::from_options_with_metrics_and_endpoint_ids(
+            new_logger(&log_factory, "router"),
+            options.route.clone(),
+            Arc::clone(&outbound),
+            Arc::clone(&metrics),
+            options.endpoints.iter().map(|endpoint| endpoint.id.clone()),
+        )?);
+        #[cfg(not(feature = "endpoint"))]
         let router = Arc::new(Router::from_options_with_metrics(
             new_logger(&log_factory, "router"),
             options.route.clone(),
@@ -241,14 +244,47 @@ impl RuntimeService {
             Arc::clone(&platform),
             Arc::clone(&metrics),
         )?);
+        // Wire the EndpointManager into every TUN inbound *before* lifecycle
+        // Start so the packet loop's L3 fast path (`L3DispatchTable`) is built
+        // with the actual endpoint set rather than running with an empty
+        // dispatcher.
+        //
+        // The endpoint API exposes inbound packets via a one-shot
+        // `ip_recv_take()` — only one consumer can drain decrypted ingress.
+        // Wiring the same `EndpointManager` into multiple TUN stacks means
+        // whichever TUN starts first wins the receiver while the others
+        // can still drive egress, splitting reply paths across interfaces.
+        // Fail fast on this misconfiguration instead of silently degrading.
+        #[cfg(feature = "endpoint")]
+        {
+            let system_tuns: Vec<_> = inbound
+                .list()
+                .into_iter()
+                .filter(|comp| {
+                    comp.runtime()
+                        .as_any()
+                        .downcast_ref::<RuntimeTunInbound>()
+                        .is_some_and(RuntimeTunInbound::uses_system_stack)
+                })
+                .collect();
+            if !endpoint.list().is_empty() && system_tuns.len() > 1 {
+                return Err(HammerError::config_validation(format!(
+                    "multiple system TUN inbounds cannot share endpoints (found {})",
+                    system_tuns.len()
+                )));
+            }
+            for comp in inbound.list() {
+                if let Some(tun) = comp.runtime().as_any().downcast_ref::<RuntimeTunInbound>() {
+                    tun.set_endpoint_manager(Arc::clone(&endpoint));
+                }
+            }
+        }
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
 
         registry.set::<CertificateStore>(Arc::clone(&cert_store));
         registry.set::<CertificateProviderManager>(Arc::clone(&cert_provider));
         #[cfg(feature = "endpoint")]
-        if let Some(endpoint) = &endpoint {
-            registry.set::<EndpointManager>(Arc::clone(endpoint));
-        }
+        registry.set::<EndpointManager>(Arc::clone(&endpoint));
         registry.set::<NetworkManager>(Arc::clone(&network));
         registry.set::<DnsTransportManager>(Arc::clone(&dns_transport));
         registry.set::<OutboundManager>(Arc::clone(&outbound));
@@ -265,9 +301,7 @@ impl RuntimeService {
             cert_provider as Arc<dyn Lifecycle>,
         ];
         #[cfg(feature = "endpoint")]
-        if let Some(endpoint) = endpoint {
-            lifecycles.push(endpoint as Arc<dyn Lifecycle>);
-        }
+        lifecycles.push(Arc::clone(&endpoint) as Arc<dyn Lifecycle>);
         lifecycles.extend([
             Arc::clone(&network) as Arc<dyn Lifecycle>,
             dns_transport as Arc<dyn Lifecycle>,
@@ -297,6 +331,8 @@ impl RuntimeService {
                 network,
                 dns_router,
                 outbound,
+                #[cfg(feature = "endpoint")]
+                endpoint,
                 #[cfg(feature = "probe")]
                 probe,
                 data_runtime: Some(data_runtime),
@@ -447,6 +483,8 @@ impl RuntimeService {
             // stale cached_client survives every network reset and the next
             // dial blocks on the dead QUIC connection's max_idle_timeout.
             inner.outbound.reset_network();
+            #[cfg(feature = "endpoint")]
+            inner.endpoint.reset_network();
             inner.dns_router.reset_network();
             inner.outbound.ensure_connected();
         });

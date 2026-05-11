@@ -1,14 +1,7 @@
-//! TUN module. Two largely independent pieces live here:
-//!
-//! * `inbound` (gated on `inbound-tun`) — the `TunInbound` lifecycle, the
-//!   kernel TUN device adapters, and the system-socket-based packet-routing
-//!   stack. This is what the iOS NetExt actually consumes.
-//! * `ipstack` (gated on `ipstack`) — a generic smoltcp user-space TCP/IP
-//!   stack, fed by an mpsc channel. Currently used by the WireGuard outbound;
-//!   the TUN inbound's smoltcp mode will share it once it lands.
-
-#[cfg(feature = "ipstack")]
-pub use hammer_core::protocol::ipstack;
+//! TUN inbound. `TunInbound` owns the kernel TUN device adapters and the
+//! system-socket packet-routing stack consumed by the iOS NetExt; L3 endpoint
+//! protocols (WireGuard etc.) are dispatched through `Endpoint::ip_send` via
+//! the packet loop's `L3DispatchTable`.
 
 #[cfg(feature = "inbound-tun")]
 pub mod stack;

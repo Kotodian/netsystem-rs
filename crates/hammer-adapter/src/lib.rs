@@ -42,5 +42,5 @@ pub use platform::{
 };
 pub use probe::{ProbeProtocol, ProbeProtocolComponent, ProbeReport};
 pub use router::Router;
-pub use rule::{HeadlessRule, RouteDecision, RouteMetadata, Rule, SocksAddr};
+pub use rule::{HeadlessRule, RouteDecision, RouteMetadata, RouteTarget, Rule, SocksAddr};
 pub use service::ServiceManager;
