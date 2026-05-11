@@ -28,9 +28,9 @@ default = [
     "hammer-runtime/probe",
 ]
 # Generic endpoint config/service wiring; required by endpoint-style protocols.
-endpoint = ["hammer-core/endpoint", "hammer-runtime/endpoint"]
+endpoint = ["hammer-core/ipstack", "hammer-runtime/endpoint"]
 # WireGuard endpoint stack. Opt-in.
-wireguard = ["endpoint", "hammer-core/wireguard", "hammer-runtime/endpoint-wireguard"]
+wireguard = ["endpoint", "hammer-core/ipstack-wireguard", "hammer-runtime/endpoint-wireguard"]
 # Hysteria2 outbound. Opt-in.
 hysteria2 = ["hammer-runtime/outbound-hysteria2"]
 

@@ -26,7 +26,7 @@ default = [
 probe = ["dep:socket2"]
 inbound-tun = ["dep:libc", "dep:tun-rs"]
 outbound-hysteria2 = [
-    "hammer-core/outbound-hysteria2",
+    "hammer-core/hysteria2",
     "dep:base64",
     "dep:blake2",
     "dep:futures",
@@ -70,12 +70,12 @@ dns-hosts = []
 dns-local = []
 # Enables the generic endpoint domain. Concrete endpoint protocols opt into
 # this parent feature.
-endpoint = ["hammer-core/endpoint"]
+endpoint = ["hammer-core/ipstack"]
 # Enables the WireGuard endpoint module. Pulls in the matching config feature
 # in hammer-core. Off by default to keep the iOS xcframework slim.
 endpoint-wireguard = [
     "endpoint",
-    "hammer-core/wireguard",
+    "hammer-core/ipstack-wireguard",
     "ipstack",
     "dep:boringtun",
     "dep:socket2",

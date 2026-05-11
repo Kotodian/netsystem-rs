@@ -15,10 +15,10 @@ use crate::error::HammerError;
 
 use super::constants as C;
 use super::raw_struct;
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 use super::raw_struct_with_default_check;
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 raw_struct_with_default_check! {
     pub struct RawHysteria2Config {
         /// Outbound id used by route rules.
@@ -67,7 +67,7 @@ raw_struct_with_default_check! {
     }
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 raw_struct_with_default_check! {
     pub struct RawHysteria2Obfs {
         /// Obfuscation type.
@@ -118,7 +118,7 @@ raw_struct! {
 #[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
 pub enum RawOutbound {
-    #[cfg(feature = "outbound-hysteria2")]
+    #[cfg(feature = "hysteria2")]
     Hysteria2(RawHysteria2Config),
     Direct(RawDirectOutboundConfig),
     Block(RawBlockOutboundConfig),
@@ -134,7 +134,7 @@ pub struct Outbound {
 impl Outbound {
     pub fn type_name(&self) -> &'static str {
         match &self.kind {
-            #[cfg(feature = "outbound-hysteria2")]
+            #[cfg(feature = "hysteria2")]
             OutboundKind::Hysteria2(_) => C::TYPE_HYSTERIA2,
             OutboundKind::Direct(_) => C::TYPE_DIRECT,
             OutboundKind::Block => C::TYPE_BLOCK,
@@ -146,7 +146,7 @@ impl Outbound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum OutboundKind {
-    #[cfg(feature = "outbound-hysteria2")]
+    #[cfg(feature = "hysteria2")]
     Hysteria2(Hysteria2OutboundOptions),
     Direct(DirectOutboundOptions),
     Block,
@@ -164,7 +164,7 @@ pub struct UrltestOutboundOptions {
     pub timeout: Duration,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hysteria2OutboundOptions {
     pub server: String,
@@ -186,7 +186,7 @@ pub struct Hysteria2OutboundOptions {
     pub obfs: Option<Hysteria2Obfs>,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2Network {
@@ -194,7 +194,7 @@ pub enum Hysteria2Network {
     Udp,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 impl Hysteria2Network {
     pub fn name(self) -> &'static str {
         match self {
@@ -204,7 +204,7 @@ impl Hysteria2Network {
     }
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Hysteria2BbrProfile {
@@ -214,7 +214,7 @@ pub enum Hysteria2BbrProfile {
     Aggressive,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 impl Hysteria2BbrProfile {
     pub fn name(self) -> &'static str {
         match self {
@@ -225,7 +225,7 @@ impl Hysteria2BbrProfile {
     }
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OutboundTlsOptions {
     pub enabled: bool,
@@ -233,14 +233,14 @@ pub struct OutboundTlsOptions {
     pub insecure: bool,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hysteria2Obfs {
     pub type_: Hysteria2ObfsType,
     pub password: String,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Hysteria2ObfsType {
@@ -248,7 +248,7 @@ pub enum Hysteria2ObfsType {
     Salamander,
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 impl Hysteria2ObfsType {
     pub fn name(self) -> &'static str {
         match self {
@@ -265,7 +265,7 @@ pub struct DirectOutboundOptions {
 /// Build the runtime outbound list from the parsed Hysteria2 section. Direct
 /// is always synthesized so the DNS subsystem (and any future "fall back to
 /// direct" rule) has a stable id to dial through.
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 pub(super) fn build_outbounds(
     hysteria: Hysteria2OutboundOptions,
     hysteria_id: String,
@@ -296,7 +296,7 @@ pub(super) fn build_declared_outbounds(
     let mut outbounds = Vec::new();
     for (idx, raw) in raw.into_iter().enumerate() {
         let outbound = match raw {
-            #[cfg(feature = "outbound-hysteria2")]
+            #[cfg(feature = "hysteria2")]
             RawOutbound::Hysteria2(raw) => {
                 let (options, id) = build_hysteria_options(raw)?;
                 Outbound {
@@ -471,7 +471,7 @@ pub(super) fn ensure_direct_outbound(outbounds: &mut Vec<Outbound>) {
     });
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 pub(super) fn build_hysteria_options(
     mut raw: RawHysteria2Config,
 ) -> Result<(Hysteria2OutboundOptions, String), HammerError> {
@@ -548,7 +548,7 @@ pub(super) fn build_hysteria_options(
     ))
 }
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 fn build_obfs(raw: RawHysteria2Obfs) -> Result<Option<Hysteria2Obfs>, HammerError> {
     if raw.type_.is_none() && raw.password.is_empty() {
         return Ok(None);

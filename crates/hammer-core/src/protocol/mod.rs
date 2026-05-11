@@ -1,6 +1,6 @@
 pub mod dns;
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(feature = "hysteria2")]
 pub mod hysteria2;
 
 #[cfg(feature = "ipstack")]

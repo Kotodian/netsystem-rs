@@ -9,19 +9,18 @@ name = "hammer_core"
 
 [features]
 default = []
-# Enables Hysteria2 outbound config schema (`[hysteria2]` and
-# `type = "hysteria2"`). Off by default for slim builds that only need
-# direct/block/urltest config.
-outbound-hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
-# Enables the generic `[[endpoints]]` config section. Concrete endpoint
-# protocols opt into this parent feature.
-endpoint = []
-# Enables WireGuard endpoint config schema (`[[endpoints]]` with
-# `type = "wireguard"`). Off by default to keep iOS xcframework builds slim
-# for users who only need hysteria2; opt in with `--features wireguard`.
-wireguard = ["endpoint", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
+# Enables Hysteria2 protocol/config schema (`[hysteria2]` and
+# `type = "hysteria2"`). The runtime outbound component has its own
+# `outbound-hysteria2` feature.
+hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
+# Enables WireGuard protocol/config schema on top of the IP stack
+# (`[[endpoints]]` with `type = "wireguard"`). The runtime endpoint component
+# has its own `endpoint-wireguard` feature.
+ipstack-wireguard = ["ipstack", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
 # Generic user-space TCP/IP stack protocol machinery shared by runtime
-# components such as WireGuard.
+# components such as WireGuard. Also gates the core `[[endpoints]]` config
+# shape that feeds IP-stack protocols; endpoint lifecycle/manager wiring lives
+# in hammer-runtime.
 ipstack = ["dep:bytes", "dep:smoltcp", "dep:rustc-hash"]
 
 [dependencies]

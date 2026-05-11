@@ -1,8 +1,8 @@
-#![cfg(feature = "outbound-hysteria2")]
+#![cfg(feature = "hysteria2")]
 
 use std::time::Duration;
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 use hammer_core::config::EndpointKind;
 
 use hammer_core::config::{
@@ -578,7 +578,7 @@ fn parse_config_rejects_unknown_dns_via() {
     );
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
     let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
@@ -591,7 +591,7 @@ fn parse_config_rejects_endpoint_id_that_duplicates_outbound_id() {
     );
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_accepts_urltest_child_that_is_endpoint_id() {
     let cfg = format!(
@@ -632,7 +632,7 @@ final = "auto"
     assert_eq!(urltest.outbounds, vec!["wg-out", "direct"]);
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_accepts_endpoint_only_wireguard_without_legacy_hysteria() {
     let cfg = format!(
@@ -697,19 +697,19 @@ fn assert_rule_action(action: &RuleActionKind, want: &'static str) {
 }
 
 // `BASE64(0x01 * 32)` — placeholder Curve25519 private key for parser tests.
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 const TEST_WG_PRIVATE_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
 // `BASE64(0x02 * 32)` — placeholder peer public key.
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 const TEST_WG_PEER_PUBLIC_KEY: &str = "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=";
 // `BASE64(0x03 * 32)` — placeholder pre-shared key.
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 const TEST_WG_PSK: &str = "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=";
 
 // `extra` is appended after the built-in peer so that callers can tack on
 // further `[[endpoints.peers]]` blocks without violating TOML's "table headers
 // terminate the previous table" rule.
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 fn wg_endpoint_block(extra: &str) -> String {
     format!(
         r#"
@@ -731,7 +731,7 @@ persistent_keepalive_interval = 25
     )
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_accepts_wireguard_endpoint() {
     let cfg = format!("{MINIMAL_CONFIG}\n{}", wg_endpoint_block(""));
@@ -757,7 +757,7 @@ fn parse_config_accepts_wireguard_endpoint() {
     assert_eq!(peer.reserved, [0, 0, 0]);
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_supports_multi_peer_wireguard() {
     let cfg = format!(
@@ -780,7 +780,7 @@ allowed_ips = ["192.168.0.0/16", "fd00::/8"]
     assert!(wg.peers[1].persistent_keepalive.is_none());
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_round_trips_wireguard_pre_shared_key_and_reserved() {
     let cfg = format!(
@@ -813,7 +813,7 @@ reserved = [255, 0, 128]
     assert_eq!(wg.peers[0].reserved, [255, 0, 128]);
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_without_id() {
     let cfg = format!(
@@ -823,7 +823,7 @@ fn parse_config_rejects_wireguard_without_id() {
     assert!(err.to_string().contains("endpoints[0].id"), "got {err:?}");
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_without_peers() {
     let cfg = format!(
@@ -836,7 +836,7 @@ fn parse_config_rejects_wireguard_without_peers() {
     );
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_invalid_base64_key() {
     let cfg = format!(
@@ -846,7 +846,7 @@ fn parse_config_rejects_wireguard_invalid_base64_key() {
     assert!(err.to_string().contains("endpoints[0]"), "got {err:?}");
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_peer_with_hostname_endpoint() {
     let cfg = format!(
@@ -856,7 +856,7 @@ fn parse_config_rejects_wireguard_peer_with_hostname_endpoint() {
     assert!(err.to_string().contains("IP literal"), "got {err:?}");
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "ipstack-wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_peer_with_zero_port() {
     let cfg = format!(
@@ -869,7 +869,7 @@ fn parse_config_rejects_wireguard_peer_with_zero_port() {
     );
 }
 
-#[cfg(feature = "endpoint")]
+#[cfg(feature = "ipstack")]
 #[test]
 fn parse_config_default_endpoints_is_empty() {
     let options = config::parse_config(MINIMAL_CONFIG).expect("parse");

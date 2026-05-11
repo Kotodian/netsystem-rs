@@ -1,4 +1,4 @@
-#![cfg(not(feature = "outbound-hysteria2"))]
+#![cfg(not(feature = "hysteria2"))]
 
 use hammer_core::config::{self, OutboundKind};
 use indoc::indoc;
