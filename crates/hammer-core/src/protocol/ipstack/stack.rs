@@ -39,14 +39,18 @@ use crate::log::Logger;
 
 use super::device::ChannelDevice;
 
-/// Per-TCP-socket smoltcp ring buffer size. 64 KiB matches a typical Linux
-/// SO_RCVBUF default and is plenty for the bursty HTTP/QUIC payloads we expect
-/// to multiplex over an IP carrier.
-const TCP_BUF: usize = 64 * 1024;
+/// Per-TCP-socket smoltcp ring buffer size. This is the advertised TCP window,
+/// so 64 KiB caps one flow at roughly 10 Mbps over a 50 ms path. 256 KiB keeps
+/// iOS memory use bounded while giving mobile/WG paths enough window to reach
+/// the native-WireGuard range without requiring many parallel streams.
+const TCP_BUF: usize = 256 * 1024;
+/// Bridge-side read chunk. Keep it smaller than the TCP ring so larger socket
+/// windows do not pin an extra 256 KiB BytesMut in every bridge task.
+const TCP_BRIDGE_READ_BUF: usize = 64 * 1024;
 /// Hard ceiling on how long a TCP bridge task may sit completely idle (no
 /// user-side traffic and no inbound from smoltcp) before we tear it down.
 /// Defensive backstop against an upstream that forgot to drop a stream:
-/// without this each forgotten connection holds ~256 KiB (smoltcp rx/tx
+/// without this each forgotten connection holds well under 1 MiB (smoltcp rx/tx
 /// rings + the bridge's `BytesMut` + the duplex tail), which is what causes
 /// the NetExt to drift up under sustained traffic. Keep it near common HTTP
 /// keepalive windows so idle browser connections are recycled quickly while
@@ -55,7 +59,7 @@ const TCP_BRIDGE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Tighter idle timeout that kicks in once the user side has signalled EOF
 /// (`Ok(0)` from `read_buf`). After EOF the bridge is just draining the
 /// remaining inbound from smoltcp and waiting for the actor to reap the
-/// socket; on a slow peer FIN we'd otherwise sit on ~256 KiB per stream for
+/// socket; on a slow peer FIN we'd otherwise sit on most of that per stream for
 /// the full 60 s active-keepalive window. Aligns with sing-box's generic
 /// `TCPTimeout = 15 s` (`constant/timeout.go`) so TLS shutdown / HTTP/2
 /// GOAWAY / application graceful-close still have room to finish.
@@ -1029,7 +1033,7 @@ async fn tcp_bridge_task(
     // `read_buf` writes straight into the BytesMut without going through a
     // local stack buffer, and `split().freeze()` turns each chunk into an
     // owned `Bytes` we can ship across the actor boundary without memcpy.
-    let mut buf = BytesMut::with_capacity(TCP_BUF);
+    let mut buf = BytesMut::with_capacity(TCP_BRIDGE_READ_BUF);
     let mut user_write_open = true;
     loop {
         // Once the user has signalled write-EOF the bridge is purely draining
@@ -1060,7 +1064,7 @@ async fn tcp_bridge_task(
                         let chunk = buf.split().freeze();
                         // `split` leaves the BytesMut empty; reserve so the
                         // next read has somewhere to land without growing.
-                        buf.reserve(TCP_BUF);
+                        buf.reserve(TCP_BRIDGE_READ_BUF);
                         let (ack_tx, ack_rx) = oneshot::channel();
                         if event_tx
                             .send(SocketEvent::TcpWrite {
@@ -1186,7 +1190,19 @@ mod tests {
     fn tcp_bridge_idle_timeout_stays_within_netext_memory_budget() {
         assert!(
             TCP_BRIDGE_IDLE_TIMEOUT <= Duration::from_secs(60),
-            "idle TCP bridge timeout retains about 256 KiB per keepalive connection"
+            "idle TCP bridge timeout retains most of a MiB per keepalive connection"
+        );
+    }
+
+    #[test]
+    fn tcp_socket_window_supports_mobile_wireguard_throughput() {
+        assert!(
+            TCP_BUF >= 256 * 1024,
+            "smoltcp's advertised TCP window is the single-flow throughput cap"
+        );
+        assert!(
+            TCP_BRIDGE_READ_BUF <= 64 * 1024,
+            "bridge read scratch should stay small after increasing TCP window"
         );
     }
 
