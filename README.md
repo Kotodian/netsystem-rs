@@ -143,7 +143,7 @@ DNS 路由匹配 (按域名规则、带 LRU)
 cargo feature 分四组：
 
 - **入口**：`inbound-tun`（默认开）。
-- **出口**：`outbound-hysteria2 / outbound-direct / outbound-block / outbound-urltest`（默认全开），`wireguard`（默认关，iOS xcframework 默认不带，省体积）。
+- **出口**：`outbound-hysteria2 / outbound-direct / outbound-block / outbound-urltest`（默认全开）；WireGuard 是 endpoint 协议，runtime feature 为 `endpoint-wireguard`（默认关，iOS xcframework 默认不带，省体积）。
 - **DNS**：`dns-udp / dns-tcp / dns-hosts / dns-local`（默认开），`dns-https`（默认关）。
 - **基础设施**：`endpoint`（endpoint 协议的公共依赖）、`ipstack`（user-space IP 栈）、`probe`（出口延迟探测，默认开）。
 
@@ -231,7 +231,7 @@ final = "proxy"
 auto_detect_interface = true
 ```
 
-**例 2 —— WireGuard endpoint（需启用 `wireguard` feature，对应 production demo）**
+**例 2 —— WireGuard endpoint（runtime 需启用 `endpoint-wireguard`；FFI/打包入口仍可用 `wireguard` feature，对应 production demo）**
 
 ```toml
 [log]

@@ -68,7 +68,7 @@ pub mod tun {
     pub use crate::protocol::tun::*;
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 pub mod wireguard {
     pub use crate::protocol::endpoint::wireguard::*;
 }

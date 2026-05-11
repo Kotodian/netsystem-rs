@@ -13,23 +13,23 @@ use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
 use crate::RuntimePlatform;
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 use crate::component_registry::register_components;
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 pub(crate) type EndpointViews = (EndpointComponent, OutboundComponent);
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 pub(crate) type EndpointBuilder =
     fn(Logger, &EndpointOptions, Option<Arc<dyn PlatformInterface>>) -> HammerResult<EndpointViews>;
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 #[derive(Clone)]
 struct EndpointFactorySet {
     builders: Arc<HashMap<&'static str, EndpointBuilder>>,
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 impl EndpointFactorySet {
     fn standard() -> Self {
         let mut builders = HashMap::new();
@@ -53,7 +53,7 @@ impl EndpointFactorySet {
     }
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 fn register_standard_endpoint_builders(builders: &mut HashMap<&'static str, EndpointBuilder>) {
     register_components!(
         endpoint,
@@ -63,7 +63,7 @@ fn register_standard_endpoint_builders(builders: &mut HashMap<&'static str, Endp
 }
 
 pub struct EndpointManager {
-    #[cfg_attr(not(feature = "wireguard"), allow(dead_code))]
+    #[cfg_attr(not(feature = "endpoint-wireguard"), allow(dead_code))]
     logger: Logger,
     items: Mutex<HashMap<String, EndpointComponent>>,
     /// Same set of endpoints as `items`, but viewed through their `Outbound`
@@ -71,7 +71,7 @@ pub struct EndpointManager {
     /// `Outbound` registration so the router can resolve the id through
     /// `OutboundManager::get` exactly like any other outbound.
     outbound_view: Mutex<Vec<OutboundComponent>>,
-    #[cfg(feature = "wireguard")]
+    #[cfg(feature = "endpoint-wireguard")]
     factories: EndpointFactorySet,
 }
 
@@ -81,7 +81,7 @@ impl EndpointManager {
             logger,
             items: Mutex::new(HashMap::new()),
             outbound_view: Mutex::new(Vec::new()),
-            #[cfg(feature = "wireguard")]
+            #[cfg(feature = "endpoint-wireguard")]
             factories: EndpointFactorySet::standard(),
         }
     }
@@ -108,13 +108,13 @@ impl EndpointManager {
         platform: Option<Arc<dyn PlatformInterface>>,
     ) -> HammerResult<Self> {
         let manager = Self::new(logger);
-        #[cfg(not(feature = "wireguard"))]
+        #[cfg(not(feature = "endpoint-wireguard"))]
         for _ in options {
             return Err(HammerError::config_validation(
                 "no endpoint protocols are enabled",
             ));
         }
-        #[cfg(feature = "wireguard")]
+        #[cfg(feature = "endpoint-wireguard")]
         for option in options {
             let (endpoint_view, outbound_view) = manager.factories.build(
                 manager.logger.clone(),
@@ -136,7 +136,7 @@ impl EndpointManager {
                 .expect("EndpointManager poisoned")
                 .push(outbound_view);
         }
-        #[cfg(not(feature = "wireguard"))]
+        #[cfg(not(feature = "endpoint-wireguard"))]
         let _ = platform;
         Ok(manager)
     }

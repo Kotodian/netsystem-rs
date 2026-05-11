@@ -57,7 +57,7 @@ pub(crate) fn register_inbound_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 pub(crate) trait EndpointComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -68,7 +68,7 @@ pub(crate) trait EndpointComponentDeclaration {
     ) -> hammer_core::error::HammerResult<crate::endpoints::EndpointViews>;
 }
 
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 pub(crate) fn register_endpoint_component<C>(
     builders: &mut HashMap<&'static str, crate::endpoints::EndpointBuilder>,
 ) where

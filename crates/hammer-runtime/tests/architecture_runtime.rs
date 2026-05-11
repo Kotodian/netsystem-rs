@@ -10,7 +10,7 @@ use hammer_runtime::{
 
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointManager;
-#[cfg(feature = "wireguard")]
+#[cfg(feature = "endpoint-wireguard")]
 use hammer_runtime::protocol::endpoint::wireguard::WireguardEndpoint;
 
 #[test]
@@ -20,7 +20,7 @@ fn protocol_namespace_exposes_runtime_protocols() {
     let _ = std::any::type_name::<Hysteria2Outbound>();
     let _ = std::any::type_name::<TunInbound<Router, DnsRouter, OutboundManager>>();
 
-    #[cfg(feature = "wireguard")]
+    #[cfg(feature = "endpoint-wireguard")]
     let _ = std::any::type_name::<WireguardEndpoint>();
 }
 
