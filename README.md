@@ -160,53 +160,9 @@ iOS 的 path-update / wake 事件应当触发一次网络重置——它会扇�
 
 ### 配置示例
 
-格式是 **TOML**。下面 3 个例子从最小到典型递进，字段名与 production demo（`HammerVPNDemo-rs-wg`）对齐。
+格式是 **TOML**。下面三个例子按典型出口拆开，每个都带完整的 DNS 分流规则，字段名与 production demo（`HammerVPNDemo-rs-wg`）对齐。
 
-**例 1 —— 最小（一个 hysteria2 出口，全流量走它）**
-
-```toml
-[log]
-level = "info"
-
-[[inbounds]]
-type = "tun"
-id = "tun"
-interface_name = "utun"
-address = ["172.19.0.1/30"]
-route_address = ["0.0.0.0/0"]
-mtu = 1408
-stack = "system"
-auto_route = true
-sniff = true
-hijack_dns = true
-
-[dns]
-final = "default"
-strategy = "ipv4_only"
-
-[[dns.servers]]
-type = "udp"
-id = "default"
-server = "223.5.5.5"
-via = "proxy"
-
-[[outbounds]]
-type = "hysteria2"
-id = "proxy"
-server = "example.com"
-server_port = 443
-password = "demo"
-
-[[outbounds]]
-type = "direct"
-id = "direct"
-
-[route]
-final = "proxy"
-auto_detect_interface = true
-```
-
-**例 2 —— 分流（拦截广告 / 国内直连 / 默认走代理，DNS 同步分流）**
+**例 1 —— Hysteria2 代理（默认走代理 + 国内直连 + 拦截广告 + DNS 同步分流）**
 
 ```toml
 [log]
@@ -275,7 +231,7 @@ final = "proxy"
 auto_detect_interface = true
 ```
 
-**例 3 —— WireGuard endpoint（需启用 `wireguard` feature，对应 production demo）**
+**例 2 —— WireGuard endpoint（需启用 `wireguard` feature，对应 production demo）**
 
 ```toml
 [log]
@@ -331,11 +287,67 @@ id = "direct"
 type = "block"
 id = "block"
 
-[route]
-final = "wg-out"
-auto_detect_interface = true
-
 [[route.rules]]
 domain_suffix = ["ifconfig.so"]
 outbound = "direct"
+
+[route]
+final = "wg-out"
+auto_detect_interface = true
+```
+
+**例 3 —— Direct 直连（不挂代理；本地域名走 local 解析、广告关键词拦截）**
+
+```toml
+[log]
+level = "info"
+
+[[inbounds]]
+type = "tun"
+id = "tun"
+interface_name = "utun"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+mtu = 1408
+stack = "system"
+auto_route = true
+sniff = true
+hijack_dns = true
+
+[dns]
+final = "default"
+strategy = "ipv4_only"
+
+[[dns.servers]]
+type = "udp"
+id = "default"
+server = "223.5.5.5"
+
+[[dns.servers]]
+type = "local"
+id = "local"
+
+[[dns.rules]]
+domain_suffix = [".lan", ".local"]
+server = "local"
+
+[[dns.rules]]
+domain_keyword = ["doubleclick", "analytics"]
+action = "reject"
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "block"
+id = "block"
+
+[[route.rules]]
+domain_keyword = ["doubleclick", "analytics"]
+outbound = "block"
+
+[route]
+final = "direct"
+auto_detect_interface = true
 ```
