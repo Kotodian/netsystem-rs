@@ -1,10 +1,10 @@
 //! WireGuard endpoint.
 //!
-//! Mirrors sing-box's split between an outer `protocol/wireguard.Endpoint`
+//! Mirrors sing-box's split between an outer WireGuard endpoint
 //! (which the router dials into via `DialContext`) and an inner
 //! `transport/wireguard` device that owns the gVisor stack + wireguard-go
-//! runtime. Hammer's stack equivalent is `wireguard::stack` (smoltcp) +
-//! `wireguard::transport` (boringtun + UDP); this module ties them together
+//! runtime. Hammer's stack equivalent is `ipstack` (smoltcp) +
+//! `ipstack::wireguard::transport` (boringtun + UDP); this module ties them together
 //! into the public `Outbound`/`Endpoint` surface and the lifecycle.
 //!
 //! A handful of helpers (mtu/peers/route_outbound/encapsulate_buffer) are only
@@ -33,9 +33,9 @@ use hammer_core::config::{EndpointKind, WireguardEndpointOptions};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
+use hammer_core::protocol::ipstack::wireguard::WIREGUARD_OVERHEAD;
+use hammer_core::protocol::ipstack::wireguard::peer::{self, Peer};
 use hammer_core::protocol::ipstack::{IpStackHandles, IpStackInput, UdpHandle, spawn_ipstack};
-use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
 
 use super::transport::{self, TransportHandles};
 use crate::socket_protector::SocketProtector;

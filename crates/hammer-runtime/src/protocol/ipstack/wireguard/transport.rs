@@ -33,8 +33,8 @@ use tokio::time::{self, MissedTickBehavior};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::ipstack::IpStackInput;
-use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
+use hammer_core::protocol::ipstack::wireguard::WIREGUARD_OVERHEAD;
+use hammer_core::protocol::ipstack::wireguard::peer::{self, Peer};
 
 use crate::socket_protector::SocketProtector;
 
