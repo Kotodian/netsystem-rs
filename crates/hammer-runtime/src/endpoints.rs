@@ -8,8 +8,6 @@ use hammer_adapter::{
 };
 #[cfg(feature = "endpoint")]
 use hammer_core::config::Endpoint as EndpointOptions;
-#[cfg(feature = "wireguard")]
-use hammer_core::config::EndpointKind;
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
@@ -22,12 +20,8 @@ use crate::component_registry::register_components;
 pub(crate) type EndpointViews = (EndpointComponent, OutboundComponent);
 
 #[cfg(feature = "wireguard")]
-pub(crate) type EndpointBuilder = fn(
-    Logger,
-    String,
-    &EndpointKind,
-    Option<Arc<dyn PlatformInterface>>,
-) -> HammerResult<EndpointViews>;
+pub(crate) type EndpointBuilder =
+    fn(Logger, &EndpointOptions, Option<Arc<dyn PlatformInterface>>) -> HammerResult<EndpointViews>;
 
 #[cfg(feature = "wireguard")]
 #[derive(Clone)]
@@ -55,7 +49,7 @@ impl EndpointFactorySet {
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown endpoint type: {type_name}"))
         })?;
-        builder(logger, option.id.clone(), &option.kind, platform)
+        builder(logger, option, platform)
     }
 }
 

@@ -742,10 +742,10 @@ fn parse_config_accepts_wireguard_endpoint() {
     assert_eq!(endpoint.type_name(), "wireguard");
     let EndpointKind::Wireguard(wg) = &endpoint.kind;
     assert_eq!(wg.private_key, [1u8; 32]);
-    assert_eq!(wg.mtu, 1408);
+    assert_eq!(endpoint.interface.mtu, 1408);
     assert_eq!(wg.listen_port, 0);
-    assert_eq!(wg.address.len(), 1);
-    assert_eq!(wg.address[0].to_string(), "10.66.0.2/32");
+    assert_eq!(endpoint.interface.address.len(), 1);
+    assert_eq!(endpoint.interface.address[0].to_string(), "10.66.0.2/32");
     assert_eq!(wg.peers.len(), 1);
     let peer = &wg.peers[0];
     assert_eq!(peer.public_key, [2u8; 32]);
@@ -805,7 +805,10 @@ reserved = [255, 0, 128]
     let options = config::parse_config(&cfg).expect("parse");
     let EndpointKind::Wireguard(wg) = &options.endpoints[0].kind;
     assert_eq!(wg.listen_port, 12345);
-    assert_eq!(wg.mtu, 1408, "mtu defaults to sing-box's 1408 when omitted");
+    assert_eq!(
+        options.endpoints[0].interface.mtu, 1408,
+        "mtu defaults to sing-box's 1408 when omitted"
+    );
     assert_eq!(wg.peers[0].pre_shared_key, Some([3u8; 32]));
     assert_eq!(wg.peers[0].reserved, [255, 0, 128]);
 }

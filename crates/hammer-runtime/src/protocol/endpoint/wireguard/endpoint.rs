@@ -29,7 +29,7 @@ use hammer_adapter::{
     Endpoint, Lifecycle, Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn,
     ProxyStream, SocksAddr,
 };
-use hammer_core::config::{EndpointKind, WireguardEndpointOptions};
+use hammer_core::config::{Endpoint as EndpointOptions, EndpointKind, WireguardEndpointOptions};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
@@ -38,6 +38,7 @@ use hammer_core::protocol::ipstack::wireguard::peer::{self, Peer};
 use hammer_core::protocol::ipstack::{IpStackHandles, IpStackInput, UdpHandle, spawn_ipstack};
 
 use super::transport::{self, TransportHandles};
+use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 
 /// Endpoint backed by WireGuard. Its `Tunn` state machines and smoltcp stack
@@ -59,29 +60,33 @@ pub struct WireguardEndpoint {
     addresses: Vec<IpNet>,
     peers: Arc<Vec<Peer>>,
     protector: SocketProtector,
-    inner: Mutex<EndpointState>,
+    inner: Mutex<WireguardState>,
     #[cfg(test)]
     fail_next_start: AtomicBool,
 }
 
-struct EndpointRuntime {
+struct WireguardRuntime {
     transport: TransportHandles,
     stack: Arc<IpStackHandles>,
 }
 
-enum EndpointState {
+enum WireguardState {
     Idle,
-    Running(EndpointRuntime),
+    Running(WireguardRuntime),
     Closed,
 }
 
 impl WireguardEndpoint {
     fn new(
         logger: Logger,
-        id: String,
-        options: WireguardEndpointOptions,
+        options: EndpointRuntimeOptions<WireguardEndpointOptions>,
         protector: SocketProtector,
     ) -> Self {
+        let EndpointRuntimeOptions {
+            id,
+            interface,
+            protocol: options,
+        } = options;
         let private_key = x25519::StaticSecret::from(options.private_key);
         let peers: Vec<Peer> = options
             .peers
@@ -94,12 +99,12 @@ impl WireguardEndpoint {
             id,
             networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
-            mtu: options.mtu,
+            mtu: interface.mtu,
             listen_port: options.listen_port,
-            addresses: options.address,
+            addresses: interface.address,
             peers: Arc::new(peers),
             protector,
-            inner: Mutex::new(EndpointState::Idle),
+            inner: Mutex::new(WireguardState::Idle),
             #[cfg(test)]
             fail_next_start: AtomicBool::new(false),
         }
@@ -129,22 +134,22 @@ impl WireguardEndpoint {
     fn boot(&self) -> HammerResult<()> {
         {
             let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            if matches!(*inner, EndpointState::Running(_) | EndpointState::Closed) {
+            if matches!(*inner, WireguardState::Running(_) | WireguardState::Closed) {
                 return Ok(());
             }
         }
 
         let runtime = self.start_runtime()?;
         let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-        if matches!(*inner, EndpointState::Idle) {
-            *inner = EndpointState::Running(runtime);
+        if matches!(*inner, WireguardState::Idle) {
+            *inner = WireguardState::Running(runtime);
         } else {
             stop_runtime(runtime);
         }
         Ok(())
     }
 
-    fn start_runtime(&self) -> HammerResult<EndpointRuntime> {
+    fn start_runtime(&self) -> HammerResult<WireguardRuntime> {
         #[cfg(test)]
         if self.fail_next_start.swap(false, Ordering::SeqCst) {
             return Err(HammerError::internal("injected wireguard start failure"));
@@ -176,7 +181,7 @@ impl WireguardEndpoint {
             encrypt_tx.clone(),
         )?;
 
-        Ok(EndpointRuntime {
+        Ok(WireguardRuntime {
             transport: TransportHandles {
                 encrypt_tx,
                 // After hand-off the transport handle no longer needs to expose
@@ -195,8 +200,8 @@ impl WireguardEndpoint {
     fn shutdown(&self) {
         let runtime = {
             let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            match std::mem::replace(&mut *inner, EndpointState::Closed) {
-                EndpointState::Running(rt) => Some(rt),
+            match std::mem::replace(&mut *inner, WireguardState::Closed) {
+                WireguardState::Running(rt) => Some(rt),
                 _ => None,
             }
         };
@@ -215,11 +220,11 @@ impl WireguardEndpoint {
 
         let runtime = {
             let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            match std::mem::replace(&mut *inner, EndpointState::Idle) {
-                EndpointState::Running(rt) => Some(rt),
-                EndpointState::Idle => None,
-                EndpointState::Closed => {
-                    *inner = EndpointState::Closed;
+            match std::mem::replace(&mut *inner, WireguardState::Idle) {
+                WireguardState::Running(rt) => Some(rt),
+                WireguardState::Idle => None,
+                WireguardState::Closed => {
+                    *inner = WireguardState::Closed;
                     None
                 }
             }
@@ -236,7 +241,7 @@ impl WireguardEndpoint {
     fn restart_ephemeral(&self) {
         {
             let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            if !matches!(*inner, EndpointState::Running(_)) {
+            if !matches!(*inner, WireguardState::Running(_)) {
                 return;
             }
         }
@@ -250,20 +255,20 @@ impl WireguardEndpoint {
         };
         let old_runtime = {
             let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
-            match std::mem::replace(&mut *inner, EndpointState::Running(new_runtime)) {
-                EndpointState::Running(rt) => Some(rt),
-                EndpointState::Idle => {
-                    let EndpointState::Running(rt) =
-                        std::mem::replace(&mut *inner, EndpointState::Idle)
+            match std::mem::replace(&mut *inner, WireguardState::Running(new_runtime)) {
+                WireguardState::Running(rt) => Some(rt),
+                WireguardState::Idle => {
+                    let WireguardState::Running(rt) =
+                        std::mem::replace(&mut *inner, WireguardState::Idle)
                     else {
                         unreachable!("new runtime was just installed")
                     };
                     stop_runtime(rt);
                     None
                 }
-                EndpointState::Closed => {
-                    let EndpointState::Running(rt) =
-                        std::mem::replace(&mut *inner, EndpointState::Closed)
+                WireguardState::Closed => {
+                    let WireguardState::Running(rt) =
+                        std::mem::replace(&mut *inner, WireguardState::Closed)
                     else {
                         unreachable!("new runtime was just installed")
                     };
@@ -285,14 +290,16 @@ impl WireguardEndpoint {
     fn stack_handle(&self) -> HammerResult<Arc<IpStackHandles>> {
         let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         match &*inner {
-            EndpointState::Running(rt) => Ok(Arc::clone(&rt.stack)),
-            EndpointState::Idle => Err(HammerError::internal("wireguard endpoint not started yet")),
-            EndpointState::Closed => Err(HammerError::internal("wireguard endpoint is closed")),
+            WireguardState::Running(rt) => Ok(Arc::clone(&rt.stack)),
+            WireguardState::Idle => {
+                Err(HammerError::internal("wireguard endpoint not started yet"))
+            }
+            WireguardState::Closed => Err(HammerError::internal("wireguard endpoint is closed")),
         }
     }
 }
 
-fn stop_runtime(rt: EndpointRuntime) {
+fn stop_runtime(rt: WireguardRuntime) {
     let _ = rt.transport.shutdown.send(());
     rt.transport.join.abort();
     rt.stack.signal_shutdown();
@@ -406,33 +413,39 @@ impl ProxyPacketConn for WireguardUdp {
 fn endpoint_for_test(
     logger: Logger,
     id: String,
+    interface: hammer_core::config::EndpointInterfaceOptions,
     options: WireguardEndpointOptions,
 ) -> WireguardEndpoint {
-    WireguardEndpoint::new(logger, id, options, SocketProtector::default())
+    WireguardEndpoint::new(
+        logger,
+        EndpointRuntimeOptions {
+            id,
+            interface,
+            protocol: options,
+        },
+        SocketProtector::default(),
+    )
 }
 
 /// Convenience constructor used by `EndpointManager::from_options_with_platform`.
 pub(crate) fn build_with_platform(
     logger: Logger,
-    id: String,
-    options: WireguardEndpointOptions,
+    options: EndpointRuntimeOptions<WireguardEndpointOptions>,
     platform: Option<Arc<dyn PlatformInterface>>,
 ) -> WireguardEndpoint {
     let protector = SocketProtector::from(platform);
-    WireguardEndpoint::new(logger, id, options, protector)
+    WireguardEndpoint::new(logger, options, protector)
 }
 
 pub(crate) fn build_endpoint_views(
     logger: Logger,
-    id: String,
-    kind: &EndpointKind,
+    option: &EndpointOptions,
     platform: Option<Arc<dyn PlatformInterface>>,
 ) -> HammerResult<Arc<WireguardEndpoint>> {
-    match kind {
+    match &option.kind {
         EndpointKind::Wireguard(options) => Ok(Arc::new(build_with_platform(
             logger,
-            id,
-            options.clone(),
+            EndpointRuntimeOptions::from_endpoint(option, options.clone()),
             platform,
         ))),
     }
@@ -446,7 +459,9 @@ mod tests {
     use std::time::Instant;
 
     use boringtun::noise::TunnResult;
-    use hammer_core::config::{WireguardEndpointOptions, WireguardPeerOptions};
+    use hammer_core::config::{
+        EndpointInterfaceOptions, WireguardEndpointOptions, WireguardPeerOptions,
+    };
     use hammer_core::log::{DiscardWriter, Factory};
 
     fn logger(id: &str) -> Logger {
@@ -457,6 +472,13 @@ mod tests {
         x25519::PublicKey::from(&x25519::StaticSecret::from(secret)).to_bytes()
     }
 
+    fn test_interface(address: &str) -> EndpointInterfaceOptions {
+        EndpointInterfaceOptions {
+            mtu: 1408,
+            address: vec![address.parse().unwrap()],
+        }
+    }
+
     fn make_endpoint(
         name: &'static str,
         my_priv: [u8; 32],
@@ -465,8 +487,6 @@ mod tests {
         let options = WireguardEndpointOptions {
             private_key: my_priv,
             listen_port: 0,
-            mtu: 1408,
-            address: vec!["10.66.0.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: peer_pub,
                 pre_shared_key: None,
@@ -476,7 +496,12 @@ mod tests {
                 reserved: [0; 3],
             }],
         };
-        endpoint_for_test(logger(name), name.to_owned(), options)
+        endpoint_for_test(
+            logger(name),
+            name.to_owned(),
+            test_interface("10.66.0.2/32"),
+            options,
+        )
     }
 
     #[test]
@@ -596,8 +621,6 @@ mod tests {
         let opts = WireguardEndpointOptions {
             private_key: local_priv,
             listen_port: 0,
-            mtu: 1408,
-            address: vec!["10.66.0.2/32".parse().unwrap()],
             peers: vec![
                 WireguardPeerOptions {
                     public_key: peer1_pub,
@@ -617,7 +640,12 @@ mod tests {
                 },
             ],
         };
-        let ep = endpoint_for_test(logger("multi"), "multi".to_owned(), opts);
+        let ep = endpoint_for_test(
+            logger("multi"),
+            "multi".to_owned(),
+            test_interface("10.66.0.2/32"),
+            opts,
+        );
 
         let chosen = ep
             .route_outbound(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 5)))
@@ -643,8 +671,6 @@ mod tests {
         let opts = WireguardEndpointOptions {
             private_key: priv_key,
             listen_port: 0,
-            mtu: 1408,
-            address: vec!["10.66.0.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: peer_pub,
                 pre_shared_key: None,
@@ -654,7 +680,12 @@ mod tests {
                 reserved: [1, 2, 3],
             }],
         };
-        let ep = endpoint_for_test(logger("buf"), "buf".to_owned(), opts);
+        let ep = endpoint_for_test(
+            logger("buf"),
+            "buf".to_owned(),
+            test_interface("10.66.0.2/32"),
+            opts,
+        );
         assert_eq!(
             ep.encapsulate_buffer().len(),
             ep.mtu() as usize + WIREGUARD_OVERHEAD
@@ -721,8 +752,6 @@ mod tests {
         let a_options = WireguardEndpointOptions {
             private_key: a_priv,
             listen_port: port_a,
-            mtu: 1408,
-            address: vec!["10.0.0.1/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: b_pub,
                 pre_shared_key: None,
@@ -735,8 +764,6 @@ mod tests {
         let b_options = WireguardEndpointOptions {
             private_key: b_priv,
             listen_port: port_b,
-            mtu: 1408,
-            address: vec!["10.0.0.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: a_pub,
                 pre_shared_key: None,
@@ -747,8 +774,18 @@ mod tests {
             }],
         };
 
-        let a = endpoint_for_test(logger("wg-a"), "wg-a".to_owned(), a_options);
-        let b = endpoint_for_test(logger("wg-b"), "wg-b".to_owned(), b_options);
+        let a = endpoint_for_test(
+            logger("wg-a"),
+            "wg-a".to_owned(),
+            test_interface("10.0.0.1/32"),
+            a_options,
+        );
+        let b = endpoint_for_test(
+            logger("wg-b"),
+            "wg-b".to_owned(),
+            test_interface("10.0.0.2/32"),
+            b_options,
+        );
         a.boot().expect("boot a");
         b.boot().expect("boot b");
 
@@ -818,8 +855,6 @@ mod tests {
         let a_options = WireguardEndpointOptions {
             private_key: a_priv,
             listen_port: port_a,
-            mtu: 1408,
-            address: vec!["10.0.0.1/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: b_pub,
                 pre_shared_key: None,
@@ -832,8 +867,6 @@ mod tests {
         let b_options = WireguardEndpointOptions {
             private_key: b_priv,
             listen_port: port_b,
-            mtu: 1408,
-            address: vec!["10.0.0.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: a_pub,
                 pre_shared_key: None,
@@ -844,8 +877,18 @@ mod tests {
             }],
         };
 
-        let a = endpoint_for_test(logger("wg-a-frag"), "wg-a-frag".to_owned(), a_options);
-        let b = endpoint_for_test(logger("wg-b-frag"), "wg-b-frag".to_owned(), b_options);
+        let a = endpoint_for_test(
+            logger("wg-a-frag"),
+            "wg-a-frag".to_owned(),
+            test_interface("10.0.0.1/32"),
+            a_options,
+        );
+        let b = endpoint_for_test(
+            logger("wg-b-frag"),
+            "wg-b-frag".to_owned(),
+            test_interface("10.0.0.2/32"),
+            b_options,
+        );
         a.boot().expect("boot a");
         b.boot().expect("boot b");
 
@@ -920,8 +963,6 @@ mod tests {
         let a_options = WireguardEndpointOptions {
             private_key: a_priv,
             listen_port: port_a,
-            mtu: 1408,
-            address: vec!["10.0.0.1/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: b_pub,
                 pre_shared_key: None,
@@ -934,8 +975,6 @@ mod tests {
         let b_options = WireguardEndpointOptions {
             private_key: b_priv,
             listen_port: port_b,
-            mtu: 1408,
-            address: vec!["10.0.0.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: a_pub,
                 pre_shared_key: None,
@@ -946,8 +985,18 @@ mod tests {
             }],
         };
 
-        let a = endpoint_for_test(logger("wg-tcp-a"), "wg-a".to_owned(), a_options);
-        let b = endpoint_for_test(logger("wg-tcp-b"), "wg-b".to_owned(), b_options);
+        let a = endpoint_for_test(
+            logger("wg-tcp-a"),
+            "wg-a".to_owned(),
+            test_interface("10.0.0.1/32"),
+            a_options,
+        );
+        let b = endpoint_for_test(
+            logger("wg-tcp-b"),
+            "wg-b".to_owned(),
+            test_interface("10.0.0.2/32"),
+            b_options,
+        );
         a.boot().expect("boot a");
         b.boot().expect("boot b");
 
@@ -1026,8 +1075,6 @@ mod tests {
         let a_options = WireguardEndpointOptions {
             private_key: a_priv,
             listen_port: port_a,
-            mtu: 1408,
-            address: vec!["10.0.1.1/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: b_pub,
                 pre_shared_key: None,
@@ -1040,8 +1087,6 @@ mod tests {
         let b_options = WireguardEndpointOptions {
             private_key: b_priv,
             listen_port: port_b,
-            mtu: 1408,
-            address: vec!["10.0.1.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: a_pub,
                 pre_shared_key: None,
@@ -1052,8 +1097,18 @@ mod tests {
             }],
         };
 
-        let a = endpoint_for_test(logger("wg-big-a"), "wg-a".to_owned(), a_options);
-        let b = endpoint_for_test(logger("wg-big-b"), "wg-b".to_owned(), b_options);
+        let a = endpoint_for_test(
+            logger("wg-big-a"),
+            "wg-a".to_owned(),
+            test_interface("10.0.1.1/32"),
+            a_options,
+        );
+        let b = endpoint_for_test(
+            logger("wg-big-b"),
+            "wg-b".to_owned(),
+            test_interface("10.0.1.2/32"),
+            b_options,
+        );
         a.boot().expect("boot a");
         b.boot().expect("boot b");
 
@@ -1129,8 +1184,6 @@ mod tests {
         let a_options = WireguardEndpointOptions {
             private_key: a_priv,
             listen_port: port_a,
-            mtu: 1408,
-            address: vec!["10.0.2.1/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: b_pub,
                 pre_shared_key: None,
@@ -1143,8 +1196,6 @@ mod tests {
         let b_options = WireguardEndpointOptions {
             private_key: b_priv,
             listen_port: port_b,
-            mtu: 1408,
-            address: vec!["10.0.2.2/32".parse().unwrap()],
             peers: vec![WireguardPeerOptions {
                 public_key: a_pub,
                 pre_shared_key: None,
@@ -1155,8 +1206,18 @@ mod tests {
             }],
         };
 
-        let a = endpoint_for_test(logger("wg-closed-a"), "wg-a".to_owned(), a_options);
-        let b = endpoint_for_test(logger("wg-closed-b"), "wg-b".to_owned(), b_options);
+        let a = endpoint_for_test(
+            logger("wg-closed-a"),
+            "wg-a".to_owned(),
+            test_interface("10.0.2.1/32"),
+            a_options,
+        );
+        let b = endpoint_for_test(
+            logger("wg-closed-b"),
+            "wg-b".to_owned(),
+            test_interface("10.0.2.2/32"),
+            b_options,
+        );
         a.boot().expect("boot a");
         b.boot().expect("boot b");
 

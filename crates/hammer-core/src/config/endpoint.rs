@@ -12,7 +12,6 @@ use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "wireguard")]
 use std::time::Duration;
 
-#[cfg(feature = "wireguard")]
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "wireguard")]
@@ -93,6 +92,7 @@ impl RawWireguardKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoint {
     pub id: String,
+    pub interface: EndpointInterfaceOptions,
     pub kind: EndpointKind,
 }
 
@@ -110,6 +110,14 @@ impl Endpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointInterfaceOptions {
+    /// Tunnel MTU advertised to the inner endpoint stack.
+    pub mtu: u32,
+    /// Local addresses inside the endpoint interface (CIDR form).
+    pub address: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EndpointKind {
     #[cfg(feature = "wireguard")]
     Wireguard(WireguardEndpointOptions),
@@ -122,10 +130,6 @@ pub struct WireguardEndpointOptions {
     pub private_key: [u8; 32],
     /// Local UDP listen port; `0` lets the OS pick.
     pub listen_port: u16,
-    /// Tunnel MTU advertised to the inner stack. sing-box default is 1408.
-    pub mtu: u32,
-    /// Local addresses inside the tunnel (CIDR form).
-    pub address: Vec<IpNet>,
     pub peers: Vec<WireguardPeerOptions>,
 }
 
@@ -202,11 +206,10 @@ fn build_wireguard_endpoint(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Endpoint {
         id,
+        interface: EndpointInterfaceOptions { mtu, address },
         kind: EndpointKind::Wireguard(WireguardEndpointOptions {
             private_key: private_key.into_bytes(),
             listen_port,
-            mtu,
-            address,
             peers,
         }),
     })

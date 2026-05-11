@@ -315,11 +315,10 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
 
                 fn build(
                     logger: ::hammer_core::log::Logger,
-                    id: String,
-                    kind: &::hammer_core::config::EndpointKind,
+                    option: &::hammer_core::config::Endpoint,
                     platform: Option<::std::sync::Arc<dyn ::hammer_adapter::PlatformInterface>>,
                 ) -> ::hammer_core::error::HammerResult<crate::endpoints::EndpointViews> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, id, kind, platform)?;
+                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, option, platform)?;
                     let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
                     let endpoint: ::std::sync::Arc<dyn ::hammer_adapter::Endpoint> = runtime.clone();
                     let outbound: ::std::sync::Arc<dyn ::hammer_adapter::Outbound> = runtime;

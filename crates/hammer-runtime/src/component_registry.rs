@@ -63,8 +63,7 @@ pub(crate) trait EndpointComponentDeclaration {
 
     fn build(
         logger: hammer_core::log::Logger,
-        id: String,
-        kind: &hammer_core::config::EndpointKind,
+        option: &hammer_core::config::Endpoint,
         platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
     ) -> hammer_core::error::HammerResult<crate::endpoints::EndpointViews>;
 }
