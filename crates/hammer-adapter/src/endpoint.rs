@@ -2,11 +2,20 @@ use bytes::Bytes;
 use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::Lifecycle;
 use ipnet::IpNet;
+use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
+use crate::Network;
 use crate::RuntimeComponent;
 
 pub type EndpointComponent = RuntimeComponent<dyn Endpoint>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EndpointLocalFlow {
+    pub network: Network,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+}
 
 /// L3 tunnel endpoint (wireguard today; future ipsec / wg-over-tcp later).
 ///
@@ -33,6 +42,26 @@ pub trait Endpoint: Lifecycle {
     /// ownership of the receiver at start-up and fans it into the TUN
     /// writer.
     fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>>;
+
+    /// One-shot ingress receiver for a *local* consumer (the
+    /// EndpointOutboundAdapter). Calling this enables a lazy fan-out
+    /// inside the endpoint: decapsulated IP packets matching a registered
+    /// local flow are delivered to this channel instead of the default
+    /// `ip_recv_take` channel that feeds the TUN packet loop.
+    ///
+    /// Default `None` keeps non-WG endpoints honest — they opt in by
+    /// overriding this and honoring `register_local_flow`.
+    fn ip_local_recv_take(&self) -> Option<mpsc::Receiver<Bytes>> {
+        None
+    }
+
+    /// Register a locally originated flow that should be consumed by
+    /// `ip_local_recv_take` rather than mirrored into the default TUN
+    /// receiver. Endpoint outbound adapters use this for their own DNS
+    /// TCP/UDP sessions.
+    fn register_local_flow(&self, _flow: EndpointLocalFlow) {}
+
+    fn unregister_local_flow(&self, _flow: EndpointLocalFlow) {}
 
     /// Maximum raw IP packet size this endpoint can encapsulate without
     /// fragmentation / PMTU feedback. `None` means the endpoint accepts the

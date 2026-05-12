@@ -2274,10 +2274,7 @@ const IPV6_FRAGMENT_NEXT_HEADER: u8 = 44;
 const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
 
 #[cfg(feature = "endpoint")]
-fn ipv6_transport_location(
-    packet: &[u8],
-    next_header: u8,
-) -> HammerResult<(usize, u8, bool)> {
+fn ipv6_transport_location(packet: &[u8], next_header: u8) -> HammerResult<(usize, u8, bool)> {
     if next_header == IPV6_FRAGMENT_NEXT_HEADER {
         if packet.len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
             return Err(HammerError::internal("short IPv6 fragment header"));
@@ -2299,11 +2296,7 @@ fn ipv6_transport_location(
 }
 
 #[cfg(feature = "endpoint")]
-fn ipv4_validate_transport_for_delta(
-    packet: &[u8],
-    ihl: usize,
-    protocol: u8,
-) -> HammerResult<()> {
+fn ipv4_validate_transport_for_delta(packet: &[u8], ihl: usize, protocol: u8) -> HammerResult<()> {
     if protocol == IpProtocol::Tcp.wire_value() {
         if packet.len() < ihl + TCP_CHECKSUM_OFFSET + 2 {
             return Err(HammerError::internal("short TCP segment"));
@@ -2330,9 +2323,7 @@ fn ipv6_validate_transport_for_delta(
         if packet.len() < transport_offset + UDP_HEADER_LEN {
             return Err(HammerError::internal("short UDP datagram"));
         }
-    } else if protocol == IpProtocol::Icmpv6.wire_value()
-        && packet.len() < transport_offset + 4
-    {
+    } else if protocol == IpProtocol::Icmpv6.wire_value() && packet.len() < transport_offset + 4 {
         return Err(HammerError::internal("short ICMPv6 packet"));
     }
     Ok(())

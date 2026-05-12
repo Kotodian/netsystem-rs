@@ -15,8 +15,56 @@ use hammer_runtime::{
     ConnectionManager, MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router,
 };
 
+#[cfg(feature = "endpoint")]
+use async_trait::async_trait;
+#[cfg(feature = "endpoint")]
+use hammer_adapter::{
+    ComponentMeta, ComponentMetadata, Outbound as AdapterOutbound, ProxyIcmpConn, ProxyPacketConn,
+    ProxyStream, RuntimeComponent,
+};
+
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+#[cfg(feature = "endpoint")]
+struct NamedOutbound {
+    id: String,
+}
+
+#[cfg(feature = "endpoint")]
+#[async_trait]
+impl AdapterOutbound for NamedOutbound {
+    async fn dial(
+        &self,
+        _network: Network,
+        _destination: SocksAddr,
+        _initial_payload: &[u8],
+    ) -> Result<Box<dyn ProxyStream>, HammerError> {
+        Err(HammerError::internal("unused test outbound"))
+    }
+
+    async fn listen_packet(&self) -> Result<Box<dyn ProxyPacketConn>, HammerError> {
+        Err(HammerError::internal("unused test outbound"))
+    }
+
+    async fn listen_icmp(&self) -> Result<Box<dyn ProxyIcmpConn>, HammerError> {
+        Err(HammerError::internal("unused test outbound"))
+    }
+}
+
+#[cfg(feature = "endpoint")]
+impl ComponentMetadata for NamedOutbound {
+    fn component_meta(&self) -> ComponentMeta {
+        ComponentMeta::new(
+            "outbound",
+            "named-test",
+            self.id.clone(),
+            vec![Network::Tcp, Network::Udp],
+            Vec::new(),
+            None,
+        )
+    }
 }
 
 fn options() -> Options {
@@ -559,6 +607,51 @@ fn router_marks_endpoint_default_target() {
         )
         .expect("outbound manager"),
     );
+    let router = Router::from_options_with_metrics_and_endpoint_ids(
+        logger("router"),
+        opts.route.clone(),
+        outbound,
+        MetricsRegistry::new(),
+        vec!["wg-out".to_owned()],
+    )
+    .expect("router");
+
+    let mut metadata = metadata_with_destination(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+    assert_eq!(
+        router.match_route(&mut metadata).expect("match"),
+        RouteDecision::Route {
+            target: RouteTarget::Endpoint("wg-out".to_owned())
+        }
+    );
+}
+
+#[cfg(feature = "endpoint")]
+#[test]
+fn router_prefers_endpoint_target_when_adapter_outbound_has_same_id() {
+    let mut opts = options();
+    opts.route.final_ = "wg-out".to_owned();
+    let outbound = Arc::new(
+        OutboundManager::from_options(logger("outbound"), "direct".to_owned(), &opts.outbounds)
+            .expect("outbound manager"),
+    );
+    let adapter: Arc<NamedOutbound> = Arc::new(NamedOutbound {
+        id: "wg-out".to_owned(),
+    });
+    let runtime: Arc<dyn AdapterOutbound> = adapter;
+    outbound
+        .register_outbound(RuntimeComponent::new(
+            ComponentMeta::new(
+                "outbound",
+                "endpoint-adapter",
+                "wg-out",
+                vec![Network::Tcp, Network::Udp],
+                Vec::new(),
+                None,
+            ),
+            runtime,
+        ))
+        .expect("register adapter outbound");
+
     let router = Router::from_options_with_metrics_and_endpoint_ids(
         logger("router"),
         opts.route.clone(),

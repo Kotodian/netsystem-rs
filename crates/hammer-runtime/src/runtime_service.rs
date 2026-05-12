@@ -15,6 +15,8 @@ use crate::EndpointManager;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 #[cfg(feature = "endpoint")]
+use crate::endpoints::EndpointOutboundAdapter;
+#[cfg(feature = "endpoint")]
 use crate::protocol::tun::RuntimeTunInbound;
 use crate::spawn::DataRuntimeContext;
 use crate::{
@@ -194,11 +196,17 @@ impl RuntimeService {
             Arc::clone(&platform),
             Arc::clone(&metrics),
         )?);
+        // Auto-register an `EndpointOutboundAdapter` for every declared
+        // endpoint **before** `bind_aggregates`: urltest and friends will
+        // resolve `<endpoint-id>` against the same OutboundManager when
+        // their children include endpoint ids, and DNS `via = "<endpoint-id>"`
+        // requires the adapter to be findable through `outbound.get()`.
+        #[cfg(feature = "endpoint")]
+        register_endpoint_outbound_adapters(&outbound, &endpoint, &log_factory)?;
         // Aggregate outbounds (urltest) need a `Weak<dyn OutboundManager>`
         // before any children can be looked up. Bind once here, after every
         // declared outbound has been registered, so the urltest's first dial /
-        // probe can resolve every outbound child without races. Endpoint ids
-        // are route targets, not outbound views.
+        // probe can resolve every outbound child without races.
         outbound.bind_aggregates();
         let default_domain_resolver = options
             .route
@@ -573,6 +581,31 @@ impl RuntimeService {
 
 fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
+}
+
+/// Wraps every declared `Endpoint` in an `EndpointOutboundAdapter` and
+/// registers it into the `OutboundManager` under the endpoint's id. This
+/// is what lets `[[dns.servers]] via = "<endpoint-id>"` resolve through
+/// the same `outbound.get(...)` path used by every other transport.
+///
+/// Must run after the user's `[[outbounds]]` are loaded (so duplicate-id
+/// validation lines up with the parse-time `validate_unique_ids` check)
+/// and before `bind_aggregates()` (so urltest children that reference an
+/// endpoint id resolve to the adapter rather than an empty slot).
+#[cfg(feature = "endpoint")]
+fn register_endpoint_outbound_adapters(
+    outbound: &Arc<OutboundManager>,
+    endpoint: &Arc<EndpointManager>,
+    log_factory: &Arc<Factory>,
+) -> HammerResult<()> {
+    for component in endpoint.list() {
+        let id = component.meta().id().to_owned();
+        let logger = new_logger(log_factory, &format!("endpoint-outbound/{id}"));
+        let adapter =
+            EndpointOutboundAdapter::arc(logger, id.clone(), Arc::clone(component.runtime()));
+        outbound.register_outbound(adapter)?;
+    }
+    Ok(())
 }
 
 fn start_inner(inner: &mut ServiceInner) -> HammerResult<()> {

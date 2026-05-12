@@ -5,6 +5,11 @@ use std::sync::Mutex;
 use tracing::debug;
 
 #[cfg(feature = "endpoint")]
+mod outbound_adapter;
+#[cfg(feature = "endpoint")]
+pub use outbound_adapter::EndpointOutboundAdapter;
+
+#[cfg(feature = "endpoint")]
 use hammer_adapter::PlatformInterface;
 use hammer_adapter::{EndpointComponent, EndpointManager as EndpointManagerTrait, Lifecycle};
 #[cfg(feature = "endpoint")]

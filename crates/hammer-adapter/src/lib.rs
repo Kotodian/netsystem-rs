@@ -29,7 +29,7 @@ pub use dialer::{Dialer, Network};
 pub use dns::{
     DnsQueryOptions, DnsRouter, DnsTransport, DnsTransportComponent, DnsTransportManager,
 };
-pub use endpoint::{Endpoint, EndpointComponent, EndpointManager};
+pub use endpoint::{Endpoint, EndpointComponent, EndpointLocalFlow, EndpointManager};
 pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;

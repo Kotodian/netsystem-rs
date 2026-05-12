@@ -390,6 +390,20 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         &dns_options.final_,
         dns_options.servers.iter().map(|item| item.id.as_str()),
     )?;
+    // `via` resolves through the runtime OutboundManager, which the service
+    // layer auto-populates with an EndpointOutboundAdapter per declared
+    // endpoint. Accept endpoint ids here so `via = "<endpoint-id>"` round-
+    // trips through parse → runtime without the runtime having to learn
+    // about endpoint ids itself.
+    #[cfg(feature = "wireguard")]
+    validate_dns_server_via(
+        &dns_options.servers,
+        outbounds
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(endpoints.iter().map(|item| item.id.as_str())),
+    )?;
+    #[cfg(not(feature = "wireguard"))]
     validate_dns_server_via(
         &dns_options.servers,
         outbounds.iter().map(|item| item.id.as_str()),

@@ -920,16 +920,34 @@ final = "direct"
 
 #[cfg(feature = "wireguard")]
 #[test]
-fn parse_config_rejects_dns_via_endpoint_id() {
+fn parse_config_accepts_dns_via_endpoint_id() {
+    // Endpoint ids are valid `via` targets — the runtime registers an
+    // `EndpointOutboundAdapter` per endpoint so the lookup resolves through
+    // the OutboundManager just like any other outbound.
     let cfg = format!(
         "{}\n{}",
         DOMAIN_RESOLVER_FIXTURE.replace("via = \"direct\"", "via = \"wg-out\""),
         wg_endpoint_block("")
     );
-    let err = config::parse_config(&cfg).expect_err("dns via must point to an outbound");
+    let options = config::parse_config(&cfg).expect("dns via endpoint must parse");
+    let remote = options
+        .dns
+        .servers
+        .iter()
+        .find(|s| s.id == "remote")
+        .expect("remote dns server");
+    assert_eq!(remote.via(), "wg-out");
+}
+
+#[test]
+fn parse_config_still_rejects_dns_via_unknown() {
+    // Negative path: a `via` that matches neither an outbound nor an
+    // endpoint must still fail at parse time.
+    let cfg = DOMAIN_RESOLVER_FIXTURE.replace("via = \"direct\"", "via = \"ghost\"");
+    let err = config::parse_config(&cfg).expect_err("via=ghost must reject");
     assert!(
         err.to_string()
-            .contains("dns.server via references unknown outbound id: wg-out"),
+            .contains("dns.server via references unknown outbound id: ghost"),
         "got {err:?}"
     );
 }

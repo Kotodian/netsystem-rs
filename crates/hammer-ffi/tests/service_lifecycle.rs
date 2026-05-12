@@ -7,7 +7,7 @@ use hammer::{
 };
 use hammer_core::lifecycle::LIFECYCLE_ORDER;
 
-const MIN_TOML: &str = r#"
+const MIN_TOML_BASE: &str = r#"
 [log]
 level = "debug"
 
@@ -22,9 +22,31 @@ mtu = 1400
 stack = "disabled"
 [dns]
 server = "udp://1.1.1.1"
+
 [route]
 final = "direct"
 "#;
+
+#[cfg(feature = "hysteria2")]
+const MIN_TOML_HYSTERIA2: &str = r#"
+[hysteria2]
+server = "example.com"
+password = "secret"
+sni = "example.com"
+"#;
+
+fn min_toml() -> String {
+    #[cfg(feature = "hysteria2")]
+    {
+        let mut toml = MIN_TOML_BASE.to_owned();
+        toml.push_str(MIN_TOML_HYSTERIA2);
+        toml
+    }
+    #[cfg(not(feature = "hysteria2"))]
+    {
+        MIN_TOML_BASE.to_owned()
+    }
+}
 
 #[derive(Default)]
 struct CapturePlatform {
@@ -95,7 +117,8 @@ impl HammerNetworkInterfaceIterator for EmptyInterfaceIterator {
 
 fn make_service() -> (Arc<CapturePlatform>, Arc<HammerService>) {
     let platform = Arc::new(CapturePlatform::default());
-    let svc = HammerService::new(MIN_TOML, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+    let config = min_toml();
+    let svc = HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
         .expect("HammerService::new should accept the minimal config");
     (platform, svc)
 }
@@ -203,7 +226,7 @@ fn service_exposes_runtime_metrics() {
     assert!(
         samples.iter().any(|sample| sample.module == "outbound"
             && sample.component_type == "outbound"
-            && sample.component_id == "hysteria2"
+            && sample.component_id == "direct"
             && sample.name == "dial_error_total"
             && sample.kind == "counter"),
         "samples = {samples:?}"

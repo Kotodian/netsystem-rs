@@ -97,7 +97,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 | **Endpoint** | 比 outbound 高一层——同一个"协议端点"**同时具备 inbound 和 outbound 能力**。典型：WireGuard。隧道两头各是一个 endpoint，对端发来的流量从这里"入"，本端要发出去的流量从这里"出" |
 | **Router** | 流量决策器。按规则匹配每条进来的流量（协议、域名、目的 IP、来自哪个 inbound 等），决定走哪个 outbound，或者直接拒绝。整个 hammer 的"分流"语义都集中在这里 |
 
-其他细节（DNS 传输、user-space IP 栈、boringtun 等）在下面对应章节随上下文解读。
+其他细节（DNS 传输、boringtun L3 fast path 等）在下面对应章节随上下文解读。
 
 ### Dispatch 路径
 
@@ -112,15 +112,17 @@ TUN 入口
   ↓  (抽五元组 + sniff 域名)
 Router 匹配规则
   ↓
-选定 Outbound
+选定 Outbound 或 Endpoint
   ↓
-  ├─ hysteria2  →  QUIC 隧道       →  远端
-  ├─ direct     →  系统 socket     →  远端
-  ├─ wireguard  →  user-space IP 栈 + WireGuard 加密  →  远端 peer
+  ├─ hysteria2  →  QUIC 隧道                       →  远端
+  ├─ direct     →  系统 socket                     →  远端
+  ├─ wireguard  →  L3DispatchTable → boringtun     →  远端 peer
   └─ urltest    →  转交给当前最快的子 outbound
 ```
 
-user-space IP 栈在生产路径上**只在 WireGuard 出口内部出现一次**——因为 WireGuard 解密出来的还是 IP 包，必须再过一层 IP 栈才能拿到 TCP / UDP 连接。hysteria2 / direct / urltest 完全不碰 user-space IP 栈。
+WireGuard 走 **L3 fast path**：TUN packet loop 在 NAT 前先查 `L3DispatchTable` —— 把 inner IP 包按目的 IP 直接送进 boringtun 的 encrypt 通道，不经 user-space TCP/UDP 重组。hysteria2 / direct / urltest 仍然走 outbound dial / listen_packet 系统 socket 路径。
+
+> DNS `via = "<endpoint-id>"`（demo wg 模式默认就用这条）走的是另一条独立路径：runtime 会自动为每个 endpoint 注册一个 `EndpointOutboundAdapter` 进 OutboundManager。DNS UDP query 通过 adapter `listen_packet` 拼成 IPv4+UDP 包直接灌进 endpoint 的 encrypt 通道；TCP / DoH 路径同 endpoint 但 adapter 内部用一个仅 DNS 用的微 smoltcp 做 L4↔L3 翻译。这条路径不经过 TUN packet_loop，避免被 `hijack_dns` 自己 sniff 形成循环。
 
 **DNS 查询**
 
@@ -143,9 +145,9 @@ DNS 路由匹配 (按域名规则、带 LRU)
 cargo feature 分四组：
 
 - **入口**：`inbound-tun`（默认开）。
-- **出口**：runtime feature 为 `outbound-hysteria2 / outbound-direct / outbound-block / outbound-urltest`（默认全开）；core 的 Hysteria2 协议/config feature 为 `hysteria2`。WireGuard 是 endpoint 协议，runtime feature 为 `endpoint-wireguard`，core 协议/config feature 为 `ipstack-wireguard`（默认关，iOS xcframework 默认不带，省体积）。
+- **出口**：runtime feature 为 `outbound-hysteria2 / outbound-direct / outbound-block / outbound-urltest`（默认全开）；core 的 Hysteria2 协议/config feature 为 `hysteria2`。WireGuard 是 endpoint 协议，runtime feature 为 `endpoint-wireguard`，core 协议/config feature 为 `wireguard`（默认关，iOS xcframework 默认不带，省体积）。
 - **DNS**：`dns-udp / dns-tcp / dns-hosts / dns-local`（默认开），`dns-https`（默认关）。
-- **基础设施**：`endpoint`（endpoint 协议的公共依赖）、`ipstack`（user-space IP 栈）、`probe`（出口延迟探测，默认开）。
+- **基础设施**：`endpoint`（endpoint 协议的公共依赖，自动拉 `arc-swap` + `smoltcp` —— 后者**仅给 `EndpointOutboundAdapter` 的 TCP DNS 用**，不在 TUN 数据路径上）、`probe`（出口延迟探测，默认开）。
 
 设计原则：
 - 任何独立出口 / 协议都挂在自己的 cargo feature 后面。
@@ -231,7 +233,7 @@ final = "proxy"
 auto_detect_interface = true
 ```
 
-**例 2 —— WireGuard endpoint（runtime 需启用 `endpoint-wireguard`，core 需启用 `ipstack-wireguard`；FFI/打包入口仍可用 `wireguard` feature，对应 production demo）**
+**例 2 —— WireGuard endpoint（runtime 需启用 `endpoint-wireguard`，core 需启用 `wireguard`；FFI/打包入口仍可用 `wireguard` feature，对应 production demo）**
 
 ```toml
 [log]

@@ -70,7 +70,7 @@ dns-hosts = []
 dns-local = []
 # Enables the generic L3 endpoint domain (Endpoint trait, manager, packet-loop
 # fast path). Concrete endpoint protocols opt into this parent feature.
-endpoint = ["inbound-tun", "hammer-core/wireguard", "dep:etherparse"]
+endpoint = ["inbound-tun", "hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]
 # Enables the WireGuard endpoint module. Pulls in the matching config feature
 # in hammer-core. Off by default to keep the iOS xcframework slim.
 endpoint-wireguard = [
@@ -88,6 +88,8 @@ boringtun = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
 bytes = { workspace = true }
 etherparse = { workspace = true, optional = true }
+arc-swap = { workspace = true, optional = true }
+smoltcp = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }

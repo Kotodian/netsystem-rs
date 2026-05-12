@@ -262,11 +262,11 @@ fn resolve_route_target(
     id: &str,
     field: &str,
 ) -> HammerResult<RouteTarget> {
-    if outbound.get(id).is_some() {
-        return Ok(RouteTarget::Outbound(id.to_owned()));
-    }
     if endpoint_ids.contains(id) {
         return Ok(RouteTarget::Endpoint(id.to_owned()));
+    }
+    if outbound.get(id).is_some() {
+        return Ok(RouteTarget::Outbound(id.to_owned()));
     }
     Err(HammerError::config_validation(format!(
         "{field} {id:?} is not declared"
