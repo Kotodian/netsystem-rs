@@ -351,3 +351,92 @@ outbound = "block"
 final = "direct"
 auto_detect_interface = true
 ```
+
+## 打包 iOS xcframework
+
+把整套 Rust runtime + uniffi Swift glue 编译成 `Hammer.xcframework`，
+给 NEPacketTunnelProvider extension 直接 import。
+
+### 工具链准备
+
+- macOS + Xcode 15+（`xcodebuild` / `install_name_tool` / `strip` 来自 Xcode 命令行工具）。
+- Rust stable，加上 iOS device target：
+
+  ```bash
+  rustup target add aarch64-apple-ios
+  ```
+
+> 当前脚本只构建 **arm64 真机 slice**，不带 simulator。模拟器联调请直接在 macOS 上跑测试，或者自行扩展脚本加 `aarch64-apple-ios-sim` / `x86_64-apple-ios`。
+
+### 一键构建
+
+仓库根目录下：
+
+```bash
+make xcframework
+# 或者直接：./scripts/build-xcframework.sh
+```
+
+脚本会依次：
+
+1. `cargo build -p hammer-ffi --target aarch64-apple-ios`，产出 `libhammer.dylib`；
+2. 把 dylib 包装成 `Hammer.framework`（加 modulemap、Info.plist、`@rpath` install_name）；
+3. 通过 `hammer-uniffi-bindgen` 用 `crates/hammer-ffi/src/hammer.udl` 生成 Swift glue 与 C header；
+4. `xcodebuild -create-xcframework` 把 framework 包成 `Hammer.xcframework`。
+
+### 输出布局
+
+默认输出到 `dist/ios/`：
+
+```
+dist/ios/
+├── Hammer.xcframework         # 真机 arm64 framework
+├── Sources/Hammer/hammer.swift # uniffi 生成的 Swift glue（已把 `hammerFFI` 替换为 `Hammer`）
+├── ios/Hammer.framework        # 打包前的中间 framework，调试时方便看 layout
+└── generated/                  # uniffi 原始输出（hammer.h 等）
+```
+
+### 可调环境变量
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `FEATURES` / `CARGO_FEATURES` | 空（用 `hammer-ffi` 的 default features） | 传给 `cargo build` 的 feature 列表 |
+| `PROFILE` | `release` | 改成 `release-perf` 保留 line-table debuginfo、不 strip，方便 Instruments 出火焰图 |
+| `OUTPUT_DIR` / `BUILD_DIR` | `dist/ios` | 改输出目录 |
+| `IPHONEOS_DEPLOYMENT_TARGET` | `15.0` | 调最低 iOS 版本——要和 aws-lc-sys / ring 等 C 依赖编译时的目标对齐，否则可能链接出 `___chkstk_darwin` 之类未解析符号 |
+
+`hammer-ffi` 的默认 features 只带 **TUN 入口 + DNS 传输 + direct / block / urltest 三个出口 + probe**。
+代理协议都是 opt-in，要打进包必须显式开 feature：
+
+```bash
+# 默认基线：不带任何代理协议（适合纯 direct / block 使用）
+make xcframework
+
+# 只开 Hysteria2
+FEATURES=hysteria2 make xcframework
+
+# 只开 WireGuard endpoint
+FEATURES=wireguard make xcframework
+
+# 同时开 Hysteria2 + WireGuard（demo / 生产典型组合）
+FEATURES="hysteria2 wireguard" make xcframework
+
+# 上面任一组合 + Instruments 友好包（保留 debuginfo、不 strip）
+FEATURES="hysteria2 wireguard" PROFILE=release-perf make xcframework
+```
+
+> Feature 名对齐 `crates/hammer-ffi/Cargo.toml`——`wireguard` 会自动拉上 `endpoint`
+> 与 `hammer-core/wireguard`；`hysteria2` 会拉上 `hammer-runtime/outbound-hysteria2`。
+> 不需要手动把 runtime / core 的子 feature 一个个写出来。
+
+### Xcode 端集成
+
+1. 把 `dist/ios/Hammer.xcframework` 拖进 host app + NetExt target，General → Frameworks 设为 **Embed & Sign**。
+2. 把 `dist/ios/Sources/Hammer/hammer.swift` 加入 NetExt target（不需要 Embed，纯 Swift 源文件）。
+3. NetExt 的 `NEPacketTunnelProvider` 子类 `import Hammer` 之后即可拿到服务句柄、平台回调接口（TUN fd、网卡监控、Wi-Fi 状态、证书提供方、日志）等 uniffi 暴露的类型。
+
+### 清理
+
+```bash
+make clean-ios-lib   # 等价于 rm -rf dist/ios
+```
