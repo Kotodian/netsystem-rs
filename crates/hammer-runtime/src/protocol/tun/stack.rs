@@ -4126,7 +4126,7 @@ where
     {
         return;
     }
-    let Some(destination) = metadata.destination.as_mut() else {
+    let Some(destination) = metadata.destination.as_ref() else {
         return;
     };
     if destination.domain.is_some() {
@@ -4138,9 +4138,7 @@ where
     let Some(domain) = router.lookup_reverse_mapping(destination.host) else {
         return;
     };
-    let domain = normalize_destination_domain(&domain);
-    metadata.domain = Some(domain.clone());
-    destination.domain = Some(domain);
+    metadata.domain = Some(normalize_destination_domain(&domain));
 }
 
 fn route_destination<Q>(metadata: &RouteMetadata, dns_router: Option<&Q>) -> HammerResult<SocksAddr>
@@ -6238,6 +6236,29 @@ mod tests {
         ));
         assert_eq!(metadata.domain.as_deref(), Some("ifconfig.so"));
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn reverse_dns_mapping_keeps_tcp_dial_destination_as_ip() {
+        let dns_router = ReverseMappingDnsRouter;
+        let mut metadata = RouteMetadata {
+            inbound: "tun".to_owned(),
+            network: Network::Tcp,
+            destination: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)),
+            ..Default::default()
+        };
+
+        apply_reverse_dns_mapping(&mut metadata, Some(&dns_router));
+        let destination = route_destination_without_dns(&metadata).expect("destination");
+
+        assert_eq!(metadata.domain.as_deref(), Some("ifconfig.so"));
+        assert_eq!(destination.host, IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert_eq!(destination.port, 443);
+        assert_eq!(
+            destination.domain, None,
+            "reverse DNS is for routing; direct TCP dial must keep the concrete IP",
+        );
     }
 
     #[cfg(feature = "endpoint")]
