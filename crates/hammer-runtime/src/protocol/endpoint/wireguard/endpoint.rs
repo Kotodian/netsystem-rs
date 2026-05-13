@@ -62,6 +62,7 @@ struct WireguardRuntime {
     /// Cloneable hot-path sender so `ip_send_clone` doesn't have to mutex-walk
     /// for every packet.
     encrypt_tx: mpsc::Sender<Bytes>,
+    encrypt_batch_tx: mpsc::Sender<Vec<Bytes>>,
     inbound: InboundFanout,
 }
 
@@ -78,6 +79,7 @@ struct WireguardRuntime {
 /// is `None` and the default channel pays zero local-flow lookup cost.
 struct InboundFanout {
     default_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
+    default_batch_rx: Mutex<Option<mpsc::Receiver<Vec<Bytes>>>>,
     local_rx: Mutex<Option<mpsc::Receiver<Bytes>>>,
     local_tx_slot: Arc<ArcSwapOption<mpsc::Sender<Bytes>>>,
     /// Held so `take_local` can publish a sender clone into `local_tx_slot`
@@ -121,6 +123,13 @@ impl InboundFanout {
         self.default_rx
             .lock()
             .expect("default_rx mutex poisoned")
+            .take()
+    }
+
+    fn take_default_batch(&self) -> Option<mpsc::Receiver<Vec<Bytes>>> {
+        self.default_batch_rx
+            .lock()
+            .expect("default_batch_rx mutex poisoned")
             .take()
     }
 
@@ -241,9 +250,12 @@ impl WireguardEndpoint {
         )?;
 
         let encrypt_tx_clone = transport.encrypt_tx.clone();
+        let encrypt_batch_tx_clone = transport.encrypt_batch_tx.clone();
         let TransportHandles {
             encrypt_tx,
+            encrypt_batch_tx,
             inbound_rx,
+            inbound_batch_rx,
             local_addr,
             shutdown,
             reset_tx,
@@ -255,13 +267,17 @@ impl WireguardEndpoint {
         // channel is opt-in (EndpointOutboundAdapter) and stays cold via
         // `ArcSwapOption::None` until someone calls `take_local`.
         let (default_tx, default_rx) = mpsc::channel::<Bytes>(DEFAULT_RECV_QUEUE);
+        let (default_batch_tx, default_batch_rx) =
+            mpsc::channel::<Vec<Bytes>>(transport::INBOUND_BATCH_QUEUE);
         let (local_tx_template, local_rx) = mpsc::channel::<Bytes>(LOCAL_RECV_QUEUE);
         let local_tx_slot: Arc<ArcSwapOption<mpsc::Sender<Bytes>>> =
             Arc::new(ArcSwapOption::empty());
         crate::spawn::spawn(run_inbound_forwarder(
             self.logger.clone(),
             inbound_rx,
+            inbound_batch_rx,
             default_tx,
+            default_batch_tx,
             Arc::clone(&local_tx_slot),
             Arc::clone(&self.local_flows),
         ));
@@ -269,16 +285,20 @@ impl WireguardEndpoint {
         Ok(WireguardRuntime {
             transport: TransportHandles {
                 encrypt_tx,
+                encrypt_batch_tx,
                 // Sentinel — the live receiver has moved into the forwarder.
                 inbound_rx: mpsc::channel::<Bytes>(1).1,
+                inbound_batch_rx: mpsc::channel::<Vec<Bytes>>(1).1,
                 local_addr,
                 shutdown,
                 reset_tx,
                 join,
             },
             encrypt_tx: encrypt_tx_clone,
+            encrypt_batch_tx: encrypt_batch_tx_clone,
             inbound: InboundFanout {
                 default_rx: Mutex::new(Some(default_rx)),
+                default_batch_rx: Mutex::new(Some(default_batch_rx)),
                 local_rx: Mutex::new(Some(local_rx)),
                 local_tx_slot,
                 local_tx_template,
@@ -324,6 +344,7 @@ fn stop_runtime(rt: WireguardRuntime) {
     let _ = rt.transport.shutdown.send(());
     rt.transport.join.abort();
     drop(rt.encrypt_tx);
+    drop(rt.encrypt_batch_tx);
     // Drops both fan-out channels; the forwarder task exits when its
     // upstream `inbound_rx` (owned by the transport actor we just told to
     // shut down) closes.
@@ -337,26 +358,86 @@ fn stop_runtime(rt: WireguardRuntime) {
 async fn run_inbound_forwarder(
     logger: Logger,
     mut inbound_rx: mpsc::Receiver<Bytes>,
+    mut inbound_batch_rx: mpsc::Receiver<Vec<Bytes>>,
     default_tx: mpsc::Sender<Bytes>,
+    default_batch_tx: mpsc::Sender<Vec<Bytes>>,
     local_tx_slot: Arc<ArcSwapOption<mpsc::Sender<Bytes>>>,
     local_flows: Arc<LocalFlowTable>,
 ) {
-    while let Some(pkt) = inbound_rx.recv().await {
+    loop {
+        tokio::select! {
+            packet = inbound_rx.recv() => {
+                let Some(packet) = packet else {
+                    break;
+                };
+                forward_inbound_packets(
+                    &logger,
+                    vec![packet],
+                    &default_tx,
+                    &default_batch_tx,
+                    &local_tx_slot,
+                    &local_flows,
+                )
+                .await;
+            }
+            batch = inbound_batch_rx.recv() => {
+                let Some(batch) = batch else {
+                    break;
+                };
+                forward_inbound_packets(
+                    &logger,
+                    batch,
+                    &default_tx,
+                    &default_batch_tx,
+                    &local_tx_slot,
+                    &local_flows,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn forward_inbound_packets(
+    logger: &Logger,
+    packets: Vec<Bytes>,
+    default_tx: &mpsc::Sender<Bytes>,
+    default_batch_tx: &mpsc::Sender<Vec<Bytes>>,
+    local_tx_slot: &Arc<ArcSwapOption<mpsc::Sender<Bytes>>>,
+    local_flows: &LocalFlowTable,
+) {
+    let mut default_batch = Vec::with_capacity(packets.len());
+    for pkt in packets {
         if let Some(local_tx) = local_tx_slot.load().as_ref()
             && local_flows.matches_inbound(&pkt)
         {
             let _ = local_tx.try_send(pkt);
-            continue;
+        } else {
+            default_batch.push(pkt);
         }
-        match default_tx.try_send(pkt) {
+    }
+    if default_batch.is_empty() {
+        return;
+    }
+    if default_batch.len() == 1 {
+        match default_tx.try_send(default_batch.pop().expect("one packet")) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
                 logger.debug("wg inbound forwarder: TUN receiver full; dropped packet");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 logger.debug("wg inbound forwarder: TUN receiver dropped");
-                break;
             }
+        }
+        return;
+    }
+    match default_batch_tx.try_send(default_batch) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            logger.debug("wg inbound forwarder: TUN batch receiver full; dropped batch");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            logger.debug("wg inbound forwarder: TUN batch receiver dropped");
         }
     }
 }
@@ -425,10 +506,26 @@ impl Endpoint for WireguardEndpoint {
         }
     }
 
+    fn ip_send_batch_clone(&self) -> Option<mpsc::Sender<Vec<Bytes>>> {
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        match &*inner {
+            WireguardState::Running(rt) => Some(rt.encrypt_batch_tx.clone()),
+            WireguardState::Idle | WireguardState::Closed => None,
+        }
+    }
+
     fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>> {
         let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         match &*inner {
             WireguardState::Running(rt) => rt.inbound.take_default(),
+            _ => None,
+        }
+    }
+
+    fn ip_recv_batch_take(&self) -> Option<mpsc::Receiver<Vec<Bytes>>> {
+        let inner = self.inner.lock().expect("WireguardEndpoint poisoned");
+        match &*inner {
+            WireguardState::Running(rt) => rt.inbound.take_default_batch(),
             _ => None,
         }
     }
@@ -731,7 +828,9 @@ mod tests {
         // Wire the fan-out plumbing manually so the test exercises only the
         // forwarder + `InboundFanout` contract, independent of boringtun.
         let (transport_tx, transport_rx) = mpsc::channel::<Bytes>(8);
+        let (_transport_batch_tx, transport_batch_rx) = mpsc::channel::<Vec<Bytes>>(8);
         let (default_tx, mut default_rx) = mpsc::channel::<Bytes>(8);
+        let (default_batch_tx, _default_batch_rx) = mpsc::channel::<Vec<Bytes>>(8);
         let (local_tx_template, local_rx) = mpsc::channel::<Bytes>(8);
         let local_tx_slot: Arc<ArcSwapOption<mpsc::Sender<Bytes>>> =
             Arc::new(ArcSwapOption::empty());
@@ -739,6 +838,7 @@ mod tests {
 
         let fanout = InboundFanout {
             default_rx: Mutex::new(Some(mpsc::channel::<Bytes>(1).1)), // unused for this test
+            default_batch_rx: Mutex::new(Some(mpsc::channel::<Vec<Bytes>>(1).1)),
             local_rx: Mutex::new(Some(local_rx)),
             local_tx_slot: Arc::clone(&local_tx_slot),
             local_tx_template,
@@ -748,7 +848,9 @@ mod tests {
         let forwarder = tokio::spawn(run_inbound_forwarder(
             logger,
             transport_rx,
+            transport_batch_rx,
             default_tx,
+            default_batch_tx,
             Arc::clone(&local_tx_slot),
             Arc::clone(&local_flows),
         ));
@@ -822,13 +924,16 @@ mod tests {
         use tokio::time::timeout;
 
         let (transport_tx, transport_rx) = mpsc::channel::<Bytes>(8);
+        let (_transport_batch_tx, transport_batch_rx) = mpsc::channel::<Vec<Bytes>>(8);
         let (default_tx, _default_rx) = mpsc::channel::<Bytes>(1);
+        let (default_batch_tx, _default_batch_rx) = mpsc::channel::<Vec<Bytes>>(1);
         let (local_tx_template, local_rx) = mpsc::channel::<Bytes>(8);
         let local_tx_slot: Arc<ArcSwapOption<mpsc::Sender<Bytes>>> =
             Arc::new(ArcSwapOption::empty());
         let local_flows = Arc::new(LocalFlowTable::default());
         let fanout = InboundFanout {
             default_rx: Mutex::new(Some(mpsc::channel::<Bytes>(1).1)),
+            default_batch_rx: Mutex::new(Some(mpsc::channel::<Vec<Bytes>>(1).1)),
             local_rx: Mutex::new(Some(local_rx)),
             local_tx_slot: Arc::clone(&local_tx_slot),
             local_tx_template,
@@ -838,7 +943,9 @@ mod tests {
         let forwarder = tokio::spawn(run_inbound_forwarder(
             test_logger(),
             transport_rx,
+            transport_batch_rx,
             default_tx,
+            default_batch_tx,
             Arc::clone(&local_tx_slot),
             Arc::clone(&local_flows),
         ));

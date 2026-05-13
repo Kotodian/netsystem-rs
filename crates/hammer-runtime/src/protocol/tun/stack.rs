@@ -51,6 +51,12 @@ const SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY: usize = 64;
 const SYSTEM_TCP_PENDING_DIAL_CAPACITY: usize = 64;
 const SYSTEM_TCP_BRIDGE_BUFFER_SIZE: usize = 64 * 1024;
 const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum TunWriteItem {
+    Packet(Vec<u8>),
+    Batch(Vec<Vec<u8>>),
+}
+
 const IPV4_HEADER_MIN_LEN: usize = 20;
 const IPV6_HEADER_LEN: usize = 40;
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -631,15 +637,27 @@ struct L3EndpointRoute {
     id: String,
     allowed: Vec<IpNet>,
     tx: mpsc::Sender<Bytes>,
+    batch_tx: Option<mpsc::Sender<Vec<Bytes>>>,
     rewrite: L3AddressRewrites,
     mtu: Option<usize>,
 }
 
 #[cfg(feature = "endpoint")]
 struct L3InboundReceiver {
-    rx: mpsc::Receiver<Bytes>,
+    rx: Option<mpsc::Receiver<Bytes>>,
+    batch_rx: Option<mpsc::Receiver<Vec<Bytes>>>,
     rewrite: L3AddressRewrites,
 }
+
+#[cfg(feature = "endpoint")]
+struct L3EndpointQueuedBatch {
+    tx: mpsc::Sender<Bytes>,
+    batch_tx: Option<mpsc::Sender<Vec<Bytes>>>,
+    packets: Vec<Bytes>,
+}
+
+#[cfg(feature = "endpoint")]
+type L3EndpointQueuedBatches = HashMap<String, L3EndpointQueuedBatch>;
 
 #[cfg(feature = "endpoint")]
 pub(crate) struct L3DispatchTable {
@@ -655,6 +673,7 @@ impl L3DispatchTable {
         for ep in eps {
             let rewrite = L3AddressRewrites::from_endpoint(addresses, &ep.interface_addresses());
             let tx = ep.ip_send_clone();
+            let batch_tx = ep.ip_send_batch_clone();
             let mtu = ep.ip_packet_mtu();
             let mut allowed = ep.allowed_destinations();
             allowed.sort_by(|a, b| b.prefix_len().cmp(&a.prefix_len()));
@@ -664,12 +683,19 @@ impl L3DispatchTable {
                     id: ep.id().to_owned(),
                     allowed,
                     tx,
+                    batch_tx,
                     rewrite,
                     mtu,
                 });
             }
-            if let Some(rx) = ep.ip_recv_take() {
-                inbound.push(L3InboundReceiver { rx, rewrite });
+            let rx = ep.ip_recv_take();
+            let batch_rx = ep.ip_recv_batch_take();
+            if rx.is_some() || batch_rx.is_some() {
+                inbound.push(L3InboundReceiver {
+                    rx,
+                    batch_rx,
+                    rewrite,
+                });
             }
         }
         Self {
@@ -747,11 +773,29 @@ impl L3AddressRewrites {
 
 #[cfg(feature = "endpoint")]
 impl L3EndpointRoute {
+    fn prepare_packets(
+        &self,
+        packet: Vec<u8>,
+        parsed: &ParsedIpPacketView,
+        tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
+        metrics: &TunMetrics,
+    ) -> HammerResult<Vec<Bytes>> {
+        if let Some(mtu) = self.mtu {
+            if packet.len() > mtu {
+                return self.prepare_oversized(packet, parsed, mtu, tun_write_tx, metrics);
+            }
+        }
+        let mut packet = packet;
+        self.rewrite.rewrite_egress(&mut packet, parsed)?;
+        Ok(vec![Bytes::from(packet)])
+    }
+
+    #[cfg(test)]
     fn dispatch(
         &self,
         packet: Vec<u8>,
         parsed: &ParsedIpPacketView,
-        tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+        tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
         metrics: &TunMetrics,
     ) -> HammerResult<()> {
         if let Some(mtu) = self.mtu {
@@ -762,6 +806,7 @@ impl L3EndpointRoute {
         self.dispatch_rewritten(packet, parsed)
     }
 
+    #[cfg(test)]
     fn dispatch_rewritten(
         &self,
         mut packet: Vec<u8>,
@@ -771,34 +816,52 @@ impl L3EndpointRoute {
         self.send_packet(packet)
     }
 
+    #[cfg(test)]
     fn dispatch_oversized(
         &self,
         packet: Vec<u8>,
         parsed: &ParsedIpPacketView,
         mtu: usize,
-        tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+        tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
         metrics: &TunMetrics,
     ) -> HammerResult<()> {
+        for packet in self.prepare_oversized(packet, parsed, mtu, tun_write_tx, metrics)? {
+            self.send_packet(packet.to_vec())?;
+        }
+        Ok(())
+    }
+
+    fn prepare_oversized(
+        &self,
+        packet: Vec<u8>,
+        parsed: &ParsedIpPacketView,
+        mtu: usize,
+        tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
+        metrics: &TunMetrics,
+    ) -> HammerResult<Vec<Bytes>> {
         match IpVersion::from_packet(&packet)? {
             IpVersion::V4 if ipv4_dont_fragment(&packet)? => {
                 let response = ipv4_packet_too_big_packet(&packet, mtu)?;
-                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)
+                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)?;
+                Ok(Vec::new())
             }
             IpVersion::V4 => {
                 let mut packet = packet;
                 self.rewrite.rewrite_egress(&mut packet, parsed)?;
-                for fragment in fragment_ipv4_packet(&packet, mtu)? {
-                    self.send_packet(fragment)?;
-                }
-                Ok(())
+                Ok(fragment_ipv4_packet(&packet, mtu)?
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect())
             }
             IpVersion::V6 => {
                 let response = ipv6_packet_too_big_packet(&packet, mtu)?;
-                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)
+                enqueue_endpoint_pmtu_response(tun_write_tx, response, metrics)?;
+                Ok(Vec::new())
             }
         }
     }
 
+    #[cfg(test)]
     fn send_packet(&self, packet: Vec<u8>) -> HammerResult<()> {
         self.tx
             .try_send(Bytes::from(packet))
@@ -807,13 +870,14 @@ impl L3EndpointRoute {
 }
 
 #[cfg(feature = "endpoint")]
+#[cfg(test)]
 fn dispatch_endpoint_l3_packet(
     dispatch: &L3DispatchTable,
     endpoint_id: &str,
     packet: Vec<u8>,
     parsed: &ParsedIpPacketView,
     metrics: &TunMetrics,
-    tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+    tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
 ) -> bool {
     if let Some(endpoint) = dispatch.match_endpoint(endpoint_id, parsed.destination.host) {
         match endpoint.dispatch(packet, parsed, tun_write_tx, metrics) {
@@ -837,8 +901,72 @@ fn dispatch_endpoint_l3_packet(
 }
 
 #[cfg(feature = "endpoint")]
+fn queue_endpoint_l3_packet(
+    dispatch: &L3DispatchTable,
+    endpoint_id: &str,
+    packet: Vec<u8>,
+    parsed: &ParsedIpPacketView,
+    metrics: &TunMetrics,
+    tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
+    batches: &mut L3EndpointQueuedBatches,
+) -> bool {
+    if let Some(endpoint) = dispatch.match_endpoint(endpoint_id, parsed.destination.host) {
+        match endpoint.prepare_packets(packet, parsed, tun_write_tx, metrics) {
+            Ok(packets) => {
+                metrics.counters.endpoint_dispatch_total.increment(1);
+                if !packets.is_empty() {
+                    let batch = batches.entry(endpoint.id.clone()).or_insert_with(|| {
+                        L3EndpointQueuedBatch {
+                            tx: endpoint.tx.clone(),
+                            batch_tx: endpoint.batch_tx.clone(),
+                            packets: Vec::new(),
+                        }
+                    });
+                    batch.packets.extend(packets);
+                }
+            }
+            Err(err) => {
+                metrics.counters.endpoint_dispatch_drop_total.increment(1);
+                debug!("dispatch endpoint L3 packet: {err}");
+            }
+        }
+        true
+    } else {
+        metrics.counters.endpoint_dispatch_drop_total.increment(1);
+        debug!(
+            "endpoint route {endpoint_id} does not accept {}",
+            parsed.destination.host
+        );
+        false
+    }
+}
+
+#[cfg(feature = "endpoint")]
+async fn flush_endpoint_l3_batches(batches: &mut L3EndpointQueuedBatches, metrics: &TunMetrics) {
+    for (_, mut batch) in batches.drain() {
+        if batch.packets.is_empty() {
+            continue;
+        }
+        if let Some(batch_tx) = batch.batch_tx {
+            if batch_tx.send(batch.packets).await.is_err() {
+                metrics.counters.endpoint_dispatch_drop_total.increment(1);
+                debug!("dispatch endpoint L3 batch: endpoint batch channel closed");
+            }
+            continue;
+        }
+        for packet in batch.packets.drain(..) {
+            if batch.tx.send(packet).await.is_err() {
+                metrics.counters.endpoint_dispatch_drop_total.increment(1);
+                debug!("dispatch endpoint L3 packet: endpoint channel closed");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "endpoint")]
 fn enqueue_endpoint_pmtu_response(
-    tun_write_tx: Option<&mpsc::Sender<Vec<u8>>>,
+    tun_write_tx: Option<&mpsc::Sender<TunWriteItem>>,
     response: Vec<u8>,
     metrics: &TunMetrics,
 ) -> HammerResult<()> {
@@ -848,6 +976,20 @@ fn enqueue_endpoint_pmtu_response(
         ));
     };
     enqueue_tun_packet_write(tun_write_tx, response, metrics);
+    Ok(())
+}
+
+#[cfg(feature = "endpoint")]
+fn rewrite_endpoint_inbound_packet(
+    rewrite: &L3AddressRewrites,
+    packet: &mut [u8],
+    metrics: &TunMetrics,
+) -> HammerResult<()> {
+    if let Err(err) = rewrite.rewrite_ingress(packet) {
+        metrics.counters.endpoint_dispatch_drop_total.increment(1);
+        debug!("rewrite endpoint inbound packet: {err}");
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -3115,6 +3257,8 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
         Vec::with_capacity(SYSTEM_TUN_RECV_BATCH_HINT);
     #[cfg(feature = "endpoint")]
     let mut tcp_endpoint_flows: TcpEndpointFlowMap = HashMap::new();
+    #[cfg(feature = "endpoint")]
+    let mut endpoint_batches: L3EndpointQueuedBatches = HashMap::new();
     let (tun_write_tx, tun_write_rx) = mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
     spawn_tun_packet_writer(Arc::clone(&device), metrics.clone(), tun_write_rx);
     let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
@@ -3142,24 +3286,68 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
             let tun_tx = tun_write_tx.clone();
             let metrics_clone = metrics.clone();
             crate::spawn::spawn(async move {
-                while let Some(packet) = inbound.rx.recv().await {
-                    let mut packet = packet.to_vec();
-                    if let Err(err) = inbound.rewrite.rewrite_ingress(&mut packet) {
-                        metrics_clone
-                            .counters
-                            .endpoint_dispatch_drop_total
-                            .increment(1);
-                        debug!("rewrite endpoint inbound packet: {err}");
-                        continue;
+                loop {
+                    tokio::select! {
+                        packet = async {
+                            match inbound.rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            let Some(packet) = packet else {
+                                inbound.rx = None;
+                                if inbound.batch_rx.is_none() {
+                                    break;
+                                }
+                                continue;
+                            };
+                            let mut packet = packet.to_vec();
+                            if rewrite_endpoint_inbound_packet(&inbound.rewrite, &mut packet, &metrics_clone).is_err() {
+                                continue;
+                            }
+                            if tun_tx.send(TunWriteItem::Packet(packet)).await.is_err() {
+                                metrics_clone
+                                    .counters
+                                    .tcp_writeback_error_total
+                                    .increment(1);
+                                break;
+                            }
+                            metrics_clone.counters.endpoint_inbound_total.increment(1);
+                        }
+                        batch = async {
+                            match inbound.batch_rx.as_mut() {
+                                Some(rx) => rx.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            let Some(batch) = batch else {
+                                inbound.batch_rx = None;
+                                if inbound.rx.is_none() {
+                                    break;
+                                }
+                                continue;
+                            };
+                            let mut packets = Vec::with_capacity(batch.len());
+                            for packet in batch {
+                                let mut packet = packet.to_vec();
+                                if rewrite_endpoint_inbound_packet(&inbound.rewrite, &mut packet, &metrics_clone).is_ok() {
+                                    packets.push(packet);
+                                }
+                            }
+                            let count = packets.len() as u64;
+                            if count == 0 {
+                                continue;
+                            }
+                            if tun_tx.send(TunWriteItem::Batch(packets)).await.is_err() {
+                                metrics_clone
+                                    .counters
+                                    .tcp_writeback_error_total
+                                    .increment(1);
+                                break;
+                            }
+                            metrics_clone.counters.endpoint_inbound_total.increment(count);
+                        }
                     }
-                    if tun_tx.send(packet).await.is_err() {
-                        metrics_clone
-                            .counters
-                            .tcp_writeback_error_total
-                            .increment(1);
-                        break;
-                    }
-                    metrics_clone.counters.endpoint_inbound_total.increment(1);
                 }
             });
         }
@@ -3180,6 +3368,8 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
         tcp_writeback.clear();
         udp_pending.clear();
         icmp_pending.clear();
+        #[cfg(feature = "endpoint")]
+        endpoint_batches.clear();
         // Pass 1: under one NAT mutex acquisition, rewrite every TCP packet
         // in the batch and stash UDP packets for sequential post-processing.
         // The guard is released at the end of this scope before any I/O
@@ -3234,13 +3424,14 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                             pinned_tcp_endpoint(&mut tcp_endpoint_flows, key, udp_timeout)
                         {
                             let closes = tcp_packet_closes_flow(&packet);
-                            let dispatched = dispatch_endpoint_l3_packet(
+                            let dispatched = queue_endpoint_l3_packet(
                                 dispatch,
                                 &endpoint_id,
                                 packet,
                                 &parsed,
                                 &metrics,
                                 Some(&tun_write_tx),
+                                &mut endpoint_batches,
                             );
                             if closes || !dispatched {
                                 tcp_endpoint_flows.remove(key);
@@ -3260,13 +3451,14 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                         }) => {
                             if let Some(key) = tcp_flow_key {
                                 let closes = tcp_packet_closes_flow(&packet);
-                                let dispatched = dispatch_endpoint_l3_packet(
+                                let dispatched = queue_endpoint_l3_packet(
                                     dispatch,
                                     &endpoint_id,
                                     packet,
                                     &parsed,
                                     &metrics,
                                     Some(&tun_write_tx),
+                                    &mut endpoint_batches,
                                 );
                                 if dispatched && !closes {
                                     pin_tcp_endpoint_flow(
@@ -3278,13 +3470,14 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                                     tcp_endpoint_flows.remove(&key);
                                 }
                             } else {
-                                let _ = dispatch_endpoint_l3_packet(
+                                let _ = queue_endpoint_l3_packet(
                                     dispatch,
                                     &endpoint_id,
                                     packet,
                                     &parsed,
                                     &metrics,
                                     Some(&tun_write_tx),
+                                    &mut endpoint_batches,
                                 );
                             }
                             continue;
@@ -3325,6 +3518,8 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                 }
             }
         }
+        #[cfg(feature = "endpoint")]
+        flush_endpoint_l3_batches(&mut endpoint_batches, &metrics).await;
         // Pass 2: send the rewritten TCP batch either to the system TUN fd
         // or directly into an endpoint fast path, depending on the selected route.
         mode.write_tcp_packets(&mut tcp_writeback, &metrics).await;
@@ -3365,7 +3560,7 @@ fn handle_system_udp_packet<R, Q, O>(
     inbound_id: String,
     udp_flows: Arc<StdMutex<UdpFlowMap>>,
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
-    tun_write_tx: &mpsc::Sender<Vec<u8>>,
+    tun_write_tx: &mpsc::Sender<TunWriteItem>,
     udp_timeout: Duration,
     packet: Vec<u8>,
     parsed: ParsedIpPacketView,
@@ -3620,7 +3815,7 @@ fn enqueue_system_dns_hijack_packet(
 
 fn spawn_dns_hijack_workers<Q>(
     dns_router: Arc<Q>,
-    tun_write_tx: mpsc::Sender<Vec<u8>>,
+    tun_write_tx: mpsc::Sender<TunWriteItem>,
     metrics: TunMetrics,
     rx: mpsc::Receiver<DnsHijackJob>,
 ) where
@@ -3702,7 +3897,7 @@ async fn wait_dispatch_dns_hijack_job(
 
 fn spawn_dns_hijack_worker<Q>(
     dns_router: Arc<Q>,
-    tun_write_tx: mpsc::Sender<Vec<u8>>,
+    tun_write_tx: mpsc::Sender<TunWriteItem>,
     metrics: TunMetrics,
     mut rx: mpsc::Receiver<DnsHijackJob>,
 ) -> JoinHandle<()>
@@ -3735,11 +3930,11 @@ where
 }
 
 fn enqueue_tun_packet_write(
-    tun_write_tx: &mpsc::Sender<Vec<u8>>,
+    tun_write_tx: &mpsc::Sender<TunWriteItem>,
     packet: Vec<u8>,
     metrics: &TunMetrics,
 ) {
-    match tun_write_tx.try_send(packet) {
+    match tun_write_tx.try_send(TunWriteItem::Packet(packet)) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             metrics.counters.control_write_drop_busy_total.increment(1);
@@ -3753,11 +3948,11 @@ fn enqueue_tun_packet_write(
 }
 
 fn enqueue_tun_udp_response_write(
-    tun_write_tx: &mpsc::Sender<Vec<u8>>,
+    tun_write_tx: &mpsc::Sender<TunWriteItem>,
     packet: Vec<u8>,
     metrics: &TunMetrics,
 ) {
-    match tun_write_tx.try_send(packet) {
+    match tun_write_tx.try_send(TunWriteItem::Packet(packet)) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
             metrics
@@ -3779,19 +3974,19 @@ fn enqueue_tun_udp_response_write(
 fn spawn_tun_packet_writer<D>(
     device: Arc<D>,
     metrics: TunMetrics,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<TunWriteItem>,
 ) -> JoinHandle<()>
 where
     D: TunDevice,
 {
     crate::spawn::spawn(async move {
         const WRITE_BATCH_HINT: usize = 64;
-        let mut batch = Vec::with_capacity(WRITE_BATCH_HINT);
-        while let Some(packet) = rx.recv().await {
-            batch.push(packet);
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_HINT);
+        while let Some(item) = rx.recv().await {
+            append_tun_write_item(item, &mut batch);
             while batch.len() < WRITE_BATCH_HINT {
                 match rx.try_recv() {
-                    Ok(packet) => batch.push(packet),
+                    Ok(item) => append_tun_write_item(item, &mut batch),
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
                 }
@@ -3803,6 +3998,13 @@ where
             }
         }
     })
+}
+
+fn append_tun_write_item(item: TunWriteItem, batch: &mut Vec<Vec<u8>>) {
+    match item {
+        TunWriteItem::Packet(packet) => batch.push(packet),
+        TunWriteItem::Batch(mut packets) => batch.append(&mut packets),
+    }
 }
 
 fn dns_query_options(metadata: &RouteMetadata) -> DnsQueryOptions {
@@ -3911,7 +4113,7 @@ async fn system_udp_flow_loop(
     response_template: UdpResponseTemplate,
     udp_timeout: Duration,
     mut rx: mpsc::Receiver<UdpFlowPayload>,
-    tun_write_tx: mpsc::Sender<Vec<u8>>,
+    tun_write_tx: mpsc::Sender<TunWriteItem>,
     metrics: TunMetrics,
 ) {
     let mut packet_conn = match outbound.listen_packet().await {
@@ -4697,6 +4899,7 @@ mod tests {
     #[cfg(feature = "endpoint")]
     struct RecordingEndpoint {
         tx: mpsc::Sender<Bytes>,
+        batch_tx: Option<mpsc::Sender<Vec<Bytes>>>,
         mtu: Option<usize>,
     }
 
@@ -4892,6 +5095,10 @@ mod tests {
 
         fn ip_send_clone(&self) -> mpsc::Sender<Bytes> {
             self.tx.clone()
+        }
+
+        fn ip_send_batch_clone(&self) -> Option<mpsc::Sender<Vec<Bytes>>> {
+            self.batch_tx.clone()
         }
 
         fn ip_packet_mtu(&self) -> Option<usize> {
@@ -5567,6 +5774,7 @@ mod tests {
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: None,
             mtu: Some(68),
         });
         let addresses = StackAddresses {
@@ -5610,10 +5818,11 @@ mod tests {
     async fn l3_endpoint_dispatch_accepts_one_tun_batch_without_capacity_drop() {
         let packet = udp_packet_with_source([172, 19, 0, 1], [1, 1, 1, 1], 5353, 443, &[0x42; 32]);
         let parsed = parse_ip_packet_view(&packet).expect("parse packet");
-        let (endpoint_tx, mut endpoint_rx) =
-            mpsc::channel(crate::protocol::endpoint::wireguard::TEST_ENCRYPT_QUEUE);
+        let (endpoint_tx, mut endpoint_rx) = mpsc::channel(1);
+        let (endpoint_batch_tx, mut endpoint_batch_rx) = mpsc::channel(1);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: Some(endpoint_batch_tx),
             mtu: Some(1400),
         });
         let addresses = StackAddresses {
@@ -5625,23 +5834,24 @@ mod tests {
         };
         let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let mut batches = L3EndpointQueuedBatches::new();
 
         for _ in 0..SYSTEM_TUN_RECV_BATCH_HINT {
-            assert!(dispatch_endpoint_l3_packet(
+            assert!(queue_endpoint_l3_packet(
                 &dispatch,
                 "wg-out",
                 packet.clone(),
                 &parsed,
                 &metrics,
                 None,
+                &mut batches,
             ));
         }
+        flush_endpoint_l3_batches(&mut batches, &metrics).await;
 
-        let mut received = 0usize;
-        while endpoint_rx.try_recv().is_ok() {
-            received += 1;
-        }
-        assert_eq!(received, SYSTEM_TUN_RECV_BATCH_HINT);
+        assert!(endpoint_rx.try_recv().is_err());
+        let received = endpoint_batch_rx.try_recv().expect("batched packets");
+        assert_eq!(received.len(), SYSTEM_TUN_RECV_BATCH_HINT);
     }
 
     #[cfg(feature = "endpoint")]
@@ -5655,6 +5865,7 @@ mod tests {
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: None,
             mtu: Some(68),
         });
         let addresses = StackAddresses {
@@ -5666,7 +5877,7 @@ mod tests {
         };
         let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
-        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<TunWriteItem>(4);
 
         assert!(dispatch_endpoint_l3_packet(
             &dispatch,
@@ -5682,6 +5893,9 @@ mod tests {
             .await
             .expect("icmp response")
             .expect("icmp response");
+        let TunWriteItem::Packet(response) = response else {
+            panic!("expected one ICMP response packet");
+        };
         assert_eq!(
             response[IPV4_PROTOCOL_OFFSET],
             IpProtocol::Icmpv4.wire_value()
@@ -5700,6 +5914,7 @@ mod tests {
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(8);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: None,
             mtu: Some(68),
         });
         let addresses = StackAddresses {
@@ -5711,7 +5926,7 @@ mod tests {
         };
         let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
-        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<Vec<u8>>(4);
+        let (tun_write_tx, mut tun_write_rx) = mpsc::channel::<TunWriteItem>(4);
 
         assert!(dispatch_endpoint_l3_packet(
             &dispatch,
@@ -5727,6 +5942,9 @@ mod tests {
             .await
             .expect("icmp response")
             .expect("icmp response");
+        let TunWriteItem::Packet(response) = response else {
+            panic!("expected one ICMP response packet");
+        };
         assert_eq!(
             response[IPV6_PROTOCOL_OFFSET],
             IpProtocol::Icmpv6.wire_value()
@@ -5787,6 +6005,7 @@ mod tests {
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(4);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: None,
             mtu: None,
         });
         let addresses = StackAddresses {
@@ -5876,6 +6095,7 @@ mod tests {
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(4);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
+            batch_tx: None,
             mtu: None,
         });
         let addresses = StackAddresses {
@@ -6114,6 +6334,9 @@ final = "direct"
             .await
             .expect("cached DNS response should bypass slowpath queue")
             .expect("cached DNS response packet");
+        let TunWriteItem::Packet(response_packet) = response_packet else {
+            panic!("expected cached DNS response packet");
+        };
         let response = dns_message_from_packet(&response_packet);
         assert_eq!(response.metadata.id, 0x1234);
         assert_eq!(response.metadata.response_code, ResponseCode::NoError);
@@ -6125,9 +6348,34 @@ final = "direct"
         let device = BatchRecordingTunDevice::new();
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
         let (tx, rx) = mpsc::channel(8);
-        tx.try_send(vec![1]).expect("queue packet 1");
-        tx.try_send(vec![2]).expect("queue packet 2");
-        tx.try_send(vec![3]).expect("queue packet 3");
+        tx.try_send(TunWriteItem::Packet(vec![1]))
+            .expect("queue packet 1");
+        tx.try_send(TunWriteItem::Packet(vec![2]))
+            .expect("queue packet 2");
+        tx.try_send(TunWriteItem::Packet(vec![3]))
+            .expect("queue packet 3");
+        drop(tx);
+
+        let task = spawn_tun_packet_writer(Arc::clone(&device), metrics, rx);
+        timeout(Duration::from_millis(50), task)
+            .await
+            .expect("writer exits after sender closes")
+            .expect("writer task");
+
+        assert_eq!(*device.batch_sizes.lock().await, vec![3]);
+        assert_eq!(
+            *device.packets.lock().await,
+            vec![vec![1], vec![2], vec![3]]
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_packet_writer_preserves_batch_write_items() {
+        let device = BatchRecordingTunDevice::new();
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let (tx, rx) = mpsc::channel(8);
+        tx.try_send(TunWriteItem::Batch(vec![vec![1], vec![2], vec![3]]))
+            .expect("queue packet batch");
         drop(tx);
 
         let task = spawn_tun_packet_writer(Arc::clone(&device), metrics, rx);

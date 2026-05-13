@@ -48,12 +48,14 @@ const TIMER_TICK: Duration = Duration::from_millis(250);
 /// batches; otherwise a single speed-test burst can fill the channel and turn
 /// the rest of that batch into drops.
 pub(crate) const ENCRYPT_QUEUE: usize = 512;
+pub(crate) const ENCRYPT_BATCH_QUEUE: usize = 32;
 /// Same for the decrypted-inbound side. Now that each decrypted packet is
 /// pushed as its own `Bytes` (the old `IpStackInput::Batch` enum is gone), the
 /// queue holds one packet per slot.
 /// 256 × MTU 1408 ≈ 360 KiB worst case, comfortably inside NetExt budget; the
 /// queue almost never fills because the TUN writer drains it line-rate.
 const INBOUND_QUEUE: usize = 256;
+pub(crate) const INBOUND_BATCH_QUEUE: usize = 32;
 /// After one UDP readiness wake, drain a small bounded burst so we keep the
 /// boringtun decap loop hot before re-entering `select!`. Each packet is then
 /// pushed individually to `inbound_tx`.
@@ -73,10 +75,12 @@ pub(crate) struct TransportHandles {
     /// Push IP packets into here to have them encapsulated and shipped to
     /// whichever peer's `allowed_ips` matches the destination.
     pub(crate) encrypt_tx: mpsc::Sender<Bytes>,
+    pub(crate) encrypt_batch_tx: mpsc::Sender<Vec<Bytes>>,
     /// Receive decrypted IP packets coming back from any peer. The endpoint
     /// (now an `adapter::Endpoint`, not an `Outbound`) hands this stream
     /// straight to the TUN packet-loop fan-in.
     pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
+    pub(crate) inbound_batch_rx: mpsc::Receiver<Vec<Bytes>>,
     /// The address the OS bound the UDP socket to. Mostly useful for tests
     /// — production peers configure their endpoints out-of-band.
     #[allow(dead_code)]
@@ -153,7 +157,9 @@ pub(crate) fn spawn_transport(
     info!("wireguard transport listening on {local_addr}");
 
     let (encrypt_tx, encrypt_rx) = mpsc::channel::<Bytes>(ENCRYPT_QUEUE);
+    let (encrypt_batch_tx, encrypt_batch_rx) = mpsc::channel::<Vec<Bytes>>(ENCRYPT_BATCH_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
+    let (inbound_batch_tx, inbound_batch_rx) = mpsc::channel::<Vec<Bytes>>(INBOUND_BATCH_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
 
@@ -164,14 +170,18 @@ pub(crate) fn spawn_transport(
         mtu,
         protector,
         encrypt_rx,
+        encrypt_batch_rx,
         inbound_tx,
+        inbound_batch_tx,
         shutdown_rx,
         reset_rx,
     ));
 
     Ok(TransportHandles {
         encrypt_tx,
+        encrypt_batch_tx,
         inbound_rx,
+        inbound_batch_rx,
         local_addr,
         shutdown: shutdown_tx,
         reset_tx,
@@ -306,7 +316,9 @@ async fn run_actor(
     mtu: u32,
     protector: SocketProtector,
     mut encrypt_rx: mpsc::Receiver<Bytes>,
+    mut encrypt_batch_rx: mpsc::Receiver<Vec<Bytes>>,
     inbound_tx: mpsc::Sender<Bytes>,
+    inbound_batch_tx: mpsc::Sender<Vec<Bytes>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     mut reset_rx: mpsc::Receiver<()>,
 ) {
@@ -381,6 +393,7 @@ async fn run_actor(
                             &mut udp_buf_v4,
                             crypto_cap,
                             &inbound_tx,
+                            &inbound_batch_tx,
                             &mut inbound_batch,
                         )
                         .await;
@@ -406,6 +419,7 @@ async fn run_actor(
                             &mut udp_buf_v6,
                             crypto_cap,
                             &inbound_tx,
+                            &inbound_batch_tx,
                             &mut inbound_batch,
                         )
                         .await;
@@ -427,6 +441,21 @@ async fn run_actor(
                     &mut encrypt_rx,
                     crypto_cap,
                     &mut outbound_batch,
+                    &mut outbound_routed,
+                    &mut outbound_send_buf,
+                )
+                .await;
+            }
+            batch = encrypt_batch_rx.recv() => {
+                let Some(mut batch) = batch else {
+                    debug!("wireguard transport: encrypt_batch_rx closed");
+                    break;
+                };
+                handle_outbound_packet_batch(
+                    &sockets,
+                    &peers,
+                    &mut batch,
+                    crypto_cap,
                     &mut outbound_routed,
                     &mut outbound_send_buf,
                 )
@@ -469,6 +498,7 @@ async fn handle_inbound_ready(
     recv_buf: &mut [u8],
     crypto_cap: usize,
     inbound_tx: &mpsc::Sender<Bytes>,
+    inbound_batch_tx: &mpsc::Sender<Vec<Bytes>>,
     inbound_batch: &mut Vec<Bytes>,
 ) {
     // Re-use the actor-owned Vec; capacity (>= INBOUND_DRAIN_BATCH) survives
@@ -505,7 +535,7 @@ async fn handle_inbound_ready(
         }
     }
 
-    flush_inbound_batch(inbound_tx, inbound_batch);
+    flush_inbound_batch(inbound_tx, inbound_batch_tx, inbound_batch).await;
 }
 
 async fn handle_inbound_datagram(
@@ -597,18 +627,25 @@ async fn dispatch_action(
 /// 256`) so a 32-packet readiness drain never has to block, and per-packet
 /// granularity makes congestion drops localised instead of taking the whole
 /// burst down. `batch` is reused across wakes; `drain(..)` keeps capacity.
-fn flush_inbound_batch(inbound_tx: &mpsc::Sender<Bytes>, batch: &mut Vec<Bytes>) {
+async fn flush_inbound_batch(
+    inbound_tx: &mpsc::Sender<Bytes>,
+    inbound_batch_tx: &mpsc::Sender<Vec<Bytes>>,
+    batch: &mut Vec<Bytes>,
+) {
     if batch.is_empty() {
         return;
     }
-    let mut dropped = 0usize;
-    for pkt in batch.drain(..) {
-        if inbound_tx.try_send(pkt).is_err() {
-            dropped += 1;
+    if batch.len() == 1 {
+        if let Some(pkt) = batch.pop() {
+            if inbound_tx.send(pkt).await.is_err() {
+                warn!("wireguard inbound queue closed; dropped packet");
+            }
         }
+        return;
     }
-    if dropped > 0 {
-        warn!("wireguard inbound queue full or closed; dropped {dropped} packet(s)");
+    let outbound = std::mem::replace(batch, Vec::with_capacity(batch.capacity()));
+    if inbound_batch_tx.send(outbound).await.is_err() {
+        warn!("wireguard inbound batch queue closed; dropped packet batch");
     }
 }
 
@@ -715,7 +752,17 @@ async fn handle_outbound_batch(
             Err(_) => break, // empty or disconnected — surface on next select arm
         }
     }
+    handle_outbound_packet_batch(sockets, peers, batch, crypto_cap, routed, send_buf).await;
+}
 
+async fn handle_outbound_packet_batch(
+    sockets: &TransportSockets,
+    peers: &[Peer],
+    batch: &mut Vec<Bytes>,
+    crypto_cap: usize,
+    routed: &mut Vec<(usize, Bytes)>,
+    send_buf: &mut BytesMut,
+) {
     // Step 2: route each packet to its peer; drop malformed / unrouted ones now
     // so the per-peer encrypt loop doesn't have to re-check.
     routed.clear();
@@ -917,35 +964,52 @@ mod tests {
         pkt
     }
 
-    #[test]
-    fn flush_inbound_batch_sends_one_packet() {
+    async fn recv_transport_packet(handles: &mut TransportHandles) -> Option<Bytes> {
+        tokio::select! {
+            packet = handles.inbound_rx.recv() => packet,
+            batch = handles.inbound_batch_rx.recv() => {
+                batch.and_then(|mut packets| {
+                    if packets.is_empty() {
+                        None
+                    } else {
+                        Some(packets.remove(0))
+                    }
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_inbound_batch_sends_one_packet() {
         let (tx, mut rx) = mpsc::channel(1);
+        let (batch_tx, mut batch_rx) = mpsc::channel(1);
         let packet = Bytes::from_static(b"one");
         let mut batch = vec![packet.clone()];
 
-        flush_inbound_batch(&tx, &mut batch);
+        flush_inbound_batch(&tx, &batch_tx, &mut batch).await;
 
         let received = rx.try_recv().expect("one inbound message");
         assert_eq!(received, packet);
         assert!(rx.try_recv().is_err(), "only one packet pushed");
+        assert!(batch_rx.try_recv().is_err(), "no batch for one packet");
         assert!(batch.is_empty(), "batch must be drained for the next wake");
     }
 
-    #[test]
-    fn flush_inbound_batch_pushes_each_packet_separately() {
+    #[tokio::test]
+    async fn flush_inbound_batch_pushes_multiple_packets_as_one_batch() {
         let (tx, mut rx) = mpsc::channel(4);
+        let (batch_tx, mut batch_rx) = mpsc::channel(4);
         let first = Bytes::from_static(b"one");
         let second = Bytes::from_static(b"two");
         let mut batch = vec![first.clone(), second.clone()];
         let original_capacity = batch.capacity();
 
-        flush_inbound_batch(&tx, &mut batch);
+        flush_inbound_batch(&tx, &batch_tx, &mut batch).await;
 
-        // L3 fast path: each decap'd packet is pushed individually so the
-        // TUN-writer fan-in sees them in order without an enum hop.
-        assert_eq!(rx.try_recv().expect("first packet"), first);
-        assert_eq!(rx.try_recv().expect("second packet"), second);
         assert!(rx.try_recv().is_err());
+        let received = batch_rx.try_recv().expect("batched packets");
+        assert_eq!(received, vec![first, second]);
+        assert!(batch_rx.try_recv().is_err());
         assert!(batch.is_empty(), "batch must be drained for reuse");
         assert!(
             batch.capacity() >= original_capacity,
@@ -1000,10 +1064,13 @@ mod tests {
 
         // Five seconds is generous: the handshake completes in <50 ms over
         // localhost, even with the 250 ms timer driving retransmits.
-        let recovered = timeout(Duration::from_secs(5), handles_b.inbound_rx.recv())
-            .await
-            .expect("timed out waiting for inbound packet")
-            .expect("inbound_rx closed before delivering");
+        let recovered = timeout(
+            Duration::from_secs(5),
+            recv_transport_packet(&mut handles_b),
+        )
+        .await
+        .expect("timed out waiting for inbound packet")
+        .expect("inbound_rx closed before delivering");
         assert_eq!(&recovered[..], payload.as_slice());
 
         // Dropping the handles closes both mpsc channels and the oneshot;
@@ -1068,12 +1135,21 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while received < BURST {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let next = timeout(remaining, handles_b.inbound_rx.recv())
-                .await
-                .expect("timed out waiting for inbound burst packets")
-                .expect("inbound_rx closed before delivering all burst packets");
-            assert_eq!(&next[..], payload.as_slice());
-            received += 1;
+            let delivered = timeout(remaining, async {
+                tokio::select! {
+                    packet = handles_b.inbound_rx.recv() => {
+                        packet.map(|packet| vec![packet])
+                    }
+                    batch = handles_b.inbound_batch_rx.recv() => batch,
+                }
+            })
+            .await
+            .expect("timed out waiting for inbound burst packets")
+            .expect("inbound channels closed before delivering all burst packets");
+            for packet in delivered {
+                assert_eq!(&packet[..], payload.as_slice());
+                received += 1;
+            }
         }
         assert_eq!(received, BURST);
     }

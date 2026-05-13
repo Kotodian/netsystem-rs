@@ -36,12 +36,28 @@ pub trait Endpoint: Lifecycle {
     /// dispatch per packet. Cheap (`Arc` clone under the hood).
     fn ip_send_clone(&self) -> mpsc::Sender<Bytes>;
 
+    /// Optional batched hot-path egress. Endpoints that can consume raw IP
+    /// packets in batches should return a sender here so the TUN packet loop
+    /// can hand off one routed TUN batch with one channel send. The single
+    /// packet sender remains the compatibility path for endpoints that have
+    /// not opted into batch processing.
+    fn ip_send_batch_clone(&self) -> Option<mpsc::Sender<Vec<Bytes>>> {
+        None
+    }
+
     /// One-shot ingress receiver. Returns the inbound IP packet stream
     /// (already decapsulated, ready to write back to TUN) the first time
     /// it is called; subsequent calls return `None`. The runtime takes
     /// ownership of the receiver at start-up and fans it into the TUN
     /// writer.
     fn ip_recv_take(&self) -> Option<mpsc::Receiver<Bytes>>;
+
+    /// Optional batched ingress receiver. Batch-capable endpoints use this
+    /// default TUN fan-in path; older endpoints can keep returning packets
+    /// through `ip_recv_take`.
+    fn ip_recv_batch_take(&self) -> Option<mpsc::Receiver<Vec<Bytes>>> {
+        None
+    }
 
     /// One-shot ingress receiver for a *local* consumer (the
     /// EndpointOutboundAdapter). Calling this enables a lazy fan-out
