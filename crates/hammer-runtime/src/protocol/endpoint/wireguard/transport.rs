@@ -42,10 +42,12 @@ use crate::socket_protector::SocketProtector;
 /// without burning a CPU.
 const TIMER_TICK: Duration = Duration::from_millis(250);
 
-/// Channel buffer for IP packets waiting to be encrypted. 64 packets at
-/// MTU=1408 ≈ 90 KiB of headroom — keeps a brief stall on the encryption
-/// thread from immediately back-pressuring the TUN packet loop.
-const ENCRYPT_QUEUE: usize = 64;
+/// Channel buffer for IP packets waiting to be encrypted. Apple utun can hand
+/// the packet loop a 256-packet batch, and the L3 fast path uses `try_send` so
+/// it never parks the TUN reader. Keep enough room for at least two full TUN
+/// batches; otherwise a single speed-test burst can fill the channel and turn
+/// the rest of that batch into drops.
+pub(crate) const ENCRYPT_QUEUE: usize = 512;
 /// Same for the decrypted-inbound side. Now that each decrypted packet is
 /// pushed as its own `Bytes` (the old `IpStackInput::Batch` enum is gone), the
 /// queue holds one packet per slot.
@@ -62,7 +64,7 @@ const INBOUND_DRAIN_BATCH: usize = 32;
 /// instead of N times. Single-peer (the typical iOS client) batches collapse
 /// to one lock acquisition; multi-peer split-tunnel still saves a lock per
 /// run of consecutive same-peer packets.
-const OUTBOUND_DRAIN_BATCH: usize = 32;
+const OUTBOUND_DRAIN_BATCH: usize = 64;
 
 /// Handles returned to the owner of a transport actor. Hold these for the
 /// lifetime of the endpoint; dropping `shutdown` is enough to stop the actor

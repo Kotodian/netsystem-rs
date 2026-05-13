@@ -471,7 +471,8 @@ impl TunDevice for AppleTunDevice {
         self.send_batch(&mut packets).await
     }
 
-    async fn recv_batch(&self, _max: usize) -> HammerResult<Vec<Vec<u8>>> {
+    async fn recv_batch(&self, max: usize) -> HammerResult<Vec<Vec<u8>>> {
+        let max = max.max(1);
         loop {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(HammerError::internal("apple TUN closed"));
@@ -480,7 +481,8 @@ impl TunDevice for AppleTunDevice {
             {
                 let mut state = self.rx.lock().expect("apple TUN rx poisoned");
                 if !state.pending.is_empty() {
-                    return Ok(state.pending.drain(..).collect());
+                    let take = max.min(state.pending.len());
+                    return Ok(state.pending.drain(..take).collect());
                 }
             }
             let mut guard = self

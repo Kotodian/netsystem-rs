@@ -39,6 +39,7 @@ use metrics::{Counter, Key, Metadata, Recorder};
 
 const TUN_READ_HEADROOM: usize = 128;
 const MAX_TUN_PACKET_SIZE: usize = 65_535;
+pub(crate) const SYSTEM_TUN_RECV_BATCH_HINT: usize = 256;
 const SYSTEM_UDP_FLOW_CAPACITY: usize = 256;
 const SYSTEM_UDP_CHANNEL_CAPACITY: usize = 64;
 const SYSTEM_DNS_HIJACK_QUEUE_CAPACITY: usize = 64;
@@ -3107,10 +3108,11 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
     // utun driver, currently). On platforms where recv_batch falls back to
     // single-packet recv() the batch is just `vec![pkt]` and the loop body
     // degrades to the previous behaviour.
-    const RECV_BATCH_HINT: usize = 256;
-    let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(RECV_BATCH_HINT);
-    let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
-    let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> = Vec::with_capacity(RECV_BATCH_HINT);
+    let mut tcp_writeback: Vec<Vec<u8>> = Vec::with_capacity(SYSTEM_TUN_RECV_BATCH_HINT);
+    let mut udp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> =
+        Vec::with_capacity(SYSTEM_TUN_RECV_BATCH_HINT);
+    let mut icmp_pending: Vec<(Vec<u8>, ParsedIpPacketView)> =
+        Vec::with_capacity(SYSTEM_TUN_RECV_BATCH_HINT);
     #[cfg(feature = "endpoint")]
     let mut tcp_endpoint_flows: TcpEndpointFlowMap = HashMap::new();
     let (tun_write_tx, tun_write_rx) = mpsc::channel(SYSTEM_TUN_CONTROL_WRITE_QUEUE_CAPACITY);
@@ -3163,7 +3165,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
         }
     }
     loop {
-        let packets = match device.recv_batch(RECV_BATCH_HINT).await {
+        let packets = match device.recv_batch(SYSTEM_TUN_RECV_BATCH_HINT).await {
             Ok(packets) => packets,
             Err(err) => {
                 metrics.counters.packet_recv_error_total.increment(1);
@@ -5601,6 +5603,45 @@ mod tests {
         );
         assert_eq!(read_u16(&first, 6) & 0x2000, 0x2000);
         assert_eq!(read_u16(&second, 6) & 0x1fff, 6);
+    }
+
+    #[cfg(feature = "endpoint-wireguard")]
+    #[tokio::test]
+    async fn l3_endpoint_dispatch_accepts_one_tun_batch_without_capacity_drop() {
+        let packet = udp_packet_with_source([172, 19, 0, 1], [1, 1, 1, 1], 5353, 443, &[0x42; 32]);
+        let parsed = parse_ip_packet_view(&packet).expect("parse packet");
+        let (endpoint_tx, mut endpoint_rx) =
+            mpsc::channel(crate::protocol::endpoint::wireguard::TEST_ENCRYPT_QUEUE);
+        let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
+            tx: endpoint_tx,
+            mtu: Some(1400),
+        });
+        let addresses = StackAddresses {
+            v4: Some(StackAddress {
+                listener: Ipv4Addr::new(172, 19, 0, 1),
+                next: Ipv4Addr::new(172, 19, 0, 2),
+            }),
+            v6: None,
+        };
+        let dispatch = L3DispatchTable::from_endpoints(&[endpoint], &addresses);
+        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+
+        for _ in 0..SYSTEM_TUN_RECV_BATCH_HINT {
+            assert!(dispatch_endpoint_l3_packet(
+                &dispatch,
+                "wg-out",
+                packet.clone(),
+                &parsed,
+                &metrics,
+                None,
+            ));
+        }
+
+        let mut received = 0usize;
+        while endpoint_rx.try_recv().is_ok() {
+            received += 1;
+        }
+        assert_eq!(received, SYSTEM_TUN_RECV_BATCH_HINT);
     }
 
     #[cfg(feature = "endpoint")]
