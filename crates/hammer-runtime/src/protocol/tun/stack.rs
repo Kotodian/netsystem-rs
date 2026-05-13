@@ -1468,26 +1468,58 @@ impl SystemStackRoutes {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 fn bind_system_listener(addr: IpAddr, interface_index: Option<u32>) -> HammerResult<TcpListener> {
+    use std::os::fd::AsRawFd;
+
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let domain = match addr {
+        IpAddr::V4(_) => Domain::IPV4,
+        IpAddr::V6(_) => Domain::IPV6,
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .map_err(|err| HammerError::internal(format!("create {addr} listener socket: {err}")))?;
+    if matches!(addr, IpAddr::V6(_)) {
+        socket.set_only_v6(true).map_err(|err| {
+            HammerError::internal(format!("set {addr} listener IPv6-only: {err}"))
+        })?;
+    }
+    if let Some(index) = interface_index {
+        bind_listener_to_tun_interface_fd(socket.as_raw_fd(), addr, index)?;
+    }
+    socket
+        .bind(&SocketAddr::new(addr, 0).into())
+        .map_err(|err| HammerError::internal(format!("bind {addr}: {err}")))?;
+    socket
+        .listen(128)
+        .map_err(|err| HammerError::internal(format!("listen {addr}: {err}")))?;
+    let listener: StdTcpListener = socket.into();
+    listener
+        .set_nonblocking(true)
+        .map_err(|err| HammerError::internal(format!("set {addr} listener nonblocking: {err}")))?;
+    TcpListener::from_std(listener)
+        .map_err(|err| HammerError::internal(format!("register {addr} listener: {err}")))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
+fn bind_system_listener(addr: IpAddr, interface_index: Option<u32>) -> HammerResult<TcpListener> {
+    use std::os::fd::AsRawFd;
+
     let listener = StdTcpListener::bind(SocketAddr::new(addr, 0))
         .map_err(|err| HammerError::internal(format!("bind {addr}: {err}")))?;
     listener
         .set_nonblocking(true)
         .map_err(|err| HammerError::internal(format!("set {addr} listener nonblocking: {err}")))?;
     if let Some(index) = interface_index {
-        bind_listener_to_tun_interface(&listener, addr, index)?;
+        bind_listener_to_tun_interface_fd(listener.as_raw_fd(), addr, index)?;
     }
     TcpListener::from_std(listener)
         .map_err(|err| HammerError::internal(format!("register {addr} listener: {err}")))
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
-fn bind_listener_to_tun_interface(
-    listener: &StdTcpListener,
-    addr: IpAddr,
-    index: u32,
-) -> HammerResult<()> {
-    use std::os::fd::AsRawFd;
+fn bind_listener_to_tun_interface_fd(fd: RawFd, addr: IpAddr, index: u32) -> HammerResult<()> {
     let (level, name) = match addr {
         IpAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_BOUND_IF),
         IpAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_BOUND_IF),
@@ -1495,7 +1527,7 @@ fn bind_listener_to_tun_interface(
     let value = index as libc::c_int;
     let ret = unsafe {
         libc::setsockopt(
-            listener.as_raw_fd(),
+            fd,
             level,
             name,
             (&value as *const libc::c_int).cast::<libc::c_void>(),
@@ -1512,11 +1544,7 @@ fn bind_listener_to_tun_interface(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
-fn bind_listener_to_tun_interface(
-    _listener: &StdTcpListener,
-    _addr: IpAddr,
-    _index: u32,
-) -> HammerResult<()> {
+fn bind_listener_to_tun_interface_fd(_fd: RawFd, _addr: IpAddr, _index: u32) -> HammerResult<()> {
     Ok(())
 }
 

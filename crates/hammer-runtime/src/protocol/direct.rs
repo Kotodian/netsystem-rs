@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::info;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -82,10 +82,6 @@ impl Outbound for DirectOutbound {
         }
         info!("outbound connection to {destination}");
         let target = resolve_destination(&destination).await?;
-        debug!(
-            "direct TCP dial start: destination={destination} target={target} initial_payload={}B",
-            initial_payload.len()
-        );
         let socket = if target.is_ipv6() {
             TcpSocket::new_v6()
         } else {
@@ -97,18 +93,11 @@ impl Outbound for DirectOutbound {
             .connect(target)
             .await
             .with_context(|| "direct tcp connect")?;
-        if let (Ok(local), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) {
-            debug!("direct TCP connected: local={local} peer={peer}");
-        }
         if !initial_payload.is_empty() {
             stream
                 .write_all(initial_payload)
                 .await
                 .with_context(|| "direct tcp write")?;
-            debug!(
-                "direct TCP wrote initial payload: destination={destination} bytes={}B",
-                initial_payload.len()
-            );
         }
         Ok(Box::new(stream))
     }
@@ -160,10 +149,6 @@ impl DirectPacketConn {
 impl ProxyPacketConn for DirectPacketConn {
     async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
         let target = resolve_destination(&destination).await?;
-        debug!(
-            "direct UDP send: destination={destination} target={target} bytes={}B",
-            payload.len()
-        );
         self.socket_for(target.ip())?
             .send_to(&payload, target)
             .await
@@ -213,7 +198,6 @@ fn datagram_from_recv(
 ) -> HammerResult<ProxyDatagram> {
     let (len, source) = result.with_context(|| "direct udp recv")?;
     buf.truncate(len);
-    debug!("direct UDP recv: source={source} bytes={}B", len);
     Ok(ProxyDatagram {
         destination: SocksAddr::ip(source.ip(), source.port()),
         payload: Bytes::from(buf),

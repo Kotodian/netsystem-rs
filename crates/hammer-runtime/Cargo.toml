@@ -24,7 +24,7 @@ default = [
 # under `crate::probe`, plus the `RuntimeService::probe_outbounds` API.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
 probe = ["dep:socket2"]
-inbound-tun = ["dep:libc", "dep:tun-rs"]
+inbound-tun = ["dep:libc", "dep:tun-rs", "dep:socket2"]
 outbound-hysteria2 = [
     "hammer-core/hysteria2",
     "dep:base64",
