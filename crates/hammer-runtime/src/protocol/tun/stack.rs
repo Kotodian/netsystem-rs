@@ -1196,6 +1196,7 @@ where
             handles.push(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
+                Arc::clone(&self.dns_router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
                 self.tcp_pending_dials.clone(),
@@ -1222,6 +1223,7 @@ where
             handles.push(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
+                Arc::clone(&self.dns_router),
                 Arc::clone(&self.outbound),
                 Arc::clone(&self.tcp_nat),
                 self.tcp_pending_dials.clone(),
@@ -2889,9 +2891,10 @@ fn is_global_unicast(addr: IpAddr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn accept_tcp_loop<R, O>(
+async fn accept_tcp_loop<R, Q, O>(
     _logger: Logger,
     router: Arc<R>,
+    dns_router: Arc<Q>,
     outbound: Arc<O>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
@@ -2900,6 +2903,7 @@ async fn accept_tcp_loop<R, O>(
     metrics: TunMetrics,
 ) where
     R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
     loop {
@@ -2923,6 +2927,7 @@ async fn accept_tcp_loop<R, O>(
         };
         let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
         let router = Arc::clone(&router);
+        let dns_router = Arc::clone(&dns_router);
         let outbound = Arc::clone(&outbound);
         let tcp_pending_dials = tcp_pending_dials.clone();
         let inbound_id = inbound_id.clone();
@@ -2978,7 +2983,11 @@ async fn accept_tcp_loop<R, O>(
                     }
                 }
             }
-            let decision = match router.match_route(&mut metadata) {
+            let decision = match route_system_tcp_metadata(
+                router.as_ref(),
+                dns_router.as_ref(),
+                &mut metadata,
+            ) {
                 Ok(decision) => decision,
                 Err(err) => {
                     metrics.route_error_total.inc(Network::Tcp);
@@ -3049,6 +3058,19 @@ async fn accept_tcp_loop<R, O>(
             }
         });
     }
+}
+
+fn route_system_tcp_metadata<R, Q>(
+    router: &R,
+    dns_router: &Q,
+    metadata: &mut RouteMetadata,
+) -> HammerResult<RouteDecision>
+where
+    R: RouterTrait + ?Sized,
+    Q: DnsRouterTrait + ?Sized,
+{
+    prepare_route_metadata(router, metadata, Some(dns_router))?;
+    router.match_route(metadata)
 }
 
 enum TunPacketLoopMode<D>
@@ -6118,6 +6140,34 @@ mod tests {
                 target: RouteTarget::Outbound(ref outbound)
             } if outbound == "direct"
         ));
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn system_tcp_route_uses_reverse_dns_for_split_routes() {
+        let router = DomainSplitRouter {
+            match_calls: AtomicUsize::new(0),
+        };
+        let dns_router = ReverseMappingDnsRouter;
+        let mut metadata = RouteMetadata {
+            inbound: "tun".to_owned(),
+            network: Network::Tcp,
+            source: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50000)),
+            destination: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)),
+            ..Default::default()
+        };
+
+        let decision =
+            route_system_tcp_metadata(&router, &dns_router, &mut metadata).expect("route");
+
+        assert!(matches!(
+            decision,
+            RouteDecision::Route {
+                target: RouteTarget::Outbound(ref outbound)
+            } if outbound == "direct"
+        ));
+        assert_eq!(metadata.domain.as_deref(), Some("ifconfig.so"));
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
     }
 
