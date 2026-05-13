@@ -1,3 +1,5 @@
+#[cfg(feature = "amneziawg")]
+pub mod amnezia2;
 pub mod peer;
 
 /// Tunnel-side overhead added to every IP packet by WireGuard's data frame

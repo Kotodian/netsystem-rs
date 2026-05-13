@@ -34,7 +34,13 @@ use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
 use hammer_core::protocol::wireguard::peer::{self, Peer};
+#[cfg(feature = "endpoint-amneziawg")]
+use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
 
+#[cfg(feature = "endpoint-amneziawg")]
+use super::amnezia2::{
+    decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets,
+};
 use crate::socket_protector::SocketProtector;
 
 /// 250 ms matches what boringtun's own examples and Cloudflare WARP use to
@@ -151,6 +157,7 @@ pub(crate) fn spawn_transport(
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<Amnezia2Options>,
 ) -> HammerResult<TransportHandles> {
     let sockets = bind_transport_sockets(&peers, listen_port, &protector)?;
     let local_addr = sockets.local_addr()?;
@@ -169,6 +176,8 @@ pub(crate) fn spawn_transport(
         listen_port,
         mtu,
         protector,
+        #[cfg(feature = "endpoint-amneziawg")]
+        amnezia,
         encrypt_rx,
         encrypt_batch_rx,
         inbound_tx,
@@ -315,6 +324,7 @@ async fn run_actor(
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<Amnezia2Options>,
     mut encrypt_rx: mpsc::Receiver<Bytes>,
     mut encrypt_batch_rx: mpsc::Receiver<Vec<Bytes>>,
     inbound_tx: mpsc::Sender<Bytes>,
@@ -387,6 +397,8 @@ async fn run_actor(
                         handle_inbound_ready(
                             &sockets,
                             &peers,
+                            #[cfg(feature = "endpoint-amneziawg")]
+                            amnezia.as_ref(),
                             socket,
                             src,
                             n,
@@ -413,6 +425,8 @@ async fn run_actor(
                         handle_inbound_ready(
                             &sockets,
                             &peers,
+                            #[cfg(feature = "endpoint-amneziawg")]
+                            amnezia.as_ref(),
                             socket,
                             src,
                             n,
@@ -437,6 +451,8 @@ async fn run_actor(
                 handle_outbound_batch(
                     &sockets,
                     &peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.as_ref(),
                     first,
                     &mut encrypt_rx,
                     crypto_cap,
@@ -454,6 +470,8 @@ async fn run_actor(
                 handle_outbound_packet_batch(
                     &sockets,
                     &peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.as_ref(),
                     &mut batch,
                     crypto_cap,
                     &mut outbound_routed,
@@ -462,7 +480,14 @@ async fn run_actor(
                 .await;
             }
             _ = timer.tick() => {
-                tick_timers(&sockets, &peers, crypto_cap, &mut tick_buf).await;
+                tick_timers(
+                    &sockets,
+                    &peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.as_ref(),
+                    crypto_cap,
+                    &mut tick_buf,
+                ).await;
             }
         }
     }
@@ -492,6 +517,7 @@ async fn recv_from_optional(
 async fn handle_inbound_ready(
     sockets: &TransportSockets,
     peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     udp_socket: &UdpSocket,
     first_src: SocketAddr,
     first_len: usize,
@@ -507,6 +533,8 @@ async fn handle_inbound_ready(
     handle_inbound_datagram(
         sockets,
         peers,
+        #[cfg(feature = "endpoint-amneziawg")]
+        amnezia,
         first_src,
         &mut recv_buf[..first_len],
         crypto_cap,
@@ -520,6 +548,8 @@ async fn handle_inbound_ready(
                 handle_inbound_datagram(
                     sockets,
                     peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia,
                     src,
                     &mut recv_buf[..n],
                     crypto_cap,
@@ -541,6 +571,7 @@ async fn handle_inbound_ready(
 async fn handle_inbound_datagram(
     sockets: &TransportSockets,
     peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     src: SocketAddr,
     datagram: &mut [u8],
     crypto_cap: usize,
@@ -555,6 +586,19 @@ async fn handle_inbound_datagram(
     };
     let peer = &peers[peer_idx];
 
+    let mut datagram = datagram.to_vec();
+    #[cfg(feature = "endpoint-amneziawg")]
+    if let Some(options) = amnezia {
+        match decode_inbound_packet(options, &mut datagram) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::trace!(?err, "wireguard amnezia inbound decode error");
+                return;
+            }
+        }
+    }
+
     // WARP-style 3-byte reserved header: sing-box clears it on the inbound
     // side before letting boringtun parse the frame (boringtun expects bytes
     // 1..4 to be zero).
@@ -565,7 +609,7 @@ async fn handle_inbound_datagram(
     }
 
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
-    let action = step_decapsulate(peer, Some(src.ip()), datagram, crypto_cap);
+    let action = step_decapsulate(peer, Some(src.ip()), &datagram, crypto_cap);
     dispatch_action(sockets, peer, action, inbound_batch).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
@@ -736,6 +780,7 @@ enum DecapOutcome {
 async fn handle_outbound_batch(
     sockets: &TransportSockets,
     peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     first: Bytes,
     encrypt_rx: &mut mpsc::Receiver<Bytes>,
     crypto_cap: usize,
@@ -752,12 +797,23 @@ async fn handle_outbound_batch(
             Err(_) => break, // empty or disconnected — surface on next select arm
         }
     }
-    handle_outbound_packet_batch(sockets, peers, batch, crypto_cap, routed, send_buf).await;
+    handle_outbound_packet_batch(
+        sockets,
+        peers,
+        #[cfg(feature = "endpoint-amneziawg")]
+        amnezia,
+        batch,
+        crypto_cap,
+        routed,
+        send_buf,
+    )
+    .await;
 }
 
 async fn handle_outbound_packet_batch(
     sockets: &TransportSockets,
     peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     batch: &mut Vec<Bytes>,
     crypto_cap: usize,
     routed: &mut Vec<(usize, Bytes)>,
@@ -822,6 +878,21 @@ async fn handle_outbound_packet_batch(
                 continue;
             };
             send_buf.truncate(len);
+            #[cfg(feature = "endpoint-amneziawg")]
+            if let Some(options) = amnezia {
+                let is_handshake = send_buf.first().is_some_and(|byte| matches!(*byte, 1 | 2));
+                if is_handshake {
+                    for junk in make_handshake_junk_packets(options) {
+                        if let Err(err) = socket.send_to(&junk, dst).await {
+                            warn!("wireguard amnezia junk send_to {dst}: {err}");
+                        }
+                    }
+                }
+                let mut encoded = send_buf.to_vec();
+                encode_outbound_packet(options, &mut encoded);
+                send_buf.clear();
+                send_buf.extend_from_slice(&encoded);
+            }
             stamp_reserved_in_place(send_buf, reserved);
             if let Err(err) = socket.send_to(&send_buf, dst).await {
                 warn!("wireguard udp send_to {dst}: {err}");
@@ -847,6 +918,7 @@ fn route_outbound_peer(peers: &[Peer], dst: IpAddr) -> Option<usize> {
 async fn tick_timers(
     sockets: &TransportSockets,
     peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     crypto_cap: usize,
     buf: &mut BytesMut,
 ) {
@@ -864,6 +936,26 @@ async fn tick_timers(
         };
         if let Some(len) = len {
             buf.truncate(len);
+            #[cfg(feature = "endpoint-amneziawg")]
+            if let Some(options) = amnezia {
+                let is_handshake = buf.first().is_some_and(|byte| matches!(*byte, 1 | 2));
+                if is_handshake {
+                    for junk in make_handshake_junk_packets(options) {
+                        let dst = peer.endpoint();
+                        let Some(socket) = sockets.send_socket(dst) else {
+                            warn!("wireguard udp has no socket for {dst}");
+                            continue;
+                        };
+                        if let Err(err) = socket.send_to(&junk, dst).await {
+                            warn!("wireguard amnezia junk send_to {dst}: {err}");
+                        }
+                    }
+                }
+                let mut encoded = buf.to_vec();
+                encode_outbound_packet(options, &mut encoded);
+                buf.clear();
+                buf.extend_from_slice(&encoded);
+            }
             stamp_reserved_in_place(buf, peer.reserved());
             let dst = peer.endpoint();
             let Some(socket) = sockets.send_socket(dst) else {
@@ -948,7 +1040,13 @@ mod tests {
             persistent_keepalive: None,
             reserved: [0; 3],
         };
-        Peer::new(opts, &x25519::StaticSecret::from(local_priv), index)
+        Peer::new(
+            opts,
+            &x25519::StaticSecret::from(local_priv),
+            index,
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
+        )
     }
 
     /// Minimal 60-byte IPv4 datagram targeting 10.0.0.5 — boringtun doesn't
@@ -1042,6 +1140,8 @@ mod tests {
             port_a,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn A");
         let mut handles_b = spawn_transport(
@@ -1050,6 +1150,8 @@ mod tests {
             port_b,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn B");
         assert_eq!(handles_a.local_addr.port(), port_a);
@@ -1111,6 +1213,8 @@ mod tests {
             port_a,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn A");
         let mut handles_b = spawn_transport(
@@ -1119,6 +1223,8 @@ mod tests {
             port_b,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn B");
 
@@ -1177,6 +1283,8 @@ mod tests {
         handle_outbound_batch(
             &sockets,
             &peers,
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
             Bytes::from(packet),
             &mut encrypt_rx,
             64 + WIREGUARD_OVERHEAD,
@@ -1241,6 +1349,8 @@ mod tests {
             0,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn v6 transport");
 
@@ -1277,6 +1387,8 @@ mod tests {
             0,
             1408,
             SocketProtector::default(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
         )
         .expect("spawn mixed transport");
 

@@ -27,8 +27,12 @@ use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
 use hammer_core::protocol::wireguard::peer::{self, Peer};
+#[cfg(feature = "endpoint-amneziawg")]
+use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
 
 use super::transport::{self, TransportHandles};
+#[cfg(feature = "endpoint-amneziawg")]
+use super::amnezia2::to_boringtun_config;
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 
@@ -49,6 +53,8 @@ pub struct WireguardEndpoint {
     mtu: u32,
     listen_port: u16,
     addresses: Vec<IpNet>,
+    #[cfg(feature = "endpoint-amneziawg")]
+    amnezia: Option<Amnezia2Options>,
     peers: Arc<Vec<Peer>>,
     protector: SocketProtector,
     local_flows: Arc<LocalFlowTable>,
@@ -174,11 +180,23 @@ impl WireguardEndpoint {
             protocol: options,
         } = options;
         let private_key = x25519::StaticSecret::from(options.private_key);
+        #[cfg(feature = "endpoint-amneziawg")]
+        let amnezia = options.amnezia.as_ref().map(to_boringtun_config);
+        #[cfg(feature = "endpoint-amneziawg")]
+        let runtime_amnezia = options.amnezia.clone();
         let peers: Vec<Peer> = options
             .peers
             .into_iter()
             .enumerate()
-            .map(|(idx, peer_opts)| Peer::new(peer_opts, &private_key, idx as u32))
+            .map(|(idx, peer_opts)| {
+                Peer::new(
+                    peer_opts,
+                    &private_key,
+                    idx as u32,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.clone(),
+                )
+            })
             .collect();
         Self {
             logger,
@@ -188,6 +206,8 @@ impl WireguardEndpoint {
             mtu: interface.mtu,
             listen_port: options.listen_port,
             addresses: interface.address,
+            #[cfg(feature = "endpoint-amneziawg")]
+            amnezia: runtime_amnezia,
             peers: Arc::new(peers),
             protector,
             local_flows: Arc::new(LocalFlowTable::default()),
@@ -247,6 +267,8 @@ impl WireguardEndpoint {
             self.listen_port,
             self.mtu,
             self.protector.clone(),
+            #[cfg(feature = "endpoint-amneziawg")]
+            self.amnezia.clone(),
         )?;
 
         let encrypt_tx_clone = transport.encrypt_tx.clone();
@@ -651,6 +673,8 @@ mod tests {
         let options = WireguardEndpointOptions {
             private_key: my_priv,
             listen_port: 0,
+            #[cfg(feature = "endpoint-amneziawg")]
+            amnezia: None,
             peers: vec![WireguardPeerOptions {
                 public_key: peer_pub,
                 pre_shared_key: None,
@@ -748,6 +772,8 @@ mod tests {
         let opts = WireguardEndpointOptions {
             private_key: local_priv,
             listen_port: 0,
+            #[cfg(feature = "endpoint-amneziawg")]
+            amnezia: None,
             peers: vec![
                 WireguardPeerOptions {
                     public_key: peer1_pub,
@@ -798,6 +824,8 @@ mod tests {
         let opts = WireguardEndpointOptions {
             private_key: priv_key,
             listen_port: 0,
+            #[cfg(feature = "endpoint-amneziawg")]
+            amnezia: None,
             peers: vec![WireguardPeerOptions {
                 public_key: peer_pub,
                 pre_shared_key: None,

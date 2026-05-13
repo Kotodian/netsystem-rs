@@ -78,6 +78,12 @@ endpoint-wireguard = [
     "dep:boringtun",
     "dep:socket2",
 ]
+endpoint-amneziawg = [
+    "endpoint-wireguard",
+    "hammer-core/amneziawg",
+    "boringtun/amneziawg",
+    "dep:rand",
+]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }

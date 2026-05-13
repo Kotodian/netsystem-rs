@@ -18,6 +18,7 @@ hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
 # `endpoint-wireguard` feature; this one carries the protocol primitives
 # (boringtun `Tunn`, peer struct, `WIREGUARD_OVERHEAD`) the runtime relies on.
 wireguard = ["dep:bytes", "dep:boringtun", "dep:serde_with", "serde_with/base64"]
+amneziawg = ["wireguard", "boringtun/amneziawg"]
 
 [dependencies]
 serde = { workspace = true }

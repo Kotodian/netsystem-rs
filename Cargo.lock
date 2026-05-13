@@ -237,8 +237,6 @@ dependencies = [
 [[package]]
 name = "boringtun"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc4267b0c97985d9b089b19ff965b959e61870640d2f0842a97552e030fa43f"
 dependencies = [
  "aead",
  "base64 0.13.1",

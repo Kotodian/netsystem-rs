@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::{As, base64::Base64};
 
 use crate::error::HammerError;
+#[cfg(feature = "amneziawg")]
+use crate::protocol::wireguard::amnezia2::Amnezia2Options;
 
 #[cfg(feature = "wireguard")]
 use super::constants as C;
@@ -48,6 +50,9 @@ raw_struct! {
         pub mtu: Option<u32> => "Option::is_none",
         /// Local WireGuard interface addresses in CIDR form.
         pub address: Vec<IpNet> => "Vec::is_empty",
+        /// Optional AmneziaWG 2.0 endpoint configuration.
+        #[cfg(feature = "amneziawg")]
+        pub amnezia: Option<Amnezia2Options> => "Option::is_none",
         /// WireGuard peer list.
         pub peers: Vec<RawWireguardPeer> => "Vec::is_empty",
     }
@@ -130,6 +135,8 @@ pub struct WireguardEndpointOptions {
     pub private_key: [u8; 32],
     /// Local UDP listen port; `0` lets the OS pick.
     pub listen_port: u16,
+    #[cfg(feature = "amneziawg")]
+    pub amnezia: Option<Amnezia2Options>,
     pub peers: Vec<WireguardPeerOptions>,
 }
 
@@ -198,6 +205,10 @@ fn build_wireguard_endpoint(
             "endpoints[{idx}].peers must contain at least one peer"
         )));
     }
+    #[cfg(feature = "amneziawg")]
+    if let Some(amnezia) = raw.amnezia.as_ref() {
+        amnezia.validate(&format!("endpoints[{idx}].amnezia"))?;
+    }
     let peers = raw
         .peers
         .into_iter()
@@ -210,6 +221,8 @@ fn build_wireguard_endpoint(
         kind: EndpointKind::Wireguard(WireguardEndpointOptions {
             private_key: private_key.into_bytes(),
             listen_port,
+            #[cfg(feature = "amneziawg")]
+            amnezia: raw.amnezia,
             peers,
         }),
     })

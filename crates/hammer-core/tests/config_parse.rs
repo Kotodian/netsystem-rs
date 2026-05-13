@@ -809,6 +809,56 @@ reserved = [255, 0, 128]
     assert_eq!(wg.peers[0].reserved, [255, 0, 128]);
 }
 
+#[cfg(feature = "amneziawg")]
+#[test]
+fn parse_config_accepts_wireguard_amnezia2_endpoint() {
+    let cfg = format!(
+        r#"{MINIMAL_CONFIG}
+
+[[endpoints]]
+type = "wireguard"
+id = "wg-out"
+private_key = "{TEST_WG_PRIVATE_KEY}"
+address = ["10.66.0.2/32"]
+
+[endpoints.amnezia]
+enabled = true
+version = "2.0"
+h1 = "11-21"
+h2 = "22-32"
+h3 = "33-43"
+h4 = "44-54"
+s1 = 21
+s2 = 22
+s3 = 23
+s4 = 24
+jc = 3
+jmin = 64
+jmax = 80
+i1 = "5-20"
+i2 = "10-25"
+i3 = "15-30"
+i4 = "20-35"
+i5 = "25-40"
+
+[[endpoints.peers]]
+public_key = "{TEST_WG_PEER_PUBLIC_KEY}"
+address = "1.2.3.4"
+port = 51820
+allowed_ips = ["0.0.0.0/0"]
+"#
+    );
+    let options = config::parse_config(&cfg).expect("parse");
+    let EndpointKind::Wireguard(wg) = &options.endpoints[0].kind;
+    let amnezia = wg.amnezia.as_ref().expect("amnezia should be parsed");
+    assert!(amnezia.enabled);
+    assert_eq!(amnezia.h1.min, 11);
+    assert_eq!(amnezia.h1.max, 21);
+    assert_eq!(amnezia.s4, 24);
+    assert_eq!(amnezia.jmax, 80);
+    assert_eq!(amnezia.i5.as_deref(), Some("25-40"));
+}
+
 #[cfg(feature = "wireguard")]
 #[test]
 fn parse_config_rejects_wireguard_without_id() {

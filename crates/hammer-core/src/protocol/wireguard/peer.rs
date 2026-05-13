@@ -1,6 +1,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
+#[cfg(feature = "amneziawg")]
+use boringtun::noise::AmneziaConfig;
 use boringtun::noise::Tunn;
 use boringtun::x25519;
 use ipnet::IpNet;
@@ -26,6 +28,7 @@ impl Peer {
         opts: WireguardPeerOptions,
         local_private: &x25519::StaticSecret,
         index: u32,
+        #[cfg(feature = "amneziawg")] amnezia: Option<AmneziaConfig>,
     ) -> Self {
         let public_key = x25519::PublicKey::from(opts.public_key);
         // boringtun stores the keepalive interval as `u16` seconds; clamp the
@@ -40,6 +43,8 @@ impl Peer {
             keepalive,
             index,
             None, // rate_limiter: None lets boringtun build a default per-peer one
+            #[cfg(feature = "amneziawg")]
+            amnezia,
         );
         Self {
             tunn: Mutex::new(tunn),
