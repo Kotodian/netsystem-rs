@@ -62,6 +62,11 @@ pub mod hysteria2 {
     pub use crate::protocol::hysteria2::*;
 }
 
+#[cfg(feature = "outbound-hysteria2")]
+pub mod congestion {
+    pub use crate::protocol::congestion::*;
+}
+
 #[cfg(feature = "inbound-tun")]
 pub mod tun {
     pub use crate::protocol::tun::*;

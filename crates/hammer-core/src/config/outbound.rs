@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::HammerError;
+#[cfg(feature = "hysteria2")]
+use crate::protocol::congestion::BbrProfile;
 
 use super::constants as C;
 use super::raw_struct;
@@ -54,7 +56,7 @@ raw_struct_with_default_check! {
         #[serde(with = "humantime_serde::option")]
         pub keep_alive_period: Option<Duration> => "Option::is_none",
         /// Hysteria2 BBR profile.
-        pub bbr_profile: Option<Hysteria2BbrProfile> => "Option::is_none",
+        pub bbr_profile: Option<BbrProfile> => "Option::is_none",
         /// Whether Brutal congestion-control debug output is enabled.
         pub brutal_debug: Option<bool> => "Option::is_none",
         /// Whether QUIC path MTU discovery is disabled.
@@ -178,7 +180,7 @@ pub struct Hysteria2OutboundOptions {
     pub hop_interval_max: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub keep_alive_period: Option<Duration>,
-    pub bbr_profile: Hysteria2BbrProfile,
+    pub bbr_profile: BbrProfile,
     pub brutal_debug: bool,
     pub disable_path_mtu_discovery: bool,
     pub initial_packet_size: u16,
@@ -200,27 +202,6 @@ impl Hysteria2Network {
         match self {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
-        }
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Hysteria2BbrProfile {
-    #[default]
-    Standard,
-    Conservative,
-    Aggressive,
-}
-
-#[cfg(feature = "hysteria2")]
-impl Hysteria2BbrProfile {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Conservative => "conservative",
-            Self::Aggressive => "aggressive",
         }
     }
 }

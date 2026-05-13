@@ -6,10 +6,11 @@ use std::time::Duration;
 use hammer_core::config::EndpointKind;
 
 use hammer_core::config::{
-    self, DnsServerKind, Hysteria2BbrProfile, Hysteria2Network, Hysteria2ObfsType, InboundKind,
+    self, DnsServerKind, Hysteria2Network, Hysteria2ObfsType, InboundKind,
     OutboundKind, RuleActionKind, RuleMatcher, TunStack,
 };
 use hammer_core::log::Level;
+use hammer_core::protocol::congestion::BbrProfile;
 
 const MINIMAL_CONFIG: &str = r#"
 [log]
@@ -115,7 +116,7 @@ fn parse_config_builds_hysteria_tun_options() {
         hysteria.network,
         vec![Hysteria2Network::Tcp, Hysteria2Network::Udp]
     );
-    assert_eq!(hysteria.bbr_profile, Hysteria2BbrProfile::Standard);
+    assert_eq!(hysteria.bbr_profile, BbrProfile::Standard);
     let obfs = hysteria.obfs.as_ref().expect("obfs should be parsed");
     assert_eq!(obfs.type_, Hysteria2ObfsType::Salamander);
     assert_eq!(options.outbounds[1].type_name(), "direct");

@@ -16,11 +16,11 @@ use hammer_adapter::{
     Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::{
-    Hysteria2BbrProfile, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
-    Hysteria2OutboundOptions, OutboundKind,
+    Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions, OutboundKind,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
+use hammer_core::protocol::congestion::BbrProfile;
 use http::Request;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -28,16 +28,17 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 
-pub mod bbr;
 mod outbound;
 pub use hammer_core::protocol::hysteria2::{obfs, protocol};
 #[cfg(test)]
 use outbound::ConnectBackoff;
 pub use outbound::Hysteria2Outbound;
 
-use bbr::{BbrProfile, CongestionControlHandle, apply_transport_config_with_handle};
 use obfs::Salamander;
 
+use crate::protocol::congestion::{
+    CongestionControlHandle, apply_transport_config_with_handle,
+};
 #[cfg(feature = "probe")]
 use crate::protocol::icmp;
 use crate::socket_protector::SocketProtector;
@@ -664,14 +665,6 @@ fn adapter_networks(value: &[Hysteria2Network]) -> Vec<Network> {
         return vec![Network::Tcp, Network::Udp];
     }
     value.iter().copied().map(adapter_network).collect()
-}
-
-fn runtime_bbr_profile(profile: Hysteria2BbrProfile) -> BbrProfile {
-    match profile {
-        Hysteria2BbrProfile::Standard => BbrProfile::Standard,
-        Hysteria2BbrProfile::Conservative => BbrProfile::Conservative,
-        Hysteria2BbrProfile::Aggressive => BbrProfile::Aggressive,
-    }
 }
 
 fn adapter_network(value: Hysteria2Network) -> Network {

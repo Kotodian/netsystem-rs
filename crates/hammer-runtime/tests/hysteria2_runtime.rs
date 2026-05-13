@@ -13,8 +13,11 @@ use hammer_adapter::{
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
+use hammer_core::protocol::congestion::BbrProfile;
 use hammer_runtime::OutboundManager;
-use hammer_runtime::hysteria2::bbr::{BbrProfile, CongestionControlHandle, HysteriaBbrConfig};
+use hammer_runtime::congestion::{
+    CongestionControlHandle, DynamicCongestionController, HysteriaBbrConfig,
+};
 use hammer_runtime::hysteria2::{ClientOptions, Hysteria2Client, obfs::Salamander, protocol};
 use support::hysteria2_echo::EchoServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -311,7 +314,7 @@ fn hysteria2_bbr_factory_builds_hysteria_controller() {
     assert!(
         !controller
             .into_any()
-            .is::<hammer_runtime::hysteria2::bbr::DynamicHysteriaController>()
+            .is::<DynamicCongestionController>()
     );
 }
 
@@ -328,7 +331,7 @@ fn hysteria2_congestion_handle_switches_to_brutal_after_auth() {
     assert!(
         before
             .into_any()
-            .is::<hammer_runtime::hysteria2::bbr::DynamicHysteriaController>()
+            .is::<DynamicCongestionController>()
     );
 
     handle.use_brutal(2_000_000);

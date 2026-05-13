@@ -1,3 +1,4 @@
+pub mod congestion;
 pub mod dns;
 
 #[cfg(feature = "hysteria2")]

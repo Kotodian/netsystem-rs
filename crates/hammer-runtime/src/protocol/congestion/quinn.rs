@@ -1,38 +1,15 @@
 use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use hammer_core::protocol::congestion::BbrProfile;
 use quinn::congestion::{
     AckedPacketInfo, BbrConfig, Controller, ControllerFactory, ControllerMetrics, LostPacketInfo,
 };
 use quinn::{ClientConfig, TransportConfig};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BbrProfile {
-    Standard,
-    Conservative,
-    Aggressive,
-}
-
-impl BbrProfile {
-    pub fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "" | "standard" => Ok(Self::Standard),
-            "conservative" => Ok(Self::Conservative),
-            "aggressive" => Ok(Self::Aggressive),
-            _ => Err(format!("unsupported BBR profile: {value}")),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Conservative => "conservative",
-            Self::Aggressive => "aggressive",
-        }
-    }
-}
+use super::brutal::BrutalController;
 
 #[derive(Debug, Clone)]
 pub struct HysteriaBbrConfig {
@@ -72,7 +49,7 @@ impl ControllerFactory for HysteriaBbrConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         let mtu = current_mtu.max(self.initial_mtu).max(1200);
         if let Some((handle, brutal_debug)) = &self.dynamic {
-            return Box::new(DynamicHysteriaController::new(
+            return Box::new(DynamicCongestionController::new(
                 mtu,
                 handle.clone(),
                 *brutal_debug,
@@ -107,13 +84,13 @@ impl CongestionControlHandle {
 /// hysteria2 auth response (server-advertised `rx_auto`). The `profile` knob
 /// from the toml is currently advisory only — preserved on `HysteriaBbrConfig`
 /// for forward compatibility but not consumed by the underlying BBR.
-pub struct DynamicHysteriaController {
+pub struct DynamicCongestionController {
     bbr: Box<dyn Controller>,
     brutal: BrutalController,
     handle: CongestionControlHandle,
 }
 
-impl DynamicHysteriaController {
+impl DynamicCongestionController {
     fn new(mtu: u16, handle: CongestionControlHandle, brutal_debug: bool) -> Self {
         Self {
             bbr: build_quinn_bbr(mtu),
@@ -133,7 +110,7 @@ fn build_quinn_bbr(mtu: u16) -> Box<dyn Controller> {
     config.build(Instant::now(), mtu)
 }
 
-impl Controller for DynamicHysteriaController {
+impl Controller for DynamicCongestionController {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         if self.using_brutal() {
             self.brutal.on_sent(now, bytes, last_packet_number);
@@ -265,155 +242,6 @@ impl Controller for DynamicHysteriaController {
     }
 }
 
-#[derive(Debug, Clone)]
-struct BrutalController {
-    mtu: u64,
-    ack_rate_milli: u64,
-    rtt: Duration,
-    start: Instant,
-    slots: [PacketSlot; 5],
-    debug: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct PacketSlot {
-    second: u64,
-    acked: u64,
-    lost: u64,
-}
-
-impl BrutalController {
-    fn new(mtu: u16, debug: bool) -> Self {
-        Self {
-            mtu: u64::from(mtu.max(1200)),
-            ack_rate_milli: 1000,
-            rtt: Duration::from_millis(100),
-            start: Instant::now(),
-            slots: [PacketSlot::default(); 5],
-            debug,
-        }
-    }
-
-    fn record_packets(&mut self, now: Instant, acked: usize, lost: usize) {
-        let second = now.saturating_duration_since(self.start).as_secs();
-        let slot = (second % self.slots.len() as u64) as usize;
-        if self.slots[slot].second != second {
-            self.slots[slot] = PacketSlot {
-                second,
-                acked: 0,
-                lost: 0,
-            };
-        }
-        self.slots[slot].acked += acked as u64;
-        self.slots[slot].lost += lost as u64;
-        let min_second = second.saturating_sub(self.slots.len() as u64);
-        let (acked, lost) = self
-            .slots
-            .iter()
-            .filter(|slot| slot.second >= min_second)
-            .fold((0_u64, 0_u64), |(a, l), slot| {
-                (a + slot.acked, l + slot.lost)
-            });
-        if acked + lost >= 50 {
-            self.ack_rate_milli = ((acked * 1000) / (acked + lost)).max(800);
-        }
-    }
-
-    fn window_for_bps(&self, bps: u64) -> u64 {
-        let rtt_micros = self.rtt.as_micros().max(1) as u64;
-        let window = bps
-            .saturating_mul(rtt_micros)
-            .saturating_mul(2)
-            .saturating_mul(1000)
-            / 1_000_000
-            / self.ack_rate_milli.max(800);
-        window.max(2 * self.mtu).max(10_240)
-    }
-
-    fn metrics_for_bps(&self, bps: u64) -> ControllerMetrics {
-        let mut metrics = ControllerMetrics::default();
-        metrics.congestion_window = self.window_for_bps(bps);
-        metrics.pacing_rate = Some(bps.saturating_mul(8));
-        metrics
-    }
-}
-
-impl Controller for BrutalController {
-    fn on_sent(&mut self, _now: Instant, _bytes: u64, _last_packet_number: u64) {}
-
-    fn on_ack(
-        &mut self,
-        _now: Instant,
-        _sent: Instant,
-        _bytes: u64,
-        _app_limited: bool,
-        rtt: &quinn::RttEstimator,
-    ) {
-        self.rtt = rtt.get();
-    }
-
-    fn on_end_acks(
-        &mut self,
-        _now: Instant,
-        _in_flight: u64,
-        _app_limited: bool,
-        _largest_packet_num_acked: Option<u64>,
-    ) {
-    }
-
-    fn on_congestion_event(
-        &mut self,
-        _now: Instant,
-        _sent: Instant,
-        _is_persistent_congestion: bool,
-        _lost_bytes: u64,
-    ) {
-    }
-
-    fn on_congestion_event_ex(
-        &mut self,
-        now: Instant,
-        _prior_in_flight: u64,
-        acked: &[AckedPacketInfo],
-        lost: &[LostPacketInfo],
-        _app_limited: bool,
-        rtt: &quinn::RttEstimator,
-        _largest_packet_num_acked: Option<u64>,
-        _is_persistent_congestion: bool,
-    ) -> bool {
-        self.rtt = rtt.get();
-        self.record_packets(now, acked.len(), lost.len());
-        let _ = self.debug;
-        true
-    }
-
-    fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.mtu = u64::from(new_mtu.max(1200));
-    }
-
-    fn window(&self) -> u64 {
-        self.window_for_bps(0)
-    }
-
-    fn metrics(&self) -> ControllerMetrics {
-        self.metrics_for_bps(0)
-    }
-
-    fn clone_box(&self) -> Box<dyn Controller> {
-        Box::new(self.clone())
-    }
-
-    fn initial_window(&self) -> u64 {
-        // Mirrors the previous shared helper: 10 * MTU, clamped to a
-        // minimum window of 14720 bytes, never below 2 * MTU.
-        (10 * self.mtu).max((2 * self.mtu).max(14_720))
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-}
-
 pub(crate) fn apply_transport_config_with_handle(
     config: &mut ClientConfig,
     transport: TransportConfig,
@@ -451,28 +279,4 @@ fn apply_transport_config_with_factory(
     }
     transport.congestion_controller_factory(factory);
     config.transport_config(Arc::new(transport));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn brutal_controller_uses_sliding_window_relative_to_first_sample() {
-        let mut controller = BrutalController::new(1200, false);
-        let start = controller.start;
-
-        controller.record_packets(start, 25, 25);
-        assert_eq!(controller.ack_rate_milli, 800);
-
-        controller.record_packets(start + Duration::from_secs(6), 50, 0);
-        assert_eq!(controller.ack_rate_milli, 1000);
-    }
-
-    #[test]
-    fn brutal_controller_initial_window_respects_minimum_window() {
-        let controller = BrutalController::new(1200, false);
-
-        assert_eq!(controller.initial_window(), 14_720);
-    }
 }

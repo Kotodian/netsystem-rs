@@ -1,5 +1,7 @@
 #[cfg(feature = "outbound-block")]
 pub mod block;
+#[cfg(feature = "outbound-hysteria2")]
+pub mod congestion;
 #[cfg(feature = "outbound-direct")]
 pub mod direct;
 #[cfg(feature = "endpoint")]

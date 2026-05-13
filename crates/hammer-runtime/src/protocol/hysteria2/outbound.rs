@@ -197,7 +197,7 @@ impl Hysteria2Outbound {
             server_name: self.options.tls.server_name.clone(),
             insecure: self.options.tls.insecure,
             udp_enabled: self.networks.contains(&Network::Udp),
-            bbr_profile: runtime_bbr_profile(self.options.bbr_profile),
+            bbr_profile: self.options.bbr_profile,
             disable_path_mtu_discovery: self.options.disable_path_mtu_discovery,
             initial_packet_size: self.options.initial_packet_size,
             idle_timeout: self.options.idle_timeout,
