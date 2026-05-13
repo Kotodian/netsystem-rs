@@ -3025,6 +3025,18 @@ async fn accept_tcp_loop<R, Q, O>(
                     return;
                 }
             };
+            debug!(
+                "system TCP outbound dial: source={} destination={} domain={} protocol={} outbound={outbound_id} initial_payload={}B",
+                metadata
+                    .source
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "-".to_owned()),
+                destination,
+                metadata.domain.as_deref().unwrap_or("-"),
+                metadata.protocol,
+                initial_payload.len()
+            );
             let dial_permit = match tcp_pending_dials.try_acquire() {
                 Ok(permit) => permit,
                 Err(err) => {
@@ -3070,7 +3082,23 @@ where
     Q: DnsRouterTrait + ?Sized,
 {
     prepare_route_metadata(router, metadata, Some(dns_router))?;
-    router.match_route(metadata)
+    let decision = router.match_route(metadata)?;
+    debug!(
+        "system TCP route decision: source={} destination={} domain={} protocol={} decision={decision:?}",
+        metadata
+            .source
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_owned()),
+        metadata
+            .destination
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_owned()),
+        metadata.domain.as_deref().unwrap_or("-"),
+        metadata.protocol
+    );
+    Ok(decision)
 }
 
 enum TunPacketLoopMode<D>
@@ -3146,7 +3174,32 @@ where
         _ => {}
     }
     prepare_route_metadata(router, &mut metadata, Some(dns_router))?;
-    router.match_route(&mut metadata)
+    let decision = router.match_route(&mut metadata)?;
+    if metadata.domain.is_some()
+        || matches!(
+            decision,
+            RouteDecision::Route {
+                target: RouteTarget::Endpoint(_)
+            }
+        )
+    {
+        debug!(
+            "endpoint L3 route decision: source={} destination={} domain={} protocol={} decision={decision:?}",
+            metadata
+                .source
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".to_owned()),
+            metadata
+                .destination
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".to_owned()),
+            metadata.domain.as_deref().unwrap_or("-"),
+            metadata.protocol
+        );
+    }
+    Ok(decision)
 }
 
 #[cfg(feature = "endpoint")]
@@ -3676,6 +3729,19 @@ where
                 )));
             };
             let destination = route_destination(&metadata, Some(dns_router.as_ref()))?;
+            if metadata.domain.is_some() || outbound_id == "direct" {
+                debug!(
+                    "system UDP route decision: source={} destination={} domain={} protocol={} outbound={outbound_id}",
+                    metadata
+                        .source
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "-".to_owned()),
+                    destination,
+                    metadata.domain.as_deref().unwrap_or("-"),
+                    metadata.protocol
+                );
+            }
             let template = UdpResponseTemplate::from_request(&packet)?;
             let mut start_flow = None;
             let sender = {
@@ -6153,7 +6219,10 @@ mod tests {
         let mut metadata = RouteMetadata {
             inbound: "tun".to_owned(),
             network: Network::Tcp,
-            source: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)), 50000)),
+            source: Some(SocksAddr::ip(
+                IpAddr::V4(Ipv4Addr::new(172, 19, 0, 1)),
+                50000,
+            )),
             destination: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443)),
             ..Default::default()
         };
