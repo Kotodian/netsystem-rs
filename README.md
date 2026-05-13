@@ -262,12 +262,13 @@ server = "223.5.5.5"
 via = "wg-out"
 
 [[dns.servers]]
-type = "local"
-id = "local"
+type = "udp"
+id = "direct-dns"
+server = "8.8.8.8"
 
 [[dns.rules]]
 domain_suffix = ["ifconfig.so"]
-server = "local"
+server = "direct-dns"
 
 [[endpoints]]
 type = "wireguard"
