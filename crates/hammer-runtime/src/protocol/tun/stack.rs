@@ -1646,6 +1646,63 @@ pub fn process_system_tcp_packet(
     }
 }
 
+fn read_socks_addr(packet: &[u8], source: bool) -> HammerResult<SocksAddr> {
+    match IpVersion::from_packet(packet)? {
+        IpVersion::V4 => {
+            if packet.len() < IPV4_HEADER_MIN_LEN + TCP_HEADER_MIN_LEN {
+                return Err(HammerError::internal("short IPv4 TCP packet"));
+            }
+            let ihl = ((packet[0] & 0x0f) as usize) * 4;
+            if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl + TCP_HEADER_MIN_LEN {
+                return Err(HammerError::internal("invalid IPv4 TCP packet"));
+            }
+            let host = if source {
+                IpAddr::V4(Ipv4Addr::new(
+                    packet[IPV4_SOURCE_OFFSET],
+                    packet[IPV4_SOURCE_OFFSET + 1],
+                    packet[IPV4_SOURCE_OFFSET + 2],
+                    packet[IPV4_SOURCE_OFFSET + 3],
+                ))
+            } else {
+                IpAddr::V4(Ipv4Addr::new(
+                    packet[IPV4_DESTINATION_OFFSET],
+                    packet[IPV4_DESTINATION_OFFSET + 1],
+                    packet[IPV4_DESTINATION_OFFSET + 2],
+                    packet[IPV4_DESTINATION_OFFSET + 3],
+                ))
+            };
+            let port = if source {
+                read_u16(packet, ihl)
+            } else {
+                read_u16(packet, ihl + 2)
+            };
+            Ok(SocksAddr::ip(host, port))
+        }
+        IpVersion::V6 => {
+            if packet.len() < IPV6_HEADER_LEN + TCP_HEADER_MIN_LEN {
+                return Err(HammerError::internal("short IPv6 TCP packet"));
+            }
+            let host = if source {
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&packet[IPV6_SOURCE_OFFSET..IPV6_DESTINATION_OFFSET])
+                        .map_err(|_| HammerError::internal("invalid IPv6 source"))?,
+                ))
+            } else {
+                IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(&packet[IPV6_DESTINATION_OFFSET..IPV6_HEADER_LEN])
+                        .map_err(|_| HammerError::internal("invalid IPv6 destination"))?,
+                ))
+            };
+            let port = if source {
+                read_u16(packet, IPV6_HEADER_LEN)
+            } else {
+                read_u16(packet, IPV6_HEADER_LEN + 2)
+            };
+            Ok(SocksAddr::ip(host, port))
+        }
+    }
+}
+
 pub fn udp_response_packet(
     request: &[u8],
     source: SocksAddr,
@@ -2915,6 +2972,11 @@ async fn accept_tcp_loop<R, Q, O>(
                 return;
             }
         };
+        if let Ok(local) = inbound.local_addr() {
+            debug!("system TCP listener accepted: local={local} peer={peer}");
+        } else {
+            debug!("system TCP listener accepted: peer={peer}");
+        }
         let session = {
             let mut nat = tcp_nat.lock().expect("tcp_nat poisoned");
             nat.claim_active(peer.port())
@@ -2925,6 +2987,12 @@ async fn accept_tcp_loop<R, Q, O>(
             close_system_tcp_stream(&inbound);
             continue;
         };
+        debug!(
+            "system TCP NAT claimed: peer_port={} source={} destination={}",
+            peer.port(),
+            session.source,
+            session.destination
+        );
         let nat_lease = SystemTcpNatLease::new(Arc::clone(&tcp_nat), peer.port());
         let router = Arc::clone(&router);
         let dns_router = Arc::clone(&dns_router);
@@ -3122,11 +3190,14 @@ where
         if packets.is_empty() {
             return;
         }
+        let count = packets.len();
         match self {
             Self::System { device } => {
                 if let Err(err) = device.send_batch(packets).await {
                     metrics.counters.tcp_writeback_error_total.increment(1);
                     debug!("write {} TCP packets: {err}", self.name());
+                } else {
+                    debug!("write {count} {} TCP packets back to TUN", self.name());
                 }
             }
         }
@@ -3571,6 +3642,8 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                             debug!("missing {stack_name} TCP route for packet family");
                             continue;
                         };
+                        let original_source = read_socks_addr(&packet, true).ok();
+                        let original_destination = read_socks_addr(&packet, false).ok();
                         let rewrite_result = process_system_tcp_packet(
                             &mut packet,
                             &mut nat,
@@ -3582,6 +3655,29 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                             debug!("rewrite {stack_name} TCP packet: {err}");
                             continue;
                         }
+                        let rewritten_source = read_socks_addr(&packet, true).ok();
+                        let rewritten_destination = read_socks_addr(&packet, false).ok();
+                        debug!(
+                            "rewrite {stack_name} TCP packet: {} -> {} => {} -> {} (listener={} nat={})",
+                            original_source
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            original_destination
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            rewritten_source
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            rewritten_destination
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            route.listener_addr,
+                            route.nat_addr
+                        );
                         tcp_writeback.push(packet);
                     }
                     Network::Udp => {
