@@ -4032,7 +4032,7 @@ fn apply_reverse_dns_mapping<Q>(metadata: &mut RouteMetadata, dns_router: Option
 where
     Q: DnsRouterTrait + ?Sized,
 {
-    if metadata.network != Network::Udp
+    if !matches!(metadata.network, Network::Tcp | Network::Udp)
         || metadata.udp_disable_domain_unmapping
         || metadata.domain.is_some()
     {
@@ -4897,6 +4897,12 @@ mod tests {
         match_calls: AtomicUsize,
     }
     #[cfg(feature = "endpoint")]
+    struct DomainSplitRouter {
+        match_calls: AtomicUsize,
+    }
+    #[cfg(feature = "endpoint")]
+    struct ReverseMappingDnsRouter;
+    #[cfg(feature = "endpoint")]
     struct RecordingEndpoint {
         tx: mpsc::Sender<Bytes>,
         batch_tx: Option<mpsc::Sender<Vec<Bytes>>>,
@@ -5073,6 +5079,51 @@ mod tests {
     }
 
     #[cfg(feature = "endpoint")]
+    impl Lifecycle for DomainSplitRouter {
+        fn name(&self) -> &str {
+            "domain-split-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl AdapterRouter for DomainSplitRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
+            self.match_calls.fetch_add(1, Ordering::Relaxed);
+            if metadata.domain.as_deref() == Some("ifconfig.so") {
+                Ok(RouteDecision::Route {
+                    target: RouteTarget::Outbound("direct".to_owned()),
+                })
+            } else {
+                Ok(RouteDecision::Route {
+                    target: RouteTarget::Endpoint("wg-out".to_owned()),
+                })
+            }
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+            None
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            false
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
     impl Lifecycle for RecordingEndpoint {
         fn name(&self) -> &str {
             "recording-endpoint"
@@ -5165,6 +5216,57 @@ mod tests {
 
         fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
             None
+        }
+
+        fn reset_network(&self) {}
+    }
+
+    #[cfg(feature = "endpoint")]
+    impl Lifecycle for ReverseMappingDnsRouter {
+        fn name(&self) -> &str {
+            "reverse-mapping-dns-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[async_trait]
+    impl AdapterDnsRouter for ReverseMappingDnsRouter {
+        async fn exchange(
+            &self,
+            message: Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Message> {
+            Ok(message)
+        }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Vec<IpAddr>> {
+            Ok(Vec::new())
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Option<Message>> {
+            Ok(None)
+        }
+
+        fn clear_cache(&self) {}
+
+        fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String> {
+            (ip == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))).then(|| "ifconfig.so".to_owned())
         }
 
         fn reset_network(&self) {}
@@ -5994,6 +6096,29 @@ mod tests {
             1,
             "empty SYN cannot fall through to the system TCP listener for endpoint routing"
         );
+    }
+
+    #[cfg(feature = "endpoint")]
+    #[test]
+    fn endpoint_fast_path_uses_reverse_dns_for_tcp_split_routes() {
+        let router = DomainSplitRouter {
+            match_calls: AtomicUsize::new(0),
+        };
+        let dns_router = ReverseMappingDnsRouter;
+        let packet = tcp_packet(50000, 443, 0x02, b"");
+        let parsed = parse_ip_packet_view(&packet).expect("parse tcp packet");
+
+        let decision =
+            endpoint_fast_path_decision(&router, &dns_router, "tun-in", &packet, &parsed)
+                .expect("route");
+
+        assert!(matches!(
+            decision,
+            RouteDecision::Route {
+                target: RouteTarget::Outbound(ref outbound)
+            } if outbound == "direct"
+        ));
+        assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
     }
 
     #[cfg(feature = "endpoint")]
