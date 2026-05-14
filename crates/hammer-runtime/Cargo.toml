@@ -25,6 +25,9 @@ default = [
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
 probe = ["dep:socket2"]
 inbound-tun = ["dep:libc", "dep:tun-rs", "dep:socket2"]
+inbound-socks = ["dep:base64"]
+inbound-http = ["dep:base64"]
+inbound-mixed = ["inbound-socks", "inbound-http"]
 outbound-hysteria2 = [
     "hammer-core/hysteria2",
     "dep:base64",

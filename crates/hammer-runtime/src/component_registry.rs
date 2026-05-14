@@ -31,7 +31,12 @@ pub(crate) fn register_outbound_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-#[cfg(feature = "inbound-tun")]
+#[cfg(any(
+    feature = "inbound-tun",
+    feature = "inbound-socks",
+    feature = "inbound-http",
+    feature = "inbound-mixed"
+))]
 pub(crate) trait InboundComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -48,7 +53,12 @@ pub(crate) trait InboundComponentDeclaration {
     ) -> hammer_core::error::HammerResult<hammer_adapter::inbound::InboundComponent>;
 }
 
-#[cfg(feature = "inbound-tun")]
+#[cfg(any(
+    feature = "inbound-tun",
+    feature = "inbound-socks",
+    feature = "inbound-http",
+    feature = "inbound-mixed"
+))]
 pub(crate) fn register_inbound_component<C>(
     builders: &mut HashMap<&'static str, crate::inbounds::InboundBuilder>,
 ) where

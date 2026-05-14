@@ -6,8 +6,8 @@ use std::time::Duration;
 use hammer_core::config::EndpointKind;
 
 use hammer_core::config::{
-    self, DnsServerKind, Hysteria2Network, Hysteria2ObfsType, InboundKind,
-    OutboundKind, RuleActionKind, RuleMatcher, TunStack,
+    self, DnsServerKind, Hysteria2Network, Hysteria2ObfsType, InboundKind, OutboundKind,
+    RuleActionKind, RuleMatcher, TunStack,
 };
 use hammer_core::log::Level;
 use hammer_core::protocol::congestion::BbrProfile;
@@ -56,7 +56,9 @@ fn parse_config_builds_hysteria_tun_options() {
     assert_eq!(options.inbounds.len(), 1);
     assert_eq!(options.inbounds[0].type_name(), "tun");
     matches::assert_inbound_tun(&options.inbounds[0].kind);
-    let InboundKind::Tun(tun) = &options.inbounds[0].kind;
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
     assert_eq!(tun.stack, TunStack::System);
 
     assert_eq!(options.route.rules.len(), 5, "expected 5 tun rules");
@@ -130,6 +132,80 @@ fn parse_config_builds_hysteria_tun_options() {
         _ => panic!("dns server is not Https"),
     };
     assert_eq!(https.via, "direct");
+}
+
+#[test]
+fn parse_config_builds_socks_http_mixed_without_tun_rules() {
+    let cfg = format!(
+        r#"
+[[inbounds]]
+type = "socks"
+id = "socks-in"
+listen = "127.0.0.1"
+listen_port = 1080
+udp_timeout = "20s"
+
+[[inbounds.users]]
+username = "alice"
+password = "secret"
+
+[[inbounds]]
+type = "http"
+id = "http-in"
+listen = "127.0.0.1"
+listen_port = 8080
+
+[[inbounds.users]]
+username = "bob"
+password = "secret"
+
+[[inbounds]]
+type = "mixed"
+id = "mixed-in"
+listen = "::1"
+listen_port = 2080
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[dns]
+server = "https://1.1.1.1/dns-query"
+
+[route]
+final = "direct"
+"#
+    );
+    let options = config::parse_config(&cfg).expect("parse proxy inbounds");
+
+    assert_eq!(options.inbounds.len(), 3);
+    assert_eq!(options.inbounds[0].type_name(), "socks");
+    assert_eq!(options.inbounds[1].type_name(), "http");
+    assert_eq!(options.inbounds[2].type_name(), "mixed");
+    assert!(
+        options.route.rules.is_empty(),
+        "non-TUN inbounds must not derive TUN route rules"
+    );
+
+    let InboundKind::Socks(socks) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not socks");
+    };
+    assert_eq!(socks.listen.listen.to_string(), "127.0.0.1");
+    assert_eq!(socks.listen.listen_port, 1080);
+    assert_eq!(socks.listen.udp_timeout, Some(Duration::from_secs(20)));
+    assert_eq!(socks.users[0].username, "alice");
+
+    let InboundKind::Http(http) = &options.inbounds[1].kind else {
+        panic!("inbound[1] not http");
+    };
+    assert_eq!(http.listen.listen_port, 8080);
+    assert_eq!(http.users[0].username, "bob");
+
+    let InboundKind::Mixed(mixed) = &options.inbounds[2].kind else {
+        panic!("inbound[2] not mixed");
+    };
+    assert_eq!(mixed.listen.listen.to_string(), "::1");
+    assert_eq!(mixed.listen.listen_port, 2080);
 }
 
 #[test]
@@ -1271,6 +1347,7 @@ mod matches {
     pub fn assert_inbound_tun(kind: &InboundKind) {
         match kind {
             InboundKind::Tun(_) => {}
+            _ => panic!("inbound not tun"),
         }
     }
 

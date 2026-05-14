@@ -1,10 +1,11 @@
-//! `[tun]` inbound config section.
+//! Inbound config sections.
 //!
 //! Currently the only inbound kind is `tun`, but `Inbound` / `InboundKind`
 //! sit at this layer so adding a new inbound (e.g. `socks` for desktop
 //! debugging) means dropping a new variant here without touching the rest
 //! of the config tree.
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use ipnet::IpNet;
@@ -14,7 +15,7 @@ use crate::error::HammerError;
 
 use super::constants as C;
 use super::dns::DomainStrategy;
-use super::raw_struct_with_default_check;
+use super::{raw_struct, raw_struct_with_default_check};
 
 raw_struct_with_default_check! {
     pub struct RawTunConfig {
@@ -57,10 +58,72 @@ raw_struct_with_default_check! {
     }
 }
 
+raw_struct! {
+    pub struct RawInboundUser {
+        /// Proxy authentication username.
+        pub username: String => "String::is_empty",
+        /// Proxy authentication password.
+        pub password: String => "String::is_empty",
+    }
+}
+
+raw_struct! {
+    pub struct RawSocksInboundConfig {
+        /// Inbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// Local address to listen on.
+        pub listen: Option<IpAddr> => "Option::is_none",
+        /// Local TCP port to listen on.
+        pub listen_port: Option<u16> => "Option::is_none",
+        /// UDP association idle timeout.
+        #[serde(with = "humantime_serde::option")]
+        pub udp_timeout: Option<Duration> => "Option::is_none",
+        /// Authentication users.
+        pub users: Vec<RawInboundUser> => "Vec::is_empty",
+    }
+}
+
+raw_struct! {
+    pub struct RawHttpInboundConfig {
+        /// Inbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// Local address to listen on.
+        pub listen: Option<IpAddr> => "Option::is_none",
+        /// Local TCP port to listen on.
+        pub listen_port: Option<u16> => "Option::is_none",
+        /// UDP idle timeout from shared listen fields. HTTP inbound does not
+        /// use UDP today, but keeping the field accepted matches sing-box's
+        /// shared listen schema.
+        #[serde(with = "humantime_serde::option")]
+        pub udp_timeout: Option<Duration> => "Option::is_none",
+        /// Authentication users.
+        pub users: Vec<RawInboundUser> => "Vec::is_empty",
+    }
+}
+
+raw_struct! {
+    pub struct RawMixedInboundConfig {
+        /// Inbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// Local address to listen on.
+        pub listen: Option<IpAddr> => "Option::is_none",
+        /// Local TCP port to listen on.
+        pub listen_port: Option<u16> => "Option::is_none",
+        /// UDP association idle timeout.
+        #[serde(with = "humantime_serde::option")]
+        pub udp_timeout: Option<Duration> => "Option::is_none",
+        /// Authentication users.
+        pub users: Vec<RawInboundUser> => "Vec::is_empty",
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "lowercase")]
 pub enum RawInbound {
     Tun(RawTunConfig),
+    Socks(RawSocksInboundConfig),
+    Http(RawHttpInboundConfig),
+    Mixed(RawMixedInboundConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,9 +133,10 @@ pub struct Inbound {
 }
 
 impl RawInbound {
-    pub(super) fn tun(&self) -> &RawTunConfig {
+    pub(super) fn tun(&self) -> Option<&RawTunConfig> {
         match self {
-            RawInbound::Tun(raw) => raw,
+            RawInbound::Tun(raw) => Some(raw),
+            RawInbound::Socks(_) | RawInbound::Http(_) | RawInbound::Mixed(_) => None,
         }
     }
 }
@@ -81,6 +145,9 @@ impl Inbound {
     pub fn type_name(&self) -> &'static str {
         match self.kind {
             InboundKind::Tun(_) => "tun",
+            InboundKind::Socks(_) => "socks",
+            InboundKind::Http(_) => "http",
+            InboundKind::Mixed(_) => "mixed",
         }
     }
 }
@@ -88,6 +155,9 @@ impl Inbound {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundKind {
     Tun(TunInboundOptions),
+    Socks(SocksInboundOptions),
+    Http(HttpInboundOptions),
+    Mixed(MixedInboundOptions),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -101,6 +171,37 @@ pub struct TunInboundOptions {
     pub strict_route: bool,
     pub stack: TunStack,
     pub udp_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenInboundOptions {
+    pub listen: IpAddr,
+    pub listen_port: u16,
+    pub udp_timeout: Option<Duration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundUser {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksInboundOptions {
+    pub listen: ListenInboundOptions,
+    pub users: Vec<InboundUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpInboundOptions {
+    pub listen: ListenInboundOptions,
+    pub users: Vec<InboundUser>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedInboundOptions {
+    pub listen: ListenInboundOptions,
+    pub users: Vec<InboundUser>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -141,7 +242,99 @@ pub(super) fn build_tun_inbound(raw: &RawTunConfig) -> Result<(Inbound, String),
 pub(super) fn build_inbound(raw: &RawInbound) -> Result<(Inbound, String), HammerError> {
     match raw {
         RawInbound::Tun(tun) => build_tun_inbound(tun),
+        RawInbound::Socks(socks) => build_socks_inbound(socks),
+        RawInbound::Http(http) => build_http_inbound(http),
+        RawInbound::Mixed(mixed) => build_mixed_inbound(mixed),
     }
+}
+
+fn build_socks_inbound(raw: &RawSocksInboundConfig) -> Result<(Inbound, String), HammerError> {
+    let id = if raw.id.is_empty() {
+        "socks".to_owned()
+    } else {
+        raw.id.clone()
+    };
+    Ok((
+        Inbound {
+            id: id.clone(),
+            kind: InboundKind::Socks(SocksInboundOptions {
+                listen: build_listen_options(raw.listen, raw.listen_port, raw.udp_timeout)?,
+                users: build_users(&raw.users)?,
+            }),
+        },
+        id,
+    ))
+}
+
+fn build_http_inbound(raw: &RawHttpInboundConfig) -> Result<(Inbound, String), HammerError> {
+    let id = if raw.id.is_empty() {
+        "http".to_owned()
+    } else {
+        raw.id.clone()
+    };
+    Ok((
+        Inbound {
+            id: id.clone(),
+            kind: InboundKind::Http(HttpInboundOptions {
+                listen: build_listen_options(raw.listen, raw.listen_port, raw.udp_timeout)?,
+                users: build_users(&raw.users)?,
+            }),
+        },
+        id,
+    ))
+}
+
+fn build_mixed_inbound(raw: &RawMixedInboundConfig) -> Result<(Inbound, String), HammerError> {
+    let id = if raw.id.is_empty() {
+        "mixed".to_owned()
+    } else {
+        raw.id.clone()
+    };
+    Ok((
+        Inbound {
+            id: id.clone(),
+            kind: InboundKind::Mixed(MixedInboundOptions {
+                listen: build_listen_options(raw.listen, raw.listen_port, raw.udp_timeout)?,
+                users: build_users(&raw.users)?,
+            }),
+        },
+        id,
+    ))
+}
+
+fn build_listen_options(
+    listen: Option<IpAddr>,
+    listen_port: Option<u16>,
+    udp_timeout: Option<Duration>,
+) -> Result<ListenInboundOptions, HammerError> {
+    let listen_port = listen_port
+        .ok_or_else(|| HammerError::config_validation("inbound.listen_port is required"))?;
+    if listen_port == 0 {
+        return Err(HammerError::config_validation(
+            "inbound.listen_port must be non-zero",
+        ));
+    }
+    Ok(ListenInboundOptions {
+        listen: listen.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        listen_port,
+        udp_timeout,
+    })
+}
+
+fn build_users(raw: &[RawInboundUser]) -> Result<Vec<InboundUser>, HammerError> {
+    raw.iter()
+        .map(|user| {
+            if user.username.is_empty() || user.password.is_empty() {
+                return Err(HammerError::config_validation(
+                    "inbound users require username and password",
+                ));
+            }
+            Ok(InboundUser {
+                username: user.username.clone(),
+                password: user.password.clone(),
+            })
+        })
+        .collect()
 }
 
 fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerError> {

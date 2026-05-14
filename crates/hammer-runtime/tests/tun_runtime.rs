@@ -628,7 +628,9 @@ fn inbound_manager_registers_tun_inbound_from_options() {
 fn inbound_manager_register_accepts_concrete_component_arc() {
     let options = options();
     let router = router_from_options(&options);
-    let config::InboundKind::Tun(tun_options) = &options.inbounds[0].kind;
+    let config::InboundKind::Tun(tun_options) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
     let inbound = Arc::new(RuntimeTunInbound::new(
         "tun-arc",
         logger("tun"),

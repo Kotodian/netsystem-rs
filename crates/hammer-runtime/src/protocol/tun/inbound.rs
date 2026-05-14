@@ -338,6 +338,7 @@ pub(crate) fn build_inbound(
             };
             Ok(inbound)
         }
+        _ => Err(HammerError::internal("tun factory received wrong options")),
     }
 }
 

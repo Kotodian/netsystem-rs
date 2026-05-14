@@ -54,6 +54,7 @@ const DEFAULT_SYSTEM_UDP_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum TunWriteItem {
     Packet(Vec<u8>),
+    #[cfg(any(test, feature = "endpoint"))]
     Batch(Vec<Vec<u8>>),
 }
 
@@ -4215,6 +4216,7 @@ where
 fn append_tun_write_item(item: TunWriteItem, batch: &mut Vec<Vec<u8>>) {
     match item {
         TunWriteItem::Packet(packet) => batch.push(packet),
+        #[cfg(any(test, feature = "endpoint"))]
         TunWriteItem::Batch(mut packets) => batch.append(&mut packets),
     }
 }

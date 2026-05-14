@@ -12,7 +12,12 @@ use hammer_core::log::Logger;
 use hammer_core::metrics::MetricsRegistry;
 use tracing::debug;
 
-#[cfg(feature = "inbound-tun")]
+#[cfg(any(
+    feature = "inbound-tun",
+    feature = "inbound-socks",
+    feature = "inbound-http",
+    feature = "inbound-mixed"
+))]
 use crate::component_registry::register_components;
 #[cfg(feature = "inbound-tun")]
 use crate::protocol::tun;
@@ -75,6 +80,24 @@ impl InboundFactorySet {
 fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, InboundBuilder>) {
     #[cfg(feature = "inbound-tun")]
     register_components!(inbound, builders, [tun::RuntimeTunInbound]);
+    #[cfg(feature = "inbound-socks")]
+    register_components!(
+        inbound,
+        builders,
+        [crate::protocol::proxy::inbound::SocksInbound]
+    );
+    #[cfg(feature = "inbound-http")]
+    register_components!(
+        inbound,
+        builders,
+        [crate::protocol::proxy::inbound::HttpInbound]
+    );
+    #[cfg(feature = "inbound-mixed")]
+    register_components!(
+        inbound,
+        builders,
+        [crate::protocol::proxy::inbound::MixedInbound]
+    );
 }
 
 pub struct InboundManager {

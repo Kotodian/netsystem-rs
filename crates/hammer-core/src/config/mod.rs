@@ -279,7 +279,9 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         let mut rules = Vec::new();
         for raw_inbound in &raw_inbounds {
             let (inbound, id) = inbound::build_inbound(raw_inbound)?;
-            rules.extend(route::derive_tun_route_rules(raw_inbound.tun(), &id)?);
+            if let Some(tun) = raw_inbound.tun() {
+                rules.extend(route::derive_tun_route_rules(tun, &id)?);
+            }
             inbounds.push(inbound);
         }
         (inbounds, rules)
