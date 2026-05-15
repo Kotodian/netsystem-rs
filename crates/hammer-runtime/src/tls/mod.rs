@@ -7,6 +7,8 @@ mod ech;
 #[cfg(feature = "tls-outbound")]
 mod material;
 mod provider;
+#[cfg(feature = "tls-utls")]
+pub mod reality;
 mod roots;
 mod rustls_backend;
 #[cfg(feature = "tls-outbound")]

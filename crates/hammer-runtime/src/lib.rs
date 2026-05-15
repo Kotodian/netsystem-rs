@@ -47,7 +47,7 @@ pub mod spawn;
     feature = "outbound-urltest",
     feature = "tls-quic"
 ))]
-mod tls;
+pub mod tls;
 
 #[cfg(feature = "outbound-hysteria2")]
 pub mod hysteria2 {
