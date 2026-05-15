@@ -6,14 +6,19 @@ use super::material::load_client_auth;
 use super::roots::platform_root_certificates;
 use super::utls::{fingerprint_name, unsupported_for_rustls};
 use crate::tls::backend::TlsBackend;
+use btls::hash::MessageDigest;
 use btls::pkey::PKey;
+use btls::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl};
 use btls::x509::X509;
 use foreign_types_shared::ForeignType;
 use hammer_adapter::PlatformInterface;
-use hammer_core::config::{CertificateFingerprint, UtlsFingerprint, UtlsOptions};
+use hammer_core::config::{
+    CertificateFingerprint, CertificateFingerprintAlgorithm, UtlsFingerprint, UtlsOptions,
+};
 use hammer_core::error::{HammerError, HammerResult};
 use quinn_btls::QuicSslContext;
 use std::ffi::CString;
+use std::io::Cursor;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -57,15 +62,11 @@ impl TlsBackend for BtlsUtlsBackend {
         let utls = options.utls.as_ref().ok_or_else(|| {
             HammerError::config_validation("tls.utls is required for the BoringSSL uTLS backend")
         })?;
-        if options.ech.is_some() {
-            return Err(HammerError::config_validation(
-                "tls.ech with tls.utls is not supported by the current QUIC uTLS backend",
-            ));
-        }
+        let ech_config_list = options.ech.as_ref().map(btls_ech_config_list).transpose()?;
 
-        let mut crypto = quinn_btls::ClientConfig::new()
-            .map_err(|err| HammerError::internal(format!("btls quic client config: {err}")))?;
-        apply_utls_profile(&mut crypto, utls)?;
+        let mut crypto =
+            new_utls_client_config(utls, options.insecure, &options.server_fingerprints)?;
+        apply_utls_profile(&mut crypto, utls, &options.alpn_protocols, ech_config_list)?;
         add_platform_roots(&mut crypto, options.platform)?;
         configure_server_verification(&mut crypto, options.insecure, options.server_fingerprints)?;
         configure_client_auth(&mut crypto, options.client_auth)?;
@@ -77,9 +78,75 @@ impl TlsBackend for BtlsUtlsBackend {
     }
 }
 
+fn btls_ech_config_list(ech: &hammer_core::config::EchOptions) -> HammerResult<Vec<u8>> {
+    if ech.pq_signature_schemes_enabled {
+        return Err(HammerError::config_validation(
+            "tls.ech.pq_signature_schemes_enabled is parsed but not supported by the BoringSSL uTLS backend",
+        ));
+    }
+    if ech.dynamic_record_sizing_disabled {
+        return Err(HammerError::config_validation(
+            "tls.ech.dynamic_record_sizing_disabled is only valid for TCP TLS streams",
+        ));
+    }
+    super::ech::ech_config_list_bytes(ech)
+}
+
+fn new_utls_client_config(
+    options: &UtlsOptions,
+    insecure: bool,
+    server_fingerprints: &[CertificateFingerprint],
+) -> HammerResult<quinn_btls::ClientConfig> {
+    let profile = UtlsProfile::for_fingerprint(options.fingerprint);
+    let result = if profile.certificate_compression || !server_fingerprints.is_empty() {
+        let server_fingerprints = server_fingerprints.to_vec();
+        quinn_btls::ClientConfig::new_with_context_config(|builder| {
+            if profile.certificate_compression {
+                builder
+                    .add_certificate_compression_algorithm(BrotliCertificateDecompressor)
+                    .map_err(quinn_btls::Error::from)?;
+            }
+            if !server_fingerprints.is_empty() {
+                builder.set_cert_verify_callback(move |x509| {
+                    verify_btls_server_fingerprint(x509, insecure, &server_fingerprints)
+                });
+            }
+            Ok(())
+        })
+    } else {
+        quinn_btls::ClientConfig::new()
+    };
+    result.map_err(|err| HammerError::internal(format!("btls quic client config: {err}")))
+}
+
+fn verify_btls_server_fingerprint(
+    x509: &mut btls::x509::X509StoreContextRef,
+    insecure: bool,
+    server_fingerprints: &[CertificateFingerprint],
+) -> bool {
+    if !insecure && !x509.verify_cert().unwrap_or(false) {
+        return false;
+    }
+    let Some(certificate) = x509.cert() else {
+        return false;
+    };
+    let Ok(digest) = certificate.digest(MessageDigest::sha256()) else {
+        return false;
+    };
+    server_fingerprints
+        .iter()
+        .any(|fingerprint| match fingerprint.algorithm {
+            CertificateFingerprintAlgorithm::Sha256 => {
+                digest.as_ref() == fingerprint.digest.as_slice()
+            }
+        })
+}
+
 fn apply_utls_profile(
     crypto: &mut quinn_btls::ClientConfig,
     options: &UtlsOptions,
+    alpn_protocols: &[Vec<u8>],
+    ech_config_list: Option<Vec<u8>>,
 ) -> HammerResult<()> {
     let profile = UtlsProfile::for_fingerprint(options.fingerprint);
     let ctx = crypto.ctx_mut();
@@ -95,8 +162,27 @@ fn apply_utls_profile(
             options,
             "max TLS version",
         )?;
+        btls_sys::SSL_CTX_set_preserve_tls13_cipher_list(ctx, 1);
+        set_ctx_string(
+            ctx,
+            profile.cipher_list,
+            options,
+            "cipher suites",
+            |ctx, value| btls_sys::SSL_CTX_set_cipher_list(ctx, value),
+        )?;
         btls_sys::SSL_CTX_set_grease_enabled(ctx, i32::from(profile.grease));
         btls_sys::SSL_CTX_set_permute_extensions(ctx, i32::from(profile.permute_extensions));
+        if let Some(extension_order) = profile.extension_order {
+            cvt_btls(
+                btls_sys::SSL_CTX_set_extension_order(
+                    ctx,
+                    extension_order.as_ptr(),
+                    extension_order.len() as std::ffi::c_int,
+                ),
+                options,
+                "extension order",
+            )?;
+        }
         set_ctx_string(ctx, profile.curves, options, "curves", |ctx, value| {
             btls_sys::SSL_CTX_set1_curves_list(ctx, value)
         })?;
@@ -117,7 +203,68 @@ fn apply_utls_profile(
             btls_sys::SSL_CTX_enable_ocsp_stapling(ctx);
         }
     }
+    let connection_profile = UtlsConnectionProfile {
+        key_shares: profile.key_shares,
+        ech_grease: profile.ech_grease,
+        alps: profile.alps,
+        alps_new_codepoint: profile.alps_new_codepoint,
+        alpn_protocols: alpn_protocols.to_vec(),
+        ech_config_list,
+    };
+    crypto.set_ssl_config_callback(move |ssl| connection_profile.apply(ssl));
     Ok(())
+}
+
+struct UtlsConnectionProfile {
+    key_shares: &'static [KeyShare],
+    ech_grease: bool,
+    alps: bool,
+    alps_new_codepoint: bool,
+    alpn_protocols: Vec<Vec<u8>>,
+    ech_config_list: Option<Vec<u8>>,
+}
+
+impl UtlsConnectionProfile {
+    fn apply(&self, ssl: &mut Ssl) -> quinn_btls::Result<()> {
+        if !self.key_shares.is_empty() {
+            ssl.set_client_key_shares(self.key_shares)
+                .map_err(quinn_btls::Error::from)?;
+        }
+        if let Some(ech_config_list) = &self.ech_config_list {
+            ssl.set_ech_config_list(ech_config_list)
+                .map_err(quinn_btls::Error::from)?;
+        } else if self.ech_grease {
+            ssl.set_enable_ech_grease(true);
+        }
+        if self.alps {
+            ssl.set_alps_use_new_codepoint(self.alps_new_codepoint);
+            for protocol in self
+                .alpn_protocols
+                .iter()
+                .filter(|protocol| !protocol.is_empty())
+            {
+                ssl.add_application_settings(protocol)
+                    .map_err(quinn_btls::Error::from)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct BrotliCertificateDecompressor;
+
+impl CertificateCompressor for BrotliCertificateDecompressor {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm::BROTLI;
+    const CAN_COMPRESS: bool = false;
+    const CAN_DECOMPRESS: bool = true;
+
+    fn decompress<W>(&self, input: &[u8], output: &mut W) -> std::io::Result<()>
+    where
+        W: std::io::Write,
+    {
+        brotli::BrotliDecompress(&mut Cursor::new(input), output)?;
+        Ok(())
+    }
 }
 
 unsafe fn set_ctx_string(
@@ -166,12 +313,7 @@ fn configure_server_verification(
     insecure: bool,
     server_fingerprints: Vec<CertificateFingerprint>,
 ) -> HammerResult<()> {
-    if !server_fingerprints.is_empty() {
-        return Err(HammerError::config_validation(
-            "tls.server_fingerprint with tls.utls is not supported by the current QUIC uTLS backend",
-        ));
-    }
-    crypto.verify_peer(!insecure);
+    crypto.verify_peer(!insecure || !server_fingerprints.is_empty());
     Ok(())
 }
 
@@ -220,70 +362,279 @@ fn configure_client_auth(
 }
 
 struct UtlsProfile {
+    cipher_list: &'static str,
     curves: &'static str,
     signature_algorithms: &'static str,
+    key_shares: &'static [KeyShare],
     grease: bool,
     permute_extensions: bool,
+    extension_order: Option<&'static [u16]>,
     signed_certificate_timestamps: bool,
     ocsp_stapling: bool,
     record_size_limit: Option<u16>,
+    ech_grease: bool,
+    alps: bool,
+    alps_new_codepoint: bool,
+    certificate_compression: bool,
 }
 
 impl UtlsProfile {
     fn for_fingerprint(fingerprint: UtlsFingerprint) -> Self {
         match fingerprint {
             UtlsFingerprint::Firefox => Self::firefox(),
-            UtlsFingerprint::Safari | UtlsFingerprint::Ios => Self::safari(),
+            UtlsFingerprint::Edge => Self::edge(),
+            UtlsFingerprint::Safari => Self::safari(),
+            UtlsFingerprint::ThreeSixty => Self::three_sixty(),
+            UtlsFingerprint::Qq => Self::qq(),
+            UtlsFingerprint::Ios => Self::ios(),
+            UtlsFingerprint::Android => Self::android(),
             UtlsFingerprint::Random | UtlsFingerprint::Randomized => Self {
                 permute_extensions: true,
+                extension_order: None,
                 ..Self::chrome()
             },
-            UtlsFingerprint::Chrome
-            | UtlsFingerprint::Edge
-            | UtlsFingerprint::ThreeSixty
-            | UtlsFingerprint::Qq
-            | UtlsFingerprint::Android => Self::chrome(),
+            UtlsFingerprint::Chrome => Self::chrome(),
         }
     }
 
     fn chrome() -> Self {
         Self {
+            cipher_list: CHROME_CIPHERS,
             curves: "X25519MLKEM768:X25519:P-256:P-384",
-            signature_algorithms: COMMON_SIGALGS,
+            signature_algorithms: CHROMIUM_SIGALGS,
+            key_shares: CHROME_KEY_SHARES,
             grease: true,
-            permute_extensions: false,
+            permute_extensions: true,
+            extension_order: None,
             signed_certificate_timestamps: true,
             ocsp_stapling: true,
             record_size_limit: None,
+            ech_grease: true,
+            alps: true,
+            alps_new_codepoint: true,
+            certificate_compression: true,
         }
     }
 
     fn firefox() -> Self {
         Self {
-            curves: "X25519:P-256:P-384:P-521",
+            cipher_list: FIREFOX_CIPHERS,
+            curves: "X25519MLKEM768:X25519:P-256:P-384:P-521:ffdhe2048:ffdhe3072",
             signature_algorithms: FIREFOX_SIGALGS,
-            grease: true,
+            key_shares: CHROME_KEY_SHARES,
+            grease: false,
             permute_extensions: false,
+            extension_order: Some(FIREFOX_EXTENSION_ORDER),
             signed_certificate_timestamps: true,
             ocsp_stapling: true,
             record_size_limit: Some(0x4001),
+            ech_grease: true,
+            alps: false,
+            alps_new_codepoint: false,
+            certificate_compression: true,
+        }
+    }
+
+    fn edge() -> Self {
+        Self {
+            cipher_list: CHROME_CIPHERS,
+            curves: "X25519:P-256:P-384",
+            signature_algorithms: CHROMIUM_SIGALGS,
+            key_shares: CLASSIC_KEY_SHARES,
+            grease: true,
+            permute_extensions: false,
+            extension_order: Some(CHROMIUM_LEGACY_EXTENSION_ORDER),
+            signed_certificate_timestamps: true,
+            ocsp_stapling: true,
+            record_size_limit: None,
+            ech_grease: true,
+            alps: true,
+            alps_new_codepoint: true,
+            certificate_compression: true,
         }
     }
 
     fn safari() -> Self {
         Self {
-            curves: "X25519:P-256:P-384:P-521",
-            signature_algorithms: COMMON_SIGALGS,
+            cipher_list: SAFARI_CIPHERS,
+            curves: "X25519MLKEM768:X25519:P-256:P-384:P-521",
+            signature_algorithms: SAFARI_SIGALGS,
+            key_shares: CHROME_KEY_SHARES,
             grease: true,
             permute_extensions: false,
+            extension_order: Some(SAFARI_EXTENSION_ORDER),
             signed_certificate_timestamps: true,
             ocsp_stapling: true,
             record_size_limit: None,
+            ech_grease: true,
+            alps: false,
+            alps_new_codepoint: false,
+            certificate_compression: true,
+        }
+    }
+
+    fn three_sixty() -> Self {
+        Self {
+            cipher_list: CHROME_CIPHERS,
+            curves: "X25519:P-256:P-384",
+            signature_algorithms: CHROMIUM_LEGACY_SIGALGS,
+            key_shares: CLASSIC_KEY_SHARES,
+            grease: true,
+            permute_extensions: false,
+            extension_order: Some(CHROMIUM_LEGACY_EXTENSION_ORDER),
+            signed_certificate_timestamps: true,
+            ocsp_stapling: true,
+            record_size_limit: None,
+            ech_grease: true,
+            alps: true,
+            alps_new_codepoint: true,
+            certificate_compression: true,
+        }
+    }
+
+    fn qq() -> Self {
+        Self {
+            cipher_list: CHROME_CIPHERS,
+            curves: "X25519:P-256:P-384",
+            signature_algorithms: CHROMIUM_SIGALGS,
+            key_shares: CLASSIC_KEY_SHARES,
+            grease: true,
+            permute_extensions: false,
+            extension_order: Some(QQ_EXTENSION_ORDER),
+            signed_certificate_timestamps: true,
+            ocsp_stapling: true,
+            record_size_limit: None,
+            ech_grease: true,
+            alps: true,
+            alps_new_codepoint: true,
+            certificate_compression: true,
+        }
+    }
+
+    fn ios() -> Self {
+        Self {
+            cipher_list: IOS_CIPHERS,
+            curves: "X25519:P-256:P-384:P-521",
+            signature_algorithms: IOS_SIGALGS,
+            key_shares: CLASSIC_KEY_SHARES,
+            grease: true,
+            permute_extensions: false,
+            extension_order: Some(IOS_EXTENSION_ORDER),
+            signed_certificate_timestamps: true,
+            ocsp_stapling: true,
+            record_size_limit: None,
+            ech_grease: true,
+            alps: false,
+            alps_new_codepoint: false,
+            certificate_compression: false,
+        }
+    }
+
+    fn android() -> Self {
+        Self {
+            cipher_list: CHROME_CIPHERS,
+            curves: "X25519:P-256:P-384",
+            signature_algorithms: CHROMIUM_LEGACY_SIGALGS,
+            key_shares: CLASSIC_KEY_SHARES,
+            grease: false,
+            permute_extensions: false,
+            extension_order: Some(ANDROID_EXTENSION_ORDER),
+            signed_certificate_timestamps: false,
+            ocsp_stapling: true,
+            record_size_limit: None,
+            ech_grease: false,
+            alps: false,
+            alps_new_codepoint: false,
+            certificate_compression: false,
         }
     }
 }
 
-const COMMON_SIGALGS: &str = concat!(
+const CHROME_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519_MLKEM768, KeyShare::X25519];
+const CLASSIC_KEY_SHARES: &[KeyShare] = &[KeyShare::X25519];
+
+const CHROME_CIPHERS: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "ECDHE-ECDSA-AES128-GCM-SHA256:",
+    "ECDHE-RSA-AES128-GCM-SHA256:",
+    "ECDHE-ECDSA-AES256-GCM-SHA384:",
+    "ECDHE-RSA-AES256-GCM-SHA384:",
+    "ECDHE-ECDSA-CHACHA20-POLY1305:",
+    "ECDHE-RSA-CHACHA20-POLY1305:",
+    "ECDHE-RSA-AES128-SHA:",
+    "ECDHE-RSA-AES256-SHA:",
+    "AES128-GCM-SHA256:",
+    "AES256-GCM-SHA384:",
+    "AES128-SHA:",
+    "AES256-SHA"
+);
+const FIREFOX_CIPHERS: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "ECDHE-ECDSA-AES128-GCM-SHA256:",
+    "ECDHE-RSA-AES128-GCM-SHA256:",
+    "ECDHE-ECDSA-CHACHA20-POLY1305:",
+    "ECDHE-RSA-CHACHA20-POLY1305:",
+    "ECDHE-ECDSA-AES256-GCM-SHA384:",
+    "ECDHE-RSA-AES256-GCM-SHA384:",
+    "ECDHE-ECDSA-AES256-SHA:",
+    "ECDHE-ECDSA-AES128-SHA:",
+    "ECDHE-RSA-AES128-SHA:",
+    "ECDHE-RSA-AES256-SHA:",
+    "AES128-GCM-SHA256:",
+    "AES256-GCM-SHA384:",
+    "AES128-SHA:",
+    "AES256-SHA"
+);
+const SAFARI_CIPHERS: &str = concat!(
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "TLS_AES_128_GCM_SHA256:",
+    "ECDHE-ECDSA-AES256-GCM-SHA384:",
+    "ECDHE-ECDSA-AES128-GCM-SHA256:",
+    "ECDHE-ECDSA-CHACHA20-POLY1305:",
+    "ECDHE-RSA-AES256-GCM-SHA384:",
+    "ECDHE-RSA-AES128-GCM-SHA256:",
+    "ECDHE-RSA-CHACHA20-POLY1305:",
+    "ECDHE-ECDSA-AES256-SHA:",
+    "ECDHE-ECDSA-AES128-SHA:",
+    "ECDHE-RSA-AES256-SHA:",
+    "ECDHE-RSA-AES128-SHA:",
+    "AES256-GCM-SHA384:",
+    "AES128-GCM-SHA256:",
+    "AES256-SHA:",
+    "AES128-SHA"
+);
+const IOS_CIPHERS: &str = concat!(
+    "TLS_AES_128_GCM_SHA256:",
+    "TLS_AES_256_GCM_SHA384:",
+    "TLS_CHACHA20_POLY1305_SHA256:",
+    "ECDHE-ECDSA-AES256-GCM-SHA384:",
+    "ECDHE-ECDSA-AES128-GCM-SHA256:",
+    "ECDHE-ECDSA-CHACHA20-POLY1305:",
+    "ECDHE-RSA-AES256-GCM-SHA384:",
+    "ECDHE-RSA-AES128-GCM-SHA256:",
+    "ECDHE-RSA-CHACHA20-POLY1305:",
+    "ECDHE-ECDSA-AES256-SHA384:",
+    "ECDHE-ECDSA-AES128-SHA256:",
+    "ECDHE-ECDSA-AES256-SHA:",
+    "ECDHE-ECDSA-AES128-SHA:",
+    "ECDHE-RSA-AES256-SHA384:",
+    "ECDHE-RSA-AES128-SHA256:",
+    "ECDHE-RSA-AES256-SHA:",
+    "ECDHE-RSA-AES128-SHA:",
+    "AES256-GCM-SHA384:",
+    "AES128-GCM-SHA256:",
+    "AES256-SHA256:",
+    "AES128-SHA256:",
+    "AES256-SHA:",
+    "AES128-SHA"
+);
+
+const CHROMIUM_SIGALGS: &str = concat!(
     "ecdsa_secp256r1_sha256:",
     "rsa_pss_rsae_sha256:",
     "rsa_pkcs1_sha256:",
@@ -292,6 +643,17 @@ const COMMON_SIGALGS: &str = concat!(
     "rsa_pkcs1_sha384:",
     "rsa_pss_rsae_sha512:",
     "rsa_pkcs1_sha512"
+);
+const CHROMIUM_LEGACY_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "ecdsa_secp384r1_sha384:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pkcs1_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "rsa_pkcs1_sha512:",
+    "rsa_pkcs1_sha1"
 );
 const FIREFOX_SIGALGS: &str = concat!(
     "ecdsa_secp256r1_sha256:",
@@ -302,8 +664,193 @@ const FIREFOX_SIGALGS: &str = concat!(
     "rsa_pss_rsae_sha512:",
     "rsa_pkcs1_sha256:",
     "rsa_pkcs1_sha384:",
-    "rsa_pkcs1_sha512"
+    "rsa_pkcs1_sha512:",
+    "ecdsa_sha1:",
+    "rsa_pkcs1_sha1"
 );
+const SAFARI_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "ecdsa_secp384r1_sha384:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pkcs1_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "rsa_pkcs1_sha512:",
+    "rsa_pkcs1_sha1"
+);
+const IOS_SIGALGS: &str = concat!(
+    "ecdsa_secp256r1_sha256:",
+    "rsa_pss_rsae_sha256:",
+    "rsa_pkcs1_sha256:",
+    "ecdsa_secp384r1_sha384:",
+    "ecdsa_sha1:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pss_rsae_sha384:",
+    "rsa_pkcs1_sha384:",
+    "rsa_pss_rsae_sha512:",
+    "rsa_pkcs1_sha512:",
+    "rsa_pkcs1_sha1"
+);
+
+const CHROMIUM_LEGACY_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_session_ticket as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_encrypted_client_hello as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
+const QQ_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_session_ticket as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
+const FIREFOX_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_record_size_limit as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_encrypted_client_hello as u16,
+    btls_sys::TLSEXT_TYPE_session_ticket as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
+const SAFARI_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
+const IOS_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
+const ANDROID_EXTENSION_ORDER: &[u16] = &[
+    btls_sys::TLSEXT_TYPE_server_name as u16,
+    btls_sys::TLSEXT_TYPE_extended_master_secret as u16,
+    btls_sys::TLSEXT_TYPE_renegotiate as u16,
+    btls_sys::TLSEXT_TYPE_supported_groups as u16,
+    btls_sys::TLSEXT_TYPE_ec_point_formats as u16,
+    btls_sys::TLSEXT_TYPE_status_request as u16,
+    btls_sys::TLSEXT_TYPE_signature_algorithms as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters as u16,
+    btls_sys::TLSEXT_TYPE_key_share as u16,
+    btls_sys::TLSEXT_TYPE_psk_key_exchange_modes as u16,
+    btls_sys::TLSEXT_TYPE_supported_versions as u16,
+    btls_sys::TLSEXT_TYPE_session_ticket as u16,
+    btls_sys::TLSEXT_TYPE_application_layer_protocol_negotiation as u16,
+    btls_sys::TLSEXT_TYPE_certificate_timestamp as u16,
+    btls_sys::TLSEXT_TYPE_cert_compression as u16,
+    btls_sys::TLSEXT_TYPE_early_data as u16,
+    btls_sys::TLSEXT_TYPE_cookie as u16,
+    btls_sys::TLSEXT_TYPE_delegated_credential as u16,
+    btls_sys::TLSEXT_TYPE_application_settings as u16,
+    btls_sys::TLSEXT_TYPE_application_settings_old as u16,
+    btls_sys::TLSEXT_TYPE_certificate_authorities as u16,
+    btls_sys::TLSEXT_TYPE_pake as u16,
+    btls_sys::TLSEXT_TYPE_trust_anchors as u16,
+    btls_sys::TLSEXT_TYPE_quic_transport_parameters_legacy as u16,
+];
 
 #[cfg(test)]
 mod tests {
@@ -314,12 +861,37 @@ mod tests {
         for fingerprint in [
             UtlsFingerprint::Chrome,
             UtlsFingerprint::Firefox,
+            UtlsFingerprint::Edge,
             UtlsFingerprint::Safari,
+            UtlsFingerprint::ThreeSixty,
+            UtlsFingerprint::Qq,
+            UtlsFingerprint::Ios,
+            UtlsFingerprint::Android,
+            UtlsFingerprint::Random,
             UtlsFingerprint::Randomized,
         ] {
-            let mut crypto = quinn_btls::ClientConfig::new().expect("btls client config");
-            apply_utls_profile(&mut crypto, &UtlsOptions { fingerprint })
+            let options = UtlsOptions { fingerprint };
+            let mut crypto =
+                new_utls_client_config(&options, false, &[]).expect("btls client config");
+            apply_utls_profile(&mut crypto, &options, &[b"h3".to_vec()], None)
                 .expect("uTLS profile should be accepted by BoringSSL");
         }
+    }
+
+    #[test]
+    fn utls_server_fingerprints_build_btls_config() {
+        let options = UtlsOptions {
+            fingerprint: UtlsFingerprint::Chrome,
+        };
+        let fingerprints = [CertificateFingerprint {
+            algorithm: CertificateFingerprintAlgorithm::Sha256,
+            digest: vec![0; 32],
+        }];
+        let mut crypto =
+            new_utls_client_config(&options, false, &fingerprints).expect("btls client config");
+        apply_utls_profile(&mut crypto, &options, &[b"h3".to_vec()], None)
+            .expect("uTLS profile should be accepted by BoringSSL");
+        configure_server_verification(&mut crypto, false, fingerprints.to_vec())
+            .expect("uTLS server fingerprint verification should be accepted");
     }
 }

@@ -10,6 +10,7 @@ members = [
 ]
 exclude = [
     "third_party/boringtun",
+    "third_party/quinn-btls",
     "third_party/quinn/quinn",
     "third_party/quinn/quinn-proto",
 ]
@@ -69,6 +70,7 @@ quinn-btls = { version = "0.1.0", default-features = false, features = ["prefix-
 btls = { version = "0.5.6", default-features = false, features = ["prefix-symbols"] }
 btls-sys = { version = "0.5.6", default-features = false, features = ["prefix-symbols"] }
 foreign-types-shared = "0.3"
+brotli = "8.0"
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
@@ -95,4 +97,5 @@ rcgen = "0.14"
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }
 quinn = { path = "third_party/quinn/quinn" }
+quinn-btls = { path = "third_party/quinn-btls" }
 quinn-proto = { path = "third_party/quinn/quinn-proto" }

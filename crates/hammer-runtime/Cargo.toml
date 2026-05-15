@@ -41,6 +41,7 @@ tls-utls = [
     "tls-quic",
     "dep:btls",
     "dep:btls-sys",
+    "dep:brotli",
     "dep:foreign-types-shared",
     "dep:quinn-btls",
 ]
@@ -115,6 +116,7 @@ quinn = { workspace = true, optional = true }
 quinn-btls = { workspace = true, optional = true }
 btls = { workspace = true, optional = true }
 btls-sys = { workspace = true, optional = true }
+brotli = { workspace = true, optional = true }
 foreign-types-shared = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
