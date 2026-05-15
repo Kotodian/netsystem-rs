@@ -25,10 +25,13 @@ pub struct Config {
     ctx: SslContext,
     session_cache: Arc<dyn SessionCache>,
     ssl_config_callback: Option<Arc<ClientSslConfigCallback>>,
+    ech_rejected_callback: Option<Arc<ClientEchRejectedCallback>>,
 }
 
 /// Callback invoked after a client [Ssl] is created and before the handshake starts.
 pub type ClientSslConfigCallback = dyn Fn(&mut Ssl) -> Result<()> + Send + Sync + 'static;
+/// Callback invoked when ECH is rejected and BoringSSL exposes retry configs.
+pub type ClientEchRejectedCallback = dyn Fn(Vec<u8>) + Send + Sync + 'static;
 
 impl Config {
     pub fn new() -> Result<Self> {
@@ -76,6 +79,7 @@ impl Config {
             ctx,
             session_cache: Arc::new(SimpleCache::new(256)),
             ssl_config_callback: None,
+            ech_rejected_callback: None,
         })
     }
 
@@ -124,6 +128,19 @@ impl Config {
         self.ssl_config_callback = None;
     }
 
+    /// Sets a callback used to observe ECH retry configs after ECH rejection.
+    pub fn set_ech_rejected_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
+    {
+        self.ech_rejected_callback = Some(Arc::new(callback));
+    }
+
+    /// Clears the ECH rejection callback.
+    pub fn clear_ech_rejected_callback(&mut self) {
+        self.ech_rejected_callback = None;
+    }
+
     /// Sets the ALPN protocols supported by the client. QUIC requires that
     /// ALPN be used (see <https://www.rfc-editor.org/rfc/rfc9001.html#section-8.1>).
     /// By default, the client will offer "h3".
@@ -157,6 +174,7 @@ struct Session {
     state: Box<SessionState>,
     server_name: Bytes,
     session_cache: Arc<dyn SessionCache>,
+    ech_rejected_callback: Option<Arc<ClientEchRejectedCallback>>,
     zero_rtt_peer_params: Option<TransportParameters>,
     handshake_data_available: bool,
     handshake_data_sent: bool,
@@ -233,6 +251,7 @@ impl Session {
             state: SessionState::new(ssl, Side::Client, version)?,
             server_name: server_name_bytes,
             session_cache,
+            ech_rejected_callback: cfg.ech_rejected_callback.clone(),
             zero_rtt_peer_params,
             handshake_data_available: false,
             handshake_data_sent: false,
@@ -250,9 +269,22 @@ impl Session {
 
         // Start the handshake in order to emit the Client Hello on the first
         // call to write_handshake.
-        session.state.advance_handshake()?;
+        if let Err(err) = session.state.advance_handshake() {
+            session.notify_ech_rejected();
+            return Err(err.into());
+        }
 
         Ok(session)
+    }
+
+    fn notify_ech_rejected(&self) {
+        let Some(callback) = &self.ech_rejected_callback else {
+            return;
+        };
+        let Some(retry_configs) = self.state.ssl.get_ech_retry_configs() else {
+            return;
+        };
+        callback(retry_configs.to_vec());
     }
 
     /// Handler for the rejection of a 0-RTT attempt. Will continue with 1-RTT.
@@ -362,7 +394,10 @@ impl crypto::Session for Session {
     }
 
     fn read_handshake(&mut self, plaintext: &[u8]) -> StdResult<bool, TransportError> {
-        self.state.read_handshake(plaintext)?;
+        if let Err(err) = self.state.read_handshake(plaintext) {
+            self.notify_ech_rejected();
+            return Err(err);
+        }
 
         if self.state.early_data_rejected {
             self.on_zero_rtt_rejected();

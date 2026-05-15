@@ -16,8 +16,8 @@ use hammer_adapter::{
     Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::{
-    EchConfigSource, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions,
-    OutboundKind, OutboundTlsOptions,
+    EchConfigList, EchConfigSource, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
+    Hysteria2OutboundOptions, OutboundKind, OutboundTlsOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
@@ -134,42 +134,55 @@ impl Hysteria2Client {
 }
 
 async fn connect_with_timeout(
-    options: ClientOptions,
+    mut options: ClientOptions,
     connect_timeout: Duration,
 ) -> HammerResult<Arc<Hysteria2Client>> {
+    resolve_hysteria2_ech_config(&mut options).await?;
     let server = format!("{}:{}", options.server, effective_port(options.server_port));
     debug!("hysteria2 resolving server {server}");
     let address = resolve_server(&options.server, options.server_port).await?;
     debug!("hysteria2 resolved server {server} -> {address}");
     let congestion = CongestionControlHandle::default();
-    let endpoint = client_endpoint(&options, address, congestion.clone())?;
-    let server_name = if options.server_name.is_empty() {
-        options.server.as_str()
-    } else {
-        options.server_name.as_str()
-    };
+    let ech_retry_configs = ech_retry_config_store(&options);
+    let mut endpoint = client_endpoint(
+        &options,
+        address,
+        congestion.clone(),
+        ech_retry_configs.clone(),
+    )?;
+    let server_name = effective_server_name(&options).to_owned();
     let tls_mode = tls_mode(&options);
     debug!(
         "hysteria2 connecting {address} server_name={server_name} tls={tls_mode} udp={} timeout={}",
         options.udp_enabled,
         duration_label(connect_timeout)
     );
-    let context = connect_context(&server, address, server_name, tls_mode, options.udp_enabled);
-    let connecting = endpoint.connect(address, server_name).map_err(|err| {
-        HammerError::internal(format!("start hysteria2 connect failed {context}: {err}"))
-    })?;
-    let connection = match tokio::time::timeout(connect_timeout, connecting).await {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(err)) => {
-            return Err(HammerError::internal(format!(
-                "connect hysteria2 failed {context}: {err}"
-            )));
-        }
-        Err(_) => {
-            return Err(HammerError::internal(format!(
-                "connect hysteria2 timed out after {} {context}; no QUIC handshake result",
-                duration_label(connect_timeout)
-            )));
+    let context = connect_context(
+        &server,
+        address,
+        &server_name,
+        tls_mode,
+        options.udp_enabled,
+    );
+    let connection = match connect_quic_with_timeout(
+        &endpoint,
+        address,
+        &server_name,
+        connect_timeout,
+        &context,
+    )
+    .await
+    {
+        Ok(connection) => connection,
+        Err(err) => {
+            let Some(retry_configs) = take_ech_retry_configs(&ech_retry_configs) else {
+                return Err(err);
+            };
+            debug!("hysteria2 retrying with ECH retry config server_name={server_name}");
+            apply_hysteria2_ech_retry_config(&mut options, retry_configs);
+            endpoint = client_endpoint(&options, address, congestion.clone(), None)?;
+            connect_quic_with_timeout(&endpoint, address, &server_name, connect_timeout, &context)
+                .await?
         }
     };
     debug!("hysteria2 connected {address}");
@@ -203,6 +216,28 @@ async fn connect_with_timeout(
         spawn_datagram_loop(Arc::clone(&client));
     }
     Ok(client)
+}
+
+async fn connect_quic_with_timeout(
+    endpoint: &quinn::Endpoint,
+    address: SocketAddr,
+    server_name: &str,
+    connect_timeout: Duration,
+    context: &str,
+) -> HammerResult<quinn::Connection> {
+    let connecting = endpoint.connect(address, server_name).map_err(|err| {
+        HammerError::internal(format!("start hysteria2 connect failed {context}: {err}"))
+    })?;
+    match tokio::time::timeout(connect_timeout, connecting).await {
+        Ok(Ok(connection)) => Ok(connection),
+        Ok(Err(err)) => Err(HammerError::internal(format!(
+            "connect hysteria2 failed {context}: {err}"
+        ))),
+        Err(_) => Err(HammerError::internal(format!(
+            "connect hysteria2 timed out after {} {context}; no QUIC handshake result",
+            duration_label(connect_timeout)
+        ))),
+    }
 }
 
 pub struct Hysteria2Stream {
@@ -429,6 +464,7 @@ fn client_endpoint(
     options: &ClientOptions,
     server_addr: SocketAddr,
     congestion: CongestionControlHandle,
+    ech_retry_configs: Option<Arc<StdMutex<Option<Vec<u8>>>>>,
 ) -> HammerResult<quinn::Endpoint> {
     validate_hysteria2_tls_options(&options.tls)?;
     let bind_addr = if server_addr.is_ipv6() {
@@ -456,14 +492,17 @@ fn client_endpoint(
         runtime,
     )
     .map_err(|err| HammerError::internal(format!("create QUIC endpoint: {err}")))?;
-    endpoint.set_default_client_config(client_config(options, congestion)?);
+    endpoint.set_default_client_config(client_config(options, congestion, ech_retry_configs)?);
     Ok(endpoint)
 }
 
 fn client_config(
     options: &ClientOptions,
     congestion: CongestionControlHandle,
+    ech_retry_configs: Option<Arc<StdMutex<Option<Vec<u8>>>>>,
 ) -> HammerResult<quinn::ClientConfig> {
+    #[cfg(not(feature = "tls-utls"))]
+    let _ = &ech_retry_configs;
     let alpn_protocols = if options.tls.alpn.is_empty() {
         vec![b"h3".to_vec()]
     } else {
@@ -481,6 +520,8 @@ fn client_config(
         server_fingerprints: options.tls.server_fingerprints.clone(),
         client_auth: options.tls.client_auth.clone(),
         ech: options.tls.ech.clone(),
+        #[cfg(feature = "tls-utls")]
+        ech_retry_configs,
         utls: options.tls.utls.clone(),
     })?;
     let mut transport = quinn::TransportConfig::default();
@@ -518,12 +559,9 @@ fn client_config(
 
 fn validate_hysteria2_tls_options(tls: &OutboundTlsOptions) -> HammerResult<()> {
     if let Some(ech) = &tls.ech {
-        if matches!(
-            ech.config_source,
-            None | Some(EchConfigSource::DnsHttpsRecord)
-        ) {
+        if ech.config_source.is_none() {
             return Err(HammerError::config_validation(
-                "hysteria2.tls.ech requires inline config or config_path; DNS HTTPS record lookup is not implemented yet",
+                "hysteria2.tls.ech requires inline config, config_path, or DNS HTTPS lookup",
             ));
         }
         if ech.pq_signature_schemes_enabled {
@@ -548,6 +586,59 @@ fn validate_hysteria2_tls_options(tls: &OutboundTlsOptions) -> HammerResult<()> 
         ));
     }
     Ok(())
+}
+
+async fn resolve_hysteria2_ech_config(options: &mut ClientOptions) -> HammerResult<()> {
+    if !matches!(
+        options
+            .tls
+            .ech
+            .as_ref()
+            .and_then(|ech| ech.config_source.as_ref()),
+        Some(EchConfigSource::DnsHttpsRecord)
+    ) {
+        return Ok(());
+    }
+
+    let server_name = effective_server_name(options).to_owned();
+    let config = crate::tls::resolve_dns_https_ech_config_list(&server_name).await?;
+    debug!("hysteria2 resolved ECH config from HTTPS record server_name={server_name}");
+    if let Some(ech) = options.tls.ech.as_mut() {
+        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(config)));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tls-utls")]
+fn ech_retry_config_store(options: &ClientOptions) -> Option<Arc<StdMutex<Option<Vec<u8>>>>> {
+    options
+        .tls
+        .ech
+        .as_ref()
+        .map(|_| Arc::new(StdMutex::new(None)))
+}
+
+#[cfg(not(feature = "tls-utls"))]
+fn ech_retry_config_store(_: &ClientOptions) -> Option<Arc<StdMutex<Option<Vec<u8>>>>> {
+    None
+}
+
+fn take_ech_retry_configs(store: &Option<Arc<StdMutex<Option<Vec<u8>>>>>) -> Option<Vec<u8>> {
+    store.as_ref().and_then(|store| store.lock().ok()?.take())
+}
+
+fn apply_hysteria2_ech_retry_config(options: &mut ClientOptions, retry_configs: Vec<u8>) {
+    if let Some(ech) = options.tls.ech.as_mut() {
+        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(retry_configs)));
+    }
+}
+
+fn effective_server_name(options: &ClientOptions) -> &str {
+    if options.server_name.is_empty() {
+        options.server.as_str()
+    } else {
+        options.server_name.as_str()
+    }
 }
 
 fn connect_context(
@@ -1228,7 +1319,7 @@ mod tests {
             fingerprint: hammer_core::config::UtlsFingerprint::Chrome,
         });
 
-        client_config(&options, CongestionControlHandle::default())
+        client_config(&options, CongestionControlHandle::default(), None)
             .expect("uTLS should build a QUIC client config when tls-utls is enabled");
     }
 
@@ -1264,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn hysteria2_tls_validation_rejects_ech_dns_lookup() {
+    fn hysteria2_tls_validation_allows_ech_dns_lookup() {
         let tls = hammer_core::config::OutboundTlsOptions {
             enabled: true,
             server_name: "localhost".to_owned(),
@@ -1277,8 +1368,7 @@ mod tests {
             ..Default::default()
         };
 
-        let err = validate_hysteria2_tls_options(&tls).expect_err("DNS ECH is not implemented");
-        assert!(err.to_string().contains("DNS HTTPS record lookup"));
+        validate_hysteria2_tls_options(&tls).expect("DNS HTTPS ECH should validate");
     }
 
     #[tokio::test]

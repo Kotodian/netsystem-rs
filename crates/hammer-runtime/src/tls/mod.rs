@@ -26,3 +26,5 @@ pub(crate) use client::outbound_quic_client_config;
 pub(crate) use client::safe_default_client_config;
 #[cfg(feature = "dns-https")]
 pub(crate) use client::tls13_client_config;
+#[cfg(feature = "tls-outbound")]
+pub(crate) use ech::resolve_dns_https_ech_config_list;

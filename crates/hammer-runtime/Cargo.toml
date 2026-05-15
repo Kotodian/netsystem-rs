@@ -35,7 +35,7 @@ tls = [
     "dep:rustls-platform-verifier",
 ]
 tls-client = ["tls"]
-tls-outbound = ["tls", "hammer-core/tls"]
+tls-outbound = ["tls", "hammer-core/tls", "dep:hickory-resolver"]
 tls-quic = ["tls-outbound", "dep:quinn"]
 tls-utls = [
     "tls-quic",
@@ -103,6 +103,7 @@ hammer-component-macros = { path = "../hammer-component-macros" }
 async-trait = { workspace = true }
 boringtun = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
+hickory-resolver = { workspace = true, optional = true }
 bytes = { workspace = true }
 etherparse = { workspace = true, optional = true }
 arc-swap = { workspace = true, optional = true }

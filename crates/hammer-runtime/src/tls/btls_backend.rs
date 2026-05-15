@@ -9,7 +9,7 @@ use crate::tls::backend::TlsBackend;
 use btls::hash::MessageDigest;
 use btls::pkey::PKey;
 use btls::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl};
-use btls::x509::X509;
+use btls::x509::{X509, X509StoreContext, X509StoreContextRef};
 use foreign_types_shared::ForeignType;
 use hammer_adapter::PlatformInterface;
 use hammer_core::config::{
@@ -64,8 +64,19 @@ impl TlsBackend for BtlsUtlsBackend {
         })?;
         let ech_config_list = options.ech.as_ref().map(btls_ech_config_list).transpose()?;
 
-        let mut crypto =
-            new_utls_client_config(utls, options.insecure, &options.server_fingerprints)?;
+        let mut crypto = new_utls_client_config(
+            utls,
+            options.insecure,
+            &options.server_fingerprints,
+            ech_config_list.is_some(),
+        )?;
+        if let Some(ech_retry_configs) = options.ech_retry_configs.clone() {
+            crypto.set_ech_rejected_callback(move |retry_configs| {
+                if let Ok(mut slot) = ech_retry_configs.lock() {
+                    *slot = Some(retry_configs);
+                }
+            });
+        }
         apply_utls_profile(&mut crypto, utls, &options.alpn_protocols, ech_config_list)?;
         add_platform_roots(&mut crypto, options.platform)?;
         configure_server_verification(&mut crypto, options.insecure, options.server_fingerprints)?;
@@ -96,9 +107,11 @@ fn new_utls_client_config(
     options: &UtlsOptions,
     insecure: bool,
     server_fingerprints: &[CertificateFingerprint],
+    ech_enabled: bool,
 ) -> HammerResult<quinn_btls::ClientConfig> {
     let profile = UtlsProfile::for_fingerprint(options.fingerprint);
-    let result = if profile.certificate_compression || !server_fingerprints.is_empty() {
+    let needs_cert_verify_callback = !server_fingerprints.is_empty() || (ech_enabled && !insecure);
+    let result = if profile.certificate_compression || needs_cert_verify_callback {
         let server_fingerprints = server_fingerprints.to_vec();
         quinn_btls::ClientConfig::new_with_context_config(|builder| {
             if profile.certificate_compression {
@@ -106,9 +119,9 @@ fn new_utls_client_config(
                     .add_certificate_compression_algorithm(BrotliCertificateDecompressor)
                     .map_err(quinn_btls::Error::from)?;
             }
-            if !server_fingerprints.is_empty() {
+            if needs_cert_verify_callback {
                 builder.set_cert_verify_callback(move |x509| {
-                    verify_btls_server_fingerprint(x509, insecure, &server_fingerprints)
+                    verify_btls_server_certificate(x509, insecure, &server_fingerprints)
                 });
             }
             Ok(())
@@ -119,14 +132,45 @@ fn new_utls_client_config(
     result.map_err(|err| HammerError::internal(format!("btls quic client config: {err}")))
 }
 
-fn verify_btls_server_fingerprint(
-    x509: &mut btls::x509::X509StoreContextRef,
+fn verify_btls_server_certificate(
+    x509: &mut X509StoreContextRef,
     insecure: bool,
     server_fingerprints: &[CertificateFingerprint],
 ) -> bool {
-    if !insecure && !x509.verify_cert().unwrap_or(false) {
-        return false;
+    if !insecure {
+        if !apply_btls_ech_name_override(x509) {
+            return false;
+        }
+        if !x509.verify_cert().unwrap_or(false) {
+            return false;
+        }
     }
+    if server_fingerprints.is_empty() {
+        return true;
+    }
+    verify_btls_server_fingerprint(x509, server_fingerprints)
+}
+
+fn apply_btls_ech_name_override(x509: &mut X509StoreContextRef) -> bool {
+    let Ok(ssl_idx) = X509StoreContext::ssl_idx() else {
+        return true;
+    };
+    let Some(name) = x509
+        .ex_data(ssl_idx)
+        .and_then(|ssl| ssl.get_ech_name_override().map(Vec::from))
+    else {
+        return true;
+    };
+    let Ok(name) = std::str::from_utf8(&name) else {
+        return false;
+    };
+    x509.verify_param_mut().set_host(name).is_ok()
+}
+
+fn verify_btls_server_fingerprint(
+    x509: &mut X509StoreContextRef,
+    server_fingerprints: &[CertificateFingerprint],
+) -> bool {
     let Some(certificate) = x509.cert() else {
         return false;
     };
@@ -872,7 +916,7 @@ mod tests {
         ] {
             let options = UtlsOptions { fingerprint };
             let mut crypto =
-                new_utls_client_config(&options, false, &[]).expect("btls client config");
+                new_utls_client_config(&options, false, &[], false).expect("btls client config");
             apply_utls_profile(&mut crypto, &options, &[b"h3".to_vec()], None)
                 .expect("uTLS profile should be accepted by BoringSSL");
         }
@@ -887,11 +931,27 @@ mod tests {
             algorithm: CertificateFingerprintAlgorithm::Sha256,
             digest: vec![0; 32],
         }];
-        let mut crypto =
-            new_utls_client_config(&options, false, &fingerprints).expect("btls client config");
+        let mut crypto = new_utls_client_config(&options, false, &fingerprints, false)
+            .expect("btls client config");
         apply_utls_profile(&mut crypto, &options, &[b"h3".to_vec()], None)
             .expect("uTLS profile should be accepted by BoringSSL");
         configure_server_verification(&mut crypto, false, fingerprints.to_vec())
             .expect("uTLS server fingerprint verification should be accepted");
+    }
+
+    #[test]
+    fn utls_ech_builds_btls_config_with_cert_verify_callback() {
+        let options = UtlsOptions {
+            fingerprint: UtlsFingerprint::Chrome,
+        };
+        let mut crypto =
+            new_utls_client_config(&options, false, &[], true).expect("btls client config");
+        apply_utls_profile(
+            &mut crypto,
+            &options,
+            &[b"h3".to_vec()],
+            Some(vec![0, 1, 2]),
+        )
+        .expect("uTLS ECH profile should be accepted by BoringSSL");
     }
 }
