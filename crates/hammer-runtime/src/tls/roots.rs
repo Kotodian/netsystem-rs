@@ -47,7 +47,7 @@ fn client_verifier_builder_for_platform(
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn root_cert_store(extra_roots: Vec<CertificateDer<'static>>) -> RootCertStore {
+pub(super) fn root_cert_store(extra_roots: Vec<CertificateDer<'static>>) -> RootCertStore {
     let mut roots = RootCertStore::empty();
     for cert in extra_roots {
         let _ = roots.add(cert);
@@ -60,7 +60,7 @@ fn root_cert_store(extra_roots: Vec<CertificateDer<'static>>) -> RootCertStore {
     roots
 }
 
-fn platform_root_certificates(
+pub(super) fn platform_root_certificates(
     platform: Option<Arc<dyn PlatformInterface>>,
 ) -> Vec<CertificateDer<'static>> {
     platform

@@ -21,7 +21,7 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 use crate::RuntimePlatform;
-use crate::tls_support::client_verifier_builder;
+use crate::tls::{BasicClientTlsConfig, safe_default_client_config};
 
 /// Maximum bytes of response head we will buffer before bailing — gstatic and
 /// other typical probe URLs answer in well under 1 KiB; cap to bound memory.
@@ -74,12 +74,10 @@ impl HttpUrltestProbe {
             .ok_or_else(|| HammerError::config_validation("urltest url is missing a port"))?;
 
         let (tls, server_name) = if use_tls {
-            let provider = Arc::new(rustls::crypto::ring::default_provider());
-            let builder = ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|err| HammerError::internal(format!("urltest tls versions: {err}")))?;
-            let mut config = client_verifier_builder(builder, platform)?.with_no_client_auth();
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let config = safe_default_client_config(BasicClientTlsConfig {
+                platform,
+                alpn_protocols: vec![b"http/1.1".to_vec()],
+            })?;
             let server_name: ServerName<'static> = ServerName::try_from(host.as_str())
                 .map_err(|err| {
                     HammerError::config_validation(format!("urltest tls server name: {err}"))

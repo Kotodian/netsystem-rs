@@ -33,6 +33,8 @@ endpoint = ["hammer-runtime/endpoint"]
 wireguard = ["endpoint", "hammer-core/wireguard", "hammer-runtime/endpoint-wireguard"]
 # Hysteria2 outbound. Opt-in.
 hysteria2 = ["hammer-runtime/outbound-hysteria2"]
+# BoringSSL-backed uTLS ClientHello shaping for QUIC outbounds.
+utls = ["hammer-runtime/tls-utls"]
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }

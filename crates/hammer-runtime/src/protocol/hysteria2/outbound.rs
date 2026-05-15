@@ -190,6 +190,7 @@ impl Hysteria2Outbound {
     }
 
     fn client_options(&self) -> HammerResult<ClientOptions> {
+        validate_hysteria2_tls_options(&self.options.tls)?;
         Ok(ClientOptions {
             server: self.options.server.clone(),
             server_port: self.options.server_port,
@@ -205,6 +206,7 @@ impl Hysteria2Outbound {
             send_bps: mbps_to_bps(self.options.up_mbps)?,
             receive_bps: mbps_to_bps(self.options.down_mbps)?,
             brutal_debug: self.options.brutal_debug,
+            tls: self.options.tls.clone(),
             obfs: self.options.obfs.clone(),
             platform: self.protector.platform(),
         })

@@ -16,15 +16,13 @@ use hammer_adapter::{
     Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::{
-    Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions, OutboundKind,
+    EchConfigSource, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions,
+    OutboundKind, OutboundTlsOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hammer_core::protocol::congestion::BbrProfile;
 use http::Request;
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 
@@ -36,12 +34,11 @@ pub use outbound::Hysteria2Outbound;
 
 use obfs::Salamander;
 
-use crate::protocol::congestion::{
-    CongestionControlHandle, apply_transport_config_with_handle,
-};
+use crate::protocol::congestion::{CongestionControlHandle, apply_transport_config_with_handle};
 #[cfg(feature = "probe")]
 use crate::protocol::icmp;
 use crate::socket_protector::SocketProtector;
+use crate::tls::{OutboundClientTlsConfig, outbound_quic_client_config};
 
 // Match sing-quic's hysteria2 client defaults
 // (quic/hysteria/protocol.go DefaultStreamReceiveWindow / DefaultConnReceiveWindow):
@@ -71,6 +68,7 @@ pub struct ClientOptions {
     pub send_bps: u64,
     pub receive_bps: u64,
     pub brutal_debug: bool,
+    pub tls: OutboundTlsOptions,
     pub obfs: Option<Hysteria2Obfs>,
     pub platform: Option<Arc<dyn PlatformInterface>>,
 }
@@ -432,6 +430,7 @@ fn client_endpoint(
     server_addr: SocketAddr,
     congestion: CongestionControlHandle,
 ) -> HammerResult<quinn::Endpoint> {
+    validate_hysteria2_tls_options(&options.tls)?;
     let bind_addr = if server_addr.is_ipv6() {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
     } else {
@@ -465,24 +464,25 @@ fn client_config(
     options: &ClientOptions,
     congestion: CongestionControlHandle,
 ) -> HammerResult<quinn::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|err| HammerError::internal(format!("tls versions: {err}")))?;
-    let mut crypto = if options.insecure {
-        builder
-            .dangerous()
-            .with_custom_certificate_verifier(SkipServerVerification::new(provider))
-            .with_no_client_auth()
+    let alpn_protocols = if options.tls.alpn.is_empty() {
+        vec![b"h3".to_vec()]
     } else {
-        crate::tls_support::client_verifier_builder(builder, options.platform.clone())?
-            .with_no_client_auth()
+        options
+            .tls
+            .alpn
+            .iter()
+            .map(|alpn| alpn.as_bytes().to_vec())
+            .collect()
     };
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(crypto)
-            .map_err(|err| HammerError::internal(format!("quic tls config: {err}")))?,
-    ));
+    let mut config = outbound_quic_client_config(OutboundClientTlsConfig {
+        platform: options.platform.clone(),
+        insecure: options.tls.insecure,
+        alpn_protocols,
+        server_fingerprints: options.tls.server_fingerprints.clone(),
+        client_auth: options.tls.client_auth.clone(),
+        ech: options.tls.ech.clone(),
+        utls: options.tls.utls.clone(),
+    })?;
     let mut transport = quinn::TransportConfig::default();
     // Match the sing-quic / hysteria2 official defaults — quinn's defaults are
     // far below the BDP we typically need for cross-region transfers.
@@ -514,6 +514,40 @@ fn client_config(
         options.brutal_debug,
     );
     Ok(config)
+}
+
+fn validate_hysteria2_tls_options(tls: &OutboundTlsOptions) -> HammerResult<()> {
+    if let Some(ech) = &tls.ech {
+        if matches!(
+            ech.config_source,
+            None | Some(EchConfigSource::DnsHttpsRecord)
+        ) {
+            return Err(HammerError::config_validation(
+                "hysteria2.tls.ech requires inline config or config_path; DNS HTTPS record lookup is not implemented yet",
+            ));
+        }
+        if ech.pq_signature_schemes_enabled {
+            return Err(HammerError::config_validation(
+                "hysteria2.tls.ech.pq_signature_schemes_enabled is parsed but not supported by the current TLS backend",
+            ));
+        }
+        if ech.dynamic_record_sizing_disabled {
+            return Err(HammerError::config_validation(
+                "hysteria2.tls.ech.dynamic_record_sizing_disabled is only valid for TCP TLS streams",
+            ));
+        }
+    }
+    if tls.reality.is_some() {
+        return Err(HammerError::config_validation(
+            "hysteria2.tls.reality requires a Reality-capable outbound such as VLESS",
+        ));
+    }
+    if tls.fragment.is_some() || tls.record_fragment {
+        return Err(HammerError::config_validation(
+            "hysteria2.tls fragmentation is only valid for TCP TLS streams",
+        ));
+    }
+    Ok(())
 }
 
 fn connect_context(
@@ -690,60 +724,6 @@ fn parse_destination(destination: &str) -> SocksAddr {
     SocksAddr::ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
 }
 
-#[derive(Debug)]
-struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
-
-impl SkipServerVerification {
-    fn new(provider: Arc<rustls::crypto::CryptoProvider>) -> Arc<Self> {
-        Arc::new(Self(provider))
-    }
-}
-
-impl ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
 fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> HammerResult<()> {
     if let Some(obfs) = obfs {
         match obfs.type_ {
@@ -783,6 +763,12 @@ mod tests {
             send_bps: 0,
             receive_bps: 0,
             brutal_debug: false,
+            tls: hammer_core::config::OutboundTlsOptions {
+                enabled: true,
+                server_name: "localhost".to_owned(),
+                insecure: true,
+                ..Default::default()
+            },
             obfs: None,
             platform: None,
         }
@@ -803,6 +789,7 @@ mod tests {
                 enabled: true,
                 server_name: "localhost".to_owned(),
                 insecure: true,
+                ..Default::default()
             },
             ..Default::default()
         }
@@ -921,7 +908,7 @@ mod tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
         let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?
@@ -1207,6 +1194,91 @@ mod tests {
             "ICMP probe destination resolution must not initialize the QUIC client"
         );
         assert_eq!(outbound.connect_backoff_remaining(), None);
+    }
+
+    #[cfg(not(feature = "tls-utls"))]
+    #[tokio::test]
+    async fn unsupported_hysteria2_tls_options_fail_before_connecting() {
+        let mut options = outbound_options_for_test(443);
+        options.tls.utls = Some(hammer_core::config::UtlsOptions {
+            fingerprint: hammer_core::config::UtlsFingerprint::Chrome,
+        });
+        let outbound = Hysteria2Outbound::new(logger("hysteria2"), "hysteria2".to_owned(), options);
+
+        let err = outbound
+            .ensure_connected()
+            .await
+            .expect_err("uTLS must not be silently ignored");
+        let message = err.to_string();
+        assert!(
+            message.contains("hysteria2.tls.utls"),
+            "error = {message:?}"
+        );
+        assert!(
+            outbound.cached_client().is_none(),
+            "unsupported TLS options must fail before a QUIC client is initialized"
+        );
+    }
+
+    #[cfg(feature = "tls-utls")]
+    #[test]
+    fn hysteria2_utls_options_build_quic_config() {
+        let mut options = client_options_for_test(443);
+        options.tls.utls = Some(hammer_core::config::UtlsOptions {
+            fingerprint: hammer_core::config::UtlsFingerprint::Chrome,
+        });
+
+        client_config(&options, CongestionControlHandle::default())
+            .expect("uTLS should build a QUIC client config when tls-utls is enabled");
+    }
+
+    #[test]
+    fn hysteria2_tls_validation_allows_backend_supported_options() {
+        let tls = hammer_core::config::OutboundTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            server_fingerprints: vec![hammer_core::config::CertificateFingerprint {
+                algorithm: hammer_core::config::CertificateFingerprintAlgorithm::Sha256,
+                digest: vec![0x11; 32],
+            }],
+            client_auth: Some(hammer_core::config::ClientTlsAuth {
+                certificates: vec![hammer_core::config::CertificateSource::Inline(
+                    hammer_core::config::CertificateDerBytes(vec![1, 2, 3]),
+                )],
+                key: hammer_core::config::PrivateKeySource::Inline(
+                    hammer_core::config::PrivateKeyDerBytes(vec![4, 5, 6]),
+                ),
+            }),
+            ech: Some(hammer_core::config::EchOptions {
+                config_source: Some(hammer_core::config::EchConfigSource::Inline(
+                    hammer_core::config::EchConfigList(vec![0, 1, 2]),
+                )),
+                pq_signature_schemes_enabled: false,
+                dynamic_record_sizing_disabled: false,
+            }),
+            ..Default::default()
+        };
+
+        validate_hysteria2_tls_options(&tls).expect("supported TLS options should validate");
+    }
+
+    #[test]
+    fn hysteria2_tls_validation_rejects_ech_dns_lookup() {
+        let tls = hammer_core::config::OutboundTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            ech: Some(hammer_core::config::EchOptions {
+                config_source: Some(hammer_core::config::EchConfigSource::DnsHttpsRecord),
+                pq_signature_schemes_enabled: false,
+                dynamic_record_sizing_disabled: false,
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_hysteria2_tls_options(&tls).expect_err("DNS ECH is not implemented");
+        assert!(err.to_string().contains("DNS HTTPS record lookup"));
     }
 
     #[tokio::test]

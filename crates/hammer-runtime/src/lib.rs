@@ -7,28 +7,20 @@ pub mod adapter {
 
 pub use hammer_core::error::{HammerError, HammerResult};
 
-/// Install the ring CryptoProvider as the rustls process-wide default.
+/// Install the aws-lc-rs CryptoProvider as the rustls process-wide default.
 ///
 /// Some rustls code paths may use the process-wide provider instead of an
 /// explicit builder provider. Idempotent — subsequent calls are no-ops when a
 /// provider is already installed.
-#[cfg(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-urltest",
-    feature = "dns-https"
-))]
+#[cfg(feature = "tls")]
 pub fn install_default_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
-#[cfg(not(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-urltest",
-    feature = "dns-https"
-)))]
+#[cfg(not(feature = "tls"))]
 pub fn install_default_crypto_provider() {}
 
 mod certificate;
@@ -51,11 +43,11 @@ mod service_mgr;
 mod socket_protector;
 pub mod spawn;
 #[cfg(any(
-    feature = "outbound-hysteria2",
+    feature = "dns-https",
     feature = "outbound-urltest",
-    feature = "dns-https"
+    feature = "tls-quic"
 ))]
-mod tls_support;
+mod tls;
 
 #[cfg(feature = "outbound-hysteria2")]
 pub mod hysteria2 {

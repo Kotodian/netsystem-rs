@@ -234,7 +234,7 @@ fn server_config() -> Result<quinn::ServerConfig, HammerError> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
         .map_err(|err| HammerError::internal(format!("generate certificate: {err}")))?;
     let mut crypto = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
+        rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])
     .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?

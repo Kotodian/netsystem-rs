@@ -9,10 +9,11 @@ name = "hammer_core"
 
 [features]
 default = []
+tls = ["dep:base64"]
 # Enables Hysteria2 protocol/config schema (`[hysteria2]` and
 # `type = "hysteria2"`). The runtime outbound component has its own
 # `outbound-hysteria2` feature.
-hysteria2 = ["dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
+hysteria2 = ["tls", "dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
 # Enables the WireGuard peer state machine + config schema (`[[endpoints]]`
 # with `type = "wireguard"`). The runtime endpoint component has its own
 # `endpoint-wireguard` feature; this one carries the protocol primitives
@@ -39,6 +40,7 @@ bytes = { workspace = true, optional = true }
 hickory-proto = { workspace = true }
 http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

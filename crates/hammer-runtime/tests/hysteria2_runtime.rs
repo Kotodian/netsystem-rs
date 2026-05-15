@@ -10,7 +10,7 @@ use hammer_adapter::{
     DefaultInterfaceUpdateListener, Network, NetworkInterface, OutboundManager as _,
     PlatformInterface, SocksAddr, TunOptions, WifiState,
 };
-use hammer_core::config::{self, Options};
+use hammer_core::config::{self, Options, OutboundTlsOptions};
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_core::protocol::congestion::BbrProfile;
@@ -175,6 +175,12 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
         send_bps: 0,
         receive_bps: 0,
         brutal_debug: false,
+        tls: OutboundTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            ..Default::default()
+        },
         obfs: None,
         platform: None,
     })
@@ -220,6 +226,12 @@ async fn hysteria2_client_protects_quic_socket_before_connecting() {
         send_bps: 0,
         receive_bps: 0,
         brutal_debug: false,
+        tls: OutboundTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            ..Default::default()
+        },
         obfs: None,
         platform: Some(Arc::clone(&platform) as Arc<dyn PlatformInterface>),
     })
@@ -311,11 +323,7 @@ fn hysteria2_bbr_factory_builds_hysteria_controller() {
     // Without a CongestionControlHandle we hand the connection straight to
     // quinn's stock BBR controller — never the dynamic wrapper that would
     // otherwise fall through to the brutal CC path.
-    assert!(
-        !controller
-            .into_any()
-            .is::<DynamicCongestionController>()
-    );
+    assert!(!controller.into_any().is::<DynamicCongestionController>());
 }
 
 #[test]
@@ -328,11 +336,7 @@ fn hysteria2_congestion_handle_switches_to_brutal_after_auth() {
         false,
     ));
     let before = quinn::congestion::ControllerFactory::build(factory.clone(), Instant::now(), 1200);
-    assert!(
-        before
-            .into_any()
-            .is::<DynamicCongestionController>()
-    );
+    assert!(before.into_any().is::<DynamicCongestionController>());
 
     handle.use_brutal(2_000_000);
     let after = quinn::congestion::ControllerFactory::build(factory, Instant::now(), 1200);

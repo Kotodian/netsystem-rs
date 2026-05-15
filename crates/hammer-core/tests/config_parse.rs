@@ -6,8 +6,9 @@ use std::time::Duration;
 use hammer_core::config::EndpointKind;
 
 use hammer_core::config::{
-    self, DnsServerKind, Hysteria2Network, Hysteria2ObfsType, InboundKind, OutboundKind,
-    RuleActionKind, RuleMatcher, TunStack,
+    self, CertificateSource, DnsServerKind, EchConfigSource, Hysteria2Network, Hysteria2ObfsType,
+    InboundKind, OutboundKind, PrivateKeySource, RuleActionKind, RuleMatcher, TunStack,
+    UtlsFingerprint,
 };
 use hammer_core::log::Level;
 use hammer_core::protocol::congestion::BbrProfile;
@@ -277,6 +278,106 @@ fn parse_config_rejects_hysteria2_port_hopping() {
     assert!(
         err.to_string().contains("port hopping is not supported"),
         "error = {err:?}"
+    );
+}
+
+#[test]
+fn parse_config_expands_inline_tls_material_to_der_and_keeps_paths_typed() {
+    let cfg = MINIMAL_CONFIG.replace(
+        "insecure = false\n\n[hysteria2.obfs]\n",
+        r#"insecure = false
+
+[hysteria2.tls]
+server_name = "example.com"
+insecure = false
+alpn = ["h3"]
+server_fingerprint = ["sha256/1111111111111111111111111111111111111111111111111111111111111111"]
+client_certificate = ['''-----BEGIN CERTIFICATE-----
+AQID
+-----END CERTIFICATE-----''']
+client_certificate_path = ["/tmp/client.pem"]
+client_key = '''-----BEGIN PRIVATE KEY-----
+BAUG
+-----END PRIVATE KEY-----'''
+
+[hysteria2.tls.utls]
+enabled = true
+fingerprint = "chrome"
+
+[hysteria2.tls.ech]
+enabled = true
+config = "AQIDBA=="
+
+[hysteria2.tls.reality]
+enabled = true
+public_key = "0000000000000000000000000000000000000000000000000000000000000000"
+short_id = "0a0b"
+
+[hysteria2.tls.fragment]
+enabled = true
+size = "tlshello"
+sleep = "1ms"
+
+[hysteria2.tls.record_fragment]
+enabled = true
+
+[hysteria2.obfs]
+"#,
+    );
+    let options = config::parse_config(&cfg).expect("parse tls config");
+    let hysteria = match &options.outbounds[0].kind {
+        OutboundKind::Hysteria2(o) => o,
+        _ => panic!("outbound[0] not hysteria2"),
+    };
+    let tls = &hysteria.tls;
+
+    assert_eq!(tls.alpn, vec!["h3".to_owned()]);
+    assert_eq!(tls.server_fingerprints[0].digest, vec![0x11; 32]);
+
+    let auth = tls.client_auth.as_ref().expect("client auth");
+    assert_eq!(auth.certificates.len(), 2);
+    match &auth.certificates[0] {
+        CertificateSource::Inline(cert) => assert_eq!(cert.0, vec![1, 2, 3]),
+        other => panic!("expected inline cert, got {other:?}"),
+    }
+    match &auth.certificates[1] {
+        CertificateSource::Path(path) => assert_eq!(path, std::path::Path::new("/tmp/client.pem")),
+        other => panic!("expected cert path, got {other:?}"),
+    }
+    match &auth.key {
+        PrivateKeySource::Inline(key) => assert_eq!(key.0, vec![4, 5, 6]),
+        other => panic!("expected inline key, got {other:?}"),
+    }
+
+    assert_eq!(
+        tls.utls.as_ref().expect("utls").fingerprint,
+        UtlsFingerprint::Chrome
+    );
+    match &tls.ech.as_ref().expect("ech").config_source {
+        Some(EchConfigSource::Inline(config)) => assert_eq!(config.0, vec![1, 2, 3, 4]),
+        other => panic!("expected inline ECH config, got {other:?}"),
+    }
+    let reality = tls.reality.as_ref().expect("reality");
+    assert_eq!(reality.public_key.0, [0u8; 32]);
+    assert_eq!(reality.short_id.0, vec![0x0a, 0x0b]);
+    assert_eq!(
+        tls.fragment.as_ref().expect("fragment").sleep,
+        Duration::from_millis(1)
+    );
+    assert!(tls.record_fragment);
+}
+
+#[test]
+fn parse_config_rejects_conflicting_legacy_and_nested_tls_fields() {
+    let cfg = MINIMAL_CONFIG.replace(
+        "insecure = false\n\n[hysteria2.obfs]\n",
+        "insecure = false\n\n[hysteria2.tls]\nserver_name = \"other.example.com\"\n\n[hysteria2.obfs]\n",
+    );
+    let err = config::parse_config(&cfg).expect_err("accepted conflicting tls server_name");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("hysteria2.sni conflicts with hysteria2.tls.server_name"),
+        "error = {msg:?}"
     );
 }
 

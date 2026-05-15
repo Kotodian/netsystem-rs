@@ -28,9 +28,25 @@ inbound-tun = ["dep:libc", "dep:tun-rs", "dep:socket2"]
 inbound-socks = ["dep:base64"]
 inbound-http = ["dep:base64"]
 inbound-mixed = ["inbound-socks", "inbound-http"]
-outbound-hysteria2 = [
-    "hammer-core/hysteria2",
+tls = [
     "dep:base64",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+    "dep:rustls-platform-verifier",
+]
+tls-client = ["tls"]
+tls-outbound = ["tls", "hammer-core/tls"]
+tls-quic = ["tls-outbound", "dep:quinn"]
+tls-utls = [
+    "tls-quic",
+    "dep:btls",
+    "dep:btls-sys",
+    "dep:foreign-types-shared",
+    "dep:quinn-btls",
+]
+outbound-hysteria2 = [
+    "tls-quic",
+    "hammer-core/hysteria2",
     "dep:blake2",
     "dep:futures",
     "dep:h3",
@@ -38,9 +54,6 @@ outbound-hysteria2 = [
     "dep:http",
     "dep:quinn",
     "dep:rand",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:rustls-platform-verifier",
 ]
 outbound-direct = ["dep:socket2"]
 outbound-block = []
@@ -48,25 +61,19 @@ outbound-block = []
 # stream and routes traffic through the lowest-latency child. Carries its own
 # TLS stack since the probe URL is normally https.
 outbound-urltest = [
-    "dep:base64",
+    "tls-client",
     "dep:httparse",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:rustls-platform-verifier",
     "dep:tokio-rustls",
     "dep:url",
 ]
 dns-udp = ["dns-tcp"]
 dns-tcp = []
 dns-https = [
-    "dep:base64",
+    "tls-client",
     "dep:http",
     "dep:http-body-util",
     "dep:hyper",
     "dep:hyper-util",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:rustls-platform-verifier",
     "dep:tokio-rustls",
 ]
 dns-hosts = []
@@ -105,6 +112,10 @@ hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
+quinn-btls = { workspace = true, optional = true }
+btls = { workspace = true, optional = true }
+btls-sys = { workspace = true, optional = true }
+foreign-types-shared = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
