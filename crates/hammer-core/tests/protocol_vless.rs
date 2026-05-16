@@ -3,7 +3,9 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use hammer_core::SocksAddr;
-use hammer_core::protocol::vless::{VlessCommand, VlessStream, encode_request};
+use hammer_core::protocol::vless::{
+    VlessCommand, VlessStream, encode_request, encode_udp_packet, read_udp_packet,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn uuid() -> [u8; 16] {
@@ -50,4 +52,24 @@ async fn stream_strips_response_header_before_payload() {
     stream.read_to_end(&mut payload).await.unwrap();
 
     assert_eq!(payload, b"reply");
+}
+
+#[test]
+fn encodes_udp_packet_with_length_prefix() {
+    let packet = encode_udp_packet(b"dns").expect("udp packet");
+
+    assert_eq!(packet, [0x00, 0x03, b'd', b'n', b's']);
+}
+
+#[tokio::test]
+async fn reads_udp_packet_with_length_prefix() {
+    let (mut server, mut client) = tokio::io::duplex(64);
+    tokio::spawn(async move {
+        server.write_all(&[0x00, 0x08]).await.unwrap();
+        server.write_all(b"echo:dns").await.unwrap();
+    });
+
+    let payload = read_udp_packet(&mut client).await.expect("udp packet");
+
+    assert_eq!(payload, b"echo:dns");
 }

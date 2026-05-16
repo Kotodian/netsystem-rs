@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
 use hammer_core::config::{Outbound, OutboundKind, OutboundTlsOptions, VlessOutboundOptions};
 use hammer_core::error::{HammerError, HammerResult};
@@ -167,6 +168,68 @@ async fn vless_outbound_dials_tcp_over_tls() {
     expected.push(0x01);
     expected.extend_from_slice(&[198, 51, 100, 7]);
     expected.extend_from_slice(b"hello");
+    assert_eq!(request, expected);
+}
+
+#[tokio::test]
+async fn vless_outbound_sends_and_receives_udp_datagrams() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let expected_request_len = 1 + 16 + 1 + 1 + 2 + 1 + 4;
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+
+        let mut len = [0_u8; 2];
+        stream.read_exact(&mut len).await.unwrap();
+        let mut payload = vec![0_u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut payload).await.unwrap();
+        assert_eq!(payload, b"dns");
+
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream
+            .write_all(&(b"echo:dns".len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(b"echo:dns").await.unwrap();
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
+    let mut packet = outbound.listen_packet().await.expect("listen vless udp");
+
+    packet
+        .send_to(destination.clone(), Bytes::from_static(b"dns"))
+        .await
+        .expect("send vless udp");
+    let got = packet.recv_from().await.expect("recv vless udp");
+
+    assert_eq!(got.destination, destination);
+    assert_eq!(got.payload.as_ref(), b"echo:dns");
+
+    let request = captured.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&[
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ]);
+    expected.push(0x00);
+    expected.push(0x02);
+    expected.extend_from_slice(&53_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[192, 0, 2, 53]);
     assert_eq!(request, expected);
 }
 

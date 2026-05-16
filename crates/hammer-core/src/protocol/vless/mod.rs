@@ -2,7 +2,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 use crate::error::{HammerError, HammerResult};
 use crate::network::SocksAddr;
@@ -34,6 +34,32 @@ pub fn encode_request(
     encode_address(destination, &mut out)?;
     out.extend_from_slice(initial_payload);
     Ok(out)
+}
+
+pub fn encode_udp_packet(payload: &[u8]) -> HammerResult<Vec<u8>> {
+    let len = u16::try_from(payload.len())
+        .map_err(|_| HammerError::config_validation("vless udp packet exceeds 65535 bytes"))?;
+    let mut out = Vec::with_capacity(payload.len() + 2);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+pub async fn read_udp_packet<S>(stream: &mut S) -> HammerResult<Vec<u8>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut len = [0_u8; 2];
+    stream
+        .read_exact(&mut len)
+        .await
+        .map_err(|err| HammerError::internal(format!("read vless udp packet length: {err}")))?;
+    let mut payload = vec![0_u8; u16::from_be_bytes(len) as usize];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|err| HammerError::internal(format!("read vless udp packet payload: {err}")))?;
+    Ok(payload)
 }
 
 fn encode_address(destination: &SocksAddr, out: &mut Vec<u8>) -> HammerResult<()> {
