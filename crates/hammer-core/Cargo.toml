@@ -14,6 +14,8 @@ tls = ["dep:base64"]
 # `type = "hysteria2"`). The runtime outbound component has its own
 # `outbound-hysteria2` feature.
 hysteria2 = ["tls", "dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
+# Enables VLESS outbound config schema (`[[outbounds]] type = "vless"`).
+vless = ["tls"]
 # Enables the WireGuard peer state machine + config schema (`[[endpoints]]`
 # with `type = "wireguard"`). The runtime endpoint component has its own
 # `endpoint-wireguard` feature; this one carries the protocol primitives

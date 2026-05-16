@@ -89,6 +89,8 @@ pub mod constants {
     pub const TYPE_TUN: &str = "tun";
     #[cfg(feature = "hysteria2")]
     pub const TYPE_HYSTERIA2: &str = "hysteria2";
+    #[cfg(feature = "vless")]
+    pub const TYPE_VLESS: &str = "vless";
     pub const TYPE_DIRECT: &str = "direct";
     pub const TYPE_BLOCK: &str = "block";
     pub const TYPE_URLTEST: &str = "urltest";
@@ -122,6 +124,8 @@ pub mod constants {
     pub const DEFAULT_DNS_PATH: &str = "/dns-query";
     #[cfg(feature = "hysteria2")]
     pub const DEFAULT_HYSTERIA_PORT: u16 = 443;
+    #[cfg(feature = "vless")]
+    pub const DEFAULT_VLESS_PORT: u16 = 443;
     /// sing-box's default WireGuard tunnel MTU (1500 - 20 IPv4 - 8 UDP - 32 wg overhead - margin).
     #[cfg(feature = "wireguard")]
     pub const DEFAULT_WIREGUARD_MTU: u32 = 1408;

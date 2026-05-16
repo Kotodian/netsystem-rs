@@ -1456,6 +1456,8 @@ mod matches {
     pub fn outbound_kind(kind: &OutboundKind) -> &'static str {
         match kind {
             OutboundKind::Hysteria2(_) => "hysteria2",
+            #[cfg(feature = "vless")]
+            OutboundKind::Vless(_) => "vless",
             OutboundKind::Direct(_) => "direct",
             OutboundKind::Block => "block",
             OutboundKind::Urltest(_) => "urltest",

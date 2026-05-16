@@ -11,7 +11,7 @@ use std::time::Duration;
 #[cfg(feature = "tls")]
 use std::path::PathBuf;
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -76,6 +76,24 @@ raw_struct_with_default_check! {
     }
 }
 
+#[cfg(feature = "vless")]
+raw_struct! {
+    pub struct RawVlessConfig {
+        /// Outbound id used by route rules.
+        pub id: String => "String::is_empty",
+        /// VLESS server host or IP.
+        pub server: String => "String::is_empty",
+        /// VLESS server port.
+        pub server_port: Option<u16> => "Option::is_none",
+        /// VLESS user UUID.
+        pub uuid: String => "String::is_empty",
+        /// Optional VLESS flow, currently empty or xtls-rprx-vision.
+        pub flow: String => "String::is_empty",
+        /// Optional sing-box-style TLS section.
+        pub tls: RawOutboundTlsConfig => "RawOutboundTlsConfig::is_default",
+    }
+}
+
 #[cfg(feature = "tls")]
 raw_struct! {
     pub struct RawOutboundTlsConfig {
@@ -114,7 +132,7 @@ raw_struct! {
     }
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 impl RawOutboundTlsConfig {
     pub(super) fn is_default(&self) -> bool {
         *self == Self::default()
@@ -233,6 +251,8 @@ raw_struct! {
 pub enum RawOutbound {
     #[cfg(feature = "hysteria2")]
     Hysteria2(RawHysteria2Config),
+    #[cfg(feature = "vless")]
+    Vless(RawVlessConfig),
     Direct(RawDirectOutboundConfig),
     Block(RawBlockOutboundConfig),
     Urltest(RawUrltestConfig),
@@ -249,6 +269,8 @@ impl Outbound {
         match &self.kind {
             #[cfg(feature = "hysteria2")]
             OutboundKind::Hysteria2(_) => C::TYPE_HYSTERIA2,
+            #[cfg(feature = "vless")]
+            OutboundKind::Vless(_) => C::TYPE_VLESS,
             OutboundKind::Direct(_) => C::TYPE_DIRECT,
             OutboundKind::Block => C::TYPE_BLOCK,
             OutboundKind::Urltest(_) => C::TYPE_URLTEST,
@@ -261,6 +283,8 @@ impl Outbound {
 pub enum OutboundKind {
     #[cfg(feature = "hysteria2")]
     Hysteria2(Hysteria2OutboundOptions),
+    #[cfg(feature = "vless")]
+    Vless(VlessOutboundOptions),
     Direct(DirectOutboundOptions),
     Block,
     Urltest(UrltestOutboundOptions),
@@ -297,6 +321,16 @@ pub struct Hysteria2OutboundOptions {
     pub initial_packet_size: u16,
     pub tls: OutboundTlsOptions,
     pub obfs: Option<Hysteria2Obfs>,
+}
+
+#[cfg(feature = "vless")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlessOutboundOptions {
+    pub server: String,
+    pub server_port: u16,
+    pub uuid: [u8; 16],
+    pub flow: Option<String>,
+    pub tls: OutboundTlsOptions,
 }
 
 #[cfg(feature = "hysteria2")]
@@ -553,6 +587,14 @@ pub(super) fn build_declared_outbounds(
                     kind: OutboundKind::Hysteria2(options),
                 }
             }
+            #[cfg(feature = "vless")]
+            RawOutbound::Vless(raw) => {
+                let (options, id) = build_vless_options(idx, raw)?;
+                Outbound {
+                    id,
+                    kind: OutboundKind::Vless(options),
+                }
+            }
             RawOutbound::Direct(raw) => {
                 let id = if raw.id.is_empty() {
                     C::DEFAULT_DIRECT_ID.to_owned()
@@ -593,6 +635,68 @@ pub(super) fn build_declared_outbounds(
     }
     ensure_direct_outbound(&mut outbounds);
     Ok(outbounds)
+}
+
+#[cfg(feature = "vless")]
+fn build_vless_options(
+    idx: usize,
+    raw: RawVlessConfig,
+) -> Result<(VlessOutboundOptions, String), HammerError> {
+    let RawVlessConfig {
+        id,
+        server,
+        server_port,
+        uuid,
+        flow,
+        tls,
+    } = raw;
+    if id.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "outbounds[{idx}].id is required"
+        )));
+    }
+    let prefix = format!("outbounds[{idx}] (vless '{id}')");
+    if server.is_empty() {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.server is required"
+        )));
+    }
+    let uuid = parse_vless_uuid(&format!("outbounds[{idx}].uuid"), &uuid)?;
+    let flow = match flow.as_str() {
+        "" => None,
+        "xtls-rprx-vision" => Some(flow),
+        unsupported => {
+            return Err(HammerError::config_validation(format!(
+                "{prefix} unsupported flow: {unsupported}"
+            )));
+        }
+    };
+    let tls = OutboundTlsOptionsBuilder::new(&prefix, tls)
+        .server(&server)
+        .policy(OutboundTlsBuildPolicy::tcp_stream())
+        .build()?;
+    if flow.as_deref() == Some("xtls-rprx-vision") && !tls.enabled {
+        return Err(HammerError::config_validation(format!(
+            "{prefix} flow xtls-rprx-vision requires tls.enabled=true"
+        )));
+    }
+    Ok((
+        VlessOutboundOptions {
+            server,
+            server_port: server_port.unwrap_or(C::DEFAULT_VLESS_PORT),
+            uuid,
+            flow,
+            tls,
+        },
+        id,
+    ))
+}
+
+#[cfg(feature = "vless")]
+fn parse_vless_uuid(field: &str, raw: &str) -> Result<[u8; 16], HammerError> {
+    decode_hex(field, raw)?
+        .try_into()
+        .map_err(|_| HammerError::config_validation(format!("{field} must be 16 bytes")))
 }
 
 fn build_urltest_options(
@@ -727,77 +831,295 @@ fn build_hysteria_tls_options(
     legacy_insecure: Option<bool>,
     server: &str,
 ) -> Result<OutboundTlsOptions, HammerError> {
-    let RawOutboundTlsConfig {
-        enabled,
-        server_name: tls_server_name,
-        insecure: tls_insecure,
-        alpn,
-        min_version,
-        max_version,
-        server_fingerprint,
-        client_certificate,
-        client_certificate_path,
-        client_key,
-        client_key_path,
-        utls,
-        ech,
-        reality,
-        fragment,
-        record_fragment,
-    } = raw;
-
-    if enabled == Some(false) {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.enabled=false is not supported",
-        ));
-    }
-    let mut server_name = merge_tls_server_name("hysteria2", legacy_sni, tls_server_name)?;
-    let insecure = merge_tls_insecure("hysteria2", legacy_insecure, tls_insecure)?;
-    if !insecure && server_name.is_empty() && server.parse::<std::net::IpAddr>().is_err() {
-        server_name = server.to_owned();
-    }
-    if !insecure && server_name.is_empty() {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.server_name is required unless insecure=true",
-        ));
-    }
-    validate_hysteria_tls_versions(min_version, max_version)?;
-    validate_hysteria_alpn(&alpn)?;
-
-    let server_fingerprints = server_fingerprint
-        .into_iter()
-        .map(TryInto::try_into)
-        .collect::<Result<Vec<CertificateFingerprint>, _>>()?;
-    let client_auth: Optional<ClientTlsAuth> = RawClientTlsAuth {
-        certificates: client_certificate,
-        certificate_paths: client_certificate_path,
-        key: client_key,
-        key_path: client_key_path,
-    }
-    .try_into()?;
-    let utls: Optional<UtlsOptions> = utls.try_into()?;
-    let ech: Optional<EchOptions> = ech.try_into()?;
-    let reality: Optional<RealityOptions> = reality.try_into()?;
-    let fragment: Optional<TlsFragmentOptions> = fragment.try_into()?;
-
-    Ok(OutboundTlsOptions {
-        enabled: true,
-        server_name,
-        insecure,
-        alpn,
-        min_version,
-        max_version,
-        server_fingerprints,
-        client_auth: client_auth.into_option(),
-        utls: utls.into_option(),
-        ech: ech.into_option(),
-        reality: reality.into_option(),
-        fragment: fragment.into_option(),
-        record_fragment: record_fragment.enabled.unwrap_or(false),
-    })
+    OutboundTlsOptionsBuilder::new("hysteria2", raw)
+        .server(server)
+        .legacy(TlsLegacyOptions {
+            server_name: legacy_sni,
+            insecure: legacy_insecure,
+        })
+        .policy(OutboundTlsBuildPolicy::hysteria2())
+        .build()
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+struct OutboundTlsOptionsBuilder<'a> {
+    prefix: &'a str,
+    raw: RawOutboundTlsConfig,
+    server: &'a str,
+    legacy: TlsLegacyOptions,
+    policy: OutboundTlsBuildPolicy,
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+impl<'a> OutboundTlsOptionsBuilder<'a> {
+    fn new(prefix: &'a str, raw: RawOutboundTlsConfig) -> Self {
+        Self {
+            prefix,
+            raw,
+            server: "",
+            legacy: TlsLegacyOptions::default(),
+            policy: OutboundTlsBuildPolicy::default(),
+        }
+    }
+
+    fn server(mut self, server: &'a str) -> Self {
+        self.server = server;
+        self
+    }
+
+    #[cfg(feature = "hysteria2")]
+    fn legacy(mut self, legacy: TlsLegacyOptions) -> Self {
+        self.legacy = legacy;
+        self
+    }
+
+    fn policy(mut self, policy: OutboundTlsBuildPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    fn build(self) -> Result<OutboundTlsOptions, HammerError> {
+        let Self {
+            prefix,
+            raw,
+            server,
+            legacy,
+            policy,
+        } = self;
+        let RawOutboundTlsConfig {
+            enabled,
+            server_name: tls_server_name,
+            insecure: tls_insecure,
+            alpn,
+            min_version,
+            max_version,
+            server_fingerprint,
+            client_certificate,
+            client_certificate_path,
+            client_key,
+            client_key_path,
+            utls,
+            ech,
+            reality,
+            fragment,
+            record_fragment,
+        } = raw;
+
+        let tls_fields_set = tls_fields_set(TlsFieldState {
+            server_name: &tls_server_name,
+            insecure: tls_insecure,
+            alpn: &alpn,
+            min_version,
+            max_version,
+            server_fingerprint: &server_fingerprint,
+            client_certificate: &client_certificate,
+            client_certificate_path: &client_certificate_path,
+            client_key: client_key.as_ref(),
+            client_key_path: client_key_path.as_ref(),
+            utls: &utls,
+            ech: &ech,
+            reality: &reality,
+            fragment: &fragment,
+            record_fragment: &record_fragment,
+        });
+        let enabled = match (policy.required, enabled) {
+            (true, Some(false)) => {
+                return Err(HammerError::config_validation(format!(
+                    "{prefix}.tls.enabled=false is not supported"
+                )));
+            }
+            (true, _) => true,
+            (false, Some(enabled)) => enabled,
+            (false, None) => false,
+        };
+        if !enabled {
+            if tls_fields_set {
+                return Err(HammerError::config_validation(format!(
+                    "{prefix}.tls.enabled must be true when TLS fields are set"
+                )));
+            }
+            return Ok(OutboundTlsOptions::default());
+        }
+
+        let mut server_name = merge_tls_server_name(prefix, legacy.server_name, tls_server_name)?;
+        let insecure = merge_tls_insecure(prefix, legacy.insecure, tls_insecure)?;
+        if policy.default_server_name_from_server
+            && !insecure
+            && server_name.is_empty()
+            && server.parse::<std::net::IpAddr>().is_err()
+        {
+            server_name = server.to_owned();
+        }
+        if !insecure && server_name.is_empty() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.server_name is required unless insecure=true"
+            )));
+        }
+        if policy.tls13_only {
+            validate_tls13_only(prefix, min_version, max_version)?;
+        }
+        match policy.alpn {
+            AlpnPolicy::Any => validate_tls_alpn(prefix, &alpn)?,
+            #[cfg(feature = "hysteria2")]
+            AlpnPolicy::H3Only => validate_h3_alpn(prefix, &alpn)?,
+        }
+
+        let server_fingerprints = server_fingerprint
+            .into_iter()
+            .map(|fingerprint| {
+                parse_certificate_fingerprint_for_field(
+                    &format!("{prefix}.tls.server_fingerprint"),
+                    &fingerprint.0,
+                )
+            })
+            .collect::<Result<Vec<CertificateFingerprint>, _>>()?;
+        let client_auth = build_client_tls_auth_for_prefix(
+            prefix,
+            client_certificate,
+            client_certificate_path,
+            client_key,
+            client_key_path,
+        )?;
+        let utls = build_utls_options_for_prefix(prefix, utls)?;
+        let ech = build_ech_options_for_prefix(prefix, ech)?;
+        let reality = build_reality_options_for_prefix(prefix, reality)?;
+        let fragment = build_tls_fragment_options_for_prefix(prefix, fragment)?;
+        if !policy.allow_reality && reality.is_some() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.reality requires a Reality-capable outbound such as VLESS"
+            )));
+        }
+        let record_fragment = record_fragment.enabled.unwrap_or(false);
+        if !policy.allow_fragment && (fragment.is_some() || record_fragment) {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls fragmentation is only valid for TCP TLS streams"
+            )));
+        }
+
+        Ok(OutboundTlsOptions {
+            enabled: true,
+            server_name,
+            insecure,
+            alpn,
+            min_version,
+            max_version,
+            server_fingerprints,
+            client_auth,
+            utls,
+            ech,
+            reality,
+            fragment,
+            record_fragment,
+        })
+    }
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+#[derive(Default)]
+struct TlsLegacyOptions {
+    server_name: String,
+    insecure: Option<bool>,
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+#[derive(Debug, Clone, Copy)]
+struct OutboundTlsBuildPolicy {
+    required: bool,
+    default_server_name_from_server: bool,
+    tls13_only: bool,
+    alpn: AlpnPolicy,
+    allow_reality: bool,
+    allow_fragment: bool,
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+impl Default for OutboundTlsBuildPolicy {
+    fn default() -> Self {
+        Self {
+            required: false,
+            default_server_name_from_server: false,
+            tls13_only: false,
+            alpn: AlpnPolicy::Any,
+            allow_reality: false,
+            allow_fragment: false,
+        }
+    }
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+impl OutboundTlsBuildPolicy {
+    #[cfg(feature = "hysteria2")]
+    fn hysteria2() -> Self {
+        Self {
+            required: true,
+            default_server_name_from_server: true,
+            tls13_only: true,
+            alpn: AlpnPolicy::H3Only,
+            allow_reality: true,
+            allow_fragment: true,
+        }
+    }
+
+    #[cfg(feature = "vless")]
+    fn tcp_stream() -> Self {
+        Self {
+            required: false,
+            default_server_name_from_server: true,
+            tls13_only: false,
+            alpn: AlpnPolicy::Any,
+            allow_reality: true,
+            allow_fragment: true,
+        }
+    }
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+#[derive(Debug, Clone, Copy)]
+enum AlpnPolicy {
+    Any,
+    #[cfg(feature = "hysteria2")]
+    H3Only,
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+struct TlsFieldState<'a> {
+    server_name: &'a str,
+    insecure: Option<bool>,
+    alpn: &'a [String],
+    min_version: Option<TlsVersion>,
+    max_version: Option<TlsVersion>,
+    server_fingerprint: &'a [RawCertificateFingerprint],
+    client_certificate: &'a [RawCertificate],
+    client_certificate_path: &'a [PathBuf],
+    client_key: Option<&'a RawPrivateKey>,
+    client_key_path: Option<&'a PathBuf>,
+    utls: &'a RawUtlsConfig,
+    ech: &'a RawEchConfig,
+    reality: &'a RawRealityConfig,
+    fragment: &'a RawTlsFragmentConfig,
+    record_fragment: &'a RawTlsRecordFragmentConfig,
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn tls_fields_set(state: TlsFieldState<'_>) -> bool {
+    !state.server_name.is_empty()
+        || state.insecure.is_some()
+        || !state.alpn.is_empty()
+        || state.min_version.is_some()
+        || state.max_version.is_some()
+        || !state.server_fingerprint.is_empty()
+        || !state.client_certificate.is_empty()
+        || !state.client_certificate_path.is_empty()
+        || state.client_key.is_some()
+        || state.client_key_path.is_some()
+        || !state.utls.is_default()
+        || !state.ech.is_default()
+        || !state.reality.is_default()
+        || !state.fragment.is_default()
+        || !state.record_fragment.is_default()
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn merge_tls_server_name(
     prefix: &str,
     legacy_sni: String,
@@ -815,7 +1137,7 @@ fn merge_tls_server_name(
     }
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn merge_tls_insecure(
     prefix: &str,
     legacy_insecure: Option<bool>,
@@ -831,70 +1153,248 @@ fn merge_tls_insecure(
     Ok(tls_insecure.or(legacy_insecure).unwrap_or(false))
 }
 
-#[cfg(feature = "hysteria2")]
-fn validate_hysteria_tls_versions(
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn validate_tls13_only(
+    prefix: &str,
     min_version: Option<TlsVersion>,
     max_version: Option<TlsVersion>,
 ) -> Result<(), HammerError> {
     if min_version == Some(TlsVersion::Tls12) || max_version == Some(TlsVersion::Tls12) {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls only supports TLS 1.3",
-        ));
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.tls only supports TLS 1.3"
+        )));
     }
     Ok(())
 }
 
-#[cfg(feature = "hysteria2")]
-fn validate_hysteria_alpn(alpn: &[String]) -> Result<(), HammerError> {
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn validate_tls_alpn(prefix: &str, alpn: &[String]) -> Result<(), HammerError> {
     if alpn.iter().any(String::is_empty) {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.alpn must not contain empty protocols",
-        ));
-    }
-    if !alpn.is_empty() && (alpn.len() != 1 || alpn[0] != "h3") {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.alpn must be [\"h3\"]",
-        ));
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.tls.alpn must not contain empty protocols"
+        )));
     }
     Ok(())
 }
 
 #[cfg(feature = "hysteria2")]
-struct Optional<T>(Option<T>);
+fn validate_h3_alpn(prefix: &str, alpn: &[String]) -> Result<(), HammerError> {
+    validate_tls_alpn(prefix, alpn)?;
+    if !alpn.is_empty() && (alpn.len() != 1 || alpn[0] != "h3") {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.tls.alpn must be [\"h3\"]"
+        )));
+    }
+    Ok(())
+}
 
-#[cfg(feature = "hysteria2")]
-impl<T> Optional<T> {
-    fn into_option(self) -> Option<T> {
-        self.0
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn build_client_tls_auth_for_prefix(
+    prefix: &str,
+    certificates: Vec<RawCertificate>,
+    certificate_paths: Vec<PathBuf>,
+    key: Option<RawPrivateKey>,
+    key_path: Option<PathBuf>,
+) -> Result<Option<ClientTlsAuth>, HammerError> {
+    let mut certificate_sources = Vec::new();
+    for certificate in certificates {
+        let certificates =
+            parse_certificate_chain(&certificate.0, &format!("{prefix}.tls.client_certificate"))?;
+        certificate_sources.extend(
+            certificates
+                .into_iter()
+                .map(|der| CertificateSource::Inline(CertificateDerBytes(der))),
+        );
+    }
+    for path in certificate_paths {
+        if path.as_os_str().is_empty() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.client_certificate_path must not contain empty paths"
+            )));
+        }
+        certificate_sources.push(CertificateSource::Path(path));
+    }
+
+    let key_source = match (key, key_path) {
+        (Some(_), Some(_)) => {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.client_key and client_key_path cannot both be set"
+            )));
+        }
+        (Some(key), None) => Some(PrivateKeySource::Inline(PrivateKeyDerBytes(
+            parse_private_key(&key.0, &format!("{prefix}.tls.client_key"))?,
+        ))),
+        (None, Some(path)) => {
+            if path.as_os_str().is_empty() {
+                return Err(HammerError::config_validation(format!(
+                    "{prefix}.tls.client_key_path must not be empty"
+                )));
+            }
+            Some(PrivateKeySource::Path(path))
+        }
+        (None, None) => None,
+    };
+
+    match (certificate_sources.is_empty(), key_source) {
+        (true, None) => Ok(None),
+        (true, Some(_)) => Err(HammerError::config_validation(format!(
+            "{prefix}.tls.client_certificate is required when client_key is set"
+        ))),
+        (false, None) => Err(HammerError::config_validation(format!(
+            "{prefix}.tls.client_key is required when client_certificate is set"
+        ))),
+        (false, Some(key)) => Ok(Some(ClientTlsAuth {
+            certificates: certificate_sources,
+            key,
+        })),
     }
 }
 
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawCertificateFingerprint> for CertificateFingerprint {
-    type Error = HammerError;
-
-    fn try_from(raw: RawCertificateFingerprint) -> Result<Self, Self::Error> {
-        parse_certificate_fingerprint(&raw.0)
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn build_utls_options_for_prefix(
+    prefix: &str,
+    raw: RawUtlsConfig,
+) -> Result<Option<UtlsOptions>, HammerError> {
+    let enabled = raw.enabled.unwrap_or(false);
+    if !enabled {
+        if raw.fingerprint.is_some() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.utls.enabled must be true when fingerprint is set"
+            )));
+        }
+        return Ok(None);
     }
+    Ok(Some(UtlsOptions {
+        fingerprint: raw.fingerprint.unwrap_or_default(),
+    }))
 }
 
-#[cfg(feature = "hysteria2")]
-fn parse_certificate_fingerprint(raw: &str) -> Result<CertificateFingerprint, HammerError> {
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn build_ech_options_for_prefix(
+    prefix: &str,
+    raw: RawEchConfig,
+) -> Result<Option<EchOptions>, HammerError> {
+    let RawEchConfig {
+        enabled,
+        config,
+        config_path,
+        pq_signature_schemes_enabled,
+        dynamic_record_sizing_disabled,
+    } = raw;
+    let enabled = enabled.unwrap_or(false);
+    if !enabled {
+        if config.is_some()
+            || config_path.is_some()
+            || pq_signature_schemes_enabled.is_some()
+            || dynamic_record_sizing_disabled.is_some()
+        {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.ech.enabled must be true when ECH fields are set"
+            )));
+        }
+        return Ok(None);
+    }
+    if config.is_some() && config_path.is_some() {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.tls.ech.config and config_path cannot both be set"
+        )));
+    }
+    let config_source = match (config, config_path) {
+        (Some(config), None) => Some(EchConfigSource::Inline(EchConfigList(
+            decode_hex_or_base64(&format!("{prefix}.tls.ech.config"), &config.0)?,
+        ))),
+        (None, Some(path)) => Some(EchConfigSource::Path(path)),
+        (None, None) => Some(EchConfigSource::DnsHttpsRecord),
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
+    Ok(Some(EchOptions {
+        config_source,
+        pq_signature_schemes_enabled: pq_signature_schemes_enabled.unwrap_or(false),
+        dynamic_record_sizing_disabled: dynamic_record_sizing_disabled.unwrap_or(false),
+    }))
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn build_reality_options_for_prefix(
+    prefix: &str,
+    raw: RawRealityConfig,
+) -> Result<Option<RealityOptions>, HammerError> {
+    let enabled = raw.enabled.unwrap_or(false);
+    if !enabled {
+        if raw.public_key.is_some() || raw.short_id.is_some() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.reality.enabled must be true when Reality fields are set"
+            )));
+        }
+        return Ok(None);
+    }
+    let public_key = raw.public_key.ok_or_else(|| {
+        HammerError::config_validation(format!("{prefix}.tls.reality.public_key is required"))
+    })?;
+    let public_key =
+        decode_hex_or_base64(&format!("{prefix}.tls.reality.public_key"), &public_key.0)?;
+    let public_key = public_key.try_into().map_err(|_| {
+        HammerError::config_validation(format!("{prefix}.tls.reality.public_key must be 32 bytes"))
+    })?;
+    let short_id = raw.short_id.ok_or_else(|| {
+        HammerError::config_validation(format!("{prefix}.tls.reality.short_id is required"))
+    })?;
+    let short_id = decode_hex(&format!("{prefix}.tls.reality.short_id"), &short_id.0)?;
+    if short_id.len() > 8 {
+        return Err(HammerError::config_validation(format!(
+            "{prefix}.tls.reality.short_id must be at most 8 bytes"
+        )));
+    }
+    Ok(Some(RealityOptions {
+        public_key: RealityPublicKey(public_key),
+        short_id: RealityShortId(short_id),
+    }))
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn build_tls_fragment_options_for_prefix(
+    prefix: &str,
+    raw: RawTlsFragmentConfig,
+) -> Result<Option<TlsFragmentOptions>, HammerError> {
+    let enabled = raw.enabled.unwrap_or(false);
+    if !enabled {
+        if !raw.size.is_empty() || raw.sleep.is_some() {
+            return Err(HammerError::config_validation(format!(
+                "{prefix}.tls.fragment.enabled must be true when fragment fields are set"
+            )));
+        }
+        return Ok(None);
+    }
+    Ok(Some(TlsFragmentOptions {
+        size: if raw.size.is_empty() {
+            "tlshello".to_owned()
+        } else {
+            raw.size
+        },
+        sleep: raw.sleep.unwrap_or(Duration::ZERO),
+    }))
+}
+
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
+fn parse_certificate_fingerprint_for_field(
+    field: &str,
+    raw: &str,
+) -> Result<CertificateFingerprint, HammerError> {
     let Some((algorithm, digest)) = raw.split_once('/') else {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.server_fingerprint entries must use sha256/<digest>",
-        ));
+        return Err(HammerError::config_validation(format!(
+            "{field} entries must use sha256/<digest>"
+        )));
     };
     if !algorithm.eq_ignore_ascii_case("sha256") {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.server_fingerprint only supports sha256",
-        ));
+        return Err(HammerError::config_validation(format!(
+            "{field} only supports sha256"
+        )));
     }
-    let digest = decode_hex_or_base64("hysteria2.tls.server_fingerprint", digest)?;
+    let digest = decode_hex_or_base64(field, digest)?;
     if digest.len() != 32 {
-        return Err(HammerError::config_validation(
-            "hysteria2.tls.server_fingerprint sha256 digest must be 32 bytes",
-        ));
+        return Err(HammerError::config_validation(format!(
+            "{field} sha256 digest must be 32 bytes"
+        )));
     }
     Ok(CertificateFingerprint {
         algorithm: CertificateFingerprintAlgorithm::Sha256,
@@ -902,258 +1402,7 @@ fn parse_certificate_fingerprint(raw: &str) -> Result<CertificateFingerprint, Ha
     })
 }
 
-#[cfg(feature = "hysteria2")]
-struct RawClientTlsAuth {
-    certificates: Vec<RawCertificate>,
-    certificate_paths: Vec<PathBuf>,
-    key: Option<RawPrivateKey>,
-    key_path: Option<PathBuf>,
-}
-
-#[cfg(feature = "hysteria2")]
-struct CertificateSources(Vec<CertificateSource>);
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawCertificate> for CertificateSources {
-    type Error = HammerError;
-
-    fn try_from(raw: RawCertificate) -> Result<Self, Self::Error> {
-        parse_certificate_chain(&raw.0, "hysteria2.tls.client_certificate").map(|certificates| {
-            CertificateSources(
-                certificates
-                    .into_iter()
-                    .map(|der| CertificateSource::Inline(CertificateDerBytes(der)))
-                    .collect(),
-            )
-        })
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawPrivateKey> for PrivateKeySource {
-    type Error = HammerError;
-
-    fn try_from(raw: RawPrivateKey) -> Result<Self, Self::Error> {
-        parse_private_key(&raw.0, "hysteria2.tls.client_key")
-            .map(PrivateKeyDerBytes)
-            .map(PrivateKeySource::Inline)
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawClientTlsAuth> for Optional<ClientTlsAuth> {
-    type Error = HammerError;
-
-    fn try_from(raw: RawClientTlsAuth) -> Result<Self, Self::Error> {
-        let RawClientTlsAuth {
-            certificates,
-            certificate_paths,
-            key,
-            key_path,
-        } = raw;
-        let mut certificate_sources = Vec::new();
-        for certificate in certificates {
-            let CertificateSources(mut sources) = certificate.try_into()?;
-            certificate_sources.append(&mut sources);
-        }
-        for path in certificate_paths {
-            if path.as_os_str().is_empty() {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.client_certificate_path must not contain empty paths",
-                ));
-            }
-            certificate_sources.push(CertificateSource::Path(path));
-        }
-
-        let key_source = match (key, key_path) {
-            (Some(_), Some(_)) => {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.client_key and client_key_path cannot both be set",
-                ));
-            }
-            (Some(key), None) => Some(key.try_into()?),
-            (None, Some(path)) => {
-                if path.as_os_str().is_empty() {
-                    return Err(HammerError::config_validation(
-                        "hysteria2.tls.client_key_path must not be empty",
-                    ));
-                }
-                Some(PrivateKeySource::Path(path))
-            }
-            (None, None) => None,
-        };
-
-        let auth = match (certificate_sources.is_empty(), key_source) {
-            (true, None) => None,
-            (true, Some(_)) => Err(HammerError::config_validation(
-                "hysteria2.tls.client_certificate is required when client_key is set",
-            ))?,
-            (false, None) => Err(HammerError::config_validation(
-                "hysteria2.tls.client_key is required when client_certificate is set",
-            ))?,
-            (false, Some(key)) => Some(ClientTlsAuth {
-                certificates: certificate_sources,
-                key,
-            }),
-        };
-        Ok(Self(auth))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawUtlsConfig> for Optional<UtlsOptions> {
-    type Error = HammerError;
-
-    fn try_from(raw: RawUtlsConfig) -> Result<Self, Self::Error> {
-        let enabled = raw.enabled.unwrap_or(false);
-        if !enabled {
-            if raw.fingerprint.is_some() {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.utls.enabled must be true when fingerprint is set",
-                ));
-            }
-            return Ok(Self(None));
-        }
-        Ok(Self(Some(UtlsOptions {
-            fingerprint: raw.fingerprint.unwrap_or_default(),
-        })))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawEchConfigList> for EchConfigList {
-    type Error = HammerError;
-
-    fn try_from(raw: RawEchConfigList) -> Result<Self, Self::Error> {
-        decode_hex_or_base64("hysteria2.tls.ech.config", &raw.0).map(Self)
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawEchConfig> for Optional<EchOptions> {
-    type Error = HammerError;
-
-    fn try_from(raw: RawEchConfig) -> Result<Self, Self::Error> {
-        let RawEchConfig {
-            enabled,
-            config,
-            config_path,
-            pq_signature_schemes_enabled,
-            dynamic_record_sizing_disabled,
-        } = raw;
-        let enabled = enabled.unwrap_or(false);
-        if !enabled {
-            if config.is_some()
-                || config_path.is_some()
-                || pq_signature_schemes_enabled.is_some()
-                || dynamic_record_sizing_disabled.is_some()
-            {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.ech.enabled must be true when ECH fields are set",
-                ));
-            }
-            return Ok(Self(None));
-        }
-        if config.is_some() && config_path.is_some() {
-            return Err(HammerError::config_validation(
-                "hysteria2.tls.ech.config and config_path cannot both be set",
-            ));
-        }
-        let config_source = match (config, config_path) {
-            (Some(config), None) => Some(EchConfigSource::Inline(config.try_into()?)),
-            (None, Some(path)) => Some(EchConfigSource::Path(path)),
-            (None, None) => Some(EchConfigSource::DnsHttpsRecord),
-            (Some(_), Some(_)) => unreachable!("checked above"),
-        };
-        Ok(Self(Some(EchOptions {
-            config_source,
-            pq_signature_schemes_enabled: pq_signature_schemes_enabled.unwrap_or(false),
-            dynamic_record_sizing_disabled: dynamic_record_sizing_disabled.unwrap_or(false),
-        })))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawRealityPublicKey> for RealityPublicKey {
-    type Error = HammerError;
-
-    fn try_from(raw: RawRealityPublicKey) -> Result<Self, Self::Error> {
-        let public_key = decode_hex_or_base64("hysteria2.tls.reality.public_key", &raw.0)?;
-        let public_key = public_key.try_into().map_err(|_| {
-            HammerError::config_validation("hysteria2.tls.reality.public_key must be 32 bytes")
-        })?;
-        Ok(Self(public_key))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawRealityShortId> for RealityShortId {
-    type Error = HammerError;
-
-    fn try_from(raw: RawRealityShortId) -> Result<Self, Self::Error> {
-        let short_id = decode_hex("hysteria2.tls.reality.short_id", &raw.0)?;
-        if short_id.len() > 8 {
-            return Err(HammerError::config_validation(
-                "hysteria2.tls.reality.short_id must be at most 8 bytes",
-            ));
-        }
-        Ok(Self(short_id))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawRealityConfig> for Optional<RealityOptions> {
-    type Error = HammerError;
-
-    fn try_from(raw: RawRealityConfig) -> Result<Self, Self::Error> {
-        let enabled = raw.enabled.unwrap_or(false);
-        if !enabled {
-            if raw.public_key.is_some() || raw.short_id.is_some() {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.reality.enabled must be true when Reality fields are set",
-                ));
-            }
-            return Ok(Self(None));
-        }
-        let public_key = raw.public_key.ok_or_else(|| {
-            HammerError::config_validation("hysteria2.tls.reality.public_key is required")
-        })?;
-        let short_id = raw.short_id.ok_or_else(|| {
-            HammerError::config_validation("hysteria2.tls.reality.short_id is required")
-        })?;
-        Ok(Self(Some(RealityOptions {
-            public_key: public_key.try_into()?,
-            short_id: short_id.try_into()?,
-        })))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
-impl TryFrom<RawTlsFragmentConfig> for Optional<TlsFragmentOptions> {
-    type Error = HammerError;
-
-    fn try_from(raw: RawTlsFragmentConfig) -> Result<Self, Self::Error> {
-        let enabled = raw.enabled.unwrap_or(false);
-        if !enabled {
-            if !raw.size.is_empty() || raw.sleep.is_some() {
-                return Err(HammerError::config_validation(
-                    "hysteria2.tls.fragment.enabled must be true when fragment fields are set",
-                ));
-            }
-            return Ok(Self(None));
-        }
-        Ok(Self(Some(TlsFragmentOptions {
-            size: if raw.size.is_empty() {
-                "tlshello".to_owned()
-            } else {
-                raw.size
-            },
-            sleep: raw.sleep.unwrap_or(Duration::ZERO),
-        })))
-    }
-}
-
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn parse_certificate_chain(raw: &str, field: &str) -> Result<Vec<Vec<u8>>, HammerError> {
     if raw.contains("-----BEGIN ") {
         return parse_pem_blocks(raw, &["CERTIFICATE"], field);
@@ -1161,7 +1410,7 @@ fn parse_certificate_chain(raw: &str, field: &str) -> Result<Vec<Vec<u8>>, Hamme
     Ok(vec![decode_hex_or_base64(field, raw)?])
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn parse_private_key(raw: &str, field: &str) -> Result<Vec<u8>, HammerError> {
     let keys = if raw.contains("-----BEGIN ") {
         parse_pem_blocks(
@@ -1180,7 +1429,7 @@ fn parse_private_key(raw: &str, field: &str) -> Result<Vec<u8>, HammerError> {
     Ok(keys.into_iter().next().expect("one key checked"))
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn parse_pem_blocks(
     input: &str,
     accepted_labels: &[&str],
@@ -1231,7 +1480,7 @@ fn parse_pem_blocks(
     Ok(blocks)
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn decode_hex_or_base64(field: &str, value: &str) -> Result<Vec<u8>, HammerError> {
     let compact: String = value
         .chars()
@@ -1250,7 +1499,7 @@ fn decode_hex_or_base64(field: &str, value: &str) -> Result<Vec<u8>, HammerError
         .map_err(|_| HammerError::config_validation(format!("{field} must be hex or base64")))
 }
 
-#[cfg(feature = "hysteria2")]
+#[cfg(any(feature = "hysteria2", feature = "vless"))]
 fn decode_hex(field: &str, value: &str) -> Result<Vec<u8>, HammerError> {
     let compact: String = value
         .chars()
