@@ -255,6 +255,38 @@ final = "auto"
         .expect("default FFI build must construct urltest outbounds");
 }
 
+#[cfg(feature = "vless")]
+#[test]
+fn service_accepts_vless_feature_config() {
+    let toml = r#"
+[tun]
+address = ["172.19.0.1/30"]
+mtu = 1400
+stack = "disabled"
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[[outbounds]]
+type = "vless"
+id = "vl"
+server = "example.com"
+server_port = 443
+uuid = "00112233-4455-6677-8899-aabbccddeeff"
+network = ["tcp"]
+
+[dns]
+server = "udp://1.1.1.1"
+
+[route]
+final = "vl"
+"#;
+    let platform = Arc::new(CapturePlatform::default());
+    HammerService::new(toml, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("FFI vless feature must construct vless outbounds");
+}
+
 /// Booting a config with a `[[endpoints]]` block must walk the configured
 /// lifecycle graph and register the endpoint's outbound view.
 #[cfg(feature = "wireguard")]
