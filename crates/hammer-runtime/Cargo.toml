@@ -56,6 +56,7 @@ outbound-hysteria2 = [
     "dep:quinn",
     "dep:rand",
 ]
+outbound-vless = ["hammer-core/vless"]
 outbound-direct = ["dep:socket2"]
 outbound-block = []
 # Outbound group that probes child outbounds via HTTP HEAD over the proxied

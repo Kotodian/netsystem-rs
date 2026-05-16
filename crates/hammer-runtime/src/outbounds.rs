@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::RuntimePlatform;
 #[cfg(any(
     feature = "outbound-hysteria2",
+    feature = "outbound-vless",
     feature = "outbound-direct",
     feature = "outbound-block",
     feature = "outbound-urltest"
@@ -90,6 +91,8 @@ fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, Outb
         builders,
         [crate::protocol::hysteria2::Hysteria2Outbound]
     );
+    #[cfg(feature = "outbound-vless")]
+    register_components!(outbound, builders, [crate::protocol::vless::VlessOutbound]);
     #[cfg(feature = "outbound-direct")]
     register_components!(
         outbound,

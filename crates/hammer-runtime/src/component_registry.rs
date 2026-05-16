@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 #[cfg(any(
     feature = "outbound-hysteria2",
+    feature = "outbound-vless",
     feature = "outbound-direct",
     feature = "outbound-block",
     feature = "outbound-urltest"
@@ -19,6 +20,7 @@ pub(crate) trait OutboundComponentDeclaration {
 
 #[cfg(any(
     feature = "outbound-hysteria2",
+    feature = "outbound-vless",
     feature = "outbound-direct",
     feature = "outbound-block",
     feature = "outbound-urltest"

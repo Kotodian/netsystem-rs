@@ -16,7 +16,11 @@ pub(crate) mod icmp;
     feature = "inbound-mixed"
 ))]
 pub mod proxy;
+#[cfg(feature = "outbound-vless")]
+pub(crate) mod server_tcp;
 #[cfg(feature = "inbound-tun")]
 pub mod tun;
 #[cfg(feature = "outbound-urltest")]
 pub mod urltest;
+#[cfg(feature = "outbound-vless")]
+pub mod vless;

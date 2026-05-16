@@ -54,6 +54,11 @@ pub mod hysteria2 {
     pub use crate::protocol::hysteria2::*;
 }
 
+#[cfg(feature = "outbound-vless")]
+pub mod vless {
+    pub use crate::protocol::vless::*;
+}
+
 #[cfg(feature = "outbound-hysteria2")]
 pub mod congestion {
     pub use crate::protocol::congestion::*;
