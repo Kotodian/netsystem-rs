@@ -45,6 +45,7 @@ pub mod spawn;
 #[cfg(any(
     feature = "dns-https",
     feature = "outbound-urltest",
+    feature = "tls-outbound",
     feature = "tls-quic"
 ))]
 pub mod tls;

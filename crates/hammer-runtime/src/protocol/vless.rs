@@ -9,11 +9,14 @@ use hammer_adapter::{Network, Outbound, ProxyPacketConn, ProxyStream, SocksAddr}
 use hammer_core::config::{OutboundKind, VlessOutboundOptions};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
+use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::protocol::server_tcp::ServerTcpConnector;
 use crate::socket_protector::SocketProtector;
+use crate::tls::{OutboundClientTlsConfig, outbound_client_config};
 
 const VLESS_VERSION: u8 = 0;
 const VLESS_COMMAND_TCP: u8 = 1;
@@ -67,9 +70,14 @@ impl VlessOutbound {
             ));
         }
         let tls = &self.options.tls;
-        if tls.enabled {
+        if tls.reality.is_some() {
             return Err(HammerError::config_validation(
-                "vless tls is parsed but not supported by the runtime yet",
+                "vless tls.reality is parsed but not supported by the runtime yet",
+            ));
+        }
+        if tls.fragment.is_some() || tls.record_fragment {
+            return Err(HammerError::config_validation(
+                "vless tls fragmentation is parsed but not supported by the runtime yet",
             ));
         }
         Ok(())
@@ -107,13 +115,13 @@ impl Outbound for VlessOutbound {
             return Err(HammerError::internal("vless dial only supports tcp"));
         }
         self.validate_runtime_options()?;
-        let mut stream = self.connector.connect("vless").await?;
         let request = encode_tcp_request(&self.options, &destination, initial_payload)?;
-        stream
-            .write_all(&request)
-            .await
-            .with_context(|| "vless tcp write request")?;
-        Ok(Box::new(VlessTcpStream::new(stream)))
+        let stream = self.connector.connect("vless").await?;
+        if self.options.tls.enabled {
+            let stream = self.connect_tls(stream).await?;
+            return write_request_and_wrap(stream, &request).await;
+        }
+        write_request_and_wrap(stream, &request).await
     }
 
     async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
@@ -121,6 +129,50 @@ impl Outbound for VlessOutbound {
             "vless udp packet connections are not supported yet",
         ))
     }
+}
+
+impl VlessOutbound {
+    async fn connect_tls(&self, stream: TcpStream) -> HammerResult<TlsStream<TcpStream>> {
+        let tls = &self.options.tls;
+        let config = outbound_client_config(OutboundClientTlsConfig {
+            platform: self.connector.platform(),
+            insecure: tls.insecure,
+            alpn_protocols: tls
+                .alpn
+                .iter()
+                .map(|item| item.as_bytes().to_vec())
+                .collect(),
+            server_fingerprints: tls.server_fingerprints.clone(),
+            client_auth: tls.client_auth.clone(),
+            ech: tls.ech.clone(),
+            #[cfg(feature = "tls-utls")]
+            ech_retry_configs: None,
+            utls: tls.utls.clone(),
+        })?;
+        let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|_| {
+            HammerError::config_validation(
+                "vless.tls.server_name must be a valid DNS name or IP address",
+            )
+        })?;
+        TlsConnector::from(Arc::new(config))
+            .connect(server_name, stream)
+            .await
+            .with_context(|| "vless tls connect")
+    }
+}
+
+async fn write_request_and_wrap<S>(
+    mut stream: S,
+    request: &[u8],
+) -> HammerResult<Box<dyn ProxyStream>>
+where
+    S: ProxyStream,
+{
+    stream
+        .write_all(request)
+        .await
+        .with_context(|| "vless tcp write request")?;
+    Ok(Box::new(VlessTcpStream::new(stream)))
 }
 
 fn encode_tcp_request(
@@ -163,13 +215,13 @@ fn encode_address(destination: &SocksAddr, out: &mut Vec<u8>) -> HammerResult<()
     Ok(())
 }
 
-struct VlessTcpStream {
-    inner: TcpStream,
+struct VlessTcpStream<S> {
+    inner: S,
     response: ResponseHeaderState,
 }
 
-impl VlessTcpStream {
-    fn new(inner: TcpStream) -> Self {
+impl<S> VlessTcpStream<S> {
+    fn new(inner: S) -> Self {
         Self {
             inner,
             response: ResponseHeaderState::new(),
@@ -177,7 +229,10 @@ impl VlessTcpStream {
     }
 }
 
-impl AsyncRead for VlessTcpStream {
+impl<S> AsyncRead for VlessTcpStream<S>
+where
+    S: ProxyStream,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -194,7 +249,10 @@ impl AsyncRead for VlessTcpStream {
     }
 }
 
-impl AsyncWrite for VlessTcpStream {
+impl<S> AsyncWrite for VlessTcpStream<S>
+where
+    S: ProxyStream,
+{
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -231,7 +289,11 @@ impl ResponseHeaderState {
         self.done
     }
 
-    fn poll_read(&mut self, stream: &mut TcpStream, cx: &mut Context<'_>) -> io::Result<Poll<()>> {
+    fn poll_read(
+        &mut self,
+        stream: &mut (impl AsyncRead + Unpin),
+        cx: &mut Context<'_>,
+    ) -> io::Result<Poll<()>> {
         let target = self.bytes.len();
         let before = self.read;
         let mut buf = ReadBuf::new(&mut self.bytes[self.read..target]);

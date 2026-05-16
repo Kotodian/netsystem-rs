@@ -1,15 +1,20 @@
 use std::fs;
+#[cfg(feature = "tls-quic")]
 use std::net::IpAddr;
 use std::path::Path;
 
 use base64::Engine as _;
 use hammer_core::config::{EchConfigSource, EchOptions};
 use hammer_core::error::{HammerError, HammerResult};
+#[cfg(feature = "tls-quic")]
 use hickory_resolver::Resolver;
+#[cfg(feature = "tls-quic")]
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+#[cfg(feature = "tls-quic")]
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use rustls::pki_types::EchConfigListBytes;
 
+#[cfg(feature = "tls-quic")]
 const MAX_HTTPS_ALIAS_DEPTH: usize = 4;
 
 pub(super) fn ech_config(ech: &EchOptions) -> HammerResult<rustls::client::EchConfig> {
@@ -63,6 +68,7 @@ fn load_ech_config_path(path: &Path) -> HammerResult<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(feature = "tls-quic")]
 pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> HammerResult<Vec<u8>> {
     let resolver = Resolver::builder_tokio()
         .map_err(|err| HammerError::internal(format!("read system DNS config: {err}")))?
@@ -100,6 +106,7 @@ pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> Hamm
     unreachable!("HTTPS alias loop must return before exceeding max depth")
 }
 
+#[cfg(feature = "tls-quic")]
 fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     let server_name = server_name.trim();
     if server_name.is_empty() {
@@ -119,6 +126,7 @@ fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     }
 }
 
+#[cfg(feature = "tls-quic")]
 #[derive(Debug, PartialEq, Eq)]
 enum HttpsEchLookupResult {
     Config(Vec<u8>),
@@ -126,6 +134,7 @@ enum HttpsEchLookupResult {
     NotFound,
 }
 
+#[cfg(feature = "tls-quic")]
 fn ech_config_list_from_https_answers(answers: &[Record]) -> HttpsEchLookupResult {
     let mut https_records = answers
         .iter()

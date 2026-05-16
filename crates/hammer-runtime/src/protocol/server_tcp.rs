@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use hammer_adapter::PlatformInterface;
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use tokio::net::{TcpSocket, TcpStream};
 
@@ -30,6 +32,10 @@ impl ServerTcpConnector {
             .connect(target)
             .await
             .with_context(|| format!("{context} tcp connect"))
+    }
+
+    pub(crate) fn platform(&self) -> Option<Arc<dyn PlatformInterface>> {
+        self.protector.platform()
     }
 }
 
