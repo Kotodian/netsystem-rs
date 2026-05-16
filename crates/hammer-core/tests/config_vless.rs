@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use hammer_core::Network;
 use hammer_core::config::{self, EchConfigSource, OutboundKind, RealityShortId, UtlsFingerprint};
 use indoc::indoc;
 
@@ -159,4 +160,57 @@ fn parse_config_accepts_vless_ech_and_tls_fragment_options() {
         Duration::from_millis(5)
     );
     assert!(vless.tls.record_fragment);
+}
+
+#[test]
+fn parse_config_accepts_vless_network_selection() {
+    let cfg = indoc! {r#"
+        [tun]
+        address = ["172.19.0.1/30"]
+
+        [[outbounds]]
+        type = "vless"
+        id = "vl"
+        server = "example.com"
+        server_port = 443
+        uuid = "00112233-4455-6677-8899-aabbccddeeff"
+        network = ["tcp"]
+
+        [dns]
+        server = "local"
+    "#};
+
+    let options = config::parse_config(cfg).expect("parse vless network config");
+    let vless = match &options.outbounds[0].kind {
+        OutboundKind::Vless(options) => options,
+        other => panic!("outbound[0] not vless: {other:?}"),
+    };
+
+    assert_eq!(vless.network, vec![Network::Tcp]);
+}
+
+#[test]
+fn parse_config_rejects_vless_icmp_network() {
+    let cfg = indoc! {r#"
+        [tun]
+        address = ["172.19.0.1/30"]
+
+        [[outbounds]]
+        type = "vless"
+        id = "vl"
+        server = "example.com"
+        server_port = 443
+        uuid = "00112233-4455-6677-8899-aabbccddeeff"
+        network = ["icmp"]
+
+        [dns]
+        server = "local"
+    "#};
+
+    let err = config::parse_config(cfg).expect_err("icmp network accepted");
+    assert!(
+        err.to_string()
+            .contains("outbounds[0] (vless 'vl').network supports only tcp and udp"),
+        "error = {err:?}"
+    );
 }

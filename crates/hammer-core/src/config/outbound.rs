@@ -89,6 +89,8 @@ raw_struct! {
         pub uuid: String => "String::is_empty",
         /// Optional VLESS flow, currently empty or xtls-rprx-vision.
         pub flow: String => "String::is_empty",
+        /// Enabled network list. Defaults to tcp+udp.
+        pub network: Vec<crate::Network> => "Vec::is_empty",
         /// Optional sing-box-style TLS section.
         pub tls: RawOutboundTlsConfig => "RawOutboundTlsConfig::is_default",
     }
@@ -330,6 +332,7 @@ pub struct VlessOutboundOptions {
     pub server_port: u16,
     pub uuid: [u8; 16],
     pub flow: Option<String>,
+    pub network: Vec<crate::Network>,
     pub tls: OutboundTlsOptions,
 }
 
@@ -648,6 +651,7 @@ fn build_vless_options(
         server_port,
         uuid,
         flow,
+        network,
         tls,
     } = raw;
     if id.is_empty() {
@@ -680,16 +684,54 @@ fn build_vless_options(
             "{prefix} flow xtls-rprx-vision requires tls.enabled=true"
         )));
     }
+    let network = build_tcp_udp_networks(&format!("{prefix}.network"), network)?;
     Ok((
         VlessOutboundOptions {
             server,
             server_port: server_port.unwrap_or(C::DEFAULT_VLESS_PORT),
             uuid,
             flow,
+            network,
             tls,
         },
         id,
     ))
+}
+
+#[cfg(feature = "vless")]
+fn build_tcp_udp_networks(
+    field: &str,
+    networks: Vec<crate::Network>,
+) -> Result<Vec<crate::Network>, HammerError> {
+    let networks = if networks.is_empty() {
+        vec![crate::Network::Tcp, crate::Network::Udp]
+    } else {
+        networks
+    };
+    let mut has_tcp = false;
+    let mut has_udp = false;
+    for network in &networks {
+        match network {
+            crate::Network::Tcp if has_tcp => {
+                return Err(HammerError::config_validation(format!(
+                    "{field} lists duplicate network: tcp"
+                )));
+            }
+            crate::Network::Tcp => has_tcp = true,
+            crate::Network::Udp if has_udp => {
+                return Err(HammerError::config_validation(format!(
+                    "{field} lists duplicate network: udp"
+                )));
+            }
+            crate::Network::Udp => has_udp = true,
+            crate::Network::Icmp => {
+                return Err(HammerError::config_validation(format!(
+                    "{field} supports only tcp and udp"
+                )));
+            }
+        }
+    }
+    Ok(networks)
 }
 
 #[cfg(feature = "vless")]

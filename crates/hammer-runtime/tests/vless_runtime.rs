@@ -28,6 +28,7 @@ fn vless_options(port: u16) -> VlessOutboundOptions {
             0xee, 0xff,
         ],
         flow: None,
+        network: vec![Network::Tcp, Network::Udp],
         tls: OutboundTlsOptions::default(),
     }
 }
@@ -40,6 +41,20 @@ fn vless_tls_options(port: u16) -> VlessOutboundOptions {
             insecure: true,
             ..Default::default()
         },
+        ..vless_options(port)
+    }
+}
+
+fn vless_tcp_only_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        network: vec![Network::Tcp],
+        ..vless_options(port)
+    }
+}
+
+fn vless_udp_only_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        network: vec![Network::Udp],
         ..vless_options(port)
     }
 }
@@ -59,6 +74,71 @@ fn outbound_manager_registers_vless_outbound() {
     let outbound = manager.get("vl").expect("vless outbound");
     assert_eq!(outbound.type_name(), "vless");
     assert_eq!(manager.default().unwrap().id(), "vl");
+}
+
+#[test]
+fn outbound_manager_registers_vless_configured_networks() {
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_tcp_only_options(443)),
+        }],
+    )
+    .expect("outbound manager");
+
+    let outbound = manager.get("vl").expect("vless outbound");
+    assert_eq!(outbound.networks(), &[Network::Tcp]);
+}
+
+#[tokio::test]
+async fn vless_outbound_rejects_tcp_when_disabled_by_network() {
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_udp_only_options(9)),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 443);
+
+    let err = match outbound.dial(Network::Tcp, destination, b"").await {
+        Ok(_) => panic!("tcp dial accepted"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("vless tcp is disabled by network"),
+        "error = {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn vless_outbound_rejects_udp_when_disabled_by_network() {
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_tcp_only_options(443)),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+
+    let err = match outbound.listen_packet().await {
+        Ok(_) => panic!("udp listener accepted"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("vless udp is disabled by network"),
+        "error = {err:?}"
+    );
 }
 
 #[tokio::test]

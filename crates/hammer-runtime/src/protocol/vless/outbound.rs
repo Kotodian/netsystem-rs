@@ -52,8 +52,8 @@ impl VlessOutbound {
             .build()?;
         Ok(Self {
             id,
+            networks: options.network.clone(),
             options,
-            networks: vec![Network::Tcp, Network::Udp],
             dependencies: Vec::new(),
             connector,
         })
@@ -110,6 +110,11 @@ impl Outbound for VlessOutbound {
         if network != Network::Tcp {
             return Err(HammerError::internal("vless dial only supports tcp"));
         }
+        if !self.options.network.contains(&Network::Tcp) {
+            return Err(HammerError::config_validation(
+                "vless tcp is disabled by network",
+            ));
+        }
         self.validate_runtime_options()?;
         let request = encode_request(
             &self.options.uuid,
@@ -128,6 +133,11 @@ impl Outbound for VlessOutbound {
     }
 
     async fn listen_packet(&self) -> HammerResult<Box<dyn ProxyPacketConn>> {
+        if !self.options.network.contains(&Network::Udp) {
+            return Err(HammerError::config_validation(
+                "vless udp is disabled by network",
+            ));
+        }
         self.validate_runtime_options()?;
         Ok(Box::new(VlessPacketConn {
             options: self.options.clone(),
