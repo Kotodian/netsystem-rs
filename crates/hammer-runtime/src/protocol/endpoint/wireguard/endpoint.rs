@@ -26,13 +26,13 @@ use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
 #[cfg(feature = "endpoint-amneziawg")]
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
+use hammer_core::protocol::wireguard::peer::{self, Peer};
 
-use super::transport::{self, TransportHandles};
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::to_boringtun_config;
+use super::transport::{self, TransportHandles};
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 

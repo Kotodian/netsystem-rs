@@ -33,14 +33,12 @@ use tokio::time::{self, MissedTickBehavior};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
 #[cfg(feature = "endpoint-amneziawg")]
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
+use hammer_core::protocol::wireguard::peer::{self, Peer};
 
 #[cfg(feature = "endpoint-amneziawg")]
-use super::amnezia2::{
-    decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets,
-};
+use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets};
 use crate::socket_protector::SocketProtector;
 
 /// 250 ms matches what boringtun's own examples and Cloudflare WARP use to
