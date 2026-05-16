@@ -23,29 +23,16 @@ stack = "disabled"
 [dns]
 server = "udp://1.1.1.1"
 
+[[outbounds]]
+type = "direct"
+id = "direct"
+
 [route]
 final = "direct"
 "#;
 
-#[cfg(feature = "hysteria2")]
-const MIN_TOML_HYSTERIA2: &str = r#"
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
-"#;
-
 fn min_toml() -> String {
-    #[cfg(feature = "hysteria2")]
-    {
-        let mut toml = MIN_TOML_BASE.to_owned();
-        toml.push_str(MIN_TOML_HYSTERIA2);
-        toml
-    }
-    #[cfg(not(feature = "hysteria2"))]
-    {
-        MIN_TOML_BASE.to_owned()
-    }
+    MIN_TOML_BASE.to_owned()
 }
 
 #[derive(Default)]

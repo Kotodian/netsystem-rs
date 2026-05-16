@@ -1,53 +1,10 @@
 // Rule / RuleSet surface for the minimal M4 route engine. Full sing-box rule
 // sets land later; M4 only consumes the default rules generated from tun.*.
 
+pub use hammer_core::SocksAddr;
 use hammer_core::config::{DomainStrategy, RuleActionKind};
 
-use std::fmt;
-use std::net::IpAddr;
-
 use crate::Network;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocksAddr {
-    pub host: IpAddr,
-    pub port: u16,
-    pub domain: Option<String>,
-}
-
-impl SocksAddr {
-    pub fn ip(host: IpAddr, port: u16) -> Self {
-        Self {
-            host,
-            port,
-            domain: None,
-        }
-    }
-
-    pub fn domain(domain: impl Into<String>, fallback: IpAddr, port: u16) -> Self {
-        Self {
-            host: fallback,
-            port,
-            domain: Some(domain.into()),
-        }
-    }
-
-    pub fn destination_host(&self) -> String {
-        self.domain.clone().unwrap_or_else(|| self.host.to_string())
-    }
-}
-
-impl fmt::Display for SocksAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(domain) = &self.domain {
-            return write!(f, "{domain}:{}", self.port);
-        }
-        match self.host {
-            IpAddr::V4(addr) => write!(f, "{addr}:{}", self.port),
-            IpAddr::V6(addr) => write!(f, "[{addr}]:{}", self.port),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteMetadata {

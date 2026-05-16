@@ -13,4 +13,4 @@ pub use metrics::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope, NetworkCounters, RegistryRecorder,
 };
-pub use network::Network;
+pub use network::{Network, SocksAddr};

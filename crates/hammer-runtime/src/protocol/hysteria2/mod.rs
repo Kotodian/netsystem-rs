@@ -1302,7 +1302,7 @@ mod tests {
             .expect_err("uTLS must not be silently ignored");
         let message = err.to_string();
         assert!(
-            message.contains("hysteria2.tls.utls"),
+            message.contains("tls.utls fingerprint chrome requires"),
             "error = {message:?}"
         );
         assert!(
