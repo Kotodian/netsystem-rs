@@ -1,11 +1,19 @@
+use async_trait::async_trait;
 use rustls::ClientConfig;
 
 #[cfg(feature = "tls-client")]
 use super::client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 use super::client::OutboundClientTlsConfig;
+#[cfg(feature = "tls-outbound-stream")]
+use super::client::TlsClientStream;
 use hammer_core::error::HammerResult;
+#[cfg(feature = "tls-outbound-stream")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls-outbound-stream")]
+use tokio::net::TcpStream;
 
+#[async_trait]
 pub(super) trait TlsBackend: Sync {
     #[cfg(feature = "dns-https")]
     fn tls13_client_config(&self, options: BasicClientTlsConfig) -> HammerResult<ClientConfig>;
@@ -21,6 +29,14 @@ pub(super) trait TlsBackend: Sync {
         &self,
         options: OutboundClientTlsConfig,
     ) -> HammerResult<ClientConfig>;
+
+    #[cfg(feature = "tls-outbound-stream")]
+    async fn outbound_client_stream(
+        &self,
+        options: OutboundClientTlsConfig,
+        server_name: ServerName<'static>,
+        stream: TcpStream,
+    ) -> HammerResult<TlsClientStream<TcpStream>>;
 
     #[cfg(feature = "tls-quic")]
     fn outbound_quic_client_config(

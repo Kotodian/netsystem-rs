@@ -1,4 +1,10 @@
+#[cfg(feature = "tls-outbound-stream")]
+use std::io;
+#[cfg(feature = "tls-outbound-stream")]
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "tls-outbound-stream")]
+use std::task::{Context, Poll};
 
 use hammer_adapter::PlatformInterface;
 #[cfg(feature = "tls-outbound")]
@@ -9,12 +15,14 @@ use hammer_core::config::{CertificateFingerprint, ClientTlsAuth, EchOptions, Utl
 ))]
 use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
-#[cfg(any(
-    feature = "dns-https",
-    feature = "outbound-urltest",
-    feature = "tls-outbound-stream"
-))]
+#[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
 use rustls::ClientConfig;
+#[cfg(feature = "tls-outbound-stream")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls-outbound-stream")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "tls-outbound-stream")]
+use tokio::net::TcpStream;
 
 use super::backend::default_backend;
 #[cfg(feature = "tls-utls")]
@@ -53,13 +61,66 @@ pub(crate) struct OutboundClientTlsConfig {
 }
 
 #[cfg(feature = "tls-outbound-stream")]
-pub(crate) fn outbound_client_config(
+pub(crate) enum TlsClientStream<S> {
+    Rustls(tokio_rustls::client::TlsStream<S>),
+}
+
+#[cfg(feature = "tls-outbound-stream")]
+impl<S> AsyncRead for TlsClientStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+#[cfg(feature = "tls-outbound-stream")]
+impl<S> AsyncWrite for TlsClientStream<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Rustls(stream) => Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
+#[cfg(feature = "tls-outbound-stream")]
+pub(crate) async fn outbound_client_stream(
     options: OutboundClientTlsConfig,
-) -> HammerResult<ClientConfig> {
+    server_name: ServerName<'static>,
+    stream: TcpStream,
+) -> HammerResult<TlsClientStream<TcpStream>> {
     if options.utls.is_some() {
         #[cfg(feature = "tls-utls")]
         {
-            return utls_backend().outbound_client_config(options);
+            return utls_backend()
+                .outbound_client_stream(options, server_name, stream)
+                .await;
         }
 
         #[cfg(not(feature = "tls-utls"))]
@@ -71,7 +132,9 @@ pub(crate) fn outbound_client_config(
             )));
         }
     }
-    default_backend().outbound_client_config(options)
+    default_backend()
+        .outbound_client_stream(options, server_name, stream)
+        .await
 }
 
 #[cfg(feature = "tls-quic")]

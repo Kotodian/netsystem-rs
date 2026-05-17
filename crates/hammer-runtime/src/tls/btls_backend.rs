@@ -1,11 +1,14 @@
 #[cfg(feature = "tls-client")]
 use super::client::BasicClientTlsConfig;
 use super::client::OutboundClientTlsConfig;
+#[cfg(feature = "tls-outbound-stream")]
+use super::client::TlsClientStream;
 #[cfg(feature = "tls-outbound")]
 use super::material::load_client_auth;
 use super::roots::platform_root_certificates;
 use super::utls::{fingerprint_name, unsupported_for_rustls};
 use crate::tls::backend::TlsBackend;
+use async_trait::async_trait;
 use btls::hash::MessageDigest;
 use btls::pkey::PKey;
 use btls::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl};
@@ -17,15 +20,20 @@ use hammer_core::config::{
 };
 use hammer_core::error::{HammerError, HammerResult};
 use quinn_btls::QuicSslContext;
+#[cfg(feature = "tls-outbound-stream")]
+use rustls::pki_types::ServerName;
 use std::ffi::CString;
 use std::io::Cursor;
 use std::sync::Arc;
+#[cfg(feature = "tls-outbound-stream")]
+use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub(super) struct BtlsUtlsBackend;
 
 pub(super) static BTLS_UTLS_BACKEND: BtlsUtlsBackend = BtlsUtlsBackend;
 
+#[async_trait]
 impl TlsBackend for BtlsUtlsBackend {
     #[cfg(feature = "dns-https")]
     fn tls13_client_config(
@@ -52,6 +60,21 @@ impl TlsBackend for BtlsUtlsBackend {
             return Err(unsupported_for_rustls(utls));
         }
         super::rustls_backend::RUSTLS_AWS_LC_BACKEND.outbound_client_config(options)
+    }
+
+    #[cfg(feature = "tls-outbound-stream")]
+    async fn outbound_client_stream(
+        &self,
+        options: OutboundClientTlsConfig,
+        server_name: ServerName<'static>,
+        stream: TcpStream,
+    ) -> HammerResult<TlsClientStream<TcpStream>> {
+        if let Some(utls) = &options.utls {
+            return Err(unsupported_for_rustls(utls));
+        }
+        super::rustls_backend::RUSTLS_AWS_LC_BACKEND
+            .outbound_client_stream(options, server_name, stream)
+            .await
     }
 
     #[cfg(feature = "tls-quic")]

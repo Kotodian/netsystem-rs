@@ -2,6 +2,8 @@
 use super::client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 use super::client::OutboundClientTlsConfig;
+#[cfg(feature = "tls-outbound-stream")]
+use super::client::TlsClientStream;
 #[cfg(feature = "tls-outbound")]
 use super::ech::ech_config;
 #[cfg(feature = "tls-outbound")]
@@ -12,14 +14,22 @@ use super::roots::client_verifier_builder;
 #[cfg(feature = "tls-outbound")]
 use super::verifier::outbound_client_verifier_builder;
 use crate::tls::backend::TlsBackend;
+use async_trait::async_trait;
 use hammer_core::error::{HammerError, HammerResult};
 use rustls::ClientConfig;
+#[cfg(feature = "tls-outbound-stream")]
+use rustls::pki_types::ServerName;
+#[cfg(feature = "tls-outbound-stream")]
+use tokio::net::TcpStream;
+#[cfg(feature = "tls-outbound-stream")]
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug)]
 pub(super) struct RustlsAwsLcBackend;
 
 pub(super) static RUSTLS_AWS_LC_BACKEND: RustlsAwsLcBackend = RustlsAwsLcBackend;
 
+#[async_trait]
 impl TlsBackend for RustlsAwsLcBackend {
     #[cfg(feature = "dns-https")]
     fn tls13_client_config(&self, options: BasicClientTlsConfig) -> HammerResult<ClientConfig> {
@@ -80,6 +90,21 @@ impl TlsBackend for RustlsAwsLcBackend {
         config.alpn_protocols = options.alpn_protocols;
         config.max_fragment_size = options.max_fragment_size;
         Ok(config)
+    }
+
+    #[cfg(feature = "tls-outbound-stream")]
+    async fn outbound_client_stream(
+        &self,
+        options: OutboundClientTlsConfig,
+        server_name: ServerName<'static>,
+        stream: TcpStream,
+    ) -> HammerResult<TlsClientStream<TcpStream>> {
+        let config = self.outbound_client_config(options)?;
+        let stream = TlsConnector::from(std::sync::Arc::new(config))
+            .connect(server_name, stream)
+            .await
+            .map_err(|err| HammerError::internal(format!("tls connect: {err}")))?;
+        Ok(TlsClientStream::Rustls(stream))
     }
 
     #[cfg(feature = "tls-quic")]

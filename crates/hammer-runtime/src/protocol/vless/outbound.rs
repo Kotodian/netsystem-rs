@@ -15,11 +15,10 @@ use hammer_core::protocol::vless::{
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::protocol::server_tcp::ServerTcpConnector;
 use crate::socket_protector::SocketProtector;
-use crate::tls::{OutboundClientTlsConfig, outbound_client_config};
+use crate::tls::{OutboundClientTlsConfig, TlsClientStream, outbound_client_stream};
 
 const TLS_RECORD_FRAGMENT_SIZE: usize = 32;
 
@@ -160,7 +159,7 @@ impl Outbound for VlessOutbound {
 
 enum VlessServerStream {
     Plain(VlessStream<TcpStream>),
-    Tls(VlessStream<TlsStream<TcpStream>>),
+    Tls(VlessStream<TlsClientStream<TcpStream>>),
 }
 
 impl AsyncRead for VlessServerStream {
@@ -303,31 +302,33 @@ async fn connect_tls(
     connector: &ServerTcpConnector,
     options: &VlessOutboundOptions,
     stream: TcpStream,
-) -> HammerResult<TlsStream<TcpStream>> {
+) -> HammerResult<TlsClientStream<TcpStream>> {
     let tls = &options.tls;
-    let config = outbound_client_config(OutboundClientTlsConfig {
-        platform: connector.platform(),
-        insecure: tls.insecure,
-        alpn_protocols: tls
-            .alpn
-            .iter()
-            .map(|item| item.as_bytes().to_vec())
-            .collect(),
-        server_fingerprints: tls.server_fingerprints.clone(),
-        client_auth: tls.client_auth.clone(),
-        ech: tls.ech.clone(),
-        max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
-        #[cfg(feature = "tls-utls")]
-        ech_retry_configs: None,
-        utls: tls.utls.clone(),
-    })?;
     let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|_| {
         HammerError::config_validation(
             "vless.tls.server_name must be a valid DNS name or IP address",
         )
     })?;
-    TlsConnector::from(Arc::new(config))
-        .connect(server_name, stream)
-        .await
-        .with_context(|| "vless tls connect")
+    outbound_client_stream(
+        OutboundClientTlsConfig {
+            platform: connector.platform(),
+            insecure: tls.insecure,
+            alpn_protocols: tls
+                .alpn
+                .iter()
+                .map(|item| item.as_bytes().to_vec())
+                .collect(),
+            server_fingerprints: tls.server_fingerprints.clone(),
+            client_auth: tls.client_auth.clone(),
+            ech: tls.ech.clone(),
+            max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
+            #[cfg(feature = "tls-utls")]
+            ech_retry_configs: None,
+            utls: tls.utls.clone(),
+        },
+        server_name,
+        stream,
+    )
+    .await
+    .with_context(|| "vless tls connect")
 }
