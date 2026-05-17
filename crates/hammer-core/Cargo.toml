@@ -15,7 +15,7 @@ tls = ["dep:base64"]
 # `outbound-hysteria2` feature.
 hysteria2 = ["tls", "dep:blake2", "dep:bytes", "dep:http", "dep:rand"]
 # Enables VLESS outbound config schema (`[[outbounds]] type = "vless"`).
-vless = ["tls", "dep:rand"]
+vless = ["tls", "dep:aws-lc-rs", "dep:rand"]
 # Enables the WireGuard peer state machine + config schema (`[[endpoints]]`
 # with `type = "wireguard"`). The runtime endpoint component has its own
 # `endpoint-wireguard` feature; this one carries the protocol primitives
@@ -43,6 +43,7 @@ hickory-proto = { workspace = true }
 http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
+aws-lc-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
 indoc = { workspace = true }

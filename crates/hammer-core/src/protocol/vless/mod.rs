@@ -8,6 +8,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use crate::error::{HammerError, HammerResult};
 use crate::network::SocksAddr;
 
+pub mod reality;
+
 pub const FLOW_XTLS_RPRX_VISION: &str = "xtls-rprx-vision";
 
 const VERSION: u8 = 0;
