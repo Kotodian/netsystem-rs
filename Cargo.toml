@@ -10,6 +10,7 @@ members = [
 ]
 exclude = [
     "third_party/boringtun",
+    "third_party/btls-sys",
     "third_party/quinn-btls",
     "third_party/quinn/quinn",
     "third_party/quinn/quinn-proto",
@@ -98,6 +99,7 @@ rcgen = "0.14"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }
+btls-sys = { path = "third_party/btls-sys" }
 quinn = { path = "third_party/quinn/quinn" }
 quinn-btls = { path = "third_party/quinn-btls" }
 quinn-proto = { path = "third_party/quinn/quinn-proto" }

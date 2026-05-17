@@ -1151,4 +1151,88 @@ mod tests {
         )
         .expect("uTLS ECH profile should be accepted by BoringSSL");
     }
+
+    #[test]
+    fn btls_reality_client_hello_callback_rewrites_session_id() {
+        use std::ffi::c_void;
+        use std::io::{Read, Write};
+
+        extern "C" fn callback(
+            _ssl: *mut btls_sys::SSL,
+            out_session_id: *mut u8,
+            client_random: *const u8,
+            client_random_len: usize,
+            private_key: *const u8,
+            private_key_len: usize,
+            client_hello: *const u8,
+            client_hello_len: usize,
+            session_id_offset: usize,
+            arg: *mut c_void,
+        ) -> std::ffi::c_int {
+            assert!(!out_session_id.is_null());
+            assert!(!client_random.is_null());
+            assert_eq!(client_random_len, 32);
+            assert!(!private_key.is_null());
+            assert_eq!(private_key_len, 32);
+            assert!(!client_hello.is_null());
+            assert!(client_hello_len > session_id_offset + 32);
+            unsafe {
+                std::ptr::write_bytes(out_session_id, 0x5a, 32);
+                *(arg.cast::<bool>()) = true;
+            }
+            1
+        }
+
+        #[derive(Default)]
+        struct RecordingStream {
+            written: Vec<u8>,
+        }
+
+        impl Read for RecordingStream {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+
+        impl Write for RecordingStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let options = UtlsOptions {
+            fingerprint: UtlsFingerprint::Chrome,
+        };
+        let connector = new_utls_tcp_connector(&options, true, &[], false, &[], None, None)
+            .expect("btls connector");
+        let config = connector.configure().expect("btls configure");
+        let mut ssl = config.into_ssl("localhost").expect("btls ssl");
+        let profile = utls_connection_profile(&options, &[], None);
+        profile.apply_to_ssl(&mut ssl).expect("apply uTLS profile");
+        let mut called = false;
+        unsafe {
+            btls_sys::SSL_set_reality_client_hello_callback(
+                ssl.as_ptr(),
+                Some(callback),
+                (&mut called as *mut bool).cast(),
+            );
+        }
+
+        let mut stream =
+            btls::ssl::SslStream::new(ssl, RecordingStream::default()).expect("ssl stream");
+        let _ = stream.connect();
+
+        assert!(called, "Reality ClientHello callback was not called");
+        let written = &stream.get_ref().written;
+        assert!(written.len() > 5, "no TLS record was written");
+        assert_eq!(written[0], btls_sys::SSL3_RT_HANDSHAKE as u8);
+        let record_len = usize::from(u16::from_be_bytes([written[3], written[4]]));
+        let client_hello = &written[5..5 + record_len];
+        assert_eq!(&client_hello[39..71], &[0x5a; 32]);
+    }
 }
