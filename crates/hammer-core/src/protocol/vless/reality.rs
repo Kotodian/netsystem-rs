@@ -1,4 +1,5 @@
 use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use aws_lc_rs::agreement;
 use aws_lc_rs::hmac;
 
 use crate::config::{RealityOptions, RealityShortId};
@@ -82,6 +83,26 @@ pub fn seal_session_id(
     Ok(RealitySessionId(session_id))
 }
 
+pub fn seal_session_id_with_x25519_private_key(
+    options: &RealityOptions,
+    client_private_key: &[u8; 32],
+    client_random: &[u8; 32],
+    client_hello_raw: &[u8],
+    version: RealityClientVersion,
+    unix_time: u32,
+) -> HammerResult<RealitySessionId> {
+    let auth_key =
+        derive_auth_key_with_x25519_private_key(options, client_private_key, client_random)?;
+    seal_session_id(
+        options,
+        &auth_key,
+        client_random,
+        client_hello_raw,
+        version,
+        unix_time,
+    )
+}
+
 pub fn verify_temporary_certificate_signature(
     auth_key: &RealityAuthKey,
     ed25519_public_key: &[u8],
@@ -92,6 +113,29 @@ pub fn verify_temporary_certificate_signature(
     }
     let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key.as_bytes());
     hmac::verify(&key, ed25519_public_key, signature).is_ok()
+}
+
+fn derive_auth_key_with_x25519_private_key(
+    options: &RealityOptions,
+    client_private_key: &[u8; 32],
+    client_random: &[u8; 32],
+) -> HammerResult<RealityAuthKey> {
+    let private_key =
+        agreement::PrivateKey::from_private_key(&agreement::X25519, client_private_key)
+            .map_err(|_| HammerError::config_validation("Reality X25519 client private key"))?;
+    let server_public_key =
+        agreement::UnparsedPublicKey::new(&agreement::X25519, &options.public_key.0);
+    agreement::agree(
+        &private_key,
+        server_public_key,
+        HammerError::config_validation("Reality X25519 server public key"),
+        |shared_secret| {
+            let shared_secret: &[u8; 32] = shared_secret
+                .try_into()
+                .map_err(|_| HammerError::internal("Reality X25519 shared secret length"))?;
+            derive_auth_key(shared_secret, client_random)
+        },
+    )
 }
 
 fn session_id_plaintext(

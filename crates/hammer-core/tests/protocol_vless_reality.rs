@@ -3,7 +3,7 @@
 use hammer_core::config::{RealityOptions, RealityPublicKey, RealityShortId};
 use hammer_core::protocol::vless::reality::{
     RealityAuthKey, RealityClientVersion, derive_auth_key, seal_session_id,
-    verify_temporary_certificate_signature,
+    seal_session_id_with_x25519_private_key, verify_temporary_certificate_signature,
 };
 
 #[test]
@@ -46,6 +46,46 @@ fn reality_session_id_seals_version_time_short_id_with_client_hello_aad() {
         session_id.as_bytes(),
         &hex_bytes("a91644933fe88eeb9f515209b4070da78ace9f7199cb97d7ba0e8bdc080ff04f")
     );
+}
+
+#[test]
+fn reality_session_id_can_be_sealed_from_x25519_private_key() {
+    let options = RealityOptions {
+        public_key: RealityPublicKey(hex_bytes(
+            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        )),
+        short_id: RealityShortId(vec![0xaa, 0xbb]),
+    };
+    let client_private_key =
+        hex_bytes("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    let shared_secret =
+        hex_bytes("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+    let client_random = std::array::from_fn(|idx| idx as u8);
+    let mut client_hello_raw = vec![0_u8; 96];
+    client_hello_raw[39..55]
+        .copy_from_slice(&[0, 1, 0, 0, 0x65, 0, 0, 1, 0xaa, 0xbb, 0, 0, 0, 0, 0, 0]);
+    let expected_auth_key = derive_auth_key(&shared_secret, &client_random).expect("auth key");
+    let expected = seal_session_id(
+        &options,
+        &expected_auth_key,
+        &client_random,
+        &client_hello_raw,
+        RealityClientVersion::new(0, 1, 0),
+        0x6500_0001,
+    )
+    .expect("session id");
+
+    let session_id = seal_session_id_with_x25519_private_key(
+        &options,
+        &client_private_key,
+        &client_random,
+        &client_hello_raw,
+        RealityClientVersion::new(0, 1, 0),
+        0x6500_0001,
+    )
+    .expect("session id");
+
+    assert_eq!(session_id, expected);
 }
 
 #[test]
