@@ -46,6 +46,7 @@ pub(crate) struct OutboundClientTlsConfig {
     pub server_fingerprints: Vec<CertificateFingerprint>,
     pub client_auth: Option<ClientTlsAuth>,
     pub ech: Option<EchOptions>,
+    pub max_fragment_size: Option<usize>,
     #[cfg(feature = "tls-utls")]
     pub ech_retry_configs: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
     pub utls: Option<UtlsOptions>,

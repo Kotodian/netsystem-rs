@@ -78,6 +78,7 @@ impl TlsBackend for RustlsAwsLcBackend {
             builder.with_no_client_auth()
         };
         config.alpn_protocols = options.alpn_protocols;
+        config.max_fragment_size = options.max_fragment_size;
         Ok(config)
     }
 
@@ -91,5 +92,30 @@ impl TlsBackend for RustlsAwsLcBackend {
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
                 .map_err(|err| HammerError::internal(format!("quic tls config: {err}")))?,
         )))
+    }
+}
+
+#[cfg(all(test, feature = "tls-outbound"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_client_config_applies_max_fragment_size() {
+        let config = RUSTLS_AWS_LC_BACKEND
+            .outbound_client_config(OutboundClientTlsConfig {
+                platform: None,
+                insecure: true,
+                alpn_protocols: Vec::new(),
+                server_fingerprints: Vec::new(),
+                client_auth: None,
+                ech: None,
+                max_fragment_size: Some(32),
+                #[cfg(feature = "tls-utls")]
+                ech_retry_configs: None,
+                utls: None,
+            })
+            .expect("tls config");
+
+        assert_eq!(config.max_fragment_size, Some(32));
     }
 }

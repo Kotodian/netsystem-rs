@@ -45,6 +45,16 @@ fn vless_tls_options(port: u16) -> VlessOutboundOptions {
     }
 }
 
+fn vless_record_fragment_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            record_fragment: true,
+            ..vless_tls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
 fn vless_tcp_only_options(port: u16) -> VlessOutboundOptions {
     VlessOutboundOptions {
         network: vec![Network::Tcp],
@@ -248,6 +258,59 @@ async fn vless_outbound_dials_tcp_over_tls() {
     expected.push(0x01);
     expected.extend_from_slice(&[198, 51, 100, 7]);
     expected.extend_from_slice(b"hello");
+    assert_eq!(request, expected);
+}
+
+#[tokio::test]
+async fn vless_outbound_dials_tcp_over_tls_with_record_fragment() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_server_config().expect("server tls config")));
+    let expected_request_len = 1 + 16 + 1 + 1 + 2 + 1 + 4;
+    let captured = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream.write_all(b"record-fragment-reply").await.unwrap();
+        stream.shutdown().await.unwrap();
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_record_fragment_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let mut stream = outbound
+        .dial(Network::Tcp, destination, b"")
+        .await
+        .expect("dial vless tls record fragment tcp");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    assert_eq!(response, b"record-fragment-reply");
+
+    let request = captured.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&[
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ]);
+    expected.push(0x00);
+    expected.push(0x01);
+    expected.extend_from_slice(&8443_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[198, 51, 100, 7]);
     assert_eq!(request, expected);
 }
 

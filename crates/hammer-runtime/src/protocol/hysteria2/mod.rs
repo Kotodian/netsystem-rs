@@ -520,6 +520,7 @@ fn client_config(
         server_fingerprints: options.tls.server_fingerprints.clone(),
         client_auth: options.tls.client_auth.clone(),
         ech: options.tls.ech.clone(),
+        max_fragment_size: None,
         #[cfg(feature = "tls-utls")]
         ech_retry_configs,
         utls: options.tls.utls.clone(),

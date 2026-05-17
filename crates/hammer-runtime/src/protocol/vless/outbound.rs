@@ -20,6 +20,8 @@ use crate::protocol::server_tcp::ServerTcpConnector;
 use crate::socket_protector::SocketProtector;
 use crate::tls::{OutboundClientTlsConfig, outbound_client_config};
 
+const TLS_RECORD_FRAGMENT_SIZE: usize = 32;
+
 #[hammer_component_macros::hammer_component(
     outbound,
     name = "vless",
@@ -71,9 +73,9 @@ impl VlessOutbound {
                 "vless tls.reality is parsed but not supported by the runtime yet",
             ));
         }
-        if tls.fragment.is_some() || tls.record_fragment {
+        if tls.fragment.is_some() {
             return Err(HammerError::config_validation(
-                "vless tls fragmentation is parsed but not supported by the runtime yet",
+                "vless tls.fragment is parsed but not supported by the runtime yet",
             ));
         }
         Ok(())
@@ -282,6 +284,7 @@ async fn connect_tls(
         server_fingerprints: tls.server_fingerprints.clone(),
         client_auth: tls.client_auth.clone(),
         ech: tls.ech.clone(),
+        max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
         #[cfg(feature = "tls-utls")]
         ech_retry_configs: None,
         utls: tls.utls.clone(),
