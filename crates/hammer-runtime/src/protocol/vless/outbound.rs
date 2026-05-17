@@ -9,7 +9,8 @@ use hammer_core::config::{OutboundKind, VlessOutboundOptions};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::vless::{
-    VlessCommand, VlessStream, encode_request, encode_udp_packet, read_udp_packet,
+    FLOW_XTLS_RPRX_VISION, VlessCommand, VlessRequestBuilder, VlessStream, VlessStreamBuilder,
+    encode_udp_packet, read_udp_packet,
 };
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -62,10 +63,12 @@ impl VlessOutbound {
     }
 
     fn validate_runtime_options(&self) -> HammerResult<()> {
-        if self.options.flow.is_some() {
-            return Err(HammerError::config_validation(
-                "vless flow xtls-rprx-vision is parsed but not supported by the runtime yet",
-            ));
+        if let Some(flow) = self.options.flow.as_deref()
+            && flow != FLOW_XTLS_RPRX_VISION
+        {
+            return Err(HammerError::config_validation(format!(
+                "unsupported vless flow: {flow}"
+            )));
         }
         let tls = &self.options.tls;
         if tls.reality.is_some() {
@@ -118,19 +121,24 @@ impl Outbound for VlessOutbound {
             ));
         }
         self.validate_runtime_options()?;
-        let request = encode_request(
-            &self.options.uuid,
-            VlessCommand::Tcp,
-            &destination,
-            initial_payload,
-        )?;
+        let initial_payload_in_header = if is_vision_flow(&self.options) {
+            &[][..]
+        } else {
+            initial_payload
+        };
+        let request = VlessRequestBuilder::new(&self.options.uuid, VlessCommand::Tcp, &destination)
+            .optional_flow(self.options.flow.as_deref())
+            .initial_payload(initial_payload_in_header)
+            .encode()?;
         let stream = self.connector.connect("vless").await?;
         if self.options.tls.enabled {
             let stream = connect_tls(&self.connector, &self.options, stream).await?;
-            let stream = write_request_and_wrap(stream, &request).await?;
+            let stream =
+                write_request_and_wrap(stream, &self.options, &request, initial_payload).await?;
             return Ok(Box::new(stream));
         }
-        let stream = write_request_and_wrap(stream, &request).await?;
+        let stream =
+            write_request_and_wrap(stream, &self.options, &request, initial_payload).await?;
         Ok(Box::new(stream))
     }
 
@@ -208,14 +216,16 @@ impl VlessPacketConn {
             return Ok(());
         }
 
-        let request = encode_request(&self.options.uuid, VlessCommand::Udp, destination, &[])?;
+        let request = VlessRequestBuilder::new(&self.options.uuid, VlessCommand::Udp, destination)
+            .optional_flow(self.options.flow.as_deref())
+            .encode()?;
         let stream = self.connector.connect("vless udp").await?;
         let stream = if self.options.tls.enabled {
             let stream = connect_tls(&self.connector, &self.options, stream).await?;
-            let stream = write_request_and_wrap(stream, &request).await?;
+            let stream = write_request_and_wrap(stream, &self.options, &request, &[]).await?;
             VlessServerStream::Tls(stream)
         } else {
-            let stream = write_request_and_wrap(stream, &request).await?;
+            let stream = write_request_and_wrap(stream, &self.options, &request, &[]).await?;
             VlessServerStream::Plain(stream)
         };
         self.destination = Some(destination.clone());
@@ -256,7 +266,12 @@ impl ProxyPacketConn for VlessPacketConn {
     }
 }
 
-async fn write_request_and_wrap<S>(mut stream: S, request: &[u8]) -> HammerResult<VlessStream<S>>
+async fn write_request_and_wrap<S>(
+    mut stream: S,
+    options: &VlessOutboundOptions,
+    request: &[u8],
+    initial_payload: &[u8],
+) -> HammerResult<VlessStream<S>>
 where
     S: ProxyStream,
 {
@@ -264,7 +279,24 @@ where
         .write_all(request)
         .await
         .with_context(|| "vless tcp write request")?;
-    Ok(VlessStream::new(stream))
+    let mut stream = if is_vision_flow(options) {
+        VlessStreamBuilder::new(stream)
+            .vision(&options.uuid)
+            .build()
+    } else {
+        VlessStream::new(stream)
+    };
+    if is_vision_flow(options) && !initial_payload.is_empty() {
+        stream
+            .write_all(initial_payload)
+            .await
+            .with_context(|| "vless vision write initial payload")?;
+    }
+    Ok(stream)
+}
+
+fn is_vision_flow(options: &VlessOutboundOptions) -> bool {
+    options.flow.as_deref() == Some(FLOW_XTLS_RPRX_VISION)
 }
 
 async fn connect_tls(
