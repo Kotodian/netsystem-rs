@@ -67,9 +67,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 futures = "0.3"
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-quinn-btls = { version = "0.1.0", default-features = false, features = ["prefix-symbols"] }
-btls = { version = "0.5.6", default-features = false, features = ["prefix-symbols"] }
-btls-sys = { version = "0.5.6", default-features = false, features = ["prefix-symbols"] }
+quinn-btls = { version = "0.1.0", default-features = false }
+btls = { version = "0.5.6", default-features = false }
+btls-sys = { version = "0.5.6", default-features = false }
 foreign-types-shared = "0.3"
 brotli = "8.0"
 h3 = "0.0.8"
