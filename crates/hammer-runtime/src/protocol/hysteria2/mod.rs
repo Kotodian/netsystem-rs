@@ -523,6 +523,8 @@ fn client_config(
         max_fragment_size: None,
         #[cfg(feature = "tls-utls")]
         ech_retry_configs,
+        #[cfg(feature = "tls-utls")]
+        reality: None,
         utls: options.tls.utls.clone(),
     })?;
     let mut transport = quinn::TransportConfig::default();

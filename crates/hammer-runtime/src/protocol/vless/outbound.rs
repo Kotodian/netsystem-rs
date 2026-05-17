@@ -71,9 +71,27 @@ impl VlessOutbound {
         }
         let tls = &self.options.tls;
         if tls.reality.is_some() {
-            return Err(HammerError::config_validation(
-                "vless tls.reality is parsed but not supported by the runtime yet",
-            ));
+            if !tls.enabled {
+                return Err(HammerError::config_validation(
+                    "vless tls.reality requires tls.enabled",
+                ));
+            }
+            if tls.utls.is_none() {
+                return Err(HammerError::config_validation(
+                    "vless tls.reality requires tls.utls",
+                ));
+            }
+            if tls.ech.is_some() {
+                return Err(HammerError::config_validation(
+                    "vless tls.reality cannot be combined with tls.ech",
+                ));
+            }
+            #[cfg(not(feature = "tls-utls"))]
+            {
+                return Err(HammerError::config_validation(
+                    "vless tls.reality requires the hammer-runtime tls-utls feature",
+                ));
+            }
         }
         if tls.fragment.is_some() {
             return Err(HammerError::config_validation(
@@ -324,6 +342,8 @@ async fn connect_tls(
             max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
             #[cfg(feature = "tls-utls")]
             ech_retry_configs: None,
+            #[cfg(feature = "tls-utls")]
+            reality: tls.reality.clone(),
             utls: tls.utls.clone(),
         },
         server_name,

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use hammer_adapter::PlatformInterface;
+#[cfg(all(feature = "tls-outbound", feature = "tls-utls"))]
+use hammer_core::config::RealityOptions;
 #[cfg(feature = "tls-outbound")]
 use hammer_core::config::{CertificateFingerprint, ClientTlsAuth, EchOptions, UtlsOptions};
 #[cfg(all(
@@ -57,6 +59,8 @@ pub(crate) struct OutboundClientTlsConfig {
     pub max_fragment_size: Option<usize>,
     #[cfg(feature = "tls-utls")]
     pub ech_retry_configs: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
+    #[cfg(feature = "tls-utls")]
+    pub reality: Option<RealityOptions>,
     pub utls: Option<UtlsOptions>,
 }
 
@@ -119,7 +123,12 @@ pub(crate) async fn outbound_client_stream(
     server_name: ServerName<'static>,
     stream: TcpStream,
 ) -> HammerResult<TlsClientStream> {
-    if options.utls.is_some() {
+    #[cfg(feature = "tls-utls")]
+    let use_utls_backend = options.utls.is_some() || options.reality.is_some();
+    #[cfg(not(feature = "tls-utls"))]
+    let use_utls_backend = options.utls.is_some();
+
+    if use_utls_backend {
         #[cfg(feature = "tls-utls")]
         {
             return utls_backend()

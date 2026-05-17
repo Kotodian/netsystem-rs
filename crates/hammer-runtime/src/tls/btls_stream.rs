@@ -4,7 +4,7 @@ use std::task::{Context, Poll, ready};
 
 use btls::ssl::{
     Error as BtlsError, ErrorCode, HandshakeError, MidHandshakeSslStream, ShutdownResult, Ssl,
-    SslStream,
+    SslRef, SslStream,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -12,6 +12,12 @@ use tokio::net::TcpStream;
 
 pub(crate) struct BtlsClientStream {
     inner: SslStream<TokioTcpAdapter>,
+}
+
+impl BtlsClientStream {
+    pub(super) fn ssl_mut(&mut self) -> &mut SslRef {
+        self.inner.ssl_mut()
+    }
 }
 
 pub(super) async fn connect(ssl: Ssl, stream: TcpStream) -> HammerResult<BtlsClientStream> {

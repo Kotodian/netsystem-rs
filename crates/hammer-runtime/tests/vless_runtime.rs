@@ -3,15 +3,25 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "tls-utls")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "tls-utls")]
+use aws_lc_rs::agreement;
 use bytes::Bytes;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
 use hammer_core::config::{Outbound, OutboundKind, OutboundTlsOptions, VlessOutboundOptions};
 #[cfg(feature = "tls-utls")]
-use hammer_core::config::{UtlsFingerprint, UtlsOptions};
+use hammer_core::config::{
+    RealityOptions, RealityPublicKey, RealityShortId, UtlsFingerprint, UtlsOptions,
+};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_core::protocol::vless::FLOW_XTLS_RPRX_VISION;
+#[cfg(feature = "tls-utls")]
+use hammer_core::protocol::vless::reality::{
+    RealityClientVersion, derive_auth_key, seal_session_id,
+};
 use hammer_runtime::OutboundManager;
 use rustls::pki_types::PrivateKeyDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,6 +84,27 @@ fn vless_utls_options(port: u16) -> VlessOutboundOptions {
             ..Default::default()
         },
         ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+fn vless_reality_utls_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            reality: Some(test_reality_options()),
+            ..vless_utls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+fn test_reality_options() -> RealityOptions {
+    RealityOptions {
+        public_key: RealityPublicKey(hex_bytes(
+            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        )),
+        short_id: RealityShortId(vec![0x0a, 0x0b]),
     }
 }
 
@@ -437,6 +468,43 @@ async fn vless_outbound_dials_tcp_over_utls() {
     assert_eq!(request, expected);
 }
 
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
+async fn vless_reality_over_utls_seals_client_hello_session_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut record_header = [0_u8; 5];
+        stream.read_exact(&mut record_header).await.unwrap();
+        assert_eq!(record_header[0], 22, "first TLS record must be handshake");
+        let record_len = usize::from(u16::from_be_bytes([record_header[3], record_header[4]]));
+        let mut client_hello = vec![0_u8; record_len];
+        stream.read_exact(&mut client_hello).await.unwrap();
+        client_hello
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_utls_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let _ = outbound.dial(Network::Tcp, destination, b"").await;
+    let client_hello = tokio::time::timeout(Duration::from_secs(2), captured)
+        .await
+        .expect("client hello captured")
+        .unwrap();
+
+    assert_reality_session_id(&client_hello);
+}
+
 #[tokio::test]
 async fn vless_outbound_dials_tcp_over_tls_with_record_fragment() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -566,4 +634,132 @@ fn tls_server_config() -> HammerResult<rustls::ServerConfig> {
         PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
     )
     .map_err(|err| HammerError::internal(format!("server certificate: {err}")))
+}
+
+#[cfg(feature = "tls-utls")]
+fn assert_reality_session_id(client_hello: &[u8]) {
+    assert_eq!(client_hello[0], 1, "handshake message must be ClientHello");
+    let client_random: [u8; 32] = client_hello[6..38].try_into().unwrap();
+    let session_id_offset = 39;
+    assert_eq!(
+        client_hello[38], 32,
+        "Reality requires a 32-byte session id"
+    );
+    let session_id = &client_hello[session_id_offset..session_id_offset + 32];
+    let client_public_key = x25519_key_share_from_client_hello(client_hello);
+    let mut aad = client_hello.to_vec();
+    aad[session_id_offset..session_id_offset + 32].fill(0);
+
+    let server_private_key = agreement::PrivateKey::from_private_key(
+        &agreement::X25519,
+        &hex_bytes::<32>("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"),
+    )
+    .expect("server x25519 private key");
+    let client_public_key =
+        agreement::UnparsedPublicKey::new(&agreement::X25519, client_public_key);
+    let auth_key = agreement::agree(
+        &server_private_key,
+        client_public_key,
+        HammerError::internal("server/client x25519 agreement"),
+        |shared_secret| {
+            let shared_secret: &[u8; 32] = shared_secret.try_into().unwrap();
+            derive_auth_key(shared_secret, &client_random)
+        },
+    )
+    .expect("Reality auth key");
+
+    let unix_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let mut matched = false;
+    for candidate_time in unix_time.saturating_sub(3)..=unix_time.saturating_add(3) {
+        let expected = seal_session_id(
+            &test_reality_options(),
+            &auth_key,
+            &client_random,
+            &aad,
+            RealityClientVersion::new(0, 1, 0),
+            candidate_time,
+        )
+        .expect("Reality session id");
+        if expected.as_bytes() == session_id {
+            matched = true;
+            break;
+        }
+    }
+
+    assert!(
+        matched,
+        "ClientHello session id is not a valid Reality seal"
+    );
+}
+
+#[cfg(feature = "tls-utls")]
+fn x25519_key_share_from_client_hello(client_hello: &[u8]) -> &[u8] {
+    let mut offset = 4 + 2 + 32;
+    let session_id_len = usize::from(client_hello[offset]);
+    offset += 1 + session_id_len;
+    let cipher_suites_len = usize::from(u16::from_be_bytes([
+        client_hello[offset],
+        client_hello[offset + 1],
+    ]));
+    offset += 2 + cipher_suites_len;
+    let compression_methods_len = usize::from(client_hello[offset]);
+    offset += 1 + compression_methods_len;
+    let extensions_len = usize::from(u16::from_be_bytes([
+        client_hello[offset],
+        client_hello[offset + 1],
+    ]));
+    offset += 2;
+    let extensions_end = offset + extensions_len;
+    while offset < extensions_end {
+        let extension_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
+        let extension_len = usize::from(u16::from_be_bytes([
+            client_hello[offset + 2],
+            client_hello[offset + 3],
+        ]));
+        offset += 4;
+        if extension_type == 51 {
+            let mut share_offset = offset + 2;
+            let share_end = offset + extension_len;
+            while share_offset < share_end {
+                let group = u16::from_be_bytes([
+                    client_hello[share_offset],
+                    client_hello[share_offset + 1],
+                ]);
+                let key_len = usize::from(u16::from_be_bytes([
+                    client_hello[share_offset + 2],
+                    client_hello[share_offset + 3],
+                ]));
+                share_offset += 4;
+                if group == 0x001d && key_len == 32 {
+                    return &client_hello[share_offset..share_offset + key_len];
+                }
+                share_offset += key_len;
+            }
+        }
+        offset += extension_len;
+    }
+    panic!("ClientHello did not include an X25519 key share");
+}
+
+#[cfg(feature = "tls-utls")]
+fn hex_bytes<const N: usize>(hex: &str) -> [u8; N] {
+    assert_eq!(hex.len(), N * 2);
+    let mut bytes = [0_u8; N];
+    for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        bytes[index] = (hex_nibble(chunk[0]) << 4) | hex_nibble(chunk[1]);
+    }
+    bytes
+}
+
+#[cfg(feature = "tls-utls")]
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("invalid hex byte"),
+    }
 }

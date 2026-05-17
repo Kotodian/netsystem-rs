@@ -13,22 +13,26 @@ use btls::hash::MessageDigest;
 use btls::pkey::PKey;
 use btls::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl, SslConnector,
-    SslConnectorBuilder, SslMethod, SslVerifyMode,
+    SslConnectorBuilder, SslMethod, SslRef, SslVerifyMode,
 };
 use btls::x509::{X509, X509StoreContext, X509StoreContextRef};
-use foreign_types_shared::ForeignType;
+use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use hammer_adapter::PlatformInterface;
 use hammer_core::config::{
-    CertificateFingerprint, CertificateFingerprintAlgorithm, ClientTlsAuth, UtlsFingerprint,
-    UtlsOptions,
+    CertificateFingerprint, CertificateFingerprintAlgorithm, ClientTlsAuth, RealityOptions,
+    UtlsFingerprint, UtlsOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::protocol::vless::reality::{
+    RealityClientVersion, seal_session_id_with_x25519_private_key,
+};
 use quinn_btls::QuicSslContext;
 #[cfg(feature = "tls-outbound-stream")]
 use rustls::pki_types::ServerName;
-use std::ffi::CString;
+use std::ffi::{CString, c_int, c_void};
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "tls-outbound-stream")]
 use tokio::net::TcpStream;
 
@@ -36,6 +40,7 @@ use tokio::net::TcpStream;
 pub(super) struct BtlsUtlsBackend;
 
 pub(super) static BTLS_UTLS_BACKEND: BtlsUtlsBackend = BtlsUtlsBackend;
+const REALITY_CLIENT_VERSION: RealityClientVersion = RealityClientVersion::new(0, 1, 0);
 
 #[async_trait]
 impl TlsBackend for BtlsUtlsBackend {
@@ -103,7 +108,17 @@ impl TlsBackend for BtlsUtlsBackend {
         connection_profile
             .apply_to_ssl(&mut ssl)
             .map_err(|err| HammerError::config_validation(format!("tls.utls connection: {err}")))?;
-        let stream = super::btls_stream::connect(ssl, stream).await?;
+        let mut reality_patch = options
+            .reality
+            .clone()
+            .map(|reality| Box::new(RealityClientHelloPatch::new(reality)));
+        if let Some(patch) = reality_patch.as_deref_mut() {
+            install_reality_client_hello_callback(&mut ssl, patch);
+        }
+        let mut stream = super::btls_stream::connect(ssl, stream).await?;
+        if reality_patch.is_some() {
+            clear_reality_client_hello_callback(stream.ssl_mut());
+        }
         Ok(TlsClientStream::Btls(stream))
     }
 
@@ -406,6 +421,103 @@ impl UtlsConnectionProfile {
             }
         }
         Ok(())
+    }
+}
+
+struct RealityClientHelloPatch {
+    options: RealityOptions,
+    version: RealityClientVersion,
+}
+
+impl RealityClientHelloPatch {
+    fn new(options: RealityOptions) -> Self {
+        Self {
+            options,
+            version: REALITY_CLIENT_VERSION,
+        }
+    }
+}
+
+fn install_reality_client_hello_callback(ssl: &mut Ssl, patch: &mut RealityClientHelloPatch) {
+    unsafe {
+        btls_sys::SSL_set_reality_client_hello_callback(
+            ssl.as_ptr(),
+            Some(reality_client_hello_callback),
+            (patch as *mut RealityClientHelloPatch).cast(),
+        );
+    }
+}
+
+fn clear_reality_client_hello_callback(ssl: &mut SslRef) {
+    unsafe {
+        btls_sys::SSL_set_reality_client_hello_callback(ssl.as_ptr(), None, std::ptr::null_mut());
+    }
+}
+
+extern "C" fn reality_client_hello_callback(
+    _ssl: *mut btls_sys::SSL,
+    out_session_id: *mut u8,
+    client_random: *const u8,
+    client_random_len: usize,
+    private_key: *const u8,
+    private_key_len: usize,
+    client_hello: *const u8,
+    client_hello_len: usize,
+    session_id_offset: usize,
+    arg: *mut c_void,
+) -> c_int {
+    let session_id_end = match session_id_offset.checked_add(32) {
+        Some(end) => end,
+        None => return 0,
+    };
+    if out_session_id.is_null()
+        || client_random.is_null()
+        || client_random_len != 32
+        || private_key.is_null()
+        || private_key_len != 32
+        || client_hello.is_null()
+        || session_id_end > client_hello_len
+        || arg.is_null()
+    {
+        return 0;
+    }
+
+    let patch = unsafe { &*(arg.cast::<RealityClientHelloPatch>()) };
+    let client_random = unsafe { std::slice::from_raw_parts(client_random, client_random_len) };
+    let private_key = unsafe { std::slice::from_raw_parts(private_key, private_key_len) };
+    let client_hello = unsafe { std::slice::from_raw_parts(client_hello, client_hello_len) };
+    let client_random: &[u8; 32] = match client_random.try_into() {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let private_key: &[u8; 32] = match private_key.try_into() {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    let mut aad = client_hello.to_vec();
+    aad[session_id_offset..session_id_end].fill(0);
+    let unix_time = current_unix_time_u32();
+    let session_id = match seal_session_id_with_x25519_private_key(
+        &patch.options,
+        private_key,
+        client_random,
+        &aad,
+        patch.version,
+        unix_time,
+    ) {
+        Ok(value) => value,
+        Err(_) => return 0,
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(session_id.as_bytes().as_ptr(), out_session_id, 32);
+    }
+    1
+}
+
+fn current_unix_time_u32() -> u32 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => u32::try_from(duration.as_secs()).unwrap_or(u32::MAX),
+        Err(_) => 0,
     }
 }
 

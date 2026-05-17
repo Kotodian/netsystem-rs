@@ -145,6 +145,7 @@ lru = { workspace = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 
 [dev-dependencies]
+aws-lc-rs = { workspace = true }
 indoc = { workspace = true }
 rcgen = { workspace = true }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based

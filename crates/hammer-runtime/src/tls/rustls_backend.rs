@@ -137,6 +137,8 @@ mod tests {
                 max_fragment_size: Some(32),
                 #[cfg(feature = "tls-utls")]
                 ech_retry_configs: None,
+                #[cfg(feature = "tls-utls")]
+                reality: None,
                 utls: None,
             })
             .expect("tls config");
