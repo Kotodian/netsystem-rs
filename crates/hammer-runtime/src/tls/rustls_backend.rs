@@ -98,7 +98,7 @@ impl TlsBackend for RustlsAwsLcBackend {
         options: OutboundClientTlsConfig,
         server_name: ServerName<'static>,
         stream: TcpStream,
-    ) -> HammerResult<TlsClientStream<TcpStream>> {
+    ) -> HammerResult<TlsClientStream> {
         let config = self.outbound_client_config(options)?;
         let stream = TlsConnector::from(std::sync::Arc::new(config))
             .connect(server_name, stream)

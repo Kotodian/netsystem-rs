@@ -159,7 +159,7 @@ impl Outbound for VlessOutbound {
 
 enum VlessServerStream {
     Plain(VlessStream<TcpStream>),
-    Tls(VlessStream<TlsClientStream<TcpStream>>),
+    Tls(VlessStream<TlsClientStream>),
 }
 
 impl AsyncRead for VlessServerStream {
@@ -302,7 +302,7 @@ async fn connect_tls(
     connector: &ServerTcpConnector,
     options: &VlessOutboundOptions,
     stream: TcpStream,
-) -> HammerResult<TlsClientStream<TcpStream>> {
+) -> HammerResult<TlsClientStream> {
     let tls = &options.tls;
     let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|_| {
         HammerError::config_validation(

@@ -11,12 +11,16 @@ use crate::tls::backend::TlsBackend;
 use async_trait::async_trait;
 use btls::hash::MessageDigest;
 use btls::pkey::PKey;
-use btls::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl};
+use btls::ssl::{
+    CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl, SslConnector,
+    SslConnectorBuilder, SslMethod, SslVerifyMode,
+};
 use btls::x509::{X509, X509StoreContext, X509StoreContextRef};
 use foreign_types_shared::ForeignType;
 use hammer_adapter::PlatformInterface;
 use hammer_core::config::{
-    CertificateFingerprint, CertificateFingerprintAlgorithm, UtlsFingerprint, UtlsOptions,
+    CertificateFingerprint, CertificateFingerprintAlgorithm, ClientTlsAuth, UtlsFingerprint,
+    UtlsOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use quinn_btls::QuicSslContext;
@@ -68,13 +72,39 @@ impl TlsBackend for BtlsUtlsBackend {
         options: OutboundClientTlsConfig,
         server_name: ServerName<'static>,
         stream: TcpStream,
-    ) -> HammerResult<TlsClientStream<TcpStream>> {
-        if let Some(utls) = &options.utls {
-            return Err(unsupported_for_rustls(utls));
-        }
-        super::rustls_backend::RUSTLS_AWS_LC_BACKEND
-            .outbound_client_stream(options, server_name, stream)
-            .await
+    ) -> HammerResult<TlsClientStream> {
+        let utls = options.utls.as_ref().ok_or_else(|| {
+            HammerError::config_validation("tls.utls is required for the BoringSSL uTLS backend")
+        })?;
+        let ech_config_list = options
+            .ech
+            .as_ref()
+            .map(btls_tcp_ech_config_list)
+            .transpose()?;
+        let connector = new_utls_tcp_connector(
+            utls,
+            options.insecure,
+            &options.server_fingerprints,
+            ech_config_list.is_some(),
+            &options.alpn_protocols,
+            options.platform,
+            options.client_auth,
+        )?;
+        let mut config = connector
+            .configure()
+            .map_err(|err| HammerError::internal(format!("btls tls configure: {err}")))?;
+        config.set_verify_hostname(!options.insecure);
+        let server_name = server_name.to_str();
+        let mut ssl = config
+            .into_ssl(server_name.as_ref())
+            .map_err(|err| HammerError::internal(format!("btls tls ssl: {err}")))?;
+        let connection_profile =
+            utls_connection_profile(utls, &options.alpn_protocols, ech_config_list);
+        connection_profile
+            .apply_to_ssl(&mut ssl)
+            .map_err(|err| HammerError::config_validation(format!("tls.utls connection: {err}")))?;
+        let stream = super::btls_stream::connect(ssl, stream).await?;
+        Ok(TlsClientStream::Btls(stream))
     }
 
     #[cfg(feature = "tls-quic")]
@@ -126,6 +156,15 @@ fn btls_ech_config_list(ech: &hammer_core::config::EchOptions) -> HammerResult<V
     super::ech::ech_config_list_bytes(ech)
 }
 
+fn btls_tcp_ech_config_list(ech: &hammer_core::config::EchOptions) -> HammerResult<Vec<u8>> {
+    if ech.pq_signature_schemes_enabled {
+        return Err(HammerError::config_validation(
+            "tls.ech.pq_signature_schemes_enabled is parsed but not supported by the BoringSSL uTLS backend",
+        ));
+    }
+    super::ech::ech_config_list_bytes(ech)
+}
+
 fn new_utls_client_config(
     options: &UtlsOptions,
     insecure: bool,
@@ -153,6 +192,41 @@ fn new_utls_client_config(
         quinn_btls::ClientConfig::new()
     };
     result.map_err(|err| HammerError::internal(format!("btls quic client config: {err}")))
+}
+
+fn new_utls_tcp_connector(
+    options: &UtlsOptions,
+    insecure: bool,
+    server_fingerprints: &[CertificateFingerprint],
+    ech_enabled: bool,
+    alpn_protocols: &[Vec<u8>],
+    platform: Option<Arc<dyn PlatformInterface>>,
+    client_auth: Option<ClientTlsAuth>,
+) -> HammerResult<SslConnector> {
+    let profile = UtlsProfile::for_fingerprint(options.fingerprint);
+    let mut builder = SslConnector::builder(SslMethod::tls())
+        .map_err(|err| HammerError::internal(format!("btls connector builder: {err}")))?;
+    apply_utls_context_profile(builder.as_ptr(), &profile, options)?;
+    if profile.certificate_compression {
+        builder
+            .add_certificate_compression_algorithm(BrotliCertificateDecompressor)
+            .map_err(|err| {
+                HammerError::config_validation(format!(
+                    "tls.utls fingerprint {} certificate compression: {err}",
+                    fingerprint_name(options.fingerprint),
+                ))
+            })?;
+    }
+    configure_tcp_server_verification(&mut builder, insecure, server_fingerprints, ech_enabled);
+    add_platform_roots_to_builder(&mut builder, platform)?;
+    configure_tcp_client_auth(&mut builder, client_auth)?;
+    let alpn = encode_alpn_protocols(alpn_protocols)?;
+    if !alpn.is_empty() {
+        builder
+            .set_alpn_protos(&alpn)
+            .map_err(|err| HammerError::config_validation(format!("tls ALPN: {err}")))?;
+    }
+    Ok(builder.build())
 }
 
 fn verify_btls_server_certificate(
@@ -216,8 +290,17 @@ fn apply_utls_profile(
     ech_config_list: Option<Vec<u8>>,
 ) -> HammerResult<()> {
     let profile = UtlsProfile::for_fingerprint(options.fingerprint);
-    let ctx = crypto.ctx_mut();
-    let ctx = ctx.as_ptr();
+    apply_utls_context_profile(crypto.ctx_mut().as_ptr(), &profile, options)?;
+    let connection_profile = utls_connection_profile(options, alpn_protocols, ech_config_list);
+    crypto.set_ssl_config_callback(move |ssl| connection_profile.apply(ssl));
+    Ok(())
+}
+
+fn apply_utls_context_profile(
+    ctx: *mut btls_sys::SSL_CTX,
+    profile: &UtlsProfile,
+    options: &UtlsOptions,
+) -> HammerResult<()> {
     unsafe {
         cvt_btls(
             btls_sys::SSL_CTX_set_min_proto_version(ctx, btls_sys::TLS1_3_VERSION as u16),
@@ -270,16 +353,23 @@ fn apply_utls_profile(
             btls_sys::SSL_CTX_enable_ocsp_stapling(ctx);
         }
     }
-    let connection_profile = UtlsConnectionProfile {
+    Ok(())
+}
+
+fn utls_connection_profile(
+    options: &UtlsOptions,
+    alpn_protocols: &[Vec<u8>],
+    ech_config_list: Option<Vec<u8>>,
+) -> UtlsConnectionProfile {
+    let profile = UtlsProfile::for_fingerprint(options.fingerprint);
+    UtlsConnectionProfile {
         key_shares: profile.key_shares,
         ech_grease: profile.ech_grease,
         alps: profile.alps,
         alps_new_codepoint: profile.alps_new_codepoint,
         alpn_protocols: alpn_protocols.to_vec(),
         ech_config_list,
-    };
-    crypto.set_ssl_config_callback(move |ssl| connection_profile.apply(ssl));
-    Ok(())
+    }
 }
 
 struct UtlsConnectionProfile {
@@ -293,13 +383,15 @@ struct UtlsConnectionProfile {
 
 impl UtlsConnectionProfile {
     fn apply(&self, ssl: &mut Ssl) -> quinn_btls::Result<()> {
+        self.apply_to_ssl(ssl).map_err(quinn_btls::Error::from)
+    }
+
+    fn apply_to_ssl(&self, ssl: &mut Ssl) -> Result<(), btls::error::ErrorStack> {
         if !self.key_shares.is_empty() {
-            ssl.set_client_key_shares(self.key_shares)
-                .map_err(quinn_btls::Error::from)?;
+            ssl.set_client_key_shares(self.key_shares)?;
         }
         if let Some(ech_config_list) = &self.ech_config_list {
-            ssl.set_ech_config_list(ech_config_list)
-                .map_err(quinn_btls::Error::from)?;
+            ssl.set_ech_config_list(ech_config_list)?;
         } else if self.ech_grease {
             ssl.set_enable_ech_grease(true);
         }
@@ -310,8 +402,7 @@ impl UtlsConnectionProfile {
                 .iter()
                 .filter(|protocol| !protocol.is_empty())
             {
-                ssl.add_application_settings(protocol)
-                    .map_err(quinn_btls::Error::from)?;
+                ssl.add_application_settings(protocol)?;
             }
         }
         Ok(())
@@ -375,6 +466,19 @@ fn add_platform_roots(
     Ok(())
 }
 
+fn add_platform_roots_to_builder(
+    builder: &mut SslConnectorBuilder,
+    platform: Option<Arc<dyn PlatformInterface>>,
+) -> HammerResult<()> {
+    for certificate in platform_root_certificates(platform) {
+        let cert = X509::from_der(certificate.as_ref()).map_err(|err| {
+            HammerError::config_validation(format!("tls root certificate: {err}"))
+        })?;
+        let _ = builder.cert_store_mut().add_cert(&cert);
+    }
+    Ok(())
+}
+
 fn configure_server_verification(
     crypto: &mut quinn_btls::ClientConfig,
     insecure: bool,
@@ -382,6 +486,26 @@ fn configure_server_verification(
 ) -> HammerResult<()> {
     crypto.verify_peer(!insecure || !server_fingerprints.is_empty());
     Ok(())
+}
+
+fn configure_tcp_server_verification(
+    builder: &mut SslConnectorBuilder,
+    insecure: bool,
+    server_fingerprints: &[CertificateFingerprint],
+    ech_enabled: bool,
+) {
+    let verify_peer = !insecure || !server_fingerprints.is_empty();
+    if !server_fingerprints.is_empty() || (ech_enabled && !insecure) {
+        let server_fingerprints = server_fingerprints.to_vec();
+        builder.set_cert_verify_callback(move |x509| {
+            verify_btls_server_certificate(x509, insecure, &server_fingerprints)
+        });
+    }
+    builder.set_verify(if verify_peer {
+        SslVerifyMode::PEER
+    } else {
+        SslVerifyMode::NONE
+    });
 }
 
 fn configure_client_auth(
@@ -426,6 +550,56 @@ fn configure_client_auth(
         .check_private_key()
         .map_err(|err| HammerError::config_validation(format!("tls client key: {err}")))?;
     Ok(())
+}
+
+fn configure_tcp_client_auth(
+    builder: &mut SslConnectorBuilder,
+    auth: Option<ClientTlsAuth>,
+) -> HammerResult<()> {
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    let (certificates, key) = load_client_auth(auth)?;
+    let mut certificates = certificates.into_iter();
+    let first = certificates.next().ok_or_else(|| {
+        HammerError::config_validation("tls client certificate chain must not be empty")
+    })?;
+    let first = X509::from_der(first.as_ref()).map_err(|err| {
+        HammerError::config_validation(format!("parse tls client certificate: {err}"))
+    })?;
+    builder
+        .set_certificate(&first)
+        .map_err(|err| HammerError::config_validation(format!("tls client certificate: {err}")))?;
+    for certificate in certificates {
+        let certificate = X509::from_der(certificate.as_ref()).map_err(|err| {
+            HammerError::config_validation(format!("parse tls client certificate chain: {err}"))
+        })?;
+        builder.add_extra_chain_cert(certificate).map_err(|err| {
+            HammerError::config_validation(format!("tls client certificate chain: {err}"))
+        })?;
+    }
+    let key = PKey::private_key_from_der(key.secret_der())
+        .or_else(|_| PKey::private_key_from_pkcs8(key.secret_der()))
+        .map_err(|err| HammerError::config_validation(format!("parse tls client key: {err}")))?;
+    builder
+        .set_private_key(&key)
+        .map_err(|err| HammerError::config_validation(format!("tls client key: {err}")))?;
+    builder
+        .check_private_key()
+        .map_err(|err| HammerError::config_validation(format!("tls client key: {err}")))?;
+    Ok(())
+}
+
+fn encode_alpn_protocols(protocols: &[Vec<u8>]) -> HammerResult<Vec<u8>> {
+    let mut encoded = Vec::new();
+    for protocol in protocols.iter().filter(|protocol| !protocol.is_empty()) {
+        let len = u8::try_from(protocol.len()).map_err(|_| {
+            HammerError::config_validation("tls ALPN protocol name must be at most 255 bytes")
+        })?;
+        encoded.push(len);
+        encoded.extend_from_slice(protocol);
+    }
+    Ok(encoded)
 }
 
 struct UtlsProfile {

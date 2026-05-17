@@ -7,6 +7,8 @@ use std::time::Instant;
 use bytes::Bytes;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
 use hammer_core::config::{Outbound, OutboundKind, OutboundTlsOptions, VlessOutboundOptions};
+#[cfg(feature = "tls-utls")]
+use hammer_core::config::{UtlsFingerprint, UtlsOptions};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_core::protocol::vless::FLOW_XTLS_RPRX_VISION;
@@ -53,6 +55,22 @@ fn vless_vision_options(port: u16) -> VlessOutboundOptions {
             enabled: true,
             server_name: "localhost".to_owned(),
             insecure: true,
+            ..Default::default()
+        },
+        ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+fn vless_utls_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            enabled: true,
+            server_name: "localhost".to_owned(),
+            insecure: true,
+            utls: Some(UtlsOptions {
+                fingerprint: UtlsFingerprint::Chrome,
+            }),
             ..Default::default()
         },
         ..vless_options(port)
@@ -361,6 +379,61 @@ async fn vless_outbound_dials_tcp_with_vision_body_codec() {
     expected.push(0x02);
     expected.push("example.com".len() as u8);
     expected.extend_from_slice(b"example.com");
+    assert_eq!(request, expected);
+}
+
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
+async fn vless_outbound_dials_tcp_over_utls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(Arc::new(tls_server_config().expect("server tls config")));
+    let expected_request_len = 1 + 16 + 1 + 1 + 2 + 1 + 4 + "hello".len();
+    let captured = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream.write_all(b"utls-reply").await.unwrap();
+        stream.shutdown().await.unwrap();
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_utls_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let mut stream = outbound
+        .dial(Network::Tcp, destination, b"hello")
+        .await
+        .expect("dial vless utls tcp");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    assert_eq!(response, b"utls-reply");
+
+    let request = captured.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&[
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ]);
+    expected.push(0x00);
+    expected.push(0x01);
+    expected.extend_from_slice(&8443_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[198, 51, 100, 7]);
+    expected.extend_from_slice(b"hello");
     assert_eq!(request, expected);
 }
 

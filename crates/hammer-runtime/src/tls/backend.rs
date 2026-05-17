@@ -36,7 +36,7 @@ pub(super) trait TlsBackend: Sync {
         options: OutboundClientTlsConfig,
         server_name: ServerName<'static>,
         stream: TcpStream,
-    ) -> HammerResult<TlsClientStream<TcpStream>>;
+    ) -> HammerResult<TlsClientStream>;
 
     #[cfg(feature = "tls-quic")]
     fn outbound_quic_client_config(

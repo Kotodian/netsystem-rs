@@ -1,6 +1,8 @@
 mod backend;
 #[cfg(feature = "tls-utls")]
 mod btls_backend;
+#[cfg(all(feature = "tls-utls", feature = "tls-outbound-stream"))]
+mod btls_stream;
 mod client;
 #[cfg(feature = "tls-outbound")]
 mod ech;

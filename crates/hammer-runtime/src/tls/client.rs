@@ -61,15 +61,14 @@ pub(crate) struct OutboundClientTlsConfig {
 }
 
 #[cfg(feature = "tls-outbound-stream")]
-pub(crate) enum TlsClientStream<S> {
-    Rustls(tokio_rustls::client::TlsStream<S>),
+pub(crate) enum TlsClientStream {
+    Rustls(tokio_rustls::client::TlsStream<TcpStream>),
+    #[cfg(feature = "tls-utls")]
+    Btls(super::btls_stream::BtlsClientStream),
 }
 
 #[cfg(feature = "tls-outbound-stream")]
-impl<S> AsyncRead for TlsClientStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+impl AsyncRead for TlsClientStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -77,15 +76,14 @@ where
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
+            #[cfg(feature = "tls-utls")]
+            Self::Btls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
 }
 
 #[cfg(feature = "tls-outbound-stream")]
-impl<S> AsyncWrite for TlsClientStream<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+impl AsyncWrite for TlsClientStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -93,18 +91,24 @@ where
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
+            #[cfg(feature = "tls-utls")]
+            Self::Btls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
+            #[cfg(feature = "tls-utls")]
+            Self::Btls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_shutdown(cx),
+            #[cfg(feature = "tls-utls")]
+            Self::Btls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
 }
@@ -114,7 +118,7 @@ pub(crate) async fn outbound_client_stream(
     options: OutboundClientTlsConfig,
     server_name: ServerName<'static>,
     stream: TcpStream,
-) -> HammerResult<TlsClientStream<TcpStream>> {
+) -> HammerResult<TlsClientStream> {
     if options.utls.is_some() {
         #[cfg(feature = "tls-utls")]
         {
