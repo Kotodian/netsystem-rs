@@ -16,8 +16,8 @@ use hammer_adapter::{
     Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
 };
 use hammer_core::config::{
-    EchConfigList, EchConfigSource, Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType,
-    Hysteria2OutboundOptions, OutboundKind, OutboundTlsOptions,
+    Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions, OutboundKind,
+    OutboundTlsOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
@@ -25,6 +25,10 @@ use hammer_core::protocol::congestion::BbrProfile;
 use http::Request;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
+
+use crate::tls::{
+    EchRetryConfigStore, apply_ech_retry_config, ech_retry_config_store, take_ech_retry_configs,
+};
 
 mod outbound;
 pub use hammer_core::protocol::hysteria2::{obfs, protocol};
@@ -143,7 +147,7 @@ async fn connect_with_timeout(
     let address = resolve_server(&options.server, options.server_port).await?;
     debug!("hysteria2 resolved server {server} -> {address}");
     let congestion = CongestionControlHandle::default();
-    let ech_retry_configs = ech_retry_config_store(&options);
+    let ech_retry_configs = ech_retry_config_store(&options.tls.ech);
     let mut endpoint = client_endpoint(
         &options,
         address,
@@ -179,7 +183,7 @@ async fn connect_with_timeout(
                 return Err(err);
             };
             debug!("hysteria2 retrying with ECH retry config server_name={server_name}");
-            apply_hysteria2_ech_retry_config(&mut options, retry_configs);
+            apply_ech_retry_config(&mut options.tls.ech, retry_configs);
             endpoint = client_endpoint(&options, address, congestion.clone(), None)?;
             connect_quic_with_timeout(&endpoint, address, &server_name, connect_timeout, &context)
                 .await?
@@ -464,7 +468,7 @@ fn client_endpoint(
     options: &ClientOptions,
     server_addr: SocketAddr,
     congestion: CongestionControlHandle,
-    ech_retry_configs: Option<Arc<StdMutex<Option<Vec<u8>>>>>,
+    ech_retry_configs: Option<EchRetryConfigStore>,
 ) -> HammerResult<quinn::Endpoint> {
     validate_hysteria2_tls_options(&options.tls)?;
     let bind_addr = if server_addr.is_ipv6() {
@@ -499,9 +503,9 @@ fn client_endpoint(
 fn client_config(
     options: &ClientOptions,
     congestion: CongestionControlHandle,
-    ech_retry_configs: Option<Arc<StdMutex<Option<Vec<u8>>>>>,
+    ech_retry_configs: Option<EchRetryConfigStore>,
 ) -> HammerResult<quinn::ClientConfig> {
-    #[cfg(not(feature = "tls-utls"))]
+    #[cfg(not(feature = "tls-utls-stream"))]
     let _ = &ech_retry_configs;
     let alpn_protocols = if options.tls.alpn.is_empty() {
         vec![b"h3".to_vec()]
@@ -523,7 +527,7 @@ fn client_config(
         max_fragment_size: None,
         #[cfg(feature = "tls-outbound-stream")]
         fragment: None,
-        #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
+        #[cfg(feature = "tls-utls-stream")]
         ech_retry_configs,
         #[cfg(feature = "tls-utls-stream")]
         reality: None,
@@ -594,48 +598,11 @@ fn validate_hysteria2_tls_options(tls: &OutboundTlsOptions) -> HammerResult<()> 
 }
 
 async fn resolve_hysteria2_ech_config(options: &mut ClientOptions) -> HammerResult<()> {
-    if !matches!(
-        options
-            .tls
-            .ech
-            .as_ref()
-            .and_then(|ech| ech.config_source.as_ref()),
-        Some(EchConfigSource::DnsHttpsRecord)
-    ) {
-        return Ok(());
-    }
-
     let server_name = effective_server_name(options).to_owned();
-    let config = crate::tls::resolve_dns_https_ech_config_list(&server_name).await?;
-    debug!("hysteria2 resolved ECH config from HTTPS record server_name={server_name}");
-    if let Some(ech) = options.tls.ech.as_mut() {
-        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(config)));
+    if crate::tls::resolve_dns_https_ech_config(&mut options.tls.ech, &server_name).await? {
+        debug!("hysteria2 resolved ECH config from HTTPS record server_name={server_name}");
     }
     Ok(())
-}
-
-#[cfg(feature = "tls-utls")]
-fn ech_retry_config_store(options: &ClientOptions) -> Option<Arc<StdMutex<Option<Vec<u8>>>>> {
-    options
-        .tls
-        .ech
-        .as_ref()
-        .map(|_| Arc::new(StdMutex::new(None)))
-}
-
-#[cfg(not(feature = "tls-utls"))]
-fn ech_retry_config_store(_: &ClientOptions) -> Option<Arc<StdMutex<Option<Vec<u8>>>>> {
-    None
-}
-
-fn take_ech_retry_configs(store: &Option<Arc<StdMutex<Option<Vec<u8>>>>>) -> Option<Vec<u8>> {
-    store.as_ref().and_then(|store| store.lock().ok()?.take())
-}
-
-fn apply_hysteria2_ech_retry_config(options: &mut ClientOptions, retry_configs: Vec<u8>) {
-    if let Some(ech) = options.tls.ech.as_mut() {
-        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(retry_configs)));
-    }
 }
 
 fn effective_server_name(options: &ClientOptions) -> &str {

@@ -30,5 +30,9 @@ pub(crate) use client::safe_default_client_config;
 pub(crate) use client::tls13_client_config;
 #[cfg(feature = "tls-outbound-stream")]
 pub(crate) use client::{TlsClientStream, outbound_client_stream};
-#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
-pub(crate) use ech::resolve_dns_https_ech_config_list;
+#[cfg(any(feature = "outbound-hysteria2", feature = "outbound-vless"))]
+pub(crate) use ech::resolve_dns_https_ech_config;
+#[cfg(feature = "tls-outbound")]
+pub(crate) use ech::{
+    EchRetryConfigStore, apply_ech_retry_config, ech_retry_config_store, take_ech_retry_configs,
+};

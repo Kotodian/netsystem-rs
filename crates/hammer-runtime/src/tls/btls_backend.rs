@@ -146,7 +146,8 @@ impl TlsBackend for BtlsUtlsBackend {
             install_reality_client_hello_callback(&mut ssl, patch);
         }
         let stream = FragmentedTcpStream::new(stream, options.fragment.clone())?;
-        let mut stream = super::btls_stream::connect(ssl, stream).await?;
+        let mut stream =
+            super::btls_stream::connect(ssl, stream, options.ech_retry_configs.clone()).await?;
         if reality_patch.is_some() {
             clear_reality_client_hello_callback(stream.ssl_mut());
         }

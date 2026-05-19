@@ -541,6 +541,41 @@ async fn vless_outbound_dials_tcp_over_utls() {
 
 #[cfg(feature = "tls-utls-stream")]
 #[tokio::test]
+async fn vless_ech_dns_https_lookup_validates_server_name_before_tls_backend() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let mut options = vless_tls_options(server_addr.port());
+    options.tls.server_name = "127.0.0.1".to_owned();
+    options.tls.ech = Some(EchOptions {
+        config_source: Some(EchConfigSource::DnsHttpsRecord),
+        pq_signature_schemes_enabled: false,
+        dynamic_record_sizing_disabled: false,
+    });
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(options),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let err = match outbound.dial(Network::Tcp, destination, b"").await {
+        Ok(_) => panic!("ECH DNS HTTPS lookup must validate VLESS server_name"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("tls.ech DNS HTTPS lookup requires a DNS server_name, not an IP address"),
+        "error = {message:?}"
+    );
+}
+
+#[cfg(feature = "tls-utls-stream")]
+#[tokio::test]
 async fn vless_reality_over_utls_seals_client_hello_session_id() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();

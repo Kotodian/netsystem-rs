@@ -38,6 +38,8 @@ use super::fragment::FragmentedTcpStream;
 use super::backend::default_backend;
 #[cfg(feature = "tls-utls-stream")]
 use super::backend::utls_backend;
+#[cfg(feature = "tls-utls-stream")]
+use super::ech::EchRetryConfigStore;
 
 #[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
 pub(crate) struct BasicClientTlsConfig {
@@ -68,8 +70,8 @@ pub(crate) struct OutboundClientTlsConfig {
     pub max_fragment_size: Option<usize>,
     #[cfg(feature = "tls-outbound-stream")]
     pub fragment: Option<TlsFragmentOptions>,
-    #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
-    pub ech_retry_configs: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
+    #[cfg(feature = "tls-utls-stream")]
+    pub ech_retry_configs: Option<EchRetryConfigStore>,
     #[cfg(feature = "tls-utls-stream")]
     pub reality: Option<RealityOptions>,
     pub utls: Option<UtlsOptions>,

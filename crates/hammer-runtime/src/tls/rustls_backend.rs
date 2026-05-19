@@ -141,7 +141,7 @@ mod tests {
                 max_fragment_size: Some(32),
                 #[cfg(feature = "tls-outbound-stream")]
                 fragment: None,
-                #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
+                #[cfg(feature = "tls-utls-stream")]
                 ech_retry_configs: None,
                 #[cfg(feature = "tls-utls-stream")]
                 reality: None,

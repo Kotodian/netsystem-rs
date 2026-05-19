@@ -1,20 +1,23 @@
 use std::fs;
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use hammer_core::config::{EchConfigSource, EchOptions};
+use hammer_core::config::{EchConfigList, EchConfigSource, EchOptions};
 use hammer_core::error::{HammerError, HammerResult};
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 use hickory_resolver::Resolver;
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use rustls::pki_types::EchConfigListBytes;
 
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+pub(crate) type EchRetryConfigStore = Arc<Mutex<Option<Vec<u8>>>>;
+
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 const MAX_HTTPS_ALIAS_DEPTH: usize = 4;
 
 pub(super) fn ech_config(ech: &EchOptions) -> HammerResult<rustls::client::EchConfig> {
@@ -68,7 +71,26 @@ fn load_ech_config_path(path: &Path) -> HammerResult<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
+#[cfg(any(feature = "outbound-hysteria2", feature = "outbound-vless"))]
+pub(crate) async fn resolve_dns_https_ech_config(
+    ech: &mut Option<EchOptions>,
+    server_name: &str,
+) -> HammerResult<bool> {
+    if !matches!(
+        ech.as_ref().and_then(|ech| ech.config_source.as_ref()),
+        Some(EchConfigSource::DnsHttpsRecord)
+    ) {
+        return Ok(false);
+    }
+
+    let config = resolve_dns_https_ech_config_list(server_name).await?;
+    if let Some(ech) = ech.as_mut() {
+        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(config)));
+    }
+    Ok(true)
+}
+
+#[cfg(any(feature = "outbound-hysteria2", feature = "outbound-vless"))]
 pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> HammerResult<Vec<u8>> {
     let resolver = Resolver::builder_tokio()
         .map_err(|err| HammerError::internal(format!("read system DNS config: {err}")))?
@@ -106,7 +128,35 @@ pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> Hamm
     unreachable!("HTTPS alias loop must return before exceeding max depth")
 }
 
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+pub(crate) fn ech_retry_config_store(ech: &Option<EchOptions>) -> Option<EchRetryConfigStore> {
+    if cfg!(feature = "tls-utls-stream") {
+        ech.as_ref().map(|_| Arc::new(Mutex::new(None)))
+    } else {
+        let _ = ech;
+        None
+    }
+}
+
+pub(crate) fn take_ech_retry_configs(store: &Option<EchRetryConfigStore>) -> Option<Vec<u8>> {
+    store.as_ref().and_then(|store| store.lock().ok()?.take())
+}
+
+pub(crate) fn apply_ech_retry_config(ech: &mut Option<EchOptions>, retry_configs: Vec<u8>) {
+    if let Some(ech) = ech.as_mut() {
+        ech.config_source = Some(EchConfigSource::Inline(EchConfigList(retry_configs)));
+    }
+}
+
+#[cfg(feature = "tls-utls-stream")]
+pub(crate) fn store_ech_retry_configs(store: &Option<EchRetryConfigStore>, retry_configs: &[u8]) {
+    if let Some(store) = store
+        && let Ok(mut slot) = store.lock()
+    {
+        *slot = Some(retry_configs.to_vec());
+    }
+}
+
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     let server_name = server_name.trim();
     if server_name.is_empty() {
@@ -126,7 +176,7 @@ fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     }
 }
 
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 #[derive(Debug, PartialEq, Eq)]
 enum HttpsEchLookupResult {
     Config(Vec<u8>),
@@ -134,7 +184,7 @@ enum HttpsEchLookupResult {
     NotFound,
 }
 
-#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
+#[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 fn ech_config_list_from_https_answers(answers: &[Record]) -> HttpsEchLookupResult {
     let mut https_records = answers
         .iter()
@@ -216,6 +266,28 @@ mod tests {
             ech_config_list_from_https_answers(&[service, alias]),
             HttpsEchLookupResult::Alias("svc.example.".to_owned())
         );
+    }
+
+    #[cfg(feature = "tls-utls-stream")]
+    #[test]
+    fn ech_retry_config_helpers_replace_config_source() {
+        let mut ech = Some(EchOptions {
+            config_source: Some(EchConfigSource::DnsHttpsRecord),
+            pq_signature_schemes_enabled: false,
+            dynamic_record_sizing_disabled: true,
+        });
+        let store = ech_retry_config_store(&ech).expect("retry config store");
+        store.lock().unwrap().replace(vec![0x01, 0x02, 0x03]);
+
+        let retry_configs = take_ech_retry_configs(&Some(store)).expect("retry configs");
+        apply_ech_retry_config(&mut ech, retry_configs);
+
+        let ech = ech.expect("ech");
+        match ech.config_source.expect("ech config") {
+            EchConfigSource::Inline(config) => assert_eq!(config.0, vec![0x01, 0x02, 0x03]),
+            other => panic!("expected inline retry config, got {other:?}"),
+        }
+        assert!(ech.dynamic_record_sizing_disabled);
     }
 
     fn https_record(priority: u16, target: &str, ech: Option<Vec<u8>>) -> Record {

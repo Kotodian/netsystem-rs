@@ -9,6 +9,7 @@ use btls::ssl::{
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use super::ech::EchRetryConfigStore;
 use super::fragment::FragmentedTcpStream;
 
 pub(crate) struct BtlsClientStream {
@@ -24,6 +25,7 @@ impl BtlsClientStream {
 pub(super) async fn connect(
     ssl: Ssl,
     stream: FragmentedTcpStream,
+    ech_retry_configs: Option<EchRetryConfigStore>,
 ) -> HammerResult<BtlsClientStream> {
     let mut handshake = ssl.setup_connect(TokioTcpAdapter { stream });
     loop {
@@ -34,6 +36,9 @@ pub(super) async fn connect(
                 handshake = blocked;
             }
             Err(HandshakeError::Failure(failed)) => {
+                if is_btls_ech_rejected(failed.error()) {
+                    store_btls_ech_retry_configs(failed.ssl(), &ech_retry_configs);
+                }
                 return Err(HammerError::internal(format!(
                     "btls tls handshake: {}",
                     failed.error()
@@ -43,6 +48,21 @@ pub(super) async fn connect(
                 return Err(HammerError::internal(format!("btls tls setup: {err}")));
             }
         }
+    }
+}
+
+fn is_btls_ech_rejected(err: &BtlsError) -> bool {
+    err.ssl_error()
+        .is_some_and(|stack| stack.errors().iter().any(is_btls_ech_rejected_error))
+}
+
+fn is_btls_ech_rejected_error(err: &btls::error::Error) -> bool {
+    err.library_reason(btls_sys::ERR_LIB_SSL) == Some(btls_sys::SSL_R_ECH_REJECTED)
+}
+
+fn store_btls_ech_retry_configs(ssl: &SslRef, store: &Option<EchRetryConfigStore>) {
+    if let Some(retry_configs) = ssl.get_ech_retry_configs() {
+        super::ech::store_ech_retry_configs(store, retry_configs);
     }
 }
 

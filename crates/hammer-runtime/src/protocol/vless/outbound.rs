@@ -15,10 +15,15 @@ use hammer_core::protocol::vless::{
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tracing::debug;
 
 use crate::protocol::server_tcp::ServerTcpConnector;
 use crate::socket_protector::SocketProtector;
-use crate::tls::{OutboundClientTlsConfig, TlsClientStream, outbound_client_stream};
+use crate::tls::{
+    EchRetryConfigStore, OutboundClientTlsConfig, TlsClientStream, apply_ech_retry_config,
+    ech_retry_config_store, outbound_client_stream, resolve_dns_https_ech_config,
+    take_ech_retry_configs,
+};
 
 const TLS_RECORD_FRAGMENT_SIZE: usize = 32;
 
@@ -122,17 +127,18 @@ impl Outbound for VlessOutbound {
         } else {
             initial_payload
         };
-        let request = VlessRequestBuilder::new(&self.options.uuid, VlessCommand::Tcp, &destination)
+        let mut options = self.options.clone();
+        let request = VlessRequestBuilder::new(&options.uuid, VlessCommand::Tcp, &destination)
             .optional_flow(self.options.flow.as_deref())
             .initial_payload(initial_payload_in_header)
             .encode()?;
-        let stream = self.connector.connect("vless").await?;
-        if self.options.tls.enabled {
-            let stream = connect_tls(&self.connector, &self.options, stream).await?;
+        if options.tls.enabled {
+            let stream = connect_tls_with_ech_retry(&self.connector, &mut options, "vless").await?;
             let stream =
-                write_request_and_wrap(stream, &self.options, &request, initial_payload).await?;
+                write_request_and_wrap(stream, &options, &request, initial_payload).await?;
             return Ok(Box::new(stream));
         }
+        let stream = self.connector.connect("vless").await?;
         let stream =
             write_request_and_wrap(stream, &self.options, &request, initial_payload).await?;
         Ok(Box::new(stream))
@@ -215,12 +221,14 @@ impl VlessPacketConn {
         let request = VlessRequestBuilder::new(&self.options.uuid, VlessCommand::Udp, destination)
             .optional_flow(self.options.flow.as_deref())
             .encode()?;
-        let stream = self.connector.connect("vless udp").await?;
-        let stream = if self.options.tls.enabled {
-            let stream = connect_tls(&self.connector, &self.options, stream).await?;
-            let stream = write_request_and_wrap(stream, &self.options, &request, &[]).await?;
+        let mut options = self.options.clone();
+        let stream = if options.tls.enabled {
+            let stream =
+                connect_tls_with_ech_retry(&self.connector, &mut options, "vless udp").await?;
+            let stream = write_request_and_wrap(stream, &options, &request, &[]).await?;
             VlessServerStream::Tls(stream)
         } else {
+            let stream = self.connector.connect("vless udp").await?;
             let stream = write_request_and_wrap(stream, &self.options, &request, &[]).await?;
             VlessServerStream::Plain(stream)
         };
@@ -299,6 +307,7 @@ async fn connect_tls(
     connector: &ServerTcpConnector,
     options: &VlessOutboundOptions,
     stream: TcpStream,
+    ech_retry_configs: Option<EchRetryConfigStore>,
 ) -> HammerResult<TlsClientStream> {
     let tls = &options.tls;
     let server_name = ServerName::try_from(tls.server_name.clone()).map_err(|_| {
@@ -320,8 +329,8 @@ async fn connect_tls(
             ech: tls.ech.clone(),
             max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
             fragment: tls.fragment.clone(),
-            #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
-            ech_retry_configs: None,
+            #[cfg(feature = "tls-utls-stream")]
+            ech_retry_configs,
             #[cfg(feature = "tls-utls-stream")]
             reality: tls.reality.clone(),
             utls: tls.utls.clone(),
@@ -331,4 +340,37 @@ async fn connect_tls(
     )
     .await
     .with_context(|| "vless tls connect")
+}
+
+async fn connect_tls_with_ech_retry(
+    connector: &ServerTcpConnector,
+    options: &mut VlessOutboundOptions,
+    label: &str,
+) -> HammerResult<TlsClientStream> {
+    resolve_vless_ech_config(options).await?;
+    let ech_retry_configs = ech_retry_config_store(&options.tls.ech);
+    let stream = connector.connect(label).await?;
+    match connect_tls(connector, options, stream, ech_retry_configs.clone()).await {
+        Ok(stream) => Ok(stream),
+        Err(err) => {
+            let Some(retry_configs) = take_ech_retry_configs(&ech_retry_configs) else {
+                return Err(err);
+            };
+            debug!(
+                "vless retrying TLS with ECH retry config server_name={}",
+                options.tls.server_name
+            );
+            apply_ech_retry_config(&mut options.tls.ech, retry_configs);
+            let stream = connector.connect(label).await?;
+            connect_tls(connector, options, stream, None).await
+        }
+    }
+}
+
+async fn resolve_vless_ech_config(options: &mut VlessOutboundOptions) -> HammerResult<()> {
+    let server_name = options.tls.server_name.clone();
+    if resolve_dns_https_ech_config(&mut options.tls.ech, &server_name).await? {
+        debug!("vless resolved ECH config from HTTPS record server_name={server_name}");
+    }
+    Ok(())
 }
