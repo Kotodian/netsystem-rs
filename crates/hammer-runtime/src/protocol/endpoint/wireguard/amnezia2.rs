@@ -1,8 +1,7 @@
 use boringtun::noise::errors::WireGuardError;
 #[cfg(feature = "endpoint-amneziawg")]
 use boringtun::noise::{
-    AmneziaConfig as BoringtunAmneziaConfig,
-    AmneziaMessageTypeRange as BoringtunMessageTypeRange,
+    AmneziaConfig as BoringtunAmneziaConfig, AmneziaMessageTypeRange as BoringtunMessageTypeRange,
 };
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
 use rand::{Rng, thread_rng};
@@ -22,7 +21,9 @@ pub(super) fn to_boringtun_config(options: &Amnezia2Options) -> BoringtunAmnezia
 }
 
 #[cfg(feature = "endpoint-amneziawg")]
-fn to_boringtun_range(range: hammer_core::protocol::wireguard::amnezia2::MessageTypeRange) -> BoringtunMessageTypeRange {
+fn to_boringtun_range(
+    range: hammer_core::protocol::wireguard::amnezia2::MessageTypeRange,
+) -> BoringtunMessageTypeRange {
     BoringtunMessageTypeRange {
         min: range.min,
         max: range.max,
