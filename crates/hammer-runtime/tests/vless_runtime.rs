@@ -18,12 +18,13 @@ use bytes::Bytes;
 #[cfg(feature = "tls-utls")]
 use foreign_types_shared::ForeignTypeRef;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
-use hammer_core::config::{
-    Outbound, OutboundKind, OutboundTlsOptions, TlsFragmentOptions, VlessOutboundOptions,
-};
 #[cfg(feature = "tls-utls")]
 use hammer_core::config::{
-    RealityOptions, RealityPublicKey, RealityShortId, UtlsFingerprint, UtlsOptions,
+    EchConfigList, EchConfigSource, EchOptions, RealityOptions, RealityPublicKey, RealityShortId,
+    UtlsFingerprint, UtlsOptions,
+};
+use hammer_core::config::{
+    Outbound, OutboundKind, OutboundTlsOptions, TlsFragmentOptions, VlessOutboundOptions,
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
@@ -124,6 +125,18 @@ fn vless_reality_options(port: u16) -> VlessOutboundOptions {
 }
 
 #[cfg(feature = "tls-utls")]
+fn vless_reality_ech_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            ech: Some(test_ech_options()),
+            reality: Some(test_reality_options()),
+            ..vless_tls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
 fn test_reality_options() -> RealityOptions {
     RealityOptions {
         public_key: RealityPublicKey(hex_bytes(
@@ -131,6 +144,26 @@ fn test_reality_options() -> RealityOptions {
         )),
         short_id: RealityShortId(vec![0x0a, 0x0b]),
     }
+}
+
+#[cfg(feature = "tls-utls")]
+fn test_ech_options() -> EchOptions {
+    EchOptions {
+        config_source: Some(EchConfigSource::Inline(test_ech_config_list())),
+        pq_signature_schemes_enabled: false,
+        dynamic_record_sizing_disabled: false,
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+fn test_ech_config_list() -> EchConfigList {
+    EchConfigList(vec![
+        0x00, 0x45, 0xfe, 0x0d, 0x00, 0x41, 0x01, 0x00, 0x20, 0x00, 0x20, 0xa6, 0x9a, 0x41, 0x48,
+        0x5d, 0x32, 0x96, 0xa4, 0xe0, 0xc3, 0x6a, 0xee, 0xf6, 0x63, 0x0f, 0x59, 0x32, 0x6f, 0xdc,
+        0xff, 0x81, 0x29, 0x59, 0xa5, 0x85, 0xd3, 0x9b, 0x3b, 0xde, 0x98, 0x55, 0x5c, 0x00, 0x08,
+        0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x03, 0x10, 0x0e, 0x70, 0x75, 0x62, 0x6c, 0x69,
+        0x63, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x00, 0x00,
+    ])
 }
 
 fn vless_record_fragment_options(port: u16) -> VlessOutboundOptions {
@@ -572,6 +605,48 @@ async fn vless_reality_seals_client_hello_without_explicit_utls() {
 
 #[cfg(feature = "tls-utls")]
 #[tokio::test]
+async fn vless_reality_and_ech_share_utls_client_hello() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        client_hello
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_ech_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let result = outbound.dial(Network::Tcp, destination, b"").await;
+    if let Err(err) = &result {
+        assert!(
+            !err.to_string().contains("cannot be combined"),
+            "Reality+ECH should be handled by the uTLS backend: {err}"
+        );
+    }
+    let client_hello = tokio::time::timeout(Duration::from_secs(2), captured)
+        .await
+        .expect("client hello captured")
+        .unwrap();
+
+    assert_reality_session_id(&client_hello);
+    assert!(
+        client_hello_extension(&client_hello, 0xfe0d).is_some(),
+        "ClientHello must include the ECH extension"
+    );
+}
+
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
 async fn vless_reality_rejects_invalid_temporary_certificate_signature() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -930,6 +1005,39 @@ fn reality_auth_key_from_client_hello(client_hello: &[u8]) -> RealityAuthKey {
 }
 
 #[cfg(feature = "tls-utls")]
+fn client_hello_extension(client_hello: &[u8], target_type: u16) -> Option<&[u8]> {
+    let mut offset = 4 + 2 + 32;
+    let session_id_len = usize::from(client_hello[offset]);
+    offset += 1 + session_id_len;
+    let cipher_suites_len = usize::from(u16::from_be_bytes([
+        client_hello[offset],
+        client_hello[offset + 1],
+    ]));
+    offset += 2 + cipher_suites_len;
+    let compression_methods_len = usize::from(client_hello[offset]);
+    offset += 1 + compression_methods_len;
+    let extensions_len = usize::from(u16::from_be_bytes([
+        client_hello[offset],
+        client_hello[offset + 1],
+    ]));
+    offset += 2;
+    let extensions_end = offset + extensions_len;
+    while offset < extensions_end {
+        let extension_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
+        let extension_len = usize::from(u16::from_be_bytes([
+            client_hello[offset + 2],
+            client_hello[offset + 3],
+        ]));
+        offset += 4;
+        if extension_type == target_type {
+            return Some(&client_hello[offset..offset + extension_len]);
+        }
+        offset += extension_len;
+    }
+    None
+}
+
+#[cfg(feature = "tls-utls")]
 fn reality_tls_server_config(
     auth_key: &RealityAuthKey,
     valid_signature: bool,
@@ -1059,49 +1167,20 @@ impl AsyncWrite for PrefixedStream {
 
 #[cfg(feature = "tls-utls")]
 fn x25519_key_share_from_client_hello(client_hello: &[u8]) -> &[u8] {
-    let mut offset = 4 + 2 + 32;
-    let session_id_len = usize::from(client_hello[offset]);
-    offset += 1 + session_id_len;
-    let cipher_suites_len = usize::from(u16::from_be_bytes([
-        client_hello[offset],
-        client_hello[offset + 1],
-    ]));
-    offset += 2 + cipher_suites_len;
-    let compression_methods_len = usize::from(client_hello[offset]);
-    offset += 1 + compression_methods_len;
-    let extensions_len = usize::from(u16::from_be_bytes([
-        client_hello[offset],
-        client_hello[offset + 1],
-    ]));
-    offset += 2;
-    let extensions_end = offset + extensions_len;
-    while offset < extensions_end {
-        let extension_type = u16::from_be_bytes([client_hello[offset], client_hello[offset + 1]]);
-        let extension_len = usize::from(u16::from_be_bytes([
-            client_hello[offset + 2],
-            client_hello[offset + 3],
-        ]));
-        offset += 4;
-        if extension_type == 51 {
-            let mut share_offset = offset + 2;
-            let share_end = offset + extension_len;
-            while share_offset < share_end {
-                let group = u16::from_be_bytes([
-                    client_hello[share_offset],
-                    client_hello[share_offset + 1],
-                ]);
-                let key_len = usize::from(u16::from_be_bytes([
-                    client_hello[share_offset + 2],
-                    client_hello[share_offset + 3],
-                ]));
-                share_offset += 4;
-                if group == 0x001d && key_len == 32 {
-                    return &client_hello[share_offset..share_offset + key_len];
-                }
-                share_offset += key_len;
+    if let Some(key_share) = client_hello_extension(client_hello, 51) {
+        let mut share_offset = 2;
+        while share_offset < key_share.len() {
+            let group = u16::from_be_bytes([key_share[share_offset], key_share[share_offset + 1]]);
+            let key_len = usize::from(u16::from_be_bytes([
+                key_share[share_offset + 2],
+                key_share[share_offset + 3],
+            ]));
+            share_offset += 4;
+            if group == 0x001d && key_len == 32 {
+                return &key_share[share_offset..share_offset + key_len];
             }
+            share_offset += key_len;
         }
-        offset += extension_len;
     }
     panic!("ClientHello did not include an X25519 key share");
 }

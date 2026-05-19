@@ -76,11 +76,6 @@ impl VlessOutbound {
                     "vless tls.reality requires tls.enabled",
                 ));
             }
-            if tls.ech.is_some() {
-                return Err(HammerError::config_validation(
-                    "vless tls.reality cannot be combined with tls.ech",
-                ));
-            }
             #[cfg(not(feature = "tls-utls"))]
             {
                 return Err(HammerError::config_validation(
