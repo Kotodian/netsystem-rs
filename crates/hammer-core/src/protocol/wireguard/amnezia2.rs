@@ -55,8 +55,7 @@ impl<'de> Deserialize<'de> for MessageTypeRange {
                 min: value,
                 max: value,
             }),
-            Repr::Text(value) => parse_message_type_range(&value)
-                .map_err(serde::de::Error::custom),
+            Repr::Text(value) => parse_message_type_range(&value).map_err(serde::de::Error::custom),
             Repr::Pair { min, max } => Ok(Self { min, max }),
         }
     }
@@ -164,11 +163,7 @@ impl Amnezia2Options {
             }
         }
 
-        for (name, value) in [
-            ("s1", self.s1),
-            ("s2", self.s2),
-            ("s3", self.s3),
-        ] {
+        for (name, value) in [("s1", self.s1), ("s2", self.s2), ("s3", self.s3)] {
             if value > 64 {
                 return Err(HammerError::config_validation(format!(
                     "{field}.{name} must be in 0..=64"
