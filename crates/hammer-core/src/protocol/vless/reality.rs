@@ -115,7 +115,7 @@ pub fn verify_temporary_certificate_signature(
     hmac::verify(&key, ed25519_public_key, signature).is_ok()
 }
 
-fn derive_auth_key_with_x25519_private_key(
+pub fn derive_auth_key_with_x25519_private_key(
     options: &RealityOptions,
     client_private_key: &[u8; 32],
     client_random: &[u8; 32],

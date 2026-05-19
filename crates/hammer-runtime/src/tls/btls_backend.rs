@@ -12,12 +12,12 @@ use super::utls::{fingerprint_name, unsupported_for_rustls};
 use crate::tls::backend::TlsBackend;
 use async_trait::async_trait;
 use btls::hash::MessageDigest;
-use btls::pkey::PKey;
+use btls::pkey::{Id, PKey};
 use btls::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, KeyShare, Ssl, SslConnector,
     SslConnectorBuilder, SslMethod, SslRef, SslVerifyMode,
 };
-use btls::x509::{X509, X509StoreContext, X509StoreContextRef};
+use btls::x509::{X509, X509Ref, X509StoreContext, X509StoreContextRef};
 use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use hammer_adapter::PlatformInterface;
 use hammer_core::config::{
@@ -26,14 +26,15 @@ use hammer_core::config::{
 };
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::protocol::vless::reality::{
-    RealityClientVersion, seal_session_id_with_x25519_private_key,
+    RealityAuthKey, RealityClientVersion, derive_auth_key_with_x25519_private_key, seal_session_id,
+    verify_temporary_certificate_signature,
 };
 use quinn_btls::QuicSslContext;
 #[cfg(feature = "tls-outbound-stream")]
 use rustls::pki_types::ServerName;
 use std::ffi::{CString, c_int, c_void};
 use std::io::Cursor;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(feature = "tls-outbound-stream")]
 use tokio::net::TcpStream;
@@ -43,6 +44,7 @@ pub(super) struct BtlsUtlsBackend;
 
 pub(super) static BTLS_UTLS_BACKEND: BtlsUtlsBackend = BtlsUtlsBackend;
 const REALITY_CLIENT_VERSION: RealityClientVersion = RealityClientVersion::new(0, 1, 0);
+type RealityAuthState = Arc<StdMutex<Option<RealityAuthKey>>>;
 
 #[async_trait]
 impl TlsBackend for BtlsUtlsBackend {
@@ -80,9 +82,25 @@ impl TlsBackend for BtlsUtlsBackend {
         server_name: ServerName<'static>,
         stream: TcpStream,
     ) -> HammerResult<TlsClientStream> {
-        let utls = options.utls.as_ref().ok_or_else(|| {
-            HammerError::config_validation("tls.utls is required for the BoringSSL uTLS backend")
-        })?;
+        let default_reality_utls;
+        let utls = match options.utls.as_ref() {
+            Some(utls) => utls,
+            None if options.reality.is_some() => {
+                default_reality_utls = UtlsOptions {
+                    fingerprint: UtlsFingerprint::Chrome,
+                };
+                &default_reality_utls
+            }
+            None => {
+                return Err(HammerError::config_validation(
+                    "tls.utls is required for the BoringSSL uTLS backend",
+                ));
+            }
+        };
+        let reality_auth_state = options
+            .reality
+            .as_ref()
+            .map(|_| Arc::new(StdMutex::new(None)));
         let ech_config_list = options
             .ech
             .as_ref()
@@ -93,6 +111,7 @@ impl TlsBackend for BtlsUtlsBackend {
             options.insecure,
             &options.server_fingerprints,
             ech_config_list.is_some(),
+            reality_auth_state.clone(),
             &options.alpn_protocols,
             options.platform,
             options.client_auth,
@@ -100,7 +119,7 @@ impl TlsBackend for BtlsUtlsBackend {
         let mut config = connector
             .configure()
             .map_err(|err| HammerError::internal(format!("btls tls configure: {err}")))?;
-        config.set_verify_hostname(!options.insecure);
+        config.set_verify_hostname(!options.insecure && options.reality.is_none());
         let server_name = server_name.to_str();
         let mut ssl = config
             .into_ssl(server_name.as_ref())
@@ -110,10 +129,14 @@ impl TlsBackend for BtlsUtlsBackend {
         connection_profile
             .apply_to_ssl(&mut ssl)
             .map_err(|err| HammerError::config_validation(format!("tls.utls connection: {err}")))?;
-        let mut reality_patch = options
-            .reality
-            .clone()
-            .map(|reality| Box::new(RealityClientHelloPatch::new(reality)));
+        let mut reality_patch =
+            options
+                .reality
+                .clone()
+                .zip(reality_auth_state)
+                .map(|(reality, auth_state)| {
+                    Box::new(RealityClientHelloPatch::new(reality, auth_state))
+                });
         if let Some(patch) = reality_patch.as_deref_mut() {
             install_reality_client_hello_callback(&mut ssl, patch);
         }
@@ -201,7 +224,7 @@ fn new_utls_client_config(
             }
             if needs_cert_verify_callback {
                 builder.set_cert_verify_callback(move |x509| {
-                    verify_btls_server_certificate(x509, insecure, &server_fingerprints)
+                    verify_btls_server_certificate(x509, insecure, &server_fingerprints, None)
                 });
             }
             Ok(())
@@ -217,6 +240,7 @@ fn new_utls_tcp_connector(
     insecure: bool,
     server_fingerprints: &[CertificateFingerprint],
     ech_enabled: bool,
+    reality_auth_state: Option<RealityAuthState>,
     alpn_protocols: &[Vec<u8>],
     platform: Option<Arc<dyn PlatformInterface>>,
     client_auth: Option<ClientTlsAuth>,
@@ -224,7 +248,12 @@ fn new_utls_tcp_connector(
     let profile = UtlsProfile::for_fingerprint(options.fingerprint);
     let mut builder = SslConnector::builder(SslMethod::tls())
         .map_err(|err| HammerError::internal(format!("btls connector builder: {err}")))?;
-    apply_utls_context_profile(builder.as_ptr(), &profile, options)?;
+    apply_utls_context_profile(
+        builder.as_ptr(),
+        &profile,
+        options,
+        reality_auth_state.is_some(),
+    )?;
     if profile.certificate_compression {
         builder
             .add_certificate_compression_algorithm(BrotliCertificateDecompressor)
@@ -235,7 +264,13 @@ fn new_utls_tcp_connector(
                 ))
             })?;
     }
-    configure_tcp_server_verification(&mut builder, insecure, server_fingerprints, ech_enabled);
+    configure_tcp_server_verification(
+        &mut builder,
+        insecure,
+        server_fingerprints,
+        ech_enabled,
+        reality_auth_state,
+    );
     add_platform_roots_to_builder(&mut builder, platform)?;
     configure_tcp_client_auth(&mut builder, client_auth)?;
     let alpn = encode_alpn_protocols(alpn_protocols)?;
@@ -251,8 +286,13 @@ fn verify_btls_server_certificate(
     x509: &mut X509StoreContextRef,
     insecure: bool,
     server_fingerprints: &[CertificateFingerprint],
+    reality_auth_state: Option<&RealityAuthState>,
 ) -> bool {
-    if !insecure {
+    if let Some(reality_auth_state) = reality_auth_state {
+        if !verify_btls_reality_certificate(x509, reality_auth_state) {
+            return false;
+        }
+    } else if !insecure {
         if !apply_btls_ech_name_override(x509) {
             return false;
         }
@@ -264,6 +304,50 @@ fn verify_btls_server_certificate(
         return true;
     }
     verify_btls_server_fingerprint(x509, server_fingerprints)
+}
+
+fn verify_btls_reality_certificate(
+    x509: &mut X509StoreContextRef,
+    auth_state: &RealityAuthState,
+) -> bool {
+    let auth_key = match auth_state.lock() {
+        Ok(auth_key) => *auth_key,
+        Err(_) => return false,
+    };
+    let Some(auth_key) = auth_key else {
+        return false;
+    };
+    let Some(certificate) = x509.cert() else {
+        return false;
+    };
+    verify_btls_reality_temporary_certificate(certificate, &auth_key)
+}
+
+fn verify_btls_reality_temporary_certificate(
+    certificate: &X509Ref,
+    auth_key: &RealityAuthKey,
+) -> bool {
+    let Ok(public_key) = certificate.public_key() else {
+        return false;
+    };
+    if public_key.id() != Id::ED25519 {
+        return false;
+    }
+    let Ok(public_key_len) = public_key.raw_public_key_len() else {
+        return false;
+    };
+    if public_key_len != 32 {
+        return false;
+    }
+    let mut raw_public_key = [0_u8; 32];
+    let Ok(raw_public_key) = public_key.raw_public_key(&mut raw_public_key) else {
+        return false;
+    };
+    verify_temporary_certificate_signature(
+        auth_key,
+        raw_public_key,
+        certificate.signature().as_slice(),
+    )
 }
 
 fn apply_btls_ech_name_override(x509: &mut X509StoreContextRef) -> bool {
@@ -308,7 +392,7 @@ fn apply_utls_profile(
     ech_config_list: Option<Vec<u8>>,
 ) -> HammerResult<()> {
     let profile = UtlsProfile::for_fingerprint(options.fingerprint);
-    apply_utls_context_profile(crypto.ctx_mut().as_ptr(), &profile, options)?;
+    apply_utls_context_profile(crypto.ctx_mut().as_ptr(), &profile, options, false)?;
     let connection_profile = utls_connection_profile(options, alpn_protocols, ech_config_list);
     crypto.set_ssl_config_callback(move |ssl| connection_profile.apply(ssl));
     Ok(())
@@ -318,6 +402,7 @@ fn apply_utls_context_profile(
     ctx: *mut btls_sys::SSL_CTX,
     profile: &UtlsProfile,
     options: &UtlsOptions,
+    reality_enabled: bool,
 ) -> HammerResult<()> {
     unsafe {
         cvt_btls(
@@ -354,13 +439,7 @@ fn apply_utls_context_profile(
         set_ctx_string(ctx, profile.curves, options, "curves", |ctx, value| {
             btls_sys::SSL_CTX_set1_curves_list(ctx, value)
         })?;
-        set_ctx_string(
-            ctx,
-            profile.signature_algorithms,
-            options,
-            "signature algorithms",
-            |ctx, value| btls_sys::SSL_CTX_set1_sigalgs_list(ctx, value),
-        )?;
+        set_ctx_signature_algorithms(ctx, profile, options, reality_enabled)?;
         if let Some(limit) = profile.record_size_limit {
             btls_sys::SSL_CTX_set_record_size_limit(ctx, limit);
         }
@@ -372,6 +451,35 @@ fn apply_utls_context_profile(
         }
     }
     Ok(())
+}
+
+fn set_ctx_signature_algorithms(
+    ctx: *mut btls_sys::SSL_CTX,
+    profile: &UtlsProfile,
+    options: &UtlsOptions,
+    reality_enabled: bool,
+) -> HammerResult<()> {
+    let reality_signature_algorithms;
+    let signature_algorithms = if reality_enabled
+        && !profile
+            .signature_algorithms
+            .split(':')
+            .any(|algorithm| algorithm == "ed25519")
+    {
+        reality_signature_algorithms = format!("ed25519:{}", profile.signature_algorithms);
+        reality_signature_algorithms.as_str()
+    } else {
+        profile.signature_algorithms
+    };
+    unsafe {
+        set_ctx_string(
+            ctx,
+            signature_algorithms,
+            options,
+            "signature algorithms",
+            |ctx, value| btls_sys::SSL_CTX_set1_sigalgs_list(ctx, value),
+        )
+    }
 }
 
 fn utls_connection_profile(
@@ -430,13 +538,15 @@ impl UtlsConnectionProfile {
 struct RealityClientHelloPatch {
     options: RealityOptions,
     version: RealityClientVersion,
+    auth_state: RealityAuthState,
 }
 
 impl RealityClientHelloPatch {
-    fn new(options: RealityOptions) -> Self {
+    fn new(options: RealityOptions, auth_state: RealityAuthState) -> Self {
         Self {
             options,
             version: REALITY_CLIENT_VERSION,
+            auth_state,
         }
     }
 }
@@ -500,9 +610,14 @@ extern "C" fn reality_client_hello_callback(
     let mut aad = client_hello.to_vec();
     aad[session_id_offset..session_id_end].fill(0);
     let unix_time = current_unix_time_u32();
-    let session_id = match seal_session_id_with_x25519_private_key(
+    let auth_key =
+        match derive_auth_key_with_x25519_private_key(&patch.options, private_key, client_random) {
+            Ok(value) => value,
+            Err(_) => return 0,
+        };
+    let session_id = match seal_session_id(
         &patch.options,
-        private_key,
+        &auth_key,
         client_random,
         &aad,
         patch.version,
@@ -511,6 +626,10 @@ extern "C" fn reality_client_hello_callback(
         Ok(value) => value,
         Err(_) => return 0,
     };
+    let Ok(mut auth_state) = patch.auth_state.lock() else {
+        return 0;
+    };
+    *auth_state = Some(auth_key);
     unsafe {
         std::ptr::copy_nonoverlapping(session_id.as_bytes().as_ptr(), out_session_id, 32);
     }
@@ -608,12 +727,19 @@ fn configure_tcp_server_verification(
     insecure: bool,
     server_fingerprints: &[CertificateFingerprint],
     ech_enabled: bool,
+    reality_auth_state: Option<RealityAuthState>,
 ) {
-    let verify_peer = !insecure || !server_fingerprints.is_empty();
-    if !server_fingerprints.is_empty() || (ech_enabled && !insecure) {
+    let reality_enabled = reality_auth_state.is_some();
+    let verify_peer = !insecure || !server_fingerprints.is_empty() || reality_enabled;
+    if !server_fingerprints.is_empty() || (ech_enabled && !insecure) || reality_enabled {
         let server_fingerprints = server_fingerprints.to_vec();
         builder.set_cert_verify_callback(move |x509| {
-            verify_btls_server_certificate(x509, insecure, &server_fingerprints)
+            verify_btls_server_certificate(
+                x509,
+                insecure,
+                &server_fingerprints,
+                reality_auth_state.as_ref(),
+            )
         });
     }
     builder.set_verify(if verify_peer {
@@ -1323,7 +1449,7 @@ mod tests {
         let options = UtlsOptions {
             fingerprint: UtlsFingerprint::Chrome,
         };
-        let connector = new_utls_tcp_connector(&options, true, &[], false, &[], None, None)
+        let connector = new_utls_tcp_connector(&options, true, &[], false, None, &[], None, None)
             .expect("btls connector");
         let config = connector.configure().expect("btls configure");
         let mut ssl = config.into_ssl("localhost").expect("btls ssl");

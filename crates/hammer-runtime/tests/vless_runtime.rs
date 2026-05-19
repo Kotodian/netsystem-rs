@@ -1,14 +1,22 @@
 #![cfg(feature = "outbound-vless")]
 
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(feature = "tls-utls")]
+use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(feature = "tls-utls")]
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 #[cfg(feature = "tls-utls")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "tls-utls")]
 use aws_lc_rs::agreement;
+#[cfg(feature = "tls-utls")]
+use aws_lc_rs::hmac;
 use bytes::Bytes;
+#[cfg(feature = "tls-utls")]
+use foreign_types_shared::ForeignTypeRef;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
 use hammer_core::config::{
     Outbound, OutboundKind, OutboundTlsOptions, TlsFragmentOptions, VlessOutboundOptions,
@@ -22,12 +30,16 @@ use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_core::protocol::vless::FLOW_XTLS_RPRX_VISION;
 #[cfg(feature = "tls-utls")]
 use hammer_core::protocol::vless::reality::{
-    RealityClientVersion, derive_auth_key, seal_session_id,
+    RealityAuthKey, RealityClientVersion, derive_auth_key, seal_session_id,
 };
 use hammer_runtime::OutboundManager;
 use rustls::pki_types::PrivateKeyDer;
+#[cfg(feature = "tls-utls")]
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+#[cfg(feature = "tls-utls")]
+use tokio::net::TcpStream;
 use tokio_rustls::TlsAcceptor;
 
 fn logger(id: &str) -> Logger {
@@ -95,6 +107,17 @@ fn vless_reality_utls_options(port: u16) -> VlessOutboundOptions {
         tls: OutboundTlsOptions {
             reality: Some(test_reality_options()),
             ..vless_utls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+fn vless_reality_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            reality: Some(test_reality_options()),
+            ..vless_tls_options(port).tls
         },
         ..vless_options(port)
     }
@@ -490,12 +513,7 @@ async fn vless_reality_over_utls_seals_client_hello_session_id() {
     let server_addr = listener.local_addr().unwrap();
     let captured = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut record_header = [0_u8; 5];
-        stream.read_exact(&mut record_header).await.unwrap();
-        assert_eq!(record_header[0], 22, "first TLS record must be handshake");
-        let record_len = usize::from(u16::from_be_bytes([record_header[3], record_header[4]]));
-        let mut client_hello = vec![0_u8; record_len];
-        stream.read_exact(&mut client_hello).await.unwrap();
+        let (_, client_hello) = read_tls_client_hello_record(&mut stream).await;
         client_hello
     });
 
@@ -518,6 +536,145 @@ async fn vless_reality_over_utls_seals_client_hello_session_id() {
         .unwrap();
 
     assert_reality_session_id(&client_hello);
+}
+
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
+async fn vless_reality_seals_client_hello_without_explicit_utls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        client_hello
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let _ = outbound.dial(Network::Tcp, destination, b"").await;
+    let client_hello = tokio::time::timeout(Duration::from_secs(2), captured)
+        .await
+        .expect("client hello captured")
+        .unwrap();
+
+    assert_reality_session_id(&client_hello);
+}
+
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
+async fn vless_reality_rejects_invalid_temporary_certificate_signature() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (record, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        let auth_key = reality_auth_key_from_client_hello(&client_hello);
+        let acceptor = TlsAcceptor::from(Arc::new(
+            reality_tls_server_config(&auth_key, false).expect("Reality server tls config"),
+        ));
+        let result = acceptor.accept(PrefixedStream::new(record, stream)).await;
+        assert!(
+            result.is_err(),
+            "client accepted an invalid Reality temporary certificate"
+        );
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_utls_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let err = match outbound.dial(Network::Tcp, destination, b"").await {
+        Ok(_) => panic!("dial accepted invalid Reality temporary certificate"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("tls")
+            || err.to_string().contains("certificate")
+            || err.to_string().contains("handshake"),
+        "error = {err:?}"
+    );
+    server.await.unwrap();
+}
+
+#[cfg(feature = "tls-utls")]
+#[tokio::test]
+async fn vless_reality_accepts_valid_temporary_certificate_signature_without_explicit_utls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let expected_request_len = 1 + 16 + 1 + 1 + 2 + 1 + 4 + "hello".len();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (record, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        let auth_key = reality_auth_key_from_client_hello(&client_hello);
+        let acceptor = TlsAcceptor::from(Arc::new(
+            reality_tls_server_config(&auth_key, true).expect("Reality server tls config"),
+        ));
+        let mut stream = acceptor
+            .accept(PrefixedStream::new(record, stream))
+            .await
+            .expect("Reality tls accept");
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream.write_all(b"reality-reply").await.unwrap();
+        stream.shutdown().await.unwrap();
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let mut stream = outbound
+        .dial(Network::Tcp, destination, b"hello")
+        .await
+        .expect("dial vless reality tcp");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    assert_eq!(response, b"reality-reply");
+
+    let request = server.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&[
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ]);
+    expected.push(0x00);
+    expected.push(0x01);
+    expected.extend_from_slice(&8443_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[198, 51, 100, 7]);
+    expected.extend_from_slice(b"hello");
+    assert_eq!(request, expected);
 }
 
 #[tokio::test]
@@ -694,6 +851,21 @@ fn tls_server_config() -> HammerResult<rustls::ServerConfig> {
 }
 
 #[cfg(feature = "tls-utls")]
+async fn read_tls_client_hello_record(stream: &mut TcpStream) -> (Vec<u8>, Vec<u8>) {
+    let mut record_header = [0_u8; 5];
+    stream.read_exact(&mut record_header).await.unwrap();
+    assert_eq!(record_header[0], 22, "first TLS record must be handshake");
+    let record_len = usize::from(u16::from_be_bytes([record_header[3], record_header[4]]));
+    let mut client_hello = vec![0_u8; record_len];
+    stream.read_exact(&mut client_hello).await.unwrap();
+
+    let mut record = Vec::with_capacity(record_header.len() + client_hello.len());
+    record.extend_from_slice(&record_header);
+    record.extend_from_slice(&client_hello);
+    (record, client_hello)
+}
+
+#[cfg(feature = "tls-utls")]
 fn assert_reality_session_id(client_hello: &[u8]) {
     assert_eq!(client_hello[0], 1, "handshake message must be ClientHello");
     let client_random: [u8; 32] = client_hello[6..38].try_into().unwrap();
@@ -703,27 +875,9 @@ fn assert_reality_session_id(client_hello: &[u8]) {
         "Reality requires a 32-byte session id"
     );
     let session_id = &client_hello[session_id_offset..session_id_offset + 32];
-    let client_public_key = x25519_key_share_from_client_hello(client_hello);
     let mut aad = client_hello.to_vec();
     aad[session_id_offset..session_id_offset + 32].fill(0);
-
-    let server_private_key = agreement::PrivateKey::from_private_key(
-        &agreement::X25519,
-        &hex_bytes::<32>("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"),
-    )
-    .expect("server x25519 private key");
-    let client_public_key =
-        agreement::UnparsedPublicKey::new(&agreement::X25519, client_public_key);
-    let auth_key = agreement::agree(
-        &server_private_key,
-        client_public_key,
-        HammerError::internal("server/client x25519 agreement"),
-        |shared_secret| {
-            let shared_secret: &[u8; 32] = shared_secret.try_into().unwrap();
-            derive_auth_key(shared_secret, &client_random)
-        },
-    )
-    .expect("Reality auth key");
+    let auth_key = reality_auth_key_from_client_hello(client_hello);
 
     let unix_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -750,6 +904,157 @@ fn assert_reality_session_id(client_hello: &[u8]) {
         matched,
         "ClientHello session id is not a valid Reality seal"
     );
+}
+
+#[cfg(feature = "tls-utls")]
+fn reality_auth_key_from_client_hello(client_hello: &[u8]) -> RealityAuthKey {
+    let client_random: [u8; 32] = client_hello[6..38].try_into().unwrap();
+    let client_public_key = x25519_key_share_from_client_hello(client_hello);
+    let server_private_key = agreement::PrivateKey::from_private_key(
+        &agreement::X25519,
+        &hex_bytes::<32>("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"),
+    )
+    .expect("server x25519 private key");
+    let client_public_key =
+        agreement::UnparsedPublicKey::new(&agreement::X25519, client_public_key);
+    agreement::agree(
+        &server_private_key,
+        client_public_key,
+        HammerError::internal("server/client x25519 agreement"),
+        |shared_secret| {
+            let shared_secret: &[u8; 32] = shared_secret.try_into().unwrap();
+            derive_auth_key(shared_secret, &client_random)
+        },
+    )
+    .expect("Reality auth key")
+}
+
+#[cfg(feature = "tls-utls")]
+fn reality_tls_server_config(
+    auth_key: &RealityAuthKey,
+    valid_signature: bool,
+) -> HammerResult<rustls::ServerConfig> {
+    let signing_key = if valid_signature {
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .map_err(|err| HammerError::internal(format!("generate Ed25519 key: {err}")))?
+    } else {
+        rcgen::KeyPair::generate()
+            .map_err(|err| HammerError::internal(format!("generate ECDSA key: {err}")))?
+    };
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .map_err(|err| HammerError::internal(format!("Reality certificate params: {err}")))?
+        .self_signed(&signing_key)
+        .map_err(|err| HammerError::internal(format!("generate Reality certificate: {err}")))?;
+    let certificate = if valid_signature {
+        reality_temporary_certificate_der(cert.der().as_ref(), auth_key)?
+    } else {
+        cert.der().as_ref().to_vec()
+    };
+
+    rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|err| HammerError::internal(format!("server tls versions: {err}")))?
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![certificate.into()],
+        PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+    )
+    .map_err(|err| HammerError::internal(format!("server certificate: {err}")))
+}
+
+#[cfg(feature = "tls-utls")]
+fn reality_temporary_certificate_der(
+    certificate_der: &[u8],
+    auth_key: &RealityAuthKey,
+) -> HammerResult<Vec<u8>> {
+    let certificate = btls::x509::X509::from_der(certificate_der)
+        .map_err(|err| HammerError::internal(format!("parse Reality certificate: {err}")))?;
+    let public_key = certificate
+        .public_key()
+        .map_err(|err| HammerError::internal(format!("Reality certificate public key: {err}")))?;
+    let mut raw_public_key = [0_u8; 32];
+    let raw_public_key = public_key
+        .raw_public_key(&mut raw_public_key)
+        .map_err(|err| {
+            HammerError::internal(format!("Reality certificate raw public key: {err}"))
+        })?;
+    assert_eq!(raw_public_key.len(), 32);
+
+    let key = hmac::Key::new(hmac::HMAC_SHA512, auth_key.as_bytes());
+    let signature = hmac::sign(&key, raw_public_key);
+    let set_signature = unsafe {
+        btls_sys::X509_set1_signature_value(
+            certificate.as_ptr(),
+            signature.as_ref().as_ptr(),
+            signature.as_ref().len(),
+        )
+    };
+    if set_signature != 1 {
+        return Err(HammerError::internal(format!(
+            "set Reality certificate signature: {}",
+            btls::error::ErrorStack::get()
+        )));
+    }
+    certificate
+        .to_der()
+        .map_err(|err| HammerError::internal(format!("serialize Reality certificate: {err}")))
+}
+
+#[cfg(feature = "tls-utls")]
+struct PrefixedStream {
+    prefix: std::io::Cursor<Vec<u8>>,
+    stream: TcpStream,
+}
+
+#[cfg(feature = "tls-utls")]
+impl PrefixedStream {
+    fn new(prefix: Vec<u8>, stream: TcpStream) -> Self {
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            stream,
+        }
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+impl AsyncRead for PrefixedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let position = self.prefix.position() as usize;
+        let prefix_len = self.prefix.get_ref().len();
+        if position < prefix_len {
+            let remaining = &self.prefix.get_ref()[position..];
+            let len = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..len]);
+            self.prefix.set_position((position + len) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tls-utls")]
+impl AsyncWrite for PrefixedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
 
 #[cfg(feature = "tls-utls")]
