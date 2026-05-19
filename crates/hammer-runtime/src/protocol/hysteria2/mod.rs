@@ -521,6 +521,8 @@ fn client_config(
         client_auth: options.tls.client_auth.clone(),
         ech: options.tls.ech.clone(),
         max_fragment_size: None,
+        #[cfg(feature = "tls-outbound-stream")]
+        fragment: None,
         #[cfg(feature = "tls-utls")]
         ech_retry_configs,
         #[cfg(feature = "tls-utls")]

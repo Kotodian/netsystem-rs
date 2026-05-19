@@ -93,11 +93,6 @@ impl VlessOutbound {
                 ));
             }
         }
-        if tls.fragment.is_some() {
-            return Err(HammerError::config_validation(
-                "vless tls.fragment is parsed but not supported by the runtime yet",
-            ));
-        }
         Ok(())
     }
 }
@@ -340,6 +335,7 @@ async fn connect_tls(
             client_auth: tls.client_auth.clone(),
             ech: tls.ech.clone(),
             max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
+            fragment: tls.fragment.clone(),
             #[cfg(feature = "tls-utls")]
             ech_retry_configs: None,
             #[cfg(feature = "tls-utls")]

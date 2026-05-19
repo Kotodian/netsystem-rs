@@ -2,15 +2,17 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(feature = "tls-utls")]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "tls-utls")]
 use aws_lc_rs::agreement;
 use bytes::Bytes;
 use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
-use hammer_core::config::{Outbound, OutboundKind, OutboundTlsOptions, VlessOutboundOptions};
+use hammer_core::config::{
+    Outbound, OutboundKind, OutboundTlsOptions, TlsFragmentOptions, VlessOutboundOptions,
+};
 #[cfg(feature = "tls-utls")]
 use hammer_core::config::{
     RealityOptions, RealityPublicKey, RealityShortId, UtlsFingerprint, UtlsOptions,
@@ -112,6 +114,19 @@ fn vless_record_fragment_options(port: u16) -> VlessOutboundOptions {
     VlessOutboundOptions {
         tls: OutboundTlsOptions {
             record_fragment: true,
+            ..vless_tls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
+fn vless_fragment_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            fragment: Some(TlsFragmentOptions {
+                size: "1".to_owned(),
+                sleep: Duration::from_millis(20),
+            }),
             ..vless_tls_options(port).tls
         },
         ..vless_options(port)
@@ -556,6 +571,48 @@ async fn vless_outbound_dials_tcp_over_tls_with_record_fragment() {
     expected.push(0x01);
     expected.extend_from_slice(&[198, 51, 100, 7]);
     assert_eq!(request, expected);
+}
+
+#[tokio::test]
+async fn vless_outbound_dials_tcp_over_tls_with_handshake_fragment() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let captured = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut first = [0_u8; 16];
+        let first_len = stream.read(&mut first).await.unwrap();
+        let mut second = [0_u8; 16];
+        let second_len = stream.read(&mut second).await.unwrap();
+        (first[..first_len].to_vec(), second[..second_len].to_vec())
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_fragment_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let _ = outbound.dial(Network::Tcp, destination, b"").await;
+    let (first, second) = tokio::time::timeout(Duration::from_secs(2), captured)
+        .await
+        .expect("fragmented client hello captured")
+        .unwrap();
+
+    assert_eq!(
+        first,
+        vec![22],
+        "first TCP write should be one TLS handshake byte"
+    );
+    assert!(
+        !second.is_empty(),
+        "second TCP read should contain the next handshake fragment"
+    );
 }
 
 #[tokio::test]

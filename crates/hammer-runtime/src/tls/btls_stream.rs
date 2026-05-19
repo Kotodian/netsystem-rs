@@ -8,7 +8,8 @@ use btls::ssl::{
 };
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+
+use super::fragment::FragmentedTcpStream;
 
 pub(crate) struct BtlsClientStream {
     inner: SslStream<TokioTcpAdapter>,
@@ -20,13 +21,16 @@ impl BtlsClientStream {
     }
 }
 
-pub(super) async fn connect(ssl: Ssl, stream: TcpStream) -> HammerResult<BtlsClientStream> {
+pub(super) async fn connect(
+    ssl: Ssl,
+    stream: FragmentedTcpStream,
+) -> HammerResult<BtlsClientStream> {
     let mut handshake = ssl.setup_connect(TokioTcpAdapter { stream });
     loop {
         match handshake.handshake() {
             Ok(inner) => return Ok(BtlsClientStream { inner }),
-            Err(HandshakeError::WouldBlock(blocked)) => {
-                wait_for_btls_error(&blocked).await?;
+            Err(HandshakeError::WouldBlock(mut blocked)) => {
+                wait_for_btls_error(&mut blocked).await?;
                 handshake = blocked;
             }
             Err(HandshakeError::Failure(failed)) => {
@@ -43,7 +47,7 @@ pub(super) async fn connect(ssl: Ssl, stream: TcpStream) -> HammerResult<BtlsCli
 }
 
 async fn wait_for_btls_error(
-    handshake: &MidHandshakeSslStream<TokioTcpAdapter>,
+    handshake: &mut MidHandshakeSslStream<TokioTcpAdapter>,
 ) -> HammerResult<()> {
     let direction = retry_direction(handshake.error())
         .map_err(|err| HammerError::internal(format!("btls tls handshake readiness: {err}")))?;
@@ -54,12 +58,17 @@ async fn wait_for_btls_error(
             .readable()
             .await
             .map_err(|err| HammerError::internal(format!("btls tls read readiness: {err}"))),
-        RetryDirection::Write => handshake
-            .get_ref()
-            .stream
-            .writable()
-            .await
-            .map_err(|err| HammerError::internal(format!("btls tls write readiness: {err}"))),
+        RetryDirection::Write => {
+            if handshake.get_mut().stream.wait_fragment_delay().await {
+                return Ok(());
+            }
+            handshake
+                .get_ref()
+                .stream
+                .writable()
+                .await
+                .map_err(|err| HammerError::internal(format!("btls tls write readiness: {err}")))
+        }
         RetryDirection::Eof => Err(HammerError::internal("btls tls handshake: unexpected EOF")),
     }
 }
@@ -170,7 +179,7 @@ enum RetryDirection {
 }
 
 struct TokioTcpAdapter {
-    stream: TcpStream,
+    stream: FragmentedTcpStream,
 }
 
 impl Read for TokioTcpAdapter {
@@ -181,7 +190,7 @@ impl Read for TokioTcpAdapter {
 
 impl Write for TokioTcpAdapter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stream.try_write(buf)
+        self.stream.try_write_fragmented(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {

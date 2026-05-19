@@ -9,6 +9,8 @@ use std::task::{Context, Poll};
 use hammer_adapter::PlatformInterface;
 #[cfg(all(feature = "tls-outbound", feature = "tls-utls"))]
 use hammer_core::config::RealityOptions;
+#[cfg(feature = "tls-outbound-stream")]
+use hammer_core::config::TlsFragmentOptions;
 #[cfg(feature = "tls-outbound")]
 use hammer_core::config::{CertificateFingerprint, ClientTlsAuth, EchOptions, UtlsOptions};
 #[cfg(all(
@@ -25,6 +27,9 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "tls-outbound-stream")]
 use tokio::net::TcpStream;
+
+#[cfg(feature = "tls-outbound-stream")]
+use super::fragment::FragmentedTcpStream;
 
 use super::backend::default_backend;
 #[cfg(feature = "tls-utls")]
@@ -57,6 +62,8 @@ pub(crate) struct OutboundClientTlsConfig {
     pub client_auth: Option<ClientTlsAuth>,
     pub ech: Option<EchOptions>,
     pub max_fragment_size: Option<usize>,
+    #[cfg(feature = "tls-outbound-stream")]
+    pub fragment: Option<TlsFragmentOptions>,
     #[cfg(feature = "tls-utls")]
     pub ech_retry_configs: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
     #[cfg(feature = "tls-utls")]
@@ -66,7 +73,7 @@ pub(crate) struct OutboundClientTlsConfig {
 
 #[cfg(feature = "tls-outbound-stream")]
 pub(crate) enum TlsClientStream {
-    Rustls(tokio_rustls::client::TlsStream<TcpStream>),
+    Rustls(tokio_rustls::client::TlsStream<FragmentedTcpStream>),
     #[cfg(feature = "tls-utls")]
     Btls(super::btls_stream::BtlsClientStream),
 }

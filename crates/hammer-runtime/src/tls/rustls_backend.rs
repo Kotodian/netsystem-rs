@@ -6,6 +6,8 @@ use super::client::OutboundClientTlsConfig;
 use super::client::TlsClientStream;
 #[cfg(feature = "tls-outbound")]
 use super::ech::ech_config;
+#[cfg(feature = "tls-outbound-stream")]
+use super::fragment::FragmentedTcpStream;
 #[cfg(feature = "tls-outbound")]
 use super::material::load_client_auth;
 use super::provider::default_provider;
@@ -99,7 +101,9 @@ impl TlsBackend for RustlsAwsLcBackend {
         server_name: ServerName<'static>,
         stream: TcpStream,
     ) -> HammerResult<TlsClientStream> {
+        let fragment = options.fragment.clone();
         let config = self.outbound_client_config(options)?;
+        let stream = FragmentedTcpStream::new(stream, fragment)?;
         let stream = TlsConnector::from(std::sync::Arc::new(config))
             .connect(server_name, stream)
             .await
@@ -135,6 +139,8 @@ mod tests {
                 client_auth: None,
                 ech: None,
                 max_fragment_size: Some(32),
+                #[cfg(feature = "tls-outbound-stream")]
+                fragment: None,
                 #[cfg(feature = "tls-utls")]
                 ech_retry_configs: None,
                 #[cfg(feature = "tls-utls")]

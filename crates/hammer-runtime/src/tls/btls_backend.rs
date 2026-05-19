@@ -3,6 +3,8 @@ use super::client::BasicClientTlsConfig;
 use super::client::OutboundClientTlsConfig;
 #[cfg(feature = "tls-outbound-stream")]
 use super::client::TlsClientStream;
+#[cfg(feature = "tls-outbound-stream")]
+use super::fragment::FragmentedTcpStream;
 #[cfg(feature = "tls-outbound")]
 use super::material::load_client_auth;
 use super::roots::platform_root_certificates;
@@ -115,6 +117,7 @@ impl TlsBackend for BtlsUtlsBackend {
         if let Some(patch) = reality_patch.as_deref_mut() {
             install_reality_client_hello_callback(&mut ssl, patch);
         }
+        let stream = FragmentedTcpStream::new(stream, options.fragment.clone())?;
         let mut stream = super::btls_stream::connect(ssl, stream).await?;
         if reality_patch.is_some() {
             clear_reality_client_hello_callback(stream.ssl_mut());

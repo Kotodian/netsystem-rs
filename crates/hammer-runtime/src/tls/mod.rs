@@ -6,6 +6,8 @@ mod btls_stream;
 mod client;
 #[cfg(feature = "tls-outbound")]
 mod ech;
+#[cfg(feature = "tls-outbound-stream")]
+mod fragment;
 #[cfg(feature = "tls-outbound")]
 mod material;
 mod provider;
