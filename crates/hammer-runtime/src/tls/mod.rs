@@ -1,7 +1,7 @@
 mod backend;
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 mod btls_backend;
-#[cfg(all(feature = "tls-utls", feature = "tls-outbound-stream"))]
+#[cfg(feature = "tls-utls-stream")]
 mod btls_stream;
 mod client;
 #[cfg(feature = "tls-outbound")]
@@ -22,7 +22,7 @@ mod verifier;
 pub(crate) use client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 pub(crate) use client::OutboundClientTlsConfig;
-#[cfg(feature = "tls-quic")]
+#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
 pub(crate) use client::outbound_quic_client_config;
 #[cfg(feature = "outbound-urltest")]
 pub(crate) use client::safe_default_client_config;
@@ -30,5 +30,5 @@ pub(crate) use client::safe_default_client_config;
 pub(crate) use client::tls13_client_config;
 #[cfg(feature = "tls-outbound-stream")]
 pub(crate) use client::{TlsClientStream, outbound_client_stream};
-#[cfg(feature = "tls-quic")]
+#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
 pub(crate) use ech::resolve_dns_https_ech_config_list;

@@ -29,6 +29,11 @@ use hammer_core::protocol::vless::reality::{
     RealityAuthKey, RealityClientVersion, derive_auth_key_with_x25519_private_key, seal_session_id,
     verify_temporary_certificate_signature,
 };
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 use quinn_btls::QuicSslContext;
 #[cfg(feature = "tls-outbound-stream")]
 use rustls::pki_types::ServerName;
@@ -148,7 +153,11 @@ impl TlsBackend for BtlsUtlsBackend {
         Ok(TlsClientStream::Btls(stream))
     }
 
-    #[cfg(feature = "tls-quic")]
+    #[cfg(all(
+        feature = "tls-utls",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
     fn outbound_quic_client_config(
         &self,
         options: OutboundClientTlsConfig,
@@ -181,8 +190,26 @@ impl TlsBackend for BtlsUtlsBackend {
 
         Ok(quinn::ClientConfig::new(Arc::new(crypto)))
     }
+
+    #[cfg(all(
+        not(feature = "tls-utls"),
+        feature = "tls-utls-stream",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
+    fn outbound_quic_client_config(
+        &self,
+        options: OutboundClientTlsConfig,
+    ) -> HammerResult<quinn::ClientConfig> {
+        super::rustls_backend::RUSTLS_AWS_LC_BACKEND.outbound_quic_client_config(options)
+    }
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn btls_ech_config_list(ech: &hammer_core::config::EchOptions) -> HammerResult<Vec<u8>> {
     if ech.pq_signature_schemes_enabled {
         return Err(HammerError::config_validation(
@@ -206,6 +233,11 @@ fn btls_tcp_ech_config_list(ech: &hammer_core::config::EchOptions) -> HammerResu
     super::ech::ech_config_list_bytes(ech)
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn new_utls_client_config(
     options: &UtlsOptions,
     insecure: bool,
@@ -385,6 +417,11 @@ fn verify_btls_server_fingerprint(
         })
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn apply_utls_profile(
     crypto: &mut quinn_btls::ClientConfig,
     options: &UtlsOptions,
@@ -508,6 +545,11 @@ struct UtlsConnectionProfile {
 }
 
 impl UtlsConnectionProfile {
+    #[cfg(all(
+        feature = "tls-utls",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
     fn apply(&self, ssl: &mut Ssl) -> quinn_btls::Result<()> {
         self.apply_to_ssl(ssl).map_err(quinn_btls::Error::from)
     }
@@ -687,6 +729,11 @@ fn cvt_btls(result: i32, options: &UtlsOptions, setting: &str) -> HammerResult<(
     }
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn add_platform_roots(
     crypto: &mut quinn_btls::ClientConfig,
     platform: Option<Arc<dyn PlatformInterface>>,
@@ -713,6 +760,11 @@ fn add_platform_roots_to_builder(
     Ok(())
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn configure_server_verification(
     crypto: &mut quinn_btls::ClientConfig,
     insecure: bool,
@@ -749,6 +801,11 @@ fn configure_tcp_server_verification(
     });
 }
 
+#[cfg(all(
+    feature = "tls-utls",
+    feature = "tls-quic",
+    feature = "outbound-hysteria2"
+))]
 fn configure_client_auth(
     crypto: &mut quinn_btls::ClientConfig,
     auth: Option<hammer_core::config::ClientTlsAuth>,
@@ -1338,6 +1395,11 @@ const ANDROID_EXTENSION_ORDER: &[u16] = &[
 mod tests {
     use super::*;
 
+    #[cfg(all(
+        feature = "tls-utls",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
     #[test]
     fn utls_profiles_apply_to_btls_config() {
         for fingerprint in [
@@ -1360,6 +1422,11 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        feature = "tls-utls",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
     #[test]
     fn utls_server_fingerprints_build_btls_config() {
         let options = UtlsOptions {
@@ -1377,6 +1444,11 @@ mod tests {
             .expect("uTLS server fingerprint verification should be accepted");
     }
 
+    #[cfg(all(
+        feature = "tls-utls",
+        feature = "tls-quic",
+        feature = "outbound-hysteria2"
+    ))]
     #[test]
     fn utls_ech_builds_btls_config_with_cert_verify_callback() {
         let options = UtlsOptions {

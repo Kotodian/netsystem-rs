@@ -7,15 +7,19 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use hammer_adapter::PlatformInterface;
-#[cfg(all(feature = "tls-outbound", feature = "tls-utls"))]
+#[cfg(all(feature = "tls-outbound", feature = "tls-utls-stream"))]
 use hammer_core::config::RealityOptions;
 #[cfg(feature = "tls-outbound-stream")]
 use hammer_core::config::TlsFragmentOptions;
 #[cfg(feature = "tls-outbound")]
 use hammer_core::config::{CertificateFingerprint, ClientTlsAuth, EchOptions, UtlsOptions};
-#[cfg(all(
-    any(feature = "tls-quic", feature = "tls-outbound-stream"),
-    not(feature = "tls-utls")
+#[cfg(any(
+    all(
+        feature = "tls-quic",
+        feature = "outbound-hysteria2",
+        not(feature = "tls-utls")
+    ),
+    all(feature = "tls-outbound-stream", not(feature = "tls-utls-stream"))
 ))]
 use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
@@ -32,7 +36,7 @@ use tokio::net::TcpStream;
 use super::fragment::FragmentedTcpStream;
 
 use super::backend::default_backend;
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 use super::backend::utls_backend;
 
 #[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
@@ -64,9 +68,9 @@ pub(crate) struct OutboundClientTlsConfig {
     pub max_fragment_size: Option<usize>,
     #[cfg(feature = "tls-outbound-stream")]
     pub fragment: Option<TlsFragmentOptions>,
-    #[cfg(feature = "tls-utls")]
+    #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
     pub ech_retry_configs: Option<Arc<std::sync::Mutex<Option<Vec<u8>>>>>,
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub reality: Option<RealityOptions>,
     pub utls: Option<UtlsOptions>,
 }
@@ -74,7 +78,7 @@ pub(crate) struct OutboundClientTlsConfig {
 #[cfg(feature = "tls-outbound-stream")]
 pub(crate) enum TlsClientStream {
     Rustls(tokio_rustls::client::TlsStream<FragmentedTcpStream>),
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     Btls(super::btls_stream::BtlsClientStream),
 }
 
@@ -87,7 +91,7 @@ impl AsyncRead for TlsClientStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
-            #[cfg(feature = "tls-utls")]
+            #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_read(cx, buf),
         }
     }
@@ -102,7 +106,7 @@ impl AsyncWrite for TlsClientStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
-            #[cfg(feature = "tls-utls")]
+            #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_write(cx, buf),
         }
     }
@@ -110,7 +114,7 @@ impl AsyncWrite for TlsClientStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
-            #[cfg(feature = "tls-utls")]
+            #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_flush(cx),
         }
     }
@@ -118,7 +122,7 @@ impl AsyncWrite for TlsClientStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Rustls(stream) => Pin::new(stream).poll_shutdown(cx),
-            #[cfg(feature = "tls-utls")]
+            #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_shutdown(cx),
         }
     }
@@ -130,20 +134,20 @@ pub(crate) async fn outbound_client_stream(
     server_name: ServerName<'static>,
     stream: TcpStream,
 ) -> HammerResult<TlsClientStream> {
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     let use_utls_backend = options.utls.is_some() || options.reality.is_some();
-    #[cfg(not(feature = "tls-utls"))]
+    #[cfg(not(feature = "tls-utls-stream"))]
     let use_utls_backend = options.utls.is_some();
 
     if use_utls_backend {
-        #[cfg(feature = "tls-utls")]
+        #[cfg(feature = "tls-utls-stream")]
         {
             return utls_backend()
                 .outbound_client_stream(options, server_name, stream)
                 .await;
         }
 
-        #[cfg(not(feature = "tls-utls"))]
+        #[cfg(not(feature = "tls-utls-stream"))]
         {
             let utls = options.utls.as_ref().expect("checked above");
             return Err(HammerError::config_validation(format!(
@@ -157,7 +161,7 @@ pub(crate) async fn outbound_client_stream(
         .await
 }
 
-#[cfg(feature = "tls-quic")]
+#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
 pub(crate) fn outbound_quic_client_config(
     options: OutboundClientTlsConfig,
 ) -> HammerResult<quinn::ClientConfig> {

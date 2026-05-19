@@ -22,12 +22,12 @@ impl FragmentedTcpStream {
         })
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.try_read(buf)
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) fn try_write_fragmented(&mut self, buf: &[u8]) -> io::Result<usize> {
         let Some(fragment) = self.fragment.as_mut() else {
             return self.inner.try_write(buf);
@@ -44,7 +44,7 @@ impl FragmentedTcpStream {
         Ok(written)
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) async fn wait_fragment_delay(&mut self) -> bool {
         let Some(fragment) = self.fragment.as_mut() else {
             return false;
@@ -52,22 +52,22 @@ impl FragmentedTcpStream {
         fragment.wait_delay().await
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) async fn readable(&self) -> io::Result<()> {
         self.inner.readable().await
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) async fn writable(&self) -> io::Result<()> {
         self.inner.writable().await
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) fn poll_read_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner.poll_read_ready(cx)
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     pub(super) fn poll_write_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.inner.poll_write_ready(cx)
     }
@@ -171,7 +171,7 @@ impl TlsWriteFragmenter {
         }
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     fn is_ready(&mut self) -> bool {
         let Some(delay) = self.delay.as_ref() else {
             return true;
@@ -179,7 +179,7 @@ impl TlsWriteFragmenter {
         delay.is_elapsed()
     }
 
-    #[cfg(feature = "tls-utls")]
+    #[cfg(feature = "tls-utls-stream")]
     async fn wait_delay(&mut self) -> bool {
         let Some(delay) = self.delay.as_mut() else {
             return false;

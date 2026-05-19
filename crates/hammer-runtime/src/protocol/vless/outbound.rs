@@ -76,12 +76,6 @@ impl VlessOutbound {
                     "vless tls.reality requires tls.enabled",
                 ));
             }
-            #[cfg(not(feature = "tls-utls"))]
-            {
-                return Err(HammerError::config_validation(
-                    "vless tls.reality requires the hammer-runtime tls-utls feature",
-                ));
-            }
         }
         Ok(())
     }
@@ -326,9 +320,9 @@ async fn connect_tls(
             ech: tls.ech.clone(),
             max_fragment_size: tls.record_fragment.then_some(TLS_RECORD_FRAGMENT_SIZE),
             fragment: tls.fragment.clone(),
-            #[cfg(feature = "tls-utls")]
+            #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
             ech_retry_configs: None,
-            #[cfg(feature = "tls-utls")]
+            #[cfg(feature = "tls-utls-stream")]
             reality: tls.reality.clone(),
             utls: tls.utls.clone(),
         },

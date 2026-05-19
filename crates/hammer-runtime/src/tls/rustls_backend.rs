@@ -111,7 +111,7 @@ impl TlsBackend for RustlsAwsLcBackend {
         Ok(TlsClientStream::Rustls(stream))
     }
 
-    #[cfg(feature = "tls-quic")]
+    #[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
     fn outbound_quic_client_config(
         &self,
         options: OutboundClientTlsConfig,
@@ -141,9 +141,9 @@ mod tests {
                 max_fragment_size: Some(32),
                 #[cfg(feature = "tls-outbound-stream")]
                 fragment: None,
-                #[cfg(feature = "tls-utls")]
+                #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
                 ech_retry_configs: None,
-                #[cfg(feature = "tls-utls")]
+                #[cfg(feature = "tls-utls-stream")]
                 reality: None,
                 utls: None,
             })

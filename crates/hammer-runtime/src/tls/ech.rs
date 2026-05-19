@@ -1,20 +1,20 @@
 use std::fs;
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 use std::net::IpAddr;
 use std::path::Path;
 
 use base64::Engine as _;
 use hammer_core::config::{EchConfigSource, EchOptions};
 use hammer_core::error::{HammerError, HammerResult};
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 use hickory_resolver::Resolver;
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 use hickory_resolver::proto::rr::{RData, Record, RecordType};
 use rustls::pki_types::EchConfigListBytes;
 
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 const MAX_HTTPS_ALIAS_DEPTH: usize = 4;
 
 pub(super) fn ech_config(ech: &EchOptions) -> HammerResult<rustls::client::EchConfig> {
@@ -68,7 +68,7 @@ fn load_ech_config_path(path: &Path) -> HammerResult<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(feature = "tls-quic")]
+#[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
 pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> HammerResult<Vec<u8>> {
     let resolver = Resolver::builder_tokio()
         .map_err(|err| HammerError::internal(format!("read system DNS config: {err}")))?
@@ -106,7 +106,7 @@ pub(crate) async fn resolve_dns_https_ech_config_list(server_name: &str) -> Hamm
     unreachable!("HTTPS alias loop must return before exceeding max depth")
 }
 
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     let server_name = server_name.trim();
     if server_name.is_empty() {
@@ -126,7 +126,7 @@ fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     }
 }
 
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 #[derive(Debug, PartialEq, Eq)]
 enum HttpsEchLookupResult {
     Config(Vec<u8>),
@@ -134,7 +134,7 @@ enum HttpsEchLookupResult {
     NotFound,
 }
 
-#[cfg(feature = "tls-quic")]
+#[cfg(any(test, all(feature = "tls-quic", feature = "outbound-hysteria2")))]
 fn ech_config_list_from_https_answers(answers: &[Record]) -> HttpsEchLookupResult {
     let mut https_records = answers
         .iter()

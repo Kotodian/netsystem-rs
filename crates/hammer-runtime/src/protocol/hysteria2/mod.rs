@@ -523,9 +523,9 @@ fn client_config(
         max_fragment_size: None,
         #[cfg(feature = "tls-outbound-stream")]
         fragment: None,
-        #[cfg(feature = "tls-utls")]
+        #[cfg(all(feature = "tls-utls", feature = "outbound-hysteria2"))]
         ech_retry_configs,
-        #[cfg(feature = "tls-utls")]
+        #[cfg(feature = "tls-utls-stream")]
         reality: None,
         utls: options.tls.utls.clone(),
     })?;

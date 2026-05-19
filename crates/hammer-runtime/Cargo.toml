@@ -38,12 +38,16 @@ tls-client = ["tls"]
 tls-outbound = ["tls", "hammer-core/tls", "dep:hickory-resolver"]
 tls-outbound-stream = ["tls-outbound", "dep:tokio-rustls"]
 tls-quic = ["tls-outbound", "dep:quinn"]
-tls-utls = [
-    "tls-quic",
+tls-utls-stream = [
+    "tls-outbound-stream",
     "dep:btls",
     "dep:btls-sys",
     "dep:brotli",
     "dep:foreign-types-shared",
+]
+tls-utls = [
+    "tls-utls-stream",
+    "tls-quic",
     "dep:quinn-btls",
 ]
 outbound-hysteria2 = [
@@ -57,7 +61,7 @@ outbound-hysteria2 = [
     "dep:quinn",
     "dep:rand",
 ]
-outbound-vless = ["tls-outbound-stream", "hammer-core/vless"]
+outbound-vless = ["tls-utls-stream", "hammer-core/vless"]
 outbound-direct = ["dep:socket2"]
 outbound-block = []
 # Outbound group that probes child outbounds via HTTP HEAD over the proxied

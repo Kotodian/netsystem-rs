@@ -38,7 +38,7 @@ pub(super) trait TlsBackend: Sync {
         stream: TcpStream,
     ) -> HammerResult<TlsClientStream>;
 
-    #[cfg(feature = "tls-quic")]
+    #[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
     fn outbound_quic_client_config(
         &self,
         options: OutboundClientTlsConfig,
@@ -49,7 +49,7 @@ pub(super) fn default_backend() -> &'static dyn TlsBackend {
     &super::rustls_backend::RUSTLS_AWS_LC_BACKEND
 }
 
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 pub(super) fn utls_backend() -> &'static dyn TlsBackend {
     &super::btls_backend::BTLS_UTLS_BACKEND
 }

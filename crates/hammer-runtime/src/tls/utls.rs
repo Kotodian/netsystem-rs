@@ -1,7 +1,7 @@
 use hammer_core::config::UtlsFingerprint;
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 use hammer_core::config::UtlsOptions;
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 use hammer_core::error::HammerError;
 
 pub(super) fn fingerprint_name(fingerprint: UtlsFingerprint) -> &'static str {
@@ -19,7 +19,7 @@ pub(super) fn fingerprint_name(fingerprint: UtlsFingerprint) -> &'static str {
     }
 }
 
-#[cfg(feature = "tls-utls")]
+#[cfg(feature = "tls-utls-stream")]
 pub(super) fn unsupported_for_rustls(options: &UtlsOptions) -> HammerError {
     HammerError::config_validation(format!(
         "tls.utls fingerprint {} requires a uTLS-capable backend; rustls/aws-lc-rs cannot shape ClientHello fingerprints",
