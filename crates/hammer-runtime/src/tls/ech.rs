@@ -156,6 +156,37 @@ pub(crate) fn store_ech_retry_configs(store: &Option<EchRetryConfigStore>, retry
     }
 }
 
+#[cfg(feature = "tls-utls-stream")]
+pub(crate) fn store_rustls_ech_retry_configs(
+    store: &Option<EchRetryConfigStore>,
+    err: &std::io::Error,
+) {
+    let Some(retry_configs) = rustls_ech_retry_configs(err) else {
+        return;
+    };
+    store_ech_retry_configs(store, &retry_configs);
+}
+
+#[cfg(feature = "tls-utls-stream")]
+fn rustls_ech_retry_configs(err: &std::io::Error) -> Option<Vec<u8>> {
+    use rustls::internal::msgs::codec::Codec;
+
+    let rustls_error = err.get_ref()?.downcast_ref::<rustls::Error>()?;
+    let rustls::Error::PeerIncompatible(
+        rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+    ) = rustls_error
+    else {
+        return None;
+    };
+    if retry_configs.is_empty() {
+        return None;
+    }
+
+    let mut encoded = Vec::new();
+    retry_configs.encode(&mut encoded);
+    Some(encoded)
+}
+
 #[cfg(any(test, feature = "outbound-hysteria2", feature = "outbound-vless"))]
 fn normalize_dns_name(server_name: &str) -> HammerResult<String> {
     let server_name = server_name.trim();
@@ -288,6 +319,36 @@ mod tests {
             other => panic!("expected inline retry config, got {other:?}"),
         }
         assert!(ech.dynamic_record_sizing_disabled);
+    }
+
+    #[cfg(feature = "tls-utls-stream")]
+    #[test]
+    fn rustls_ech_retry_configs_are_stored_as_config_list() {
+        use rustls::internal::msgs::codec::{Codec, Reader};
+        use rustls::internal::msgs::handshake::EchConfigPayload;
+
+        let retry_config_list = vec![
+            0x00, 0x45, 0xfe, 0x0d, 0x00, 0x41, 0x01, 0x00, 0x20, 0x00, 0x20, 0xa6, 0x9a, 0x41,
+            0x48, 0x5d, 0x32, 0x96, 0xa4, 0xe0, 0xc3, 0x6a, 0xee, 0xf6, 0x63, 0x0f, 0x59, 0x32,
+            0x6f, 0xdc, 0xff, 0x81, 0x29, 0x59, 0xa5, 0x85, 0xd3, 0x9b, 0x3b, 0xde, 0x98, 0x55,
+            0x5c, 0x00, 0x08, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x03, 0x10, 0x0e, 0x70,
+            0x75, 0x62, 0x6c, 0x69, 0x63, 0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x00,
+            0x00,
+        ];
+        let retry_configs = Vec::<EchConfigPayload>::read(&mut Reader::init(&retry_config_list))
+            .expect("retry config list");
+        let err = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::PeerIncompatible(
+                rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(Some(retry_configs)),
+            ),
+        );
+        let store = Some(Arc::new(Mutex::new(None)));
+
+        store_rustls_ech_retry_configs(&store, &err);
+
+        let stored = take_ech_retry_configs(&store).expect("stored retry config list");
+        assert_eq!(stored, retry_config_list);
     }
 
     fn https_record(priority: u16, target: &str, ech: Option<Vec<u8>>) -> Record {

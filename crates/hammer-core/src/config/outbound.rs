@@ -685,6 +685,13 @@ fn build_vless_options(
         )));
     }
     let network = build_tcp_udp_networks(&format!("{prefix}.network"), network)?;
+    if flow.as_deref() == Some("xtls-rprx-vision")
+        && !matches!(network.as_slice(), [crate::Network::Tcp])
+    {
+        return Err(HammerError::config_validation(format!(
+            "{prefix} flow xtls-rprx-vision supports only tcp network"
+        )));
+    }
     Ok((
         VlessOutboundOptions {
             server,

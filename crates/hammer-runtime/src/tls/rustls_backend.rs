@@ -102,12 +102,18 @@ impl TlsBackend for RustlsAwsLcBackend {
         stream: TcpStream,
     ) -> HammerResult<TlsClientStream> {
         let fragment = options.fragment.clone();
+        #[cfg(feature = "tls-utls-stream")]
+        let ech_retry_configs = options.ech_retry_configs.clone();
         let config = self.outbound_client_config(options)?;
         let stream = FragmentedTcpStream::new(stream, fragment)?;
         let stream = TlsConnector::from(std::sync::Arc::new(config))
             .connect(server_name, stream)
             .await
-            .map_err(|err| HammerError::internal(format!("tls connect: {err}")))?;
+            .map_err(|err| {
+                #[cfg(feature = "tls-utls-stream")]
+                super::ech::store_rustls_ech_retry_configs(&ech_retry_configs, &err);
+                HammerError::internal(format!("tls connect: {err}"))
+            })?;
         Ok(TlsClientStream::Rustls(stream))
     }
 

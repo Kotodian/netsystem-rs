@@ -76,6 +76,7 @@ fn vless_tls_options(port: u16) -> VlessOutboundOptions {
 fn vless_vision_options(port: u16) -> VlessOutboundOptions {
     VlessOutboundOptions {
         flow: Some(FLOW_XTLS_RPRX_VISION.to_owned()),
+        network: vec![Network::Tcp],
         tls: OutboundTlsOptions {
             enabled: true,
             server_name: "localhost".to_owned(),
@@ -83,6 +84,13 @@ fn vless_vision_options(port: u16) -> VlessOutboundOptions {
             ..Default::default()
         },
         ..vless_options(port)
+    }
+}
+
+fn vless_vision_udp_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        network: vec![Network::Tcp, Network::Udp],
+        ..vless_vision_options(port)
     }
 }
 
@@ -116,6 +124,19 @@ fn vless_reality_utls_options(port: u16) -> VlessOutboundOptions {
 #[cfg(feature = "tls-utls-stream")]
 fn vless_reality_options(port: u16) -> VlessOutboundOptions {
     VlessOutboundOptions {
+        tls: OutboundTlsOptions {
+            reality: Some(test_reality_options()),
+            ..vless_tls_options(port).tls
+        },
+        ..vless_options(port)
+    }
+}
+
+#[cfg(feature = "tls-utls-stream")]
+fn vless_reality_vision_options(port: u16) -> VlessOutboundOptions {
+    VlessOutboundOptions {
+        flow: Some(FLOW_XTLS_RPRX_VISION.to_owned()),
+        network: vec![Network::Tcp],
         tls: OutboundTlsOptions {
             reality: Some(test_reality_options()),
             ..vless_tls_options(port).tls
@@ -281,6 +302,31 @@ async fn vless_outbound_rejects_udp_when_disabled_by_network() {
 
     assert!(
         err.to_string().contains("vless udp is disabled by network"),
+        "error = {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn vless_outbound_rejects_vision_when_udp_is_enabled() {
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_vision_udp_options(443)),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+
+    let err = match outbound.listen_packet().await {
+        Ok(_) => panic!("vless vision accepted udp network"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("vless flow xtls-rprx-vision supports only tcp network"),
         "error = {err:?}"
     );
 }
@@ -481,6 +527,90 @@ async fn vless_outbound_dials_tcp_with_vision_body_codec() {
     expected.push(0x02);
     expected.push("example.com".len() as u8);
     expected.extend_from_slice(b"example.com");
+    assert_eq!(request, expected);
+}
+
+#[cfg(feature = "tls-utls-stream")]
+#[tokio::test]
+async fn vless_reality_dials_tcp_with_vision_body_codec() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let expected_request_len = 1 + 16 + 1 + 18 + 1 + 2 + 1 + 4;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (record, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        let auth_key = reality_auth_key_from_client_hello(&client_hello);
+        let acceptor = TlsAcceptor::from(Arc::new(
+            reality_tls_server_config(&auth_key, true).expect("Reality server tls config"),
+        ));
+        let mut stream = acceptor
+            .accept(PrefixedStream::new(record, stream))
+            .await
+            .expect("Reality tls accept");
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+
+        let mut frame_prefix = [0_u8; 21];
+        stream.read_exact(&mut frame_prefix).await.unwrap();
+        assert_eq!(&frame_prefix[..16], vless_options(0).uuid.as_slice());
+        assert_eq!(u16::from_be_bytes([frame_prefix[17], frame_prefix[18]]), 5);
+        let padding_len = u16::from_be_bytes([frame_prefix[19], frame_prefix[20]]) as usize;
+        let mut body = [0_u8; 5];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"hello");
+        let mut padding = vec![0_u8; padding_len];
+        stream.read_exact(&mut padding).await.unwrap();
+
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream
+            .write_all(vless_options(0).uuid.as_slice())
+            .await
+            .unwrap();
+        let response = b"reality-vsn";
+        stream.write_all(&[0x01]).await.unwrap();
+        stream
+            .write_all(&(response.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&0_u16.to_be_bytes()).await.unwrap();
+        stream.write_all(response).await.unwrap();
+        stream.shutdown().await.unwrap();
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_vision_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let mut stream = outbound
+        .dial(Network::Tcp, destination, b"hello")
+        .await
+        .expect("dial vless reality vision tcp");
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+
+    assert_eq!(response, b"reality-vsn");
+
+    let request = server.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&vless_options(0).uuid);
+    expected.push(18);
+    expected.push(0x0a);
+    expected.push(FLOW_XTLS_RPRX_VISION.len() as u8);
+    expected.extend_from_slice(FLOW_XTLS_RPRX_VISION.as_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&8443_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[198, 51, 100, 7]);
     assert_eq!(request, expected);
 }
 

@@ -20,6 +20,7 @@ fn parse_config_accepts_vless_reality_vision_outbound() {
         server_port = 443
         uuid = "00112233-4455-6677-8899-aabbccddeeff"
         flow = "xtls-rprx-vision"
+        network = ["tcp"]
 
         [outbounds.tls]
         enabled = true
@@ -58,6 +59,7 @@ fn parse_config_accepts_vless_reality_vision_outbound() {
         ]
     );
     assert_eq!(vless.flow.as_deref(), Some("xtls-rprx-vision"));
+    assert_eq!(vless.network, vec![Network::Tcp]);
     assert!(vless.tls.enabled);
     assert_eq!(vless.tls.server_name, "www.example.com");
     assert_eq!(vless.tls.alpn, vec!["h2".to_owned(), "http/1.1".to_owned()]);
@@ -68,6 +70,36 @@ fn parse_config_accepts_vless_reality_vision_outbound() {
     let reality = vless.tls.reality.as_ref().expect("reality");
     assert_eq!(reality.public_key.0, [0u8; 32]);
     assert_eq!(reality.short_id, RealityShortId(vec![0x0a, 0x0b]));
+}
+
+#[test]
+fn parse_config_rejects_vless_vision_when_udp_is_enabled() {
+    let cfg = indoc! {r#"
+        [tun]
+        address = ["172.19.0.1/30"]
+
+        [[outbounds]]
+        type = "vless"
+        id = "vl"
+        server = "example.com"
+        server_port = 443
+        uuid = "00112233-4455-6677-8899-aabbccddeeff"
+        flow = "xtls-rprx-vision"
+
+        [outbounds.tls]
+        enabled = true
+        server_name = "example.com"
+
+        [dns]
+        server = "local"
+    "#};
+
+    let err = config::parse_config(cfg).expect_err("vless vision accepted default udp network");
+    assert!(
+        err.to_string()
+            .contains("flow xtls-rprx-vision supports only tcp network"),
+        "error = {err:?}"
+    );
 }
 
 #[test]

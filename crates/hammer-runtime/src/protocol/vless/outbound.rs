@@ -74,6 +74,13 @@ impl VlessOutbound {
                 "unsupported vless flow: {flow}"
             )));
         }
+        if is_vision_flow(&self.options)
+            && !matches!(self.options.network.as_slice(), [Network::Tcp])
+        {
+            return Err(HammerError::config_validation(
+                "vless flow xtls-rprx-vision supports only tcp network",
+            ));
+        }
         let tls = &self.options.tls;
         if tls.reality.is_some() {
             if !tls.enabled {
