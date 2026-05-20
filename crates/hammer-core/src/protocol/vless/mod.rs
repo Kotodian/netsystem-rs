@@ -171,41 +171,77 @@ fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
     out.push(value as u8);
 }
 
-pub struct VlessStream<S> {
+pub struct VlessStream<S, D = NoVisionDirect> {
     inner: S,
     response: ResponseHeaderState,
     body: VlessBodyCodec,
+    direct: D,
 }
 
-impl<S> VlessStream<S> {
+impl<S> VlessStream<S, NoVisionDirect> {
     pub fn new(inner: S) -> Self {
         VlessStreamBuilder::new(inner).build()
     }
+}
 
+impl<S, D> VlessStream<S, D> {
     pub fn into_inner(self) -> S {
         self.inner
     }
 }
 
-pub struct VlessStreamBuilder<S> {
-    inner: S,
-    vision_uuid: Option<[u8; 16]>,
+pub trait VisionDirectHandler<S> {
+    fn poll_switch_vision_direct(
+        &mut self,
+        stream: &mut S,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>>;
 }
 
-impl<S> VlessStreamBuilder<S> {
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoVisionDirect;
+
+impl<S> VisionDirectHandler<S> for NoVisionDirect {
+    fn poll_switch_vision_direct(
+        &mut self,
+        _stream: &mut S,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub struct VlessStreamBuilder<S, D = NoVisionDirect> {
+    inner: S,
+    vision_uuid: Option<[u8; 16]>,
+    direct: D,
+}
+
+impl<S> VlessStreamBuilder<S, NoVisionDirect> {
     pub fn new(inner: S) -> Self {
         Self {
             inner,
             vision_uuid: None,
+            direct: NoVisionDirect,
         }
     }
+}
 
+impl<S, D> VlessStreamBuilder<S, D> {
     pub fn vision(mut self, uuid: &[u8; 16]) -> Self {
         self.vision_uuid = Some(*uuid);
         self
     }
 
-    pub fn build(self) -> VlessStream<S> {
+    pub fn vision_direct_handler<H>(self, handler: H) -> VlessStreamBuilder<S, H> {
+        VlessStreamBuilder {
+            inner: self.inner,
+            vision_uuid: self.vision_uuid,
+            direct: handler,
+        }
+    }
+
+    pub fn build(self) -> VlessStream<S, D> {
         VlessStream {
             inner: self.inner,
             response: ResponseHeaderState::new(),
@@ -213,13 +249,15 @@ impl<S> VlessStreamBuilder<S> {
                 Some(uuid) => VlessBodyCodec::Vision(VisionBodyCodec::new(uuid)),
                 None => VlessBodyCodec::Plain,
             },
+            direct: self.direct,
         }
     }
 }
 
-impl<S> AsyncRead for VlessStream<S>
+impl<S, D> AsyncRead for VlessStream<S, D>
 where
     S: AsyncRead + Unpin,
+    D: VisionDirectHandler<S> + Unpin,
 {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -233,13 +271,15 @@ where
                 Poll::Pending => return Poll::Pending,
             }
         }
-        this.body.poll_read(&mut this.inner, cx, buf)
+        this.body
+            .poll_read(&mut this.inner, &mut this.direct, cx, buf)
     }
 }
 
-impl<S> AsyncWrite for VlessStream<S>
+impl<S, D> AsyncWrite for VlessStream<S, D>
 where
     S: AsyncWrite + Unpin,
+    D: Unpin,
 {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -267,18 +307,20 @@ enum VlessBodyCodec {
 }
 
 impl VlessBodyCodec {
-    fn poll_read<S>(
+    fn poll_read<S, D>(
         &mut self,
         stream: &mut S,
+        direct: &mut D,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>>
     where
         S: AsyncRead + Unpin,
+        D: VisionDirectHandler<S> + Unpin,
     {
         match self {
             Self::Plain => Pin::new(stream).poll_read(cx, buf),
-            Self::Vision(vision) => vision.poll_read(stream, cx, buf),
+            Self::Vision(vision) => vision.poll_read(stream, direct, cx, buf),
         }
     }
 
@@ -343,16 +385,22 @@ impl VisionBodyCodec {
         }
     }
 
-    fn poll_read<S>(
+    fn poll_read<S, D>(
         &mut self,
         stream: &mut S,
+        direct: &mut D,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>>
     where
         S: AsyncRead + Unpin,
+        D: VisionDirectHandler<S> + Unpin,
     {
-        if buf.remaining() == 0 || self.read.copy_output_to(buf) {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        if self.read.copy_output_to(buf) {
+            ready!(self.poll_switch_direct_if_needed(stream, direct, cx))?;
             return Poll::Ready(Ok(()));
         }
 
@@ -371,10 +419,29 @@ impl VisionBodyCodec {
                 return Poll::Ready(Ok(()));
             }
             self.read.push(filled)?;
+            ready!(self.poll_switch_direct_if_needed(stream, direct, cx))?;
             if self.read.copy_output_to(buf) {
                 return Poll::Ready(Ok(()));
             }
         }
+    }
+
+    fn poll_switch_direct_if_needed<S, D>(
+        &mut self,
+        stream: &mut S,
+        direct: &mut D,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>>
+    where
+        D: VisionDirectHandler<S> + Unpin,
+    {
+        if !self.read.is_direct_requested() {
+            return Poll::Ready(Ok(()));
+        }
+        self.write_padding = false;
+        ready!(direct.poll_switch_vision_direct(stream, cx))?;
+        self.read.clear_direct_requested();
+        Poll::Ready(Ok(()))
     }
 
     fn poll_write<S>(
@@ -489,6 +556,7 @@ struct VisionReadDecoder {
     input: Vec<u8>,
     output: Vec<u8>,
     mode: VisionReadMode,
+    direct_requested: bool,
 }
 
 impl VisionReadDecoder {
@@ -498,6 +566,7 @@ impl VisionReadDecoder {
             input: Vec::new(),
             output: Vec::new(),
             mode: VisionReadMode::Probe,
+            direct_requested: false,
         }
     }
 
@@ -514,6 +583,14 @@ impl VisionReadDecoder {
         buf.put_slice(&self.output[..len]);
         self.output.drain(..len);
         true
+    }
+
+    fn is_direct_requested(&self) -> bool {
+        self.direct_requested
+    }
+
+    fn clear_direct_requested(&mut self) {
+        self.direct_requested = false;
     }
 
     fn finish_eof(&mut self) -> io::Result<()> {
@@ -613,6 +690,9 @@ impl VisionReadDecoder {
                 self.mode = VisionReadMode::FrameHeader;
             }
             VISION_COMMAND_PADDING_END | VISION_COMMAND_PADDING_DIRECT => {
+                if command == VISION_COMMAND_PADDING_DIRECT {
+                    self.direct_requested = true;
+                }
                 self.output.extend_from_slice(&self.input);
                 self.input.clear();
                 self.mode = VisionReadMode::Direct;

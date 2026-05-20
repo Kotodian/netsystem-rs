@@ -20,6 +20,10 @@ impl BtlsClientStream {
     pub(super) fn ssl_mut(&mut self) -> &mut SslRef {
         self.inner.ssl_mut()
     }
+
+    pub(super) fn into_tcp_stream(self) -> tokio::net::TcpStream {
+        self.inner.into_inner().stream.into_inner()
+    }
 }
 
 pub(super) async fn connect(

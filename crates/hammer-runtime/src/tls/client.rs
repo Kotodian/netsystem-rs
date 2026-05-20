@@ -82,6 +82,30 @@ pub(crate) enum TlsClientStream {
     Rustls(tokio_rustls::client::TlsStream<FragmentedTcpStream>),
     #[cfg(feature = "tls-utls-stream")]
     Btls(super::btls_stream::BtlsClientStream),
+    Raw(TcpStream),
+    Taken,
+}
+
+#[cfg(feature = "tls-outbound-stream")]
+impl TlsClientStream {
+    pub(crate) fn switch_vision_direct(&mut self) -> io::Result<()> {
+        let raw = match std::mem::replace(self, Self::Taken) {
+            Self::Rustls(stream) => {
+                let (stream, _) = stream.into_inner();
+                stream.into_inner()
+            }
+            #[cfg(feature = "tls-utls-stream")]
+            Self::Btls(stream) => stream.into_tcp_stream(),
+            Self::Raw(stream) => stream,
+            Self::Taken => {
+                return Err(io::Error::other(
+                    "tls stream is already switching to Vision direct mode",
+                ));
+            }
+        };
+        *self = Self::Raw(raw);
+        Ok(())
+    }
 }
 
 #[cfg(feature = "tls-outbound-stream")]
@@ -95,6 +119,8 @@ impl AsyncRead for TlsClientStream {
             Self::Rustls(stream) => Pin::new(stream).poll_read(cx, buf),
             #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Raw(stream) => Pin::new(stream).poll_read(cx, buf),
+            Self::Taken => Poll::Ready(Err(io::Error::other("tls stream is taken"))),
         }
     }
 }
@@ -110,6 +136,8 @@ impl AsyncWrite for TlsClientStream {
             Self::Rustls(stream) => Pin::new(stream).poll_write(cx, buf),
             #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Raw(stream) => Pin::new(stream).poll_write(cx, buf),
+            Self::Taken => Poll::Ready(Err(io::Error::other("tls stream is taken"))),
         }
     }
 
@@ -118,6 +146,8 @@ impl AsyncWrite for TlsClientStream {
             Self::Rustls(stream) => Pin::new(stream).poll_flush(cx),
             #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Raw(stream) => Pin::new(stream).poll_flush(cx),
+            Self::Taken => Poll::Ready(Err(io::Error::other("tls stream is taken"))),
         }
     }
 
@@ -126,6 +156,8 @@ impl AsyncWrite for TlsClientStream {
             Self::Rustls(stream) => Pin::new(stream).poll_shutdown(cx),
             #[cfg(feature = "tls-utls-stream")]
             Self::Btls(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Raw(stream) => Pin::new(stream).poll_shutdown(cx),
+            Self::Taken => Poll::Ready(Err(io::Error::other("tls stream is taken"))),
         }
     }
 }

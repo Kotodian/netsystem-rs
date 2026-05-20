@@ -616,6 +616,100 @@ async fn vless_reality_dials_tcp_with_vision_body_codec() {
 
 #[cfg(feature = "tls-utls-stream")]
 #[tokio::test]
+async fn vless_reality_vision_switches_to_raw_stream_on_direct_command() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = listener.local_addr().unwrap();
+    let expected_request_len = 1 + 16 + 1 + 18 + 1 + 2 + 1 + 4;
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (record, client_hello) = read_tls_client_hello_record(&mut stream).await;
+        let auth_key = reality_auth_key_from_client_hello(&client_hello);
+        let acceptor = TlsAcceptor::from(Arc::new(
+            reality_tls_server_config(&auth_key, true).expect("Reality server tls config"),
+        ));
+        let mut stream = acceptor
+            .accept(PrefixedStream::new(record, stream))
+            .await
+            .expect("Reality tls accept");
+        let mut request = vec![0_u8; expected_request_len];
+        stream.read_exact(&mut request).await.unwrap();
+
+        let mut frame_prefix = [0_u8; 21];
+        stream.read_exact(&mut frame_prefix).await.unwrap();
+        let padding_len = u16::from_be_bytes([frame_prefix[19], frame_prefix[20]]) as usize;
+        let mut body = [0_u8; 12];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"client-first");
+        let mut padding = vec![0_u8; padding_len];
+        stream.read_exact(&mut padding).await.unwrap();
+
+        stream.write_all(&[0x00, 0x00]).await.unwrap();
+        stream
+            .write_all(vless_options(0).uuid.as_slice())
+            .await
+            .unwrap();
+        stream.write_all(&[0x02]).await.unwrap();
+        stream.write_all(&5_u16.to_be_bytes()).await.unwrap();
+        stream.write_all(&0_u16.to_be_bytes()).await.unwrap();
+        stream.write_all(b"hello").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let (prefixed, _) = stream.into_inner();
+        let mut raw = prefixed.into_inner();
+        raw.write_all(b"-raw").await.unwrap();
+        raw.flush().await.unwrap();
+
+        let mut after_direct = [0_u8; 12];
+        tokio::time::timeout(Duration::from_secs(2), raw.read_exact(&mut after_direct))
+            .await
+            .expect("read raw uplink after Vision direct timed out")
+            .unwrap();
+        assert_eq!(&after_direct, b"after-direct");
+        request
+    });
+
+    let manager = OutboundManager::from_options(
+        logger("outbound"),
+        "vl",
+        &[Outbound {
+            id: "vl".to_owned(),
+            kind: OutboundKind::Vless(vless_reality_vision_options(server_addr.port())),
+        }],
+    )
+    .expect("outbound manager");
+    let outbound = manager.get("vl").expect("vless outbound");
+    let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 8443);
+
+    let mut stream = outbound
+        .dial(Network::Tcp, destination, b"client-first")
+        .await
+        .expect("dial vless reality vision tcp");
+    let mut response = [0_u8; 9];
+    tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut response))
+        .await
+        .expect("read Vision direct response timed out")
+        .unwrap();
+    assert_eq!(&response, b"hello-raw");
+    stream.write_all(b"after-direct").await.unwrap();
+    stream.flush().await.unwrap();
+
+    let request = server.await.unwrap();
+    let mut expected = Vec::new();
+    expected.push(0x00);
+    expected.extend_from_slice(&vless_options(0).uuid);
+    expected.push(18);
+    expected.push(0x0a);
+    expected.push(FLOW_XTLS_RPRX_VISION.len() as u8);
+    expected.extend_from_slice(FLOW_XTLS_RPRX_VISION.as_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&8443_u16.to_be_bytes());
+    expected.push(0x01);
+    expected.extend_from_slice(&[198, 51, 100, 7]);
+    assert_eq!(request, expected);
+}
+
+#[cfg(feature = "tls-utls-stream")]
+#[tokio::test]
 async fn vless_outbound_dials_tcp_over_utls() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
@@ -1288,6 +1382,10 @@ impl PrefixedStream {
             prefix: std::io::Cursor::new(prefix),
             stream,
         }
+    }
+
+    fn into_inner(self) -> TcpStream {
+        self.stream
     }
 }
 

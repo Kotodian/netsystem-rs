@@ -9,8 +9,8 @@ use hammer_core::config::{OutboundKind, VlessOutboundOptions};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::vless::{
-    FLOW_XTLS_RPRX_VISION, VlessCommand, VlessRequestBuilder, VlessStream, VlessStreamBuilder,
-    encode_udp_packet, read_udp_packet,
+    FLOW_XTLS_RPRX_VISION, NoVisionDirect, VisionDirectHandler, VlessCommand, VlessRequestBuilder,
+    VlessStream, VlessStreamBuilder, encode_udp_packet, read_udp_packet,
 };
 use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -141,13 +141,25 @@ impl Outbound for VlessOutbound {
             .encode()?;
         if options.tls.enabled {
             let stream = connect_tls_with_ech_retry(&self.connector, &mut options, "vless").await?;
-            let stream =
-                write_request_and_wrap(stream, &options, &request, initial_payload).await?;
+            let stream = write_request_and_wrap(
+                stream,
+                &options,
+                &request,
+                initial_payload,
+                TlsVisionDirect,
+            )
+            .await?;
             return Ok(Box::new(stream));
         }
         let stream = self.connector.connect("vless").await?;
-        let stream =
-            write_request_and_wrap(stream, &self.options, &request, initial_payload).await?;
+        let stream = write_request_and_wrap(
+            stream,
+            &self.options,
+            &request,
+            initial_payload,
+            NoVisionDirect,
+        )
+        .await?;
         Ok(Box::new(stream))
     }
 
@@ -169,7 +181,20 @@ impl Outbound for VlessOutbound {
 
 enum VlessServerStream {
     Plain(VlessStream<TcpStream>),
-    Tls(VlessStream<TlsClientStream>),
+    Tls(VlessStream<TlsClientStream, TlsVisionDirect>),
+}
+
+#[derive(Debug, Default)]
+struct TlsVisionDirect;
+
+impl VisionDirectHandler<TlsClientStream> for TlsVisionDirect {
+    fn poll_switch_vision_direct(
+        &mut self,
+        stream: &mut TlsClientStream,
+        _cx: &mut Context<'_>,
+    ) -> Poll<io::Result<()>> {
+        Poll::Ready(stream.switch_vision_direct())
+    }
 }
 
 impl AsyncRead for VlessServerStream {
@@ -232,11 +257,14 @@ impl VlessPacketConn {
         let stream = if options.tls.enabled {
             let stream =
                 connect_tls_with_ech_retry(&self.connector, &mut options, "vless udp").await?;
-            let stream = write_request_and_wrap(stream, &options, &request, &[]).await?;
+            let stream =
+                write_request_and_wrap(stream, &options, &request, &[], TlsVisionDirect).await?;
             VlessServerStream::Tls(stream)
         } else {
             let stream = self.connector.connect("vless udp").await?;
-            let stream = write_request_and_wrap(stream, &self.options, &request, &[]).await?;
+            let stream =
+                write_request_and_wrap(stream, &self.options, &request, &[], NoVisionDirect)
+                    .await?;
             VlessServerStream::Plain(stream)
         };
         self.destination = Some(destination.clone());
@@ -277,14 +305,16 @@ impl ProxyPacketConn for VlessPacketConn {
     }
 }
 
-async fn write_request_and_wrap<S>(
+async fn write_request_and_wrap<S, D>(
     mut stream: S,
     options: &VlessOutboundOptions,
     request: &[u8],
     initial_payload: &[u8],
-) -> HammerResult<VlessStream<S>>
+    direct: D,
+) -> HammerResult<VlessStream<S, D>>
 where
     S: ProxyStream,
+    D: VisionDirectHandler<S> + Unpin,
 {
     stream
         .write_all(request)
@@ -293,9 +323,12 @@ where
     let mut stream = if is_vision_flow(options) {
         VlessStreamBuilder::new(stream)
             .vision(&options.uuid)
+            .vision_direct_handler(direct)
             .build()
     } else {
-        VlessStream::new(stream)
+        VlessStreamBuilder::new(stream)
+            .vision_direct_handler(direct)
+            .build()
     };
     if is_vision_flow(options) && !initial_payload.is_empty() {
         stream

@@ -22,6 +22,10 @@ impl FragmentedTcpStream {
         })
     }
 
+    pub(super) fn into_inner(self) -> TcpStream {
+        self.inner
+    }
+
     #[cfg(feature = "tls-utls-stream")]
     pub(super) fn try_read(&self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.try_read(buf)
