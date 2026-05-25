@@ -17,7 +17,7 @@ pub(crate) type TimerCallback = Box<dyn FnMut() -> TimerFuture + Send + 'static>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlTimerId(pub(crate) u64);
 
-pub(crate) struct ControlTimerHandle {
+pub struct ControlTimerHandle {
     id: ControlTimerId,
     command_tx: UnboundedSender<ControlCommand>,
 }
@@ -27,7 +27,7 @@ impl ControlTimerHandle {
         Self { id, command_tx }
     }
 
-    pub(crate) fn cancel_timeout(&self, timeout: Duration) -> bool {
+    pub fn cancel_timeout(&self, timeout: Duration) -> bool {
         let (done_tx, done_rx) = mpsc::channel();
         if self
             .command_tx

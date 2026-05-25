@@ -15,9 +15,8 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
-use self::timer::{
-    ControlTimerHandle, ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry,
-};
+pub use self::timer::ControlTimerHandle;
+use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
 const LOG_QUEUE_CAPACITY: usize = 4096;
 /// Default ceiling for regular synchronous `call` round-trips. Lifecycle
@@ -27,7 +26,7 @@ const LOG_QUEUE_CAPACITY: usize = 4096;
 /// waiting for the lifecycle operation to finish.
 pub(crate) const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) struct ControlLogWriter {
+pub struct ControlLogWriter {
     log_tx: Sender<LogRecord>,
     command_tx: UnboundedSender<ControlCommand>,
     closed: AtomicBool,
@@ -87,7 +86,7 @@ impl ControlLogWriter {
         self.closed.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn schedule_once<F, Fut>(
+    pub fn schedule_once<F, Fut>(
         &self,
         delay: Duration,
         callback: F,
@@ -103,7 +102,7 @@ impl ControlLogWriter {
         ))
     }
 
-    pub(crate) fn schedule_interval<F, Fut>(
+    pub fn schedule_interval<F, Fut>(
         &self,
         initial_delay: Duration,
         interval: Duration,
