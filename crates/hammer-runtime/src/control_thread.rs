@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{Level, LogWriter};
-use hammer_core::metrics::{MetricCounter, MetricsRegistry};
+use hammer_core::metrics::MetricsRegistry;
 #[cfg(test)]
 use hammer_core::metrics::{MetricKind, MetricSample};
 use tokio::sync::mpsc::{
@@ -21,7 +21,8 @@ pub(crate) use self::event::{
     EventSubscriberBuilder, LogEventArgs, SyntheticEventArgs, build_standard_event_subscribers,
 };
 use self::event::{
-    ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
+    ControlEventSubscriptionId, EventDropMetrics, EventRegistry, EventSubscriberRegistration,
+    boxed_event_callback,
 };
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
@@ -40,16 +41,14 @@ pub struct ControlThreadHandle {
     closed: AtomicBool,
     next_timer_id: std::sync::atomic::AtomicU64,
     next_event_subscription_id: std::sync::atomic::AtomicU64,
-    dropped_logs: MetricCounter,
-    dropped_events: MetricCounter,
+    dropped_events: EventDropMetrics,
 }
 
 impl ControlThreadHandle {
     fn new(
         event_tx: Sender<ControlEvent>,
         command_tx: UnboundedSender<ControlCommand>,
-        dropped_logs: MetricCounter,
-        dropped_events: MetricCounter,
+        dropped_events: EventDropMetrics,
     ) -> Arc<Self> {
         Arc::new(Self {
             event_tx,
@@ -57,7 +56,6 @@ impl ControlThreadHandle {
             closed: AtomicBool::new(false),
             next_timer_id: std::sync::atomic::AtomicU64::new(1),
             next_event_subscription_id: std::sync::atomic::AtomicU64::new(1),
-            dropped_logs,
             dropped_events,
         })
     }
@@ -203,11 +201,7 @@ impl ControlThreadHandle {
     }
 
     fn record_dropped_event(&self, event: &ControlEvent) {
-        if event.is_log() {
-            self.dropped_logs.inc();
-        } else {
-            self.dropped_events.inc();
-        }
+        self.dropped_events.inc(event.kind());
     }
 
     fn schedule_timer(
@@ -387,8 +381,7 @@ impl ControlThread {
         let handle = ControlThreadHandle::new(
             event_tx,
             command_tx,
-            scope.counter("log_dropped_total"),
-            scope.counter("event_dropped_full_total"),
+            EventDropMetrics::new(&scope),
         );
         let thread = Self {
             event_rx,
@@ -1345,6 +1338,45 @@ mod tests {
     }
 
     #[test]
+    fn control_event_drop_full_metric_uses_event_kind_label() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, _thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            Arc::clone(&metrics),
+            Duration::from_secs(60),
+            Level::Info,
+        );
+
+        for index in 0..=CONTROL_EVENT_QUEUE_CAPACITY {
+            control_handle.write_message(Level::Info, format!("queued log {index}\n"));
+        }
+
+        let samples = metrics.snapshot();
+        let dropped_log = samples
+            .iter()
+            .find(|sample| {
+                sample.module == "runtime"
+                    && sample.component_type == "control_thread"
+                    && sample.component_id == "hammer-main"
+                    && sample.name == "event_dropped_full_total"
+                    && sample
+                        .labels
+                        .iter()
+                        .any(|label| label.key == "kind" && label.value == "log")
+            })
+            .expect("log event drop counter");
+        assert_eq!(dropped_log.value, 1);
+        assert!(
+            samples
+                .iter()
+                .all(|sample| sample.name != "log_dropped_total"),
+            "log drops should use the generic event drop metric: {samples:?}"
+        );
+    }
+
+    #[test]
     fn control_event_publish_from_data_thread_runs_callback_on_control_thread() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
@@ -1992,7 +2024,13 @@ mod tests {
     fn build_snapshot_lines_groups_output_by_component() {
         let samples = vec![
             sample("outbound", "direct", "dial_error_total", 1, &[]),
-            sample("runtime", "hammer-main", "log_dropped_total", 0, &[]),
+            sample(
+                "runtime",
+                "hammer-main",
+                "event_dropped_full_total",
+                0,
+                &[("kind", "log")],
+            ),
         ];
         let lines = build_snapshot_lines(&samples, 1715059200);
         assert_eq!(lines.len(), 2, "one line per component: {lines:?}");
@@ -2011,7 +2049,10 @@ mod tests {
             .iter()
             .find(|line| line.contains("\"component\":\"runtime.runtime.hammer-main\""))
             .expect("runtime component line");
-        assert!(runtime.contains("\"runtime.runtime.hammer-main.log_dropped_total.counter\":0"));
+        assert!(
+            runtime
+                .contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter.kind.log\":0")
+        );
         assert!(
             !runtime.contains("outbound.outbound.direct"),
             "component lines must not mix samples: {runtime}"

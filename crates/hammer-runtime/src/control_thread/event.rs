@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hammer_core::error::HammerResult;
 use hammer_core::log::{Level, Logger};
-use hammer_core::metrics::MetricCounter;
+use hammer_core::metrics::{MetricCounter, MetricsScope};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -32,10 +32,6 @@ impl ControlEvent {
             Self::Synthetic(_) => ControlEventKind::Synthetic,
         }
     }
-
-    pub(crate) fn is_log(&self) -> bool {
-        matches!(self, Self::Log(_))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +50,42 @@ pub(crate) struct SyntheticEventArgs {
 pub(crate) enum ControlEventKind {
     Log,
     Synthetic,
+}
+
+impl ControlEventKind {
+    fn metric_label(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Synthetic => "synthetic",
+        }
+    }
+}
+
+pub(crate) struct EventDropMetrics {
+    log: MetricCounter,
+    synthetic: MetricCounter,
+}
+
+impl EventDropMetrics {
+    pub(crate) fn new(scope: &MetricsScope) -> Self {
+        Self {
+            log: scope.counter_with_labels(
+                "event_dropped_full_total",
+                [("kind", ControlEventKind::Log.metric_label())],
+            ),
+            synthetic: scope.counter_with_labels(
+                "event_dropped_full_total",
+                [("kind", ControlEventKind::Synthetic.metric_label())],
+            ),
+        }
+    }
+
+    pub(crate) fn inc(&self, kind: ControlEventKind) {
+        match kind {
+            ControlEventKind::Log => self.log.inc(),
+            ControlEventKind::Synthetic => self.synthetic.inc(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
