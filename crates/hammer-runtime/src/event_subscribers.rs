@@ -68,9 +68,9 @@ mod tests {
     use hammer_core::metrics::MetricsRegistry;
 
     use crate::ControlEventFilter;
+    use crate::ControlThread;
     use crate::component_registry::register_components;
     use crate::control_thread::SyntheticEventArgs;
-    use crate::ControlThread;
     #[cfg(feature = "outbound-hysteria2")]
     use crate::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
 
