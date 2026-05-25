@@ -922,7 +922,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let result: HammerResult<()> = control_handle.call_with_timeout(Duration::from_millis(100), || ());
+        let result: HammerResult<()> =
+            control_handle.call_with_timeout(Duration::from_millis(100), || ());
         let elapsed = start.elapsed();
         assert!(result.is_err(), "expected timeout, got Ok");
         assert!(

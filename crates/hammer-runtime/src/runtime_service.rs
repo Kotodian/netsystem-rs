@@ -20,9 +20,9 @@ use crate::endpoints::EndpointOutboundAdapter;
 use crate::protocol::tun::RuntimeTunInbound;
 use crate::spawn::DataRuntimeContext;
 use crate::{
-    CertificateProviderManager, CertificateStore, ConnectionManager, ControlThreadHandle,
-    ControlThread, DnsRouter, DnsTransportManager, InboundManager, MetricSample, MetricsRegistry,
-    NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
+    CertificateProviderManager, CertificateStore, ConnectionManager, ControlThread,
+    ControlThreadHandle, DnsRouter, DnsTransportManager, InboundManager, MetricSample,
+    MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
 #[cfg(feature = "endpoint")]
 use hammer_adapter::{EndpointManager as _, InboundManager as _};
@@ -524,7 +524,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self
+            .control_handle()
+            .ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
         control_handle.call(move || {
             let mut inner = inner.lock().expect("service mutex poisoned");
@@ -541,7 +543,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self
+            .control_handle()
+            .ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
         control_handle.call_blocking(move || {
             let mut inner = inner.lock().expect("service mutex poisoned");
@@ -561,7 +565,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self
+            .control_handle()
+            .ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
         control_handle.call_async(timeout, move |done| {
             let mut inner = inner.lock().expect("service mutex poisoned");
