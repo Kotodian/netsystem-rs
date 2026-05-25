@@ -33,7 +33,7 @@ use hammer_core::protocol::wireguard::peer::{self, Peer};
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::to_boringtun_config;
 use super::transport::{self, TransportHandles};
-use crate::ControlLogWriter;
+use crate::ControlThreadHandle;
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 
@@ -58,7 +58,7 @@ pub struct WireguardEndpoint {
     amnezia: Option<Amnezia2Options>,
     peers: Arc<Vec<Peer>>,
     protector: SocketProtector,
-    control_log: Option<Arc<ControlLogWriter>>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
     local_flows: Arc<LocalFlowTable>,
     inner: Mutex<WireguardState>,
     #[cfg(test)]
@@ -175,7 +175,7 @@ impl WireguardEndpoint {
         logger: Logger,
         options: EndpointRuntimeOptions<WireguardEndpointOptions>,
         protector: SocketProtector,
-        control_log: Option<Arc<ControlLogWriter>>,
+        control_handle: Option<Arc<ControlThreadHandle>>,
     ) -> Self {
         let EndpointRuntimeOptions {
             id,
@@ -213,7 +213,7 @@ impl WireguardEndpoint {
             amnezia: runtime_amnezia,
             peers: Arc::new(peers),
             protector,
-            control_log,
+            control_handle,
             local_flows: Arc::new(LocalFlowTable::default()),
             inner: Mutex::new(WireguardState::Idle),
             #[cfg(test)]
@@ -271,7 +271,7 @@ impl WireguardEndpoint {
             self.listen_port,
             self.mtu,
             self.protector.clone(),
-            self.control_log.as_ref().map(Arc::clone),
+            self.control_handle.as_ref().map(Arc::clone),
             #[cfg(feature = "endpoint-amneziawg")]
             self.amnezia.clone(),
         )?;
@@ -627,24 +627,24 @@ pub(crate) fn build_with_platform(
     logger: Logger,
     options: EndpointRuntimeOptions<WireguardEndpointOptions>,
     platform: Option<Arc<dyn PlatformInterface>>,
-    control_log: Option<Arc<ControlLogWriter>>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 ) -> WireguardEndpoint {
     let protector = SocketProtector::from(platform);
-    WireguardEndpoint::new(logger, options, protector, control_log)
+    WireguardEndpoint::new(logger, options, protector, control_handle)
 }
 
 pub(crate) fn build_endpoint_views(
     logger: Logger,
     option: &EndpointOptions,
     platform: Option<Arc<dyn PlatformInterface>>,
-    control_log: Option<Arc<ControlLogWriter>>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 ) -> HammerResult<Arc<WireguardEndpoint>> {
     match &option.kind {
         EndpointKind::Wireguard(options) => Ok(Arc::new(build_with_platform(
             logger,
             EndpointRuntimeOptions::from_endpoint(option, options.clone()),
             platform,
-            control_log,
+            control_handle,
         ))),
     }
 }

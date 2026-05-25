@@ -26,7 +26,7 @@ const LOG_QUEUE_CAPACITY: usize = 4096;
 /// waiting for the lifecycle operation to finish.
 pub(crate) const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub struct ControlLogWriter {
+pub struct ControlThreadHandle {
     log_tx: Sender<LogRecord>,
     command_tx: UnboundedSender<ControlCommand>,
     closed: AtomicBool,
@@ -34,7 +34,7 @@ pub struct ControlLogWriter {
     dropped_logs: MetricCounter,
 }
 
-impl ControlLogWriter {
+impl ControlThreadHandle {
     fn new(
         log_tx: Sender<LogRecord>,
         command_tx: UnboundedSender<ControlCommand>,
@@ -269,7 +269,7 @@ impl ControlLogWriter {
     }
 }
 
-impl LogWriter for ControlLogWriter {
+impl LogWriter for ControlThreadHandle {
     fn write_message(&self, level: Level, message: String) {
         if self.closed.load(Ordering::Relaxed) {
             return;
@@ -296,22 +296,23 @@ impl ControlThread {
         metrics: Arc<MetricsRegistry>,
         _metrics_interval: Duration,
         _min_level: Level,
-    ) -> (Arc<ControlLogWriter>, Self) {
+    ) -> (Arc<ControlThreadHandle>, Self) {
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(LOG_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let scope = metrics.scope("runtime", "control_thread", "hammer-main");
-        let writer = ControlLogWriter::new(log_tx, command_tx, scope.counter("log_dropped_total"));
+        let handle =
+            ControlThreadHandle::new(log_tx, command_tx, scope.counter("log_dropped_total"));
         let thread = Self {
             log_rx,
             command_rx,
             inner,
             timers: TimerRegistry::new(),
         };
-        (writer, thread)
+        (handle, thread)
     }
 
     pub(crate) async fn run(mut self) {
-        // Once every `ControlLogWriter` is dropped, `log_rx.recv()` returns
+        // Once every `ControlThreadHandle` is dropped, `log_rx.recv()` returns
         // `None` permanently. Disable that branch instead of `continue`-ing,
         // which would re-poll a ready-`None` future on every loop iteration
         // and burn CPU. Command and metrics dispatch keep running until the
@@ -783,10 +784,10 @@ mod tests {
     }
 
     #[test]
-    fn control_writer_flushes_queued_logs() {
+    fn control_handle_flushes_queued_logs() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -795,9 +796,9 @@ mod tests {
         );
         let handle = run_control_thread(thread);
 
-        writer.write_message(Level::Info, "line\n".to_owned());
-        assert!(writer.flush_timeout(Duration::from_secs(1)));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        control_handle.write_message(Level::Info, "line\n".to_owned());
+        assert!(control_handle.flush_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
@@ -805,14 +806,14 @@ mod tests {
     }
 
     #[test]
-    fn control_writer_does_not_dump_registered_metrics() {
+    fn control_handle_does_not_dump_registered_metrics() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
             .scope("outbound", "outbound", "direct")
             .counter_with_labels("dial_error_total", [("network", "tcp")])
             .inc();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -822,7 +823,7 @@ mod tests {
         let handle = run_control_thread(thread);
 
         std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
@@ -833,14 +834,14 @@ mod tests {
     }
 
     #[test]
-    fn control_writer_respects_log_level_for_metrics() {
+    fn control_handle_respects_log_level_for_metrics() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
             .scope("outbound", "outbound", "direct")
             .counter_with_labels("dial_error_total", [("network", "tcp")])
             .inc();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -850,7 +851,7 @@ mod tests {
         let handle = run_control_thread(thread);
 
         std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
@@ -864,7 +865,7 @@ mod tests {
     fn control_thread_survives_panicking_call() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -879,19 +880,19 @@ mod tests {
         std::panic::set_hook(Box::new(|_| {}));
 
         let panicked: HammerResult<()> =
-            writer.call_with_timeout(Duration::from_secs(1), || panic!("boom"));
+            control_handle.call_with_timeout(Duration::from_secs(1), || panic!("boom"));
         assert!(panicked.is_err(), "panicking closure should surface error");
 
         // The control thread must still be alive and able to service further
         // calls — that is the whole point of catching the unwind.
-        let value = writer
+        let value = control_handle
             .call_with_timeout(Duration::from_secs(1), || 42_u32)
             .expect("post-panic call should succeed");
         assert_eq!(value, 42);
 
         std::panic::set_hook(prev_hook);
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -899,7 +900,7 @@ mod tests {
     fn control_call_times_out_when_thread_blocked() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -912,16 +913,16 @@ mod tests {
         // attempt a second call with a much shorter timeout. The second call
         // must return Err quickly instead of blocking until the first one
         // completes.
-        let blocker_writer = Arc::clone(&writer);
+        let blocker_control_handle = Arc::clone(&control_handle);
         let blocker = std::thread::spawn(move || {
-            let _ = blocker_writer.call_with_timeout(Duration::from_secs(2), || {
+            let _ = blocker_control_handle.call_with_timeout(Duration::from_secs(2), || {
                 std::thread::sleep(Duration::from_millis(300));
             });
         });
         std::thread::sleep(Duration::from_millis(50));
 
         let start = Instant::now();
-        let result: HammerResult<()> = writer.call_with_timeout(Duration::from_millis(100), || ());
+        let result: HammerResult<()> = control_handle.call_with_timeout(Duration::from_millis(100), || ());
         let elapsed = start.elapsed();
         assert!(result.is_err(), "expected timeout, got Ok");
         assert!(
@@ -930,7 +931,7 @@ mod tests {
         );
 
         blocker.join().expect("blocker thread join");
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -938,7 +939,7 @@ mod tests {
     fn control_blocking_call_waits_for_slow_closure() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -947,7 +948,7 @@ mod tests {
         );
         let handle = run_control_thread(thread);
 
-        let value = writer
+        let value = control_handle
             .call_blocking(|| {
                 std::thread::sleep(Duration::from_millis(120));
                 7_u32
@@ -955,7 +956,7 @@ mod tests {
             .expect("blocking control call");
         assert_eq!(value, 7);
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -963,7 +964,7 @@ mod tests {
     fn control_timer_runs_one_shot_once() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -974,7 +975,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let timer_count = Arc::clone(&count);
 
-        let _timer = writer
+        let _timer = control_handle
             .schedule_once(Duration::from_millis(20), move || {
                 let timer_count = Arc::clone(&timer_count);
                 async move {
@@ -988,7 +989,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert_eq!(count.load(Ordering::SeqCst), 1);
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -996,7 +997,7 @@ mod tests {
     fn control_timer_interval_stops_after_cancel() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1007,7 +1008,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let timer_count = Arc::clone(&count);
 
-        let timer = writer
+        let timer = control_handle
             .schedule_interval(Duration::ZERO, Duration::from_millis(20), move || {
                 let timer_count = Arc::clone(&timer_count);
                 async move {
@@ -1023,7 +1024,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(70));
         assert_eq!(count.load(Ordering::SeqCst), before_cancel);
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -1031,7 +1032,7 @@ mod tests {
     fn control_timer_interval_skips_when_previous_tick_is_running() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1046,7 +1047,7 @@ mod tests {
         let timer_active = Arc::clone(&active);
         let timer_overlaps = Arc::clone(&overlaps);
 
-        let timer = writer
+        let timer = control_handle
             .schedule_interval(Duration::ZERO, Duration::from_millis(5), move || {
                 let timer_starts = Arc::clone(&timer_starts);
                 let timer_active = Arc::clone(&timer_active);
@@ -1068,7 +1069,7 @@ mod tests {
         assert_eq!(overlaps.load(Ordering::SeqCst), 0);
         assert!(starts <= 3, "slow timer should skip ticks, got {starts}");
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
@@ -1096,7 +1097,7 @@ mod tests {
     fn control_timer_shutdown_aborts_running_task() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1107,7 +1108,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (dropped_tx, dropped_rx) = mpsc::channel();
 
-        let _timer = writer
+        let _timer = control_handle
             .schedule_once(Duration::ZERO, move || {
                 let _ = started_tx.send(());
                 DropSignalFuture {
@@ -1119,7 +1120,7 @@ mod tests {
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("timer should start");
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
         dropped_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1130,7 +1131,7 @@ mod tests {
     fn control_timer_survives_panicking_callback() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1141,28 +1142,28 @@ mod tests {
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
 
-        let _timer = writer
+        let _timer = control_handle
             .schedule_once(Duration::ZERO, move || async move {
                 panic!("timer boom");
             })
             .expect("schedule panicking timer");
         std::thread::sleep(Duration::from_millis(50));
 
-        let value = writer
+        let value = control_handle
             .call_with_timeout(Duration::from_secs(1), || 42_u32)
             .expect("control thread should survive panicking timer callback");
         assert_eq!(value, 42);
 
         std::panic::set_hook(prev_hook);
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
 
     #[test]
-    fn control_writer_shutdown_does_not_dump_idle_metrics() {
+    fn control_handle_shutdown_does_not_dump_idle_metrics() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1172,7 +1173,7 @@ mod tests {
         let handle = run_control_thread(thread);
 
         std::thread::sleep(Duration::from_millis(40));
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();
@@ -1253,7 +1254,7 @@ mod tests {
             .counter("dial_error_total")
             .inc();
         // Long interval → only the shutdown path can fire dump_metrics.
-        let (writer, thread) = ControlThread::new(
+        let (control_handle, thread) = ControlThread::new(
             Instant::now(),
             inner.clone(),
             metrics,
@@ -1262,7 +1263,7 @@ mod tests {
         );
         let handle = run_control_thread(thread);
 
-        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
 
         let lines = inner.lines.lock().unwrap();

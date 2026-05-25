@@ -41,7 +41,7 @@ use hammer_core::protocol::wireguard::peer::{self, Peer};
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets};
 use crate::socket_protector::SocketProtector;
-use crate::{ControlLogWriter, ControlTimerHandle};
+use crate::{ControlThreadHandle, ControlTimerHandle};
 
 /// 250 ms matches what boringtun's own examples and Cloudflare WARP use to
 /// drive `Tunn::update_timers` — fine-grained enough for handshake retries
@@ -170,7 +170,7 @@ pub(crate) fn spawn_transport(
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
-    control_log: Option<Arc<ControlLogWriter>>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<Amnezia2Options>,
 ) -> HammerResult<TransportHandles> {
     let sockets = bind_transport_sockets(&peers, listen_port, &protector)?;
@@ -184,10 +184,10 @@ pub(crate) fn spawn_transport(
     let (timer_tick_tx, timer_tick_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
-    let keepalive_timer = if let Some(control_log) = control_log {
+    let keepalive_timer = if let Some(control_handle) = control_handle {
         let timer_tick_tx = timer_tick_tx.clone();
         Some(
-            control_log
+            control_handle
                 .schedule_interval(TIMER_TICK, TIMER_TICK, move || {
                     let timer_tick_tx = timer_tick_tx.clone();
                     async move {
@@ -1244,14 +1244,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_registers_keepalive_timer_on_control_thread() {
         let inner = Arc::new(DiscardWriter);
-        let (control_writer, control_thread) = ControlThread::new(
+        let (control_thread_handle, control_thread) = ControlThread::new(
             Instant::now(),
             inner,
             MetricsRegistry::new(),
             Duration::from_secs(60),
             Level::Info,
         );
-        let control_handle = std::thread::spawn(move || {
+        let control_join = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1274,7 +1274,7 @@ mod tests {
             0,
             1408,
             SocketProtector::default(),
-            Some(Arc::clone(&control_writer)),
+            Some(Arc::clone(&control_thread_handle)),
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1286,8 +1286,8 @@ mod tests {
         );
 
         let _ = handles.shutdown.send(());
-        assert!(control_writer.shutdown_timeout(Duration::from_secs(1)));
-        control_handle.join().expect("control thread join");
+        assert!(control_thread_handle.shutdown_timeout(Duration::from_secs(1)));
+        control_join.join().expect("control thread join");
     }
 
     /// Push a burst of IP packets through `encrypt_tx` in quick succession so

@@ -77,7 +77,7 @@ pub(crate) trait EndpointComponentDeclaration {
         logger: hammer_core::log::Logger,
         option: &hammer_core::config::Endpoint,
         platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
-        control_log: Option<std::sync::Arc<crate::ControlLogWriter>>,
+        control_handle: Option<std::sync::Arc<crate::ControlThreadHandle>>,
     ) -> hammer_core::error::HammerResult<hammer_adapter::EndpointComponent>;
 }
 

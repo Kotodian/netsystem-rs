@@ -20,7 +20,7 @@ use crate::endpoints::EndpointOutboundAdapter;
 use crate::protocol::tun::RuntimeTunInbound;
 use crate::spawn::DataRuntimeContext;
 use crate::{
-    CertificateProviderManager, CertificateStore, ConnectionManager, ControlLogWriter,
+    CertificateProviderManager, CertificateStore, ConnectionManager, ControlThreadHandle,
     ControlThread, DnsRouter, DnsTransportManager, InboundManager, MetricSample, MetricsRegistry,
     NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
@@ -88,7 +88,7 @@ pub struct RuntimeService {
 struct ServiceInner {
     state: ServiceState,
     log_factory: Arc<Factory>,
-    control_log: Option<Arc<ControlLogWriter>>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
     control_thread: Option<JoinHandle<()>>,
     metrics: Arc<MetricsRegistry>,
     #[allow(dead_code)]
@@ -144,7 +144,7 @@ impl RuntimeService {
         } else {
             writer
         };
-        let (control_writer, control_loop) = ControlThread::new(
+        let (control_handle, control_loop) = ControlThread::new(
             base_time,
             writer,
             Arc::clone(&metrics),
@@ -161,7 +161,7 @@ impl RuntimeService {
                 return Err(err);
             }
         };
-        let writer: Arc<dyn LogWriter> = Arc::clone(&control_writer) as Arc<dyn LogWriter>;
+        let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
 
         let registry = RuntimeRegistry::new();
@@ -180,7 +180,7 @@ impl RuntimeService {
             new_logger(&log_factory, "endpoint"),
             &options.endpoints,
             Arc::clone(&platform),
-            Arc::clone(&control_writer),
+            Arc::clone(&control_handle),
         )?);
         let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
@@ -330,7 +330,7 @@ impl RuntimeService {
             inner: Arc::new(Mutex::new(ServiceInner {
                 state: ServiceState::NotStarted,
                 log_factory,
-                control_log: Some(control_writer),
+                control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
                 metrics,
                 platform,
@@ -453,11 +453,11 @@ impl RuntimeService {
         let needs_lifecycle_close =
             { self.inner.lock().expect("service mutex poisoned").state != ServiceState::Closed };
         let result = if needs_lifecycle_close {
-            let Some(control_log) = self.control_log() else {
+            let Some(control_handle) = self.control_handle() else {
                 return Ok(());
             };
             let inner = Arc::clone(&self.inner);
-            match control_log.call_blocking(move || {
+            match control_handle.call_blocking(move || {
                 let mut inner = inner.lock().expect("service mutex poisoned");
                 let _dispatch_guard =
                     tracing::dispatcher::set_default(inner.log_factory.dispatch());
@@ -524,9 +524,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_log = self.control_log().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
-        control_log.call(move || {
+        control_handle.call(move || {
             let mut inner = inner.lock().expect("service mutex poisoned");
             let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
             let data_context = inner.data_context.clone();
@@ -541,9 +541,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_log = self.control_log().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
-        control_log.call_blocking(move || {
+        control_handle.call_blocking(move || {
             let mut inner = inner.lock().expect("service mutex poisoned");
             let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
             let data_context = inner.data_context.clone();
@@ -561,9 +561,9 @@ impl RuntimeService {
     where
         R: Send + 'static,
     {
-        let control_log = self.control_log().ok_or_else(HammerError::service_closed)?;
+        let control_handle = self.control_handle().ok_or_else(HammerError::service_closed)?;
         let inner = Arc::clone(&self.inner);
-        control_log.call_async(timeout, move |done| {
+        control_handle.call_async(timeout, move |done| {
             let mut inner = inner.lock().expect("service mutex poisoned");
             let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
             let data_context = inner.data_context.clone();
@@ -571,11 +571,11 @@ impl RuntimeService {
         })
     }
 
-    fn control_log(&self) -> Option<Arc<ControlLogWriter>> {
+    fn control_handle(&self) -> Option<Arc<ControlThreadHandle>> {
         self.inner
             .lock()
             .expect("service mutex poisoned")
-            .control_log
+            .control_handle
             .clone()
     }
 }
@@ -664,24 +664,24 @@ fn finish_close(
     close_result: HammerResult<()>,
 ) -> HammerResult<()> {
     // Lifecycles have already been closed on hammer-main, so worker-owned tasks
-    // have had a chance to emit their shutdown logs while the control writer was
+    // have had a chance to emit their shutdown logs while the control handle was
     // still open. The Tokio runtime itself must outlive this step because the
     // control loop is driven by a handle to that same runtime.
     let mut result = close_result;
-    let control_log = {
+    let control_handle = {
         inner
             .lock()
             .expect("service mutex poisoned")
-            .control_log
+            .control_handle
             .clone()
     };
-    if let Some(control_log) = control_log
-        && !control_log.is_closed()
+    if let Some(control_handle) = control_handle
+        && !control_handle.is_closed()
     {
-        if !control_log.flush_timeout(CONTROL_SHUTDOWN_TIMEOUT) {
+        if !control_handle.flush_timeout(CONTROL_SHUTDOWN_TIMEOUT) {
             result = combine_close_error(result, "control thread log flush timed out");
         }
-        if !control_log.shutdown_timeout(CONTROL_SHUTDOWN_TIMEOUT) {
+        if !control_handle.shutdown_timeout(CONTROL_SHUTDOWN_TIMEOUT) {
             result = combine_close_error(result, "control thread shutdown timed out");
         }
     }
@@ -699,7 +699,7 @@ fn finish_close(
                 inner
                     .lock()
                     .expect("service mutex poisoned")
-                    .control_log
+                    .control_handle
                     .take();
                 control_finished = true;
             }
@@ -711,7 +711,7 @@ fn finish_close(
                 inner
                     .lock()
                     .expect("service mutex poisoned")
-                    .control_log
+                    .control_handle
                     .take();
                 result = combine_close_error(result, "control thread panicked");
                 // A panicked control thread is dead — its `block_on` has
