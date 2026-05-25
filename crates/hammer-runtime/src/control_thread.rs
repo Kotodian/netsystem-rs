@@ -19,12 +19,13 @@ use tokio::sync::mpsc::{
 #[cfg(test)]
 pub(crate) use self::event::SyntheticEventArgs;
 pub use self::event::{
-    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, LogEventArgs,
+    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, EventSubscriberBuilder,
+    LogEventArgs,
 };
 use self::event::{
     ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
 };
-pub(crate) use self::event::{EventSubscriberBuilder, build_standard_event_subscribers};
+pub(crate) use self::event::build_standard_event_subscribers;
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
@@ -495,9 +496,13 @@ impl ControlThread {
     }
 
     fn handle_event(&mut self, event: ControlEvent) {
-        if let ControlEvent::Log(args) = &event {
-            self.inner
-                .write_message(args.level, args.message.to_string());
+        match &event {
+            ControlEvent::Log(args) => {
+                self.inner
+                    .write_message(args.level, args.message.to_string());
+            }
+            #[cfg(test)]
+            ControlEvent::Synthetic(_) => {}
         }
         self.events.dispatch(event);
     }

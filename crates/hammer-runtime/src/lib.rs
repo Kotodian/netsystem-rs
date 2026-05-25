@@ -82,11 +82,14 @@ pub mod wireguard {
 mod apple_utun;
 
 pub use certificate::{CertificateProviderManager, CertificateStore};
+pub use component_registry::{
+    EventSubscriberComponentDeclaration, register_event_subscriber_component,
+};
 pub use connection::{ConnectionManager, ConnectionRegistration};
 pub(crate) use control_thread::ControlThread;
 pub use control_thread::{
     ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle,
-    ControlTimerHandle, LogEventArgs,
+    ControlTimerHandle, EventSubscriberBuilder, LogEventArgs,
 };
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;

@@ -182,11 +182,11 @@ pub trait EventSubscriberComponentDeclaration {
     fn build(
         logger: hammer_core::log::Logger,
         control_handle: std::sync::Arc<crate::ControlThreadHandle>,
-    ) -> hammer_core::error::HammerResult<Vec<crate::control_thread::ControlEventSubscriptionHandle>>;
+    ) -> hammer_core::error::HammerResult<Vec<crate::ControlEventSubscriptionHandle>>;
 }
 
 pub fn register_event_subscriber_component<C>(
-    builders: &mut HashMap<&'static str, crate::control_thread::EventSubscriberBuilder>,
+    builders: &mut HashMap<&'static str, crate::EventSubscriberBuilder>,
 ) where
     C: EventSubscriberComponentDeclaration,
 {

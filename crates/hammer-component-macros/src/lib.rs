@@ -395,7 +395,7 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                 fn build(
                     logger: ::hammer_core::log::Logger,
                     control_handle: ::std::sync::Arc<crate::ControlThreadHandle>,
-                ) -> ::hammer_core::error::HammerResult<::std::vec::Vec<crate::control_thread::ControlEventSubscriptionHandle>> {
+                ) -> ::hammer_core::error::HammerResult<::std::vec::Vec<crate::ControlEventSubscriptionHandle>> {
                     #builder(logger, control_handle)
                 }
             }
