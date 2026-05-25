@@ -16,6 +16,7 @@ enum ComponentKind {
     Router,
     Matcher,
     Probe,
+    Event,
 }
 
 impl ComponentKind {
@@ -28,10 +29,11 @@ impl ComponentKind {
             "router" => Ok(Self::Router),
             "matcher" => Ok(Self::Matcher),
             "probe" => Ok(Self::Probe),
+            "event" => Ok(Self::Event),
             other => Err(Error::new(
                 ident.span(),
                 format!(
-                    "unknown component kind `{other}`; expected outbound, inbound, endpoint, dns_transport, router, matcher, or probe"
+                    "unknown component kind `{other}`; expected outbound, inbound, endpoint, dns_transport, router, matcher, probe, or event"
                 ),
             )),
         }
@@ -48,6 +50,7 @@ impl ComponentKind {
             Self::Router => quote!(crate::component_registry::RouterComponentDeclaration),
             Self::Matcher => quote!(crate::component_registry::RouteMatcherComponentDeclaration),
             Self::Probe => quote!(crate::component_registry::ProbeComponentDeclaration),
+            Self::Event => quote!(crate::component_registry::EventSubscriberComponentDeclaration),
         }
     }
 
@@ -75,6 +78,7 @@ impl ComponentKind {
             Self::Router => "router",
             Self::Matcher => "matcher",
             Self::Probe => "probe",
+            Self::Event => "event",
         }
     }
 }
@@ -381,6 +385,18 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                     let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
                     let runtime: ::std::sync::Arc<dyn ::hammer_adapter::ProbeProtocol> = runtime;
                     ::hammer_adapter::RuntimeComponent::new(meta, runtime)
+                }
+            }
+        },
+        ComponentKind::Event => quote! {
+            #declaration_impl_head {
+                const TYPE_NAME: &'static str = #name;
+
+                fn build(
+                    logger: ::hammer_core::log::Logger,
+                    control_handle: ::std::sync::Arc<crate::ControlThreadHandle>,
+                ) -> ::hammer_core::error::HammerResult<::std::vec::Vec<crate::control_thread::ControlEventSubscriptionHandle>> {
+                    #builder(logger, control_handle)
                 }
             }
         },

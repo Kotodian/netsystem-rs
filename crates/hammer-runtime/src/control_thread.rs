@@ -1,3 +1,4 @@
+mod event;
 mod timer;
 
 use std::future::Future;
@@ -15,10 +16,17 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
+pub(crate) use self::event::{
+    ControlEvent, ControlEventFilter, ControlEventKind, ControlEventSubscriptionHandle,
+    EventSubscriberBuilder, LogEventArgs, SyntheticEventArgs, build_standard_event_subscribers,
+};
 pub use self::timer::ControlTimerHandle;
+use self::event::{
+    ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
+};
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
-const LOG_QUEUE_CAPACITY: usize = 4096;
+const CONTROL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Default ceiling for regular synchronous `call` round-trips. Lifecycle
 /// start/close is deliberately dispatched through `call_blocking` instead:
 /// those paths are synchronous and non-cancelable, so timing out the caller
@@ -27,25 +35,30 @@ const LOG_QUEUE_CAPACITY: usize = 4096;
 pub(crate) const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ControlThreadHandle {
-    log_tx: Sender<LogRecord>,
+    event_tx: Sender<ControlEvent>,
     command_tx: UnboundedSender<ControlCommand>,
     closed: AtomicBool,
     next_timer_id: std::sync::atomic::AtomicU64,
+    next_event_subscription_id: std::sync::atomic::AtomicU64,
     dropped_logs: MetricCounter,
+    dropped_events: MetricCounter,
 }
 
 impl ControlThreadHandle {
     fn new(
-        log_tx: Sender<LogRecord>,
+        event_tx: Sender<ControlEvent>,
         command_tx: UnboundedSender<ControlCommand>,
         dropped_logs: MetricCounter,
+        dropped_events: MetricCounter,
     ) -> Arc<Self> {
         Arc::new(Self {
-            log_tx,
+            event_tx,
             command_tx,
             closed: AtomicBool::new(false),
             next_timer_id: std::sync::atomic::AtomicU64::new(1),
+            next_event_subscription_id: std::sync::atomic::AtomicU64::new(1),
             dropped_logs,
+            dropped_events,
         })
     }
 
@@ -84,6 +97,39 @@ impl ControlThreadHandle {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn publish_event(&self, event: ControlEvent) -> HammerResult<()> {
+        self.enqueue_event(event)
+    }
+
+    pub(crate) fn subscribe_event<F, Fut>(
+        &self,
+        filter: ControlEventFilter,
+        callback: F,
+    ) -> HammerResult<ControlEventSubscriptionHandle>
+    where
+        F: FnMut(ControlEvent) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(HammerError::service_closed());
+        }
+        let id = self.next_event_subscription_id();
+        let (done_tx, done_rx) = mpsc::channel();
+        self.command_tx
+            .send(ControlCommand::RegisterEventSubscriber(
+                EventSubscriberRegistration::new(id, filter, boxed_event_callback(callback)),
+                done_tx,
+            ))
+            .map_err(|_| HammerError::internal("control thread stopped"))?;
+        done_rx
+            .recv_timeout(DEFAULT_CONTROL_CALL_TIMEOUT)
+            .map_err(|_| HammerError::internal("control event subscription timed out"))?;
+        Ok(ControlEventSubscriptionHandle::new(
+            id,
+            self.command_tx.clone(),
+        ))
     }
 
     pub fn schedule_once<F, Fut>(
@@ -130,6 +176,38 @@ impl ControlThreadHandle {
             self.next_timer_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    fn next_event_subscription_id(&self) -> ControlEventSubscriptionId {
+        ControlEventSubscriptionId(
+            self.next_event_subscription_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn enqueue_event(&self, event: ControlEvent) -> HammerResult<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(HammerError::service_closed());
+        }
+        match self.event_tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(event)) => {
+                self.record_dropped_event(&event);
+                Err(HammerError::internal("control event queue full"))
+            }
+            Err(TrySendError::Closed(event)) => {
+                self.record_dropped_event(&event);
+                Err(HammerError::internal("control thread stopped"))
+            }
+        }
+    }
+
+    fn record_dropped_event(&self, event: &ControlEvent) {
+        if event.is_log() {
+            self.dropped_logs.inc();
+        } else {
+            self.dropped_events.inc();
+        }
     }
 
     fn schedule_timer(
@@ -274,19 +352,25 @@ impl LogWriter for ControlThreadHandle {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        match self.log_tx.try_send(LogRecord { level, message }) {
+        let event = ControlEvent::Log(LogEventArgs {
+            level,
+            message: Arc::<str>::from(message),
+        });
+        match self.event_tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => self.dropped_logs.inc(),
-            Err(TrySendError::Closed(_)) => self.dropped_logs.inc(),
+            Err(TrySendError::Full(event)) | Err(TrySendError::Closed(event)) => {
+                self.record_dropped_event(&event);
+            }
         }
     }
 }
 
 pub(crate) struct ControlThread {
-    log_rx: Receiver<LogRecord>,
+    event_rx: Receiver<ControlEvent>,
     command_rx: UnboundedReceiver<ControlCommand>,
     inner: Arc<dyn LogWriter>,
     timers: TimerRegistry,
+    events: EventRegistry,
 }
 
 impl ControlThread {
@@ -297,29 +381,38 @@ impl ControlThread {
         _metrics_interval: Duration,
         _min_level: Level,
     ) -> (Arc<ControlThreadHandle>, Self) {
-        let (log_tx, log_rx) = tokio::sync::mpsc::channel(LOG_QUEUE_CAPACITY);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let scope = metrics.scope("runtime", "control_thread", "hammer-main");
-        let handle =
-            ControlThreadHandle::new(log_tx, command_tx, scope.counter("log_dropped_total"));
+        let handle = ControlThreadHandle::new(
+            event_tx,
+            command_tx,
+            scope.counter("log_dropped_total"),
+            scope.counter("event_dropped_full_total"),
+        );
         let thread = Self {
-            log_rx,
+            event_rx,
             command_rx,
             inner,
             timers: TimerRegistry::new(),
+            events: EventRegistry::new(
+                scope.counter("event_dropped_busy_total"),
+                scope.counter("event_callback_panic_total"),
+            ),
         };
         (handle, thread)
     }
 
     pub(crate) async fn run(mut self) {
-        // Once every `ControlThreadHandle` is dropped, `log_rx.recv()` returns
+        // Once every `ControlThreadHandle` is dropped, `event_rx.recv()` returns
         // `None` permanently. Disable that branch instead of `continue`-ing,
         // which would re-poll a ready-`None` future on every loop iteration
         // and burn CPU. Command and metrics dispatch keep running until the
         // command channel itself closes.
-        let mut log_open = true;
+        let mut event_open = true;
         loop {
             self.timers.reap_finished();
+            self.events.reap_finished();
             if let Some(deadline) = self.timers.next_deadline() {
                 tokio::select! {
                     command = self.command_rx.recv() => {
@@ -331,13 +424,13 @@ impl ControlThread {
                             break;
                         }
                     }
-                    log = self.log_rx.recv(), if log_open => {
-                        let Some(log) = log else {
-                            log_open = false;
+                    event = self.event_rx.recv(), if event_open => {
+                        let Some(event) = event else {
+                            event_open = false;
                             continue;
                         };
-                        self.inner.write_message(log.level, log.message);
-                        self.drain_logs();
+                        self.handle_event(event);
+                        self.drain_events();
                     }
                     _ = tokio::time::sleep_until(deadline) => {
                         self.timers.fire_due(&*self.inner);
@@ -354,13 +447,13 @@ impl ControlThread {
                             break;
                         }
                     }
-                    log = self.log_rx.recv(), if log_open => {
-                        let Some(log) = log else {
-                            log_open = false;
+                    event = self.event_rx.recv(), if event_open => {
+                        let Some(event) = event else {
+                            event_open = false;
                             continue;
                         };
-                        self.inner.write_message(log.level, log.message);
-                        self.drain_logs();
+                        self.handle_event(event);
+                        self.drain_events();
                     }
                 }
             }
@@ -370,13 +463,14 @@ impl ControlThread {
     fn handle_command(&mut self, command: ControlCommand) -> bool {
         match command {
             ControlCommand::Flush(done) => {
-                self.drain_logs();
+                self.drain_events();
                 let _ = done.send(());
                 false
             }
             ControlCommand::Shutdown(done) => {
-                self.drain_logs();
+                self.drain_events();
                 self.timers.shutdown();
+                self.events.shutdown();
                 let _ = done.send(());
                 true
             }
@@ -397,22 +491,35 @@ impl ControlThread {
                 let _ = done.send(canceled);
                 false
             }
+            ControlCommand::RegisterEventSubscriber(registration, done) => {
+                self.events.register(registration);
+                let _ = done.send(());
+                false
+            }
+            ControlCommand::CancelEventSubscription(id, done) => {
+                let canceled = self.events.cancel(id);
+                let _ = done.send(canceled);
+                false
+            }
         }
     }
 
-    fn drain_logs(&mut self) {
+    fn handle_event(&mut self, event: ControlEvent) {
+        if let ControlEvent::Log(args) = &event {
+            self.inner
+                .write_message(args.level, args.message.to_string());
+        }
+        self.events.dispatch(event);
+    }
+
+    fn drain_events(&mut self) {
         loop {
-            match self.log_rx.try_recv() {
-                Ok(LogRecord { level, message }) => self.inner.write_message(level, message),
+            match self.event_rx.try_recv() {
+                Ok(event) => self.handle_event(event),
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return,
             }
         }
     }
-}
-
-struct LogRecord {
-    level: Level,
-    message: String,
 }
 
 enum ControlCommand {
@@ -422,6 +529,8 @@ enum ControlCommand {
     AsyncCall(Box<dyn FnOnce() + Send>),
     RegisterTimer(ControlTimerRegistration),
     CancelTimer(ControlTimerId, mpsc::Sender<bool>),
+    RegisterEventSubscriber(EventSubscriberRegistration, mpsc::Sender<()>),
+    CancelEventSubscription(ControlEventSubscriptionId, mpsc::Sender<bool>),
 }
 
 fn boxed_timer_callback<F, Fut>(mut callback: F) -> TimerCallback
@@ -754,13 +863,16 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component_registry::register_components;
     use hammer_core::log::Level;
     use hammer_core::metrics::MetricLabel;
+    use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use tokio::sync::Notify;
 
     #[derive(Default)]
     struct CaptureWriter {
@@ -781,6 +893,33 @@ mod tests {
                 .expect("control test runtime");
             runtime.block_on(thread.run());
         })
+    }
+
+    static EVENT_COMPONENT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    #[hammer_component_macros::hammer_component(
+        event,
+        name = "test-event",
+        builder = build_test_event_subscriber
+    )]
+    struct TestEventSubscriber;
+
+    fn build_test_event_subscriber(
+        _logger: hammer_core::log::Logger,
+        control_handle: Arc<ControlThreadHandle>,
+    ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+        let subscription = control_handle.subscribe_event(
+            ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+            |_| async move {
+                EVENT_COMPONENT_RUNS.fetch_add(1, Ordering::SeqCst);
+            },
+        )?;
+        Ok(vec![subscription])
+    }
+
+    fn test_logger(id: &str) -> hammer_core::log::Logger {
+        hammer_core::log::Factory::new(Instant::now(), Arc::new(hammer_core::log::DiscardWriter))
+            .new_logger(id)
     }
 
     #[test]
@@ -1156,6 +1295,433 @@ mod tests {
         assert_eq!(value, 42);
 
         std::panic::set_hook(prev_hook);
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_log_writer_publishes_log_event_to_control_thread() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (seen_tx, seen_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Log]),
+                move |event| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let ControlEvent::Log(args) = event {
+                            let _ = seen_tx.send((args.level, args.message.to_string()));
+                        }
+                    }
+                },
+            )
+            .expect("subscribe log events");
+
+        control_handle.write_message(Level::Warn, "line from log event\n".to_owned());
+        let seen = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("log event delivered to subscriber");
+        assert_eq!(seen, (Level::Warn, "line from log event\n".to_owned()));
+        assert!(control_handle.flush_timeout(Duration::from_secs(1)));
+
+        let lines = inner.lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|line| line == "line from log event\n"),
+            "log event should still be written by the built-in log handler: {lines:?}"
+        );
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_publish_from_data_thread_runs_callback_on_control_thread() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let control_thread_id = control_handle
+            .call_with_timeout(Duration::from_secs(1), || std::thread::current().id())
+            .expect("read control thread id");
+        let (seen_tx, seen_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                move |event| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let ControlEvent::Synthetic(args) = event {
+                            let _ = seen_tx.send((
+                                std::thread::current().id(),
+                                args.id.to_string(),
+                                args.value,
+                            ));
+                        }
+                    }
+                },
+            )
+            .expect("subscribe synthetic events");
+
+        let publisher = Arc::clone(&control_handle);
+        let data_thread = std::thread::spawn(move || {
+            let data_thread_id = std::thread::current().id();
+            publisher
+                .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                    id: Arc::<str>::from("from-data"),
+                    value: 7,
+                }))
+                .expect("publish synthetic event from data thread");
+            data_thread_id
+        });
+        let data_thread_id = data_thread.join().expect("data thread join");
+
+        let (callback_thread_id, id, value) = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("synthetic event delivered");
+        assert_eq!(callback_thread_id, control_thread_id);
+        assert_ne!(callback_thread_id, data_thread_id);
+        assert_eq!(id, "from-data");
+        assert_eq!(value, 7);
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_subscriber_ignores_non_matching_kind() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (seen_tx, seen_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(ControlEventFilter::Kinds(&[ControlEventKind::Log]), move |_| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    let _ = seen_tx.send(());
+                }
+            })
+            .expect("subscribe log events");
+
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("ignored"),
+                value: 1,
+            }))
+            .expect("publish synthetic event");
+        assert!(
+            seen_rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "subscriber should ignore non-matching event kind"
+        );
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_all_filter_receives_multiple_kinds() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (seen_tx, seen_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(ControlEventFilter::All, move |event| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    let _ = seen_tx.send(event.kind());
+                }
+            })
+            .expect("subscribe all events");
+
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("all"),
+                value: 2,
+            }))
+            .expect("publish synthetic event");
+        let first = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first event");
+
+        control_handle.write_message(Level::Info, "all filter log\n".to_owned());
+        let second = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second event");
+
+        let mut kinds = vec![first, second];
+        kinds.sort();
+        assert_eq!(kinds, vec![ControlEventKind::Log, ControlEventKind::Synthetic]);
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_cancel_prevents_future_delivery() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (seen_tx, seen_rx) = mpsc::channel();
+
+        let subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                move |_| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let _ = seen_tx.send(());
+                    }
+                },
+            )
+            .expect("subscribe synthetic events");
+        assert!(subscription.cancel_timeout(Duration::from_secs(1)));
+
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("after-cancel"),
+                value: 3,
+            }))
+            .expect("publish synthetic event");
+        assert!(
+            seen_rx.recv_timeout(Duration::from_millis(80)).is_err(),
+            "canceled subscriber should not receive future events"
+        );
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_slow_callback_is_not_reentered() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let notify = Arc::new(Notify::new());
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                {
+                    let notify = Arc::clone(&notify);
+                    let runs = Arc::clone(&runs);
+                    move |_| {
+                        let notify = Arc::clone(&notify);
+                        let runs = Arc::clone(&runs);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            runs.fetch_add(1, Ordering::SeqCst);
+                            let _ = started_tx.send(());
+                            notify.notified().await;
+                        }
+                    }
+                },
+            )
+            .expect("subscribe synthetic events");
+
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("slow-1"),
+                value: 1,
+            }))
+            .expect("publish first event");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first callback should start");
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("slow-2"),
+                value: 2,
+            }))
+            .expect("publish skipped event");
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        notify.notify_one();
+        std::thread::sleep(Duration::from_millis(50));
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("slow-3"),
+                value: 3,
+            }))
+            .expect("publish after callback completion");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("third callback should start");
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        notify.notify_one();
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_callback_panic_does_not_kill_control_thread() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                move |_| async move {
+                    panic!("event callback boom");
+                },
+            )
+            .expect("subscribe panicking event callback");
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("panic"),
+                value: 1,
+            }))
+            .expect("publish panicking event");
+        std::thread::sleep(Duration::from_millis(80));
+
+        let value = control_handle
+            .call_with_timeout(Duration::from_secs(1), || 42_u32)
+            .expect("control thread should survive panicking event callback");
+        assert_eq!(value, 42);
+
+        std::panic::set_hook(prev_hook);
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_event_shutdown_aborts_running_callback() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                move |_| {
+                    let _ = started_tx.send(());
+                    DropSignalFuture {
+                        dropped: Some(dropped_tx.clone()),
+                    }
+                },
+            )
+            .expect("subscribe abortable event callback");
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("shutdown"),
+                value: 1,
+            }))
+            .expect("publish event");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("event callback should start");
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("event callback future should be aborted on shutdown");
+    }
+
+    #[test]
+    fn event_component_macro_registers_subscriber_builder() {
+        EVENT_COMPONENT_RUNS.store(0, Ordering::SeqCst);
+        let mut builders: HashMap<&'static str, EventSubscriberBuilder> = HashMap::new();
+        register_components!(event, &mut builders, [TestEventSubscriber]);
+        let builder = *builders
+            .get("test-event")
+            .expect("event subscriber builder should be registered");
+
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let _subscriptions = builder(test_logger("test-event"), Arc::clone(&control_handle))
+            .expect("build event subscriber");
+
+        control_handle
+            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                id: Arc::<str>::from("macro"),
+                value: 9,
+            }))
+            .expect("publish event for macro subscriber");
+        for _ in 0..20 {
+            if EVENT_COMPONENT_RUNS.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(EVENT_COMPONENT_RUNS.load(Ordering::SeqCst), 1);
+
         assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }

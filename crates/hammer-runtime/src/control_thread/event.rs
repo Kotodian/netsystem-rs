@@ -1,0 +1,278 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use hammer_core::error::HammerResult;
+use hammer_core::log::{Level, Logger};
+use hammer_core::metrics::MetricCounter;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinHandle;
+
+use super::{ControlCommand, ControlThreadHandle};
+
+pub(crate) type EventFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub(crate) type EventCallback = Box<dyn FnMut(ControlEvent) -> EventFuture + Send + 'static>;
+pub(crate) type EventSubscriberBuilder = fn(
+    Logger,
+    Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
+
+#[derive(Debug, Clone)]
+pub(crate) enum ControlEvent {
+    Log(LogEventArgs),
+    Synthetic(SyntheticEventArgs),
+}
+
+impl ControlEvent {
+    pub(crate) fn kind(&self) -> ControlEventKind {
+        match self {
+            Self::Log(_) => ControlEventKind::Log,
+            Self::Synthetic(_) => ControlEventKind::Synthetic,
+        }
+    }
+
+    pub(crate) fn is_log(&self) -> bool {
+        matches!(self, Self::Log(_))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogEventArgs {
+    pub(crate) level: Level,
+    pub(crate) message: Arc<str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SyntheticEventArgs {
+    pub(crate) id: Arc<str>,
+    pub(crate) value: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum ControlEventKind {
+    Log,
+    Synthetic,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ControlEventFilter {
+    All,
+    Kinds(&'static [ControlEventKind]),
+}
+
+impl ControlEventFilter {
+    fn matches(self, kind: ControlEventKind) -> bool {
+        match self {
+            Self::All => true,
+            Self::Kinds(kinds) => kinds.contains(&kind),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ControlEventSubscriptionId(pub(crate) u64);
+
+pub(crate) struct ControlEventSubscriptionHandle {
+    id: ControlEventSubscriptionId,
+    command_tx: UnboundedSender<ControlCommand>,
+}
+
+impl ControlEventSubscriptionHandle {
+    pub(super) fn new(
+        id: ControlEventSubscriptionId,
+        command_tx: UnboundedSender<ControlCommand>,
+    ) -> Self {
+        Self { id, command_tx }
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        let (done_tx, _done_rx) = mpsc::channel();
+        self.command_tx
+            .send(ControlCommand::CancelEventSubscription(self.id, done_tx))
+            .is_ok()
+    }
+
+    pub(crate) fn cancel_timeout(&self, timeout: Duration) -> bool {
+        let (done_tx, done_rx) = mpsc::channel();
+        if self
+            .command_tx
+            .send(ControlCommand::CancelEventSubscription(self.id, done_tx))
+            .is_err()
+        {
+            return false;
+        }
+        done_rx.recv_timeout(timeout).unwrap_or(false)
+    }
+}
+
+impl Drop for ControlEventSubscriptionHandle {
+    fn drop(&mut self) {
+        let (done_tx, _done_rx) = mpsc::channel();
+        let _ = self
+            .command_tx
+            .send(ControlCommand::CancelEventSubscription(self.id, done_tx));
+    }
+}
+
+pub(crate) struct EventSubscriberRegistration {
+    id: ControlEventSubscriptionId,
+    filter: ControlEventFilter,
+    callback: EventCallback,
+}
+
+impl EventSubscriberRegistration {
+    pub(crate) fn new(
+        id: ControlEventSubscriptionId,
+        filter: ControlEventFilter,
+        callback: EventCallback,
+    ) -> Self {
+        Self {
+            id,
+            filter,
+            callback,
+        }
+    }
+
+}
+
+pub(crate) struct EventRegistry {
+    entries: Vec<EventSubscriberEntry>,
+    dropped_busy_total: MetricCounter,
+    callback_panic_total: MetricCounter,
+}
+
+impl EventRegistry {
+    pub(crate) fn new(
+        dropped_busy_total: MetricCounter,
+        callback_panic_total: MetricCounter,
+    ) -> Self {
+        Self {
+            entries: Vec::new(),
+            dropped_busy_total,
+            callback_panic_total,
+        }
+    }
+
+    pub(crate) fn register(&mut self, registration: EventSubscriberRegistration) {
+        self.entries.push(EventSubscriberEntry {
+            id: registration.id,
+            filter: registration.filter,
+            callback: Some(registration.callback),
+            running: None,
+        });
+    }
+
+    pub(crate) fn cancel(&mut self, id: ControlEventSubscriptionId) -> bool {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
+            return false;
+        };
+        if let Some(handle) = self.entries[index].running.take() {
+            handle.abort();
+        }
+        self.entries.swap_remove(index);
+        true
+    }
+
+    pub(crate) fn shutdown(&mut self) {
+        for entry in self.entries.drain(..) {
+            if let Some(handle) = entry.running {
+                handle.abort();
+            }
+        }
+    }
+
+    pub(crate) fn reap_finished(&mut self) {
+        for entry in &mut self.entries {
+            if entry.running.as_ref().is_some_and(JoinHandle::is_finished) {
+                let handle = entry.running.take().expect("checked running handle");
+                let callback_panic_total = self.callback_panic_total.clone();
+                tokio::spawn(async move {
+                    if handle.await.is_err() {
+                        callback_panic_total.inc();
+                    }
+                });
+            }
+        }
+        self.entries
+            .retain(|entry| entry.callback.is_some() || entry.running.is_some());
+    }
+
+    pub(crate) fn dispatch(&mut self, event: ControlEvent) {
+        self.reap_finished();
+        let kind = event.kind();
+        for entry in &mut self.entries {
+            if !entry.filter.matches(kind) {
+                continue;
+            }
+            if entry.running.is_some() {
+                self.dropped_busy_total.inc();
+                continue;
+            }
+            let Some(callback) = entry.callback.as_mut() else {
+                continue;
+            };
+            let event = event.clone();
+            let future = match std::panic::catch_unwind(AssertUnwindSafe(|| callback(event))) {
+                Ok(future) => future,
+                Err(_) => {
+                    self.callback_panic_total.inc();
+                    entry.callback = None;
+                    continue;
+                }
+            };
+            entry.running = Some(tokio::spawn(future));
+        }
+        self.reap_finished();
+    }
+}
+
+struct EventSubscriberEntry {
+    id: ControlEventSubscriptionId,
+    filter: ControlEventFilter,
+    callback: Option<EventCallback>,
+    running: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct EventSubscriberFactorySet {
+    builders: Arc<HashMap<&'static str, EventSubscriberBuilder>>,
+}
+
+impl EventSubscriberFactorySet {
+    fn standard() -> Self {
+        Self {
+            builders: Arc::new(HashMap::new()),
+        }
+    }
+
+    fn build_all(
+        &self,
+        logger: Logger,
+        control_handle: Arc<ControlThreadHandle>,
+    ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+        let mut subscriptions = Vec::new();
+        for builder in self.builders.values() {
+            subscriptions.extend(builder(logger.clone(), Arc::clone(&control_handle))?);
+        }
+        Ok(subscriptions)
+    }
+}
+
+pub(crate) fn build_standard_event_subscribers(
+    logger: Logger,
+    control_handle: Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    EventSubscriberFactorySet::standard().build_all(logger, control_handle)
+}
+
+pub(crate) fn boxed_event_callback<F, Fut>(mut callback: F) -> EventCallback
+where
+    F: FnMut(ControlEvent) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Box::new(move |event| Box::pin(callback(event)))
+}

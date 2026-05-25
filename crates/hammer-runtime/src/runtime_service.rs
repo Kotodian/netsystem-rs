@@ -24,6 +24,7 @@ use crate::{
     ControlThreadHandle, DnsRouter, DnsTransportManager, InboundManager, MetricSample,
     MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
+use crate::control_thread::ControlEventSubscriptionHandle;
 #[cfg(feature = "endpoint")]
 use hammer_adapter::{EndpointManager as _, InboundManager as _};
 
@@ -90,6 +91,7 @@ struct ServiceInner {
     log_factory: Arc<Factory>,
     control_handle: Option<Arc<ControlThreadHandle>>,
     control_thread: Option<JoinHandle<()>>,
+    event_subscriptions: Vec<ControlEventSubscriptionHandle>,
     metrics: Arc<MetricsRegistry>,
     #[allow(dead_code)]
     platform: Arc<dyn PlatformInterface>,
@@ -163,6 +165,10 @@ impl RuntimeService {
         };
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
+        let event_subscriptions = crate::control_thread::build_standard_event_subscribers(
+            new_logger(&log_factory, "control-event"),
+            Arc::clone(&control_handle),
+        )?;
 
         let registry = RuntimeRegistry::new();
         let pause = Arc::new(PauseManager::new());
@@ -332,6 +338,7 @@ impl RuntimeService {
                 log_factory,
                 control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
+                event_subscriptions,
                 metrics,
                 platform,
                 registry,
@@ -674,6 +681,18 @@ fn finish_close(
     // still open. The Tokio runtime itself must outlive this step because the
     // control loop is driven by a handle to that same runtime.
     let mut result = close_result;
+    let event_subscriptions = {
+        inner
+            .lock()
+            .expect("service mutex poisoned")
+            .event_subscriptions
+            .drain(..)
+            .collect::<Vec<_>>()
+    };
+    for subscription in &event_subscriptions {
+        subscription.cancel();
+    }
+    drop(event_subscriptions);
     let control_handle = {
         inner
             .lock()

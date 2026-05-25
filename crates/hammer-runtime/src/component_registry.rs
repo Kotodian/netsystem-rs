@@ -176,6 +176,23 @@ pub(crate) fn register_probe_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
+pub(crate) trait EventSubscriberComponentDeclaration {
+    const TYPE_NAME: &'static str;
+
+    fn build(
+        logger: hammer_core::log::Logger,
+        control_handle: std::sync::Arc<crate::ControlThreadHandle>,
+    ) -> hammer_core::error::HammerResult<Vec<crate::control_thread::ControlEventSubscriptionHandle>>;
+}
+
+pub(crate) fn register_event_subscriber_component<C>(
+    builders: &mut HashMap<&'static str, crate::control_thread::EventSubscriberBuilder>,
+) where
+    C: EventSubscriberComponentDeclaration,
+{
+    builders.insert(C::TYPE_NAME, C::build);
+}
+
 macro_rules! register_components {
     (outbound, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_outbound_component::<$component>($builders);)*
@@ -197,6 +214,9 @@ macro_rules! register_components {
     };
     (probe, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_probe_component::<$component>($builders);)*
+    };
+    (event, $builders:expr, [$($component:path),* $(,)?]) => {
+        $(crate::component_registry::register_event_subscriber_component::<$component>($builders);)*
     };
 }
 
