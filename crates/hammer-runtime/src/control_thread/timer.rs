@@ -48,11 +48,7 @@ pub(crate) struct ControlTimerRegistration {
 }
 
 impl ControlTimerRegistration {
-    pub(crate) fn once(
-        id: ControlTimerId,
-        delay: Duration,
-        callback: TimerCallback,
-    ) -> Self {
+    pub(crate) fn once(id: ControlTimerId, delay: Duration, callback: TimerCallback) -> Self {
         Self {
             id,
             initial_delay: delay,

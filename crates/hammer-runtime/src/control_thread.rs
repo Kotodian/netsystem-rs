@@ -758,8 +758,8 @@ mod tests {
     use hammer_core::metrics::MetricLabel;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     #[derive(Default)]
@@ -1009,16 +1009,12 @@ mod tests {
         let timer_count = Arc::clone(&count);
 
         let timer = writer
-            .schedule_interval(
-                Duration::ZERO,
-                Duration::from_millis(20),
-                move || {
-                    let timer_count = Arc::clone(&timer_count);
-                    async move {
-                        timer_count.fetch_add(1, Ordering::SeqCst);
-                    }
-                },
-            )
+            .schedule_interval(Duration::ZERO, Duration::from_millis(20), move || {
+                let timer_count = Arc::clone(&timer_count);
+                async move {
+                    timer_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
             .expect("schedule interval timer");
 
         std::thread::sleep(Duration::from_millis(90));
@@ -1052,23 +1048,19 @@ mod tests {
         let timer_overlaps = Arc::clone(&overlaps);
 
         let timer = writer
-            .schedule_interval(
-                Duration::ZERO,
-                Duration::from_millis(5),
-                move || {
-                    let timer_starts = Arc::clone(&timer_starts);
-                    let timer_active = Arc::clone(&timer_active);
-                    let timer_overlaps = Arc::clone(&timer_overlaps);
-                    async move {
-                        timer_starts.fetch_add(1, Ordering::SeqCst);
-                        if timer_active.fetch_add(1, Ordering::SeqCst) != 0 {
-                            timer_overlaps.fetch_add(1, Ordering::SeqCst);
-                        }
-                        tokio::time::sleep(Duration::from_millis(80)).await;
-                        timer_active.fetch_sub(1, Ordering::SeqCst);
+            .schedule_interval(Duration::ZERO, Duration::from_millis(5), move || {
+                let timer_starts = Arc::clone(&timer_starts);
+                let timer_active = Arc::clone(&timer_active);
+                let timer_overlaps = Arc::clone(&timer_overlaps);
+                async move {
+                    timer_starts.fetch_add(1, Ordering::SeqCst);
+                    if timer_active.fetch_add(1, Ordering::SeqCst) != 0 {
+                        timer_overlaps.fetch_add(1, Ordering::SeqCst);
                     }
-                },
-            )
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    timer_active.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
             .expect("schedule slow interval timer");
 
         std::thread::sleep(Duration::from_millis(160));
