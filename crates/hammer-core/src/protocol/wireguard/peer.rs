@@ -18,6 +18,7 @@ use crate::config::WireguardPeerOptions;
 /// (rx loop, tx loop, timer tick) from clobbering session state.
 pub struct Peer {
     tunn: Mutex<Tunn>,
+    public_key: [u8; 32],
     allowed_ips: Vec<IpNet>,
     endpoint: SocketAddr,
     reserved: [u8; 3],
@@ -30,7 +31,8 @@ impl Peer {
         index: u32,
         #[cfg(feature = "amneziawg")] amnezia: Option<AmneziaConfig>,
     ) -> Self {
-        let public_key = x25519::PublicKey::from(opts.public_key);
+        let peer_public_key = opts.public_key;
+        let public_key = x25519::PublicKey::from(peer_public_key);
         // boringtun stores the keepalive interval as `u16` seconds; clamp the
         // configured Duration into that window. None disables keepalive.
         let keepalive = opts
@@ -48,10 +50,15 @@ impl Peer {
         );
         Self {
             tunn: Mutex::new(tunn),
+            public_key: peer_public_key,
             allowed_ips: opts.allowed_ips,
             endpoint: opts.endpoint,
             reserved: opts.reserved,
         }
+    }
+
+    pub fn public_key(&self) -> [u8; 32] {
+        self.public_key
     }
 
     pub fn endpoint(&self) -> SocketAddr {

@@ -16,6 +16,7 @@
 //! This actor only moves encrypted UDP frames between peers and the
 //! stack-facing queues.
 
+use std::fmt;
 use std::future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -73,6 +74,38 @@ const INBOUND_DRAIN_BATCH: usize = 32;
 /// to one lock acquisition; multi-peer split-tunnel still saves a lock per
 /// run of consecutive same-peer packets.
 const OUTBOUND_DRAIN_BATCH: usize = 64;
+const START_HANDSHAKE_QUEUE: usize = 16;
+
+#[derive(Clone)]
+pub(crate) struct PeerHandshakeTrigger {
+    peer_index: usize,
+    tx: mpsc::Sender<usize>,
+}
+
+impl PeerHandshakeTrigger {
+    fn new(peer_index: usize, tx: mpsc::Sender<usize>) -> Self {
+        Self { peer_index, tx }
+    }
+
+    pub(crate) fn trigger(&self) -> HammerResult<()> {
+        self.tx.try_send(self.peer_index).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(_) => {
+                HammerError::internal("wireguard start handshake queue full")
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                HammerError::internal("wireguard transport stopped")
+            }
+        })
+    }
+}
+
+impl fmt::Debug for PeerHandshakeTrigger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerHandshakeTrigger")
+            .field("peer_index", &self.peer_index)
+            .finish_non_exhaustive()
+    }
+}
 
 /// Handles returned to the owner of a transport actor. Hold these for the
 /// lifetime of the endpoint; dropping `shutdown` is enough to stop the actor
@@ -87,15 +120,15 @@ pub(crate) struct TransportHandles {
     /// straight to the TUN packet-loop fan-in.
     pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
     pub(crate) inbound_batch_rx: mpsc::Receiver<Vec<Bytes>>,
-    /// The address the OS bound the UDP socket to. Mostly useful for tests
-    /// — production peers configure their endpoints out-of-band.
-    #[allow(dead_code)]
+    /// The address the OS bound the UDP socket to.
+    #[cfg(test)]
     pub(crate) local_addr: SocketAddr,
     /// Send `()` (or drop) to ask the actor to exit promptly.
     pub(crate) shutdown: oneshot::Sender<()>,
     /// Ask the actor to rebind/reprotect its UDP sockets while keeping the
     /// packet channels stable for the TUN fast path.
     pub(crate) reset_tx: mpsc::Sender<()>,
+    pub(crate) start_handshake_tx: mpsc::Sender<usize>,
     pub(crate) keepalive_timer: Option<ControlTimerHandle>,
     /// Join handle in case the caller wants to await actor termination.
     pub(crate) join: JoinHandle<()>,
@@ -140,6 +173,10 @@ impl TransportHandles {
         }
     }
 
+    pub(crate) fn peer_handshake_trigger(&self, peer_index: usize) -> PeerHandshakeTrigger {
+        PeerHandshakeTrigger::new(peer_index, self.start_handshake_tx.clone())
+    }
+
     pub(crate) fn cancel_keepalive_timer(&self) {
         if let Some(timer) = &self.keepalive_timer {
             let _ = timer.cancel();
@@ -151,13 +188,6 @@ impl TransportHandles {
         self.keepalive_timer.is_some()
     }
 
-    /// Send the cancellation signal and await the actor finishing.
-    #[allow(dead_code)]
-    pub(crate) async fn shutdown(self) -> HammerResult<()> {
-        self.cancel_keepalive_timer();
-        let _ = self.shutdown.send(());
-        self.join.await.with_context(|| "wireguard transport join")
-    }
 }
 
 /// Spin up the UDP transport actor. Binds the socket synchronously (cheap —
@@ -184,6 +214,7 @@ pub(crate) fn spawn_transport(
     let (timer_tick_tx, timer_tick_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
+    let (start_handshake_tx, start_handshake_rx) = mpsc::channel::<usize>(START_HANDSHAKE_QUEUE);
     let keepalive_timer = if let Some(control_handle) = control_handle {
         let timer_tick_tx = timer_tick_tx.clone();
         Some(
@@ -214,6 +245,7 @@ pub(crate) fn spawn_transport(
         inbound_batch_tx,
         shutdown_rx,
         reset_rx,
+        start_handshake_rx,
         if keepalive_timer.is_some() {
             Some(timer_tick_rx)
         } else {
@@ -226,9 +258,11 @@ pub(crate) fn spawn_transport(
         encrypt_batch_tx,
         inbound_rx,
         inbound_batch_rx,
+        #[cfg(test)]
         local_addr,
         shutdown: shutdown_tx,
         reset_tx,
+        start_handshake_tx,
         keepalive_timer,
         join,
     })
@@ -367,6 +401,7 @@ async fn run_actor(
     inbound_batch_tx: mpsc::Sender<Vec<Bytes>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     mut reset_rx: mpsc::Receiver<()>,
+    mut start_handshake_rx: mpsc::Receiver<usize>,
     mut timer_tick_rx: Option<mpsc::Receiver<()>>,
 ) {
     // Capacity for every encap/decap output buffer the actor will allocate.
@@ -423,6 +458,20 @@ async fn run_actor(
                         warn!("wireguard transport reset bind failed: {err}");
                     }
                 }
+            }
+            peer_index = start_handshake_rx.recv() => {
+                let Some(peer_index) = peer_index else {
+                    break;
+                };
+                send_peer_handshake(
+                    &sockets,
+                    &peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.as_ref(),
+                    peer_index,
+                    crypto_cap,
+                    &mut tick_buf,
+                ).await;
             }
             res = recv_from_optional(sockets.ipv4.as_deref(), &mut udp_buf_v4), if sockets.ipv4.is_some() => {
                 match res {
@@ -1023,6 +1072,65 @@ async fn tick_timers(
                 warn!("wireguard timer send {dst}: {err}");
             }
         }
+    }
+}
+
+async fn send_peer_handshake(
+    sockets: &TransportSockets,
+    peers: &[Peer],
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
+    peer_index: usize,
+    crypto_cap: usize,
+    buf: &mut BytesMut,
+) {
+    let Some(peer) = peers.get(peer_index) else {
+        warn!("wireguard start handshake: peer index {peer_index} out of range");
+        return;
+    };
+
+    unsafe { buf.set_len(crypto_cap) };
+    let len = {
+        let mut tunn = peer.lock_tunn();
+        match tunn.encapsulate(&[], &mut buf[..]) {
+            TunnResult::WriteToNetwork(out) => Some(out.len()),
+            TunnResult::Done => None,
+            TunnResult::Err(err) => {
+                tracing::trace!(?err, "wireguard start handshake encapsulate error");
+                None
+            }
+            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
+        }
+    };
+    let Some(len) = len else {
+        return;
+    };
+
+    buf.truncate(len);
+    #[cfg(feature = "endpoint-amneziawg")]
+    if let Some(options) = amnezia {
+        for junk in make_handshake_junk_packets(options) {
+            let dst = peer.endpoint();
+            let Some(socket) = sockets.send_socket(dst) else {
+                warn!("wireguard udp has no socket for {dst}");
+                continue;
+            };
+            if let Err(err) = socket.send_to(&junk, dst).await {
+                warn!("wireguard amnezia junk send_to {dst}: {err}");
+            }
+        }
+        let mut encoded = buf.to_vec();
+        encode_outbound_packet(options, &mut encoded);
+        buf.clear();
+        buf.extend_from_slice(&encoded);
+    }
+    stamp_reserved_in_place(buf, peer.reserved());
+    let dst = peer.endpoint();
+    let Some(socket) = sockets.send_socket(dst) else {
+        warn!("wireguard udp has no socket for {dst}");
+        return;
+    };
+    if let Err(err) = socket.send_to(buf, dst).await {
+        warn!("wireguard start handshake send {dst}: {err}");
     }
 }
 

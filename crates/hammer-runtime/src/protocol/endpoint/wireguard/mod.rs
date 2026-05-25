@@ -5,4 +5,4 @@ mod amnezia2;
 mod endpoint;
 mod transport;
 
-pub use endpoint::WireguardEndpoint;
+pub use endpoint::{WireguardEndpoint, WireguardPeerStartArgs, WireguardStartHandshakeSubscriber};

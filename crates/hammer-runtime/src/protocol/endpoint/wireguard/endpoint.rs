@@ -5,8 +5,6 @@
 //! loop can forward raw IP packets without any L4 reassembly. The old
 //! double user-space-IP-stack data path is gone: WG sits next to outbounds,
 //! not under them.
-#![allow(dead_code)]
-
 use arc_swap::ArcSwapOption;
 use boringtun::x25519;
 use bytes::Bytes;
@@ -25,15 +23,18 @@ use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
+#[cfg(test)]
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
 #[cfg(feature = "endpoint-amneziawg")]
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
+#[cfg(test)]
+use hammer_core::protocol::wireguard::peer;
+use hammer_core::protocol::wireguard::peer::Peer;
 
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::to_boringtun_config;
 use super::transport::{self, TransportHandles};
-use crate::ControlThreadHandle;
+use crate::{ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle};
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
 
@@ -72,6 +73,55 @@ struct WireguardRuntime {
     encrypt_tx: mpsc::Sender<Bytes>,
     encrypt_batch_tx: mpsc::Sender<Vec<Bytes>>,
     inbound: InboundFanout,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireguardPeerStartArgs {
+    pub endpoint_id: String,
+    pub peer_index: usize,
+    pub peer_endpoint: SocketAddr,
+    pub peer_public_key: [u8; 32],
+    handshake: transport::PeerHandshakeTrigger,
+}
+
+impl WireguardPeerStartArgs {
+    fn trigger_handshake(&self) -> HammerResult<()> {
+        self.handshake.trigger()
+    }
+}
+
+#[hammer_component_macros::hammer_component(
+    event,
+    name = "wireguard-start-handshake",
+    builder = build_wireguard_start_handshake_subscriber
+)]
+pub struct WireguardStartHandshakeSubscriber;
+
+pub(crate) fn build_wireguard_start_handshake_subscriber(
+    logger: Logger,
+    control_handle: Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    let subscription = control_handle.subscribe_event(
+        ControlEventFilter::event::<WireguardPeerStartArgs>(),
+        move |event| {
+            let logger = logger.clone();
+            async move {
+                if let Some(args) = event.args::<WireguardPeerStartArgs>() {
+                    match args.trigger_handshake() {
+                        Ok(()) => logger.debug(format!(
+                            "wireguard endpoint {} start handshake peer_index={} peer={}",
+                            args.endpoint_id, args.peer_index, args.peer_endpoint
+                        )),
+                        Err(err) => logger.warn(format!(
+                            "wireguard endpoint {} start handshake failed peer_index={} peer={}: {}",
+                            args.endpoint_id, args.peer_index, args.peer_endpoint, err
+                        )),
+                    }
+                }
+            }
+        },
+    )?;
+    Ok(vec![subscription])
 }
 
 /// Demuxes decapsulated IP packets from the boringtun transport into two
@@ -221,24 +271,24 @@ impl WireguardEndpoint {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn mtu(&self) -> u32 {
         self.mtu
     }
 
+    #[cfg(test)]
     pub(crate) fn route_outbound(&self, dst: IpAddr) -> Option<&Peer> {
         peer::route_outbound(&self.peers, dst).map(|idx| &self.peers[idx])
     }
 
+    #[cfg(test)]
     pub(crate) fn peers(&self) -> &[Peer] {
         &self.peers
     }
 
+    #[cfg(test)]
     pub(crate) fn encapsulate_buffer(&self) -> Vec<u8> {
         vec![0u8; self.mtu as usize + WIREGUARD_OVERHEAD]
-    }
-
-    pub(crate) fn addresses(&self) -> &[IpNet] {
-        &self.addresses
     }
 
     fn boot(&self) -> HammerResult<()> {
@@ -250,13 +300,43 @@ impl WireguardEndpoint {
         }
 
         let runtime = self.start_runtime()?;
+        let start_events = self.peer_start_events(&runtime);
         let mut inner = self.inner.lock().expect("WireguardEndpoint poisoned");
         if matches!(*inner, WireguardState::Idle) {
             *inner = WireguardState::Running(runtime);
         } else {
             stop_runtime(runtime);
+            return Ok(());
         }
+        drop(inner);
+        self.publish_peer_start_events(start_events);
         Ok(())
+    }
+
+    fn peer_start_events(&self, runtime: &WireguardRuntime) -> Vec<WireguardPeerStartArgs> {
+        self.peers
+            .iter()
+            .enumerate()
+            .map(|(peer_index, peer)| WireguardPeerStartArgs {
+                endpoint_id: self.id.clone(),
+                peer_index,
+                peer_endpoint: peer.endpoint(),
+                peer_public_key: peer.public_key(),
+                handshake: runtime.transport.peer_handshake_trigger(peer_index),
+            })
+            .collect()
+    }
+
+    fn publish_peer_start_events(&self, events: Vec<WireguardPeerStartArgs>) {
+        let Some(control_handle) = &self.control_handle else {
+            return;
+        };
+        for event in events {
+            if let Err(err) = control_handle.publish_event(event) {
+                self.logger
+                    .warn(format!("wireguard start event publish failed: {err}"));
+            }
+        }
     }
 
     fn start_runtime(&self) -> HammerResult<WireguardRuntime> {
@@ -283,9 +363,11 @@ impl WireguardEndpoint {
             encrypt_batch_tx,
             inbound_rx,
             inbound_batch_rx,
+            #[cfg(test)]
             local_addr,
             shutdown,
             reset_tx,
+            start_handshake_tx,
             keepalive_timer,
             join,
         } = transport;
@@ -317,9 +399,11 @@ impl WireguardEndpoint {
                 // Sentinel — the live receiver has moved into the forwarder.
                 inbound_rx: mpsc::channel::<Bytes>(1).1,
                 inbound_batch_rx: mpsc::channel::<Vec<Bytes>>(1).1,
+                #[cfg(test)]
                 local_addr,
                 shutdown,
                 reset_tx,
+                start_handshake_tx,
                 keepalive_timer,
                 join,
             },
@@ -353,11 +437,6 @@ impl WireguardEndpoint {
         if let WireguardState::Running(rt) = &*inner {
             rt.transport.reset();
         }
-    }
-
-    #[cfg(test)]
-    fn fail_next_start_for_test(&self) {
-        self.fail_next_start.store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -661,6 +740,8 @@ mod tests {
         EndpointInterfaceOptions, WireguardEndpointOptions, WireguardPeerOptions,
     };
     use hammer_core::log::{DiscardWriter, Factory};
+    use hammer_core::metrics::MetricsRegistry;
+    use crate::ControlThread;
 
     fn logger(id: &str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -720,6 +801,82 @@ mod tests {
             .try_send(Bytes::from_static(b"stable"))
             .expect("pre-reset sender must remain attached");
         endpoint.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_event_triggers_initial_handshake() {
+        use std::time::Duration;
+
+        use hammer_core::lifecycle::StartStage;
+        use hammer_core::log::Level;
+        use tokio::net::UdpSocket;
+        use tokio::time::timeout;
+
+        let (control_handle, control_thread) = ControlThread::new(
+            Instant::now(),
+            Arc::new(DiscardWriter),
+            MetricsRegistry::new(),
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let control_join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("control thread runtime");
+            runtime.block_on(control_thread.run());
+        });
+        let _subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+            logger("wg-start-event"),
+            Arc::clone(&control_handle),
+        )
+        .expect("build standard event subscribers");
+
+        let peer_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind peer socket");
+        let peer_addr = peer_socket.local_addr().expect("peer local addr");
+        let local_priv = [25u8; 32];
+        let peer_pub = x25519_public([26u8; 32]);
+        let endpoint = WireguardEndpoint::new(
+            logger("wg-start-event-endpoint"),
+            EndpointRuntimeOptions {
+                id: "wg-start-event".to_owned(),
+                interface: test_interface("10.66.0.2/32"),
+                protocol: WireguardEndpointOptions {
+                    private_key: local_priv,
+                    listen_port: 0,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia: None,
+                    peers: vec![WireguardPeerOptions {
+                        public_key: peer_pub,
+                        pre_shared_key: None,
+                        endpoint: peer_addr,
+                        allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                        persistent_keepalive: None,
+                        reserved: [0; 3],
+                    }],
+                },
+            },
+            SocketProtector::default(),
+            Some(Arc::clone(&control_handle)),
+        );
+
+        endpoint
+            .start(StartStage::Start)
+            .expect("start wireguard endpoint");
+        let mut buf = [0u8; 2048];
+        let (n, _) = timeout(Duration::from_secs(2), peer_socket.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for start handshake")
+            .expect("receive start handshake");
+        assert!(n >= 4, "wireguard handshake packet must include a header");
+        assert_eq!(buf[0], 1, "start event must send handshake initiation");
+        assert_eq!(&buf[1..4], &[0, 0, 0]);
+
+        endpoint.shutdown();
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        control_join.join().expect("control thread join");
     }
 
     /// Two `WireguardEndpoint`s configured as each other's peer must complete

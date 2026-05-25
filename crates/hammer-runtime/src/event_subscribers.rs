@@ -4,7 +4,7 @@ use std::sync::Arc;
 use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
 
-#[cfg(feature = "outbound-hysteria2")]
+#[cfg(any(feature = "endpoint-wireguard", feature = "outbound-hysteria2"))]
 use crate::component_registry::register_components;
 use crate::{ControlEventSubscriptionHandle, ControlThreadHandle};
 
@@ -46,6 +46,12 @@ fn register_standard_event_subscriber_builders(
         event,
         _builders,
         [crate::protocol::hysteria2::Hysteria2AuthLogSubscriber]
+    );
+    #[cfg(feature = "endpoint-wireguard")]
+    register_components!(
+        event,
+        _builders,
+        [crate::protocol::endpoint::wireguard::WireguardStartHandshakeSubscriber]
     );
 }
 
