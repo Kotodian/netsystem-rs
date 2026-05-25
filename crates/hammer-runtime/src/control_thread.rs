@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{
 
 #[cfg(test)]
 pub(crate) use self::event::SyntheticEventArgs;
+pub(crate) use self::event::build_standard_event_subscribers;
 pub use self::event::{
     ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, EventSubscriberBuilder,
     LogEventArgs,
@@ -25,7 +26,6 @@ pub use self::event::{
 use self::event::{
     ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
 };
-pub(crate) use self::event::build_standard_event_subscribers;
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
