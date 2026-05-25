@@ -378,11 +378,7 @@ impl ControlThread {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let scope = metrics.scope("runtime", "control_thread", "hammer-main");
-        let handle = ControlThreadHandle::new(
-            event_tx,
-            command_tx,
-            EventDropMetrics::new(&scope),
-        );
+        let handle = ControlThreadHandle::new(event_tx, command_tx, EventDropMetrics::new(&scope));
         let thread = Self {
             event_rx,
             command_rx,
@@ -2049,10 +2045,9 @@ mod tests {
             .iter()
             .find(|line| line.contains("\"component\":\"runtime.runtime.hammer-main\""))
             .expect("runtime component line");
-        assert!(
-            runtime
-                .contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter.kind.log\":0")
-        );
+        assert!(runtime.contains(
+            "\"runtime.runtime.hammer-main.event_dropped_full_total.counter.kind.log\":0"
+        ));
         assert!(
             !runtime.contains("outbound.outbound.direct"),
             "component lines must not mix samples: {runtime}"
