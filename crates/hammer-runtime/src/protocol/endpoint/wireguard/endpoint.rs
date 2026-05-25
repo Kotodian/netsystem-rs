@@ -368,7 +368,7 @@ impl WireguardEndpoint {
             shutdown,
             reset_tx,
             start_handshake_tx,
-            keepalive_timer,
+            timer_tick,
             join,
         } = transport;
 
@@ -404,7 +404,7 @@ impl WireguardEndpoint {
                 shutdown,
                 reset_tx,
                 start_handshake_tx,
-                keepalive_timer,
+                timer_tick,
                 join,
             },
             encrypt_tx: encrypt_tx_clone,
@@ -449,7 +449,7 @@ impl WireguardEndpoint {
 }
 
 fn stop_runtime(rt: WireguardRuntime) {
-    rt.transport.cancel_keepalive_timer();
+    rt.transport.cancel_timer_tick();
     let _ = rt.transport.shutdown.send(());
     rt.transport.join.abort();
     drop(rt.encrypt_tx);

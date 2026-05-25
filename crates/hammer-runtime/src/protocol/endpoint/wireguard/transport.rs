@@ -9,7 +9,7 @@
 //!     responses, cookie replies) are sent straight back to the peer.
 //!   * outbound IP packets from `encrypt_rx` → LPM-route to a peer →
 //!     boringtun `encapsulate` → UDP `send_to` the peer's endpoint.
-//!   * keepalive ticks sent by the control thread → call
+//!   * timer ticks sent by the control thread → call
 //!     `Tunn::update_timers` per peer on this worker actor so handshakes,
 //!     keepalives, and rekeys still send UDP from the data plane.
 //!
@@ -129,7 +129,7 @@ pub(crate) struct TransportHandles {
     /// packet channels stable for the TUN fast path.
     pub(crate) reset_tx: mpsc::Sender<()>,
     pub(crate) start_handshake_tx: mpsc::Sender<usize>,
-    pub(crate) keepalive_timer: Option<ControlTimerHandle>,
+    pub(crate) timer_tick: Option<ControlTimerHandle>,
     /// Join handle in case the caller wants to await actor termination.
     pub(crate) join: JoinHandle<()>,
 }
@@ -177,15 +177,15 @@ impl TransportHandles {
         PeerHandshakeTrigger::new(peer_index, self.start_handshake_tx.clone())
     }
 
-    pub(crate) fn cancel_keepalive_timer(&self) {
-        if let Some(timer) = &self.keepalive_timer {
+    pub(crate) fn cancel_timer_tick(&self) {
+        if let Some(timer) = &self.timer_tick {
             let _ = timer.cancel();
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn has_control_keepalive_timer_for_test(&self) -> bool {
-        self.keepalive_timer.is_some()
+    pub(crate) fn has_control_timer_tick_for_test(&self) -> bool {
+        self.timer_tick.is_some()
     }
 }
 
@@ -214,7 +214,7 @@ pub(crate) fn spawn_transport(
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
     let (start_handshake_tx, start_handshake_rx) = mpsc::channel::<usize>(START_HANDSHAKE_QUEUE);
-    let keepalive_timer = if let Some(control_handle) = control_handle {
+    let timer_tick = if let Some(control_handle) = control_handle {
         let timer_tick_tx = timer_tick_tx.clone();
         Some(
             control_handle
@@ -224,7 +224,7 @@ pub(crate) fn spawn_transport(
                         let _ = timer_tick_tx.try_send(());
                     }
                 })
-                .with_context(|| "wireguard control keepalive timer")?,
+                .with_context(|| "wireguard control timer tick")?,
         )
     } else {
         None
@@ -245,7 +245,7 @@ pub(crate) fn spawn_transport(
         shutdown_rx,
         reset_rx,
         start_handshake_rx,
-        if keepalive_timer.is_some() {
+        if timer_tick.is_some() {
             Some(timer_tick_rx)
         } else {
             None
@@ -262,7 +262,7 @@ pub(crate) fn spawn_transport(
         shutdown: shutdown_tx,
         reset_tx,
         start_handshake_tx,
-        keepalive_timer,
+        timer_tick,
         join,
     })
 }
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transport_registers_keepalive_timer_on_control_thread() {
+    async fn transport_registers_wireguard_timer_on_control_thread() {
         let inner = Arc::new(DiscardWriter);
         let (control_thread_handle, control_thread) = ControlThread::new(
             Instant::now(),
@@ -1388,8 +1388,8 @@ mod tests {
         .expect("spawn transport with control timer");
 
         assert!(
-            handles.has_control_keepalive_timer_for_test(),
-            "wireguard endpoint keepalive must be registered on the control thread"
+            handles.has_control_timer_tick_for_test(),
+            "wireguard endpoint timer tick must be registered on the control thread"
         );
 
         let _ = handles.shutdown.send(());
