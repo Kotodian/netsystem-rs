@@ -19,11 +19,11 @@ use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 
 #[cfg(feature = "endpoint")]
+use crate::ControlLogWriter;
+#[cfg(feature = "endpoint")]
 use crate::RuntimePlatform;
 #[cfg(feature = "endpoint-wireguard")]
 use crate::component_registry::register_components;
-#[cfg(feature = "endpoint")]
-use crate::ControlLogWriter;
 
 #[cfg(feature = "endpoint-wireguard")]
 pub(crate) type EndpointBuilder = fn(

@@ -1064,11 +1064,11 @@ mod tests {
     use ipnet::IpNet;
     use tokio::time::timeout;
 
+    use crate::ControlThread;
     use hammer_core::config::WireguardPeerOptions;
     use hammer_core::log::Level;
     use hammer_core::log::{DiscardWriter, Factory};
     use hammer_core::metrics::MetricsRegistry;
-    use crate::ControlThread;
 
     fn logger(id: &'static str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
