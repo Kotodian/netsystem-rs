@@ -34,14 +34,13 @@ pub use crate::protocol::block::BlockOutbound;
 #[cfg(feature = "outbound-direct")]
 pub use crate::protocol::direct::DirectOutbound;
 
-pub(crate) type OutboundBuilder =
-    fn(
-        Logger,
-        String,
-        &OutboundKind,
-        SocketProtector,
-        Option<Arc<ControlThreadHandle>>,
-    ) -> HammerResult<OutboundComponent>;
+pub(crate) type OutboundBuilder = fn(
+    Logger,
+    String,
+    &OutboundKind,
+    SocketProtector,
+    Option<Arc<ControlThreadHandle>>,
+) -> HammerResult<OutboundComponent>;
 
 pub struct OutboundRegistration(OutboundComponent);
 
@@ -282,14 +281,12 @@ impl OutboundManager {
         protector: impl Into<SocketProtector>,
     ) -> HammerResult<()> {
         let protector = protector.into();
-        let descriptor = self
-            .factories
-            .build(
-                self.logger.clone(),
-                option,
-                protector,
-                self.control_handle.as_ref().map(Arc::clone),
-            )?;
+        let descriptor = self.factories.build(
+            self.logger.clone(),
+            option,
+            protector,
+            self.control_handle.as_ref().map(Arc::clone),
+        )?;
         let mut items = self.items.lock().expect("OutboundManager poisoned");
         if items.contains_key(&option.id) {
             return Err(HammerError::config_validation(format!(

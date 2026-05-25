@@ -121,27 +121,24 @@ impl Hysteria2Outbound {
                         control_handle: Arc::clone(control_handle),
                     });
             debug!("hysteria2 outbound {} initializing client", self.id);
-            let client = match connect_with_timeout_and_events(
-                options,
-                connect_timeout,
-                auth_event_context,
-            )
-            .await
-            {
-                Ok(client) => client,
-                Err(err) => {
-                    if self.client_epoch() != epoch {
-                        debug!(
-                            "hysteria2 outbound {} stale connect failed after reset: {err}",
-                            self.id
-                        );
-                        continue;
+            let client =
+                match connect_with_timeout_and_events(options, connect_timeout, auth_event_context)
+                    .await
+                {
+                    Ok(client) => client,
+                    Err(err) => {
+                        if self.client_epoch() != epoch {
+                            debug!(
+                                "hysteria2 outbound {} stale connect failed after reset: {err}",
+                                self.id
+                            );
+                            continue;
+                        }
+                        self.record_connect_failure();
+                        error!("hysteria2 outbound {} connect failed: {err}", self.id);
+                        return Err(err);
                     }
-                    self.record_connect_failure();
-                    error!("hysteria2 outbound {} connect failed: {err}", self.id);
-                    return Err(err);
-                }
-            };
+                };
             let mut state = self
                 .client_state
                 .lock()

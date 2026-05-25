@@ -196,14 +196,16 @@ impl RuntimeService {
             Arc::clone(&pause),
             Arc::clone(&connection),
         );
-        let outbound = Arc::new(OutboundManager::from_options_with_platform_metrics_and_control(
-            new_logger(&log_factory, "outbound"),
-            options.route.final_.clone(),
-            &options.outbounds,
-            Arc::clone(&platform),
-            Arc::clone(&metrics),
-            Arc::clone(&control_handle),
-        )?);
+        let outbound = Arc::new(
+            OutboundManager::from_options_with_platform_metrics_and_control(
+                new_logger(&log_factory, "outbound"),
+                options.route.final_.clone(),
+                &options.outbounds,
+                Arc::clone(&platform),
+                Arc::clone(&metrics),
+                Arc::clone(&control_handle),
+            )?,
+        );
         // Auto-register an `EndpointOutboundAdapter` for every declared
         // endpoint **before** `bind_aggregates`: urltest and friends will
         // resolve `<endpoint-id>` against the same OutboundManager when

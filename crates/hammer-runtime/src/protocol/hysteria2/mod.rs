@@ -342,11 +342,13 @@ fn publish_hysteria2_auth_failure(
     let Some(context) = context else {
         return;
     };
-    let _ = context.control_handle.publish_event(Hysteria2AuthFailureArgs {
-        outbound_id: context.outbound_id.clone(),
-        server: server.to_owned(),
-        error,
-    });
+    let _ = context
+        .control_handle
+        .publish_event(Hysteria2AuthFailureArgs {
+            outbound_id: context.outbound_id.clone(),
+            server: server.to_owned(),
+            error,
+        });
 }
 
 async fn connect_quic_with_timeout(
