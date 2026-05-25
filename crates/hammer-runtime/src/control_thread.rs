@@ -191,18 +191,14 @@ impl ControlThreadHandle {
         match self.event_tx.try_send(event) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
-                self.record_dropped_event();
+                self.dropped_events.inc();
                 Err(HammerError::internal("control event queue full"))
             }
             Err(TrySendError::Closed(_)) => {
-                self.record_dropped_event();
+                self.dropped_events.inc();
                 Err(HammerError::internal("control thread stopped"))
             }
         }
-    }
-
-    fn record_dropped_event(&self) {
-        self.dropped_events.inc();
     }
 
     fn schedule_timer(
@@ -354,7 +350,7 @@ impl LogWriter for ControlThreadHandle {
         match self.event_tx.try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                self.record_dropped_event();
+                self.dropped_events.inc();
             }
         }
     }
