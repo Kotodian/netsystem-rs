@@ -22,12 +22,15 @@ use hammer_core::log::Logger;
 use crate::RuntimePlatform;
 #[cfg(feature = "endpoint-wireguard")]
 use crate::component_registry::register_components;
+#[cfg(feature = "endpoint")]
+use crate::ControlLogWriter;
 
 #[cfg(feature = "endpoint-wireguard")]
 pub(crate) type EndpointBuilder = fn(
     Logger,
     &EndpointOptions,
     Option<Arc<dyn PlatformInterface>>,
+    Option<Arc<ControlLogWriter>>,
 ) -> HammerResult<EndpointComponent>;
 
 #[cfg(feature = "endpoint-wireguard")]
@@ -51,12 +54,13 @@ impl EndpointFactorySet {
         logger: Logger,
         option: &EndpointOptions,
         platform: Option<Arc<dyn PlatformInterface>>,
+        control_log: Option<Arc<ControlLogWriter>>,
     ) -> HammerResult<EndpointComponent> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown endpoint type: {type_name}"))
         })?;
-        builder(logger, option, platform)
+        builder(logger, option, platform, control_log)
     }
 }
 
@@ -89,7 +93,7 @@ impl EndpointManager {
 
     #[cfg(feature = "endpoint")]
     pub fn from_options(logger: Logger, options: &[EndpointOptions]) -> HammerResult<Self> {
-        Self::build(logger, options, None)
+        Self::build(logger, options, None, None)
     }
 
     #[cfg(feature = "endpoint")]
@@ -99,7 +103,18 @@ impl EndpointManager {
         platform: impl Into<RuntimePlatform>,
     ) -> HammerResult<Self> {
         let platform = platform.into().into_inner();
-        Self::build(logger, options, Some(platform))
+        Self::build(logger, options, Some(platform), None)
+    }
+
+    #[cfg(feature = "endpoint")]
+    pub fn from_options_with_platform_and_control(
+        logger: Logger,
+        options: &[EndpointOptions],
+        platform: impl Into<RuntimePlatform>,
+        control_log: Arc<ControlLogWriter>,
+    ) -> HammerResult<Self> {
+        let platform = platform.into().into_inner();
+        Self::build(logger, options, Some(platform), Some(control_log))
     }
 
     #[cfg(feature = "endpoint")]
@@ -107,6 +122,8 @@ impl EndpointManager {
         logger: Logger,
         options: &[EndpointOptions],
         platform: Option<Arc<dyn PlatformInterface>>,
+        #[cfg_attr(not(feature = "endpoint-wireguard"), allow(unused_variables))]
+        control_log: Option<Arc<ControlLogWriter>>,
     ) -> HammerResult<Self> {
         let manager = Self::new(logger);
         #[cfg(not(feature = "endpoint-wireguard"))]
@@ -121,6 +138,7 @@ impl EndpointManager {
                 manager.logger.clone(),
                 option,
                 platform.as_ref().map(Arc::clone),
+                control_log.as_ref().map(Arc::clone),
             )?;
             let mut items = manager.items.lock().expect("EndpointManager poisoned");
             if items.contains_key(&option.id) {

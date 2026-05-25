@@ -27,6 +27,13 @@ impl ControlTimerHandle {
         Self { id, command_tx }
     }
 
+    pub fn cancel(&self) -> bool {
+        let (done_tx, _done_rx) = mpsc::channel();
+        self.command_tx
+            .send(ControlCommand::CancelTimer(self.id, done_tx))
+            .is_ok()
+    }
+
     pub fn cancel_timeout(&self, timeout: Duration) -> bool {
         let (done_tx, done_rx) = mpsc::channel();
         if self

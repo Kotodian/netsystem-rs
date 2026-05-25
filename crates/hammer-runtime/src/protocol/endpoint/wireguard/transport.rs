@@ -9,8 +9,9 @@
 //!     responses, cookie replies) are sent straight back to the peer.
 //!   * outbound IP packets from `encrypt_rx` → LPM-route to a peer →
 //!     boringtun `encapsulate` → UDP `send_to` the peer's endpoint.
-//!   * a 250 ms tick that calls `Tunn::update_timers` per peer so handshakes,
-//!     keepalives, and rekeys make progress without external prodding.
+//!   * keepalive ticks sent by the control thread → call
+//!     `Tunn::update_timers` per peer on this worker actor so handshakes,
+//!     keepalives, and rekeys still send UDP from the data plane.
 //!
 //! This actor only moves encrypted UDP frames between peers and the
 //! stack-facing queues.
@@ -40,6 +41,7 @@ use hammer_core::protocol::wireguard::peer::{self, Peer};
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets};
 use crate::socket_protector::SocketProtector;
+use crate::{ControlLogWriter, ControlTimerHandle};
 
 /// 250 ms matches what boringtun's own examples and Cloudflare WARP use to
 /// drive `Tunn::update_timers` — fine-grained enough for handshake retries
@@ -94,6 +96,7 @@ pub(crate) struct TransportHandles {
     /// Ask the actor to rebind/reprotect its UDP sockets while keeping the
     /// packet channels stable for the TUN fast path.
     pub(crate) reset_tx: mpsc::Sender<()>,
+    pub(crate) keepalive_timer: Option<ControlTimerHandle>,
     /// Join handle in case the caller wants to await actor termination.
     pub(crate) join: JoinHandle<()>,
 }
@@ -137,9 +140,21 @@ impl TransportHandles {
         }
     }
 
+    pub(crate) fn cancel_keepalive_timer(&self) {
+        if let Some(timer) = &self.keepalive_timer {
+            let _ = timer.cancel();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_control_keepalive_timer_for_test(&self) -> bool {
+        self.keepalive_timer.is_some()
+    }
+
     /// Send the cancellation signal and await the actor finishing.
     #[allow(dead_code)]
     pub(crate) async fn shutdown(self) -> HammerResult<()> {
+        self.cancel_keepalive_timer();
         let _ = self.shutdown.send(());
         self.join.await.with_context(|| "wireguard transport join")
     }
@@ -155,6 +170,7 @@ pub(crate) fn spawn_transport(
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
+    control_log: Option<Arc<ControlLogWriter>>,
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<Amnezia2Options>,
 ) -> HammerResult<TransportHandles> {
     let sockets = bind_transport_sockets(&peers, listen_port, &protector)?;
@@ -165,8 +181,24 @@ pub(crate) fn spawn_transport(
     let (encrypt_batch_tx, encrypt_batch_rx) = mpsc::channel::<Vec<Bytes>>(ENCRYPT_BATCH_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
     let (inbound_batch_tx, inbound_batch_rx) = mpsc::channel::<Vec<Bytes>>(INBOUND_BATCH_QUEUE);
+    let (timer_tick_tx, timer_tick_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
+    let keepalive_timer = if let Some(control_log) = control_log {
+        let timer_tick_tx = timer_tick_tx.clone();
+        Some(
+            control_log
+                .schedule_interval(TIMER_TICK, TIMER_TICK, move || {
+                    let timer_tick_tx = timer_tick_tx.clone();
+                    async move {
+                        let _ = timer_tick_tx.try_send(());
+                    }
+                })
+                .with_context(|| "wireguard control keepalive timer")?,
+        )
+    } else {
+        None
+    };
 
     let join = crate::spawn::spawn(run_actor(
         sockets,
@@ -182,6 +214,11 @@ pub(crate) fn spawn_transport(
         inbound_batch_tx,
         shutdown_rx,
         reset_rx,
+        if keepalive_timer.is_some() {
+            Some(timer_tick_rx)
+        } else {
+            None
+        },
     ));
 
     Ok(TransportHandles {
@@ -192,6 +229,7 @@ pub(crate) fn spawn_transport(
         local_addr,
         shutdown: shutdown_tx,
         reset_tx,
+        keepalive_timer,
         join,
     })
 }
@@ -329,6 +367,7 @@ async fn run_actor(
     inbound_batch_tx: mpsc::Sender<Vec<Bytes>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     mut reset_rx: mpsc::Receiver<()>,
+    mut timer_tick_rx: Option<mpsc::Receiver<()>>,
 ) {
     // Capacity for every encap/decap output buffer the actor will allocate.
     // Each step allocates its own BytesMut so the result can be `freeze()`d
@@ -361,9 +400,9 @@ async fn run_actor(
     let mut outbound_routed: Vec<(usize, Bytes)> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
     let mut outbound_send_buf = BytesMut::with_capacity(crypto_cap);
 
-    let mut timer = time::interval(TIMER_TICK);
-    timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    timer.tick().await; // first tick fires immediately; consume it
+    let mut fallback_timer = time::interval(TIMER_TICK);
+    fallback_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    fallback_timer.tick().await; // first tick fires immediately; consume it
 
     loop {
         tokio::select! {
@@ -477,7 +516,20 @@ async fn run_actor(
                 )
                 .await;
             }
-            _ = timer.tick() => {
+            tick = control_timer_tick(&mut timer_tick_rx), if timer_tick_rx.is_some() => {
+                if tick.is_none() {
+                    break;
+                }
+                tick_timers(
+                    &sockets,
+                    &peers,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.as_ref(),
+                    crypto_cap,
+                    &mut tick_buf,
+                ).await;
+            }
+            _ = fallback_timer.tick(), if timer_tick_rx.is_none() => {
                 tick_timers(
                     &sockets,
                     &peers,
@@ -488,6 +540,13 @@ async fn run_actor(
                 ).await;
             }
         }
+    }
+}
+
+async fn control_timer_tick(timer_tick_rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match timer_tick_rx {
+        Some(rx) => rx.recv().await,
+        None => future::pending().await,
     }
 }
 
@@ -1006,7 +1065,10 @@ mod tests {
     use tokio::time::timeout;
 
     use hammer_core::config::WireguardPeerOptions;
+    use hammer_core::log::Level;
     use hammer_core::log::{DiscardWriter, Factory};
+    use hammer_core::metrics::MetricsRegistry;
+    use crate::ControlThread;
 
     fn logger(id: &'static str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
@@ -1138,6 +1200,7 @@ mod tests {
             port_a,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1148,6 +1211,7 @@ mod tests {
             port_b,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1175,6 +1239,55 @@ mod tests {
 
         // Dropping the handles closes both mpsc channels and the oneshot;
         // the actor's select! loop notices and exits cleanly.
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transport_registers_keepalive_timer_on_control_thread() {
+        let inner = Arc::new(DiscardWriter);
+        let (control_writer, control_thread) = ControlThread::new(
+            Instant::now(),
+            inner,
+            MetricsRegistry::new(),
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let control_handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("control thread runtime");
+            runtime.block_on(control_thread.run());
+        });
+
+        let local_priv = [23u8; 32];
+        let peer_pub = x25519_public([24u8; 32]);
+        let peer = make_peer(
+            peer_pub,
+            local_priv,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
+            0,
+        );
+
+        let handles = spawn_transport(
+            logger("transport-control-timer"),
+            Arc::new(vec![peer]),
+            0,
+            1408,
+            SocketProtector::default(),
+            Some(Arc::clone(&control_writer)),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
+        )
+        .expect("spawn transport with control timer");
+
+        assert!(
+            handles.has_control_keepalive_timer_for_test(),
+            "wireguard endpoint keepalive must be registered on the control thread"
+        );
+
+        let _ = handles.shutdown.send(());
+        assert!(control_writer.shutdown_timeout(Duration::from_secs(1)));
+        control_handle.join().expect("control thread join");
     }
 
     /// Push a burst of IP packets through `encrypt_tx` in quick succession so
@@ -1211,6 +1324,7 @@ mod tests {
             port_a,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1221,6 +1335,7 @@ mod tests {
             port_b,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1347,6 +1462,7 @@ mod tests {
             0,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
@@ -1385,6 +1501,7 @@ mod tests {
             0,
             1408,
             SocketProtector::default(),
+            None,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )

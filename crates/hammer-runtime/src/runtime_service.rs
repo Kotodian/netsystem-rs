@@ -176,10 +176,11 @@ impl RuntimeService {
             "certificate-provider",
         )));
         #[cfg(feature = "endpoint")]
-        let endpoint = Arc::new(EndpointManager::from_options_with_platform(
+        let endpoint = Arc::new(EndpointManager::from_options_with_platform_and_control(
             new_logger(&log_factory, "endpoint"),
             &options.endpoints,
             Arc::clone(&platform),
+            Arc::clone(&control_writer),
         )?);
         let connection = Arc::new(ConnectionManager::new());
         let network = NetworkManager::with_platform(
