@@ -1,3 +1,6 @@
+mod timer;
+
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -12,6 +15,10 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
+use self::timer::{
+    ControlTimerHandle, ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry,
+};
+
 const LOG_QUEUE_CAPACITY: usize = 4096;
 /// Default ceiling for regular synchronous `call` round-trips. Lifecycle
 /// start/close is deliberately dispatched through `call_blocking` instead:
@@ -24,6 +31,7 @@ pub(crate) struct ControlLogWriter {
     log_tx: Sender<LogRecord>,
     command_tx: UnboundedSender<ControlCommand>,
     closed: AtomicBool,
+    next_timer_id: std::sync::atomic::AtomicU64,
     dropped_logs: MetricCounter,
 }
 
@@ -37,6 +45,7 @@ impl ControlLogWriter {
             log_tx,
             command_tx,
             closed: AtomicBool::new(false),
+            next_timer_id: std::sync::atomic::AtomicU64::new(1),
             dropped_logs,
         })
     }
@@ -76,6 +85,66 @@ impl ControlLogWriter {
 
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn schedule_once<F, Fut>(
+        &self,
+        delay: Duration,
+        callback: F,
+    ) -> HammerResult<ControlTimerHandle>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.schedule_timer(ControlTimerRegistration::once(
+            self.next_timer_id(),
+            delay,
+            boxed_timer_callback(callback),
+        ))
+    }
+
+    pub(crate) fn schedule_interval<F, Fut>(
+        &self,
+        initial_delay: Duration,
+        interval: Duration,
+        callback: F,
+    ) -> HammerResult<ControlTimerHandle>
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if interval.is_zero() {
+            return Err(HammerError::internal(
+                "control timer interval must be non-zero",
+            ));
+        }
+        self.schedule_timer(ControlTimerRegistration::interval(
+            self.next_timer_id(),
+            initial_delay,
+            interval,
+            boxed_timer_callback(callback),
+        ))
+    }
+
+    fn next_timer_id(&self) -> ControlTimerId {
+        ControlTimerId(
+            self.next_timer_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    fn schedule_timer(
+        &self,
+        registration: ControlTimerRegistration,
+    ) -> HammerResult<ControlTimerHandle> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(HammerError::service_closed());
+        }
+        let id = registration.id();
+        self.command_tx
+            .send(ControlCommand::RegisterTimer(registration))
+            .map_err(|_| HammerError::internal("control thread stopped"))?;
+        Ok(ControlTimerHandle::new(id, self.command_tx.clone()))
     }
 
     /// Dispatch `f` onto the control thread and block until it completes,
@@ -218,6 +287,7 @@ pub(crate) struct ControlThread {
     log_rx: Receiver<LogRecord>,
     command_rx: UnboundedReceiver<ControlCommand>,
     inner: Arc<dyn LogWriter>,
+    timers: TimerRegistry,
 }
 
 impl ControlThread {
@@ -236,6 +306,7 @@ impl ControlThread {
             log_rx,
             command_rx,
             inner,
+            timers: TimerRegistry::new(),
         };
         (writer, thread)
     }
@@ -248,22 +319,49 @@ impl ControlThread {
         // command channel itself closes.
         let mut log_open = true;
         loop {
-            tokio::select! {
-                command = self.command_rx.recv() => {
-                    let Some(command) = command else {
-                        break;
-                    };
-                    if self.handle_command(command) {
-                        break;
+            self.timers.reap_finished();
+            if let Some(deadline) = self.timers.next_deadline() {
+                tokio::select! {
+                    command = self.command_rx.recv() => {
+                        let Some(command) = command else {
+                            self.timers.shutdown();
+                            break;
+                        };
+                        if self.handle_command(command) {
+                            break;
+                        }
+                    }
+                    log = self.log_rx.recv(), if log_open => {
+                        let Some(log) = log else {
+                            log_open = false;
+                            continue;
+                        };
+                        self.inner.write_message(log.level, log.message);
+                        self.drain_logs();
+                    }
+                    _ = tokio::time::sleep_until(deadline) => {
+                        self.timers.fire_due(&*self.inner);
                     }
                 }
-                log = self.log_rx.recv(), if log_open => {
-                    let Some(log) = log else {
-                        log_open = false;
-                        continue;
-                    };
-                    self.inner.write_message(log.level, log.message);
-                    self.drain_logs();
+            } else {
+                tokio::select! {
+                    command = self.command_rx.recv() => {
+                        let Some(command) = command else {
+                            self.timers.shutdown();
+                            break;
+                        };
+                        if self.handle_command(command) {
+                            break;
+                        }
+                    }
+                    log = self.log_rx.recv(), if log_open => {
+                        let Some(log) = log else {
+                            log_open = false;
+                            continue;
+                        };
+                        self.inner.write_message(log.level, log.message);
+                        self.drain_logs();
+                    }
                 }
             }
         }
@@ -278,6 +376,7 @@ impl ControlThread {
             }
             ControlCommand::Shutdown(done) => {
                 self.drain_logs();
+                self.timers.shutdown();
                 let _ = done.send(());
                 true
             }
@@ -287,6 +386,15 @@ impl ControlThread {
             }
             ControlCommand::AsyncCall(call) => {
                 call();
+                false
+            }
+            ControlCommand::RegisterTimer(registration) => {
+                self.timers.register(registration);
+                false
+            }
+            ControlCommand::CancelTimer(id, done) => {
+                let canceled = self.timers.cancel(id);
+                let _ = done.send(canceled);
                 false
             }
         }
@@ -312,6 +420,16 @@ enum ControlCommand {
     Shutdown(mpsc::Sender<()>),
     Call(Box<dyn FnOnce() + Send>),
     AsyncCall(Box<dyn FnOnce() + Send>),
+    RegisterTimer(ControlTimerRegistration),
+    CancelTimer(ControlTimerId, mpsc::Sender<bool>),
+}
+
+fn boxed_timer_callback<F, Fut>(mut callback: F) -> TimerCallback
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Box::new(move || Box::pin(callback()))
 }
 
 /// Prefix shared by single-line and chunked metric snapshot dumps.
@@ -638,7 +756,11 @@ mod tests {
     use super::*;
     use hammer_core::log::Level;
     use hammer_core::metrics::MetricLabel;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::task::{Context, Poll};
 
     #[derive(Default)]
     struct CaptureWriter {
@@ -834,6 +956,213 @@ mod tests {
             .expect("blocking control call");
         assert_eq!(value, 7);
 
+        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_timer_runs_one_shot_once() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (writer, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let count = Arc::new(AtomicUsize::new(0));
+        let timer_count = Arc::clone(&count);
+
+        let _timer = writer
+            .schedule_once(Duration::from_millis(20), move || {
+                let timer_count = Arc::clone(&timer_count);
+                async move {
+                    timer_count.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .expect("schedule one-shot timer");
+
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+
+        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_timer_interval_stops_after_cancel() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (writer, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let count = Arc::new(AtomicUsize::new(0));
+        let timer_count = Arc::clone(&count);
+
+        let timer = writer
+            .schedule_interval(
+                Duration::ZERO,
+                Duration::from_millis(20),
+                move || {
+                    let timer_count = Arc::clone(&timer_count);
+                    async move {
+                        timer_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .expect("schedule interval timer");
+
+        std::thread::sleep(Duration::from_millis(90));
+        let before_cancel = count.load(Ordering::SeqCst);
+        assert!(before_cancel >= 2, "interval did not tick: {before_cancel}");
+        assert!(timer.cancel_timeout(Duration::from_secs(1)));
+        std::thread::sleep(Duration::from_millis(70));
+        assert_eq!(count.load(Ordering::SeqCst), before_cancel);
+
+        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    #[test]
+    fn control_timer_interval_skips_when_previous_tick_is_running() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (writer, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let timer_starts = Arc::clone(&starts);
+        let timer_active = Arc::clone(&active);
+        let timer_overlaps = Arc::clone(&overlaps);
+
+        let timer = writer
+            .schedule_interval(
+                Duration::ZERO,
+                Duration::from_millis(5),
+                move || {
+                    let timer_starts = Arc::clone(&timer_starts);
+                    let timer_active = Arc::clone(&timer_active);
+                    let timer_overlaps = Arc::clone(&timer_overlaps);
+                    async move {
+                        timer_starts.fetch_add(1, Ordering::SeqCst);
+                        if timer_active.fetch_add(1, Ordering::SeqCst) != 0 {
+                            timer_overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        timer_active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                },
+            )
+            .expect("schedule slow interval timer");
+
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(timer.cancel_timeout(Duration::from_secs(1)));
+        let starts = starts.load(Ordering::SeqCst);
+        assert_eq!(overlaps.load(Ordering::SeqCst), 0);
+        assert!(starts <= 3, "slow timer should skip ticks, got {starts}");
+
+        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+    }
+
+    struct DropSignalFuture {
+        dropped: Option<mpsc::Sender<()>>,
+    }
+
+    impl Future for DropSignalFuture {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for DropSignalFuture {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[test]
+    fn control_timer_shutdown_aborts_running_task() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (writer, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+
+        let _timer = writer
+            .schedule_once(Duration::ZERO, move || {
+                let _ = started_tx.send(());
+                DropSignalFuture {
+                    dropped: Some(dropped_tx.clone()),
+                }
+            })
+            .expect("schedule abortable timer");
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timer should start");
+        assert!(writer.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timer future should be aborted on shutdown");
+    }
+
+    #[test]
+    fn control_timer_survives_panicking_callback() {
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (writer, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let _timer = writer
+            .schedule_once(Duration::ZERO, move || async move {
+                panic!("timer boom");
+            })
+            .expect("schedule panicking timer");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let value = writer
+            .call_with_timeout(Duration::from_secs(1), || 42_u32)
+            .expect("control thread should survive panicking timer callback");
+        assert_eq!(value, 42);
+
+        std::panic::set_hook(prev_hook);
         assert!(writer.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
     }
