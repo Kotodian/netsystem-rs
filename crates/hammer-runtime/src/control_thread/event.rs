@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use hammer_core::error::HammerResult;
 use hammer_core::log::{Level, Logger};
-use hammer_core::metrics::{MetricCounter, MetricsScope};
+use hammer_core::metrics::MetricCounter;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -20,85 +20,36 @@ pub(crate) type EventSubscriberBuilder =
     fn(Logger, Arc<ControlThreadHandle>) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
 
 #[derive(Debug, Clone)]
-pub(crate) enum ControlEvent {
+pub enum ControlEvent {
     Log(LogEventArgs),
+    #[cfg(test)]
     Synthetic(SyntheticEventArgs),
 }
 
-impl ControlEvent {
-    pub(crate) fn kind(&self) -> ControlEventKind {
-        match self {
-            Self::Log(_) => ControlEventKind::Log,
-            Self::Synthetic(_) => ControlEventKind::Synthetic,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
-pub(crate) struct LogEventArgs {
-    pub(crate) level: Level,
-    pub(crate) message: Arc<str>,
+pub struct LogEventArgs {
+    pub level: Level,
+    pub message: Arc<str>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub(crate) struct SyntheticEventArgs {
-    pub(crate) id: Arc<str>,
-    pub(crate) value: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum ControlEventKind {
-    Log,
-    Synthetic,
-}
-
-impl ControlEventKind {
-    fn metric_label(self) -> &'static str {
-        match self {
-            Self::Log => "log",
-            Self::Synthetic => "synthetic",
-        }
-    }
-}
-
-pub(crate) struct EventDropMetrics {
-    log: MetricCounter,
-    synthetic: MetricCounter,
-}
-
-impl EventDropMetrics {
-    pub(crate) fn new(scope: &MetricsScope) -> Self {
-        Self {
-            log: scope.counter_with_labels(
-                "event_dropped_full_total",
-                [("kind", ControlEventKind::Log.metric_label())],
-            ),
-            synthetic: scope.counter_with_labels(
-                "event_dropped_full_total",
-                [("kind", ControlEventKind::Synthetic.metric_label())],
-            ),
-        }
-    }
-
-    pub(crate) fn inc(&self, kind: ControlEventKind) {
-        match kind {
-            ControlEventKind::Log => self.log.inc(),
-            ControlEventKind::Synthetic => self.synthetic.inc(),
-        }
-    }
+pub struct SyntheticEventArgs {
+    pub id: Arc<str>,
+    pub value: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ControlEventFilter {
+pub enum ControlEventFilter {
     All,
-    Kinds(&'static [ControlEventKind]),
+    Predicate(fn(&ControlEvent) -> bool),
 }
 
 impl ControlEventFilter {
-    fn matches(self, kind: ControlEventKind) -> bool {
+    fn matches(self, event: &ControlEvent) -> bool {
         match self {
             Self::All => true,
-            Self::Kinds(kinds) => kinds.contains(&kind),
+            Self::Predicate(predicate) => predicate(event),
         }
     }
 }
@@ -106,7 +57,7 @@ impl ControlEventFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlEventSubscriptionId(pub(crate) u64);
 
-pub(crate) struct ControlEventSubscriptionHandle {
+pub struct ControlEventSubscriptionHandle {
     id: ControlEventSubscriptionId,
     command_tx: UnboundedSender<ControlCommand>,
 }
@@ -119,14 +70,14 @@ impl ControlEventSubscriptionHandle {
         Self { id, command_tx }
     }
 
-    pub(crate) fn cancel(&self) -> bool {
+    pub fn cancel(&self) -> bool {
         let (done_tx, _done_rx) = mpsc::channel();
         self.command_tx
             .send(ControlCommand::CancelEventSubscription(self.id, done_tx))
             .is_ok()
     }
 
-    pub(crate) fn cancel_timeout(&self, timeout: Duration) -> bool {
+    pub fn cancel_timeout(&self, timeout: Duration) -> bool {
         let (done_tx, done_rx) = mpsc::channel();
         if self
             .command_tx
@@ -232,9 +183,8 @@ impl EventRegistry {
 
     pub(crate) fn dispatch(&mut self, event: ControlEvent) {
         self.reap_finished();
-        let kind = event.kind();
         for entry in &mut self.entries {
-            if !entry.filter.matches(kind) {
+            if !entry.filter.matches(&event) {
                 continue;
             }
             if entry.running.is_some() {

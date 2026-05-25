@@ -9,20 +9,23 @@ use std::time::{Duration, Instant};
 
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::{Level, LogWriter};
-use hammer_core::metrics::MetricsRegistry;
+use hammer_core::metrics::{MetricCounter, MetricsRegistry};
 #[cfg(test)]
 use hammer_core::metrics::{MetricKind, MetricSample};
 use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
-pub(crate) use self::event::{
-    ControlEvent, ControlEventFilter, ControlEventKind, ControlEventSubscriptionHandle,
-    EventSubscriberBuilder, LogEventArgs, SyntheticEventArgs, build_standard_event_subscribers,
+pub use self::event::{
+    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, LogEventArgs,
 };
+pub(crate) use self::event::{
+    EventSubscriberBuilder, build_standard_event_subscribers,
+};
+#[cfg(test)]
+pub(crate) use self::event::SyntheticEventArgs;
 use self::event::{
-    ControlEventSubscriptionId, EventDropMetrics, EventRegistry, EventSubscriberRegistration,
-    boxed_event_callback,
+    ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
 };
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
@@ -41,14 +44,14 @@ pub struct ControlThreadHandle {
     closed: AtomicBool,
     next_timer_id: std::sync::atomic::AtomicU64,
     next_event_subscription_id: std::sync::atomic::AtomicU64,
-    dropped_events: EventDropMetrics,
+    dropped_events: MetricCounter,
 }
 
 impl ControlThreadHandle {
     fn new(
         event_tx: Sender<ControlEvent>,
         command_tx: UnboundedSender<ControlCommand>,
-        dropped_events: EventDropMetrics,
+        dropped_events: MetricCounter,
     ) -> Arc<Self> {
         Arc::new(Self {
             event_tx,
@@ -97,11 +100,11 @@ impl ControlThreadHandle {
         self.closed.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn publish_event(&self, event: ControlEvent) -> HammerResult<()> {
+    pub fn publish_event(&self, event: ControlEvent) -> HammerResult<()> {
         self.enqueue_event(event)
     }
 
-    pub(crate) fn subscribe_event<F, Fut>(
+    pub fn subscribe_event<F, Fut>(
         &self,
         filter: ControlEventFilter,
         callback: F,
@@ -189,19 +192,19 @@ impl ControlThreadHandle {
         }
         match self.event_tx.try_send(event) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(event)) => {
-                self.record_dropped_event(&event);
+            Err(TrySendError::Full(_)) => {
+                self.record_dropped_event();
                 Err(HammerError::internal("control event queue full"))
             }
-            Err(TrySendError::Closed(event)) => {
-                self.record_dropped_event(&event);
+            Err(TrySendError::Closed(_)) => {
+                self.record_dropped_event();
                 Err(HammerError::internal("control thread stopped"))
             }
         }
     }
 
-    fn record_dropped_event(&self, event: &ControlEvent) {
-        self.dropped_events.inc(event.kind());
+    fn record_dropped_event(&self) {
+        self.dropped_events.inc();
     }
 
     fn schedule_timer(
@@ -352,8 +355,8 @@ impl LogWriter for ControlThreadHandle {
         });
         match self.event_tx.try_send(event) {
             Ok(()) => {}
-            Err(TrySendError::Full(event)) | Err(TrySendError::Closed(event)) => {
-                self.record_dropped_event(&event);
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                self.record_dropped_event();
             }
         }
     }
@@ -378,7 +381,11 @@ impl ControlThread {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let scope = metrics.scope("runtime", "control_thread", "hammer-main");
-        let handle = ControlThreadHandle::new(event_tx, command_tx, EventDropMetrics::new(&scope));
+        let handle = ControlThreadHandle::new(
+            event_tx,
+            command_tx,
+            scope.counter("event_dropped_full_total"),
+        );
         let thread = Self {
             event_rx,
             command_rx,
@@ -898,7 +905,7 @@ mod tests {
         control_handle: Arc<ControlThreadHandle>,
     ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
         let subscription = control_handle.subscribe_event(
-            ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+            ControlEventFilter::Predicate(is_synthetic_event),
             |_| async move {
                 EVENT_COMPONENT_RUNS.fetch_add(1, Ordering::SeqCst);
             },
@@ -909,6 +916,14 @@ mod tests {
     fn test_logger(id: &str) -> hammer_core::log::Logger {
         hammer_core::log::Factory::new(Instant::now(), Arc::new(hammer_core::log::DiscardWriter))
             .new_logger(id)
+    }
+
+    fn is_log_event(event: &ControlEvent) -> bool {
+        matches!(event, ControlEvent::Log(_))
+    }
+
+    fn is_synthetic_event(event: &ControlEvent) -> bool {
+        matches!(event, ControlEvent::Synthetic(_))
     }
 
     #[test]
@@ -1304,7 +1319,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Log]),
+                ControlEventFilter::Predicate(is_log_event),
                 move |event| {
                     let seen_tx = seen_tx.clone();
                     async move {
@@ -1334,7 +1349,7 @@ mod tests {
     }
 
     #[test]
-    fn control_event_drop_full_metric_uses_event_kind_label() {
+    fn control_event_drop_full_metric_is_generic() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let (control_handle, _thread) = ControlThread::new(
@@ -1350,20 +1365,17 @@ mod tests {
         }
 
         let samples = metrics.snapshot();
-        let dropped_log = samples
+        let dropped_event = samples
             .iter()
             .find(|sample| {
                 sample.module == "runtime"
                     && sample.component_type == "control_thread"
                     && sample.component_id == "hammer-main"
                     && sample.name == "event_dropped_full_total"
-                    && sample
-                        .labels
-                        .iter()
-                        .any(|label| label.key == "kind" && label.value == "log")
+                    && sample.labels.is_empty()
             })
-            .expect("log event drop counter");
-        assert_eq!(dropped_log.value, 1);
+            .expect("event drop counter");
+        assert_eq!(dropped_event.value, 1);
         assert!(
             samples
                 .iter()
@@ -1391,7 +1403,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                ControlEventFilter::Predicate(is_synthetic_event),
                 move |event| {
                     let seen_tx = seen_tx.clone();
                     async move {
@@ -1433,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn control_event_subscriber_ignores_non_matching_kind() {
+    fn control_event_subscriber_ignores_non_matching_event() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let (control_handle, thread) = ControlThread::new(
@@ -1448,7 +1460,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Log]),
+                ControlEventFilter::Predicate(is_log_event),
                 move |_| {
                     let seen_tx = seen_tx.clone();
                     async move {
@@ -1474,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn control_event_all_filter_receives_multiple_kinds() {
+    fn control_event_all_filter_receives_multiple_events() {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         let (control_handle, thread) = ControlThread::new(
@@ -1491,7 +1503,10 @@ mod tests {
             .subscribe_event(ControlEventFilter::All, move |event| {
                 let seen_tx = seen_tx.clone();
                 async move {
-                    let _ = seen_tx.send(event.kind());
+                    let _ = seen_tx.send(match event {
+                        ControlEvent::Log(_) => "log",
+                        ControlEvent::Synthetic(_) => "synthetic",
+                    });
                 }
             })
             .expect("subscribe all events");
@@ -1511,12 +1526,9 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("second event");
 
-        let mut kinds = vec![first, second];
-        kinds.sort();
-        assert_eq!(
-            kinds,
-            vec![ControlEventKind::Log, ControlEventKind::Synthetic]
-        );
+        let mut event_names = vec![first, second];
+        event_names.sort();
+        assert_eq!(event_names, vec!["log", "synthetic"]);
 
         assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
@@ -1538,7 +1550,7 @@ mod tests {
 
         let subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                ControlEventFilter::Predicate(is_synthetic_event),
                 move |_| {
                     let seen_tx = seen_tx.clone();
                     async move {
@@ -1581,7 +1593,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]), {
+            .subscribe_event(ControlEventFilter::Predicate(is_synthetic_event), {
                 let notify = Arc::clone(&notify);
                 let runs = Arc::clone(&runs);
                 move |_| {
@@ -1650,7 +1662,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                ControlEventFilter::Predicate(is_synthetic_event),
                 move |_| async move {
                     panic!("event callback boom");
                 },
@@ -1691,7 +1703,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
+                ControlEventFilter::Predicate(is_synthetic_event),
                 move |_| {
                     let _ = started_tx.send(());
                     DropSignalFuture {
@@ -2025,7 +2037,7 @@ mod tests {
                 "hammer-main",
                 "event_dropped_full_total",
                 0,
-                &[("kind", "log")],
+                &[],
             ),
         ];
         let lines = build_snapshot_lines(&samples, 1715059200);
@@ -2045,9 +2057,7 @@ mod tests {
             .iter()
             .find(|line| line.contains("\"component\":\"runtime.runtime.hammer-main\""))
             .expect("runtime component line");
-        assert!(runtime.contains(
-            "\"runtime.runtime.hammer-main.event_dropped_full_total.counter.kind.log\":0"
-        ));
+        assert!(runtime.contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter\":0"));
         assert!(
             !runtime.contains("outbound.outbound.direct"),
             "component lines must not mix samples: {runtime}"

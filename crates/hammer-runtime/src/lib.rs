@@ -84,7 +84,10 @@ mod apple_utun;
 pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use connection::{ConnectionManager, ConnectionRegistration};
 pub(crate) use control_thread::ControlThread;
-pub use control_thread::{ControlThreadHandle, ControlTimerHandle};
+pub use control_thread::{
+    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle,
+    ControlTimerHandle, LogEventArgs,
+};
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;
 pub use hammer_core::{
