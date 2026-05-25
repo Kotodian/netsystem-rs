@@ -16,17 +16,15 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, error::TryRecvError, error::TrySendError,
 };
 
+#[cfg(test)]
+pub(crate) use self::event::SyntheticEventArgs;
 pub use self::event::{
     ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, LogEventArgs,
 };
-pub(crate) use self::event::{
-    EventSubscriberBuilder, build_standard_event_subscribers,
-};
-#[cfg(test)]
-pub(crate) use self::event::SyntheticEventArgs;
 use self::event::{
     ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
 };
+pub(crate) use self::event::{EventSubscriberBuilder, build_standard_event_subscribers};
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
@@ -1318,17 +1316,14 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(
-                ControlEventFilter::Predicate(is_log_event),
-                move |event| {
-                    let seen_tx = seen_tx.clone();
-                    async move {
-                        if let ControlEvent::Log(args) = event {
-                            let _ = seen_tx.send((args.level, args.message.to_string()));
-                        }
+            .subscribe_event(ControlEventFilter::Predicate(is_log_event), move |event| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    if let ControlEvent::Log(args) = event {
+                        let _ = seen_tx.send((args.level, args.message.to_string()));
                     }
-                },
-            )
+                }
+            })
             .expect("subscribe log events");
 
         control_handle.write_message(Level::Warn, "line from log event\n".to_owned());
@@ -1459,15 +1454,12 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(
-                ControlEventFilter::Predicate(is_log_event),
-                move |_| {
-                    let seen_tx = seen_tx.clone();
-                    async move {
-                        let _ = seen_tx.send(());
-                    }
-                },
-            )
+            .subscribe_event(ControlEventFilter::Predicate(is_log_event), move |_| {
+                let seen_tx = seen_tx.clone();
+                async move {
+                    let _ = seen_tx.send(());
+                }
+            })
             .expect("subscribe log events");
 
         control_handle
@@ -2032,13 +2024,7 @@ mod tests {
     fn build_snapshot_lines_groups_output_by_component() {
         let samples = vec![
             sample("outbound", "direct", "dial_error_total", 1, &[]),
-            sample(
-                "runtime",
-                "hammer-main",
-                "event_dropped_full_total",
-                0,
-                &[],
-            ),
+            sample("runtime", "hammer-main", "event_dropped_full_total", 0, &[]),
         ];
         let lines = build_snapshot_lines(&samples, 1715059200);
         assert_eq!(lines.len(), 2, "one line per component: {lines:?}");
@@ -2057,7 +2043,9 @@ mod tests {
             .iter()
             .find(|line| line.contains("\"component\":\"runtime.runtime.hammer-main\""))
             .expect("runtime component line");
-        assert!(runtime.contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter\":0"));
+        assert!(
+            runtime.contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter\":0")
+        );
         assert!(
             !runtime.contains("outbound.outbound.direct"),
             "component lines must not mix samples: {runtime}"
