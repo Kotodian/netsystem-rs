@@ -187,7 +187,6 @@ impl TransportHandles {
     pub(crate) fn has_control_keepalive_timer_for_test(&self) -> bool {
         self.keepalive_timer.is_some()
     }
-
 }
 
 /// Spin up the UDP transport actor. Binds the socket synchronously (cheap —

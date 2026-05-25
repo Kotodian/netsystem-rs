@@ -34,9 +34,9 @@ use hammer_core::protocol::wireguard::peer::Peer;
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::to_boringtun_config;
 use super::transport::{self, TransportHandles};
-use crate::{ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle};
 use crate::protocol::endpoint::EndpointRuntimeOptions;
 use crate::socket_protector::SocketProtector;
+use crate::{ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle};
 
 /// L3 WireGuard endpoint. `Tunn` state machines and the UDP transport actor
 /// are inert until lifecycle reaches `Start`; before that, `ip_send_clone`
@@ -735,13 +735,13 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use crate::ControlThread;
     use boringtun::noise::TunnResult;
     use hammer_core::config::{
         EndpointInterfaceOptions, WireguardEndpointOptions, WireguardPeerOptions,
     };
     use hammer_core::log::{DiscardWriter, Factory};
     use hammer_core::metrics::MetricsRegistry;
-    use crate::ControlThread;
 
     fn logger(id: &str) -> Logger {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
