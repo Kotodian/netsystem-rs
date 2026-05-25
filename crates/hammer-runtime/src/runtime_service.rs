@@ -14,6 +14,7 @@ use hammer_core::registry::RuntimeRegistry;
 use crate::EndpointManager;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
+use crate::control_thread::ControlEventSubscriptionHandle;
 #[cfg(feature = "endpoint")]
 use crate::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
@@ -24,7 +25,6 @@ use crate::{
     ControlThreadHandle, DnsRouter, DnsTransportManager, InboundManager, MetricSample,
     MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
 };
-use crate::control_thread::ControlEventSubscriptionHandle;
 #[cfg(feature = "endpoint")]
 use hammer_adapter::{EndpointManager as _, InboundManager as _};
 

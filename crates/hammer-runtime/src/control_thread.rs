@@ -20,10 +20,10 @@ pub(crate) use self::event::{
     ControlEvent, ControlEventFilter, ControlEventKind, ControlEventSubscriptionHandle,
     EventSubscriberBuilder, LogEventArgs, SyntheticEventArgs, build_standard_event_subscribers,
 };
-pub use self::timer::ControlTimerHandle;
 use self::event::{
     ControlEventSubscriptionId, EventRegistry, EventSubscriberRegistration, boxed_event_callback,
 };
+pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
 const CONTROL_EVENT_QUEUE_CAPACITY: usize = 4096;
@@ -1419,12 +1419,15 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(ControlEventFilter::Kinds(&[ControlEventKind::Log]), move |_| {
-                let seen_tx = seen_tx.clone();
-                async move {
-                    let _ = seen_tx.send(());
-                }
-            })
+            .subscribe_event(
+                ControlEventFilter::Kinds(&[ControlEventKind::Log]),
+                move |_| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        let _ = seen_tx.send(());
+                    }
+                },
+            )
             .expect("subscribe log events");
 
         control_handle
@@ -1482,7 +1485,10 @@ mod tests {
 
         let mut kinds = vec![first, second];
         kinds.sort();
-        assert_eq!(kinds, vec![ControlEventKind::Log, ControlEventKind::Synthetic]);
+        assert_eq!(
+            kinds,
+            vec![ControlEventKind::Log, ControlEventKind::Synthetic]
+        );
 
         assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
         handle.join().expect("control thread join");
@@ -1547,23 +1553,20 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(
-                ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]),
-                {
+            .subscribe_event(ControlEventFilter::Kinds(&[ControlEventKind::Synthetic]), {
+                let notify = Arc::clone(&notify);
+                let runs = Arc::clone(&runs);
+                move |_| {
                     let notify = Arc::clone(&notify);
                     let runs = Arc::clone(&runs);
-                    move |_| {
-                        let notify = Arc::clone(&notify);
-                        let runs = Arc::clone(&runs);
-                        let started_tx = started_tx.clone();
-                        async move {
-                            runs.fetch_add(1, Ordering::SeqCst);
-                            let _ = started_tx.send(());
-                            notify.notified().await;
-                        }
+                    let started_tx = started_tx.clone();
+                    async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        let _ = started_tx.send(());
+                        notify.notified().await;
                     }
-                },
-            )
+                }
+            })
             .expect("subscribe synthetic events");
 
         control_handle

@@ -16,10 +16,8 @@ use super::{ControlCommand, ControlThreadHandle};
 
 pub(crate) type EventFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type EventCallback = Box<dyn FnMut(ControlEvent) -> EventFuture + Send + 'static>;
-pub(crate) type EventSubscriberBuilder = fn(
-    Logger,
-    Arc<ControlThreadHandle>,
-) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
+pub(crate) type EventSubscriberBuilder =
+    fn(Logger, Arc<ControlThreadHandle>) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
 
 #[derive(Debug, Clone)]
 pub(crate) enum ControlEvent {
@@ -136,7 +134,6 @@ impl EventSubscriberRegistration {
             callback,
         }
     }
-
 }
 
 pub(crate) struct EventRegistry {
