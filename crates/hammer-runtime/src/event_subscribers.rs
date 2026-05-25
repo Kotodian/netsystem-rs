@@ -61,11 +61,15 @@ mod tests {
     use super::*;
 
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use hammer_core::log::{Level, LogWriter};
     use hammer_core::metrics::MetricsRegistry;
 
+    use crate::ControlEventFilter;
+    use crate::component_registry::register_components;
+    use crate::control_thread::SyntheticEventArgs;
     use crate::ControlThread;
     #[cfg(feature = "outbound-hysteria2")]
     use crate::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
@@ -105,6 +109,73 @@ mod tests {
             drop(lines);
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    static EVENT_COMPONENT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    #[hammer_component_macros::hammer_component(
+        event,
+        name = "test-event",
+        builder = build_test_event_subscriber
+    )]
+    struct TestEventSubscriber;
+
+    fn build_test_event_subscriber(
+        _logger: hammer_core::log::Logger,
+        control_handle: Arc<ControlThreadHandle>,
+    ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+        let subscription = control_handle.subscribe_event(
+            ControlEventFilter::event::<SyntheticEventArgs>(),
+            |_| async move {
+                EVENT_COMPONENT_RUNS.fetch_add(1, Ordering::SeqCst);
+            },
+        )?;
+        Ok(vec![subscription])
+    }
+
+    fn test_logger(id: &str) -> hammer_core::log::Logger {
+        hammer_core::log::Factory::new(Instant::now(), Arc::new(hammer_core::log::DiscardWriter))
+            .new_logger(id)
+    }
+
+    #[test]
+    fn event_component_macro_registers_subscriber_builder() {
+        EVENT_COMPONENT_RUNS.store(0, Ordering::SeqCst);
+        let mut builders: HashMap<&'static str, EventSubscriberBuilder> = HashMap::new();
+        register_components!(event, &mut builders, [TestEventSubscriber]);
+        let builder = *builders
+            .get("test-event")
+            .expect("event subscriber builder should be registered");
+
+        let inner = Arc::new(CaptureWriter::default());
+        let metrics = MetricsRegistry::new();
+        let (control_handle, thread) = ControlThread::new(
+            Instant::now(),
+            inner.clone(),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let handle = run_control_thread(thread);
+        let _subscriptions = builder(test_logger("test-event"), Arc::clone(&control_handle))
+            .expect("build event subscriber");
+
+        control_handle
+            .publish_event(SyntheticEventArgs {
+                id: Arc::<str>::from("macro"),
+                value: 9,
+            })
+            .expect("publish event for macro subscriber");
+        for _ in 0..20 {
+            if EVENT_COMPONENT_RUNS.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(EVENT_COMPONENT_RUNS.load(Ordering::SeqCst), 1);
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        handle.join().expect("control thread join");
     }
 
     #[cfg(feature = "outbound-hysteria2")]
