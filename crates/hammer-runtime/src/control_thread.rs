@@ -18,9 +18,8 @@ use tokio::sync::mpsc::{
 
 #[cfg(test)]
 pub(crate) use self::event::SyntheticEventArgs;
-pub(crate) use self::event::build_standard_event_subscribers;
 pub use self::event::{
-    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, EventSubscriberBuilder,
+    ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
     LogEventArgs,
 };
 use self::event::{
@@ -99,8 +98,11 @@ impl ControlThreadHandle {
         self.closed.load(Ordering::Relaxed)
     }
 
-    pub fn publish_event(&self, event: ControlEvent) -> HammerResult<()> {
-        self.enqueue_event(event)
+    pub fn publish_event<T>(&self, args: T) -> HammerResult<()>
+    where
+        T: ControlEventArgs,
+    {
+        self.enqueue_event(ControlEvent::new(args))
     }
 
     pub fn subscribe_event<F, Fut>(
@@ -344,7 +346,7 @@ impl LogWriter for ControlThreadHandle {
         if self.closed.load(Ordering::Relaxed) {
             return;
         }
-        let event = ControlEvent::Log(LogEventArgs {
+        let event = ControlEvent::new(LogEventArgs {
             level,
             message: Arc::<str>::from(message),
         });
@@ -496,13 +498,9 @@ impl ControlThread {
     }
 
     fn handle_event(&mut self, event: ControlEvent) {
-        match &event {
-            ControlEvent::Log(args) => {
-                self.inner
-                    .write_message(args.level, args.message.to_string());
-            }
-            #[cfg(test)]
-            ControlEvent::Synthetic(_) => {}
+        if let Some(args) = event.args::<LogEventArgs>() {
+            self.inner
+                .write_message(args.level, args.message.to_string());
         }
         self.events.dispatch(event);
     }
@@ -858,6 +856,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EventSubscriberBuilder;
     use crate::component_registry::register_components;
     use hammer_core::log::Level;
     use hammer_core::metrics::MetricLabel;
@@ -904,7 +903,7 @@ mod tests {
         control_handle: Arc<ControlThreadHandle>,
     ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
         let subscription = control_handle.subscribe_event(
-            ControlEventFilter::Predicate(is_synthetic_event),
+            ControlEventFilter::event::<SyntheticEventArgs>(),
             |_| async move {
                 EVENT_COMPONENT_RUNS.fetch_add(1, Ordering::SeqCst);
             },
@@ -915,14 +914,6 @@ mod tests {
     fn test_logger(id: &str) -> hammer_core::log::Logger {
         hammer_core::log::Factory::new(Instant::now(), Arc::new(hammer_core::log::DiscardWriter))
             .new_logger(id)
-    }
-
-    fn is_log_event(event: &ControlEvent) -> bool {
-        matches!(event, ControlEvent::Log(_))
-    }
-
-    fn is_synthetic_event(event: &ControlEvent) -> bool {
-        matches!(event, ControlEvent::Synthetic(_))
     }
 
     #[test]
@@ -1317,10 +1308,10 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(ControlEventFilter::Predicate(is_log_event), move |event| {
+            .subscribe_event(ControlEventFilter::event::<LogEventArgs>(), move |event| {
                 let seen_tx = seen_tx.clone();
                 async move {
-                    if let ControlEvent::Log(args) = event {
+                    if let Some(args) = event.args::<LogEventArgs>() {
                         let _ = seen_tx.send((args.level, args.message.to_string()));
                     }
                 }
@@ -1399,11 +1390,11 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Predicate(is_synthetic_event),
+                ControlEventFilter::event::<SyntheticEventArgs>(),
                 move |event| {
                     let seen_tx = seen_tx.clone();
                     async move {
-                        if let ControlEvent::Synthetic(args) = event {
+                        if let Some(args) = event.args::<SyntheticEventArgs>() {
                             let _ = seen_tx.send((
                                 std::thread::current().id(),
                                 args.id.to_string(),
@@ -1419,10 +1410,10 @@ mod tests {
         let data_thread = std::thread::spawn(move || {
             let data_thread_id = std::thread::current().id();
             publisher
-                .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+                .publish_event(SyntheticEventArgs {
                     id: Arc::<str>::from("from-data"),
                     value: 7,
-                }))
+                })
                 .expect("publish synthetic event from data thread");
             data_thread_id
         });
@@ -1455,7 +1446,7 @@ mod tests {
         let (seen_tx, seen_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(ControlEventFilter::Predicate(is_log_event), move |_| {
+            .subscribe_event(ControlEventFilter::event::<LogEventArgs>(), move |_| {
                 let seen_tx = seen_tx.clone();
                 async move {
                     let _ = seen_tx.send(());
@@ -1464,10 +1455,10 @@ mod tests {
             .expect("subscribe log events");
 
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("ignored"),
                 value: 1,
-            }))
+            })
             .expect("publish synthetic event");
         assert!(
             seen_rx.recv_timeout(Duration::from_millis(80)).is_err(),
@@ -1496,19 +1487,22 @@ mod tests {
             .subscribe_event(ControlEventFilter::All, move |event| {
                 let seen_tx = seen_tx.clone();
                 async move {
-                    let _ = seen_tx.send(match event {
-                        ControlEvent::Log(_) => "log",
-                        ControlEvent::Synthetic(_) => "synthetic",
+                    let _ = seen_tx.send(if event.args::<LogEventArgs>().is_some() {
+                        "log"
+                    } else if event.args::<SyntheticEventArgs>().is_some() {
+                        "synthetic"
+                    } else {
+                        "unknown"
                     });
                 }
             })
             .expect("subscribe all events");
 
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("all"),
                 value: 2,
-            }))
+            })
             .expect("publish synthetic event");
         let first = seen_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1543,7 +1537,7 @@ mod tests {
 
         let subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Predicate(is_synthetic_event),
+                ControlEventFilter::event::<SyntheticEventArgs>(),
                 move |_| {
                     let seen_tx = seen_tx.clone();
                     async move {
@@ -1555,10 +1549,10 @@ mod tests {
         assert!(subscription.cancel_timeout(Duration::from_secs(1)));
 
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("after-cancel"),
                 value: 3,
-            }))
+            })
             .expect("publish synthetic event");
         assert!(
             seen_rx.recv_timeout(Duration::from_millis(80)).is_err(),
@@ -1586,7 +1580,7 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
 
         let _subscription = control_handle
-            .subscribe_event(ControlEventFilter::Predicate(is_synthetic_event), {
+            .subscribe_event(ControlEventFilter::event::<SyntheticEventArgs>(), {
                 let notify = Arc::clone(&notify);
                 let runs = Arc::clone(&runs);
                 move |_| {
@@ -1603,19 +1597,19 @@ mod tests {
             .expect("subscribe synthetic events");
 
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("slow-1"),
                 value: 1,
-            }))
+            })
             .expect("publish first event");
         started_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("first callback should start");
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("slow-2"),
                 value: 2,
-            }))
+            })
             .expect("publish skipped event");
         std::thread::sleep(Duration::from_millis(80));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
@@ -1623,10 +1617,10 @@ mod tests {
         notify.notify_one();
         std::thread::sleep(Duration::from_millis(50));
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("slow-3"),
                 value: 3,
-            }))
+            })
             .expect("publish after callback completion");
         started_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1655,17 +1649,17 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Predicate(is_synthetic_event),
+                ControlEventFilter::event::<SyntheticEventArgs>(),
                 move |_| async move {
                     panic!("event callback boom");
                 },
             )
             .expect("subscribe panicking event callback");
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("panic"),
                 value: 1,
-            }))
+            })
             .expect("publish panicking event");
         std::thread::sleep(Duration::from_millis(80));
 
@@ -1696,7 +1690,7 @@ mod tests {
 
         let _subscription = control_handle
             .subscribe_event(
-                ControlEventFilter::Predicate(is_synthetic_event),
+                ControlEventFilter::event::<SyntheticEventArgs>(),
                 move |_| {
                     let _ = started_tx.send(());
                     DropSignalFuture {
@@ -1706,10 +1700,10 @@ mod tests {
             )
             .expect("subscribe abortable event callback");
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("shutdown"),
                 value: 1,
-            }))
+            })
             .expect("publish event");
         started_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1745,10 +1739,10 @@ mod tests {
             .expect("build event subscriber");
 
         control_handle
-            .publish_event(ControlEvent::Synthetic(SyntheticEventArgs {
+            .publish_event(SyntheticEventArgs {
                 id: Arc::<str>::from("macro"),
                 value: 9,
-            }))
+            })
             .expect("publish event for macro subscriber");
         for _ in 0..20 {
             if EVENT_COMPONENT_RUNS.load(Ordering::SeqCst) == 1 {

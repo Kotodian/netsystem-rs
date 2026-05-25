@@ -43,6 +43,7 @@ use crate::protocol::congestion::{CongestionControlHandle, apply_transport_confi
 use crate::protocol::icmp;
 use crate::socket_protector::SocketProtector;
 use crate::tls::{OutboundClientTlsConfig, outbound_quic_client_config};
+use crate::{ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle};
 
 // Match sing-quic's hysteria2 client defaults
 // (quic/hysteria/protocol.go DefaultStreamReceiveWindow / DefaultConnReceiveWindow):
@@ -55,6 +56,82 @@ const SEND_WINDOW: u64 = CONNECTION_RECEIVE_WINDOW as u64;
 const HYSTERIA2_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const HYSTERIA2_CONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const HYSTERIA2_CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+pub struct Hysteria2AuthSuccessArgs {
+    pub outbound_id: String,
+    pub server: String,
+    pub udp_enabled: bool,
+    pub rx_auto: bool,
+    pub server_rx_bps: u64,
+    pub send_bps: u64,
+    pub congestion: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Hysteria2AuthFailureArgs {
+    pub outbound_id: String,
+    pub server: String,
+    pub error: String,
+}
+
+#[derive(Clone)]
+pub(super) struct Hysteria2AuthEventContext {
+    outbound_id: String,
+    control_handle: Arc<ControlThreadHandle>,
+}
+
+#[hammer_component_macros::hammer_component(
+    event,
+    name = "hysteria2-auth-log",
+    builder = build_hysteria2_auth_log_subscriber
+)]
+pub struct Hysteria2AuthLogSubscriber;
+
+pub(crate) fn build_hysteria2_auth_log_subscriber(
+    logger: Logger,
+    control_handle: Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    let success_logger = logger.clone();
+    let success = control_handle.subscribe_event(
+        ControlEventFilter::event::<Hysteria2AuthSuccessArgs>(),
+        move |event| {
+            let logger = success_logger.clone();
+            async move {
+                if let Some(args) = event.args::<Hysteria2AuthSuccessArgs>() {
+                    logger.info(format!(
+                        "hysteria2 outbound {} auth success server={} udp={} rx_auto={} server_rx_bps={} send_bps={} congestion={}",
+                        args.outbound_id,
+                        args.server,
+                        args.udp_enabled,
+                        args.rx_auto,
+                        args.server_rx_bps,
+                        args.send_bps,
+                        args.congestion
+                    ));
+                }
+            }
+        },
+    )?;
+
+    let failure_logger = logger;
+    let failure = control_handle.subscribe_event(
+        ControlEventFilter::event::<Hysteria2AuthFailureArgs>(),
+        move |event| {
+            let logger = failure_logger.clone();
+            async move {
+                if let Some(args) = event.args::<Hysteria2AuthFailureArgs>() {
+                    logger.warn(format!(
+                        "hysteria2 outbound {} auth failed server={}: {}",
+                        args.outbound_id, args.server, args.error
+                    ));
+                }
+            }
+        },
+    )?;
+
+    Ok(vec![success, failure])
+}
 
 #[derive(Clone)]
 pub struct ClientOptions {
@@ -138,8 +215,16 @@ impl Hysteria2Client {
 }
 
 async fn connect_with_timeout(
+    options: ClientOptions,
+    connect_timeout: Duration,
+) -> HammerResult<Arc<Hysteria2Client>> {
+    connect_with_timeout_and_events(options, connect_timeout, None).await
+}
+
+async fn connect_with_timeout_and_events(
     mut options: ClientOptions,
     connect_timeout: Duration,
+    auth_event_context: Option<Hysteria2AuthEventContext>,
 ) -> HammerResult<Arc<Hysteria2Client>> {
     resolve_hysteria2_ech_config(&mut options).await?;
     let server = format!("{}:{}", options.server, effective_port(options.server_port));
@@ -191,9 +276,15 @@ async fn connect_with_timeout(
     };
     debug!("hysteria2 connected {address}");
     debug!("hysteria2 authenticating {context}");
-    let (h3_sender, auth_response) = authenticate(&connection, &options)
-        .await
-        .map_err(|err| HammerError::internal(format!("hysteria2 auth failed {context}: {err}")))?;
+    let (h3_sender, auth_response) = match authenticate(&connection, &options).await {
+        Ok(auth) => auth,
+        Err(err) => {
+            publish_hysteria2_auth_failure(&auth_event_context, &server, err.to_string());
+            return Err(HammerError::internal(format!(
+                "hysteria2 auth failed {context}: {err}"
+            )));
+        }
+    };
     let actual_tx = actual_tx_bps(options.send_bps, auth_response.rx);
     let congestion_mode = if !auth_response.rx_auto && actual_tx > 0 {
         congestion.use_brutal(actual_tx);
@@ -209,6 +300,20 @@ async fn connect_with_timeout(
         options.send_bps,
         congestion_mode
     );
+    if let Some(context) = &auth_event_context {
+        publish_hysteria2_auth_success(
+            context,
+            Hysteria2AuthSuccessArgs {
+                outbound_id: context.outbound_id.clone(),
+                server: server.clone(),
+                udp_enabled: options.udp_enabled,
+                rx_auto: auth_response.rx_auto,
+                server_rx_bps: auth_response.rx,
+                send_bps: options.send_bps,
+                congestion: congestion_mode.to_owned(),
+            },
+        );
+    }
     let client = Arc::new(Hysteria2Client {
         connection,
         _endpoint: endpoint,
@@ -220,6 +325,28 @@ async fn connect_with_timeout(
         spawn_datagram_loop(Arc::clone(&client));
     }
     Ok(client)
+}
+
+fn publish_hysteria2_auth_success(
+    context: &Hysteria2AuthEventContext,
+    args: Hysteria2AuthSuccessArgs,
+) {
+    let _ = context.control_handle.publish_event(args);
+}
+
+fn publish_hysteria2_auth_failure(
+    context: &Option<Hysteria2AuthEventContext>,
+    server: &str,
+    error: String,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    let _ = context.control_handle.publish_event(Hysteria2AuthFailureArgs {
+        outbound_id: context.outbound_id.clone(),
+        server: server.to_owned(),
+        error,
+    });
 }
 
 async fn connect_quic_with_timeout(
@@ -800,7 +927,8 @@ fn _validate_obfs(obfs: &Option<Hysteria2Obfs>) -> HammerResult<()> {
 mod tests {
     use super::*;
     use h3::server;
-    use hammer_core::log::{DiscardWriter, Factory};
+    use hammer_core::log::{DiscardWriter, Factory, Level};
+    use hammer_core::metrics::MetricsRegistry;
     use http::Response;
     use quinn::crypto::rustls::QuicServerConfig;
     use rustls::pki_types::PrivateKeyDer;
@@ -808,6 +936,16 @@ mod tests {
 
     fn logger(id: &str) -> Logger {
         Factory::new(std::time::Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    fn run_control_thread(thread: crate::ControlThread) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("control test runtime");
+            runtime.block_on(thread.run());
+        })
     }
 
     fn client_options_for_test(port: u16) -> ClientOptions {
@@ -1233,6 +1371,114 @@ mod tests {
         })
         .await
         .expect("datagram loop exit should drop all UDP session senders");
+    }
+
+    #[tokio::test]
+    async fn connect_publishes_auth_success_event() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start auth server");
+        let metrics = MetricsRegistry::new();
+        let (control_handle, control_thread) = crate::ControlThread::new(
+            std::time::Instant::now(),
+            Arc::new(DiscardWriter),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let control_join = run_control_thread(control_thread);
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::event::<Hysteria2AuthSuccessArgs>(),
+                move |event| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(args) = event.args::<Hysteria2AuthSuccessArgs>() {
+                            let _ = seen_tx.send(args.clone());
+                        }
+                    }
+                },
+            )
+            .expect("subscribe auth success");
+
+        let client = connect_with_timeout_and_events(
+            client_options_for_test(server.port()),
+            Duration::from_secs(2),
+            Some(Hysteria2AuthEventContext {
+                outbound_id: "hysteria2".to_owned(),
+                control_handle: Arc::clone(&control_handle),
+            }),
+        )
+        .await
+        .expect("connect client");
+        let args = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auth success event");
+        assert_eq!(args.outbound_id, "hysteria2");
+        assert_eq!(args.server, format!("127.0.0.1:{}", server.port()));
+        assert!(args.udp_enabled);
+        assert_eq!(args.congestion, "bbr");
+
+        client.close(b"test done");
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        control_join.join().expect("control thread join");
+    }
+
+    #[tokio::test]
+    async fn connect_publishes_auth_failure_event() {
+        let server = AuthServer::start("secret")
+            .await
+            .expect("start auth server");
+        let metrics = MetricsRegistry::new();
+        let (control_handle, control_thread) = crate::ControlThread::new(
+            std::time::Instant::now(),
+            Arc::new(DiscardWriter),
+            metrics,
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let control_join = run_control_thread(control_thread);
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _subscription = control_handle
+            .subscribe_event(
+                ControlEventFilter::event::<Hysteria2AuthFailureArgs>(),
+                move |event| {
+                    let seen_tx = seen_tx.clone();
+                    async move {
+                        if let Some(args) = event.args::<Hysteria2AuthFailureArgs>() {
+                            let _ = seen_tx.send(args.clone());
+                        }
+                    }
+                },
+            )
+            .expect("subscribe auth failure");
+
+        let mut options = client_options_for_test(server.port());
+        options.password = "wrong".to_owned();
+        let err = match connect_with_timeout_and_events(
+            options,
+            Duration::from_secs(2),
+            Some(Hysteria2AuthEventContext {
+                outbound_id: "hysteria2".to_owned(),
+                control_handle: Arc::clone(&control_handle),
+            }),
+        )
+        .await
+        {
+            Ok(_) => panic!("auth should fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("hysteria2 auth failed"));
+        let args = seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("auth failure event");
+        assert_eq!(args.outbound_id, "hysteria2");
+        assert_eq!(args.server, format!("127.0.0.1:{}", server.port()));
+        assert!(args.error.contains("authentication failed"));
+
+        assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+        control_join.join().expect("control thread join");
     }
 
     #[tokio::test]

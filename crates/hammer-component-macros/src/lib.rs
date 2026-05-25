@@ -281,8 +281,9 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                     id: String,
                     kind: &::hammer_core::config::OutboundKind,
                     protector: crate::socket_protector::SocketProtector,
+                    control_handle: Option<::std::sync::Arc<crate::ControlThreadHandle>>,
                 ) -> ::hammer_core::error::HammerResult<::hammer_adapter::outbound::OutboundComponent> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, id, kind, protector)?;
+                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(logger, id, kind, protector, control_handle)?;
                     let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
                     let runtime: ::std::sync::Arc<dyn ::hammer_adapter::Outbound> = runtime;
                     Ok(::hammer_adapter::RuntimeComponent::new(meta, runtime))

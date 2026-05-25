@@ -34,6 +34,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     _protector: crate::socket_protector::SocketProtector,
+    _control_handle: Option<Arc<crate::ControlThreadHandle>>,
 ) -> HammerResult<Arc<BlockOutbound>> {
     match kind {
         OutboundKind::Block => Ok(Arc::new(BlockOutbound::new(logger, id))),

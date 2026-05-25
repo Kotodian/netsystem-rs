@@ -15,6 +15,7 @@ pub(crate) trait OutboundComponentDeclaration {
         id: String,
         kind: &hammer_core::config::OutboundKind,
         protector: crate::socket_protector::SocketProtector,
+        control_handle: Option<std::sync::Arc<crate::ControlThreadHandle>>,
     ) -> hammer_core::error::HammerResult<hammer_adapter::outbound::OutboundComponent>;
 }
 

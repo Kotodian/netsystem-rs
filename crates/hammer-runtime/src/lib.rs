@@ -27,6 +27,7 @@ mod certificate;
 mod component_registry;
 mod connection;
 mod control_thread;
+mod event_subscribers;
 pub mod dns;
 pub mod endpoints;
 pub mod inbounds;
@@ -88,11 +89,12 @@ pub use component_registry::{
 pub use connection::{ConnectionManager, ConnectionRegistration};
 pub(crate) use control_thread::ControlThread;
 pub use control_thread::{
-    ControlEvent, ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle,
-    ControlTimerHandle, EventSubscriberBuilder, LogEventArgs,
+    ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
+    ControlThreadHandle, ControlTimerHandle, LogEventArgs,
 };
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;
+pub use event_subscribers::EventSubscriberBuilder;
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope,
@@ -103,6 +105,8 @@ pub use outbounds::OutboundManager;
 pub use pause::PauseManager;
 #[cfg(feature = "probe")]
 pub use probe::{IcmpOutboundProbe, ProbeManager};
+#[cfg(feature = "outbound-hysteria2")]
+pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use route::Router;

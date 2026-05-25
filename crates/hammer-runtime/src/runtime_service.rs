@@ -165,7 +165,7 @@ impl RuntimeService {
         };
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
-        let event_subscriptions = crate::control_thread::build_standard_event_subscribers(
+        let event_subscriptions = crate::event_subscribers::build_standard_event_subscribers(
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
         )?;
@@ -196,12 +196,13 @@ impl RuntimeService {
             Arc::clone(&pause),
             Arc::clone(&connection),
         );
-        let outbound = Arc::new(OutboundManager::from_options_with_platform_and_metrics(
+        let outbound = Arc::new(OutboundManager::from_options_with_platform_metrics_and_control(
             new_logger(&log_factory, "outbound"),
             options.route.final_.clone(),
             &options.outbounds,
             Arc::clone(&platform),
             Arc::clone(&metrics),
+            Arc::clone(&control_handle),
         )?);
         // Auto-register an `EndpointOutboundAdapter` for every declared
         // endpoint **before** `bind_aggregates`: urltest and friends will

@@ -58,6 +58,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
+    _control_handle: Option<Arc<crate::ControlThreadHandle>>,
 ) -> HammerResult<Arc<DirectOutbound>> {
     match kind {
         OutboundKind::Direct(_) => Ok(Arc::new(DirectOutbound::new_with_protector(

@@ -17,6 +17,7 @@ use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricCounter, MetricsRegistry, MetricsScope, NetworkCounters};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::ControlThreadHandle;
 use crate::RuntimePlatform;
 #[cfg(any(
     feature = "outbound-hysteria2",
@@ -34,7 +35,13 @@ pub use crate::protocol::block::BlockOutbound;
 pub use crate::protocol::direct::DirectOutbound;
 
 pub(crate) type OutboundBuilder =
-    fn(Logger, String, &OutboundKind, SocketProtector) -> HammerResult<OutboundComponent>;
+    fn(
+        Logger,
+        String,
+        &OutboundKind,
+        SocketProtector,
+        Option<Arc<ControlThreadHandle>>,
+    ) -> HammerResult<OutboundComponent>;
 
 pub struct OutboundRegistration(OutboundComponent);
 
@@ -74,12 +81,19 @@ impl OutboundFactorySet {
         logger: Logger,
         option: &OutboundOptions,
         protector: SocketProtector,
+        control_handle: Option<Arc<ControlThreadHandle>>,
     ) -> HammerResult<OutboundComponent> {
         let type_name = option.type_name();
         let builder = self.builders.get(type_name).ok_or_else(|| {
             HammerError::config_validation(format!("unknown outbound type: {type_name}"))
         })?;
-        builder(logger, option.id.clone(), &option.kind, protector)
+        builder(
+            logger,
+            option.id.clone(),
+            &option.kind,
+            protector,
+            control_handle,
+        )
     }
 }
 
@@ -115,6 +129,7 @@ pub struct OutboundManager {
     default_id: String,
     factories: OutboundFactorySet,
     metrics: Arc<MetricsRegistry>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 }
 
 impl OutboundManager {
@@ -133,6 +148,7 @@ impl OutboundManager {
             default_id: default_id.into(),
             factories: OutboundFactorySet::standard(),
             metrics,
+            control_handle: None,
         }
     }
 
@@ -171,6 +187,25 @@ impl OutboundManager {
             options,
             SocketProtector::from(platform.into()),
             metrics,
+            None,
+        )
+    }
+
+    pub(crate) fn from_options_with_platform_metrics_and_control(
+        logger: Logger,
+        default_id: impl Into<String>,
+        options: &[OutboundOptions],
+        platform: impl Into<RuntimePlatform>,
+        metrics: Arc<MetricsRegistry>,
+        control_handle: Arc<ControlThreadHandle>,
+    ) -> HammerResult<Self> {
+        Self::from_options_with_protector_and_metrics(
+            logger,
+            default_id,
+            options,
+            SocketProtector::from(platform.into()),
+            metrics,
+            Some(control_handle),
         )
     }
 
@@ -186,6 +221,7 @@ impl OutboundManager {
             options,
             protector,
             MetricsRegistry::new(),
+            None,
         )
     }
 
@@ -195,9 +231,11 @@ impl OutboundManager {
         options: &[OutboundOptions],
         protector: impl Into<SocketProtector>,
         metrics: Arc<MetricsRegistry>,
+        control_handle: Option<Arc<ControlThreadHandle>>,
     ) -> HammerResult<Self> {
         let protector = protector.into();
-        let manager = Self::new_with_metrics(logger, default_id, metrics);
+        let mut manager = Self::new_with_metrics(logger, default_id, metrics);
+        manager.control_handle = control_handle;
         for option in options {
             manager.register_descriptor_with_protector(option, protector.clone())?;
         }
@@ -246,7 +284,12 @@ impl OutboundManager {
         let protector = protector.into();
         let descriptor = self
             .factories
-            .build(self.logger.clone(), option, protector)?;
+            .build(
+                self.logger.clone(),
+                option,
+                protector,
+                self.control_handle.as_ref().map(Arc::clone),
+            )?;
         let mut items = self.items.lock().expect("OutboundManager poisoned");
         if items.contains_key(&option.id) {
             return Err(HammerError::config_validation(format!(

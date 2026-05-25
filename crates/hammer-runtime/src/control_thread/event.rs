@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::any::{Any, TypeId};
+use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -6,24 +7,53 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use hammer_core::error::HammerResult;
-use hammer_core::log::{Level, Logger};
+use hammer_core::log::Level;
 use hammer_core::metrics::MetricCounter;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
-use super::{ControlCommand, ControlThreadHandle};
+use super::ControlCommand;
 
 pub(crate) type EventFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type EventCallback = Box<dyn FnMut(ControlEvent) -> EventFuture + Send + 'static>;
-pub type EventSubscriberBuilder =
-    fn(Logger, Arc<ControlThreadHandle>) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
 
-#[derive(Debug, Clone)]
-pub enum ControlEvent {
-    Log(LogEventArgs),
-    #[cfg(test)]
-    Synthetic(SyntheticEventArgs),
+pub trait ControlEventArgs: fmt::Debug + Send + Sync + 'static {}
+
+impl<T> ControlEventArgs for T where T: fmt::Debug + Send + Sync + 'static {}
+
+#[derive(Clone)]
+pub struct ControlEvent {
+    args: Arc<dyn Any + Send + Sync>,
+    type_id: TypeId,
+    type_name: &'static str,
+}
+
+impl ControlEvent {
+    pub fn new<T>(args: T) -> Self
+    where
+        T: ControlEventArgs,
+    {
+        Self {
+            args: Arc::new(args),
+            type_id: TypeId::of::<T>(),
+            type_name: std::any::type_name::<T>(),
+        }
+    }
+
+    pub fn args<T>(&self) -> Option<&T>
+    where
+        T: ControlEventArgs,
+    {
+        self.args.downcast_ref::<T>()
+    }
+}
+
+impl fmt::Debug for ControlEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ControlEvent")
+            .field("type_name", &self.type_name)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -42,13 +72,22 @@ pub struct SyntheticEventArgs {
 #[derive(Debug, Clone, Copy)]
 pub enum ControlEventFilter {
     All,
+    EventArgs(TypeId),
     Predicate(fn(&ControlEvent) -> bool),
 }
 
 impl ControlEventFilter {
+    pub fn event<T>() -> Self
+    where
+        T: ControlEventArgs,
+    {
+        Self::EventArgs(TypeId::of::<T>())
+    }
+
     fn matches(self, event: &ControlEvent) -> bool {
         match self {
             Self::All => true,
+            Self::EventArgs(type_id) => event.type_id == type_id,
             Self::Predicate(predicate) => predicate(event),
         }
     }
@@ -214,38 +253,6 @@ struct EventSubscriberEntry {
     filter: ControlEventFilter,
     callback: Option<EventCallback>,
     running: Option<JoinHandle<()>>,
-}
-
-#[derive(Clone)]
-struct EventSubscriberFactorySet {
-    builders: Arc<HashMap<&'static str, EventSubscriberBuilder>>,
-}
-
-impl EventSubscriberFactorySet {
-    fn standard() -> Self {
-        Self {
-            builders: Arc::new(HashMap::new()),
-        }
-    }
-
-    fn build_all(
-        &self,
-        logger: Logger,
-        control_handle: Arc<ControlThreadHandle>,
-    ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
-        let mut subscriptions = Vec::new();
-        for builder in self.builders.values() {
-            subscriptions.extend(builder(logger.clone(), Arc::clone(&control_handle))?);
-        }
-        Ok(subscriptions)
-    }
-}
-
-pub(crate) fn build_standard_event_subscribers(
-    logger: Logger,
-    control_handle: Arc<ControlThreadHandle>,
-) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
-    EventSubscriberFactorySet::standard().build_all(logger, control_handle)
 }
 
 pub(crate) fn boxed_event_callback<F, Fut>(mut callback: F) -> EventCallback

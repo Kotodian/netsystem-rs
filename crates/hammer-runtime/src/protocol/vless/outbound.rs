@@ -98,6 +98,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
+    _control_handle: Option<Arc<crate::ControlThreadHandle>>,
 ) -> HammerResult<Arc<VlessOutbound>> {
     match kind {
         OutboundKind::Vless(options) => Ok(Arc::new(VlessOutbound::new_with_protector(

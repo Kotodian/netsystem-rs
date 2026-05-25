@@ -15,6 +15,7 @@ pub struct Hysteria2Outbound {
     connect_backoff: StdMutex<ConnectBackoff>,
     client_init: Mutex<()>,
     protector: SocketProtector,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 }
 
 struct ClientState {
@@ -60,7 +61,7 @@ impl ConnectBackoff {
 
 impl Hysteria2Outbound {
     pub fn new(logger: Logger, id: String, options: Hysteria2OutboundOptions) -> Self {
-        Self::new_with_protector(logger, id, options, SocketProtector::default())
+        Self::new_with_protector(logger, id, options, SocketProtector::default(), None)
     }
 
     pub(crate) fn new_with_protector(
@@ -68,6 +69,7 @@ impl Hysteria2Outbound {
         id: String,
         options: Hysteria2OutboundOptions,
         protector: SocketProtector,
+        control_handle: Option<Arc<ControlThreadHandle>>,
     ) -> Self {
         let networks = adapter_networks(&options.network);
         Self {
@@ -82,6 +84,7 @@ impl Hysteria2Outbound {
             connect_backoff: StdMutex::new(ConnectBackoff::default()),
             client_init: Mutex::new(()),
             protector,
+            control_handle,
         }
     }
 
@@ -110,8 +113,21 @@ impl Hysteria2Outbound {
             }
             let epoch = self.client_epoch();
             let options = self.client_options()?;
+            let auth_event_context =
+                self.control_handle
+                    .as_ref()
+                    .map(|control_handle| Hysteria2AuthEventContext {
+                        outbound_id: self.id.clone(),
+                        control_handle: Arc::clone(control_handle),
+                    });
             debug!("hysteria2 outbound {} initializing client", self.id);
-            let client = match connect_with_timeout(options, connect_timeout).await {
+            let client = match connect_with_timeout_and_events(
+                options,
+                connect_timeout,
+                auth_event_context,
+            )
+            .await
+            {
                 Ok(client) => client,
                 Err(err) => {
                     if self.client_epoch() != epoch {
@@ -222,6 +238,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 ) -> HammerResult<Arc<Hysteria2Outbound>> {
     match kind {
         OutboundKind::Hysteria2(options) => Ok(Arc::new(Hysteria2Outbound::new_with_protector(
@@ -229,6 +246,7 @@ pub(crate) fn build_outbound(
             id,
             options.clone(),
             protector,
+            control_handle,
         ))),
         _ => Err(HammerError::internal(
             "hysteria2 factory received wrong options",

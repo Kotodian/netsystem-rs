@@ -407,6 +407,7 @@ pub(crate) fn build_outbound(
     id: String,
     kind: &OutboundKind,
     protector: SocketProtector,
+    _control_handle: Option<Arc<crate::ControlThreadHandle>>,
 ) -> HammerResult<Arc<UrltestOutbound>> {
     let OutboundKind::Urltest(options) = kind else {
         return Err(HammerError::internal(format!(
