@@ -121,7 +121,7 @@ impl Lifecycle for UdpDnsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for UdpDnsTransport {
     fn reset(&self) {}
 

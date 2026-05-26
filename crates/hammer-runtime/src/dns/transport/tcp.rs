@@ -100,7 +100,7 @@ impl Lifecycle for TcpDnsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for TcpDnsTransport {
     fn reset(&self) {}
 

@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use hammer_adapter::{
-    ComponentMeta, DefaultInterfaceUpdateListener, Network, NetworkInterface,
-    Outbound as AdapterOutbound, OutboundComponent, PlatformInterface, ProxyDatagram,
-    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr, TunOptions, WifiState,
+    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, Network,
+    NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
+    ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, TunOptions,
+    WifiState,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
@@ -60,11 +61,17 @@ struct DialRecord {
     initial_payload: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct RecordedPacket {
+    destination: SocksAddr,
+    payload: Bytes,
+}
+
 #[derive(Default)]
 struct RecordingOutbound {
     dials: Mutex<Vec<DialRecord>>,
-    sent_packets: Arc<Mutex<Vec<ProxyDatagram>>>,
-    received_packets: Arc<Mutex<Vec<ProxyDatagram>>>,
+    sent_packets: Arc<Mutex<Vec<RecordedPacket>>>,
+    received_packets: Arc<Mutex<Vec<RecordedPacket>>>,
 }
 
 impl RecordingOutbound {
@@ -87,14 +94,14 @@ impl RecordingOutbound {
         self.dials.lock().expect("dials poisoned").remove(0)
     }
 
-    fn take_packet(&self) -> ProxyDatagram {
+    fn take_packet(&self) -> RecordedPacket {
         self.sent_packets
             .lock()
             .expect("sent packets poisoned")
             .remove(0)
     }
 
-    fn push_packet_response(&self, packet: ProxyDatagram) {
+    fn push_packet_response(&self, packet: RecordedPacket) {
         self.received_packets
             .lock()
             .expect("received packets poisoned")
@@ -161,7 +168,7 @@ async fn socks5_inbound_proxies_udp_associate_with_password_auth() {
     assert_eq!(packet.destination.port, 53);
     assert_eq!(packet.payload.as_ref(), b"hello");
 
-    outbound.push_packet_response(ProxyDatagram {
+    outbound.push_packet_response(RecordedPacket {
         destination: SocksAddr::domain("example.com", "0.0.0.0".parse().unwrap(), 53),
         payload: Bytes::from_static(b"world"),
     });
@@ -203,24 +210,45 @@ impl AdapterOutbound for RecordingOutbound {
 }
 
 struct RecordingPacketConn {
-    received: Arc<Mutex<Vec<ProxyDatagram>>>,
-    sent: Arc<Mutex<Vec<ProxyDatagram>>>,
+    received: Arc<Mutex<Vec<RecordedPacket>>>,
+    sent: Arc<Mutex<Vec<RecordedPacket>>>,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for RecordingPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> Result<(), HammerError> {
-        self.sent
-            .lock()
-            .expect("sent packets poisoned")
-            .push(ProxyDatagram {
-                destination,
-                payload,
-            });
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> Result<(), HammerError> {
+        for index in frame.drain_indices() {
+            let metadata = runtime.metadata(index)?;
+            let payload = Bytes::from(runtime.copy_current_chain(index)?);
+            runtime.free_index(index);
+            let destination = metadata
+                .destination
+                .ok_or_else(|| HammerError::internal("recording packet missing destination"))?;
+            self.sent
+                .lock()
+                .expect("sent packets poisoned")
+                .push(RecordedPacket {
+                    destination,
+                    payload,
+                });
+        }
         Ok(())
     }
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> Result<(), HammerError> {
+        runtime.free_frame(frame);
+        if max == 0 {
+            return Ok(());
+        }
         loop {
             if let Some(packet) = self
                 .received
@@ -228,7 +256,14 @@ impl ProxyPacketConn for RecordingPacketConn {
                 .expect("received packets poisoned")
                 .pop()
             {
-                return Ok(packet);
+                let mut metadata = RouteMetadata::default();
+                metadata.destination = Some(packet.destination);
+                let index = runtime.alloc_index_with_bytes(metadata, &packet.payload)?;
+                if let Err(err) = frame.push_index(index) {
+                    runtime.free_index(index);
+                    return Err(err);
+                }
+                return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

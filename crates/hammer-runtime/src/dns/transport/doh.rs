@@ -114,7 +114,7 @@ impl Lifecycle for HttpsDnsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for HttpsDnsTransport {
     fn reset(&self) {}
 

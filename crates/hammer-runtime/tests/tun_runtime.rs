@@ -662,7 +662,7 @@ impl Lifecycle for FixedDnsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for FixedDnsTransport {
     fn reset(&self) {}
 

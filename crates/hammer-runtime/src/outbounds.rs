@@ -4,10 +4,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::Bytes;
 use hammer_adapter::{
-    ComponentMeta, ComponentMetadata, IcmpReply, Lifecycle, Network, Outbound, OutboundComponent,
-    OutboundManager as OutboundManagerTrait, ProbeReport, ProxyDatagram, ProxyIcmpConn,
+    BufferFrame, DataPlaneRuntime, ComponentMeta, ComponentMetadata, IcmpReply, Lifecycle, Network, Outbound,
+    OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport, ProxyIcmpConn,
     ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
@@ -566,10 +565,10 @@ struct InstrumentedPacketConn {
     metrics: OutboundMetrics,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl ProxyPacketConn for InstrumentedPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        match self.inner.send_to(destination, payload).await {
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+        match self.inner.send(runtime, frame).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.metrics.packet_send_error_total.inc();
@@ -578,9 +577,14 @@ impl ProxyPacketConn for InstrumentedPacketConn {
         }
     }
 
-    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
-        match self.inner.recv_from().await {
-            Ok(datagram) => Ok(datagram),
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> HammerResult<()> {
+        match self.inner.recv(runtime, frame, max).await {
+            Ok(()) => Ok(()),
             Err(err) => {
                 self.metrics.packet_recv_error_total.inc();
                 Err(err)

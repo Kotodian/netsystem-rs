@@ -7,8 +7,9 @@ mod support;
 
 use bytes::Bytes;
 use hammer_adapter::{
-    DefaultInterfaceUpdateListener, Network, NetworkInterface, OutboundManager as _,
-    PlatformInterface, SocksAddr, TunOptions, WifiState,
+    DataPlaneRuntime, DefaultInterfaceUpdateListener, Network, NetworkInterface,
+    OutboundManager as _, PlatformInterface, ProxyPacketConn, RouteMetadata, SocksAddr,
+    TunOptions, WifiState,
 };
 use hammer_core::config::{self, Options, OutboundTlsOptions};
 use hammer_core::error::HammerError;
@@ -24,6 +25,42 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+fn packet_runtime() -> DataPlaneRuntime {
+    DataPlaneRuntime::with_buffer_capacity(2048, 64)
+}
+
+async fn send_packet(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+    destination: SocksAddr,
+    payload: &[u8],
+) -> Result<(), HammerError> {
+    let mut metadata = RouteMetadata::default();
+    metadata.destination = Some(destination);
+    let mut frame = runtime.frame_with_capacity(1);
+    let index = runtime.alloc_index_with_bytes(metadata, payload)?;
+    if let Err(err) = frame.push_index(index) {
+        runtime.free_index(index);
+        return Err(err);
+    }
+    conn.send(runtime, &mut frame).await
+}
+
+async fn recv_payload(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+) -> Result<Bytes, HammerError> {
+    let mut frame = runtime.frame_with_capacity(1);
+    conn.recv(runtime, &mut frame, 1).await?;
+    let index = frame
+        .drain_indices()
+        .next()
+        .ok_or_else(|| HammerError::internal("test packet recv returned empty frame"))?;
+    let payload = Bytes::from(runtime.copy_current_chain(index)?);
+    runtime.free_index(index);
+    Ok(payload)
 }
 
 #[derive(Default)]
@@ -197,12 +234,12 @@ async fn hysteria2_client_authenticates_and_proxies_tcp_and_udp() {
     assert_eq!(stream.read_to_end().await.expect("read tcp"), b"echo:ping");
 
     let mut packet = client.listen_udp().await.expect("listen udp");
-    packet
-        .send_to(destination, Bytes::from_static(b"dns-query"))
+    let runtime = packet_runtime();
+    send_packet(&mut packet, &runtime, destination, b"dns-query")
         .await
         .expect("send udp");
-    let received = packet.recv_from().await.expect("recv udp");
-    assert_eq!(received.payload.as_ref(), b"echo:dns-query");
+    let received = recv_payload(&mut packet, &runtime).await.expect("recv udp");
+    assert_eq!(received.as_ref(), b"echo:dns-query");
 }
 
 #[tokio::test]

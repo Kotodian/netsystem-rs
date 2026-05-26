@@ -4,12 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use hammer_adapter::{
-    ComponentMeta, DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport,
+    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport,
     DnsTransportComponent, Lifecycle, Network, NetworkInterface, Outbound as AdapterOutbound,
-    OutboundComponent, OutboundManager as _, PlatformInterface, ProxyDatagram, ProxyPacketConn,
-    ProxyStream, RuntimeComponent, SocksAddr, StartStage, TunOptions, WifiState,
+    OutboundComponent, OutboundManager as _, PlatformInterface, ProxyPacketConn, ProxyStream,
+    RouteMetadata, RuntimeComponent, SocksAddr, StartStage, TunOptions, WifiState,
 };
 use hammer_core::config::{self, DomainStrategy};
 use hammer_core::error::HammerError;
@@ -188,7 +187,7 @@ impl Lifecycle for IndexedTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for IndexedTransport {
     fn reset(&self) {}
 
@@ -228,7 +227,7 @@ struct CapturingOutbound {
 
 struct CapturingPacketConn {
     destinations: Arc<std::sync::Mutex<Vec<String>>>,
-    response: Option<Bytes>,
+    response: Option<Vec<u8>>,
 }
 
 #[async_trait]
@@ -250,28 +249,53 @@ impl AdapterOutbound for CapturingOutbound {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for CapturingPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> Result<(), HammerError> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> Result<(), HammerError> {
+        let index = frame
+            .drain_indices()
+            .next()
+            .ok_or_else(|| HammerError::internal("capture packet frame is empty"))?;
+        let metadata = runtime.metadata(index)?;
+        let destination = metadata
+            .destination
+            .ok_or_else(|| HammerError::internal("capture packet missing destination"))?;
         self.destinations
             .lock()
             .expect("capture destinations poisoned")
             .push(destination.to_string());
+        let payload = runtime.copy_current_chain(index)?;
+        runtime.free_index(index);
         let request = <Message as MessageExt>::from_bytes(&payload)?;
         let response = response_for(&request, 60, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 31)));
-        self.response = Some(Bytes::from(MessageExt::to_bytes(&response)?));
+        self.response = Some(MessageExt::to_bytes(&response)?);
         Ok(())
     }
 
-    async fn recv_from(&mut self) -> Result<ProxyDatagram, HammerError> {
-        Ok(ProxyDatagram {
-            destination: SocksAddr::ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53),
-            payload: self.response.take().expect("send_to must run first"),
-        })
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        _max: usize,
+    ) -> Result<(), HammerError> {
+        runtime.free_frame(frame);
+        let mut metadata = RouteMetadata::default();
+        metadata.destination = Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 53));
+        let response = self.response.take().expect("send must run first");
+        let index = runtime.alloc_index_with_bytes(metadata, &response)?;
+        if let Err(err) = frame.push_index(index) {
+            runtime.free_index(index);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsTransport for CountingTransport {
     fn reset(&self) {}
 

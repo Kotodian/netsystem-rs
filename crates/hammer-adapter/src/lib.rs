@@ -16,8 +16,8 @@ pub mod rule;
 pub mod service;
 
 pub use buffer::{
-    Buffer, BufferFlags, BufferFrame, BufferFrameDrain, BufferHandle, BufferIndex, BufferPool,
-    BufferRef,
+    Buffer, BufferFlags, BufferFrame, BufferHandle, BufferIndex, BufferPool, BufferRef,
+    DataPlaneRuntime,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
@@ -39,8 +39,8 @@ pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use outbound::{
-    IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyDatagram, ProxyIcmpConn,
-    ProxyPacketConn, ProxyStream,
+    IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,
+    ProxyStream,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,

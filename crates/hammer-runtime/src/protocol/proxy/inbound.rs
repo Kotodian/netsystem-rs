@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use bytes::Bytes;
 use hammer_adapter::{
-    BufferHandle, Inbound, Network, OutboundManager as OutboundManagerTrait, ProxyDatagram,
-    ProxyPacketConn, ProxyStream, RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
+    BufferFrame, BufferIndex, DataPlaneRuntime, Inbound, Network,
+    OutboundManager as OutboundManagerTrait, ProxyPacketConn, ProxyStream, RouteDecision,
+    RouteMetadata, RouteTarget, SocksAddr,
 };
 use hammer_core::config::{
     HttpInboundOptions, InboundKind, InboundUser, ListenInboundOptions, MixedInboundOptions,
@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 use crate::{DnsRouter, OutboundManager, Router};
 
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
+const UDP_RELAY_CHANNEL_CAPACITY: usize = 128;
 
 #[derive(Clone, Copy)]
 enum ProxyMode {
@@ -842,11 +843,12 @@ async fn handle_socks5_udp_associate(
         .local_addr()
         .map_err(|err| HammerError::internal(format!("SOCKS5 UDP relay addr: {err}")))?;
     write_socks5_success(&mut stream, bind).await?;
-    let (response_tx, mut response_rx) = mpsc::channel(128);
+    let (response_tx, mut response_rx) = mpsc::channel(UDP_RELAY_CHANNEL_CAPACITY);
     let mut relays = HashMap::<String, mpsc::Sender<UdpRelaySend>>::new();
     let timeout = options.listen.udp_timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
     let mut buf = vec![0_u8; 64 * 1024];
     let mut client_addr = None;
+    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
     loop {
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
@@ -859,48 +861,94 @@ async fn handle_socks5_udp_associate(
                     client_addr = Some(client);
                 }
                 let (destination, payload) = decode_socks5_udp(&buf[..n])?;
-                let buffer = crate::spawn::with_data_buffer_pool(|pool| {
-                    pool.alloc_with_bytes(
-                        udp_route_metadata(
-                            &inbound_id,
-                            client,
-                            destination.clone(),
-                            username.clone(),
-                        ),
-                        payload,
-                    )
-                })?;
-                let outbound_id = route_udp(&router, &buffer)?;
-                let destination = buffer
-                    .metadata()
-                    .destination
-                    .clone()
-                    .unwrap_or(destination);
-                let relay = udp_relay_sender(
+                let buffer = runtime.alloc_index_with_bytes(
+                    udp_route_metadata(
+                        &inbound_id,
+                        client,
+                        destination.clone(),
+                        username.clone(),
+                    ),
+                    payload,
+                )?;
+                let outbound_id = match route_udp(&router, &runtime, buffer) {
+                    Ok(outbound_id) => outbound_id,
+                    Err(err) => {
+                        runtime.free_index(buffer);
+                        return Err(err);
+                    }
+                };
+                let destination = match runtime.metadata(buffer) {
+                    Ok(metadata) => metadata.destination.unwrap_or(destination),
+                    Err(err) => {
+                        runtime.free_index(buffer);
+                        return Err(err);
+                    }
+                };
+                let relay = match udp_relay_sender(
                     &mut relays,
                     &outbound,
                     &outbound_id,
                     response_tx.clone(),
                 )
-                .await?;
-                relay
+                .await {
+                    Ok(relay) => relay,
+                    Err(err) => {
+                        runtime.free_index(buffer);
+                        return Err(err);
+                    }
+                };
+                if relay
                     .send(UdpRelaySend {
                         destination,
                         buffer,
                     })
                     .await
-                    .map_err(|_| HammerError::internal("SOCKS5 UDP relay closed"))?;
+                    .is_err()
+                {
+                    runtime.free_index(buffer);
+                    return Err(HammerError::internal("SOCKS5 UDP relay closed"));
+                }
             }
             result = response_rx.recv() => {
-                let Some(packet) = result else {
+                let Some(mut response) = result else {
                     break;
                 };
                 if let Some(client) = client_addr {
-                    let response = encode_socks5_udp(&packet.destination, &packet.payload)?;
-                    socket
-                        .send_to(&response, client)
-                        .await
-                        .map_err(|err| HammerError::internal(format!("send SOCKS5 UDP response: {err}")))?;
+                    let mut handled = false;
+                    for buffer in response.frame.drain_indices() {
+                        if handled {
+                            runtime.free_index(buffer);
+                            continue;
+                        }
+                        handled = true;
+                        let metadata = match runtime.metadata(buffer) {
+                            Ok(metadata) => metadata,
+                            Err(err) => {
+                                runtime.free_index(buffer);
+                                return Err(err);
+                            }
+                        };
+                        let Some(destination) = metadata.destination.as_ref() else {
+                            runtime.free_index(buffer);
+                            continue;
+                        };
+                        let payload = match runtime.copy_current_chain(buffer) {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                runtime.free_index(buffer);
+                                return Err(err);
+                            }
+                        };
+                        runtime.free_index(buffer);
+                        let response = encode_socks5_udp(destination, &payload)?;
+                        socket
+                            .send_to(&response, client)
+                            .await
+                            .map_err(|err| HammerError::internal(format!("send SOCKS5 UDP response: {err}")))?;
+                    }
+                }
+                if response.recycle.try_send(response.frame).is_err() {
+                    debug!("SOCKS5 UDP response frame recycle channel closed for {inbound_id}");
                 }
             }
             _ = tokio::time::sleep(timeout) => break,
@@ -917,14 +965,19 @@ async fn handle_socks5_udp_associate(
 
 struct UdpRelaySend {
     destination: SocksAddr,
-    buffer: BufferHandle,
+    buffer: BufferIndex,
+}
+
+struct UdpRelayResponse {
+    frame: BufferFrame,
+    recycle: mpsc::Sender<BufferFrame>,
 }
 
 async fn udp_relay_sender(
     relays: &mut HashMap<String, mpsc::Sender<UdpRelaySend>>,
     outbound: &OutboundManager,
     outbound_id: &str,
-    response_tx: mpsc::Sender<ProxyDatagram>,
+    response_tx: mpsc::Sender<UdpRelayResponse>,
 ) -> HammerResult<mpsc::Sender<UdpRelaySend>> {
     if let Some(sender) = relays.get(outbound_id) {
         return Ok(sender.clone());
@@ -943,9 +996,18 @@ fn spawn_udp_relay(
     outbound_id: String,
     mut packet_conn: Box<dyn ProxyPacketConn>,
     mut send_rx: mpsc::Receiver<UdpRelaySend>,
-    response_tx: mpsc::Sender<ProxyDatagram>,
+    response_tx: mpsc::Sender<UdpRelayResponse>,
 ) {
     crate::spawn::spawn_current_local(async move {
+        let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+        let mut outbound_frame = runtime.frame_with_capacity(1);
+        let mut inbound_frame = runtime.frame_with_capacity(1);
+        let (recycle_tx, mut recycle_rx) = mpsc::channel(UDP_RELAY_CHANNEL_CAPACITY);
+        for _ in 0..UDP_RELAY_CHANNEL_CAPACITY {
+            if recycle_tx.try_send(runtime.frame_with_capacity(1)).is_err() {
+                break;
+            }
+        }
         let mut can_recv = false;
         loop {
             if !can_recv {
@@ -953,7 +1015,7 @@ fn spawn_udp_relay(
                     break;
                 };
                 if let Err(err) =
-                    send_udp_buffer(&mut *packet_conn, packet.destination, packet.buffer).await
+                    send_udp_buffer(&mut *packet_conn, &runtime, &mut outbound_frame, packet.destination, packet.buffer).await
                 {
                     debug!("SOCKS5 UDP send failed via outbound={outbound_id}: {err}");
                     break;
@@ -967,16 +1029,43 @@ fn spawn_udp_relay(
                         break;
                     };
                     if let Err(err) =
-                        send_udp_buffer(&mut *packet_conn, packet.destination, packet.buffer).await
+                        send_udp_buffer(&mut *packet_conn, &runtime, &mut outbound_frame, packet.destination, packet.buffer).await
                     {
                         debug!("SOCKS5 UDP send failed via outbound={outbound_id}: {err}");
                         break;
                     }
                 }
-                result = packet_conn.recv_from() => {
+                result = packet_conn.recv(&runtime, &mut inbound_frame, 1) => {
                     match result {
-                        Ok(packet) => {
-                            if response_tx.try_send(packet).is_err() {
+                        Ok(()) => {
+                            if inbound_frame.is_empty() {
+                                continue;
+                            }
+                            let mut response_frame = match recycle_rx.try_recv() {
+                                Ok(frame) => frame,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                    runtime.free_frame(&mut inbound_frame);
+                                    debug!("SOCKS5 UDP response dropped via outbound={outbound_id}: no reusable frame available");
+                                    continue;
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    runtime.free_frame(&mut inbound_frame);
+                                    debug!("SOCKS5 UDP response frame pool closed via outbound={outbound_id}");
+                                    break;
+                                }
+                            };
+                            std::mem::swap(&mut response_frame, &mut inbound_frame);
+                            if let Err(err) = response_tx.try_send(UdpRelayResponse {
+                                frame: response_frame,
+                                recycle: recycle_tx.clone(),
+                            }) {
+                                let mut response = err.into_inner();
+                                runtime.free_frame(&mut response.frame);
+                                let recycle = response.recycle;
+                                let frame = response.frame;
+                                if recycle.try_send(frame).is_err() {
+                                    debug!("SOCKS5 UDP response frame recycle channel closed via outbound={outbound_id}");
+                                }
                                 debug!("SOCKS5 UDP response dropped via outbound={outbound_id}: relay channel full or closed");
                             }
                         }
@@ -993,11 +1082,20 @@ fn spawn_udp_relay(
 
 async fn send_udp_buffer(
     packet_conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
     destination: SocksAddr,
-    buffer: BufferHandle,
+    buffer: BufferIndex,
 ) -> HammerResult<()> {
-    let payload = Bytes::from(buffer.copy_current_chain());
-    packet_conn.send_to(destination, payload).await
+    runtime.with_metadata_mut(buffer, |metadata| {
+        metadata.destination = Some(destination);
+    })?;
+    frame.reset();
+    if let Err(err) = frame.push_index(buffer) {
+        runtime.free_index(buffer);
+        return Err(err);
+    }
+    packet_conn.send(runtime, frame).await
 }
 
 fn decode_socks5_udp(packet: &[u8]) -> HammerResult<(SocksAddr, &[u8])> {
@@ -1148,11 +1246,11 @@ fn udp_route_metadata(
     }
 }
 
-fn route_udp(router: &Router, buffer: &BufferHandle) -> HammerResult<String> {
-    let decision = buffer.with_metadata_mut(|metadata| {
+fn route_udp(router: &Router, runtime: &DataPlaneRuntime, buffer: BufferIndex) -> HammerResult<String> {
+    let decision = runtime.with_metadata_mut(buffer, |metadata| {
         router.prepare_route_metadata(metadata)?;
         router.match_route(metadata)
-    })?;
+    })??;
     match decision {
         RouteDecision::Route {
             target: RouteTarget::Outbound(id),

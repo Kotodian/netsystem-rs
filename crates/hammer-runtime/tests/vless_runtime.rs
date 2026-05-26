@@ -14,10 +14,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_lc_rs::agreement;
 #[cfg(feature = "tls-utls-stream")]
 use aws_lc_rs::hmac;
-use bytes::Bytes;
 #[cfg(feature = "tls-utls-stream")]
 use foreign_types_shared::ForeignTypeRef;
-use hammer_adapter::{Network, OutboundManager as _, SocksAddr};
+use hammer_adapter::{
+    DataPlaneRuntime, Network, OutboundManager as _, ProxyPacketConn, RouteMetadata, SocksAddr,
+};
 #[cfg(feature = "tls-utls-stream")]
 use hammer_core::config::{
     EchConfigList, EchConfigSource, EchOptions, RealityOptions, RealityPublicKey, RealityShortId,
@@ -45,6 +46,54 @@ use tokio_rustls::TlsAcceptor;
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+fn packet_runtime() -> DataPlaneRuntime {
+    DataPlaneRuntime::with_buffer_capacity(2048, 64)
+}
+
+struct TestPacket {
+    destination: SocksAddr,
+    payload: Vec<u8>,
+}
+
+async fn send_packet(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+    destination: SocksAddr,
+    payload: &[u8],
+) -> HammerResult<()> {
+    let mut metadata = RouteMetadata::default();
+    metadata.destination = Some(destination);
+    let mut frame = runtime.frame_with_capacity(1);
+    let index = runtime.alloc_index_with_bytes(metadata, payload)?;
+    if let Err(err) = frame.push_index(index) {
+        runtime.free_index(index);
+        return Err(err);
+    }
+    conn.send(runtime, &mut frame).await
+}
+
+async fn recv_packet(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+) -> HammerResult<TestPacket> {
+    let mut frame = runtime.frame_with_capacity(1);
+    conn.recv(runtime, &mut frame, 1).await?;
+    let index = frame
+        .drain_indices()
+        .next()
+        .ok_or_else(|| HammerError::internal("test packet recv returned empty frame"))?;
+    let metadata = runtime.metadata(index)?;
+    let payload = runtime.copy_current_chain(index)?;
+    runtime.free_index(index);
+    let destination = metadata
+        .destination
+        .ok_or_else(|| HammerError::internal("test packet recv missing destination"))?;
+    Ok(TestPacket {
+        destination,
+        payload,
+    })
 }
 
 fn vless_options(port: u16) -> VlessOutboundOptions {
@@ -1144,14 +1193,16 @@ async fn vless_outbound_sends_and_receives_udp_datagrams() {
     let destination = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)), 53);
     let mut packet = outbound.listen_packet().await.expect("listen vless udp");
 
-    packet
-        .send_to(destination.clone(), Bytes::from_static(b"dns"))
+    let runtime = packet_runtime();
+    send_packet(&mut *packet, &runtime, destination.clone(), b"dns")
         .await
         .expect("send vless udp");
-    let got = packet.recv_from().await.expect("recv vless udp");
+    let got = recv_packet(&mut *packet, &runtime)
+        .await
+        .expect("recv vless udp");
 
     assert_eq!(got.destination, destination);
-    assert_eq!(got.payload.as_ref(), b"echo:dns");
+    assert_eq!(got.payload.as_slice(), b"echo:dns");
 
     let request = captured.await.unwrap();
     let mut expected = Vec::new();

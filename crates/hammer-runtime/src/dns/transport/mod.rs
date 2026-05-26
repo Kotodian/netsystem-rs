@@ -201,10 +201,19 @@ async fn udp_exchange_via_with_timeout(
     let outbound_item = outbound_by_id(outbound, via)?;
     let mut conn = outbound_item.runtime().listen_packet().await?;
     debug!("dns udp via outbound={via} packet conn ready");
-    conn.send_to(destination.clone(), Bytes::copy_from_slice(payload))
-        .await?;
+    let mut metadata = hammer_adapter::RouteMetadata::default();
+    metadata.destination = Some(destination.clone());
+    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let mut request = runtime.frame_with_capacity(1);
+    let request_index = runtime.alloc_index_with_bytes(metadata, payload)?;
+    if let Err(err) = request.push_index(request_index) {
+        runtime.free_index(request_index);
+        return Err(err);
+    }
+    conn.send(&runtime, &mut request).await?;
     debug!("dns udp via outbound={via} sent dest={destination}");
-    let response = match timeout(response_timeout, conn.recv_from()).await {
+    let mut response = runtime.frame_with_capacity(1);
+    match timeout(response_timeout, conn.recv(&runtime, &mut response, 1)).await {
         Ok(response) => response?,
         Err(_) => {
             debug!(
@@ -216,12 +225,23 @@ async fn udp_exchange_via_with_timeout(
             )));
         }
     };
+    let index = response
+        .drain_indices()
+        .next()
+        .ok_or_else(|| HammerError::internal("dns udp via returned empty frame"))?;
+    let metadata = runtime.metadata(index)?;
+    let payload = Bytes::from(runtime.copy_current_chain(index)?);
+    runtime.free_index(index);
     debug!(
         "dns udp via outbound={via} received from {} bytes={}",
-        response.destination,
-        response.payload.len()
+        metadata
+            .destination
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "-".to_owned()),
+        payload.len()
     );
-    Ok(response.payload)
+    Ok(payload)
 }
 
 #[cfg(feature = "dns-https")]
@@ -242,8 +262,8 @@ mod tests {
 
     use async_trait::async_trait;
     use hammer_adapter::{
-        ComponentMeta, Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream,
-        RuntimeComponent,
+        BufferFrame, ComponentMeta, DataPlaneRuntime, Network, Outbound, ProxyPacketConn,
+        ProxyStream, RuntimeComponent,
     };
     use hammer_core::log::{DiscardWriter, Factory, Logger};
 
@@ -278,13 +298,19 @@ mod tests {
 
     struct HangingPacketConn;
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl ProxyPacketConn for HangingPacketConn {
-        async fn send_to(&mut self, _destination: SocksAddr, _payload: Bytes) -> HammerResult<()> {
+        async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+            runtime.free_frame(frame);
             Ok(())
         }
 
-        async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
+        async fn recv(
+            &mut self,
+            _runtime: &DataPlaneRuntime,
+            _frame: &mut BufferFrame,
+            _max: usize,
+        ) -> HammerResult<()> {
             future::pending::<()>().await;
             unreachable!("pending future never returns")
         }

@@ -28,8 +28,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    ComponentMeta, ComponentMetadata, ComponentMetricsMeta, Endpoint, EndpointLocalFlow, Network,
-    Outbound, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn, ProxyStream, SocksAddr,
+    BufferFrame, DataPlaneRuntime, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, Endpoint,
+    EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
+    RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
@@ -91,7 +92,7 @@ pub struct EndpointOutboundAdapter {
 }
 
 struct UdpFlowMap {
-    by_port: HashMap<u16, mpsc::Sender<ProxyDatagram>>,
+    by_port: HashMap<u16, mpsc::Sender<EndpointUdpDatagram>>,
 }
 
 struct TcpFlowMap {
@@ -127,7 +128,7 @@ impl EndpointOutboundAdapter {
     }
 
     /// Allocate an ephemeral source port that is currently *unused by both*
-    /// the UDP and TCP flow maps. The two share a single port pool so
+    /// the UDP and TCP flow maps. The two share a single port runtime so
     /// inner-IP responses can be unambiguously demuxed by (protocol,
     /// dst_port).
     fn allocate_port_locked(&self) -> CoreResult<u16> {
@@ -151,7 +152,7 @@ impl EndpointOutboundAdapter {
             }
         }
         Err(CoreError::internal(format!(
-            "endpoint adapter '{}' exhausted ephemeral port pool",
+            "endpoint adapter '{}' exhausted ephemeral port runtime",
             self.id
         )))
     }
@@ -257,9 +258,9 @@ fn parse_inner_ipv4_tcp_dst_port(pkt: &Bytes) -> Option<u16> {
 /// Inline IPv4 + UDP header parser tuned for the demux fast path.
 ///
 /// Returns the destination port (i.e. the adapter source port that the
-/// peer is replying to) and a `ProxyDatagram` carrying the remote
+/// peer is replying to) and a datagram carrying the remote
 /// `src_ip:src_port` so that DNS transport sees who answered.
-fn parse_inner_ipv4_udp(pkt: &Bytes) -> Option<(u16, ProxyDatagram)> {
+fn parse_inner_ipv4_udp(pkt: &Bytes) -> Option<(u16, EndpointUdpDatagram)> {
     if pkt.len() < IPV4_MIN_HEADER + UDP_HEADER {
         return None;
     }
@@ -279,7 +280,7 @@ fn parse_inner_ipv4_udp(pkt: &Bytes) -> Option<(u16, ProxyDatagram)> {
     let payload = pkt.slice(ihl + UDP_HEADER..);
     Some((
         dst_port,
-        ProxyDatagram {
+        EndpointUdpDatagram {
             destination: SocksAddr::ip(IpAddr::V4(src_ip), src_port),
             payload,
         },
@@ -331,7 +332,7 @@ impl Outbound for EndpointOutboundAdapter {
                 self.id
             ))
         })?;
-        let (tx, rx) = mpsc::channel::<ProxyDatagram>(FLOW_QUEUE);
+        let (tx, rx) = mpsc::channel::<EndpointUdpDatagram>(FLOW_QUEUE);
         let _port_guard = self.port_pool.lock().expect("port pool poisoned");
         let local_port = self.allocate_port_locked()?;
         {
@@ -401,7 +402,7 @@ impl EndpointOutboundAdapter {
             let tcp = self.tcp_flows.lock().expect("TcpFlowMap poisoned");
             if tcp.by_port.len() >= MAX_TCP_FLOWS {
                 return Err(CoreError::internal(format!(
-                    "endpoint adapter '{}' TCP socket pool exhausted ({} in flight)",
+                    "endpoint adapter '{}' TCP socket runtime exhausted ({} in flight)",
                     self.id, MAX_TCP_FLOWS,
                 )));
             }
@@ -476,8 +477,13 @@ struct EndpointUdpConn {
     flows: Weak<StdMutex<UdpFlowMap>>,
     local_flows: Arc<StdMutex<HashSet<EndpointLocalFlow>>>,
     flow_count: Weak<AtomicUsize>,
-    rx: mpsc::Receiver<ProxyDatagram>,
+    rx: mpsc::Receiver<EndpointUdpDatagram>,
     registered_routes: Vec<EndpointLocalFlow>,
+}
+
+struct EndpointUdpDatagram {
+    destination: SocksAddr,
+    payload: Bytes,
 }
 
 impl Drop for EndpointUdpConn {
@@ -496,9 +502,55 @@ impl Drop for EndpointUdpConn {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for EndpointUdpConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> CoreResult<()> {
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> CoreResult<()> {
+        let mut result = Ok(());
+        for index in frame.drain_indices() {
+            if result.is_ok() {
+                result = async {
+                    let metadata = runtime.metadata(index)?;
+                    let destination = metadata.destination.ok_or_else(|| {
+                        CoreError::internal("endpoint UDP frame missing destination")
+                    })?;
+                    let payload = runtime.copy_current_chain(index)?;
+                    self.send_payload(destination, &payload).await
+                }
+                .await;
+            }
+            runtime.free_index(index);
+        }
+        result
+    }
+
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> CoreResult<()> {
+        if max == 0 {
+            return Err(CoreError::internal("endpoint UDP recv max must be nonzero"));
+        }
+        runtime.free_frame(frame);
+        let datagram = self
+            .rx
+            .recv()
+            .await
+            .ok_or_else(|| CoreError::internal("endpoint UDP flow channel closed"))?;
+        let mut metadata = RouteMetadata::default();
+        metadata.destination = Some(datagram.destination);
+        let index = runtime.alloc_index_with_bytes(metadata, &datagram.payload)?;
+        if let Err(err) = frame.push_index(index) {
+            runtime.free_index(index);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+impl EndpointUdpConn {
+    async fn send_payload(&mut self, destination: SocksAddr, payload: &[u8]) -> CoreResult<()> {
         let dst_v4 = match destination.host {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(_) => {
@@ -512,7 +564,7 @@ impl ProxyPacketConn for EndpointUdpConn {
             self.local_port,
             dst_v4,
             destination.port,
-            &payload,
+            payload,
         );
         let flow = EndpointLocalFlow {
             network: Network::Udp,
@@ -536,13 +588,6 @@ impl ProxyPacketConn for EndpointUdpConn {
             return Err(CoreError::internal("endpoint encrypt channel closed"));
         }
         Ok(())
-    }
-
-    async fn recv_from(&mut self) -> CoreResult<ProxyDatagram> {
-        self.rx
-            .recv()
-            .await
-            .ok_or_else(|| CoreError::internal("endpoint UDP flow channel closed"))
     }
 }
 
@@ -719,6 +764,54 @@ mod tests {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger("adapter-test")
     }
 
+    fn test_runtime() -> DataPlaneRuntime {
+        DataPlaneRuntime::with_buffer_capacity(2048, 64)
+    }
+
+    struct TestDatagram {
+        destination: SocksAddr,
+        payload: Vec<u8>,
+    }
+
+    async fn send_packet(
+        conn: &mut dyn ProxyPacketConn,
+        runtime: &DataPlaneRuntime,
+        destination: SocksAddr,
+        payload: &[u8],
+    ) -> CoreResult<()> {
+        let mut metadata = RouteMetadata::default();
+        metadata.destination = Some(destination);
+        let mut frame = runtime.frame_with_capacity(1);
+        let index = runtime.alloc_index_with_bytes(metadata, payload)?;
+        if let Err(err) = frame.push_index(index) {
+            runtime.free_index(index);
+            return Err(err);
+        }
+        conn.send(runtime, &mut frame).await
+    }
+
+    async fn recv_packet(
+        conn: &mut dyn ProxyPacketConn,
+        runtime: &DataPlaneRuntime,
+    ) -> CoreResult<TestDatagram> {
+        let mut frame = runtime.frame_with_capacity(1);
+        conn.recv(runtime, &mut frame, 1).await?;
+        let index = frame
+            .drain_indices()
+            .next()
+            .ok_or_else(|| CoreError::internal("test packet recv returned empty frame"))?;
+        let metadata = runtime.metadata(index)?;
+        let payload = runtime.copy_current_chain(index)?;
+        runtime.free_index(index);
+        let destination = metadata
+            .destination
+            .ok_or_else(|| CoreError::internal("test packet recv missing destination"))?;
+        Ok(TestDatagram {
+            destination,
+            payload,
+        })
+    }
+
     #[test]
     fn parse_inner_ipv4_udp_extracts_dst_port_and_payload() {
         let pkt = build_ipv4_udp(
@@ -765,9 +858,10 @@ mod tests {
             .await
             .expect("listen_packet");
         let server = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-        conn.send_to(server.clone(), Bytes::from_static(b"\x00\x01query"))
+        let runtime = test_runtime();
+        send_packet(&mut *conn, &runtime, server.clone(), b"\x00\x01query")
             .await
-            .expect("send_to");
+            .expect("send packet");
 
         let outbound = egress_rx.recv().await.expect("egress packet");
         // Parse our own packet to verify src/dst — the egress side carries
@@ -795,8 +889,10 @@ mod tests {
             .await
             .expect("local_tx send");
 
-        let datagram = conn.recv_from().await.expect("recv_from");
-        assert_eq!(&datagram.payload[..], b"\x00\x01response");
+        let datagram = recv_packet(&mut *conn, &runtime)
+            .await
+            .expect("recv packet");
+        assert_eq!(datagram.payload.as_slice(), b"\x00\x01response");
         assert_eq!(datagram.destination.port, 53);
     }
 
@@ -813,9 +909,10 @@ mod tests {
 
         let mut conn = adapter.listen_packet().await.expect("listen_packet");
         let server = SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-        conn.send_to(server, Bytes::from_static(b"\x00\x01query"))
+        let runtime = test_runtime();
+        send_packet(&mut *conn, &runtime, server, b"\x00\x01query")
             .await
-            .expect("send_to should use live endpoint sender");
+            .expect("send packet should use live endpoint sender");
 
         let outbound = egress_rx.recv().await.expect("egress packet");
         assert_eq!(&outbound[28..], b"\x00\x01query");

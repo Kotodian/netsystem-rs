@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use hammer_adapter::{
-    ComponentMeta, ComponentMetadata, DefaultInterfaceUpdateListener, Network, NetworkInterface,
-    Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _, PlatformInterface,
-    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr, TunOptions, WifiState,
+    ComponentMeta, ComponentMetadata, DataPlaneRuntime, DefaultInterfaceUpdateListener, Network,
+    NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _,
+    PlatformInterface, ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr,
+    TunOptions, WifiState,
 };
 use hammer_core::config::{
     DirectOutboundOptions, Hysteria2OutboundOptions, Outbound, OutboundKind,
@@ -26,6 +26,54 @@ fn logger(id: &str) -> Logger {
 
 fn destination(addr: std::net::SocketAddr) -> SocksAddr {
     SocksAddr::ip(addr.ip(), addr.port())
+}
+
+fn packet_runtime() -> DataPlaneRuntime {
+    DataPlaneRuntime::with_buffer_capacity(2048, 64)
+}
+
+struct TestPacket {
+    destination: SocksAddr,
+    payload: Vec<u8>,
+}
+
+async fn send_packet(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+    destination: SocksAddr,
+    payload: &[u8],
+) -> Result<(), HammerError> {
+    let mut metadata = RouteMetadata::default();
+    metadata.destination = Some(destination);
+    let mut frame = runtime.frame_with_capacity(1);
+    let index = runtime.alloc_index_with_bytes(metadata, payload)?;
+    if let Err(err) = frame.push_index(index) {
+        runtime.free_index(index);
+        return Err(err);
+    }
+    conn.send(runtime, &mut frame).await
+}
+
+async fn recv_packet(
+    conn: &mut dyn ProxyPacketConn,
+    runtime: &DataPlaneRuntime,
+) -> Result<TestPacket, HammerError> {
+    let mut frame = runtime.frame_with_capacity(1);
+    conn.recv(runtime, &mut frame, 1).await?;
+    let index = frame
+        .drain_indices()
+        .next()
+        .ok_or_else(|| HammerError::internal("test packet recv returned empty frame"))?;
+    let metadata = runtime.metadata(index)?;
+    let payload = runtime.copy_current_chain(index)?;
+    runtime.free_index(index);
+    let destination = metadata
+        .destination
+        .ok_or_else(|| HammerError::internal("test packet recv missing destination"))?;
+    Ok(TestPacket {
+        destination,
+        payload,
+    })
 }
 
 #[derive(Default)]
@@ -294,14 +342,16 @@ async fn direct_outbound_sends_and_receives_udp_datagrams() {
     .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     let mut packet = outbound.listen_packet().await.expect("listen direct udp");
-    packet
-        .send_to(destination(addr), Bytes::from_static(b"dns"))
+    let runtime = packet_runtime();
+    send_packet(&mut *packet, &runtime, destination(addr), b"dns")
         .await
         .expect("send direct udp");
 
-    let got = packet.recv_from().await.expect("recv direct udp");
+    let got = recv_packet(&mut *packet, &runtime)
+        .await
+        .expect("recv direct udp");
     assert_eq!(got.destination, destination(addr));
-    assert_eq!(got.payload.as_ref(), b"echo:dns");
+    assert_eq!(got.payload.as_slice(), b"echo:dns");
 }
 
 #[tokio::test]
@@ -326,14 +376,16 @@ async fn direct_outbound_sends_and_receives_ipv6_udp_datagrams() {
     .expect("outbound manager");
     let outbound = manager.get("direct").expect("direct outbound");
     let mut packet = outbound.listen_packet().await.expect("listen direct udp");
-    packet
-        .send_to(destination(addr), Bytes::from_static(b"dns6"))
+    let runtime = packet_runtime();
+    send_packet(&mut *packet, &runtime, destination(addr), b"dns6")
         .await
         .expect("send direct ipv6 udp");
 
-    let got = packet.recv_from().await.expect("recv direct ipv6 udp");
+    let got = recv_packet(&mut *packet, &runtime)
+        .await
+        .expect("recv direct ipv6 udp");
     assert_eq!(got.destination, destination(addr));
-    assert_eq!(got.payload.as_ref(), b"echo:dns6");
+    assert_eq!(got.payload.as_slice(), b"echo:dns6");
 }
 
 #[tokio::test]
@@ -376,11 +428,12 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
         .listen_packet()
         .await
         .expect("listen protected udp");
-    packet
-        .send_to(destination(udp_addr), Bytes::from_static(b"x"))
+    let runtime = packet_runtime();
+    send_packet(&mut *packet, &runtime, destination(udp_addr), b"x")
         .await
         .expect("send protected udp");
-    assert_eq!(packet.recv_from().await.unwrap().payload.as_ref(), b"x");
+    let received = recv_packet(&mut *packet, &runtime).await.unwrap();
+    assert_eq!(received.payload.as_slice(), b"x");
     assert_eq!(platform.calls(), 2);
 }
 

@@ -11,7 +11,7 @@ pub type DnsTransportComponent = RuntimeComponent<dyn DnsTransport>;
 
 /// `adapter.DNSRouter` — picks a `DnsTransport` for each query and caches
 /// results.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait DnsRouter: Lifecycle {
     async fn exchange(&self, message: Message, options: DnsQueryOptions) -> CoreResult<Message>;
     async fn lookup(&self, domain: &str, options: DnsQueryOptions) -> CoreResult<Vec<IpAddr>>;
@@ -27,7 +27,7 @@ pub trait DnsRouter: Lifecycle {
 
 /// `adapter.DNSTransport` — single upstream resolver (UDP / TCP / HTTPS / hosts
 /// / local).
-#[async_trait]
+#[async_trait(?Send)]
 pub trait DnsTransport: Lifecycle {
     fn reset(&self);
     async fn exchange(&self, message: Message) -> CoreResult<Message>;

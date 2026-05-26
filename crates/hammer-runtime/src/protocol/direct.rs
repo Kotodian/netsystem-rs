@@ -3,9 +3,9 @@ use std::sync::Arc;
 use tracing::info;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use hammer_adapter::{
-    Network, Outbound, ProxyDatagram, ProxyIcmpConn, ProxyPacketConn, ProxyStream, SocksAddr,
+    BufferFrame, DataPlaneRuntime, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
+    RouteMetadata, SocksAddr,
 };
 use hammer_core::config::OutboundKind;
 use hammer_core::error::{HammerError, HammerResult, WithContext};
@@ -109,6 +109,8 @@ impl Outbound for DirectOutbound {
             protector: self.protector.clone(),
             ipv4: None,
             ipv6: None,
+            recv_v4: vec![0_u8; 64 * 1024],
+            recv_v6: vec![0_u8; 64 * 1024],
         }))
     }
 
@@ -122,6 +124,8 @@ struct DirectPacketConn {
     protector: SocketProtector,
     ipv4: Option<UdpSocket>,
     ipv6: Option<UdpSocket>,
+    recv_v4: Vec<u8>,
+    recv_v6: Vec<u8>,
 }
 
 impl DirectPacketConn {
@@ -146,34 +150,60 @@ impl DirectPacketConn {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for DirectPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        let target = resolve_destination(&destination).await?;
-        self.socket_for(target.ip())?
-            .send_to(&payload, target)
-            .await
-            .with_context(|| "direct udp send")?;
-        Ok(())
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+        let mut result = Ok(());
+        for index in frame.drain_indices() {
+            if result.is_ok() {
+                result = async {
+                    let metadata = runtime.metadata(index)?;
+                    let destination = metadata.destination.ok_or_else(|| {
+                        HammerError::internal("direct UDP frame missing destination")
+                    })?;
+                    let target = resolve_destination(&destination).await?;
+                    let payload = runtime.copy_current_chain(index)?;
+                    self.socket_for(target.ip())?
+                        .send_to(&payload, target)
+                        .await
+                        .with_context(|| "direct udp send")?;
+                    Ok(())
+                }
+                .await;
+            }
+            runtime.free_index(index);
+        }
+        result
     }
 
-    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
-        match (self.ipv4.as_mut(), self.ipv6.as_mut()) {
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> HammerResult<()> {
+        if max == 0 {
+            return Err(HammerError::internal("direct UDP recv max must be nonzero"));
+        }
+        runtime.free_frame(frame);
+        match (self.ipv4.as_ref(), self.ipv6.as_ref()) {
             (Some(ipv4), Some(ipv6)) => {
-                let mut v4 = vec![0_u8; 64 * 1024];
-                let mut v6 = vec![0_u8; 64 * 1024];
                 tokio::select! {
-                    res = ipv4.recv_from(&mut v4) => datagram_from_recv(res, v4),
-                    res = ipv6.recv_from(&mut v6) => datagram_from_recv(res, v6),
+                    res = ipv4.recv_from(&mut self.recv_v4) => {
+                        push_datagram_from_recv(runtime, frame, res, &self.recv_v4)
+                    }
+                    res = ipv6.recv_from(&mut self.recv_v6) => {
+                        push_datagram_from_recv(runtime, frame, res, &self.recv_v6)
+                    }
                 }
             }
             (Some(ipv4), None) => {
-                let mut buf = vec![0_u8; 64 * 1024];
-                datagram_from_recv(ipv4.recv_from(&mut buf).await, buf)
+                let res = ipv4.recv_from(&mut self.recv_v4).await;
+                push_datagram_from_recv(runtime, frame, res, &self.recv_v4)
             }
             (None, Some(ipv6)) => {
-                let mut buf = vec![0_u8; 64 * 1024];
-                datagram_from_recv(ipv6.recv_from(&mut buf).await, buf)
+                let res = ipv6.recv_from(&mut self.recv_v6).await;
+                push_datagram_from_recv(runtime, frame, res, &self.recv_v6)
             }
             (None, None) => Err(HammerError::internal(
                 "direct udp recv before any socket is opened",
@@ -193,16 +223,21 @@ fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> HammerResult
     Ok(socket)
 }
 
-fn datagram_from_recv(
+fn push_datagram_from_recv(
+    runtime: &DataPlaneRuntime,
+    frame: &mut BufferFrame,
     result: std::io::Result<(usize, SocketAddr)>,
-    mut buf: Vec<u8>,
-) -> HammerResult<ProxyDatagram> {
+    buf: &[u8],
+) -> HammerResult<()> {
     let (len, source) = result.with_context(|| "direct udp recv")?;
-    buf.truncate(len);
-    Ok(ProxyDatagram {
-        destination: SocksAddr::ip(source.ip(), source.port()),
-        payload: Bytes::from(buf),
-    })
+    let mut metadata = RouteMetadata::default();
+    metadata.destination = Some(SocksAddr::ip(source.ip(), source.port()));
+    let index = runtime.alloc_index_with_bytes(metadata, &buf[..len])?;
+    if let Err(err) = frame.push_index(index) {
+        runtime.free_index(index);
+        return Err(err);
+    }
+    Ok(())
 }
 
 async fn resolve_destination(destination: &SocksAddr) -> HammerResult<SocketAddr> {

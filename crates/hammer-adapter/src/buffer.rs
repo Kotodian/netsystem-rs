@@ -5,6 +5,8 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
 
+pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
     slot: u32,
@@ -156,6 +158,75 @@ pub struct BufferPool {
     inner: Rc<RefCell<BufferPoolInner>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DataPlaneRuntime {
+    buffers: BufferPool,
+}
+
+impl DataPlaneRuntime {
+    pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
+        Self {
+            buffers: BufferPool::with_capacity(slot_capacity, slots),
+        }
+    }
+
+    pub fn buffers(&self) -> &BufferPool {
+        &self.buffers
+    }
+
+    pub fn in_use_buffers(&self) -> usize {
+        self.buffers.in_use()
+    }
+
+    pub fn frame(&self) -> BufferFrame {
+        self.buffers.frame()
+    }
+
+    pub fn frame_with_capacity(&self, capacity: usize) -> BufferFrame {
+        self.buffers.frame_with_capacity(capacity)
+    }
+
+    pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
+        self.buffers.alloc_index(metadata)
+    }
+
+    pub fn alloc_index_with_bytes(
+        &self,
+        metadata: RouteMetadata,
+        bytes: &[u8],
+    ) -> CoreResult<BufferIndex> {
+        self.buffers.alloc_index_with_bytes(metadata, bytes)
+    }
+
+    pub fn free_index(&self, index: BufferIndex) {
+        self.buffers.free_index(index);
+    }
+
+    pub fn free_frame(&self, frame: &mut BufferFrame) {
+        self.buffers.free_frame(frame);
+    }
+
+    pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
+        self.buffers.metadata(index)
+    }
+
+    pub fn with_metadata_mut<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&mut RouteMetadata) -> R,
+    ) -> CoreResult<R> {
+        self.buffers.with_metadata_mut(index, f)
+    }
+
+    pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.buffers.current(index)
+    }
+
+    pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.buffers.copy_current_chain(index)
+    }
+}
+
 impl BufferPool {
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
         let free = (0..slots)
@@ -199,21 +270,63 @@ impl BufferPool {
         })
     }
 
+    pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
+        self.alloc_index_with_bytes(metadata, &[])
+    }
+
+    pub fn alloc_index_with_bytes(
+        &self,
+        metadata: RouteMetadata,
+        bytes: &[u8],
+    ) -> CoreResult<BufferIndex> {
+        self.inner.borrow_mut().alloc_chain(metadata, bytes)
+    }
+
+    pub fn free_index(&self, index: BufferIndex) {
+        self.inner.borrow_mut().free_chain(index);
+    }
+
+    pub fn free_frame(&self, frame: &mut BufferFrame) {
+        let mut pool = self.inner.borrow_mut();
+        for index in frame.drain_indices() {
+            pool.free_chain(index);
+        }
+    }
+
     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
         let guard = self.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
     }
 
+    pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
+        Ok(self.inner.borrow().buffer(index)?.metadata().clone())
+    }
+
+    pub fn with_metadata_mut<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&mut RouteMetadata) -> R,
+    ) -> CoreResult<R> {
+        let mut pool = self.inner.borrow_mut();
+        let metadata = pool.buffer_mut(index)?.metadata_mut();
+        Ok(f(metadata))
+    }
+
+    pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        Ok(self.inner.borrow().buffer(index)?.current().to_vec())
+    }
+
+    pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.inner.borrow().copy_current_chain(index)
+    }
+
     pub fn frame(&self) -> BufferFrame {
-        self.frame_with_capacity(0)
+        self.frame_with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY)
     }
 
     pub fn frame_with_capacity(&self, capacity: usize) -> BufferFrame {
-        BufferFrame {
-            pool: Rc::clone(&self.inner),
-            indices: Vec::with_capacity(capacity),
-        }
+        BufferFrame::with_capacity(capacity)
     }
 }
 
@@ -467,10 +580,6 @@ impl BufferHandle {
             .expect("live buffer handle points to valid chain")
     }
 
-    fn into_index(mut self) -> BufferIndex {
-        self.armed = false;
-        self.index
-    }
 }
 
 impl Drop for BufferHandle {
@@ -481,17 +590,22 @@ impl Drop for BufferHandle {
     }
 }
 
+#[derive(Debug)]
 pub struct BufferFrame {
-    pool: Rc<RefCell<BufferPoolInner>>,
     indices: Vec<BufferIndex>,
 }
 
 impl BufferFrame {
-    pub fn push(&mut self, buffer: BufferHandle) -> CoreResult<()> {
-        if !Rc::ptr_eq(&self.pool, &buffer.pool) {
-            return Err(CoreError::internal("buffer frame pool mismatch"));
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            indices: Vec::with_capacity(capacity),
         }
-        let index = buffer.into_index();
+    }
+
+    pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
+        if self.indices.len() == self.indices.capacity() {
+            return Err(CoreError::internal("buffer frame capacity exceeded"));
+        }
         self.indices.push(index);
         Ok(())
     }
@@ -504,11 +618,16 @@ impl BufferFrame {
         self.indices.is_empty()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.indices.capacity()
+    }
+
+    pub fn reset(&mut self) {
+        self.indices.clear();
+    }
+
     pub fn clear(&mut self) {
-        let mut pool = self.pool.borrow_mut();
-        for index in self.indices.drain(..) {
-            pool.free_chain(index);
-        }
+        self.reset();
     }
 
     pub fn indices(&self) -> &[BufferIndex] {
@@ -519,63 +638,8 @@ impl BufferFrame {
         self.indices.iter()
     }
 
-    pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
-        let guard = self.pool.borrow();
-        guard.buffer(index)?;
-        Ok(BufferRef { guard, index })
-    }
-
-    pub fn drain(&mut self) -> BufferFrameDrain<'_> {
-        BufferFrameDrain {
-            pool: Rc::clone(&self.pool),
-            indices: self.indices.drain(..),
-        }
-    }
-
-    pub fn retain(&mut self, mut f: impl FnMut(BufferIndex) -> bool) {
-        let mut retained = Vec::with_capacity(self.indices.len());
-        let mut pool = self.pool.borrow_mut();
-        for index in self.indices.drain(..) {
-            if f(index) {
-                retained.push(index);
-            } else {
-                pool.free_chain(index);
-            }
-        }
-        self.indices = retained;
-    }
-}
-
-impl Drop for BufferFrame {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-pub struct BufferFrameDrain<'frame> {
-    pool: Rc<RefCell<BufferPoolInner>>,
-    indices: std::vec::Drain<'frame, BufferIndex>,
-}
-
-impl Iterator for BufferFrameDrain<'_> {
-    type Item = BufferHandle;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let index = self.indices.next()?;
-        Some(BufferHandle {
-            pool: Rc::clone(&self.pool),
-            index,
-            armed: true,
-        })
-    }
-}
-
-impl Drop for BufferFrameDrain<'_> {
-    fn drop(&mut self) {
-        let mut pool = self.pool.borrow_mut();
-        for index in self.indices.by_ref() {
-            pool.free_chain(index);
-        }
+    pub fn drain_indices(&mut self) -> std::vec::Drain<'_, BufferIndex> {
+        self.indices.drain(..)
     }
 }
 

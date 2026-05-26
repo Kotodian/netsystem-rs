@@ -13,7 +13,8 @@ use bytes::Bytes;
 use futures::future;
 use h3::client;
 use hammer_adapter::{
-    Network, Outbound, PlatformInterface, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr,
+    BufferFrame, DataPlaneRuntime, Network, Outbound, PlatformInterface, ProxyPacketConn, ProxyStream,
+    RouteMetadata, SocksAddr,
 };
 use hammer_core::config::{
     Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions, OutboundKind,
@@ -158,7 +159,7 @@ pub struct Hysteria2Client {
     connection: quinn::Connection,
     _endpoint: quinn::Endpoint,
     _h3_sender: client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<ProxyDatagram>>>>,
+    sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<Hysteria2Datagram>>>>,
     next_session: AtomicU32,
 }
 
@@ -418,50 +419,71 @@ impl AsyncWrite for Hysteria2Stream {
 
 pub struct Hysteria2PacketConn {
     connection: quinn::Connection,
-    sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<ProxyDatagram>>>>,
+    sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<Hysteria2Datagram>>>>,
     session_id: u32,
     packet_id: AtomicU16,
-    rx: mpsc::Receiver<ProxyDatagram>,
+    rx: mpsc::Receiver<Hysteria2Datagram>,
 }
 
-impl Hysteria2PacketConn {
-    pub async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        <Self as ProxyPacketConn>::send_to(self, destination, payload).await
-    }
-
-    pub async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
-        <Self as ProxyPacketConn>::recv_from(self).await
-    }
+struct Hysteria2Datagram {
+    destination: SocksAddr,
+    payload: Bytes,
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for Hysteria2PacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        if payload.len() > protocol::MAX_UDP_SIZE {
-            return Err(HammerError::internal("UDP packet too large"));
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+        let mut result = Ok(());
+        for index in frame.drain_indices() {
+            if result.is_ok() {
+                result = (|| {
+                    let metadata = runtime.metadata(index)?;
+                    let destination = metadata.destination.ok_or_else(|| {
+                        HammerError::internal("hysteria2 UDP frame missing destination")
+                    })?;
+                    let payload = Bytes::from(runtime.copy_current_chain(index)?);
+                    if payload.len() > protocol::MAX_UDP_SIZE {
+                        return Err(HammerError::internal("UDP packet too large"));
+                    }
+                    let packet_id = self.packet_id.fetch_add(1, Ordering::SeqCst);
+                    debug!(
+                        "hysteria2 UDP send session={} packet={} dest={} bytes={}",
+                        self.session_id,
+                        packet_id,
+                        destination,
+                        payload.len()
+                    );
+                    let message = protocol::UdpMessage {
+                        session_id: self.session_id,
+                        packet_id,
+                        fragment_id: 0,
+                        fragment_total: 1,
+                        destination: destination.to_string(),
+                        payload,
+                    };
+                    self.connection.send_datagram(message.encode()).map_err(|err| {
+                        HammerError::internal(format!("send hysteria2 datagram: {err}"))
+                    })?;
+                    Ok(())
+                })();
+            }
+            runtime.free_index(index);
         }
-        let packet_id = self.packet_id.fetch_add(1, Ordering::SeqCst);
-        debug!(
-            "hysteria2 UDP send session={} packet={} dest={} bytes={}",
-            self.session_id,
-            packet_id,
-            destination,
-            payload.len()
-        );
-        let message = protocol::UdpMessage {
-            session_id: self.session_id,
-            packet_id,
-            fragment_id: 0,
-            fragment_total: 1,
-            destination: destination.to_string(),
-            payload,
-        };
-        self.connection
-            .send_datagram(message.encode())
-            .map_err(|err| HammerError::internal(format!("send hysteria2 datagram: {err}")))
+        result
     }
 
-    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> HammerResult<()> {
+        if max == 0 {
+            return Err(HammerError::internal(
+                "hysteria2 UDP recv max must be nonzero",
+            ));
+        }
+        runtime.free_frame(frame);
         let connection = self.connection.clone();
         tokio::select! {
             datagram = self.rx.recv() => {
@@ -473,7 +495,14 @@ impl ProxyPacketConn for Hysteria2PacketConn {
                             datagram.destination,
                             datagram.payload.len()
                         );
-                        Ok(datagram)
+                        let mut metadata = RouteMetadata::default();
+                        metadata.destination = Some(datagram.destination);
+                        let index = runtime.alloc_index_with_bytes(metadata, &datagram.payload)?;
+                        if let Err(err) = frame.push_index(index) {
+                            runtime.free_index(index);
+                            return Err(err);
+                        }
+                        Ok(())
                     }
                     None => Err(HammerError::internal("hysteria2 UDP session closed")),
                 }
@@ -582,7 +611,7 @@ async fn handle_datagram(client: &Hysteria2Client, data: Bytes) -> HammerResult<
     };
     if let Some(sender) = sender
         && sender
-            .try_send(ProxyDatagram {
+            .try_send(Hysteria2Datagram {
                 destination,
                 payload: message.payload,
             })
@@ -1340,7 +1369,9 @@ mod tests {
         let mut packet = client.listen_udp().await.expect("open UDP session");
 
         client.close(b"simulate suspended connection loss");
-        let err = tokio::time::timeout(Duration::from_millis(200), packet.recv_from())
+        let runtime = hammer_adapter::DataPlaneRuntime::with_buffer_capacity(2048, 8);
+        let mut frame = runtime.frame_with_capacity(1);
+        let err = tokio::time::timeout(Duration::from_millis(200), packet.recv(&runtime, &mut frame, 1))
             .await
             .expect("closed QUIC connection should wake UDP recv")
             .expect_err("UDP recv should report connection closure");

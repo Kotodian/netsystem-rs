@@ -437,7 +437,7 @@ impl Lifecycle for HostsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 #[cfg(feature = "dns-hosts")]
 impl DnsTransport for HostsTransport {
     fn reset(&self) {}
@@ -493,7 +493,7 @@ impl Lifecycle for LocalDnsTransport {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 #[cfg(feature = "dns-local")]
 impl DnsTransport for LocalDnsTransport {
     fn reset(&self) {}
@@ -1237,7 +1237,7 @@ impl Lifecycle for DnsRouter {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DnsRouterTrait for DnsRouter {
     async fn exchange(&self, message: Message, options: DnsQueryOptions) -> HammerResult<Message> {
         self.exchange(message, options).await
@@ -1317,7 +1317,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl DnsTransport for StubTransport {
         fn reset(&self) {}
         async fn exchange(&self, message: Message) -> CoreResult<Message> {

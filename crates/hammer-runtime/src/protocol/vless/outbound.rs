@@ -3,8 +3,10 @@ use std::task::{Context, Poll};
 use std::{io, pin::Pin};
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use hammer_adapter::{Network, Outbound, ProxyDatagram, ProxyPacketConn, ProxyStream, SocksAddr};
+use hammer_adapter::{
+    BufferFrame, DataPlaneRuntime, Network, Outbound, ProxyPacketConn, ProxyStream, RouteMetadata,
+    SocksAddr,
+};
 use hammer_core::config::{OutboundKind, VlessOutboundOptions};
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
@@ -274,22 +276,46 @@ impl VlessPacketConn {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl ProxyPacketConn for VlessPacketConn {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> HammerResult<()> {
-        self.ensure_stream(&destination).await?;
-        let packet = encode_udp_packet(&payload)?;
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| HammerError::internal("vless udp stream not initialized"))?;
-        stream
-            .write_all(&packet)
-            .await
-            .with_context(|| "vless udp write packet")
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+        let mut result = Ok(());
+        for index in frame.drain_indices() {
+            if result.is_ok() {
+                result = async {
+                    let metadata = runtime.metadata(index)?;
+                    let destination = metadata.destination.ok_or_else(|| {
+                        HammerError::internal("vless UDP frame missing destination")
+                    })?;
+                    self.ensure_stream(&destination).await?;
+                    let payload = runtime.copy_current_chain(index)?;
+                    let packet = encode_udp_packet(&payload)?;
+                    let stream = self.stream.as_mut().ok_or_else(|| {
+                        HammerError::internal("vless udp stream not initialized")
+                    })?;
+                    stream
+                        .write_all(&packet)
+                        .await
+                        .with_context(|| "vless udp write packet")?;
+                    Ok(())
+                }
+                .await;
+            }
+            runtime.free_index(index);
+        }
+        result
     }
 
-    async fn recv_from(&mut self) -> HammerResult<ProxyDatagram> {
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> HammerResult<()> {
+        if max == 0 {
+            return Err(HammerError::internal("vless UDP recv max must be nonzero"));
+        }
+        runtime.free_frame(frame);
         let destination = self
             .destination
             .clone()
@@ -299,10 +325,14 @@ impl ProxyPacketConn for VlessPacketConn {
             .as_mut()
             .ok_or_else(|| HammerError::internal("vless udp stream not initialized"))?;
         let payload = read_udp_packet(stream).await?;
-        Ok(ProxyDatagram {
-            destination,
-            payload: Bytes::from(payload),
-        })
+        let mut metadata = RouteMetadata::default();
+        metadata.destination = Some(destination);
+        let index = runtime.alloc_index_with_bytes(metadata, &payload)?;
+        if let Err(err) = frame.push_index(index) {
+            runtime.free_index(index);
+            return Err(err);
+        }
+        Ok(())
     }
 }
 

@@ -32,7 +32,7 @@ use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::BufferPool;
+use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -78,7 +78,8 @@ tokio::task_local! {
 thread_local! {
     static THREAD_DATA_CONTEXT: RefCell<Vec<DataRuntimeContext>> = const { RefCell::new(Vec::new()) };
     static CURRENT_DATA_WORKER: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
-    static DATA_BUFFER_POOL: BufferPool = BufferPool::with_capacity(DATA_BUFFER_SLOT_CAPACITY, DATA_BUFFER_SLOTS);
+    static DATA_PLANE_RUNTIME: DataPlaneRuntime =
+        DataPlaneRuntime::with_buffer_capacity(DATA_BUFFER_SLOT_CAPACITY, DATA_BUFFER_SLOTS);
 }
 
 const DATA_BUFFER_SLOT_CAPACITY: usize = 2048;
@@ -383,8 +384,8 @@ where
     tokio::task::spawn_local(TASK_DATA_CONTEXT.scope(context, future))
 }
 
-pub fn with_data_buffer_pool<R>(f: impl FnOnce(&BufferPool) -> R) -> R {
-    DATA_BUFFER_POOL.with(f)
+pub fn with_data_plane_runtime<R>(f: impl FnOnce(&DataPlaneRuntime) -> R) -> R {
+    DATA_PLANE_RUNTIME.with(f)
 }
 
 fn current_data_context() -> Option<DataRuntimeContext> {
@@ -461,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn data_thread_exposes_thread_local_buffer_pool() {
+    fn data_thread_exposes_thread_local_data_plane_runtime() {
         let _guard = test_lock();
         let data_runtime =
             DataRuntime::new(1, "spawn-test-buffer", 512 * 1024, 2).expect("data runtime");
@@ -475,17 +476,18 @@ mod tests {
             driver.block_on(async {
                 let (tx, rx) = oneshot::channel();
                 drop(spawn(async move {
-                    let stats = with_data_buffer_pool(|pool| {
-                        let before = pool.in_use();
+                    let stats = with_data_plane_runtime(|runtime| {
+                        let before = runtime.in_use_buffers();
                         {
-                            let _buffer = pool
-                                .alloc_with_bytes(Default::default(), b"packet")
+                            let index = runtime
+                                .alloc_index_with_bytes(Default::default(), b"packet")
                                 .expect("alloc data buffer");
-                            let during = pool.in_use();
+                            let during = runtime.in_use_buffers();
+                            runtime.free_index(index);
                             (before, during)
                         }
                     });
-                    let after = with_data_buffer_pool(|pool| pool.in_use());
+                    let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
                     let _ = tx.send((stats.0, stats.1, after));
                 }));
                 tokio::time::timeout(Duration::from_secs(2), rx)
@@ -520,12 +522,13 @@ mod tests {
                         .name()
                         .map(ToOwned::to_owned)
                         .unwrap_or_default();
-                    let buffer = with_data_buffer_pool(|pool| {
-                        let before = pool.in_use();
-                        let buffer = pool
+                    let buffer = with_data_plane_runtime(|runtime| {
+                        let before = runtime.in_use_buffers();
+                        let buffer = runtime
+                            .buffers()
                             .alloc_with_bytes(Default::default(), b"packet")
                             .expect("alloc local data buffer");
-                        let during = pool.in_use();
+                        let during = runtime.in_use_buffers();
                         (before, during, buffer)
                     });
                     tokio::task::yield_now().await;
@@ -535,7 +538,7 @@ mod tests {
                         .unwrap_or_default();
                     let payload = buffer.2.current();
                     drop(buffer.2);
-                    let after = with_data_buffer_pool(|pool| pool.in_use());
+                    let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
                     (
                         thread_before,
                         thread_after,
@@ -579,8 +582,10 @@ mod tests {
                             .name()
                             .map(ToOwned::to_owned)
                             .unwrap_or_default();
-                        let buffer = with_data_buffer_pool(|pool| {
-                            pool.alloc_with_bytes(Default::default(), b"packet")
+                        let buffer = with_data_plane_runtime(|runtime| {
+                            runtime
+                                .buffers()
+                                .alloc_with_bytes(Default::default(), b"packet")
                                 .expect("alloc local data buffer")
                         });
                         tokio::task::yield_now().await;

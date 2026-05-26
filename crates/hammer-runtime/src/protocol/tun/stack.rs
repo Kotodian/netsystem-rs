@@ -18,7 +18,7 @@ use etherparse::{
 #[cfg(feature = "endpoint")]
 use hammer_adapter::Endpoint as EndpointTrait;
 use hammer_adapter::{
-    BufferHandle, DnsQueryOptions, DnsRouter as DnsRouterTrait, Network,
+    BufferIndex, DataPlaneRuntime, DnsQueryOptions, DnsRouter as DnsRouterTrait, Network,
     OutboundManager as OutboundManagerTrait, ProxyStream, RouteDecision, RouteMetadata,
     RouteTarget, Router as RouterTrait, SocksAddr,
 };
@@ -551,7 +551,7 @@ struct UdpFlowState {
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
 type UdpFlowMapRef = Rc<std::cell::RefCell<UdpFlowMap>>;
 
-type UdpFlowPayload = BufferHandle;
+type UdpFlowPayload = BufferIndex;
 
 enum TunTaskHandle {
     Send(JoinHandle<()>),
@@ -2072,16 +2072,30 @@ where
                 })
             }
             Network::Udp => {
+                let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
                 let mut packet = outbound.listen_packet().await?;
-                packet
-                    .send_to(destination, Bytes::from(tun_packet.payload))
-                    .await?;
-                let response = timeout(Duration::from_secs(2), packet.recv_from())
+                let mut metadata = tun_packet.metadata.clone();
+                metadata.destination = Some(destination);
+                let mut request = runtime.frame_with_capacity(1);
+                let buffer = runtime.alloc_index_with_bytes(metadata, &tun_packet.payload)?;
+                if let Err(err) = request.push_index(buffer) {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+                packet.send(&runtime, &mut request).await?;
+                let mut response = runtime.frame_with_capacity(1);
+                timeout(Duration::from_secs(2), packet.recv(&runtime, &mut response, 1))
                     .await
                     .map_err(|_| HammerError::internal("TUN routed UDP response timed out"))??;
+                let response = response
+                    .drain_indices()
+                    .next()
+                    .ok_or_else(|| HammerError::internal("TUN routed UDP response empty frame"))?;
+                let payload = runtime.copy_current_chain(response)?;
+                runtime.free_index(response);
                 Ok(TunDispatch::RoutedResponse {
                     metadata: tun_packet.metadata,
-                    payload: response.payload,
+                    payload: Bytes::from(payload),
                 })
             }
             Network::Icmp => {
@@ -3804,6 +3818,7 @@ where
         return Ok(());
     }
 
+    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
     let metadata = RouteMetadata {
         inbound: inbound_id,
         network: Network::Udp,
@@ -3811,43 +3826,63 @@ where
         destination: Some(parsed.destination.clone()),
         ..Default::default()
     };
-    let buffer = crate::spawn::with_data_buffer_pool(|pool| {
-        pool.alloc_with_bytes(metadata, parsed.payload(&packet)?)
-    })?;
-    let payload = buffer.current();
-    if let Err(err) = buffer.with_metadata_mut(|metadata| {
+    let buffer = runtime.alloc_index_with_bytes(metadata, parsed.payload(&packet)?)?;
+    let payload = runtime.current(buffer)?;
+    if let Err(err) = runtime.with_metadata_mut(buffer, |metadata| {
         if router.should_sniff(metadata) {
             sniff_packet_metadata(metadata, &payload);
         }
         prepare_route_metadata(router.as_ref(), metadata, Some(dns_router.as_ref()))
     }) {
+        runtime.free_index(buffer);
         metrics.counters.udp_route_prepare_error_total.increment(1);
         return Err(err);
     }
-    let decision = match buffer.with_metadata_mut(|metadata| router.match_route(metadata)) {
-        Ok(decision) => decision,
-        Err(err) => {
+    let decision = match runtime.with_metadata_mut(buffer, |metadata| router.match_route(metadata)) {
+        Ok(Ok(decision)) => decision,
+        Ok(Err(err)) | Err(err) => {
+            runtime.free_index(buffer);
             metrics.route_error_total.inc(Network::Udp);
             return Err(err);
         }
     };
     match decision {
         RouteDecision::HijackDns => {
-            let metadata = buffer.metadata();
+            let metadata = runtime.metadata(buffer)?;
             let message = match <Message as MessageExt>::from_bytes(&payload) {
                 Ok(message) => message,
                 Err(err) => {
+                    runtime.free_index(buffer);
                     metrics.counters.udp_dns_error_total.increment(1);
                     return Err(err);
                 }
             };
             let options = dns_query_options(&metadata);
             let destination = parsed.destination;
-            match dns_router.try_exchange_fast(&message, options.clone())? {
+            let fast_response = match dns_router.try_exchange_fast(&message, options.clone()) {
+                Ok(response) => response,
+                Err(err) => {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+            };
+            match fast_response {
                 Some(response) => {
-                    let response_bytes = MessageExt::to_bytes(&response)?;
+                    let response_bytes = match MessageExt::to_bytes(&response) {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            runtime.free_index(buffer);
+                            return Err(err);
+                        }
+                    };
                     let response_packet =
-                        udp_response_packet(&packet, destination, &response_bytes)?;
+                        match udp_response_packet(&packet, destination, &response_bytes) {
+                            Ok(packet) => packet,
+                            Err(err) => {
+                                runtime.free_index(buffer);
+                                return Err(err);
+                            }
+                        };
                     enqueue_tun_packet_write(tun_write_tx, response_packet, &metrics);
                 }
                 None => {
@@ -3861,10 +3896,11 @@ where
                     );
                 }
             }
+            runtime.free_index(buffer);
         }
         RouteDecision::Reject { method } => {
             metrics.reject_total.inc(Network::Udp);
-            let metadata = buffer.metadata();
+            let metadata = runtime.metadata(buffer)?;
             let message = format!(
                 "drop UDP packet by reject rule: method={}, destination={}, protocol={}",
                 method, parsed.destination, metadata.protocol
@@ -3877,18 +3913,26 @@ where
             if let Ok(response) = udp_unreachable_packet(&packet) {
                 enqueue_tun_packet_write(tun_write_tx, response, &metrics);
             }
+            runtime.free_index(buffer);
         }
         RouteDecision::Route {
             target: RouteTarget::Outbound(outbound_id),
         } => {
             let Some(outbound_item) = outbound.get(&outbound_id) else {
+                runtime.free_index(buffer);
                 metrics.outbound_missing_total.inc(Network::Udp);
                 return Err(HammerError::internal(format!(
                     "outbound not found: {outbound_id}"
                 )));
             };
-            let metadata = buffer.metadata();
-            let destination = route_destination(&metadata, Some(dns_router.as_ref()))?;
+            let metadata = runtime.metadata(buffer)?;
+            let destination = match route_destination(&metadata, Some(dns_router.as_ref())) {
+                Ok(destination) => destination,
+                Err(err) => {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+            };
             if metadata.domain.is_some() || outbound_id == "direct" {
                 debug!(
                     "system UDP route decision: source={} destination={} domain={} protocol={} outbound={outbound_id}",
@@ -3902,7 +3946,13 @@ where
                     metadata.protocol
                 );
             }
-            let template = UdpResponseTemplate::from_request(&packet)?;
+            let template = match UdpResponseTemplate::from_request(&packet) {
+                Ok(template) => template,
+                Err(err) => {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+            };
             let mut start_flow = None;
             let sender = {
                 let mut flows = udp_flows.borrow_mut();
@@ -3934,7 +3984,7 @@ where
                     tx
                 }
             };
-            match enqueue_udp_payload(&sender, buffer, &metrics)? {
+            match enqueue_udp_payload(&sender, &runtime, buffer, &metrics)? {
                 UdpPayloadEnqueueResult::Enqueued => {}
                 UdpPayloadEnqueueResult::Full => {}
                 UdpPayloadEnqueueResult::Closed => {
@@ -3970,6 +4020,7 @@ where
         RouteDecision::Route {
             target: RouteTarget::Endpoint(endpoint_id),
         } => {
+            runtime.free_index(buffer);
             metrics.outbound_missing_total.inc(Network::Udp);
             return Err(HammerError::internal(format!(
                 "endpoint route requires L3 dispatch: {endpoint_id}"
@@ -4003,6 +4054,7 @@ fn try_enqueue_existing_udp_flow(
         return Ok(false);
     };
 
+    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
     let metadata = RouteMetadata {
         inbound: inbound_id.to_owned(),
         network: Network::Udp,
@@ -4010,11 +4062,9 @@ fn try_enqueue_existing_udp_flow(
         destination: Some(parsed.destination.clone()),
         ..Default::default()
     };
-    let buffer = crate::spawn::with_data_buffer_pool(|pool| {
-        pool.alloc_with_bytes(metadata, parsed.payload(packet)?)
-    })?;
+    let buffer = runtime.alloc_index_with_bytes(metadata, parsed.payload(packet)?)?;
 
-    match enqueue_udp_payload(&sender, buffer, metrics)? {
+    match enqueue_udp_payload(&sender, &runtime, buffer, metrics)? {
         UdpPayloadEnqueueResult::Enqueued => Ok(true),
         UdpPayloadEnqueueResult::Full => Ok(true),
         UdpPayloadEnqueueResult::Closed => {
@@ -4027,7 +4077,8 @@ fn try_enqueue_existing_udp_flow(
 
 fn enqueue_udp_payload(
     sender: &mpsc::Sender<UdpFlowPayload>,
-    buffer: BufferHandle,
+    runtime: &DataPlaneRuntime,
+    buffer: BufferIndex,
     metrics: &TunMetrics,
 ) -> HammerResult<UdpPayloadEnqueueResult> {
     match sender.try_reserve() {
@@ -4036,11 +4087,15 @@ fn enqueue_udp_payload(
             Ok(UdpPayloadEnqueueResult::Enqueued)
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
+            runtime.free_index(buffer);
             metrics.counters.udp_flow_drop_busy_total.increment(1);
             debug!("drop UDP packet for busy system flow");
             Ok(UdpPayloadEnqueueResult::Full)
         }
-        Err(mpsc::error::TrySendError::Closed(_)) => Ok(UdpPayloadEnqueueResult::Closed),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            runtime.free_index(buffer);
+            Ok(UdpPayloadEnqueueResult::Closed)
+        }
     }
 }
 
@@ -4162,7 +4217,7 @@ fn spawn_dns_hijack_worker<Q>(
 where
     Q: DnsRouterTrait + 'static,
 {
-    crate::spawn::spawn(async move {
+    crate::spawn::spawn_current_local(async move {
         while let Some(job) = rx.recv().await {
             match build_system_dns_hijack_response(Arc::clone(&dns_router), job).await {
                 Ok(packet) => enqueue_tun_packet_write(&tun_write_tx, packet, &metrics),
@@ -4382,6 +4437,9 @@ async fn system_udp_flow_loop(
             return;
         }
     };
+    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let mut outbound_frame = runtime.frame_with_capacity(1);
+    let mut inbound_frame = runtime.frame_with_capacity(1);
     let idle_timer = time::sleep(udp_timeout);
     tokio::pin!(idle_timer);
     loop {
@@ -4391,16 +4449,30 @@ async fn system_udp_flow_loop(
                     break;
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                let payload = Bytes::from(item.copy_current_chain());
-                if let Err(err) = packet_conn.send_to(destination.clone(), payload).await {
+                if let Err(err) = runtime.with_metadata_mut(item, |metadata| {
+                    metadata.destination = Some(destination.clone());
+                }) {
+                    runtime.free_index(item);
+                    metrics.counters.udp_flow_send_error_total.increment(1);
+                    debug!("prepare system UDP outbound metadata: {err}");
+                    break;
+                }
+                outbound_frame.reset();
+                if let Err(err) = outbound_frame.push_index(item) {
+                    runtime.free_index(item);
+                    metrics.counters.udp_flow_send_error_total.increment(1);
+                    debug!("queue system UDP outbound frame: {err}");
+                    break;
+                }
+                if let Err(err) = packet_conn.send(&runtime, &mut outbound_frame).await {
                     metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
                 }
             }
-            response = packet_conn.recv_from() => {
-                let response = match response {
-                    Ok(response) => response,
+            response = packet_conn.recv(&runtime, &mut inbound_frame, 1) => {
+                match response {
+                    Ok(()) => {}
                     Err(err) => {
                         metrics.counters.udp_flow_recv_error_total.increment(1);
                         debug!("receive system UDP outbound: {err}");
@@ -4408,7 +4480,32 @@ async fn system_udp_flow_loop(
                     }
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                match response_template.build(response.destination, &response.payload) {
+                let Some(response) = inbound_frame.drain_indices().next() else {
+                    continue;
+                };
+                let metadata = match runtime.metadata(response) {
+                    Ok(metadata) => metadata,
+                    Err(err) => {
+                        runtime.free_index(response);
+                        debug!("read UDP response metadata: {err}");
+                        continue;
+                    }
+                };
+                let Some(source) = metadata.destination else {
+                    runtime.free_index(response);
+                    debug!("drop UDP response without source destination metadata");
+                    continue;
+                };
+                let payload = match runtime.copy_current_chain(response) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        runtime.free_index(response);
+                        debug!("read UDP response payload: {err}");
+                        continue;
+                    }
+                };
+                runtime.free_index(response);
+                match response_template.build(source, &payload) {
                     Ok(packet) => {
                         enqueue_tun_udp_response_write(&tun_write_tx, packet, &metrics);
                     }
@@ -5444,7 +5541,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl AdapterDnsRouter for StubDnsRouter {
         async fn exchange(
             &self,
@@ -5495,7 +5592,7 @@ mod tests {
     }
 
     #[cfg(feature = "endpoint")]
-    #[async_trait]
+    #[async_trait(?Send)]
     impl AdapterDnsRouter for ReverseMappingDnsRouter {
         async fn exchange(
             &self,
@@ -5691,7 +5788,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl DnsTransport for DelayedDnsTransport {
         fn reset(&self) {}
 
@@ -5733,7 +5830,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl DnsTransport for CountingDnsTransport {
         fn reset(&self) {}
 
@@ -5775,7 +5872,7 @@ mod tests {
         }
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl AdapterDnsRouter for BlockingDnsRouter {
         async fn exchange(
             &self,
@@ -6582,11 +6679,17 @@ mod tests {
                         DEFAULT_SYSTEM_UDP_TIMEOUT,
                         metrics,
                     ));
-                    let payload = timeout(Duration::from_millis(50), flow_rx.recv())
+                    let buffer = timeout(Duration::from_millis(50), flow_rx.recv())
                         .await
                         .expect("system flow payload")
-                        .expect("system flow payload")
-                        .copy_current_chain();
+                        .expect("system flow payload");
+                    let payload = crate::spawn::with_data_plane_runtime(|runtime| {
+                        let payload = runtime
+                            .copy_current_chain(buffer)
+                            .expect("copy system flow payload");
+                        runtime.free_index(buffer);
+                        payload
+                    });
                     task.abort();
                     payload
                 })
@@ -6967,11 +7070,18 @@ final = "direct"
         assert_eq!(router.prepare_calls.load(Ordering::Relaxed), 0);
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
-            timeout(Duration::from_millis(50), rx.recv())
-                .await
-                .expect("flow payload")
-                .expect("flow payload")
-                .copy_current_chain(),
+            {
+                let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+                let buffer = timeout(Duration::from_millis(50), rx.recv())
+                    .await
+                    .expect("flow payload")
+                    .expect("flow payload");
+                let payload = runtime
+                    .copy_current_chain(buffer)
+                    .expect("flow payload bytes");
+                runtime.free_index(buffer);
+                payload
+            },
             b"quic"
         );
     }
@@ -6985,10 +7095,10 @@ final = "direct"
             destination: (parsed.destination.host, parsed.destination.port),
         };
         let (tx, mut rx) = mpsc::channel(1);
-        let queued = crate::spawn::with_data_buffer_pool(|pool| {
-            pool.alloc_with_bytes(RouteMetadata::default(), b"queued")
-        })
-        .expect("alloc queued UDP payload");
+        let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+        let queued = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"queued")
+            .expect("alloc queued UDP payload");
         tx.try_send(queued).expect("fill flow queue");
         let mut flows = HashMap::new();
         flows.insert(
@@ -7018,19 +7128,19 @@ final = "direct"
             parsed,
             metrics,
         )
-        .expect("full flow queue packet is handled as drop");
+        .expect("full queue packet");
 
+        assert_eq!(router.should_sniff_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(router.prepare_calls.load(Ordering::Relaxed), 0);
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
+        let queued = rx.try_recv().expect("queued packet remains");
         assert_eq!(
-            rx.try_recv()
-                .expect("original queued payload")
-                .copy_current_chain(),
+            runtime
+                .copy_current_chain(queued)
+                .expect("queued payload bytes"),
             b"queued"
         );
-        assert!(
-            rx.try_recv().is_err(),
-            "full existing flow must not route or enqueue the dropped payload"
-        );
+        runtime.free_index(queued);
     }
 
     #[tokio::test]

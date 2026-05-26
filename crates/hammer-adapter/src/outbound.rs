@@ -8,6 +8,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::buffer::{BufferFrame, DataPlaneRuntime};
 use crate::RuntimeComponent;
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
@@ -18,16 +19,19 @@ pub trait ProxyStream: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProxyDatagram {
-    pub destination: SocksAddr,
-    pub payload: Bytes,
-}
-
-#[async_trait]
-pub trait ProxyPacketConn: Send + Sync + 'static {
-    async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> CoreResult<()>;
-    async fn recv_from(&mut self) -> CoreResult<ProxyDatagram>;
+#[async_trait(?Send)]
+pub trait ProxyPacketConn: 'static {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<()>;
+    async fn recv(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        max: usize,
+    ) -> CoreResult<()>;
 }
 
 /// One inbound ICMP echo reply observed on a `ProxyIcmpConn`.
@@ -150,33 +154,57 @@ pub trait OutboundManager: Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RouteMetadata;
 
     struct CapturePacketConn {
-        last: Option<Bytes>,
+        last: Option<Vec<u8>>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl ProxyPacketConn for CapturePacketConn {
-        async fn send_to(&mut self, _destination: SocksAddr, payload: Bytes) -> CoreResult<()> {
-            self.last = Some(payload);
+        async fn send(
+            &mut self,
+            runtime: &DataPlaneRuntime,
+            frame: &mut BufferFrame,
+        ) -> CoreResult<()> {
+            let index = frame
+                .drain_indices()
+                .next()
+                .ok_or_else(|| CoreError::internal("empty test frame"))?;
+            self.last = Some(runtime.copy_current_chain(index)?);
+            runtime.free_index(index);
             Ok(())
         }
 
-        async fn recv_from(&mut self) -> CoreResult<ProxyDatagram> {
-            panic!("recv_from is not used in this test")
+        async fn recv(
+            &mut self,
+            _runtime: &DataPlaneRuntime,
+            _frame: &mut BufferFrame,
+            _max: usize,
+        ) -> CoreResult<()> {
+            panic!("recv is not used in this test")
         }
     }
 
     #[tokio::test]
-    async fn packet_conn_send_to_accepts_owned_bytes() {
-        let payload = Bytes::from_static(b"owned udp payload");
-        let expected = payload.clone();
+    async fn packet_conn_send_uses_borrowed_frame() {
+        let runtime = DataPlaneRuntime::with_buffer_capacity(128, 1);
+        let mut frame = runtime.frame_with_capacity(1);
+        let mut metadata = RouteMetadata::default();
+        metadata.destination = Some(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53));
+        frame
+            .push_index(
+                runtime
+                    .alloc_index_with_bytes(metadata, b"borrowed udp payload")
+                    .expect("alloc UDP payload"),
+            )
+            .expect("push UDP payload");
         let mut conn = CapturePacketConn { last: None };
 
-        conn.send_to(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53), payload)
-            .await
-            .expect("send owned payload");
+        conn.send(&runtime, &mut frame).await.expect("send frame");
 
-        assert_eq!(conn.last, Some(expected));
+        assert!(frame.is_empty());
+        assert_eq!(conn.last, Some(b"borrowed udp payload".to_vec()));
+        assert_eq!(runtime.in_use_buffers(), 0);
     }
 }
