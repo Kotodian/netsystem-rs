@@ -199,43 +199,6 @@ impl BufferPool {
         })
     }
 
-    pub fn import(&self, handoff: BufferHandoff) -> CoreResult<BufferHandle> {
-        let mut inner = self.inner.borrow_mut();
-        let mut segments = handoff.segments.into_iter();
-        let first = segments
-            .next()
-            .ok_or_else(|| CoreError::internal("empty buffer handoff"))?;
-        let first_index = inner.alloc_slot(first.metadata, &first.bytes)?;
-        {
-            let buffer = inner.buffer_mut(first_index)?;
-            buffer.flags = first.flags;
-            buffer.current_data = 0;
-            buffer.current_len = first.bytes.len();
-            buffer.data_len = first.bytes.len();
-        }
-
-        let mut tail = first_index;
-        let mut total_tail_len = 0usize;
-        for segment in segments {
-            let next = inner.alloc_slot(RouteMetadata::default(), &segment.bytes)?;
-            {
-                let tail_buffer = inner.buffer_mut(tail)?;
-                tail_buffer.next_buffer = Some(next);
-                tail_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
-            }
-            total_tail_len += segment.bytes.len();
-            tail = next;
-        }
-        inner.buffer_mut(first_index)?.total_len_not_including_first = total_tail_len;
-        drop(inner);
-
-        Ok(BufferHandle {
-            pool: Rc::clone(&self.inner),
-            index: first_index,
-            armed: true,
-        })
-    }
-
     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
         let guard = self.inner.borrow();
         guard.buffer(index)?;
@@ -342,22 +305,6 @@ impl BufferPoolInner {
                 self.free.push(index.slot);
             }
         }
-    }
-
-    fn export_chain(&mut self, index: BufferIndex) -> CoreResult<BufferHandoff> {
-        let mut segments = Vec::new();
-        let mut next = Some(index);
-        while let Some(index) = next {
-            let buffer = self.buffer(index)?;
-            segments.push(BufferHandoffSegment {
-                metadata: buffer.metadata.clone(),
-                flags: buffer.flags,
-                bytes: buffer.current().to_vec(),
-            });
-            next = buffer.next_buffer;
-        }
-        self.free_chain(index);
-        Ok(BufferHandoff { segments })
     }
 
     fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
@@ -508,14 +455,6 @@ impl BufferHandle {
             .copy_current_chain(self.index)
             .expect("live buffer handle points to valid chain")
     }
-
-    pub fn into_handoff(mut self) -> BufferHandoff {
-        self.armed = false;
-        self.pool
-            .borrow_mut()
-            .export_chain(self.index)
-            .expect("live buffer handle exports valid chain")
-    }
 }
 
 impl Drop for BufferHandle {
@@ -545,44 +484,4 @@ impl BufferRef<'_> {
             .expect("buffer ref points to valid buffer")
             .current()
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct BufferHandoff {
-    segments: Vec<BufferHandoffSegment>,
-}
-
-impl BufferHandoff {
-    pub fn current_bytes(&self) -> Vec<u8> {
-        let total_len = self
-            .segments
-            .iter()
-            .map(|segment| segment.bytes.len())
-            .sum();
-        let mut bytes = Vec::with_capacity(total_len);
-        for segment in &self.segments {
-            bytes.extend_from_slice(&segment.bytes);
-        }
-        bytes
-    }
-
-    pub fn into_current_bytes(self) -> Vec<u8> {
-        let total_len = self
-            .segments
-            .iter()
-            .map(|segment| segment.bytes.len())
-            .sum();
-        let mut bytes = Vec::with_capacity(total_len);
-        for segment in self.segments {
-            bytes.extend_from_slice(&segment.bytes);
-        }
-        bytes
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BufferHandoffSegment {
-    metadata: RouteMetadata,
-    flags: BufferFlags,
-    bytes: Vec<u8>,
 }

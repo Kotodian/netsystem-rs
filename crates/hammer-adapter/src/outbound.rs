@@ -9,7 +9,6 @@ use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::RuntimeComponent;
-use crate::buffer::BufferHandoff;
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
 
@@ -28,16 +27,6 @@ pub struct ProxyDatagram {
 #[async_trait]
 pub trait ProxyPacketConn: Send + Sync + 'static {
     async fn send_to(&mut self, destination: SocksAddr, payload: Bytes) -> CoreResult<()>;
-
-    async fn send_buffer_to(
-        &mut self,
-        destination: SocksAddr,
-        buffer: BufferHandoff,
-    ) -> CoreResult<()> {
-        self.send_to(destination, Bytes::from(buffer.into_current_bytes()))
-            .await
-    }
-
     async fn recv_from(&mut self) -> CoreResult<ProxyDatagram>;
 }
 
@@ -86,16 +75,6 @@ pub trait Outbound: Send + Sync + 'static {
         destination: SocksAddr,
         initial_payload: &[u8],
     ) -> CoreResult<Box<dyn ProxyStream>>;
-
-    async fn dial_buffer(
-        &self,
-        network: Network,
-        destination: SocksAddr,
-        buffer: BufferHandoff,
-    ) -> CoreResult<Box<dyn ProxyStream>> {
-        let initial_payload = buffer.into_current_bytes();
-        self.dial(network, destination, &initial_payload).await
-    }
 
     async fn listen_packet(&self) -> CoreResult<Box<dyn ProxyPacketConn>>;
 
