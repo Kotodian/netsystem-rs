@@ -6992,43 +6992,59 @@ final = "direct"
 
     #[tokio::test]
     async fn dns_hijack_workers_process_slow_jobs_concurrently() {
-        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-        let dns_router = BlockingDnsRouter::new(started_tx);
-        let (dns_hijack_tx, dns_hijack_rx) = mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
-        let (tun_write_tx, _tun_write_rx) = mpsc::channel(16);
-        let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+        let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
+            .expect("data runtime");
+        let max_in_flight = data_runtime
+            .context()
+            .enter(|| {
+                crate::spawn::spawn_local(|| async {
+                    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+                    let dns_router = BlockingDnsRouter::new(started_tx);
+                    let (dns_hijack_tx, dns_hijack_rx) =
+                        mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
+                    let (tun_write_tx, _tun_write_rx) = mpsc::channel(16);
+                    let metrics =
+                        TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
-        spawn_dns_hijack_workers(
-            Arc::clone(&dns_router),
-            tun_write_tx,
-            metrics,
-            dns_hijack_rx,
-        );
-        for name in [
-            "one.example.com",
-            "two.example.com",
-            "three.example.com",
-            "four.example.com",
-        ] {
-            dns_hijack_tx
-                .try_send(dns_hijack_job(name))
-                .expect("queue DNS hijack job");
-        }
+                    spawn_dns_hijack_workers(
+                        Arc::clone(&dns_router),
+                        tun_write_tx,
+                        metrics,
+                        dns_hijack_rx,
+                    );
+                    for name in [
+                        "one.example.com",
+                        "two.example.com",
+                        "three.example.com",
+                        "four.example.com",
+                    ] {
+                        dns_hijack_tx
+                            .try_send(dns_hijack_job(name))
+                            .expect("queue DNS hijack job");
+                    }
+                    drop(dns_hijack_tx);
 
-        timeout(Duration::from_millis(50), started_rx.recv())
+                    timeout(Duration::from_millis(50), started_rx.recv())
+                        .await
+                        .expect("first DNS job starts")
+                        .expect("first start event");
+                    timeout(Duration::from_millis(50), started_rx.recv())
+                        .await
+                        .expect("second DNS job starts")
+                        .expect("second start event");
+
+                    let max_in_flight = dns_router.max_in_flight.load(Ordering::Relaxed);
+                    dns_router.release.notify_waiters();
+                    max_in_flight
+                })
+            })
             .await
-            .expect("first DNS job starts")
-            .expect("first start event");
-        timeout(Duration::from_millis(50), started_rx.recv())
-            .await
-            .expect("second DNS job starts")
-            .expect("second start event");
-
+            .expect("dns hijack worker test task");
         assert!(
-            dns_router.max_in_flight.load(Ordering::Relaxed) >= 2,
+            max_in_flight >= 2,
             "DNS workers should process slow exchanges concurrently"
         );
-        dns_router.release.notify_waiters();
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
     #[tokio::test]
