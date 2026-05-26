@@ -27,7 +27,7 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -299,6 +299,19 @@ where
 
 pub struct DataLocalJoinHandle<T> {
     rx: tokio::sync::oneshot::Receiver<T>,
+    cancel: Arc<DataLocalCancel>,
+}
+
+struct DataLocalCancel {
+    cancelled: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl<T> DataLocalJoinHandle<T> {
+    pub fn abort(&mut self) {
+        self.cancel.cancelled.store(true, Ordering::Release);
+        self.cancel.notify.notify_waiters();
+    }
 }
 
 impl<T> Unpin for DataLocalJoinHandle<T> {}
@@ -323,14 +336,23 @@ where
         .local_tx
         .expect("data local spawn requires a DataRuntime worker");
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let cancel = Arc::new(DataLocalCancel {
+        cancelled: AtomicBool::new(false),
+        notify: tokio::sync::Notify::new(),
+    });
     let task_context = context.clone();
     let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+    let task_cancel = Arc::clone(&cancel);
     let task: LocalTaskFactory = Box::new(move || {
         Box::pin(
             TASK_DATA_CONTEXT
                 .scope(task_context, async move {
-                    let output = factory().await;
-                    let _ = tx.send(output);
+                    tokio::select! {
+                        output = factory() => {
+                            let _ = tx.send(output);
+                        }
+                        _ = wait_data_local_cancel(task_cancel) => {}
+                    }
                 })
                 .with_subscriber(dispatcher),
         )
@@ -338,7 +360,16 @@ where
     local_tx
         .send(task)
         .expect("data local worker stopped before task was queued");
-    DataLocalJoinHandle { rx }
+    DataLocalJoinHandle { rx, cancel }
+}
+
+async fn wait_data_local_cancel(cancel: Arc<DataLocalCancel>) {
+    loop {
+        if cancel.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        cancel.notify.notified().await;
+    }
 }
 
 pub fn spawn_current_local<F>(future: F) -> JoinHandle<F::Output>
@@ -569,6 +600,66 @@ mod tests {
         assert_eq!(thread_before, "spawn-test-current-local-0");
         assert_eq!(thread_after, "spawn-test-current-local-0");
         assert_eq!(payload, b"packet");
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_local_spawn_abort_stops_pending_task() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-abort-local", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        context.enter(|| {
+            driver.block_on(async {
+                let mut task = spawn_local(|| async {
+                    std::future::pending::<()>().await;
+                    1usize
+                });
+                task.abort();
+                let result = tokio::time::timeout(Duration::from_secs(1), task)
+                    .await
+                    .expect("aborted local task should finish");
+                assert!(
+                    result.is_err(),
+                    "aborted local task must not produce output"
+                );
+            })
+        });
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn dropping_data_local_handle_does_not_abort_task() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-drop-local", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        context.enter(|| {
+            driver.block_on(async {
+                let (tx, rx) = oneshot::channel();
+                let task = spawn_local(move || async move {
+                    tokio::task::yield_now().await;
+                    let _ = tx.send(());
+                });
+                drop(task);
+                tokio::time::timeout(Duration::from_secs(1), rx)
+                    .await
+                    .expect("dropped local handle should not abort task")
+                    .expect("local task should send completion");
+            })
+        });
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

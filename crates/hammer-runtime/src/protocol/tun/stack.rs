@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::ops::Range;
 use std::os::fd::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant as StdInstant;
@@ -17,8 +18,9 @@ use etherparse::{
 #[cfg(feature = "endpoint")]
 use hammer_adapter::Endpoint as EndpointTrait;
 use hammer_adapter::{
-    DnsQueryOptions, DnsRouter as DnsRouterTrait, Network, OutboundManager as OutboundManagerTrait,
-    ProxyStream, RouteDecision, RouteMetadata, RouteTarget, Router as RouterTrait, SocksAddr,
+    BufferHandle, DnsQueryOptions, DnsRouter as DnsRouterTrait, Network,
+    OutboundManager as OutboundManagerTrait, ProxyStream, RouteDecision, RouteMetadata,
+    RouteTarget, Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::normalize_domain;
 use hammer_core::error::{HammerError, HammerResult};
@@ -547,8 +549,23 @@ struct UdpFlowState {
 }
 
 type UdpFlowMap = HashMap<UdpFlowKey, UdpFlowState>;
+type UdpFlowMapRef = Rc<std::cell::RefCell<UdpFlowMap>>;
 
-type UdpFlowPayload = Bytes;
+type UdpFlowPayload = BufferHandle;
+
+enum TunTaskHandle {
+    Send(JoinHandle<()>),
+    Local(crate::spawn::DataLocalJoinHandle<()>),
+}
+
+impl TunTaskHandle {
+    fn abort(&mut self) {
+        match self {
+            Self::Send(task) => task.abort(),
+            Self::Local(task) => task.abort(),
+        }
+    }
+}
 
 #[cfg(feature = "endpoint")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1099,14 +1116,13 @@ where
     device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
     tcp_pending_dials: TcpPendingDialLimiter,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
     /// L3 endpoints (WireGuard today) registered for the fast path. The
     /// service builder injects these via `set_endpoints` before `start`
     /// so the packet loop can build its dispatch table.
     #[cfg(feature = "endpoint")]
     endpoints: StdMutex<Vec<Arc<dyn EndpointTrait>>>,
     tun_interface_index: Option<u32>,
-    tasks: StdMutex<Vec<JoinHandle<()>>>,
+    tasks: StdMutex<Vec<TunTaskHandle>>,
     started: AtomicBool,
     metrics: TunMetrics,
 }
@@ -1156,7 +1172,6 @@ where
             device,
             tcp_nat: Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(udp_timeout))),
             tcp_pending_dials: TcpPendingDialLimiter::new(SYSTEM_TCP_PENDING_DIAL_CAPACITY),
-            udp_flows: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(feature = "endpoint")]
             endpoints: StdMutex::new(Vec::new()),
             tun_interface_index,
@@ -1194,7 +1209,7 @@ where
                 .map_err(|err| HammerError::internal(format!("read IPv4 listener addr: {err}")))?
                 .port();
             info!("system stack TCP listener {}:{port}", v4.listener);
-            handles.push(crate::spawn::spawn(accept_tcp_loop(
+            handles.push(TunTaskHandle::Send(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
                 Arc::clone(&self.dns_router),
@@ -1204,7 +1219,7 @@ where
                 self.inbound_id.clone(),
                 listener,
                 self.metrics.clone(),
-            )));
+            ))));
             routes.v4 = Some(SystemStackRoute {
                 listener_addr: IpAddr::V4(v4.listener),
                 nat_addr: IpAddr::V4(v4.next),
@@ -1221,7 +1236,7 @@ where
                 .map_err(|err| HammerError::internal(format!("read IPv6 listener addr: {err}")))?
                 .port();
             info!("system stack TCP listener [{}]:{port}", v6.listener);
-            handles.push(crate::spawn::spawn(accept_tcp_loop(
+            handles.push(TunTaskHandle::Send(crate::spawn::spawn(accept_tcp_loop(
                 self.logger.clone(),
                 Arc::clone(&self.router),
                 Arc::clone(&self.dns_router),
@@ -1231,7 +1246,7 @@ where
                 self.inbound_id.clone(),
                 listener,
                 self.metrics.clone(),
-            )));
+            ))));
             routes.v6 = Some(SystemStackRoute {
                 listener_addr: IpAddr::V6(v6.listener),
                 nat_addr: IpAddr::V6(v6.next),
@@ -1255,23 +1270,34 @@ where
                 }
             }
         };
-        handles.push(crate::spawn::spawn(packet_loop(
-            self.logger.clone(),
-            Arc::clone(&self.router),
-            Arc::clone(&self.dns_router),
-            Arc::clone(&self.outbound),
-            self.inbound_id.clone(),
-            Arc::clone(&self.device),
-            Arc::clone(&self.tcp_nat),
-            Arc::clone(&self.udp_flows),
-            routes,
-            #[cfg(feature = "endpoint")]
-            endpoint_dispatch,
-            self.options
-                .udp_timeout
-                .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT),
-            self.metrics.clone(),
-        )));
+        let logger = self.logger.clone();
+        let router = Arc::clone(&self.router);
+        let dns_router = Arc::clone(&self.dns_router);
+        let outbound = Arc::clone(&self.outbound);
+        let inbound_id = self.inbound_id.clone();
+        let device = Arc::clone(&self.device);
+        let tcp_nat = Arc::clone(&self.tcp_nat);
+        let udp_timeout = self
+            .options
+            .udp_timeout
+            .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
+        let metrics = self.metrics.clone();
+        handles.push(TunTaskHandle::Local(crate::spawn::spawn_local(move || {
+            packet_loop(
+                logger,
+                router,
+                dns_router,
+                outbound,
+                inbound_id,
+                device,
+                tcp_nat,
+                routes,
+                #[cfg(feature = "endpoint")]
+                endpoint_dispatch,
+                udp_timeout,
+                metrics,
+            )
+        })));
         self.tasks
             .lock()
             .expect("SystemTunStack tasks poisoned")
@@ -1282,16 +1308,13 @@ where
 
     pub fn close(&self) {
         self.device.close();
-        for task in self
+        for mut task in self
             .tasks
             .lock()
             .expect("SystemTunStack tasks poisoned")
             .drain(..)
         {
             task.abort();
-        }
-        if let Ok(mut flows) = self.udp_flows.try_lock() {
-            flows.clear();
         }
     }
 }
@@ -3370,7 +3393,6 @@ async fn packet_loop<D, R, Q, O>(
     inbound_id: String,
     device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
     routes: SystemStackRoutes,
     #[cfg(feature = "endpoint")] endpoint_dispatch: Option<Arc<L3DispatchTable>>,
     udp_timeout: Duration,
@@ -3381,6 +3403,7 @@ async fn packet_loop<D, R, Q, O>(
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
+    let udp_flows: UdpFlowMapRef = Rc::new(std::cell::RefCell::new(HashMap::new()));
     packet_loop_with_tcp_sink(
         router,
         dns_router,
@@ -3407,7 +3430,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
     inbound_id: String,
     device: Arc<D>,
     tcp_nat: Arc<StdMutex<SystemTcpNat>>,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    udp_flows: UdpFlowMapRef,
     routes: SystemStackRoutes,
     mode: TunPacketLoopMode<D>,
     #[cfg(feature = "endpoint")] endpoint_dispatch: Option<Arc<L3DispatchTable>>,
@@ -3577,7 +3600,12 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                     if parsed.network == Network::Udp {
                         let key = UdpFlowKey::from_parsed(&parsed);
                         match try_enqueue_existing_udp_flow(
-                            &udp_flows, &key, &packet, &parsed, &metrics,
+                            &udp_flows,
+                            &inbound_id,
+                            &key,
+                            &packet,
+                            &parsed,
+                            &metrics,
                         ) {
                             Ok(true) => continue,
                             Ok(false) => {}
@@ -3733,7 +3761,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
                 Arc::clone(&dns_router),
                 Arc::clone(&outbound),
                 inbound_id.clone(),
-                Arc::clone(&udp_flows),
+                Rc::clone(&udp_flows),
                 &dns_hijack_tx,
                 &tun_write_tx,
                 udp_timeout,
@@ -3758,7 +3786,7 @@ fn handle_system_udp_packet<R, Q, O>(
     dns_router: Arc<Q>,
     outbound: Arc<O>,
     inbound_id: String,
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    udp_flows: UdpFlowMapRef,
     dns_hijack_tx: &mpsc::Sender<DnsHijackJob>,
     tun_write_tx: &mpsc::Sender<TunWriteItem>,
     udp_timeout: Duration,
@@ -3772,27 +3800,31 @@ where
     O: OutboundManagerTrait + 'static,
 {
     let key = UdpFlowKey::from_parsed(&parsed);
-    if try_enqueue_existing_udp_flow(&udp_flows, &key, &packet, &parsed, &metrics)? {
+    if try_enqueue_existing_udp_flow(&udp_flows, &inbound_id, &key, &packet, &parsed, &metrics)? {
         return Ok(());
     }
 
-    let mut metadata = RouteMetadata {
+    let metadata = RouteMetadata {
         inbound: inbound_id,
         network: Network::Udp,
         source: Some(parsed.source.clone()),
         destination: Some(parsed.destination.clone()),
         ..Default::default()
     };
-    if router.should_sniff(&metadata) {
-        sniff_packet_metadata(&mut metadata, parsed.payload(&packet)?);
-    }
-    if let Err(err) =
-        prepare_route_metadata(router.as_ref(), &mut metadata, Some(dns_router.as_ref()))
-    {
+    let buffer = crate::spawn::with_data_buffer_pool(|pool| {
+        pool.alloc_with_bytes(metadata, parsed.payload(&packet)?)
+    })?;
+    let payload = buffer.current();
+    if let Err(err) = buffer.with_metadata_mut(|metadata| {
+        if router.should_sniff(metadata) {
+            sniff_packet_metadata(metadata, &payload);
+        }
+        prepare_route_metadata(router.as_ref(), metadata, Some(dns_router.as_ref()))
+    }) {
         metrics.counters.udp_route_prepare_error_total.increment(1);
         return Err(err);
     }
-    let decision = match router.match_route(&mut metadata) {
+    let decision = match buffer.with_metadata_mut(|metadata| router.match_route(metadata)) {
         Ok(decision) => decision,
         Err(err) => {
             metrics.route_error_total.inc(Network::Udp);
@@ -3801,7 +3833,8 @@ where
     };
     match decision {
         RouteDecision::HijackDns => {
-            let message = match <Message as MessageExt>::from_bytes(parsed.payload(&packet)?) {
+            let metadata = buffer.metadata();
+            let message = match <Message as MessageExt>::from_bytes(&payload) {
                 Ok(message) => message,
                 Err(err) => {
                     metrics.counters.udp_dns_error_total.increment(1);
@@ -3831,6 +3864,7 @@ where
         }
         RouteDecision::Reject { method } => {
             metrics.reject_total.inc(Network::Udp);
+            let metadata = buffer.metadata();
             let message = format!(
                 "drop UDP packet by reject rule: method={}, destination={}, protocol={}",
                 method, parsed.destination, metadata.protocol
@@ -3853,6 +3887,7 @@ where
                     "outbound not found: {outbound_id}"
                 )));
             };
+            let metadata = buffer.metadata();
             let destination = route_destination(&metadata, Some(dns_router.as_ref()))?;
             if metadata.domain.is_some() || outbound_id == "direct" {
                 debug!(
@@ -3870,7 +3905,7 @@ where
             let template = UdpResponseTemplate::from_request(&packet)?;
             let mut start_flow = None;
             let sender = {
-                let mut flows = udp_flows.lock().expect("udp_flows poisoned");
+                let mut flows = udp_flows.borrow_mut();
                 if let Some(flow) = flows.get_mut(&key) {
                     flow.last_active = Instant::now();
                     flow.sender.clone()
@@ -3886,7 +3921,7 @@ where
                         },
                     );
                     start_flow = Some((
-                        Arc::clone(&udp_flows),
+                        Rc::clone(&udp_flows),
                         key.clone(),
                         Arc::clone(outbound_item.runtime()),
                         destination,
@@ -3899,11 +3934,11 @@ where
                     tx
                 }
             };
-            match enqueue_udp_payload(&sender, &packet, &parsed, &metrics)? {
+            match enqueue_udp_payload(&sender, buffer, &metrics)? {
                 UdpPayloadEnqueueResult::Enqueued => {}
                 UdpPayloadEnqueueResult::Full => {}
                 UdpPayloadEnqueueResult::Closed => {
-                    udp_flows.lock().expect("udp_flows poisoned").remove(&key);
+                    udp_flows.borrow_mut().remove(&key);
                     debug!("drop UDP packet for closed system flow: outbound={outbound_id}");
                 }
             }
@@ -3919,7 +3954,7 @@ where
                 metrics,
             )) = start_flow
             {
-                crate::spawn::spawn(system_udp_flow_loop(
+                crate::spawn::spawn_current_local(system_udp_flow_loop(
                     udp_flows,
                     key,
                     outbound_item,
@@ -3951,14 +3986,15 @@ enum UdpPayloadEnqueueResult {
 }
 
 fn try_enqueue_existing_udp_flow(
-    udp_flows: &StdMutex<UdpFlowMap>,
+    udp_flows: &UdpFlowMapRef,
+    inbound_id: &str,
     key: &UdpFlowKey,
     packet: &[u8],
     parsed: &ParsedIpPacketView,
     metrics: &TunMetrics,
 ) -> HammerResult<bool> {
     let Some((sender, outbound)) = ({
-        let mut flows = udp_flows.lock().expect("udp_flows poisoned");
+        let mut flows = udp_flows.borrow_mut();
         flows.get_mut(key).map(|flow| {
             flow.last_active = Instant::now();
             (flow.sender.clone(), flow.outbound.clone())
@@ -3967,11 +4003,22 @@ fn try_enqueue_existing_udp_flow(
         return Ok(false);
     };
 
-    match enqueue_udp_payload(&sender, packet, parsed, metrics)? {
+    let metadata = RouteMetadata {
+        inbound: inbound_id.to_owned(),
+        network: Network::Udp,
+        source: Some(parsed.source.clone()),
+        destination: Some(parsed.destination.clone()),
+        ..Default::default()
+    };
+    let buffer = crate::spawn::with_data_buffer_pool(|pool| {
+        pool.alloc_with_bytes(metadata, parsed.payload(packet)?)
+    })?;
+
+    match enqueue_udp_payload(&sender, buffer, metrics)? {
         UdpPayloadEnqueueResult::Enqueued => Ok(true),
         UdpPayloadEnqueueResult::Full => Ok(true),
         UdpPayloadEnqueueResult::Closed => {
-            udp_flows.lock().expect("udp_flows poisoned").remove(key);
+            udp_flows.borrow_mut().remove(key);
             debug!("remove closed system UDP flow before slow path: outbound={outbound}");
             Ok(false)
         }
@@ -3980,14 +4027,12 @@ fn try_enqueue_existing_udp_flow(
 
 fn enqueue_udp_payload(
     sender: &mpsc::Sender<UdpFlowPayload>,
-    packet: &[u8],
-    parsed: &ParsedIpPacketView,
+    buffer: BufferHandle,
     metrics: &TunMetrics,
 ) -> HammerResult<UdpPayloadEnqueueResult> {
     match sender.try_reserve() {
         Ok(permit) => {
-            let payload = Bytes::copy_from_slice(parsed.payload(packet)?);
-            permit.send(payload);
+            permit.send(buffer);
             Ok(UdpPayloadEnqueueResult::Enqueued)
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -4318,7 +4363,7 @@ fn normalize_destination_domain(domain: &str) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn system_udp_flow_loop(
-    udp_flows: Arc<StdMutex<UdpFlowMap>>,
+    udp_flows: UdpFlowMapRef,
     key: UdpFlowKey,
     outbound: Arc<dyn hammer_adapter::Outbound>,
     destination: SocksAddr,
@@ -4333,7 +4378,7 @@ async fn system_udp_flow_loop(
         Err(err) => {
             metrics.counters.udp_listen_error_total.increment(1);
             debug!("listen system UDP outbound: {err}");
-            udp_flows.lock().expect("udp_flows poisoned").remove(&key);
+            udp_flows.borrow_mut().remove(&key);
             return;
         }
     };
@@ -4346,7 +4391,8 @@ async fn system_udp_flow_loop(
                     break;
                 };
                 idle_timer.as_mut().reset(Instant::now() + udp_timeout);
-                if let Err(err) = packet_conn.send_to(destination.clone(), item).await {
+                let payload = Bytes::from(item.copy_current_chain());
+                if let Err(err) = packet_conn.send_to(destination.clone(), payload).await {
                     metrics.counters.udp_flow_send_error_total.increment(1);
                     debug!("send system UDP outbound: {err}");
                     break;
@@ -4375,7 +4421,7 @@ async fn system_udp_flow_loop(
             }
         }
     }
-    udp_flows.lock().expect("udp_flows poisoned").remove(&key);
+    udp_flows.borrow_mut().remove(&key);
 }
 
 fn evict_udp_flow_if_needed(flows: &mut UdpFlowMap, metrics: &TunMetrics) {
@@ -6416,22 +6462,28 @@ mod tests {
         ]]);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
-        let task = crate::spawn::spawn(packet_loop(
-            test_logger("tun"),
-            router.clone(),
-            Arc::new(StubDnsRouter),
-            Arc::new(StubOutboundManager),
-            "tun".to_owned(),
-            Arc::clone(&device),
-            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
-                DEFAULT_SYSTEM_UDP_TIMEOUT,
-            ))),
-            Arc::new(StdMutex::new(HashMap::new())),
-            SystemStackRoutes::default(),
-            dispatch,
-            DEFAULT_SYSTEM_UDP_TIMEOUT,
-            metrics,
-        ));
+        let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
+            .expect("data runtime");
+        let loop_router = Arc::clone(&router);
+        let mut task = data_runtime.context().enter(|| {
+            crate::spawn::spawn_local(move || {
+                packet_loop(
+                    test_logger("tun"),
+                    loop_router,
+                    Arc::new(StubDnsRouter),
+                    Arc::new(StubOutboundManager),
+                    "tun".to_owned(),
+                    Arc::clone(&device),
+                    Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                        DEFAULT_SYSTEM_UDP_TIMEOUT,
+                    ))),
+                    SystemStackRoutes::default(),
+                    dispatch,
+                    DEFAULT_SYSTEM_UDP_TIMEOUT,
+                    metrics,
+                )
+            })
+        });
 
         let first = timeout(Duration::from_millis(50), endpoint_rx.recv())
             .await
@@ -6456,6 +6508,7 @@ mod tests {
             "second packet in the same TCP flow must use the endpoint pin"
         );
         task.abort();
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
     #[cfg(feature = "endpoint")]
@@ -6470,19 +6523,6 @@ mod tests {
             },
         });
         let packet = udp_packet(5353, 443, b"quic-late");
-        let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
-        let key = UdpFlowKey::from_parsed(&parsed);
-        let (flow_tx, mut flow_rx) = mpsc::channel(4);
-        let mut flows = HashMap::new();
-        flows.insert(
-            key,
-            UdpFlowState {
-                sender: flow_tx,
-                last_active: Instant::now(),
-                outbound: "direct".to_owned(),
-            },
-        );
-        let udp_flows = Arc::new(StdMutex::new(flows));
         let (endpoint_tx, mut endpoint_rx) = mpsc::channel(4);
         let endpoint: Arc<dyn EndpointTrait> = Arc::new(RecordingEndpoint {
             tx: endpoint_tx,
@@ -6500,33 +6540,61 @@ mod tests {
             &[endpoint],
             &addresses,
         )));
-        let device = ScriptedBatchTunDevice::new(vec![vec![packet]]);
+        let device = ScriptedBatchTunDevice::new(vec![vec![packet.clone()]]);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
-        let task = crate::spawn::spawn(packet_loop(
-            test_logger("tun"),
-            router.clone(),
-            Arc::new(StubDnsRouter),
-            Arc::new(StubOutboundManager),
-            "tun".to_owned(),
-            Arc::clone(&device),
-            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
-                DEFAULT_SYSTEM_UDP_TIMEOUT,
-            ))),
-            udp_flows,
-            SystemStackRoutes::default(),
-            dispatch,
-            DEFAULT_SYSTEM_UDP_TIMEOUT,
-            metrics,
-        ));
+        let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
+            .expect("data runtime");
+        let loop_router = Arc::clone(&router);
+        let loop_device = Arc::clone(&device);
+        let payload = data_runtime
+            .context()
+            .enter(|| {
+                crate::spawn::spawn_local(move || async move {
+                    let parsed = parse_ip_packet_view(&packet).expect("parse UDP packet");
+                    let key = UdpFlowKey::from_parsed(&parsed);
+                    let (flow_tx, mut flow_rx) = mpsc::channel(4);
+                    let mut flows = HashMap::new();
+                    flows.insert(
+                        key,
+                        UdpFlowState {
+                            sender: flow_tx,
+                            last_active: Instant::now(),
+                            outbound: "direct".to_owned(),
+                        },
+                    );
+                    let udp_flows = Rc::new(std::cell::RefCell::new(flows));
+                    let task = crate::spawn::spawn_current_local(packet_loop_with_tcp_sink(
+                        loop_router,
+                        Arc::new(StubDnsRouter),
+                        Arc::new(StubOutboundManager),
+                        "tun".to_owned(),
+                        Arc::clone(&loop_device),
+                        Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                            DEFAULT_SYSTEM_UDP_TIMEOUT,
+                        ))),
+                        udp_flows,
+                        SystemStackRoutes::default(),
+                        TunPacketLoopMode::System {
+                            device: loop_device,
+                        },
+                        dispatch,
+                        DEFAULT_SYSTEM_UDP_TIMEOUT,
+                        metrics,
+                    ));
+                    let payload = timeout(Duration::from_millis(50), flow_rx.recv())
+                        .await
+                        .expect("system flow payload")
+                        .expect("system flow payload")
+                        .copy_current_chain();
+                    task.abort();
+                    payload
+                })
+            })
+            .await
+            .expect("local packet loop task");
 
-        assert_eq!(
-            timeout(Duration::from_millis(50), flow_rx.recv())
-                .await
-                .expect("system flow payload")
-                .expect("system flow payload"),
-            Bytes::from_static(b"quic-late")
-        );
+        assert_eq!(payload, b"quic-late");
         if let Ok(Some(packet)) = timeout(Duration::from_millis(20), endpoint_rx.recv()).await {
             panic!(
                 "existing system UDP flow must not be diverted into endpoint dispatch: {} bytes",
@@ -6535,7 +6603,7 @@ mod tests {
         }
         assert_eq!(router.should_sniff_calls.load(Ordering::Relaxed), 0);
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
-        task.abort();
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
     fn dns_hijack_job(name: &str) -> DnsHijackJob {
@@ -6601,23 +6669,29 @@ final = "direct"
         let device = ScriptedBatchTunDevice::new(vec![vec![dns_query_packet("example.com")]]);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
-        let task = crate::spawn::spawn(packet_loop(
-            test_logger("tun"),
-            router,
-            dns_router,
-            outbound,
-            "tun".to_owned(),
-            Arc::clone(&device),
-            Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
-                DEFAULT_SYSTEM_UDP_TIMEOUT,
-            ))),
-            Arc::new(StdMutex::new(HashMap::new())),
-            SystemStackRoutes::default(),
-            #[cfg(feature = "endpoint")]
-            None,
-            DEFAULT_SYSTEM_UDP_TIMEOUT,
-            metrics,
-        ));
+        let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
+            .expect("data runtime");
+        let loop_device = Arc::clone(&device);
+        let mut task = data_runtime.context().enter(|| {
+            crate::spawn::spawn_local(move || {
+                packet_loop(
+                    test_logger("tun"),
+                    router,
+                    dns_router,
+                    outbound,
+                    "tun".to_owned(),
+                    loop_device,
+                    Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                        DEFAULT_SYSTEM_UDP_TIMEOUT,
+                    ))),
+                    SystemStackRoutes::default(),
+                    #[cfg(feature = "endpoint")]
+                    None,
+                    DEFAULT_SYSTEM_UDP_TIMEOUT,
+                    metrics,
+                )
+            })
+        });
 
         timeout(
             Duration::from_millis(50),
@@ -6626,6 +6700,7 @@ final = "direct"
         .await
         .expect("packet loop should keep reading while DNS hijack is still pending");
         task.abort();
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -6711,7 +6786,7 @@ final = "direct"
             Arc::clone(&dns_router),
             outbound,
             "tun".to_owned(),
-            Arc::new(StdMutex::new(HashMap::new())),
+            Rc::new(std::cell::RefCell::new(HashMap::new())),
             &dns_hijack_tx,
             &control_write_tx,
             DEFAULT_SYSTEM_UDP_TIMEOUT,
@@ -6867,7 +6942,7 @@ final = "direct"
                 outbound: "hysteria2".to_owned(),
             },
         );
-        let udp_flows = Arc::new(StdMutex::new(flows));
+        let udp_flows = Rc::new(std::cell::RefCell::new(flows));
         let router = CountingRouter::rejecting();
         let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
         let (control_write_tx, _control_write_rx) = mpsc::channel(1);
@@ -6895,8 +6970,9 @@ final = "direct"
             timeout(Duration::from_millis(50), rx.recv())
                 .await
                 .expect("flow payload")
-                .expect("flow payload"),
-            b"quic".to_vec()
+                .expect("flow payload")
+                .copy_current_chain(),
+            b"quic"
         );
     }
 
@@ -6909,8 +6985,11 @@ final = "direct"
             destination: (parsed.destination.host, parsed.destination.port),
         };
         let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(Bytes::from_static(b"queued"))
-            .expect("fill flow queue");
+        let queued = crate::spawn::with_data_buffer_pool(|pool| {
+            pool.alloc_with_bytes(RouteMetadata::default(), b"queued")
+        })
+        .expect("alloc queued UDP payload");
+        tx.try_send(queued).expect("fill flow queue");
         let mut flows = HashMap::new();
         flows.insert(
             key,
@@ -6920,7 +6999,7 @@ final = "direct"
                 outbound: "hysteria2".to_owned(),
             },
         );
-        let udp_flows = Arc::new(StdMutex::new(flows));
+        let udp_flows = Rc::new(std::cell::RefCell::new(flows));
         let router = CountingRouter::rejecting();
         let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
         let (control_write_tx, _control_write_rx) = mpsc::channel(1);
@@ -6943,7 +7022,9 @@ final = "direct"
 
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
-            rx.try_recv().expect("original queued payload").as_ref(),
+            rx.try_recv()
+                .expect("original queued payload")
+                .copy_current_chain(),
             b"queued"
         );
         assert!(
@@ -6971,7 +7052,7 @@ final = "direct"
                 outbound: "hysteria2".to_owned(),
             },
         );
-        let udp_flows = Arc::new(StdMutex::new(flows));
+        let udp_flows = Rc::new(std::cell::RefCell::new(flows));
         let router = CountingRouter::rejecting();
         let (dns_hijack_tx, _dns_hijack_rx) = mpsc::channel(1);
         let (control_write_tx, _control_write_rx) = mpsc::channel(1);
@@ -6982,7 +7063,7 @@ final = "direct"
             Arc::new(StubDnsRouter),
             Arc::new(StubOutboundManager),
             "tun".to_owned(),
-            Arc::clone(&udp_flows),
+            Rc::clone(&udp_flows),
             &dns_hijack_tx,
             &control_write_tx,
             DEFAULT_SYSTEM_UDP_TIMEOUT,
@@ -6994,7 +7075,7 @@ final = "direct"
 
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 1);
         assert!(
-            !udp_flows.lock().expect("udp flows").contains_key(&key),
+            !udp_flows.borrow().contains_key(&key),
             "closed existing flow must be removed before slow path"
         );
     }
