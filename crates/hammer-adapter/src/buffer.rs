@@ -522,6 +522,34 @@ pub struct BufferHandoff {
     segments: Vec<BufferHandoffSegment>,
 }
 
+impl BufferHandoff {
+    pub fn current_bytes(&self) -> Vec<u8> {
+        let total_len = self
+            .segments
+            .iter()
+            .map(|segment| segment.bytes.len())
+            .sum();
+        let mut bytes = Vec::with_capacity(total_len);
+        for segment in &self.segments {
+            bytes.extend_from_slice(&segment.bytes);
+        }
+        bytes
+    }
+
+    pub fn into_current_bytes(self) -> Vec<u8> {
+        let total_len = self
+            .segments
+            .iter()
+            .map(|segment| segment.bytes.len())
+            .sum();
+        let mut bytes = Vec::with_capacity(total_len);
+        for segment in self.segments {
+            bytes.extend_from_slice(&segment.bytes);
+        }
+        bytes
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BufferHandoffSegment {
     metadata: RouteMetadata,
