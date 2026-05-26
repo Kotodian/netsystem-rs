@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{Tunn, TunnResult, TunnTimerResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 
@@ -47,6 +47,13 @@ pub enum TimerName {
 }
 
 use self::TimerName::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimerDecision {
+    None,
+    HandshakeInitiation,
+    Keepalive,
+}
 
 #[derive(Debug)]
 pub struct Timers {
@@ -165,7 +172,7 @@ impl Tunn {
         }
     }
 
-    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+    fn update_timer_decision(&mut self) -> Result<TimerDecision, WireGuardError> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
@@ -193,7 +200,7 @@ impl Tunn {
 
         {
             if self.handshake.is_expired() {
-                return TunnResult::Err(WireGuardError::ConnectionExpired);
+                return Err(WireGuardError::ConnectionExpired);
             }
 
             // Clear cookie after COOKIE_EXPIRATION_TIME
@@ -209,7 +216,7 @@ impl Tunn {
                 tracing::error!("CONNECTION_EXPIRED(REJECT_AFTER_TIME * 3)");
                 self.handshake.set_expired();
                 self.clear_all();
-                return TunnResult::Err(WireGuardError::ConnectionExpired);
+                return Err(WireGuardError::ConnectionExpired);
             }
 
             if let Some(time_init_sent) = self.handshake.timer() {
@@ -222,7 +229,7 @@ impl Tunn {
                     tracing::error!("CONNECTION_EXPIRED(REKEY_ATTEMPT_TIME)");
                     self.handshake.set_expired();
                     self.clear_all();
-                    return TunnResult::Err(WireGuardError::ConnectionExpired);
+                    return Err(WireGuardError::ConnectionExpired);
                 }
 
                 if time_init_sent.elapsed() >= REKEY_TIMEOUT {
@@ -301,14 +308,57 @@ impl Tunn {
         }
 
         if handshake_initiation_required {
-            return self.format_handshake_initiation(dst, true);
+            return Ok(TimerDecision::HandshakeInitiation);
         }
 
         if keepalive_required {
-            return self.encapsulate(&[], dst);
+            return Ok(TimerDecision::Keepalive);
         }
 
-        TunnResult::Done
+        Ok(TimerDecision::None)
+    }
+
+    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        match self.update_timer_decision() {
+            Ok(TimerDecision::None) => TunnResult::Done,
+            Ok(TimerDecision::HandshakeInitiation) => self.format_handshake_initiation(dst, true),
+            Ok(TimerDecision::Keepalive) => self.encapsulate(&[], dst),
+            Err(err) => TunnResult::Err(err),
+        }
+    }
+
+    pub fn update_timers_control<'a>(&mut self, dst: &'a mut [u8]) -> TunnTimerResult<'a> {
+        match self.update_timer_decision() {
+            Ok(TimerDecision::None) => TunnTimerResult::Done,
+            Ok(TimerDecision::HandshakeInitiation) => {
+                match self.format_handshake_initiation(dst, true) {
+                    TunnResult::WriteToNetwork(packet) => TunnTimerResult::WriteToNetwork(packet),
+                    TunnResult::Done => TunnTimerResult::Done,
+                    TunnResult::Err(err) => TunnTimerResult::Err(err),
+                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                        TunnTimerResult::Done
+                    }
+                }
+            }
+            Ok(TimerDecision::Keepalive) => TunnTimerResult::SendKeepalive,
+            Err(err) => TunnTimerResult::Err(err),
+        }
+    }
+
+    pub fn record_data_plane_packet_sent(&mut self, plaintext_len: usize) {
+        self.timer_tick(TimeLastPacketSent);
+        if plaintext_len > 0 {
+            self.timer_tick(TimeLastDataPacketSent);
+            self.tx_bytes += plaintext_len;
+        }
+    }
+
+    pub fn record_data_plane_packet_received(&mut self, plaintext_len: usize) {
+        self.timer_tick(TimeLastPacketReceived);
+        if plaintext_len > 0 {
+            self.timer_tick(TimeLastDataPacketReceived);
+            self.rx_bytes += plaintext_len;
+        }
     }
 
     pub fn time_since_last_handshake(&self) -> Option<Duration> {

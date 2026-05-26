@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
+    receiving_key: [u8; 32],
+    sending_key: [u8; 32],
     receiver: LessSafeKey,
     sender: LessSafeKey,
     sending_key_counter: AtomicUsize,
@@ -152,6 +154,10 @@ impl ReceivingKeyCounterValidator {
 }
 
 impl Session {
+    fn less_safe_key(key: &[u8; 32]) -> LessSafeKey {
+        LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap())
+    }
+
     pub(super) fn new(
         local_index: u32,
         peer_index: u32,
@@ -161,12 +167,27 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            receiving_key,
+            sending_key,
+            receiver: Self::less_safe_key(&receiving_key),
+            sender: Self::less_safe_key(&sending_key),
             sending_key_counter: AtomicUsize::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
+        }
+    }
+
+    pub(super) fn fork(&self) -> Session {
+        Session {
+            receiving_index: self.receiving_index,
+            sending_index: self.sending_index,
+            receiving_key: self.receiving_key,
+            sending_key: self.sending_key,
+            receiver: Self::less_safe_key(&self.receiving_key),
+            sender: Self::less_safe_key(&self.sending_key),
+            sending_key_counter: AtomicUsize::new(
+                self.sending_key_counter.load(Ordering::Relaxed),
+            ),
+            receiving_key_counter: Mutex::new(self.receiving_key_counter.lock().clone()),
         }
     }
 

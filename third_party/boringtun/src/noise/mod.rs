@@ -93,6 +93,70 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
     }
 }
 
+#[derive(Debug)]
+pub struct DataSession {
+    inner: session::Session,
+}
+
+impl DataSession {
+    fn from_session(session: session::Session) -> Self {
+        Self { inner: session }
+    }
+
+    pub fn local_index(&self) -> usize {
+        self.inner.local_index()
+    }
+
+    pub fn receiving_index(&self) -> u32 {
+        self.inner.receiving_index
+    }
+
+    pub fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
+        self.inner.format_packet_data(src, dst)
+    }
+
+    pub fn receive_packet_data<'a>(
+        &self,
+        packet: PacketData,
+        dst: &'a mut [u8],
+    ) -> Result<&'a mut [u8], WireGuardError> {
+        self.inner.receive_packet_data(packet, dst)
+    }
+
+    pub fn current_packet_cnt(&self) -> (u64, u64) {
+        self.inner.current_packet_cnt()
+    }
+}
+
+#[derive(Debug)]
+pub enum TunnControlResult<'a> {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(&'a mut [u8]),
+    WriteToNetworkAndInstallSession {
+        packet: &'a mut [u8],
+        session: DataSession,
+    },
+    InstallSession {
+        session: DataSession,
+        send_keepalive: bool,
+    },
+}
+
+impl<'a> From<WireGuardError> for TunnControlResult<'a> {
+    fn from(err: WireGuardError) -> TunnControlResult<'a> {
+        TunnControlResult::Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum TunnTimerResult<'a> {
+    Done,
+    Err(WireGuardError),
+    WriteToNetwork(&'a mut [u8]),
+    SendKeepalive,
+}
+
 /// Tunnel represents a point-to-point WireGuard connection
 pub struct Tunn {
     /// The handshake currently in progress
@@ -451,6 +515,39 @@ impl Tunn {
         self.handle_verified_packet(packet, dst)
     }
 
+    pub fn decapsulate_control<'a>(
+        &mut self,
+        src_addr: Option<IpAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnControlResult<'a> {
+        if datagram.is_empty() {
+            return TunnControlResult::Done;
+        }
+
+        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        let packet = match self
+            .rate_limiter
+            .verify_packet(
+                src_addr,
+                datagram,
+                #[cfg(feature = "amneziawg")]
+                self.amnezia.as_ref(),
+                &mut cookie,
+            )
+        {
+            Ok(packet) => packet,
+            Err(TunnResult::WriteToNetwork(cookie)) => {
+                dst[..cookie.len()].copy_from_slice(cookie);
+                return TunnControlResult::WriteToNetwork(&mut dst[..cookie.len()]);
+            }
+            Err(TunnResult::Err(e)) => return TunnControlResult::Err(e),
+            _ => unreachable!(),
+        };
+
+        self.handle_verified_control_packet(packet, dst)
+    }
+
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
         packet: Packet,
@@ -463,6 +560,83 @@ impl Tunn {
             Packet::PacketData(p) => self.handle_data(p, dst),
         }
         .unwrap_or_else(TunnResult::from)
+    }
+
+    pub(crate) fn handle_verified_control_packet<'a>(
+        &mut self,
+        packet: Packet,
+        dst: &'a mut [u8],
+    ) -> TunnControlResult<'a> {
+        match packet {
+            Packet::HandshakeInit(p) => self.handle_control_handshake_init(p, dst),
+            Packet::HandshakeResponse(p) => self.handle_control_handshake_response(p),
+            Packet::PacketCookieReply(p) => self
+                .handle_cookie_reply(p)
+                .map(|_| TunnControlResult::Done)
+                .unwrap_or_else(TunnControlResult::from),
+            Packet::PacketData(_) => TunnControlResult::Done,
+        }
+    }
+
+    fn handle_control_handshake_init<'a>(
+        &mut self,
+        p: HandshakeInit,
+        dst: &'a mut [u8],
+    ) -> TunnControlResult<'a> {
+        tracing::debug!(
+            message = "Received handshake_initiation",
+            remote_idx = p.sender_idx
+        );
+
+        let (packet, session) = match self.handshake.receive_handshake_initialization(p, dst) {
+            Ok(value) => value,
+            Err(err) => return TunnControlResult::Err(err),
+        };
+
+        let data_session = DataSession::from_session(session.fork());
+        let index = session.local_index();
+        self.sessions[index % N_SESSIONS] = Some(session);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        self.timer_tick_session_established(false, index);
+
+        tracing::debug!(message = "Sending handshake_response", local_idx = index);
+
+        TunnControlResult::WriteToNetworkAndInstallSession {
+            packet,
+            session: data_session,
+        }
+    }
+
+    fn handle_control_handshake_response<'a>(
+        &mut self,
+        p: HandshakeResponse,
+    ) -> TunnControlResult<'a> {
+        tracing::debug!(
+            message = "Received handshake_response",
+            local_idx = p.receiver_idx,
+            remote_idx = p.sender_idx
+        );
+
+        let session = match self.handshake.receive_handshake_response(p) {
+            Ok(session) => session,
+            Err(err) => return TunnControlResult::Err(err),
+        };
+
+        let data_session = DataSession::from_session(session.fork());
+        let l_idx = session.local_index();
+        let index = l_idx % N_SESSIONS;
+        self.sessions[index] = Some(session);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.timer_tick_session_established(true, index);
+        self.set_current_session(l_idx);
+
+        TunnControlResult::InstallSession {
+            session: data_session,
+            send_keepalive: true,
+        }
     }
 
     fn handle_handshake_init<'a>(
@@ -575,7 +749,7 @@ impl Tunn {
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
 
-        Ok(self.validate_decapsulated_packet(decapsulated_packet))
+        Ok(self.validate_decapsulated_packet_and_tick(decapsulated_packet))
     }
 
     /// Formats a new handshake initiation message and store it in dst. If force_resend is true will send
@@ -611,7 +785,7 @@ impl Tunn {
 
     /// Check if an IP packet is v4 or v6, truncate to the length indicated by the length field
     /// Returns the truncated packet and the source IP as TunnResult
-    fn validate_decapsulated_packet<'a>(&mut self, packet: &'a mut [u8]) -> TunnResult<'a> {
+    pub fn validate_decapsulated_packet<'a>(packet: &'a mut [u8]) -> TunnResult<'a> {
         let (computed_len, src_ip_address) = match packet.len() {
             0 => return TunnResult::Done, // This is keepalive, and not an error
             _ if packet[0] >> 4 == 4 && packet.len() >= IPV4_MIN_HEADER_SIZE => {
@@ -647,13 +821,28 @@ impl Tunn {
             return TunnResult::Err(WireGuardError::InvalidPacket);
         }
 
-        self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        self.rx_bytes += computed_len;
-
         match src_ip_address {
             IpAddr::V4(addr) => TunnResult::WriteToTunnelV4(&mut packet[..computed_len], addr),
             IpAddr::V6(addr) => TunnResult::WriteToTunnelV6(&mut packet[..computed_len], addr),
         }
+    }
+
+    fn validate_decapsulated_packet_and_tick<'a>(
+        &mut self,
+        packet: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        let result = Self::validate_decapsulated_packet(packet);
+        let data_len = match &result {
+            TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
+                Some(out.len())
+            }
+            _ => None,
+        };
+        if let Some(data_len) = data_len {
+            self.timer_tick(TimerName::TimeLastDataPacketReceived);
+            self.rx_bytes += data_len;
+        }
+        result
     }
 
     /// Get a packet from the queue, and try to encapsulate it
@@ -958,5 +1147,59 @@ mod tests {
             unreachable!();
         };
         assert_eq!(sent_packet_buf, recv_packet_buf);
+    }
+
+    #[test]
+    fn control_handshake_exports_data_sessions_without_control_keepalive() {
+        let (mut initiator, mut responder) = create_two_tuns();
+        let mut init_buf = vec![0u8; 2048];
+        let mut response_buf = vec![0u8; 2048];
+        let mut final_buf = vec![0u8; 2048];
+
+        let init = match initiator.format_handshake_initiation(&mut init_buf, false) {
+            TunnResult::WriteToNetwork(out) => out.to_vec(),
+            other => panic!("expected handshake initiation, got {:?}", other),
+        };
+
+        let (response, responder_session) =
+            match responder.decapsulate_control(None, &init, &mut response_buf) {
+                TunnControlResult::WriteToNetworkAndInstallSession { packet, session } => {
+                    (packet.to_vec(), session)
+                }
+                other => panic!(
+                    "expected handshake response and data session, got {:?}",
+                    other
+                ),
+            };
+
+        let (initiator_session, send_keepalive) =
+            match initiator.decapsulate_control(None, &response, &mut final_buf) {
+                TunnControlResult::InstallSession {
+                    session,
+                    send_keepalive,
+                } => (session, send_keepalive),
+                other => panic!("expected initiator data session, got {:?}", other),
+            };
+        assert!(
+            send_keepalive,
+            "initiator should ask the data plane to send the post-handshake keepalive"
+        );
+
+        let packet = create_ipv4_udp_packet();
+        let mut encrypted = vec![0u8; 2048];
+        let encrypted = initiator_session.format_packet_data(&packet, &mut encrypted);
+        let parsed = Tunn::parse_incoming_packet(encrypted).expect("parse encrypted data");
+        let Packet::PacketData(data) = parsed else {
+            panic!("expected data packet");
+        };
+
+        let mut decrypted = vec![0u8; 2048];
+        let decrypted = responder_session
+            .receive_packet_data(data, &mut decrypted)
+            .expect("responder data session decrypts initiator packet");
+        match Tunn::validate_decapsulated_packet(decrypted) {
+            TunnResult::WriteToTunnelV4(out, _) => assert_eq!(out, packet),
+            other => panic!("expected validated IPv4 packet, got {:?}", other),
+        }
     }
 }
