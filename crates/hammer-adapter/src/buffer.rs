@@ -204,6 +204,17 @@ impl BufferPool {
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
     }
+
+    pub fn frame(&self) -> BufferFrame {
+        self.frame_with_capacity(0)
+    }
+
+    pub fn frame_with_capacity(&self, capacity: usize) -> BufferFrame {
+        BufferFrame {
+            pool: Rc::clone(&self.inner),
+            indices: Vec::with_capacity(capacity),
+        }
+    }
 }
 
 impl BufferPoolInner {
@@ -455,12 +466,115 @@ impl BufferHandle {
             .copy_current_chain(self.index)
             .expect("live buffer handle points to valid chain")
     }
+
+    fn into_index(mut self) -> BufferIndex {
+        self.armed = false;
+        self.index
+    }
 }
 
 impl Drop for BufferHandle {
     fn drop(&mut self) {
         if self.armed {
             self.pool.borrow_mut().free_chain(self.index);
+        }
+    }
+}
+
+pub struct BufferFrame {
+    pool: Rc<RefCell<BufferPoolInner>>,
+    indices: Vec<BufferIndex>,
+}
+
+impl BufferFrame {
+    pub fn push(&mut self, buffer: BufferHandle) -> CoreResult<()> {
+        if !Rc::ptr_eq(&self.pool, &buffer.pool) {
+            return Err(CoreError::internal("buffer frame pool mismatch"));
+        }
+        let index = buffer.into_index();
+        self.indices.push(index);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        let mut pool = self.pool.borrow_mut();
+        for index in self.indices.drain(..) {
+            pool.free_chain(index);
+        }
+    }
+
+    pub fn indices(&self) -> &[BufferIndex] {
+        &self.indices
+    }
+
+    pub fn iter_indices(&self) -> std::slice::Iter<'_, BufferIndex> {
+        self.indices.iter()
+    }
+
+    pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+        let guard = self.pool.borrow();
+        guard.buffer(index)?;
+        Ok(BufferRef { guard, index })
+    }
+
+    pub fn drain(&mut self) -> BufferFrameDrain<'_> {
+        BufferFrameDrain {
+            pool: Rc::clone(&self.pool),
+            indices: self.indices.drain(..),
+        }
+    }
+
+    pub fn retain(&mut self, mut f: impl FnMut(BufferIndex) -> bool) {
+        let mut retained = Vec::with_capacity(self.indices.len());
+        let mut pool = self.pool.borrow_mut();
+        for index in self.indices.drain(..) {
+            if f(index) {
+                retained.push(index);
+            } else {
+                pool.free_chain(index);
+            }
+        }
+        self.indices = retained;
+    }
+}
+
+impl Drop for BufferFrame {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+pub struct BufferFrameDrain<'frame> {
+    pool: Rc<RefCell<BufferPoolInner>>,
+    indices: std::vec::Drain<'frame, BufferIndex>,
+}
+
+impl Iterator for BufferFrameDrain<'_> {
+    type Item = BufferHandle;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.indices.next()?;
+        Some(BufferHandle {
+            pool: Rc::clone(&self.pool),
+            index,
+            armed: true,
+        })
+    }
+}
+
+impl Drop for BufferFrameDrain<'_> {
+    fn drop(&mut self) {
+        let mut pool = self.pool.borrow_mut();
+        for index in self.indices.by_ref() {
+            pool.free_chain(index);
         }
     }
 }

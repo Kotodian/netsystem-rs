@@ -74,3 +74,92 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
     assert_eq!(buffer.copy_current_chain(), b"abcdefghijkl");
     assert_eq!(pool.in_use(), 3);
 }
+
+#[test]
+fn buffer_frame_drop_releases_all_buffers() {
+    let pool = BufferPool::with_capacity(8, 4);
+    let mut frame = pool.frame_with_capacity(2);
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"one")
+                .expect("alloc first frame buffer"),
+        )
+        .expect("push first frame buffer");
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"two")
+                .expect("alloc second frame buffer"),
+        )
+        .expect("push second frame buffer");
+
+    assert_eq!(frame.len(), 2);
+    assert_eq!(pool.in_use(), 2);
+
+    drop(frame);
+
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn buffer_frame_drain_preserves_order_and_moves_ownership() {
+    let pool = BufferPool::with_capacity(8, 4);
+    let mut frame = pool.frame_with_capacity(2);
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"first")
+                .expect("alloc first frame buffer"),
+        )
+        .expect("push first frame buffer");
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"second")
+                .expect("alloc second frame buffer"),
+        )
+        .expect("push second frame buffer");
+
+    let drained = frame.drain().collect::<Vec<_>>();
+
+    assert!(frame.is_empty());
+    assert_eq!(pool.in_use(), 2);
+    assert_eq!(drained[0].current(), b"first");
+    assert_eq!(drained[1].current(), b"second");
+
+    drop(drained);
+
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn buffer_frame_retain_drops_removed_buffers() {
+    let pool = BufferPool::with_capacity(8, 4);
+    let mut frame = pool.frame_with_capacity(3);
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"keep")
+                .expect("alloc kept frame buffer"),
+        )
+        .expect("push kept frame buffer");
+    let drop_index = {
+        let buffer = pool
+            .alloc_with_bytes(RouteMetadata::default(), b"drop")
+            .expect("alloc dropped frame buffer");
+        let index = buffer.index();
+        frame.push(buffer).expect("push dropped frame buffer");
+        index
+    };
+    frame
+        .push(
+            pool.alloc_with_bytes(RouteMetadata::default(), b"also")
+                .expect("alloc second kept frame buffer"),
+        )
+        .expect("push second kept frame buffer");
+
+    frame.retain(|index| index != drop_index);
+
+    let payloads = frame
+        .iter_indices()
+        .map(|index| frame.get(*index).expect("frame buffer").current().to_vec())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads, vec![b"keep".to_vec(), b"also".to_vec()]);
+    assert_eq!(pool.in_use(), 2);
+}

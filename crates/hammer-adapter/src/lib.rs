@@ -15,7 +15,10 @@ pub mod router;
 pub mod rule;
 pub mod service;
 
-pub use buffer::{Buffer, BufferFlags, BufferHandle, BufferIndex, BufferPool, BufferRef};
+pub use buffer::{
+    Buffer, BufferFlags, BufferFrame, BufferFrameDrain, BufferHandle, BufferIndex, BufferPool,
+    BufferRef,
+};
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
