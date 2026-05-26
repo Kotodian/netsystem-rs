@@ -191,7 +191,7 @@ impl BufferPool {
         metadata: RouteMetadata,
         bytes: &[u8],
     ) -> CoreResult<BufferHandle> {
-        let index = self.inner.borrow_mut().alloc_slot(metadata, bytes)?;
+        let index = self.inner.borrow_mut().alloc_chain(metadata, bytes)?;
         Ok(BufferHandle {
             pool: Rc::clone(&self.inner),
             index,
@@ -244,6 +244,36 @@ impl BufferPool {
 }
 
 impl BufferPoolInner {
+    fn alloc_chain(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
+        if self.slot_capacity == 0 {
+            return Err(CoreError::internal("buffer slot capacity must be nonzero"));
+        }
+        if bytes.len() <= self.slot_capacity {
+            return self.alloc_slot(metadata, bytes);
+        }
+
+        let first_len = self.slot_capacity;
+        let first = self.alloc_slot(metadata, &bytes[..first_len])?;
+        let mut tail = first;
+        let mut offset = first_len;
+        let mut total_tail_len = 0usize;
+
+        while offset < bytes.len() {
+            let end = (offset + self.slot_capacity).min(bytes.len());
+            let next = self.alloc_slot(RouteMetadata::default(), &bytes[offset..end])?;
+            {
+                let tail_buffer = self.buffer_mut(tail)?;
+                tail_buffer.next_buffer = Some(next);
+                tail_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+            }
+            total_tail_len += end - offset;
+            tail = next;
+            offset = end;
+        }
+        self.buffer_mut(first)?.total_len_not_including_first = total_tail_len;
+        Ok(first)
+    }
+
     fn alloc_slot(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
         if bytes.len() > self.slot_capacity {
             return Err(CoreError::internal(format!(

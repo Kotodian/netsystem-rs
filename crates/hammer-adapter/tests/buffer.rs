@@ -69,6 +69,18 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 }
 
 #[test]
+fn alloc_with_bytes_beyond_one_slot_creates_chain() {
+    let pool = BufferPool::with_capacity(4, 4);
+    let buffer = pool
+        .alloc_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .expect("alloc chained buffer");
+
+    assert!(buffer.next_buffer().is_some());
+    assert_eq!(buffer.copy_current_chain(), b"abcdefghijkl");
+    assert_eq!(pool.in_use(), 3);
+}
+
+#[test]
 fn handoff_exports_from_source_pool_and_imports_into_target_pool() {
     let source = BufferPool::with_capacity(8, 4);
     let target = BufferPool::with_capacity(8, 4);
