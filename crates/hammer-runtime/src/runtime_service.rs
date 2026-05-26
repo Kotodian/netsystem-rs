@@ -19,7 +19,7 @@ use crate::control_thread::ControlEventSubscriptionHandle;
 use crate::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
 use crate::protocol::tun::RuntimeTunInbound;
-use crate::spawn::DataRuntimeContext;
+use crate::spawn::{DataRuntime, DataRuntimeContext};
 use crate::{
     CertificateProviderManager, CertificateStore, ConnectionManager, ControlThread,
     ControlThreadHandle, DnsRouter, DnsTransportManager, InboundManager, MetricSample,
@@ -34,7 +34,7 @@ use hammer_adapter::ProbeReport;
 use std::time::Duration;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
-const DATA_WORKER_THREADS: usize = 1;
+const DATA_WORKER_THREADS: usize = 2;
 const DATA_WORKER_STACK_SIZE: usize = 512 * 1024;
 const DATA_MAX_BLOCKING_THREADS: usize = 4;
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -111,7 +111,7 @@ struct ServiceInner {
     /// `take()` and consume it via `Runtime::shutdown_timeout` to bound
     /// the abort latency of in-flight tasks. If `None`, shutdown has
     /// already happened or the runtime was never installed.
-    data_runtime: Option<tokio::runtime::Runtime>,
+    data_runtime: Option<DataRuntime>,
     data_context: DataRuntimeContext,
     _options: Options,
 }
@@ -127,20 +127,17 @@ impl RuntimeService {
         let options = config::parse_config(config_content)?;
         let metrics = MetricsRegistry::new();
         let base_time = Instant::now();
-        // Data-plane runtime: hosts every business future. Keep a single
-        // worker for iOS NetExt until we have device-side evidence that extra
-        // workers reduce latency; the control plane (below) runs on its own
-        // dedicated current_thread runtime so worker stalls cannot delay log/
-        // metrics/command dispatch.
-        let data_runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(DATA_WORKER_THREADS)
-            .thread_name("hammer-data")
-            .thread_stack_size(DATA_WORKER_STACK_SIZE)
-            .max_blocking_threads(DATA_MAX_BLOCKING_THREADS)
-            .enable_all()
-            .build()
-            .map_err(|e| HammerError::internal(format!("init data runtime: {e}")))?;
-        let data_context = DataRuntimeContext::new(data_runtime.handle().clone());
+        // Data-plane runtime: multiple fixed data threads, each with its own
+        // current-thread reactor and thread-local packet buffer pool. Futures
+        // spawned onto a data thread are not work-stolen by another data
+        // thread, so a flow can keep buffer indices local to its worker.
+        let data_runtime = DataRuntime::new(
+            DATA_WORKER_THREADS,
+            "hammer-data",
+            DATA_WORKER_STACK_SIZE,
+            DATA_MAX_BLOCKING_THREADS,
+        )?;
+        let data_context = data_runtime.context();
         let writer: Arc<dyn LogWriter> = if options.log.disabled {
             Arc::new(DiscardWriter)
         } else {
