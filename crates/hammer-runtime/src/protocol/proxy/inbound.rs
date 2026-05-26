@@ -7,8 +7,8 @@ use std::time::Duration;
 use base64::Engine;
 use bytes::Bytes;
 use hammer_adapter::{
-    Inbound, Network, OutboundManager as OutboundManagerTrait, ProxyDatagram, ProxyPacketConn,
-    ProxyStream, RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
+    BufferHandle, Inbound, Network, OutboundManager as OutboundManagerTrait, ProxyDatagram,
+    ProxyPacketConn, ProxyStream, RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
 };
 use hammer_core::config::{
     HttpInboundOptions, InboundKind, InboundUser, ListenInboundOptions, MixedInboundOptions,
@@ -307,7 +307,7 @@ fn start_listener(
                     let router = Arc::clone(&router);
                     let outbound = Arc::clone(&outbound);
                     let inbound_id = inbound_id.clone();
-                    crate::spawn::spawn(async move {
+                    drop(crate::spawn::spawn_local(move || async move {
                         if let Err(err) = handle_proxy_stream(
                             inbound_id, options, router, outbound, stream, source,
                         )
@@ -315,7 +315,7 @@ fn start_listener(
                         {
                             debug!("proxy inbound connection failed: {err}");
                         }
-                    });
+                    }));
                 }
                 Err(err) => {
                     if closed.load(Ordering::SeqCst) {
@@ -859,8 +859,23 @@ async fn handle_socks5_udp_associate(
                     client_addr = Some(client);
                 }
                 let (destination, payload) = decode_socks5_udp(&buf[..n])?;
-                let outbound_id =
-                    route_udp(&inbound_id, &router, client, destination.clone(), username.clone())?;
+                let buffer = crate::spawn::with_data_buffer_pool(|pool| {
+                    pool.alloc_with_bytes(
+                        udp_route_metadata(
+                            &inbound_id,
+                            client,
+                            destination.clone(),
+                            username.clone(),
+                        ),
+                        payload,
+                    )
+                })?;
+                let outbound_id = route_udp(&router, &buffer)?;
+                let destination = buffer
+                    .metadata()
+                    .destination
+                    .clone()
+                    .unwrap_or(destination);
                 let relay = udp_relay_sender(
                     &mut relays,
                     &outbound,
@@ -871,7 +886,7 @@ async fn handle_socks5_udp_associate(
                 relay
                     .send(UdpRelaySend {
                         destination,
-                        payload: Bytes::copy_from_slice(payload),
+                        buffer,
                     })
                     .await
                     .map_err(|_| HammerError::internal("SOCKS5 UDP relay closed"))?;
@@ -902,7 +917,7 @@ async fn handle_socks5_udp_associate(
 
 struct UdpRelaySend {
     destination: SocksAddr,
-    payload: Bytes,
+    buffer: BufferHandle,
 }
 
 async fn udp_relay_sender(
@@ -930,16 +945,15 @@ fn spawn_udp_relay(
     mut send_rx: mpsc::Receiver<UdpRelaySend>,
     response_tx: mpsc::Sender<ProxyDatagram>,
 ) {
-    crate::spawn::spawn(async move {
+    crate::spawn::spawn_current_local(async move {
         let mut can_recv = false;
         loop {
             if !can_recv {
                 let Some(packet) = send_rx.recv().await else {
                     break;
                 };
-                if let Err(err) = packet_conn
-                    .send_to(packet.destination, packet.payload)
-                    .await
+                if let Err(err) =
+                    send_udp_buffer(&mut *packet_conn, packet.destination, packet.buffer).await
                 {
                     debug!("SOCKS5 UDP send failed via outbound={outbound_id}: {err}");
                     break;
@@ -952,7 +966,9 @@ fn spawn_udp_relay(
                     let Some(packet) = packet else {
                         break;
                     };
-                    if let Err(err) = packet_conn.send_to(packet.destination, packet.payload).await {
+                    if let Err(err) =
+                        send_udp_buffer(&mut *packet_conn, packet.destination, packet.buffer).await
+                    {
                         debug!("SOCKS5 UDP send failed via outbound={outbound_id}: {err}");
                         break;
                     }
@@ -973,6 +989,15 @@ fn spawn_udp_relay(
             }
         }
     });
+}
+
+async fn send_udp_buffer(
+    packet_conn: &mut dyn ProxyPacketConn,
+    destination: SocksAddr,
+    buffer: BufferHandle,
+) -> HammerResult<()> {
+    let payload = Bytes::from(buffer.copy_current_chain());
+    packet_conn.send_to(destination, payload).await
 }
 
 fn decode_socks5_udp(packet: &[u8]) -> HammerResult<(SocksAddr, &[u8])> {
@@ -1103,14 +1128,13 @@ async fn route_tcp(
     }
 }
 
-fn route_udp(
+fn udp_route_metadata(
     inbound_id: &str,
-    router: &Router,
     source: SocketAddr,
     destination: SocksAddr,
     username: Option<String>,
-) -> HammerResult<String> {
-    let mut metadata = RouteMetadata {
+) -> RouteMetadata {
+    RouteMetadata {
         inbound: inbound_id.to_owned(),
         network: Network::Udp,
         protocol: String::new(),
@@ -1121,9 +1145,15 @@ fn route_udp(
         domain_strategy: None,
         udp_disable_domain_unmapping: false,
         override_destination: false,
-    };
-    router.prepare_route_metadata(&mut metadata)?;
-    match router.match_route(&mut metadata)? {
+    }
+}
+
+fn route_udp(router: &Router, buffer: &BufferHandle) -> HammerResult<String> {
+    let decision = buffer.with_metadata_mut(|metadata| {
+        router.prepare_route_metadata(metadata)?;
+        router.match_route(metadata)
+    })?;
+    match decision {
         RouteDecision::Route {
             target: RouteTarget::Outbound(id),
         } => Ok(id),

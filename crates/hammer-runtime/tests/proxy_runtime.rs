@@ -16,6 +16,7 @@ use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{
     DnsRouter, MetricsRegistry, OutboundManager, Router, inbounds::InboundManager,
+    spawn::DataRuntime,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -272,7 +273,21 @@ impl PlatformInterface for TestPlatform {
     }
 }
 
-async fn start_proxy(kind: &str, port: u16, outbound: Arc<RecordingOutbound>) -> InboundManager {
+struct ProxyHarness {
+    manager: InboundManager,
+    data_runtime: Option<DataRuntime>,
+}
+
+impl Drop for ProxyHarness {
+    fn drop(&mut self) {
+        let _ = self.manager.close();
+        if let Some(data_runtime) = self.data_runtime.take() {
+            data_runtime.shutdown_timeout(Duration::from_secs(1));
+        }
+    }
+}
+
+async fn start_proxy(kind: &str, port: u16, outbound: Arc<RecordingOutbound>) -> ProxyHarness {
     let options = proxy_options(kind, port);
     let outbound_manager = OutboundManager::new(logger("outbound"), "direct");
     outbound_manager
@@ -299,8 +314,15 @@ async fn start_proxy(kind: &str, port: u16, outbound: Arc<RecordingOutbound>) ->
         MetricsRegistry::new(),
     )
     .expect("inbound manager");
-    manager.start(StartStage::Start).expect("start inbounds");
-    manager
+    let data_runtime = DataRuntime::new(2, "proxy-test-data", 512 * 1024, 2).expect("data runtime");
+    let data_context = data_runtime.context();
+    data_context
+        .enter(|| manager.start(StartStage::Start))
+        .expect("start inbounds");
+    ProxyHarness {
+        manager,
+        data_runtime: Some(data_runtime),
+    }
 }
 
 #[tokio::test]

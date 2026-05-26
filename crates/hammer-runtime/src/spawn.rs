@@ -341,6 +341,17 @@ where
     DataLocalJoinHandle { rx }
 }
 
+pub fn spawn_current_local<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + 'static,
+    F::Output: 'static,
+{
+    let context =
+        current_data_context().expect("current local spawn requires a data runtime context");
+    let future = future.with_current_subscriber();
+    tokio::task::spawn_local(TASK_DATA_CONTEXT.scope(context, future))
+}
+
 pub fn with_data_buffer_pool<R>(f: impl FnOnce(&BufferPool) -> R) -> R {
     DATA_BUFFER_POOL.with(f)
 }
@@ -513,6 +524,50 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(during, 1);
         assert_eq!(after, 0);
+        assert_eq!(payload, b"packet");
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn current_local_spawn_keeps_non_send_buffer_on_current_worker() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-current-local", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let (thread_before, thread_after, payload) = context.enter(|| {
+            driver.block_on(async {
+                spawn_local(|| async {
+                    let join = spawn_current_local(async {
+                        let thread_before = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let buffer = with_data_buffer_pool(|pool| {
+                            pool.alloc_with_bytes(Default::default(), b"packet")
+                                .expect("alloc local data buffer")
+                        });
+                        tokio::task::yield_now().await;
+                        let thread_after = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        (thread_before, thread_after, buffer.current())
+                    });
+                    join.await.expect("current local task joined")
+                })
+                .await
+                .expect("outer local data task finished")
+            })
+        });
+
+        assert_eq!(thread_before, "spawn-test-current-local-0");
+        assert_eq!(thread_after, "spawn-test-current-local-0");
         assert_eq!(payload, b"packet");
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
