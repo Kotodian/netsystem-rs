@@ -9,14 +9,13 @@
 //!     responses, cookie replies) are sent straight back to the peer.
 //!   * outbound IP packets from `encrypt_rx` → LPM-route to a peer →
 //!     boringtun `encapsulate` → UDP `send_to` the peer's endpoint.
-//!   * timer ticks sent by the control thread → call
-//!     `Tunn::update_timers` per peer on this worker actor so handshakes,
-//!     keepalives, and rekeys still send UDP from the data plane.
+//!   * rekey/keepalive timer firings from the control thread → enqueue work
+//!     onto this actor. The actor owns each mutable boringtun tunnel and sends
+//!     the resulting UDP packets.
 //!
 //! This actor only moves encrypted UDP frames between peers and the
 //! stack-facing queues.
 
-use std::fmt;
 use std::future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -30,24 +29,24 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::{self, MissedTickBehavior};
 
 use hammer_core::error::{HammerError, HammerResult, WithContext};
 use hammer_core::log::Logger;
 use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
 #[cfg(feature = "endpoint-amneziawg")]
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
-use hammer_core::protocol::wireguard::peer::{self, Peer};
+use hammer_core::protocol::wireguard::peer::{self, Peer, PeerTunnel};
 
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handshake_junk_packets};
+use super::endpoint::{WireguardPeerHandshakeReceivedArgs, WireguardPeerKeepaliveReceivedArgs};
 use crate::socket_protector::SocketProtector;
 use crate::{ControlThreadHandle, ControlTimerHandle};
 
 /// 250 ms matches what boringtun's own examples and Cloudflare WARP use to
-/// drive `Tunn::update_timers` — fine-grained enough for handshake retries
-/// without burning a CPU.
-const TIMER_TICK: Duration = Duration::from_millis(250);
+/// drive `Tunn::update_timers` — fine-grained enough for rekey/keepalive
+/// decisions without burning a CPU.
+const REKEY_KEEPALIVE_TIMER: Duration = Duration::from_millis(250);
 
 /// Channel buffer for IP packets waiting to be encrypted. Apple utun can hand
 /// the packet loop a 256-packet batch, and the L3 fast path uses `try_send` so
@@ -74,23 +73,112 @@ const INBOUND_DRAIN_BATCH: usize = 32;
 /// to one lock acquisition; multi-peer split-tunnel still saves a lock per
 /// run of consecutive same-peer packets.
 const OUTBOUND_DRAIN_BATCH: usize = 64;
-const START_HANDSHAKE_QUEUE: usize = 16;
+const TUNNEL_CONTROL_QUEUE: usize = 64;
 
 #[derive(Clone)]
-pub(crate) struct PeerHandshakeTrigger {
+pub(crate) struct PeerStartControl {
     peer_index: usize,
-    tx: mpsc::Sender<usize>,
+    control: TunnelControl,
 }
 
-impl PeerHandshakeTrigger {
-    fn new(peer_index: usize, tx: mpsc::Sender<usize>) -> Self {
-        Self { peer_index, tx }
+#[derive(Clone)]
+pub(crate) struct PeerInboundControl {
+    peer_index: usize,
+    control: TunnelControl,
+}
+
+impl PeerStartControl {
+    fn new(peer_index: usize, control: TunnelControl) -> Self {
+        Self {
+            peer_index,
+            control,
+        }
     }
 
-    pub(crate) fn trigger(&self) -> HammerResult<()> {
-        self.tx.try_send(self.peer_index).map_err(|err| match err {
+    pub(crate) fn start_handshake(&self) -> HammerResult<()> {
+        self.control.start_handshake(self.peer_index)
+    }
+}
+
+impl PeerInboundControl {
+    fn new(peer_index: usize, control: TunnelControl) -> Self {
+        Self {
+            peer_index,
+            control,
+        }
+    }
+
+    pub(crate) fn process_inbound_control(
+        &self,
+        src_ip: IpAddr,
+        datagram: Bytes,
+    ) -> HammerResult<()> {
+        self.control
+            .process_inbound_control(self.peer_index, src_ip, datagram)
+    }
+}
+
+impl std::fmt::Debug for PeerStartControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerStartControl")
+            .field("peer_index", &self.peer_index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for PeerInboundControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerInboundControl")
+            .field("peer_index", &self.peer_index)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TunnelControl {
+    tx: mpsc::Sender<TunnelControlMessage>,
+}
+
+impl TunnelControl {
+    fn new(tx: mpsc::Sender<TunnelControlMessage>) -> Self {
+        Self { tx }
+    }
+
+    fn peer_start_control(&self, peer_index: usize) -> PeerStartControl {
+        PeerStartControl::new(peer_index, self.clone())
+    }
+
+    fn peer_inbound_control(&self, peer_index: usize) -> PeerInboundControl {
+        PeerInboundControl::new(peer_index, self.clone())
+    }
+
+    fn start_handshake(&self, peer_index: usize) -> HammerResult<()> {
+        self.try_send(TunnelControlMessage::StartHandshake { peer_index })
+    }
+
+    fn process_inbound_control(
+        &self,
+        peer_index: usize,
+        src_ip: IpAddr,
+        datagram: Bytes,
+    ) -> HammerResult<()> {
+        self.try_send(TunnelControlMessage::InboundControlDatagram {
+            peer_index,
+            src_ip,
+            datagram,
+        })
+    }
+
+    fn run_rekey_keepalive_timer(&self) {
+        if let Err(err) = self.try_send(TunnelControlMessage::RekeyKeepaliveTimer) {
+            warn!("wireguard rekey/keepalive timer enqueue failed: {err}");
+        }
+    }
+
+    fn try_send(&self, message: TunnelControlMessage) -> HammerResult<()> {
+        self.tx.try_send(message).map_err(|err| match err {
             mpsc::error::TrySendError::Full(_) => {
-                HammerError::internal("wireguard start handshake queue full")
+                HammerError::internal("wireguard tunnel control queue full")
             }
             mpsc::error::TrySendError::Closed(_) => {
                 HammerError::internal("wireguard transport stopped")
@@ -99,12 +187,22 @@ impl PeerHandshakeTrigger {
     }
 }
 
-impl fmt::Debug for PeerHandshakeTrigger {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PeerHandshakeTrigger")
-            .field("peer_index", &self.peer_index)
-            .finish_non_exhaustive()
+impl std::fmt::Debug for TunnelControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TunnelControl").finish_non_exhaustive()
     }
+}
+
+enum TunnelControlMessage {
+    StartHandshake {
+        peer_index: usize,
+    },
+    InboundControlDatagram {
+        peer_index: usize,
+        src_ip: IpAddr,
+        datagram: Bytes,
+    },
+    RekeyKeepaliveTimer,
 }
 
 /// Handles returned to the owner of a transport actor. Hold these for the
@@ -128,8 +226,8 @@ pub(crate) struct TransportHandles {
     /// Ask the actor to rebind/reprotect its UDP sockets while keeping the
     /// packet channels stable for the TUN fast path.
     pub(crate) reset_tx: mpsc::Sender<()>,
-    pub(crate) start_handshake_tx: mpsc::Sender<usize>,
-    pub(crate) timer_tick: Option<ControlTimerHandle>,
+    pub(crate) tunnel_control: TunnelControl,
+    pub(crate) rekey_keepalive_timer: Option<ControlTimerHandle>,
     /// Join handle in case the caller wants to await actor termination.
     pub(crate) join: JoinHandle<()>,
 }
@@ -173,19 +271,19 @@ impl TransportHandles {
         }
     }
 
-    pub(crate) fn peer_handshake_trigger(&self, peer_index: usize) -> PeerHandshakeTrigger {
-        PeerHandshakeTrigger::new(peer_index, self.start_handshake_tx.clone())
+    pub(crate) fn peer_start_control(&self, peer_index: usize) -> PeerStartControl {
+        self.tunnel_control.peer_start_control(peer_index)
     }
 
-    pub(crate) fn cancel_timer_tick(&self) {
-        if let Some(timer) = &self.timer_tick {
+    pub(crate) fn cancel_rekey_keepalive_timer(&self) {
+        if let Some(timer) = &self.rekey_keepalive_timer {
             let _ = timer.cancel();
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn has_control_timer_tick_for_test(&self) -> bool {
-        self.timer_tick.is_some()
+    pub(crate) fn has_control_rekey_keepalive_timer_for_test(&self) -> bool {
+        self.rekey_keepalive_timer.is_some()
     }
 }
 
@@ -195,13 +293,20 @@ impl TransportHandles {
 /// handed to a detached task.
 pub(crate) fn spawn_transport(
     _logger: Logger,
+    endpoint_id: String,
     peers: Arc<Vec<Peer>>,
+    peer_tunnels: Vec<PeerTunnel>,
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
     control_handle: Option<Arc<ControlThreadHandle>>,
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<Amnezia2Options>,
 ) -> HammerResult<TransportHandles> {
+    if peers.len() != peer_tunnels.len() {
+        return Err(HammerError::internal(
+            "wireguard transport peer/tunnel count mismatch",
+        ));
+    }
     let sockets = bind_transport_sockets(&peers, listen_port, &protector)?;
     let local_addr = sockets.local_addr()?;
     info!("wireguard transport listening on {local_addr}");
@@ -210,21 +315,23 @@ pub(crate) fn spawn_transport(
     let (encrypt_batch_tx, encrypt_batch_rx) = mpsc::channel::<Vec<Bytes>>(ENCRYPT_BATCH_QUEUE);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(INBOUND_QUEUE);
     let (inbound_batch_tx, inbound_batch_rx) = mpsc::channel::<Vec<Bytes>>(INBOUND_BATCH_QUEUE);
-    let (timer_tick_tx, timer_tick_rx) = mpsc::channel::<()>(1);
+    let (tunnel_control_tx, tunnel_control_rx) =
+        mpsc::channel::<TunnelControlMessage>(TUNNEL_CONTROL_QUEUE);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let (reset_tx, reset_rx) = mpsc::channel::<()>(1);
-    let (start_handshake_tx, start_handshake_rx) = mpsc::channel::<usize>(START_HANDSHAKE_QUEUE);
-    let timer_tick = if let Some(control_handle) = control_handle {
-        let timer_tick_tx = timer_tick_tx.clone();
+    let tunnel_control = TunnelControl::new(tunnel_control_tx);
+    let event_control_handle = control_handle.clone();
+    let rekey_keepalive_timer = if let Some(control_handle) = control_handle {
+        let tunnel_control = tunnel_control.clone();
         Some(
             control_handle
-                .schedule_interval(TIMER_TICK, TIMER_TICK, move || {
-                    let timer_tick_tx = timer_tick_tx.clone();
+                .schedule_interval(REKEY_KEEPALIVE_TIMER, REKEY_KEEPALIVE_TIMER, move || {
+                    let tunnel_control = tunnel_control.clone();
                     async move {
-                        let _ = timer_tick_tx.try_send(());
+                        tunnel_control.run_rekey_keepalive_timer();
                     }
                 })
-                .with_context(|| "wireguard control timer tick")?,
+                .with_context(|| "wireguard control rekey/keepalive timer")?,
         )
     } else {
         None
@@ -232,7 +339,11 @@ pub(crate) fn spawn_transport(
 
     let join = crate::spawn::spawn(run_actor(
         sockets,
+        endpoint_id,
         peers,
+        peer_tunnels,
+        tunnel_control.clone(),
+        event_control_handle,
         listen_port,
         mtu,
         protector,
@@ -244,12 +355,7 @@ pub(crate) fn spawn_transport(
         inbound_batch_tx,
         shutdown_rx,
         reset_rx,
-        start_handshake_rx,
-        if timer_tick.is_some() {
-            Some(timer_tick_rx)
-        } else {
-            None
-        },
+        tunnel_control_rx,
     ));
 
     Ok(TransportHandles {
@@ -261,8 +367,8 @@ pub(crate) fn spawn_transport(
         local_addr,
         shutdown: shutdown_tx,
         reset_tx,
-        start_handshake_tx,
-        timer_tick,
+        tunnel_control,
+        rekey_keepalive_timer,
         join,
     })
 }
@@ -389,7 +495,11 @@ fn std_udp_socket(bind: SocketAddr, protector: &SocketProtector) -> HammerResult
 /// dropping packets after a warn-log because wg is best-effort at L3 anyway.
 async fn run_actor(
     mut sockets: TransportSockets,
+    endpoint_id: String,
     peers: Arc<Vec<Peer>>,
+    mut peer_tunnels: Vec<PeerTunnel>,
+    tunnel_control: TunnelControl,
+    control_handle: Option<Arc<ControlThreadHandle>>,
     listen_port: u16,
     mtu: u32,
     protector: SocketProtector,
@@ -400,8 +510,7 @@ async fn run_actor(
     inbound_batch_tx: mpsc::Sender<Vec<Bytes>>,
     mut shutdown_rx: oneshot::Receiver<()>,
     mut reset_rx: mpsc::Receiver<()>,
-    mut start_handshake_rx: mpsc::Receiver<usize>,
-    mut timer_tick_rx: Option<mpsc::Receiver<()>>,
+    mut tunnel_control_rx: mpsc::Receiver<TunnelControlMessage>,
 ) {
     // Capacity for every encap/decap output buffer the actor will allocate.
     // Each step allocates its own BytesMut so the result can be `freeze()`d
@@ -418,25 +527,16 @@ async fn run_actor(
     let mut udp_buf_v6 = vec![0u8; udp_recv_cap];
 
     // Reusable scratch the actor holds across iterations:
-    //   * `tick_buf` — a single `crypto_cap`-sized BytesMut shared by every
-    //     peer inside one `tick_timers` call. The old code allocated one per
-    //     peer per tick; the timer fires at 4 Hz × peer-count regardless of
-    //     traffic, so this is pure idle-tick savings.
     //   * `inbound_batch` — staging Vec for `handle_inbound_ready`. Cleared
     //     and refilled on every UDP readiness wake; capacity persists across
     //     wakes so we stop re-allocating a 32-slot Vec per recv.
     //   * `outbound_batch` / `outbound_routed` — staging Vecs for encrypt
     //     bursts. Keep them actor-owned so every select wake doesn't touch
     //     the allocator before it can send the first packet.
-    let mut tick_buf = BytesMut::with_capacity(crypto_cap);
     let mut inbound_batch: Vec<Bytes> = Vec::with_capacity(INBOUND_DRAIN_BATCH);
     let mut outbound_batch: Vec<Bytes> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
     let mut outbound_routed: Vec<(usize, Bytes)> = Vec::with_capacity(OUTBOUND_DRAIN_BATCH);
     let mut outbound_send_buf = BytesMut::with_capacity(crypto_cap);
-
-    let mut fallback_timer = time::interval(TIMER_TICK);
-    fallback_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    fallback_timer.tick().await; // first tick fires immediately; consume it
 
     loop {
         tokio::select! {
@@ -458,18 +558,18 @@ async fn run_actor(
                     }
                 }
             }
-            peer_index = start_handshake_rx.recv() => {
-                let Some(peer_index) = peer_index else {
+            message = tunnel_control_rx.recv() => {
+                let Some(message) = message else {
                     break;
                 };
-                send_peer_handshake(
+                handle_tunnel_control_message(
                     &sockets,
                     &peers,
+                    &mut peer_tunnels,
                     #[cfg(feature = "endpoint-amneziawg")]
                     amnezia.as_ref(),
-                    peer_index,
+                    message,
                     crypto_cap,
-                    &mut tick_buf,
                 ).await;
             }
             res = recv_from_optional(sockets.ipv4.as_deref(), &mut udp_buf_v4), if sockets.ipv4.is_some() => {
@@ -481,7 +581,11 @@ async fn run_actor(
                             .expect("ipv4 socket guarded by select arm");
                         handle_inbound_ready(
                             &sockets,
+                            &endpoint_id,
                             &peers,
+                            &mut peer_tunnels,
+                            control_handle.as_deref(),
+                            &tunnel_control,
                             #[cfg(feature = "endpoint-amneziawg")]
                             amnezia.as_ref(),
                             socket,
@@ -509,7 +613,11 @@ async fn run_actor(
                             .expect("ipv6 socket guarded by select arm");
                         handle_inbound_ready(
                             &sockets,
+                            &endpoint_id,
                             &peers,
+                            &mut peer_tunnels,
+                            control_handle.as_deref(),
+                            &tunnel_control,
                             #[cfg(feature = "endpoint-amneziawg")]
                             amnezia.as_ref(),
                             socket,
@@ -536,6 +644,7 @@ async fn run_actor(
                 handle_outbound_batch(
                     &sockets,
                     &peers,
+                    &mut peer_tunnels,
                     #[cfg(feature = "endpoint-amneziawg")]
                     amnezia.as_ref(),
                     first,
@@ -555,6 +664,7 @@ async fn run_actor(
                 handle_outbound_packet_batch(
                     &sockets,
                     &peers,
+                    &mut peer_tunnels,
                     #[cfg(feature = "endpoint-amneziawg")]
                     amnezia.as_ref(),
                     &mut batch,
@@ -564,37 +674,7 @@ async fn run_actor(
                 )
                 .await;
             }
-            tick = control_timer_tick(&mut timer_tick_rx), if timer_tick_rx.is_some() => {
-                if tick.is_none() {
-                    break;
-                }
-                tick_timers(
-                    &sockets,
-                    &peers,
-                    #[cfg(feature = "endpoint-amneziawg")]
-                    amnezia.as_ref(),
-                    crypto_cap,
-                    &mut tick_buf,
-                ).await;
-            }
-            _ = fallback_timer.tick(), if timer_tick_rx.is_none() => {
-                tick_timers(
-                    &sockets,
-                    &peers,
-                    #[cfg(feature = "endpoint-amneziawg")]
-                    amnezia.as_ref(),
-                    crypto_cap,
-                    &mut tick_buf,
-                ).await;
-            }
         }
-    }
-}
-
-async fn control_timer_tick(timer_tick_rx: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
-    match timer_tick_rx {
-        Some(rx) => rx.recv().await,
-        None => future::pending().await,
     }
 }
 
@@ -621,7 +701,11 @@ async fn recv_from_optional(
 /// flaky enough that an integration-style test is the better tool.
 async fn handle_inbound_ready(
     sockets: &TransportSockets,
+    endpoint_id: &str,
     peers: &[Peer],
+    peer_tunnels: &mut [PeerTunnel],
+    control_handle: Option<&ControlThreadHandle>,
+    tunnel_control: &TunnelControl,
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     udp_socket: &UdpSocket,
     first_src: SocketAddr,
@@ -637,7 +721,11 @@ async fn handle_inbound_ready(
     inbound_batch.clear();
     handle_inbound_datagram(
         sockets,
+        endpoint_id,
         peers,
+        peer_tunnels,
+        control_handle,
+        tunnel_control,
         #[cfg(feature = "endpoint-amneziawg")]
         amnezia,
         first_src,
@@ -652,7 +740,11 @@ async fn handle_inbound_ready(
             Ok((n, src)) => {
                 handle_inbound_datagram(
                     sockets,
+                    endpoint_id,
                     peers,
+                    peer_tunnels,
+                    control_handle,
+                    tunnel_control,
                     #[cfg(feature = "endpoint-amneziawg")]
                     amnezia,
                     src,
@@ -675,7 +767,11 @@ async fn handle_inbound_ready(
 
 async fn handle_inbound_datagram(
     sockets: &TransportSockets,
+    endpoint_id: &str,
     peers: &[Peer],
+    peer_tunnels: &mut [PeerTunnel],
+    control_handle: Option<&ControlThreadHandle>,
+    tunnel_control: &TunnelControl,
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     src: SocketAddr,
     datagram: &mut [u8],
@@ -712,16 +808,55 @@ async fn handle_inbound_datagram(
         datagram[2] = 0;
         datagram[3] = 0;
     }
+    let message_type = wireguard_message_type(&datagram);
+
+    if let Some(message_type @ (1 | 2 | 3)) = message_type
+        && let Some(control_handle) = control_handle
+    {
+        let result = control_handle.publish_event(WireguardPeerHandshakeReceivedArgs {
+            endpoint_id: endpoint_id.to_owned(),
+            peer_index: peer_idx,
+            peer_endpoint: peer.endpoint(),
+            peer_public_key: peer.public_key(),
+            message_type,
+            src_ip: src.ip(),
+            datagram: Bytes::copy_from_slice(&datagram),
+            inbound_control: tunnel_control.peer_inbound_control(peer_idx),
+        });
+        match result {
+            Ok(()) => return,
+            Err(err) => {
+                warn!("wireguard inbound handshake event publish failed: {err}");
+            }
+        }
+    }
+
+    let Some(peer_tunnel) = peer_tunnels.get_mut(peer_idx) else {
+        warn!("wireguard udp: missing tunnel for peer index {peer_idx}");
+        return;
+    };
 
     // First call: pass the actual datagram + src ip (rate_limiter uses it).
-    let action = step_decapsulate(peer, Some(src.ip()), &datagram, crypto_cap);
+    let action = step_decapsulate(peer, peer_tunnel, Some(src.ip()), &datagram, crypto_cap);
+    if message_type == Some(4)
+        && matches!(action, DecapAction::Idle)
+        && let Some(control_handle) = control_handle
+        && let Err(err) = control_handle.publish_event(WireguardPeerKeepaliveReceivedArgs {
+            endpoint_id: endpoint_id.to_owned(),
+            peer_index: peer_idx,
+            peer_endpoint: peer.endpoint(),
+            peer_public_key: peer.public_key(),
+        })
+    {
+        warn!("wireguard keepalive event publish failed: {err}");
+    }
     dispatch_action(sockets, peer, action, inbound_batch).await;
 
     // boringtun's contract: keep calling decapsulate(None, &[], buf) until
     // it returns Done so we drain any queued WriteToNetwork frames it staged
     // (e.g. the data packets that were waiting on a fresh handshake).
     loop {
-        let action = step_decapsulate(peer, None, &[], crypto_cap);
+        let action = step_decapsulate(peer, peer_tunnel, None, &[], crypto_cap);
         if matches!(action, DecapAction::Idle) {
             break;
         }
@@ -736,8 +871,10 @@ async fn handle_inbound_datagram(
 #[derive(Debug)]
 enum DecapAction {
     /// Nothing to send. Either boringtun consumed the datagram silently
-    /// (`TunnResult::Done`) or returned an error (already trace-logged).
+    /// (`TunnResult::Done`).
     Idle,
+    /// Boringtun rejected the datagram. Already trace-logged.
+    Error,
     /// Send the encrypted frame in `buf` to `dst` over UDP. The buffer is
     /// already truncated to its real length; the WARP-reserved prefix gets
     /// stamped in place before the syscall.
@@ -754,7 +891,7 @@ async fn dispatch_action(
     inbound_batch: &mut Vec<Bytes>,
 ) {
     match action {
-        DecapAction::Idle => {}
+        DecapAction::Idle | DecapAction::Error => {}
         DecapAction::SendNetwork { mut buf, dst } => {
             stamp_reserved_in_place(&mut buf, peer.reserved());
             let Some(socket) = sockets.send_socket(dst) else {
@@ -819,36 +956,35 @@ fn alloc_crypto_buf(cap: usize) -> BytesMut {
     buf
 }
 
-/// Run a single `Tunn::decapsulate` call inside a short lock. Allocates a
+/// Run a single `Tunn::decapsulate` call. Allocates a
 /// fresh `BytesMut` of `crypto_cap` bytes — boringtun's `decapsulate` API
 /// requires a writable destination slice, and giving each call its own
 /// buffer means `WriteToTunnelV4/V6` results can be `freeze()`d straight
 /// into the inbound mpsc without copying.
 fn step_decapsulate(
     peer: &Peer,
+    tunnel: &mut PeerTunnel,
     src_ip: Option<IpAddr>,
     datagram: &[u8],
     crypto_cap: usize,
 ) -> DecapAction {
     let mut buf = alloc_crypto_buf(crypto_cap);
-    let outcome = {
-        let mut tunn = peer.lock_tunn();
-        match tunn.decapsulate(src_ip, datagram, &mut buf[..]) {
-            TunnResult::Done => DecapOutcome::Idle,
-            TunnResult::Err(err) => {
-                // Includes routine cases (replays, handshake retries) so
-                // trace, not warn.
-                tracing::trace!(?err, "wireguard decapsulate error");
-                DecapOutcome::Idle
-            }
-            TunnResult::WriteToNetwork(out) => DecapOutcome::Network(out.len()),
-            TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
-                DecapOutcome::Tunnel(out.len())
-            }
+    let outcome = match tunnel.decapsulate(src_ip, datagram, &mut buf[..]) {
+        TunnResult::Done => DecapOutcome::Idle,
+        TunnResult::Err(err) => {
+            // Includes routine cases (replays, handshake retries) so trace,
+            // not warn.
+            tracing::trace!(?err, "wireguard decapsulate error");
+            DecapOutcome::Error
+        }
+        TunnResult::WriteToNetwork(out) => DecapOutcome::Network(out.len()),
+        TunnResult::WriteToTunnelV4(out, _) | TunnResult::WriteToTunnelV6(out, _) => {
+            DecapOutcome::Tunnel(out.len())
         }
     };
     match outcome {
         DecapOutcome::Idle => DecapAction::Idle,
+        DecapOutcome::Error => DecapAction::Error,
         DecapOutcome::Network(len) => {
             buf.truncate(len);
             DecapAction::SendNetwork {
@@ -867,6 +1003,7 @@ fn step_decapsulate(
 /// borrow on `buf`, then mutate `buf` once the borrow ends.
 enum DecapOutcome {
     Idle,
+    Error,
     Network(usize),
     Tunnel(usize),
 }
@@ -876,15 +1013,13 @@ enum DecapOutcome {
 /// crypto output buffer so the common egress path does not allocate before it
 /// can send the first packet.
 ///
-/// Lock discipline: `Tunn::encapsulate` runs under `peer.lock_tunn()` which is
-/// blocking; `socket.send_to` is async and must not be called while holding
-/// the lock. We lock per packet, release immediately after encapsulation, then
-/// await `send_to` with the reusable buffer. That trades one cheap uncontended
-/// lock per packet for lower latency and less allocator pressure than staging
-/// a second Vec of encrypted frames.
+/// `Tunn::encapsulate` mutates the actor-owned [`PeerTunnel`]. `socket.send_to`
+/// is async, so the mutable tunnel borrow is kept inside a short block and is
+/// released before awaiting UDP I/O.
 async fn handle_outbound_batch(
     sockets: &TransportSockets,
     peers: &[Peer],
+    peer_tunnels: &mut [PeerTunnel],
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     first: Bytes,
     encrypt_rx: &mut mpsc::Receiver<Bytes>,
@@ -905,6 +1040,7 @@ async fn handle_outbound_batch(
     handle_outbound_packet_batch(
         sockets,
         peers,
+        peer_tunnels,
         #[cfg(feature = "endpoint-amneziawg")]
         amnezia,
         batch,
@@ -918,6 +1054,7 @@ async fn handle_outbound_batch(
 async fn handle_outbound_packet_batch(
     sockets: &TransportSockets,
     peers: &[Peer],
+    peer_tunnels: &mut [PeerTunnel],
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
     batch: &mut Vec<Bytes>,
     crypto_cap: usize,
@@ -966,16 +1103,23 @@ async fn handle_outbound_packet_batch(
         while i < routed.len() && routed[i].0 == peer_idx {
             let len = {
                 unsafe { send_buf.set_len(crypto_cap) };
-                let mut tunn = peer.lock_tunn();
-                match tunn.encapsulate(&routed[i].1, &mut send_buf[..]) {
-                    TunnResult::WriteToNetwork(out) => Some(out.len()),
-                    TunnResult::Done => None,
-                    TunnResult::Err(err) => {
-                        tracing::trace!(?err, "wireguard encapsulate error");
+                match peer_tunnels.get_mut(peer_idx) {
+                    Some(tunnel) => match tunnel.encapsulate(&routed[i].1, &mut send_buf[..]) {
+                        TunnResult::WriteToNetwork(out) => Some(out.len()),
+                        TunnResult::Done => None,
+                        TunnResult::Err(err) => {
+                            tracing::trace!(?err, "wireguard encapsulate error");
+                            None
+                        }
+                        // encapsulate never returns WriteToTunnel*, but match exhaustively.
+                        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                            None
+                        }
+                    },
+                    None => {
+                        warn!("wireguard outbound: missing tunnel for peer index {peer_idx}");
                         None
                     }
-                    // encapsulate never returns WriteToTunnel*, but match exhaustively.
-                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
                 }
             };
             i += 1;
@@ -1014,122 +1158,161 @@ fn route_outbound_peer(peers: &[Peer], dst: IpAddr) -> Option<usize> {
     peer::route_outbound(peers, dst)
 }
 
-/// Drive `Tunn::update_timers` for every peer, using a single shared scratch
-/// buffer instead of allocating one per peer per tick. `buf` is owned by the
-/// actor and stays at `crypto_cap` capacity across ticks; we reset it to full
-/// length before each `update_timers` call so boringtun has the writable
-/// surface its API expects, then `truncate` to the bytes actually produced
-/// before the syscall.
-async fn tick_timers(
+async fn handle_tunnel_control_message(
     sockets: &TransportSockets,
     peers: &[Peer],
+    peer_tunnels: &mut [PeerTunnel],
     #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
+    message: TunnelControlMessage,
     crypto_cap: usize,
-    buf: &mut BytesMut,
 ) {
-    for peer in peers {
-        // SAFETY: same argument as `alloc_crypto_buf`. boringtun writes into
-        // the slice we hand it and never reads pre-existing bytes; we only
-        // expose downstream the prefix it returned via `WriteToNetwork`.
-        unsafe { buf.set_len(crypto_cap) };
-        let len = {
-            let mut tunn = peer.lock_tunn();
-            match tunn.update_timers(&mut buf[..]) {
-                TunnResult::WriteToNetwork(out) => Some(out.len()),
-                _ => None,
-            }
-        };
-        if let Some(len) = len {
-            buf.truncate(len);
-            #[cfg(feature = "endpoint-amneziawg")]
-            if let Some(options) = amnezia {
-                let is_handshake = buf.first().is_some_and(|byte| matches!(*byte, 1 | 2));
-                if is_handshake {
-                    for junk in make_handshake_junk_packets(options) {
-                        let dst = peer.endpoint();
-                        let Some(socket) = sockets.send_socket(dst) else {
-                            warn!("wireguard udp has no socket for {dst}");
-                            continue;
-                        };
-                        if let Err(err) = socket.send_to(&junk, dst).await {
-                            warn!("wireguard amnezia junk send_to {dst}: {err}");
-                        }
-                    }
-                }
-                let mut encoded = buf.to_vec();
-                encode_outbound_packet(options, &mut encoded);
-                buf.clear();
-                buf.extend_from_slice(&encoded);
-            }
-            stamp_reserved_in_place(buf, peer.reserved());
-            let dst = peer.endpoint();
-            let Some(socket) = sockets.send_socket(dst) else {
-                warn!("wireguard udp has no socket for {dst}");
-                continue;
+    match message {
+        TunnelControlMessage::StartHandshake { peer_index } => {
+            let Some((peer, mut packet)) = run_tunnel_control_action(
+                peers,
+                peer_tunnels,
+                peer_index,
+                crypto_cap,
+                |tunnel, buf| tunnel.encapsulate(&[], buf),
+            ) else {
+                return;
             };
-            if let Err(err) = socket.send_to(buf, dst).await {
-                warn!("wireguard timer send {dst}: {err}");
+            send_tunnel_control_packet(
+                sockets,
+                peer,
+                #[cfg(feature = "endpoint-amneziawg")]
+                amnezia,
+                &mut packet,
+                #[cfg(feature = "endpoint-amneziawg")]
+                true,
+            )
+            .await;
+        }
+        TunnelControlMessage::InboundControlDatagram {
+            peer_index,
+            src_ip,
+            datagram,
+        } => {
+            let Some(peer) = peers.get(peer_index) else {
+                warn!("wireguard control packet: peer index {peer_index} out of range");
+                return;
+            };
+            let Some(peer_tunnel) = peer_tunnels.get_mut(peer_index) else {
+                warn!("wireguard control packet: missing tunnel for peer index {peer_index}");
+                return;
+            };
+            let mut inbound_batch = Vec::new();
+            let action = step_decapsulate(peer, peer_tunnel, Some(src_ip), &datagram, crypto_cap);
+            dispatch_action(sockets, peer, action, &mut inbound_batch).await;
+            loop {
+                let action = step_decapsulate(peer, peer_tunnel, None, &[], crypto_cap);
+                if matches!(action, DecapAction::Idle) {
+                    break;
+                }
+                dispatch_action(sockets, peer, action, &mut inbound_batch).await;
+            }
+            if !inbound_batch.is_empty() {
+                warn!("wireguard inbound control unexpectedly produced tunnel packets");
+            }
+        }
+        TunnelControlMessage::RekeyKeepaliveTimer => {
+            for peer_index in 0..peers.len() {
+                let Some((peer, mut packet)) = run_tunnel_control_action(
+                    peers,
+                    peer_tunnels,
+                    peer_index,
+                    crypto_cap,
+                    |tunnel, buf| tunnel.update_timers(buf),
+                ) else {
+                    continue;
+                };
+                send_tunnel_control_packet(
+                    sockets,
+                    peer,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia,
+                    &mut packet,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    false,
+                )
+                .await;
             }
         }
     }
 }
 
-async fn send_peer_handshake(
-    sockets: &TransportSockets,
-    peers: &[Peer],
-    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
+fn run_tunnel_control_action<'a>(
+    peers: &'a [Peer],
+    peer_tunnels: &mut [PeerTunnel],
     peer_index: usize,
     crypto_cap: usize,
-    buf: &mut BytesMut,
-) {
+    action: impl for<'buf> FnOnce(&mut PeerTunnel, &'buf mut [u8]) -> TunnResult<'buf>,
+) -> Option<(&'a Peer, BytesMut)> {
     let Some(peer) = peers.get(peer_index) else {
-        warn!("wireguard start handshake: peer index {peer_index} out of range");
-        return;
+        warn!("wireguard control packet: peer index {peer_index} out of range");
+        return None;
     };
-
-    unsafe { buf.set_len(crypto_cap) };
-    let len = {
-        let mut tunn = peer.lock_tunn();
-        match tunn.encapsulate(&[], &mut buf[..]) {
-            TunnResult::WriteToNetwork(out) => Some(out.len()),
-            TunnResult::Done => None,
-            TunnResult::Err(err) => {
-                tracing::trace!(?err, "wireguard start handshake encapsulate error");
-                None
-            }
-            TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
+    let Some(tunnel) = peer_tunnels.get_mut(peer_index) else {
+        warn!("wireguard control packet: missing tunnel for peer index {peer_index}");
+        return None;
+    };
+    let mut packet = alloc_crypto_buf(crypto_cap);
+    let len = match action(tunnel, &mut packet[..]) {
+        TunnResult::WriteToNetwork(out) => Some(out.len()),
+        TunnResult::Done => None,
+        TunnResult::Err(err) => {
+            tracing::trace!(?err, "wireguard control tunnel action error");
+            None
         }
+        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => None,
     };
-    let Some(len) = len else {
-        return;
-    };
-
-    buf.truncate(len);
-    #[cfg(feature = "endpoint-amneziawg")]
-    if let Some(options) = amnezia {
-        for junk in make_handshake_junk_packets(options) {
-            let dst = peer.endpoint();
-            let Some(socket) = sockets.send_socket(dst) else {
-                warn!("wireguard udp has no socket for {dst}");
-                continue;
-            };
-            if let Err(err) = socket.send_to(&junk, dst).await {
-                warn!("wireguard amnezia junk send_to {dst}: {err}");
-            }
-        }
-        let mut encoded = buf.to_vec();
-        encode_outbound_packet(options, &mut encoded);
-        buf.clear();
-        buf.extend_from_slice(&encoded);
+    if let Some(len) = len {
+        packet.truncate(len);
+        Some((peer, packet))
+    } else {
+        None
     }
-    stamp_reserved_in_place(buf, peer.reserved());
+}
+
+async fn send_tunnel_control_packet(
+    sockets: &TransportSockets,
+    peer: &Peer,
+    #[cfg(feature = "endpoint-amneziawg")] amnezia: Option<&Amnezia2Options>,
+    packet: &mut BytesMut,
+    #[cfg(feature = "endpoint-amneziawg")] send_handshake_junk: bool,
+) {
     let dst = peer.endpoint();
     let Some(socket) = sockets.send_socket(dst) else {
         warn!("wireguard udp has no socket for {dst}");
         return;
     };
-    if let Err(err) = socket.send_to(buf, dst).await {
-        warn!("wireguard start handshake send {dst}: {err}");
+    #[cfg(feature = "endpoint-amneziawg")]
+    if let Some(options) = amnezia {
+        if send_handshake_junk {
+            for junk in make_handshake_junk_packets(options) {
+                if let Err(err) = socket.send_to(&junk, dst).await {
+                    warn!("wireguard amnezia junk send_to {dst}: {err}");
+                }
+            }
+        }
+        let mut encoded = packet.to_vec();
+        encode_outbound_packet(options, &mut encoded);
+        packet.clear();
+        packet.extend_from_slice(&encoded);
+    }
+    stamp_reserved_in_place(packet, peer.reserved());
+    if let Err(err) = socket.send_to(packet, dst).await {
+        warn!("wireguard control packet send {dst}: {err}");
+    }
+}
+
+fn wireguard_message_type(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 4 || packet[1..4] != [0, 0, 0] {
+        return None;
+    }
+    match packet[0] {
+        message_type @ 1..=4 => Some(message_type),
+        _ => None,
     }
 }
 
@@ -1198,7 +1381,7 @@ mod tests {
         local_priv: [u8; 32],
         endpoint: SocketAddr,
         index: u32,
-    ) -> Peer {
+    ) -> (Peer, PeerTunnel) {
         let opts = WireguardPeerOptions {
             public_key: peer_pub,
             pre_shared_key: None,
@@ -1207,13 +1390,15 @@ mod tests {
             persistent_keepalive: None,
             reserved: [0; 3],
         };
-        Peer::new(
-            opts,
+        let peer = Peer::from_options(&opts);
+        let tunnel = PeerTunnel::new(
+            &opts,
             &x25519::StaticSecret::from(local_priv),
             index,
             #[cfg(feature = "endpoint-amneziawg")]
             None,
-        )
+        );
+        (peer, tunnel)
     }
 
     /// Minimal 60-byte IPv4 datagram targeting 10.0.0.5 — boringtun doesn't
@@ -1298,12 +1483,14 @@ mod tests {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
 
-        let peer_a = make_peer(b_pub, a_priv, addr_b, 0);
-        let peer_b = make_peer(a_pub, b_priv, addr_a, 0);
+        let (peer_a, tunnel_a) = make_peer(b_pub, a_priv, addr_b, 0);
+        let (peer_b, tunnel_b) = make_peer(a_pub, b_priv, addr_a, 0);
 
         let handles_a = spawn_transport(
             logger("transport-a"),
+            "transport-a".to_owned(),
             Arc::new(vec![peer_a]),
+            vec![tunnel_a],
             port_a,
             1408,
             SocketProtector::default(),
@@ -1314,7 +1501,9 @@ mod tests {
         .expect("spawn A");
         let mut handles_b = spawn_transport(
             logger("transport-b"),
+            "transport-b".to_owned(),
             Arc::new(vec![peer_b]),
+            vec![tunnel_b],
             port_b,
             1408,
             SocketProtector::default(),
@@ -1349,7 +1538,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn transport_registers_wireguard_timer_on_control_thread() {
+    async fn transport_registers_rekey_keepalive_timer_on_control_thread() {
         let inner = Arc::new(DiscardWriter);
         let (control_thread_handle, control_thread) = ControlThread::new(
             Instant::now(),
@@ -1368,7 +1557,7 @@ mod tests {
 
         let local_priv = [23u8; 32];
         let peer_pub = x25519_public([24u8; 32]);
-        let peer = make_peer(
+        let (peer, tunnel) = make_peer(
             peer_pub,
             local_priv,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
@@ -1376,8 +1565,10 @@ mod tests {
         );
 
         let handles = spawn_transport(
-            logger("transport-control-timer"),
+            logger("transport-control-rekey-keepalive-timer"),
+            "transport-control-rekey-keepalive-timer".to_owned(),
             Arc::new(vec![peer]),
+            vec![tunnel],
             0,
             1408,
             SocketProtector::default(),
@@ -1385,12 +1576,89 @@ mod tests {
             #[cfg(feature = "endpoint-amneziawg")]
             None,
         )
-        .expect("spawn transport with control timer");
+        .expect("spawn transport with control rekey/keepalive timer");
 
         assert!(
-            handles.has_control_timer_tick_for_test(),
-            "wireguard endpoint timer tick must be registered on the control thread"
+            handles.has_control_rekey_keepalive_timer_for_test(),
+            "wireguard endpoint rekey/keepalive timer must be registered on the control thread"
         );
+
+        let _ = handles.shutdown.send(());
+        assert!(control_thread_handle.shutdown_timeout(Duration::from_secs(1)));
+        control_join.join().expect("control thread join");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_handshake_event_updates_tunnel_state() {
+        let inner = Arc::new(DiscardWriter);
+        let (control_thread_handle, control_thread) = ControlThread::new(
+            Instant::now(),
+            inner,
+            MetricsRegistry::new(),
+            Duration::from_secs(60),
+            Level::Info,
+        );
+        let control_join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("control thread runtime");
+            runtime.block_on(control_thread.run());
+        });
+        let _subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+            logger("transport-inbound-control"),
+            Arc::clone(&control_thread_handle),
+        )
+        .expect("build standard event subscribers");
+
+        let local_priv = [123u8; 32];
+        let remote_priv = [124u8; 32];
+        let local_pub = x25519_public(local_priv);
+        let remote_pub = x25519_public(remote_priv);
+        let remote_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind remote socket");
+        let remote_addr = remote_socket.local_addr().expect("remote socket addr");
+
+        let (peer, tunnel) = make_peer(remote_pub, local_priv, remote_addr, 0);
+        let handles = spawn_transport(
+            logger("transport-inbound-control"),
+            "transport-inbound-control".to_owned(),
+            Arc::new(vec![peer]),
+            vec![tunnel],
+            0,
+            1408,
+            SocketProtector::default(),
+            Some(Arc::clone(&control_thread_handle)),
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
+        )
+        .expect("spawn transport with inbound control event");
+        let transport_addr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), handles.local_addr.port());
+
+        let (_remote_peer, mut remote_tunnel) =
+            make_peer(local_pub, remote_priv, transport_addr, 0);
+        let mut init_buf = vec![0u8; 2048];
+        let init = match remote_tunnel.encapsulate(&[], &mut init_buf) {
+            TunnResult::WriteToNetwork(out) => out.to_vec(),
+            other => panic!("remote expected handshake init, got {other:?}"),
+        };
+        remote_socket
+            .send_to(&init, transport_addr)
+            .await
+            .expect("send handshake init");
+
+        let mut recv_buf = [0u8; 2048];
+        let (n, _) = timeout(
+            Duration::from_secs(2),
+            remote_socket.recv_from(&mut recv_buf),
+        )
+        .await
+        .expect("timed out waiting for handshake response")
+        .expect("receive handshake response");
+        assert!(n >= 4, "handshake response must include a header");
+        assert_eq!(recv_buf[0], 2, "inbound event must update Tunn state");
 
         let _ = handles.shutdown.send(());
         assert!(control_thread_handle.shutdown_timeout(Duration::from_secs(1)));
@@ -1422,12 +1690,14 @@ mod tests {
         let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a);
         let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b);
 
-        let peer_a = make_peer(b_pub, a_priv, addr_b, 0);
-        let peer_b = make_peer(a_pub, b_priv, addr_a, 0);
+        let (peer_a, tunnel_a) = make_peer(b_pub, a_priv, addr_b, 0);
+        let (peer_b, tunnel_b) = make_peer(a_pub, b_priv, addr_a, 0);
 
         let handles_a = spawn_transport(
             logger("transport-a-burst"),
+            "transport-a-burst".to_owned(),
             Arc::new(vec![peer_a]),
+            vec![tunnel_a],
             port_a,
             1408,
             SocketProtector::default(),
@@ -1438,7 +1708,9 @@ mod tests {
         .expect("spawn A");
         let mut handles_b = spawn_transport(
             logger("transport-b-burst"),
+            "transport-b-burst".to_owned(),
             Arc::new(vec![peer_b]),
+            vec![tunnel_b],
             port_b,
             1408,
             SocketProtector::default(),
@@ -1484,7 +1756,7 @@ mod tests {
     async fn transport_drops_plain_packet_larger_than_endpoint_mtu() {
         let a_priv = [55u8; 32];
         let b_pub = x25519_public([66u8; 32]);
-        let peer = make_peer(
+        let (peer, mut tunnel) = make_peer(
             b_pub,
             a_priv,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
@@ -1503,6 +1775,7 @@ mod tests {
         handle_outbound_batch(
             &sockets,
             &peers,
+            std::slice::from_mut(&mut tunnel),
             #[cfg(feature = "endpoint-amneziawg")]
             None,
             Bytes::from(packet),
@@ -1524,7 +1797,7 @@ mod tests {
     async fn ephemeral_reset_bind_failure_keeps_existing_sockets() {
         let local_priv = [67u8; 32];
         let peer_pub = x25519_public([68u8; 32]);
-        let peer = make_peer(
+        let (peer, _tunnel) = make_peer(
             peer_pub,
             local_priv,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), ephemeral_port()),
@@ -1556,7 +1829,7 @@ mod tests {
         let a_priv = [77u8; 32];
         let b_priv = [88u8; 32];
         let b_pub = x25519_public(b_priv);
-        let peer = make_peer(
+        let (peer, tunnel) = make_peer(
             b_pub,
             a_priv,
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),
@@ -1565,7 +1838,9 @@ mod tests {
 
         let handles = spawn_transport(
             logger("transport-v6"),
+            "transport-v6".to_owned(),
             Arc::new(vec![peer]),
+            vec![tunnel],
             0,
             1408,
             SocketProtector::default(),
@@ -1589,13 +1864,13 @@ mod tests {
         let local_priv = [99u8; 32];
         let v4_pub = x25519_public([100u8; 32]);
         let v6_pub = x25519_public([101u8; 32]);
-        let v4_peer = make_peer(
+        let (v4_peer, v4_tunnel) = make_peer(
             v4_pub,
             local_priv,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
             0,
         );
-        let v6_peer = make_peer(
+        let (v6_peer, v6_tunnel) = make_peer(
             v6_pub,
             local_priv,
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51821),
@@ -1604,7 +1879,9 @@ mod tests {
 
         let handles = spawn_transport(
             logger("transport-mixed"),
+            "transport-mixed".to_owned(),
             Arc::new(vec![v4_peer, v6_peer]),
+            vec![v4_tunnel, v6_tunnel],
             0,
             1408,
             SocketProtector::default(),

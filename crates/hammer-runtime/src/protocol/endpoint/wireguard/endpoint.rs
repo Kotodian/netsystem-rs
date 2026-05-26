@@ -17,7 +17,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use hammer_adapter::{Endpoint, EndpointLocalFlow, Lifecycle, Network, PlatformInterface};
-use hammer_core::config::{Endpoint as EndpointOptions, EndpointKind, WireguardEndpointOptions};
+use hammer_core::config::{
+    Endpoint as EndpointOptions, EndpointKind, WireguardEndpointOptions, WireguardPeerOptions,
+};
 #[cfg(test)]
 use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
@@ -29,7 +31,7 @@ use hammer_core::protocol::wireguard::WIREGUARD_OVERHEAD;
 use hammer_core::protocol::wireguard::amnezia2::Amnezia2Options;
 #[cfg(test)]
 use hammer_core::protocol::wireguard::peer;
-use hammer_core::protocol::wireguard::peer::Peer;
+use hammer_core::protocol::wireguard::peer::{Peer, PeerTunnel};
 
 #[cfg(feature = "endpoint-amneziawg")]
 use super::amnezia2::to_boringtun_config;
@@ -55,6 +57,8 @@ pub struct WireguardEndpoint {
     mtu: u32,
     listen_port: u16,
     addresses: Vec<IpNet>,
+    private_key: [u8; 32],
+    peer_options: Vec<WireguardPeerOptions>,
     #[cfg(feature = "endpoint-amneziawg")]
     amnezia: Option<Amnezia2Options>,
     peers: Arc<Vec<Peer>>,
@@ -81,13 +85,40 @@ pub struct WireguardPeerStartArgs {
     pub peer_index: usize,
     pub peer_endpoint: SocketAddr,
     pub peer_public_key: [u8; 32],
-    handshake: transport::PeerHandshakeTrigger,
+    start_control: transport::PeerStartControl,
 }
 
 impl WireguardPeerStartArgs {
-    fn trigger_handshake(&self) -> HammerResult<()> {
-        self.handshake.trigger()
+    fn start_handshake(&self) -> HammerResult<()> {
+        self.start_control.start_handshake()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct WireguardPeerHandshakeReceivedArgs {
+    pub endpoint_id: String,
+    pub peer_index: usize,
+    pub peer_endpoint: SocketAddr,
+    pub peer_public_key: [u8; 32],
+    pub message_type: u8,
+    pub(super) src_ip: IpAddr,
+    pub(super) datagram: Bytes,
+    pub(super) inbound_control: transport::PeerInboundControl,
+}
+
+impl WireguardPeerHandshakeReceivedArgs {
+    fn process_handshake(&self) -> HammerResult<()> {
+        self.inbound_control
+            .process_inbound_control(self.src_ip, self.datagram.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WireguardPeerKeepaliveReceivedArgs {
+    pub endpoint_id: String,
+    pub peer_index: usize,
+    pub peer_endpoint: SocketAddr,
+    pub peer_public_key: [u8; 32],
 }
 
 #[hammer_component_macros::hammer_component(
@@ -107,7 +138,7 @@ pub(crate) fn build_wireguard_start_handshake_subscriber(
             let logger = logger.clone();
             async move {
                 if let Some(args) = event.args::<WireguardPeerStartArgs>() {
-                    match args.trigger_handshake() {
+                    match args.start_handshake() {
                         Ok(()) => logger.debug(format!(
                             "wireguard endpoint {} start handshake peer_index={} peer={}",
                             args.endpoint_id, args.peer_index, args.peer_endpoint
@@ -122,6 +153,41 @@ pub(crate) fn build_wireguard_start_handshake_subscriber(
         },
     )?;
     Ok(vec![subscription])
+}
+
+#[hammer_component_macros::hammer_component(
+    event,
+    name = "wireguard-inbound-control",
+    builder = build_wireguard_inbound_control_subscriber
+)]
+pub struct WireguardInboundControlSubscriber;
+
+pub(crate) fn build_wireguard_inbound_control_subscriber(
+    logger: Logger,
+    control_handle: Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    let handshake = control_handle.subscribe_event(
+        ControlEventFilter::event::<WireguardPeerHandshakeReceivedArgs>(),
+        move |event| {
+            let logger = logger.clone();
+            async move {
+                if let Some(args) = event.args::<WireguardPeerHandshakeReceivedArgs>() {
+                    if let Err(err) = args.process_handshake() {
+                        logger.warn(format!(
+                            "wireguard endpoint {} inbound handshake failed peer_index={} peer={} message_type={}: {}",
+                            args.endpoint_id,
+                            args.peer_index,
+                            args.peer_endpoint,
+                            args.message_type,
+                            err
+                        ));
+                    }
+                }
+            }
+        },
+    )?;
+
+    Ok(vec![handshake])
 }
 
 /// Demuxes decapsulated IP packets from the boringtun transport into two
@@ -232,25 +298,11 @@ impl WireguardEndpoint {
             interface,
             protocol: options,
         } = options;
-        let private_key = x25519::StaticSecret::from(options.private_key);
-        #[cfg(feature = "endpoint-amneziawg")]
-        let amnezia = options.amnezia.as_ref().map(to_boringtun_config);
+        let private_key = options.private_key;
         #[cfg(feature = "endpoint-amneziawg")]
         let runtime_amnezia = options.amnezia.clone();
-        let peers: Vec<Peer> = options
-            .peers
-            .into_iter()
-            .enumerate()
-            .map(|(idx, peer_opts)| {
-                Peer::new(
-                    peer_opts,
-                    &private_key,
-                    idx as u32,
-                    #[cfg(feature = "endpoint-amneziawg")]
-                    amnezia.clone(),
-                )
-            })
-            .collect();
+        let peer_options = options.peers.clone();
+        let peers: Vec<Peer> = peer_options.iter().map(Peer::from_options).collect();
         Self {
             logger,
             id,
@@ -259,6 +311,8 @@ impl WireguardEndpoint {
             mtu: interface.mtu,
             listen_port: options.listen_port,
             addresses: interface.address,
+            private_key,
+            peer_options,
             #[cfg(feature = "endpoint-amneziawg")]
             amnezia: runtime_amnezia,
             peers: Arc::new(peers),
@@ -322,7 +376,7 @@ impl WireguardEndpoint {
                 peer_index,
                 peer_endpoint: peer.endpoint(),
                 peer_public_key: peer.public_key(),
-                handshake: runtime.transport.peer_handshake_trigger(peer_index),
+                start_control: runtime.transport.peer_start_control(peer_index),
             })
             .collect()
     }
@@ -345,9 +399,29 @@ impl WireguardEndpoint {
             return Err(HammerError::internal("injected wireguard start failure"));
         }
 
+        let private_key = x25519::StaticSecret::from(self.private_key);
+        #[cfg(feature = "endpoint-amneziawg")]
+        let amnezia = self.amnezia.as_ref().map(to_boringtun_config);
+        let peer_tunnels: Vec<PeerTunnel> = self
+            .peer_options
+            .iter()
+            .enumerate()
+            .map(|(idx, peer_opts)| {
+                PeerTunnel::new(
+                    peer_opts,
+                    &private_key,
+                    idx as u32,
+                    #[cfg(feature = "endpoint-amneziawg")]
+                    amnezia.clone(),
+                )
+            })
+            .collect();
+
         let transport = transport::spawn_transport(
             self.logger.clone(),
+            self.id.clone(),
             Arc::clone(&self.peers),
+            peer_tunnels,
             self.listen_port,
             self.mtu,
             self.protector.clone(),
@@ -367,8 +441,8 @@ impl WireguardEndpoint {
             local_addr,
             shutdown,
             reset_tx,
-            start_handshake_tx,
-            timer_tick,
+            tunnel_control,
+            rekey_keepalive_timer,
             join,
         } = transport;
 
@@ -403,8 +477,8 @@ impl WireguardEndpoint {
                 local_addr,
                 shutdown,
                 reset_tx,
-                start_handshake_tx,
-                timer_tick,
+                tunnel_control,
+                rekey_keepalive_timer,
                 join,
             },
             encrypt_tx: encrypt_tx_clone,
@@ -449,7 +523,7 @@ impl WireguardEndpoint {
 }
 
 fn stop_runtime(rt: WireguardRuntime) {
-    rt.transport.cancel_timer_tick();
+    rt.transport.cancel_rekey_keepalive_timer();
     let _ = rt.transport.shutdown.send(());
     rt.transport.join.abort();
     drop(rt.encrypt_tx);
@@ -785,6 +859,24 @@ mod tests {
         )
     }
 
+    fn make_peer_tunnel(peer_pub: [u8; 32], local_priv: [u8; 32]) -> PeerTunnel {
+        let opts = WireguardPeerOptions {
+            public_key: peer_pub,
+            pre_shared_key: None,
+            endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 51820),
+            allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            persistent_keepalive: None,
+            reserved: [0; 3],
+        };
+        PeerTunnel::new(
+            &opts,
+            &x25519::StaticSecret::from(local_priv),
+            0,
+            #[cfg(feature = "endpoint-amneziawg")]
+            None,
+        )
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restart_keeps_existing_runtime_and_sender() {
         let a_priv = [3u8; 32];
@@ -890,25 +982,23 @@ mod tests {
         let a_pub = x25519_public(a_priv);
         let b_pub = x25519_public(b_priv);
 
-        let a = make_endpoint("a", a_priv, b_pub);
-        let b = make_endpoint("b", b_priv, a_pub);
-        let a_peer = &a.peers()[0];
-        let b_peer = &b.peers()[0];
+        let mut a_tunnel = make_peer_tunnel(b_pub, a_priv);
+        let mut b_tunnel = make_peer_tunnel(a_pub, b_priv);
 
         let mut buf1 = vec![0u8; 2048];
-        let init = match a_peer.lock_tunn().encapsulate(&[], &mut buf1) {
+        let init = match a_tunnel.encapsulate(&[], &mut buf1) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("A: expected handshake_init, got {other:?}"),
         };
 
         let mut buf2 = vec![0u8; 2048];
-        let response = match b_peer.lock_tunn().decapsulate(None, &init, &mut buf2) {
+        let response = match b_tunnel.decapsulate(None, &init, &mut buf2) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("B: expected handshake_response, got {other:?}"),
         };
 
         let mut buf3 = vec![0u8; 2048];
-        match a_peer.lock_tunn().decapsulate(None, &response, &mut buf3) {
+        match a_tunnel.decapsulate(None, &response, &mut buf3) {
             TunnResult::Done | TunnResult::WriteToNetwork(_) => {}
             other => panic!("A: handshake_response result {other:?}"),
         }
@@ -918,16 +1008,13 @@ mod tests {
         ip_packet[3] = 60;
 
         let mut enc_buf = vec![0u8; 2048];
-        let encrypted = match a_peer.lock_tunn().encapsulate(&ip_packet, &mut enc_buf) {
+        let encrypted = match a_tunnel.encapsulate(&ip_packet, &mut enc_buf) {
             TunnResult::WriteToNetwork(out) => out.to_vec(),
             other => panic!("A: encapsulate {other:?}"),
         };
 
         let mut dec_buf = vec![0u8; 2048];
-        match b_peer
-            .lock_tunn()
-            .decapsulate(None, &encrypted, &mut dec_buf)
-        {
+        match b_tunnel.decapsulate(None, &encrypted, &mut dec_buf) {
             TunnResult::WriteToTunnelV4(out, _src) => assert_eq!(out, ip_packet),
             other => panic!("B: decapsulate {other:?}"),
         }

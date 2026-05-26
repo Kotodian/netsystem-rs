@@ -51,7 +51,10 @@ fn register_standard_event_subscriber_builders(
     register_components!(
         event,
         _builders,
-        [crate::protocol::endpoint::wireguard::WireguardStartHandshakeSubscriber]
+        [
+            crate::protocol::endpoint::wireguard::WireguardStartHandshakeSubscriber,
+            crate::protocol::endpoint::wireguard::WireguardInboundControlSubscriber
+        ]
     );
 }
 

@@ -1,57 +1,34 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
 
 #[cfg(feature = "amneziawg")]
 use boringtun::noise::AmneziaConfig;
-use boringtun::noise::Tunn;
+use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519;
 use ipnet::IpNet;
 
 use crate::config::WireguardPeerOptions;
 
-/// One WireGuard peer — owns the boringtun `Tunn` state machine plus the
-/// metadata Hammer needs around it (resolved UDP endpoint, allowed_ips for
-/// outbound LPM routing, the WARP-style 3-byte reserved prefix).
-///
-/// `Tunn` is interior-mutable but not `Sync`, so we lock it ourselves. boringtun
-/// expects single-threaded access per peer; the lock keeps multiple async tasks
-/// (rx loop, tx loop, timer tick) from clobbering session state.
+/// WireGuard peer metadata used by Hammer outside the mutable tunnel state.
 pub struct Peer {
-    tunn: Mutex<Tunn>,
     public_key: [u8; 32],
     allowed_ips: Vec<IpNet>,
     endpoint: SocketAddr,
     reserved: [u8; 3],
 }
 
+/// Mutable boringtun state for one peer.
+///
+/// This type is intentionally separate from [`Peer`]. Runtime code should keep
+/// it owned by one transport actor instead of sharing it across threads.
+pub struct PeerTunnel {
+    tunn: Tunn,
+}
+
 impl Peer {
-    pub fn new(
-        opts: WireguardPeerOptions,
-        local_private: &x25519::StaticSecret,
-        index: u32,
-        #[cfg(feature = "amneziawg")] amnezia: Option<AmneziaConfig>,
-    ) -> Self {
-        let peer_public_key = opts.public_key;
-        let public_key = x25519::PublicKey::from(peer_public_key);
-        // boringtun stores the keepalive interval as `u16` seconds; clamp the
-        // configured Duration into that window. None disables keepalive.
-        let keepalive = opts
-            .persistent_keepalive
-            .map(|d| d.as_secs().min(u16::MAX as u64) as u16);
-        let tunn = Tunn::new(
-            local_private.clone(),
-            public_key,
-            opts.pre_shared_key,
-            keepalive,
-            index,
-            None, // rate_limiter: None lets boringtun build a default per-peer one
-            #[cfg(feature = "amneziawg")]
-            amnezia,
-        );
+    pub fn from_options(opts: &WireguardPeerOptions) -> Self {
         Self {
-            tunn: Mutex::new(tunn),
-            public_key: peer_public_key,
-            allowed_ips: opts.allowed_ips,
+            public_key: opts.public_key,
+            allowed_ips: opts.allowed_ips.clone(),
             endpoint: opts.endpoint,
             reserved: opts.reserved,
         }
@@ -83,9 +60,49 @@ impl Peer {
             .map(|net| net.prefix_len())
             .max()
     }
+}
 
-    pub fn lock_tunn(&self) -> std::sync::MutexGuard<'_, Tunn> {
-        self.tunn.lock().expect("wireguard peer Tunn poisoned")
+impl PeerTunnel {
+    pub fn new(
+        opts: &WireguardPeerOptions,
+        local_private: &x25519::StaticSecret,
+        index: u32,
+        #[cfg(feature = "amneziawg")] amnezia: Option<AmneziaConfig>,
+    ) -> Self {
+        let public_key = x25519::PublicKey::from(opts.public_key);
+        // boringtun stores the keepalive interval as `u16` seconds; clamp the
+        // configured Duration into that window. None disables keepalive.
+        let keepalive = opts
+            .persistent_keepalive
+            .map(|d| d.as_secs().min(u16::MAX as u64) as u16);
+        let tunn = Tunn::new(
+            local_private.clone(),
+            public_key,
+            opts.pre_shared_key,
+            keepalive,
+            index,
+            None, // rate_limiter: None lets boringtun build a default per-peer one
+            #[cfg(feature = "amneziawg")]
+            amnezia,
+        );
+        Self { tunn }
+    }
+
+    pub fn encapsulate<'a>(&mut self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.tunn.encapsulate(src, dst)
+    }
+
+    pub fn decapsulate<'a>(
+        &mut self,
+        src_addr: Option<IpAddr>,
+        datagram: &[u8],
+        dst: &'a mut [u8],
+    ) -> TunnResult<'a> {
+        self.tunn.decapsulate(src_addr, datagram, dst)
+    }
+
+    pub fn update_timers<'a>(&mut self, dst: &'a mut [u8]) -> TunnResult<'a> {
+        self.tunn.update_timers(dst)
     }
 }
 
