@@ -1014,8 +1014,14 @@ fn spawn_udp_relay(
                 let Some(packet) = send_rx.recv().await else {
                     break;
                 };
-                if let Err(err) =
-                    send_udp_buffer(&mut *packet_conn, &runtime, &mut outbound_frame, packet.destination, packet.buffer).await
+                if let Err(err) = send_udp_buffer(
+                    &mut *packet_conn,
+                    &runtime,
+                    &mut outbound_frame,
+                    packet.destination,
+                    packet.buffer,
+                )
+                .await
                 {
                     debug!("SOCKS5 UDP send failed via outbound={outbound_id}: {err}");
                     break;
@@ -1246,7 +1252,11 @@ fn udp_route_metadata(
     }
 }
 
-fn route_udp(router: &Router, runtime: &DataPlaneRuntime, buffer: BufferIndex) -> HammerResult<String> {
+fn route_udp(
+    router: &Router,
+    runtime: &DataPlaneRuntime,
+    buffer: BufferIndex,
+) -> HammerResult<String> {
     let decision = runtime.with_metadata_mut(buffer, |metadata| {
         router.prepare_route_metadata(metadata)?;
         router.match_route(metadata)

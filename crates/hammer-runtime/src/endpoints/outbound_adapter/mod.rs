@@ -28,8 +28,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, Endpoint,
-    EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
+    BufferFrame, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, DataPlaneRuntime,
+    Endpoint, EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
     RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -504,7 +504,11 @@ impl Drop for EndpointUdpConn {
 
 #[async_trait(?Send)]
 impl ProxyPacketConn for EndpointUdpConn {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> CoreResult<()> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<()> {
         let mut result = Ok(());
         for index in frame.drain_indices() {
             if result.is_ok() {

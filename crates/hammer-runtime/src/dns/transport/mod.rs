@@ -300,7 +300,11 @@ mod tests {
 
     #[async_trait(?Send)]
     impl ProxyPacketConn for HangingPacketConn {
-        async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+        async fn send(
+            &mut self,
+            runtime: &DataPlaneRuntime,
+            frame: &mut BufferFrame,
+        ) -> HammerResult<()> {
             runtime.free_frame(frame);
             Ok(())
         }

@@ -152,7 +152,11 @@ impl DirectPacketConn {
 
 #[async_trait(?Send)]
 impl ProxyPacketConn for DirectPacketConn {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> HammerResult<()> {
         let mut result = Ok(());
         for index in frame.drain_indices() {
             if result.is_ok() {

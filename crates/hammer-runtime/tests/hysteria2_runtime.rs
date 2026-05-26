@@ -8,8 +8,8 @@ mod support;
 use bytes::Bytes;
 use hammer_adapter::{
     DataPlaneRuntime, DefaultInterfaceUpdateListener, Network, NetworkInterface,
-    OutboundManager as _, PlatformInterface, ProxyPacketConn, RouteMetadata, SocksAddr,
-    TunOptions, WifiState,
+    OutboundManager as _, PlatformInterface, ProxyPacketConn, RouteMetadata, SocksAddr, TunOptions,
+    WifiState,
 };
 use hammer_core::config::{self, Options, OutboundTlsOptions};
 use hammer_core::error::HammerError;

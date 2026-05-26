@@ -2084,9 +2084,12 @@ where
                 }
                 packet.send(&runtime, &mut request).await?;
                 let mut response = runtime.frame_with_capacity(1);
-                timeout(Duration::from_secs(2), packet.recv(&runtime, &mut response, 1))
-                    .await
-                    .map_err(|_| HammerError::internal("TUN routed UDP response timed out"))??;
+                timeout(
+                    Duration::from_secs(2),
+                    packet.recv(&runtime, &mut response, 1),
+                )
+                .await
+                .map_err(|_| HammerError::internal("TUN routed UDP response timed out"))??;
                 let response = response
                     .drain_indices()
                     .next()
@@ -3838,7 +3841,8 @@ where
         metrics.counters.udp_route_prepare_error_total.increment(1);
         return Err(err);
     }
-    let decision = match runtime.with_metadata_mut(buffer, |metadata| router.match_route(metadata)) {
+    let decision = match runtime.with_metadata_mut(buffer, |metadata| router.match_route(metadata))
+    {
         Ok(Ok(decision)) => decision,
         Ok(Err(err)) | Err(err) => {
             runtime.free_index(buffer);

@@ -8,8 +8,8 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::buffer::{BufferFrame, DataPlaneRuntime};
 use crate::RuntimeComponent;
+use crate::buffer::{BufferFrame, DataPlaneRuntime};
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
 
@@ -21,11 +21,8 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'stat
 
 #[async_trait(?Send)]
 pub trait ProxyPacketConn: 'static {
-    async fn send(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<()>;
+    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame)
+    -> CoreResult<()>;
     async fn recv(
         &mut self,
         runtime: &DataPlaneRuntime,

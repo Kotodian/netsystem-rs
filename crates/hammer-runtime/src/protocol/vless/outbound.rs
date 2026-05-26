@@ -278,7 +278,11 @@ impl VlessPacketConn {
 
 #[async_trait(?Send)]
 impl ProxyPacketConn for VlessPacketConn {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> HammerResult<()> {
         let mut result = Ok(());
         for index in frame.drain_indices() {
             if result.is_ok() {
@@ -290,9 +294,10 @@ impl ProxyPacketConn for VlessPacketConn {
                     self.ensure_stream(&destination).await?;
                     let payload = runtime.copy_current_chain(index)?;
                     let packet = encode_udp_packet(&payload)?;
-                    let stream = self.stream.as_mut().ok_or_else(|| {
-                        HammerError::internal("vless udp stream not initialized")
-                    })?;
+                    let stream = self
+                        .stream
+                        .as_mut()
+                        .ok_or_else(|| HammerError::internal("vless udp stream not initialized"))?;
                     stream
                         .write_all(&packet)
                         .await

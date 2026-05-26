@@ -13,8 +13,8 @@ use bytes::Bytes;
 use futures::future;
 use h3::client;
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Outbound, PlatformInterface, ProxyPacketConn, ProxyStream,
-    RouteMetadata, SocksAddr,
+    BufferFrame, DataPlaneRuntime, Network, Outbound, PlatformInterface, ProxyPacketConn,
+    ProxyStream, RouteMetadata, SocksAddr,
 };
 use hammer_core::config::{
     Hysteria2Network, Hysteria2Obfs, Hysteria2ObfsType, Hysteria2OutboundOptions, OutboundKind,
@@ -432,7 +432,11 @@ struct Hysteria2Datagram {
 
 #[async_trait(?Send)]
 impl ProxyPacketConn for Hysteria2PacketConn {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> HammerResult<()> {
         let mut result = Ok(());
         for index in frame.drain_indices() {
             if result.is_ok() {
@@ -461,9 +465,11 @@ impl ProxyPacketConn for Hysteria2PacketConn {
                         destination: destination.to_string(),
                         payload,
                     };
-                    self.connection.send_datagram(message.encode()).map_err(|err| {
-                        HammerError::internal(format!("send hysteria2 datagram: {err}"))
-                    })?;
+                    self.connection
+                        .send_datagram(message.encode())
+                        .map_err(|err| {
+                            HammerError::internal(format!("send hysteria2 datagram: {err}"))
+                        })?;
                     Ok(())
                 })();
             }
@@ -1371,10 +1377,13 @@ mod tests {
         client.close(b"simulate suspended connection loss");
         let runtime = hammer_adapter::DataPlaneRuntime::with_buffer_capacity(2048, 8);
         let mut frame = runtime.frame_with_capacity(1);
-        let err = tokio::time::timeout(Duration::from_millis(200), packet.recv(&runtime, &mut frame, 1))
-            .await
-            .expect("closed QUIC connection should wake UDP recv")
-            .expect_err("UDP recv should report connection closure");
+        let err = tokio::time::timeout(
+            Duration::from_millis(200),
+            packet.recv(&runtime, &mut frame, 1),
+        )
+        .await
+        .expect("closed QUIC connection should wake UDP recv")
+        .expect_err("UDP recv should report connection closure");
 
         assert!(err.to_string().contains("hysteria2 UDP connection closed"));
     }

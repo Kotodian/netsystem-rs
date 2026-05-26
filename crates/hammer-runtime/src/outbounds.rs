@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ComponentMeta, ComponentMetadata, IcmpReply, Lifecycle, Network, Outbound,
-    OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport, ProxyIcmpConn,
-    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
+    BufferFrame, ComponentMeta, ComponentMetadata, DataPlaneRuntime, IcmpReply, Lifecycle, Network,
+    Outbound, OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport,
+    ProxyIcmpConn, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::{HammerError, HammerResult};
@@ -567,7 +567,11 @@ struct InstrumentedPacketConn {
 
 #[async_trait::async_trait(?Send)]
 impl ProxyPacketConn for InstrumentedPacketConn {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> HammerResult<()> {
+    async fn send(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> HammerResult<()> {
         match self.inner.send(runtime, frame).await {
             Ok(()) => Ok(()),
             Err(err) => {

@@ -579,7 +579,6 @@ impl BufferHandle {
             .copy_current_chain(self.index)
             .expect("live buffer handle points to valid chain")
     }
-
 }
 
 impl Drop for BufferHandle {

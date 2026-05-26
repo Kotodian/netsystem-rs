@@ -5,10 +5,11 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, DnsQueryOptions, DnsTransport,
-    DnsTransportComponent, Lifecycle, Network, NetworkInterface, Outbound as AdapterOutbound,
-    OutboundComponent, OutboundManager as _, PlatformInterface, ProxyPacketConn, ProxyStream,
-    RouteMetadata, RuntimeComponent, SocksAddr, StartStage, TunOptions, WifiState,
+    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, DnsQueryOptions,
+    DnsTransport, DnsTransportComponent, Lifecycle, Network, NetworkInterface,
+    Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _, PlatformInterface,
+    ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, StartStage,
+    TunOptions, WifiState,
 };
 use hammer_core::config::{self, DomainStrategy};
 use hammer_core::error::HammerError;
