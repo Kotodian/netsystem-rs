@@ -263,7 +263,7 @@ fn parse_incoming_packet_amnezia<'a>(
     ];
     for (kind, base_len) in checks {
         let prefix_len = config.prefix_len(kind);
-        if src.len() < prefix_len + 4 {
+        if src.len() < prefix_len + base_len {
             continue;
         }
         let packet_type =
@@ -315,7 +315,7 @@ fn parse_incoming_packet_amnezia<'a>(
 
 impl Tunn {
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet<'_>, WireGuardError> {
         Self::parse_incoming_packet_with_amnezia(src, None)
     }
 

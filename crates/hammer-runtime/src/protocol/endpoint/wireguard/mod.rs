@@ -7,5 +7,6 @@ mod transport;
 
 pub use endpoint::{
     WireguardEndpoint, WireguardInboundControlSubscriber, WireguardPeerHandshakeReceivedArgs,
-    WireguardPeerKeepaliveReceivedArgs, WireguardPeerStartArgs, WireguardStartHandshakeSubscriber,
+    WireguardPeerKeepaliveReceivedArgs, WireguardPeerPacketReceivedArgs,
+    WireguardPeerPacketSentArgs, WireguardPeerStartArgs, WireguardStartHandshakeSubscriber,
 };

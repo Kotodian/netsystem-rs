@@ -2,7 +2,7 @@ use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_2
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
 use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
 #[cfg(feature = "amneziawg")]
-use crate::noise::{AmneziaConfig, AmneziaPacketKind};
+use crate::noise::AmneziaConfig;
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;

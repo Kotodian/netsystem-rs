@@ -85,7 +85,7 @@ pub struct WireguardPeerStartArgs {
     pub peer_index: usize,
     pub peer_endpoint: SocketAddr,
     pub peer_public_key: [u8; 32],
-    start_control: transport::PeerStartControl,
+    pub(super) start_control: transport::PeerStartControl,
 }
 
 impl WireguardPeerStartArgs {
@@ -110,6 +110,40 @@ impl WireguardPeerHandshakeReceivedArgs {
     fn process_handshake(&self) -> HammerResult<()> {
         self.inbound_control
             .process_inbound_control(self.src_ip, self.datagram.clone())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WireguardPeerPacketSentArgs {
+    pub endpoint_id: String,
+    pub peer_index: usize,
+    pub peer_endpoint: SocketAddr,
+    pub peer_public_key: [u8; 32],
+    pub plaintext_len: usize,
+    pub(super) data_activity_control: transport::PeerDataActivityControl,
+}
+
+impl WireguardPeerPacketSentArgs {
+    fn record_packet_sent(&self) -> HammerResult<()> {
+        self.data_activity_control
+            .record_packet_sent(self.plaintext_len)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WireguardPeerPacketReceivedArgs {
+    pub endpoint_id: String,
+    pub peer_index: usize,
+    pub peer_endpoint: SocketAddr,
+    pub peer_public_key: [u8; 32],
+    pub plaintext_len: usize,
+    pub(super) data_activity_control: transport::PeerDataActivityControl,
+}
+
+impl WireguardPeerPacketReceivedArgs {
+    fn record_packet_received(&self) -> HammerResult<()> {
+        self.data_activity_control
+            .record_packet_received(self.plaintext_len)
     }
 }
 
@@ -166,10 +200,11 @@ pub(crate) fn build_wireguard_inbound_control_subscriber(
     logger: Logger,
     control_handle: Arc<ControlThreadHandle>,
 ) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    let handshake_logger = logger.clone();
     let handshake = control_handle.subscribe_event(
         ControlEventFilter::event::<WireguardPeerHandshakeReceivedArgs>(),
         move |event| {
-            let logger = logger.clone();
+            let logger = handshake_logger.clone();
             async move {
                 if let Some(args) = event.args::<WireguardPeerHandshakeReceivedArgs>() {
                     if let Err(err) = args.process_handshake() {
@@ -187,7 +222,43 @@ pub(crate) fn build_wireguard_inbound_control_subscriber(
         },
     )?;
 
-    Ok(vec![handshake])
+    let packet_sent_logger = logger.clone();
+    let packet_sent = control_handle.subscribe_event(
+        ControlEventFilter::event::<WireguardPeerPacketSentArgs>(),
+        move |event| {
+            let logger = packet_sent_logger.clone();
+            async move {
+                if let Some(args) = event.args::<WireguardPeerPacketSentArgs>() {
+                    if let Err(err) = args.record_packet_sent() {
+                        logger.warn(format!(
+                            "wireguard endpoint {} packet sent activity failed peer_index={} peer={}: {}",
+                            args.endpoint_id, args.peer_index, args.peer_endpoint, err
+                        ));
+                    }
+                }
+            }
+        },
+    )?;
+
+    let packet_received_logger = logger.clone();
+    let packet_received = control_handle.subscribe_event(
+        ControlEventFilter::event::<WireguardPeerPacketReceivedArgs>(),
+        move |event| {
+            let logger = packet_received_logger.clone();
+            async move {
+                if let Some(args) = event.args::<WireguardPeerPacketReceivedArgs>() {
+                    if let Err(err) = args.record_packet_received() {
+                        logger.warn(format!(
+                            "wireguard endpoint {} packet received activity failed peer_index={} peer={}: {}",
+                            args.endpoint_id, args.peer_index, args.peer_endpoint, err
+                        ));
+                    }
+                }
+            }
+        },
+    )?;
+
+    Ok(vec![handshake, packet_sent, packet_received])
 }
 
 /// Demuxes decapsulated IP packets from the boringtun transport into two

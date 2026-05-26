@@ -221,15 +221,23 @@ impl PeerDataTunnel {
     }
 
     pub fn encapsulate_next_queued<'a>(&mut self, dst: &'a mut [u8]) -> PeerDataResult<'a> {
+        self.encapsulate_next_queued_with_len(dst).0
+    }
+
+    pub fn encapsulate_next_queued_with_len<'a>(
+        &mut self,
+        dst: &'a mut [u8],
+    ) -> (PeerDataResult<'a>, usize) {
         let Some(packet) = self.packet_queue.pop_front() else {
-            return PeerDataResult::Done;
+            return (PeerDataResult::Done, 0);
         };
+        let plaintext_len = packet.len();
         match self.encapsulate(&packet, dst) {
             PeerDataResult::NeedHandshake | PeerDataResult::Err(_) => {
                 self.requeue_packet(packet);
-                PeerDataResult::NeedHandshake
+                (PeerDataResult::NeedHandshake, plaintext_len)
             }
-            result => result,
+            result => (result, plaintext_len),
         }
     }
 
