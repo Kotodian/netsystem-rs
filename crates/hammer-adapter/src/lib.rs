@@ -1,3 +1,4 @@
+pub mod buffer;
 pub mod certificate;
 pub mod component;
 pub mod connection;
@@ -14,6 +15,9 @@ pub mod router;
 pub mod rule;
 pub mod service;
 
+pub use buffer::{
+    Buffer, BufferFlags, BufferHandle, BufferHandoff, BufferIndex, BufferPool, BufferRef,
+};
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
