@@ -77,6 +77,7 @@ const IP_LEN_SZ: usize = 2;
 const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
+pub const SESSION_RING_SIZE: usize = N_SESSIONS;
 
 #[derive(Debug)]
 pub enum TunnResult<'a> {
