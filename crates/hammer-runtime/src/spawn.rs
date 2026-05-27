@@ -620,6 +620,150 @@ mod tests {
     }
 
     #[test]
+    fn frame_pending_future_resumes_on_current_data_worker() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-frame", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let (before_thread, after_thread, payload) = context.enter(|| {
+            driver.block_on(async {
+                spawn_local(|| async {
+                    let runtime = with_data_plane_runtime(Clone::clone);
+                    let frame = std::rc::Rc::new(RefCell::new(runtime.frame_with_capacity(1)));
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .expect("alloc data buffer");
+                    let consumer_frame = std::rc::Rc::clone(&frame);
+                    let consumer_runtime = runtime.clone();
+                    let consumer = spawn_current_local(async move {
+                        let before_thread = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let pending = consumer_frame.borrow().pending();
+                        pending.await;
+                        let after_thread = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let buffer = consumer_frame
+                            .borrow_mut()
+                            .drain_pending()
+                            .next()
+                            .expect("pending buffer");
+                        let payload = consumer_runtime
+                            .copy_current(buffer)
+                            .expect("copy pending buffer");
+                        consumer_runtime.free_index(buffer);
+                        (before_thread, after_thread, payload)
+                    });
+                    let producer_frame = std::rc::Rc::clone(&frame);
+                    let producer = spawn_current_local(async move {
+                        tokio::task::yield_now().await;
+                        producer_frame
+                            .borrow_mut()
+                            .push_index(index)
+                            .expect("push pending buffer");
+                    });
+                    producer.await.expect("producer joined");
+                    consumer.await.expect("consumer joined")
+                })
+                .await
+                .expect("local frame task finished")
+            })
+        });
+
+        assert_eq!(before_thread, "spawn-test-frame-0");
+        assert_eq!(after_thread, "spawn-test-frame-0");
+        assert_eq!(payload, b"packet");
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_runtime_local_child_stays_on_parent_worker_with_multiple_workers() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-pipeline", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let (parent_thread, child_thread) = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    let parent_thread = thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default();
+                    let child_thread = spawn_local(|| async {
+                        thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .expect("local child task finished");
+                    (parent_thread, child_thread)
+                })
+                .await
+                .expect("parent task finished")
+            })
+        });
+
+        assert_eq!(parent_thread, child_thread);
+        assert!(parent_thread.starts_with("spawn-test-pipeline-"));
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn nested_data_spawn_stays_on_current_worker_with_multiple_workers() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-nested", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let (parent_thread, child_thread) = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    let parent_thread = thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default();
+                    let child_thread = spawn(async {
+                        thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .expect("nested task finished");
+                    (parent_thread, child_thread)
+                })
+                .await
+                .expect("parent task finished")
+            })
+        });
+
+        assert_eq!(parent_thread, child_thread);
+        assert!(parent_thread.starts_with("spawn-test-nested-"));
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
     fn data_local_spawn_abort_stops_pending_task() {
         let _guard = test_lock();
         let data_runtime =

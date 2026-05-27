@@ -1,6 +1,10 @@
-use std::cell::{Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell};
+use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -576,12 +580,62 @@ impl BufferPoolInner {
 #[derive(Debug)]
 pub struct BufferFrame {
     indices: Vec<BufferIndex>,
+    readiness: Rc<FrameReadiness>,
+}
+
+#[derive(Default)]
+struct FrameReadiness {
+    pending: Cell<bool>,
+    waker: RefCell<Option<Waker>>,
+}
+
+impl fmt::Debug for FrameReadiness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FrameReadiness")
+            .field("pending", &self.pending.get())
+            .field("has_waker", &self.waker.borrow().is_some())
+            .finish()
+    }
+}
+
+impl FrameReadiness {
+    fn mark_pending(&self) {
+        self.pending.set(true);
+        if let Some(waker) = self.waker.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+
+    fn clear_pending(&self) {
+        self.pending.set(false);
+    }
+
+    fn poll_pending(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.pending.get() {
+            return Poll::Ready(());
+        }
+        let mut waker = self.waker.borrow_mut();
+        let replace_waker = match waker.as_ref() {
+            Some(waker) => !waker.will_wake(cx.waker()),
+            None => true,
+        };
+        if replace_waker {
+            *waker = Some(cx.waker().clone());
+        }
+        if self.pending.get() {
+            waker.take();
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl BufferFrame {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             indices: Vec::with_capacity(capacity),
+            readiness: Rc::new(FrameReadiness::default()),
         }
     }
 
@@ -590,6 +644,7 @@ impl BufferFrame {
             return Err(CoreError::internal("buffer frame capacity exceeded"));
         }
         self.indices.push(index);
+        self.readiness.mark_pending();
         Ok(())
     }
 
@@ -601,12 +656,21 @@ impl BufferFrame {
         self.indices.is_empty()
     }
 
+    pub fn has_pending(&self) -> bool {
+        !self.indices.is_empty()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.indices.len()
+    }
+
     pub fn capacity(&self) -> usize {
         self.indices.capacity()
     }
 
     pub fn reset(&mut self) {
         self.indices.clear();
+        self.readiness.clear_pending();
     }
 
     pub fn clear(&mut self) {
@@ -617,12 +681,40 @@ impl BufferFrame {
         &self.indices
     }
 
+    pub fn pending_indices(&self) -> &[BufferIndex] {
+        &self.indices
+    }
+
     pub fn iter_indices(&self) -> std::slice::Iter<'_, BufferIndex> {
         self.indices.iter()
     }
 
     pub fn drain_indices(&mut self) -> std::vec::Drain<'_, BufferIndex> {
+        self.readiness.clear_pending();
         self.indices.drain(..)
+    }
+
+    pub fn drain_pending(&mut self) -> std::vec::Drain<'_, BufferIndex> {
+        self.readiness.clear_pending();
+        self.indices.drain(..)
+    }
+
+    pub fn pending(&self) -> BufferFramePending {
+        BufferFramePending {
+            readiness: Rc::clone(&self.readiness),
+        }
+    }
+}
+
+pub struct BufferFramePending {
+    readiness: Rc<FrameReadiness>,
+}
+
+impl Future for BufferFramePending {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.readiness.poll_pending(cx)
     }
 }
 

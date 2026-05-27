@@ -1,4 +1,25 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+
 use hammer_adapter::{BufferFrame, BufferPool, RouteMetadata};
+
+#[derive(Default)]
+struct WakeCounter {
+    wakes: AtomicUsize,
+}
+
+impl Wake for WakeCounter {
+    fn wake(self: Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 #[test]
 fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
@@ -245,6 +266,107 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
         pool.free_index(index);
     }
     assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn buffer_frame_tracks_pending_indices_until_drained() {
+    let pool = BufferPool::with_capacity(8, 4);
+    let mut frame = BufferFrame::with_capacity(2);
+    let first = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first frame buffer");
+    let second = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second frame buffer");
+
+    assert!(!frame.has_pending());
+    assert_eq!(frame.pending_len(), 0);
+    frame.push_index(first).expect("push first frame index");
+    frame.push_index(second).expect("push second frame index");
+
+    assert!(frame.has_pending());
+    assert_eq!(frame.pending_len(), 2);
+    assert_eq!(frame.pending_indices(), &[first, second]);
+
+    let drained = frame.drain_pending().collect::<Vec<_>>();
+
+    assert_eq!(drained, vec![first, second]);
+    assert!(!frame.has_pending());
+    assert_eq!(frame.pending_len(), 0);
+    assert_eq!(pool.in_use(), 2);
+
+    for index in drained {
+        pool.free_index(index);
+    }
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
+    let pool = BufferPool::with_capacity(8, 2);
+    let mut frame = BufferFrame::with_capacity(1);
+    let index = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc frame buffer");
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut context = Context::from_waker(&waker);
+    let mut pending = frame.pending();
+
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Pending
+    ));
+    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 0);
+
+    frame.push_index(index).expect("push frame index");
+
+    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Ready(())
+    ));
+
+    pool.free_frame(&mut frame);
+}
+
+#[test]
+fn buffer_frame_pending_future_observes_reset_before_processing() {
+    let pool = BufferPool::with_capacity(8, 2);
+    let mut frame = BufferFrame::with_capacity(1);
+    let first = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first frame buffer");
+    let second = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second frame buffer");
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut context = Context::from_waker(&waker);
+    let mut pending = frame.pending();
+
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Pending
+    ));
+    frame.push_index(first).expect("push first frame index");
+    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
+
+    frame.reset();
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Pending
+    ));
+
+    pool.free_index(first);
+    frame.push_index(second).expect("push second frame index");
+    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 2);
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Ready(())
+    ));
+
+    pool.free_frame(&mut frame);
 }
 
 #[test]
