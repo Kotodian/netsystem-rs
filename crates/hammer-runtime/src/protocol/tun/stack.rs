@@ -555,14 +555,40 @@ type UdpFlowPayload = BufferIndex;
 
 enum TunTaskHandle {
     Send(JoinHandle<()>),
-    Local(crate::spawn::DataLocalJoinHandle<()>),
+    PacketLoop(TunPacketLoopTaskHandle),
+}
+
+struct TunPacketLoopTaskHandle {
+    bootstrap: JoinHandle<()>,
+    shared: Arc<TunPacketLoopTaskShared>,
+}
+
+struct TunPacketLoopTaskShared {
+    closed: AtomicBool,
+    local: StdMutex<Option<crate::spawn::DataLocalJoinHandle<()>>>,
 }
 
 impl TunTaskHandle {
     fn abort(&mut self) {
         match self {
             Self::Send(task) => task.abort(),
-            Self::Local(task) => task.abort(),
+            Self::PacketLoop(task) => task.abort(),
+        }
+    }
+}
+
+impl TunPacketLoopTaskHandle {
+    fn abort(&mut self) {
+        self.shared.closed.store(true, Ordering::Release);
+        self.bootstrap.abort();
+        if let Some(mut local) = self
+            .shared
+            .local
+            .lock()
+            .expect("TUN packet loop task poisoned")
+            .take()
+        {
+            local.abort();
         }
     }
 }
@@ -1270,34 +1296,24 @@ where
                 }
             }
         };
-        let logger = self.logger.clone();
-        let router = Arc::clone(&self.router);
-        let dns_router = Arc::clone(&self.dns_router);
-        let outbound = Arc::clone(&self.outbound);
-        let inbound_id = self.inbound_id.clone();
-        let device = Arc::clone(&self.device);
-        let tcp_nat = Arc::clone(&self.tcp_nat);
         let udp_timeout = self
             .options
             .udp_timeout
             .unwrap_or(DEFAULT_SYSTEM_UDP_TIMEOUT);
-        let metrics = self.metrics.clone();
-        handles.push(TunTaskHandle::Local(crate::spawn::spawn_local(move || {
-            packet_loop(
-                logger,
-                router,
-                dns_router,
-                outbound,
-                inbound_id,
-                device,
-                tcp_nat,
-                routes,
-                #[cfg(feature = "endpoint")]
-                endpoint_dispatch,
-                udp_timeout,
-                metrics,
-            )
-        })));
+        handles.push(spawn_system_packet_loop(
+            self.logger.clone(),
+            Arc::clone(&self.router),
+            Arc::clone(&self.dns_router),
+            Arc::clone(&self.outbound),
+            self.inbound_id.clone(),
+            Arc::clone(&self.device),
+            Arc::clone(&self.tcp_nat),
+            routes,
+            #[cfg(feature = "endpoint")]
+            endpoint_dispatch,
+            udp_timeout,
+            self.metrics.clone(),
+        ));
         self.tasks
             .lock()
             .expect("SystemTunStack tasks poisoned")
@@ -1317,6 +1333,61 @@ where
             task.abort();
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_system_packet_loop<D, R, Q, O>(
+    logger: Logger,
+    router: Arc<R>,
+    dns_router: Arc<Q>,
+    outbound: Arc<O>,
+    inbound_id: String,
+    device: Arc<D>,
+    tcp_nat: Arc<StdMutex<SystemTcpNat>>,
+    routes: SystemStackRoutes,
+    #[cfg(feature = "endpoint")] endpoint_dispatch: Option<Arc<L3DispatchTable>>,
+    udp_timeout: Duration,
+    metrics: TunMetrics,
+) -> TunTaskHandle
+where
+    D: TunDevice,
+    R: RouterTrait + 'static,
+    Q: DnsRouterTrait + 'static,
+    O: OutboundManagerTrait + 'static,
+{
+    let shared = Arc::new(TunPacketLoopTaskShared {
+        closed: AtomicBool::new(false),
+        local: StdMutex::new(None),
+    });
+    let task_shared = Arc::clone(&shared);
+    let bootstrap = crate::spawn::spawn(async move {
+        let mut local = crate::spawn::spawn_local(move || {
+            packet_loop(
+                logger,
+                router,
+                dns_router,
+                outbound,
+                inbound_id,
+                device,
+                tcp_nat,
+                routes,
+                #[cfg(feature = "endpoint")]
+                endpoint_dispatch,
+                udp_timeout,
+                metrics,
+            )
+        });
+        let mut local_slot = task_shared
+            .local
+            .lock()
+            .expect("TUN packet loop task poisoned");
+        if task_shared.closed.load(Ordering::Acquire) {
+            local.abort();
+        } else {
+            *local_slot = Some(local);
+        }
+    });
+    TunTaskHandle::PacketLoop(TunPacketLoopTaskHandle { bootstrap, shared })
 }
 
 /// Plain counter set for the TUN inbound, registered directly against the
@@ -5670,6 +5741,34 @@ mod tests {
         >();
         let _ =
             std::any::type_name::<PacketTunStack<StubRouter, StubDnsRouter, StubOutboundManager>>();
+    }
+
+    #[test]
+    fn system_tun_packet_loop_bootstraps_from_control_context() {
+        let data_runtime = crate::spawn::DataRuntime::new(1, "tun-start-data", 512 * 1024, 2)
+            .expect("data runtime");
+        let device = MemoryTunDevice::new();
+
+        let mut task = data_runtime.context().enter(|| {
+            spawn_system_packet_loop(
+                test_logger("tun"),
+                Arc::new(StubRouter),
+                Arc::new(StubDnsRouter),
+                Arc::new(StubOutboundManager),
+                "tun".to_owned(),
+                device,
+                Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                    DEFAULT_SYSTEM_UDP_TIMEOUT,
+                ))),
+                SystemStackRoutes::default(),
+                #[cfg(feature = "endpoint")]
+                None,
+                Duration::from_millis(50),
+                TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test")),
+            )
+        });
+        task.abort();
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
     #[test]
