@@ -7,7 +7,10 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
         .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
         .expect("alloc first buffer");
     assert_eq!(pool.in_use(), 1);
-    assert_eq!(pool.copy_current(first_index).expect("first current"), b"hello");
+    assert_eq!(
+        pool.copy_current(first_index).expect("first current"),
+        b"hello"
+    );
     pool.free_index(first_index);
 
     assert_eq!(pool.in_use(), 0);
@@ -19,7 +22,10 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
     assert_eq!(second_index.slot(), first_index.slot());
     assert_ne!(second_index.generation(), first_index.generation());
     assert!(pool.get(first_index).is_err());
-    assert_eq!(pool.copy_current(second_index).expect("second current"), b"world");
+    assert_eq!(
+        pool.copy_current(second_index).expect("second current"),
+        b"world"
+    );
     pool.free_index(second_index);
 }
 
@@ -31,16 +37,28 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
         .expect("alloc buffer");
 
     pool.advance(buffer, 3).expect("advance current");
-    assert_eq!(pool.copy_current(buffer).expect("advanced current"), b"load");
+    assert_eq!(
+        pool.copy_current(buffer).expect("advanced current"),
+        b"load"
+    );
 
     pool.prepend(buffer, b"pre").expect("prepend into headroom");
-    assert_eq!(pool.copy_current(buffer).expect("prepended current"), b"preload");
+    assert_eq!(
+        pool.copy_current(buffer).expect("prepended current"),
+        b"preload"
+    );
 
     pool.append(buffer, b"-tail").expect("append current");
-    assert_eq!(pool.copy_packet(buffer).expect("appended packet"), b"preload-tail");
+    assert_eq!(
+        pool.copy_packet(buffer).expect("appended packet"),
+        b"preload-tail"
+    );
 
     pool.truncate_current(buffer, 7).expect("truncate current");
-    assert_eq!(pool.copy_current(buffer).expect("truncated current"), b"preload");
+    assert_eq!(
+        pool.copy_current(buffer).expect("truncated current"),
+        b"preload"
+    );
     pool.free_index(buffer);
 }
 
@@ -72,7 +90,10 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
         .expect("alloc chained buffer");
 
     assert!(pool.is_chained(buffer).expect("buffer is chained"));
-    assert_eq!(pool.copy_packet(buffer).expect("chained packet"), b"abcdefghijkl");
+    assert_eq!(
+        pool.copy_packet(buffer).expect("chained packet"),
+        b"abcdefghijkl"
+    );
     assert_eq!(pool.in_use(), 3);
     pool.free_index(buffer);
 }
@@ -91,8 +112,14 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
     assert!(pool.is_chained(chained).expect("chained state"));
     assert_eq!(pool.copy_current(single).expect("single current"), b"abc");
     assert_eq!(pool.copy_packet(single).expect("single packet"), b"abc");
-    assert_eq!(pool.copy_current(chained).expect("chained current"), b"abcd");
-    assert_eq!(pool.copy_packet(chained).expect("chained packet"), b"abcdefghij");
+    assert_eq!(
+        pool.copy_current(chained).expect("chained current"),
+        b"abcd"
+    );
+    assert_eq!(
+        pool.copy_packet(chained).expect("chained packet"),
+        b"abcdefghij"
+    );
 
     pool.free_index(single);
     pool.free_index(chained);
