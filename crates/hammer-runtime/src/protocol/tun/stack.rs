@@ -4217,7 +4217,7 @@ fn spawn_dns_hijack_worker<Q>(
     tun_write_tx: mpsc::Sender<TunWriteItem>,
     metrics: TunMetrics,
     mut rx: mpsc::Receiver<DnsHijackJob>,
-) -> JoinHandle<()>
+) -> crate::spawn::DataLocalJoinHandle<()>
 where
     Q: DnsRouterTrait + 'static,
 {
@@ -6566,7 +6566,7 @@ mod tests {
         let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
             .expect("data runtime");
         let loop_router = Arc::clone(&router);
-        let mut task = data_runtime.context().enter(|| {
+        let task = data_runtime.context().enter(|| {
             crate::spawn::spawn_local(move || {
                 packet_loop(
                     test_logger("tun"),
@@ -6779,24 +6779,28 @@ final = "direct"
         let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
             .expect("data runtime");
         let loop_device = Arc::clone(&device);
-        let mut task = data_runtime.context().enter(|| {
-            crate::spawn::spawn_local(move || {
-                packet_loop(
-                    test_logger("tun"),
-                    router,
-                    dns_router,
-                    outbound,
-                    "tun".to_owned(),
-                    loop_device,
-                    Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+        let task = data_runtime.context().enter(|| {
+            crate::spawn::spawn(async move {
+                crate::spawn::spawn_local(move || {
+                    packet_loop(
+                        test_logger("tun"),
+                        router,
+                        dns_router,
+                        outbound,
+                        "tun".to_owned(),
+                        loop_device,
+                        Arc::new(StdMutex::new(SystemTcpNat::new_with_timeout(
+                            DEFAULT_SYSTEM_UDP_TIMEOUT,
+                        ))),
+                        SystemStackRoutes::default(),
+                        #[cfg(feature = "endpoint")]
+                        None,
                         DEFAULT_SYSTEM_UDP_TIMEOUT,
-                    ))),
-                    SystemStackRoutes::default(),
-                    #[cfg(feature = "endpoint")]
-                    None,
-                    DEFAULT_SYSTEM_UDP_TIMEOUT,
-                    metrics,
-                )
+                        metrics,
+                    )
+                })
+                .await
+                .expect("packet loop task")
             })
         });
 
@@ -6997,45 +7001,49 @@ final = "direct"
         let max_in_flight = data_runtime
             .context()
             .enter(|| {
-                crate::spawn::spawn_local(|| async {
-                    let (started_tx, mut started_rx) = mpsc::unbounded_channel();
-                    let dns_router = BlockingDnsRouter::new(started_tx);
-                    let (dns_hijack_tx, dns_hijack_rx) =
-                        mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
-                    let (tun_write_tx, _tun_write_rx) = mpsc::channel(16);
-                    let metrics =
-                        TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
+                crate::spawn::spawn(async {
+                    crate::spawn::spawn_local(|| async {
+                        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+                        let dns_router = BlockingDnsRouter::new(started_tx);
+                        let (dns_hijack_tx, dns_hijack_rx) =
+                            mpsc::channel(SYSTEM_DNS_HIJACK_QUEUE_CAPACITY);
+                        let (tun_write_tx, _tun_write_rx) = mpsc::channel(16);
+                        let metrics =
+                            TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
-                    spawn_dns_hijack_workers(
-                        Arc::clone(&dns_router),
-                        tun_write_tx,
-                        metrics,
-                        dns_hijack_rx,
-                    );
-                    for name in [
-                        "one.example.com",
-                        "two.example.com",
-                        "three.example.com",
-                        "four.example.com",
-                    ] {
-                        dns_hijack_tx
-                            .try_send(dns_hijack_job(name))
-                            .expect("queue DNS hijack job");
-                    }
-                    drop(dns_hijack_tx);
+                        spawn_dns_hijack_workers(
+                            Arc::clone(&dns_router),
+                            tun_write_tx,
+                            metrics,
+                            dns_hijack_rx,
+                        );
+                        for name in [
+                            "one.example.com",
+                            "two.example.com",
+                            "three.example.com",
+                            "four.example.com",
+                        ] {
+                            dns_hijack_tx
+                                .try_send(dns_hijack_job(name))
+                                .expect("queue DNS hijack job");
+                        }
+                        drop(dns_hijack_tx);
 
-                    timeout(Duration::from_millis(50), started_rx.recv())
-                        .await
-                        .expect("first DNS job starts")
-                        .expect("first start event");
-                    timeout(Duration::from_millis(50), started_rx.recv())
-                        .await
-                        .expect("second DNS job starts")
-                        .expect("second start event");
+                        timeout(Duration::from_millis(50), started_rx.recv())
+                            .await
+                            .expect("first DNS job starts")
+                            .expect("first start event");
+                        timeout(Duration::from_millis(50), started_rx.recv())
+                            .await
+                            .expect("second DNS job starts")
+                            .expect("second start event");
 
-                    let max_in_flight = dns_router.max_in_flight.load(Ordering::Relaxed);
-                    dns_router.release.notify_waiters();
-                    max_in_flight
+                        let max_in_flight = dns_router.max_in_flight.load(Ordering::Relaxed);
+                        dns_router.release.notify_waiters();
+                        max_in_flight
+                    })
+                    .await
+                    .expect("dns hijack worker local task")
                 })
             })
             .await

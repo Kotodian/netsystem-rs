@@ -24,11 +24,16 @@
 //! installed) — but it should still be considered a bug.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +48,11 @@ pub struct DataRuntimeContext {
     inner: Arc<DataRuntimeContextInner>,
 }
 
+#[derive(Clone)]
+pub struct DataPlaneExecutor {
+    context: DataRuntimeContext,
+}
+
 struct DataRuntimeContextInner {
     id: usize,
     workers: Vec<DataRuntimeContextWorker>,
@@ -52,7 +62,6 @@ struct DataRuntimeContextInner {
 #[derive(Clone)]
 struct DataRuntimeContextWorker {
     handle: Handle,
-    local_tx: Option<tokio::sync::mpsc::UnboundedSender<LocalTaskFactory>>,
 }
 
 pub struct DataRuntime {
@@ -66,8 +75,7 @@ struct DataRuntimeWorker {
     join: Option<thread::JoinHandle<()>>,
 }
 
-type LocalTask = Pin<Box<dyn Future<Output = ()> + 'static>>;
-type LocalTaskFactory = Box<dyn FnOnce() -> LocalTask + Send + 'static>;
+type DataLocalTaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
 
 static NEXT_DATA_RUNTIME_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -80,6 +88,9 @@ thread_local! {
     static CURRENT_DATA_WORKER: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     static DATA_PLANE_RUNTIME: DataPlaneRuntime =
         DataPlaneRuntime::with_buffer_capacity(DATA_BUFFER_SLOT_CAPACITY, DATA_BUFFER_SLOTS);
+    static DATA_LOCAL_TASKS: RefCell<VecDeque<Rc<DataLocalTask>>> =
+        const { RefCell::new(VecDeque::new()) };
+    static DATA_LOCAL_DRIVER_WAKER: RefCell<Option<Waker>> = const { RefCell::new(None) };
 }
 
 const DATA_BUFFER_SLOT_CAPACITY: usize = 2048;
@@ -106,8 +117,6 @@ impl DataRuntime {
             let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<Handle, String>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let (local_tx, mut local_rx) =
-                tokio::sync::mpsc::unbounded_channel::<LocalTaskFactory>();
             let builder = thread::Builder::new()
                 .name(worker_name.clone())
                 .stack_size(thread_stack_size);
@@ -120,22 +129,13 @@ impl DataRuntime {
                     match runtime {
                         Ok(runtime) => {
                             CURRENT_DATA_WORKER.with(|slot| slot.set(Some((context_id, index))));
+                            drop(runtime.spawn(DataLocalDriver));
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
-                            let local_set = tokio::task::LocalSet::new();
-                            let mut shutdown_rx = shutdown_rx;
-                            runtime.block_on(local_set.run_until(async move {
-                                loop {
-                                    tokio::select! {
-                                        task = local_rx.recv() => match task {
-                                            Some(task) => {
-                                                tokio::task::spawn_local(task());
-                                            }
-                                            None => break,
-                                        },
-                                        _ = &mut shutdown_rx => break,
-                                    }
-                                }
-                            }));
+                            runtime.block_on(async move {
+                                let _ = shutdown_rx.await;
+                            });
+                            DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
+                            DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
                         }
                         Err(err) => {
@@ -154,10 +154,7 @@ impl DataRuntime {
                 HammerError::internal(format!("receive data runtime handle: {err}"))
             })?;
             let handle = handle.map_err(HammerError::internal)?;
-            context_workers.push(DataRuntimeContextWorker {
-                handle,
-                local_tx: Some(local_tx),
-            });
+            context_workers.push(DataRuntimeContextWorker { handle });
             workers.push(DataRuntimeWorker {
                 shutdown_tx: Some(shutdown_tx),
                 done_rx,
@@ -173,6 +170,10 @@ impl DataRuntime {
 
     pub fn context(&self) -> DataRuntimeContext {
         self.context.clone()
+    }
+
+    pub fn executor(&self) -> DataPlaneExecutor {
+        self.context.executor()
     }
 
     pub fn shutdown_timeout(mut self, timeout: Duration) {
@@ -210,10 +211,7 @@ impl DataRuntimeContext {
         );
         let workers = handles
             .into_iter()
-            .map(|handle| DataRuntimeContextWorker {
-                handle,
-                local_tx: None,
-            })
+            .map(|handle| DataRuntimeContextWorker { handle })
             .collect();
         Self::from_workers(next_data_runtime_context_id(), workers)
     }
@@ -239,18 +237,17 @@ impl DataRuntimeContext {
         f()
     }
 
+    pub fn executor(&self) -> DataPlaneExecutor {
+        DataPlaneExecutor {
+            context: self.clone(),
+        }
+    }
+
     fn first_handle(&self) -> &Handle {
         &self.inner.workers[0].handle
     }
 
     fn spawn_worker(&self) -> DataRuntimeContextWorker {
-        if let Some(index) = self.current_worker_index() {
-            return self.inner.workers[index].clone();
-        }
-        self.next_worker()
-    }
-
-    fn local_worker(&self) -> DataRuntimeContextWorker {
         if let Some(index) = self.current_worker_index() {
             return self.inner.workers[index].clone();
         }
@@ -272,6 +269,221 @@ impl DataRuntimeContext {
     }
 }
 
+impl DataPlaneExecutor {
+    pub fn execute<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let future = future.with_current_subscriber();
+        let worker = self.context.spawn_worker();
+        let scoped = TASK_DATA_CONTEXT.scope(self.context.clone(), future);
+        worker.handle.spawn(scoped)
+    }
+}
+
+struct DataLocalDriver;
+
+impl Future for DataLocalDriver {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        DATA_LOCAL_DRIVER_WAKER.with(|waker| {
+            *waker.borrow_mut() = Some(cx.waker().clone());
+        });
+        poll_data_local_tasks(cx);
+        Poll::Pending
+    }
+}
+
+struct DataLocalTask {
+    control: Arc<DataLocalTaskControl>,
+    future: RefCell<Option<DataLocalTaskFuture>>,
+    on_panic: Box<dyn Fn() + 'static>,
+}
+
+impl DataLocalTask {
+    fn poll(&self, cx: &mut Context<'_>) -> bool {
+        self.control.set_driver_waker(cx.waker().clone());
+        if self.control.is_cancelled() {
+            self.future.borrow_mut().take();
+            return false;
+        }
+
+        let mut future_slot = self.future.borrow_mut();
+        let Some(future) = future_slot.as_mut() else {
+            return false;
+        };
+        match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(())) => {
+                future_slot.take();
+                false
+            }
+            Ok(Poll::Pending) => true,
+            Err(_) => {
+                future_slot.take();
+                (self.on_panic)();
+                false
+            }
+        }
+    }
+}
+
+struct DataLocalTaskControl {
+    cancelled: AtomicBool,
+    driver_waker: Mutex<Option<Waker>>,
+}
+
+impl DataLocalTaskControl {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            driver_waker: Mutex::new(None),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.wake_driver();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    fn set_driver_waker(&self, waker: Waker) {
+        *self.driver_waker.lock().expect("data local waker poisoned") = Some(waker);
+    }
+
+    fn wake_driver(&self) {
+        if let Some(waker) = self
+            .driver_waker
+            .lock()
+            .expect("data local waker poisoned")
+            .as_ref()
+            .cloned()
+        {
+            waker.wake();
+        }
+    }
+}
+
+struct DataLocalJoinState<T> {
+    control: Arc<DataLocalTaskControl>,
+    result: Mutex<Option<Result<T, DataLocalJoinError>>>,
+    join_waker: Mutex<Option<Waker>>,
+}
+
+impl<T> DataLocalJoinState<T> {
+    fn new(control: Arc<DataLocalTaskControl>) -> Self {
+        Self {
+            control,
+            result: Mutex::new(None),
+            join_waker: Mutex::new(None),
+        }
+    }
+
+    fn complete(&self, output: T) {
+        let mut result = self.result.lock().expect("data local result poisoned");
+        if result.is_none() && !self.control.is_cancelled() {
+            *result = Some(Ok(output));
+            drop(result);
+            self.wake_join();
+        }
+    }
+
+    fn cancel(&self) {
+        self.control.cancel();
+        let mut result = self.result.lock().expect("data local result poisoned");
+        if result.is_none() {
+            *result = Some(Err(DataLocalJoinError::cancelled()));
+            drop(result);
+            self.wake_join();
+        }
+    }
+
+    fn panic(&self) {
+        let mut result = self.result.lock().expect("data local result poisoned");
+        if result.is_none() {
+            *result = Some(Err(DataLocalJoinError::panic()));
+            drop(result);
+            self.wake_join();
+        }
+    }
+
+    fn wake_join(&self) {
+        if let Some(waker) = self
+            .join_waker
+            .lock()
+            .expect("data local join waker poisoned")
+            .take()
+        {
+            waker.wake();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataLocalJoinError {
+    kind: DataLocalJoinErrorKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataLocalJoinErrorKind {
+    Cancelled,
+    Panic,
+}
+
+impl DataLocalJoinError {
+    fn cancelled() -> Self {
+        Self {
+            kind: DataLocalJoinErrorKind::Cancelled,
+        }
+    }
+
+    fn panic() -> Self {
+        Self {
+            kind: DataLocalJoinErrorKind::Panic,
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self.kind, DataLocalJoinErrorKind::Cancelled)
+    }
+
+    pub fn is_panic(&self) -> bool {
+        matches!(self.kind, DataLocalJoinErrorKind::Panic)
+    }
+}
+
+impl fmt::Display for DataLocalJoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            DataLocalJoinErrorKind::Cancelled => f.write_str("data local task cancelled"),
+            DataLocalJoinErrorKind::Panic => f.write_str("data local task panicked"),
+        }
+    }
+}
+
+impl Error for DataLocalJoinError {}
+
+fn poll_data_local_tasks(cx: &mut Context<'_>) {
+    let tasks = DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
+    for task in tasks {
+        if task.poll(cx) {
+            DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().push_back(task));
+        }
+    }
+}
+
+fn wake_data_local_driver() {
+    DATA_LOCAL_DRIVER_WAKER.with(|waker| {
+        if let Some(waker) = waker.borrow().as_ref().cloned() {
+            waker.wake();
+        }
+    });
+}
+
 struct ThreadDataContextGuard;
 
 impl Drop for ThreadDataContextGuard {
@@ -287,101 +499,95 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let future = future.with_current_subscriber();
     match current_data_context() {
-        Some(context) => {
-            let handle = context.spawn_worker().handle;
-            let scoped = TASK_DATA_CONTEXT.scope(context, future);
-            handle.spawn(scoped)
-        }
-        None => tokio::spawn(future),
+        Some(context) => context.executor().execute(future),
+        None => tokio::spawn(future.with_current_subscriber()),
     }
 }
 
 pub struct DataLocalJoinHandle<T> {
-    rx: tokio::sync::oneshot::Receiver<T>,
-    cancel: Arc<DataLocalCancel>,
-}
-
-struct DataLocalCancel {
-    cancelled: AtomicBool,
-    notify: tokio::sync::Notify,
+    state: Arc<DataLocalJoinState<T>>,
 }
 
 impl<T> DataLocalJoinHandle<T> {
     pub fn abort(&mut self) {
-        self.cancel.cancelled.store(true, Ordering::Release);
-        self.cancel.notify.notify_waiters();
+        self.state.cancel();
     }
 }
 
 impl<T> Unpin for DataLocalJoinHandle<T> {}
 
 impl<T> Future for DataLocalJoinHandle<T> {
-    type Output = Result<T, tokio::sync::oneshot::error::RecvError>;
+    type Output = Result<T, DataLocalJoinError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.rx).poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut result = self
+            .state
+            .result
+            .lock()
+            .expect("data local result poisoned");
+        if let Some(result) = result.take() {
+            return Poll::Ready(result);
+        }
+        *self
+            .state
+            .join_waker
+            .lock()
+            .expect("data local join waker poisoned") = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
 pub fn spawn_local<F, Fut, T>(factory: F) -> DataLocalJoinHandle<T>
 where
-    F: FnOnce() -> Fut + Send + 'static,
+    F: FnOnce() -> Fut + 'static,
     Fut: Future<Output = T> + 'static,
     T: Send + 'static,
 {
     let context = current_data_context().expect("data local spawn requires a data runtime context");
-    let worker = context.local_worker();
-    let local_tx = worker
-        .local_tx
-        .expect("data local spawn requires a DataRuntime worker");
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let cancel = Arc::new(DataLocalCancel {
-        cancelled: AtomicBool::new(false),
-        notify: tokio::sync::Notify::new(),
-    });
-    let task_context = context.clone();
+    assert!(
+        context.current_worker_index().is_some(),
+        "data local spawn requires the current data worker thread"
+    );
     let dispatcher = tracing::dispatcher::get_default(Clone::clone);
-    let task_cancel = Arc::clone(&cancel);
-    let task: LocalTaskFactory = Box::new(move || {
-        Box::pin(
-            TASK_DATA_CONTEXT
-                .scope(task_context, async move {
-                    tokio::select! {
-                        output = factory() => {
-                            let _ = tx.send(output);
-                        }
-                        _ = wait_data_local_cancel(task_cancel) => {}
-                    }
-                })
-                .with_subscriber(dispatcher),
-        )
-    });
-    local_tx
-        .send(task)
-        .expect("data local worker stopped before task was queued");
-    DataLocalJoinHandle { rx, cancel }
-}
-
-async fn wait_data_local_cancel(cancel: Arc<DataLocalCancel>) {
-    loop {
-        if cancel.cancelled.load(Ordering::Acquire) {
-            return;
+    let control = Arc::new(DataLocalTaskControl::new());
+    DATA_LOCAL_DRIVER_WAKER.with(|waker| {
+        if let Some(waker) = waker.borrow().as_ref().cloned() {
+            control.set_driver_waker(waker);
         }
-        cancel.notify.notified().await;
-    }
+    });
+    let state = Arc::new(DataLocalJoinState::new(Arc::clone(&control)));
+    let task_state = Arc::clone(&state);
+    let future = TASK_DATA_CONTEXT
+        .scope(context, async move {
+            let output = factory().await;
+            task_state.complete(output);
+        })
+        .with_subscriber(dispatcher);
+    DATA_LOCAL_TASKS.with(|queue| {
+        let panic_state = Arc::clone(&state);
+        queue.borrow_mut().push_back(Rc::new(DataLocalTask {
+            control,
+            future: RefCell::new(Some(Box::pin(future))),
+            on_panic: Box::new(move || panic_state.panic()),
+        }));
+    });
+    wake_data_local_driver();
+    DataLocalJoinHandle { state }
 }
 
-pub fn spawn_current_local<F>(future: F) -> JoinHandle<F::Output>
+pub fn spawn_current_local<F>(future: F) -> DataLocalJoinHandle<F::Output>
 where
     F: Future + 'static,
-    F::Output: 'static,
+    F::Output: Send + 'static,
 {
     let context =
         current_data_context().expect("current local spawn requires a data runtime context");
-    let future = future.with_current_subscriber();
-    tokio::task::spawn_local(TASK_DATA_CONTEXT.scope(context, future))
+    assert!(
+        context.current_worker_index().is_some(),
+        "current local spawn requires the current data worker thread"
+    );
+    spawn_local(move || future)
 }
 
 pub fn with_data_plane_runtime<R>(f: impl FnOnce(&DataPlaneRuntime) -> R) -> R {
@@ -517,43 +723,47 @@ mod tests {
 
         let (thread_before, thread_after, before, during, after, payload) = context.enter(|| {
             driver.block_on(async {
-                spawn_local(|| async {
-                    let thread_before = thread::current()
-                        .name()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_default();
-                    let buffer = with_data_plane_runtime(|runtime| {
-                        let before = runtime.in_use_buffers();
-                        let buffer = runtime
-                            .alloc_index_with_bytes(Default::default(), b"packet")
-                            .expect("alloc local data buffer");
-                        let during = runtime.in_use_buffers();
-                        (before, during, buffer)
-                    });
-                    tokio::task::yield_now().await;
-                    let thread_after = thread::current()
-                        .name()
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_default();
-                    let payload = with_data_plane_runtime(|runtime| {
-                        let payload = runtime
-                            .copy_current(buffer.2)
-                            .expect("copy local data buffer");
-                        runtime.free_index(buffer.2);
-                        payload
-                    });
-                    let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
-                    (
-                        thread_before,
-                        thread_after,
-                        buffer.0,
-                        buffer.1,
-                        after,
-                        payload,
-                    )
+                spawn(async {
+                    spawn_local(|| async {
+                        let thread_before = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let buffer = with_data_plane_runtime(|runtime| {
+                            let before = runtime.in_use_buffers();
+                            let buffer = runtime
+                                .alloc_index_with_bytes(Default::default(), b"packet")
+                                .expect("alloc local data buffer");
+                            let during = runtime.in_use_buffers();
+                            (before, during, buffer)
+                        });
+                        tokio::task::yield_now().await;
+                        let thread_after = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let payload = with_data_plane_runtime(|runtime| {
+                            let payload = runtime
+                                .copy_current(buffer.2)
+                                .expect("copy local data buffer");
+                            runtime.free_index(buffer.2);
+                            payload
+                        });
+                        let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
+                        (
+                            thread_before,
+                            thread_after,
+                            buffer.0,
+                            buffer.1,
+                            after,
+                            payload,
+                        )
+                    })
+                    .await
+                    .expect("local data task finished")
                 })
                 .await
-                .expect("local data task finished")
+                .expect("data task finished")
             })
         });
 
@@ -580,35 +790,39 @@ mod tests {
 
         let (thread_before, thread_after, payload) = context.enter(|| {
             driver.block_on(async {
-                spawn_local(|| async {
-                    let join = spawn_current_local(async {
-                        let thread_before = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let buffer = with_data_plane_runtime(|runtime| {
-                            runtime
-                                .alloc_index_with_bytes(Default::default(), b"packet")
-                                .expect("alloc local data buffer")
+                spawn(async {
+                    spawn_local(|| async {
+                        let join = spawn_current_local(async {
+                            let thread_before = thread::current()
+                                .name()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_default();
+                            let buffer = with_data_plane_runtime(|runtime| {
+                                runtime
+                                    .alloc_index_with_bytes(Default::default(), b"packet")
+                                    .expect("alloc local data buffer")
+                            });
+                            tokio::task::yield_now().await;
+                            let thread_after = thread::current()
+                                .name()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_default();
+                            let payload = with_data_plane_runtime(|runtime| {
+                                let payload = runtime
+                                    .copy_current(buffer)
+                                    .expect("copy current local data buffer");
+                                runtime.free_index(buffer);
+                                payload
+                            });
+                            (thread_before, thread_after, payload)
                         });
-                        tokio::task::yield_now().await;
-                        let thread_after = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let payload = with_data_plane_runtime(|runtime| {
-                            let payload = runtime
-                                .copy_current(buffer)
-                                .expect("copy current local data buffer");
-                            runtime.free_index(buffer);
-                            payload
-                        });
-                        (thread_before, thread_after, payload)
-                    });
-                    join.await.expect("current local task joined")
+                        join.await.expect("current local task joined")
+                    })
+                    .await
+                    .expect("outer local data task finished")
                 })
                 .await
-                .expect("outer local data task finished")
+                .expect("data task finished")
             })
         });
 
@@ -632,49 +846,53 @@ mod tests {
 
         let (before_thread, after_thread, payload) = context.enter(|| {
             driver.block_on(async {
-                spawn_local(|| async {
-                    let runtime = with_data_plane_runtime(Clone::clone);
-                    let frame = std::rc::Rc::new(RefCell::new(runtime.frame_with_capacity(1)));
-                    let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"packet")
-                        .expect("alloc data buffer");
-                    let consumer_frame = std::rc::Rc::clone(&frame);
-                    let consumer_runtime = runtime.clone();
-                    let consumer = spawn_current_local(async move {
-                        let before_thread = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let pending = consumer_frame.borrow().pending();
-                        pending.await;
-                        let after_thread = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let buffer = consumer_frame
-                            .borrow_mut()
-                            .drain_pending()
-                            .next()
-                            .expect("pending buffer");
-                        let payload = consumer_runtime
-                            .copy_current(buffer)
-                            .expect("copy pending buffer");
-                        consumer_runtime.free_index(buffer);
-                        (before_thread, after_thread, payload)
-                    });
-                    let producer_frame = std::rc::Rc::clone(&frame);
-                    let producer = spawn_current_local(async move {
-                        tokio::task::yield_now().await;
-                        producer_frame
-                            .borrow_mut()
-                            .push_index(index)
-                            .expect("push pending buffer");
-                    });
-                    producer.await.expect("producer joined");
-                    consumer.await.expect("consumer joined")
+                spawn(async {
+                    spawn_local(|| async {
+                        let runtime = with_data_plane_runtime(Clone::clone);
+                        let frame = std::rc::Rc::new(RefCell::new(runtime.frame_with_capacity(1)));
+                        let index = runtime
+                            .alloc_index_with_bytes(Default::default(), b"packet")
+                            .expect("alloc data buffer");
+                        let consumer_frame = std::rc::Rc::clone(&frame);
+                        let consumer_runtime = runtime.clone();
+                        let consumer = spawn_current_local(async move {
+                            let before_thread = thread::current()
+                                .name()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_default();
+                            let pending = consumer_frame.borrow().pending();
+                            pending.await;
+                            let after_thread = thread::current()
+                                .name()
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_default();
+                            let buffer = consumer_frame
+                                .borrow_mut()
+                                .drain_pending()
+                                .next()
+                                .expect("pending buffer");
+                            let payload = consumer_runtime
+                                .copy_current(buffer)
+                                .expect("copy pending buffer");
+                            consumer_runtime.free_index(buffer);
+                            (before_thread, after_thread, payload)
+                        });
+                        let producer_frame = std::rc::Rc::clone(&frame);
+                        let producer = spawn_current_local(async move {
+                            tokio::task::yield_now().await;
+                            producer_frame
+                                .borrow_mut()
+                                .push_index(index)
+                                .expect("push pending buffer");
+                        });
+                        producer.await.expect("producer joined");
+                        consumer.await.expect("consumer joined")
+                    })
+                    .await
+                    .expect("local frame task finished")
                 })
                 .await
-                .expect("local frame task finished")
+                .expect("data task finished")
             })
         });
 
@@ -764,6 +982,44 @@ mod tests {
     }
 
     #[test]
+    fn data_plane_executor_bootstrap_starts_local_child_on_parent_worker() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-executor", 512 * 1024, 2).expect("data runtime");
+        let executor = data_runtime.executor();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let (parent_thread, child_thread) = driver.block_on(async {
+            executor
+                .execute(async move {
+                    let parent_thread = thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default();
+                    let child_thread = spawn_local(|| async {
+                        thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .expect("local child task finished");
+                    (parent_thread, child_thread)
+                })
+                .await
+                .expect("executor parent task finished")
+        });
+
+        assert_eq!(parent_thread, child_thread);
+        assert!(parent_thread.starts_with("spawn-test-executor-"));
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
     fn data_local_spawn_abort_stops_pending_task() {
         let _guard = test_lock();
         let data_runtime =
@@ -776,18 +1032,20 @@ mod tests {
 
         context.enter(|| {
             driver.block_on(async {
-                let mut task = spawn_local(|| async {
-                    std::future::pending::<()>().await;
-                    1usize
-                });
-                task.abort();
-                let result = tokio::time::timeout(Duration::from_secs(1), task)
-                    .await
-                    .expect("aborted local task should finish");
-                assert!(
-                    result.is_err(),
-                    "aborted local task must not produce output"
-                );
+                spawn(async {
+                    let mut task = spawn_local(|| async {
+                        std::future::pending::<()>().await;
+                        1usize
+                    });
+                    task.abort();
+                    let result = tokio::time::timeout(Duration::from_secs(1), task)
+                        .await
+                        .expect("aborted local task should finish");
+                    let err = result.expect_err("aborted local task must not produce output");
+                    assert!(err.is_cancelled(), "{err}");
+                })
+                .await
+                .expect("data task finished")
             })
         });
 
@@ -807,18 +1065,59 @@ mod tests {
 
         context.enter(|| {
             driver.block_on(async {
-                let (tx, rx) = oneshot::channel();
-                let task = spawn_local(move || async move {
-                    tokio::task::yield_now().await;
-                    let _ = tx.send(());
-                });
-                drop(task);
-                tokio::time::timeout(Duration::from_secs(1), rx)
-                    .await
-                    .expect("dropped local handle should not abort task")
-                    .expect("local task should send completion");
+                spawn(async {
+                    let (tx, rx) = oneshot::channel();
+                    let task = spawn_local(move || async move {
+                        tokio::task::yield_now().await;
+                        let _ = tx.send(());
+                    });
+                    drop(task);
+                    tokio::time::timeout(Duration::from_secs(1), rx)
+                        .await
+                        .expect("dropped local handle should not abort task")
+                        .expect("local task should send completion");
+                })
+                .await
+                .expect("data task finished")
             })
         });
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_local_spawn_panic_returns_error_without_stopping_driver() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-panic-local", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let output = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    let panicking = spawn_local(|| async {
+                        panic!("local task panic");
+                    });
+                    let result = tokio::time::timeout(Duration::from_secs(1), panicking)
+                        .await
+                        .expect("panicking local task should finish");
+                    let err = result.expect_err("panic should be reported as join error");
+                    assert!(err.is_panic(), "{err}");
+
+                    spawn_local(|| async { 42usize })
+                        .await
+                        .expect("driver should continue after panic")
+                })
+                .await
+                .expect("data task finished")
+            })
+        });
+
+        assert_eq!(output, 42);
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
