@@ -1,65 +1,66 @@
 use hammer_adapter::{BufferFrame, BufferPool, RouteMetadata};
 
 #[test]
-fn buffer_handle_drop_releases_slot_for_reuse_with_new_generation() {
+fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
     let pool = BufferPool::with_capacity(128, 1);
-    let first_index = {
-        let buffer = pool
-            .alloc_with_bytes(RouteMetadata::default(), b"hello")
-            .expect("alloc first buffer");
-        let index = buffer.index();
-        assert_eq!(pool.in_use(), 1);
-        assert_eq!(buffer.current(), b"hello");
-        index
-    };
+    let first_index = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
+        .expect("alloc first buffer");
+    assert_eq!(pool.in_use(), 1);
+    assert_eq!(pool.copy_current(first_index).expect("first current"), b"hello");
+    pool.free_index(first_index);
 
     assert_eq!(pool.in_use(), 0);
 
-    let second = pool
-        .alloc_with_bytes(RouteMetadata::default(), b"world")
+    let second_index = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"world")
         .expect("alloc second buffer");
-    let second_index = second.index();
 
     assert_eq!(second_index.slot(), first_index.slot());
     assert_ne!(second_index.generation(), first_index.generation());
     assert!(pool.get(first_index).is_err());
-    assert_eq!(second.current(), b"world");
+    assert_eq!(pool.copy_current(second_index).expect("second current"), b"world");
+    pool.free_index(second_index);
 }
 
 #[test]
 fn buffer_cursor_headroom_and_append_manage_current_bytes() {
     let pool = BufferPool::with_capacity(16, 2);
-    let mut buffer = pool
-        .alloc_with_bytes(RouteMetadata::default(), b"payload")
+    let buffer = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
         .expect("alloc buffer");
 
-    buffer.advance(3).expect("advance current");
-    assert_eq!(buffer.current(), b"load");
+    pool.advance(buffer, 3).expect("advance current");
+    assert_eq!(pool.copy_current(buffer).expect("advanced current"), b"load");
 
-    buffer.prepend(b"pre").expect("prepend into headroom");
-    assert_eq!(buffer.current(), b"preload");
+    pool.prepend(buffer, b"pre").expect("prepend into headroom");
+    assert_eq!(pool.copy_current(buffer).expect("prepended current"), b"preload");
 
-    buffer.append(b"-tail").expect("append current");
-    assert_eq!(buffer.copy_current_chain(), b"preload-tail");
+    pool.append(buffer, b"-tail").expect("append current");
+    assert_eq!(pool.copy_packet(buffer).expect("appended packet"), b"preload-tail");
 
-    buffer.truncate_current(7).expect("truncate current");
-    assert_eq!(buffer.current(), b"preload");
+    pool.truncate_current(buffer, 7).expect("truncate current");
+    assert_eq!(pool.copy_current(buffer).expect("truncated current"), b"preload");
+    pool.free_index(buffer);
 }
 
 #[test]
 fn append_beyond_one_slot_creates_and_frees_chain() {
     let pool = BufferPool::with_capacity(8, 4);
-    let mut buffer = pool
-        .alloc_with_bytes(RouteMetadata::default(), b"123456")
+    let buffer = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"123456")
         .expect("alloc buffer");
 
-    buffer.append(b"7890abcdef").expect("append chain");
+    pool.append(buffer, b"7890abcdef").expect("append chain");
 
-    assert!(buffer.next_buffer().is_some());
-    assert_eq!(buffer.copy_current_chain(), b"1234567890abcdef");
+    assert!(pool.is_chained(buffer).expect("buffer is chained"));
+    assert_eq!(
+        pool.copy_packet(buffer).expect("chained packet"),
+        b"1234567890abcdef"
+    );
     assert!(pool.in_use() > 1);
 
-    drop(buffer);
+    pool.free_index(buffer);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -67,12 +68,56 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 fn alloc_with_bytes_beyond_one_slot_creates_chain() {
     let pool = BufferPool::with_capacity(4, 4);
     let buffer = pool
-        .alloc_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
         .expect("alloc chained buffer");
 
-    assert!(buffer.next_buffer().is_some());
-    assert_eq!(buffer.copy_current_chain(), b"abcdefghijkl");
+    assert!(pool.is_chained(buffer).expect("buffer is chained"));
+    assert_eq!(pool.copy_packet(buffer).expect("chained packet"), b"abcdefghijkl");
     assert_eq!(pool.in_use(), 3);
+    pool.free_index(buffer);
+}
+
+#[test]
+fn buffer_pool_reports_single_segment_and_chained_packets() {
+    let pool = BufferPool::with_capacity(4, 8);
+    let single = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abc")
+        .expect("alloc single buffer");
+    let chained = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghij")
+        .expect("alloc chained buffer");
+
+    assert!(!pool.is_chained(single).expect("single chain state"));
+    assert!(pool.is_chained(chained).expect("chained state"));
+    assert_eq!(pool.copy_current(single).expect("single current"), b"abc");
+    assert_eq!(pool.copy_packet(single).expect("single packet"), b"abc");
+    assert_eq!(pool.copy_current(chained).expect("chained current"), b"abcd");
+    assert_eq!(pool.copy_packet(chained).expect("chained packet"), b"abcdefghij");
+
+    pool.free_index(single);
+    pool.free_index(chained);
+}
+
+#[test]
+fn buffer_pool_rejects_index_from_another_runtime() {
+    let first_pool = BufferPool::with_capacity(8, 2);
+    let second_pool = BufferPool::with_capacity(8, 2);
+    let first_index = first_pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc first pool buffer");
+    let second_index = second_pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"other")
+        .expect("alloc second pool buffer");
+
+    assert_eq!(first_index.slot(), second_index.slot());
+    assert_eq!(first_index.generation(), second_index.generation());
+    assert_ne!(first_index.pool_id(), second_index.pool_id());
+    assert!(second_pool.get(first_index).is_err());
+    assert!(second_pool.copy_packet(first_index).is_err());
+    assert!(second_pool.is_chained(first_index).is_err());
+
+    first_pool.free_index(first_index);
+    second_pool.free_index(second_index);
 }
 
 #[test]

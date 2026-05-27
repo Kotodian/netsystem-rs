@@ -1,5 +1,6 @@
 use std::cell::{Ref, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -9,11 +10,16 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
+    pool_id: u64,
     slot: u32,
     generation: u32,
 }
 
 impl BufferIndex {
+    pub fn pool_id(self) -> u64 {
+        self.pool_id
+    }
+
     pub fn slot(self) -> u32 {
         self.slot
     }
@@ -147,6 +153,7 @@ struct BufferSlot {
 
 #[derive(Debug)]
 struct BufferPoolInner {
+    pool_id: u64,
     slot_capacity: usize,
     slots: Vec<BufferSlot>,
     free: Vec<u32>,
@@ -161,6 +168,12 @@ pub struct BufferPool {
 #[derive(Debug, Clone)]
 pub struct DataPlaneRuntime {
     buffers: BufferPool,
+}
+
+static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_buffer_pool_id() -> u64 {
+    NEXT_BUFFER_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl DataPlaneRuntime {
@@ -218,8 +231,36 @@ impl DataPlaneRuntime {
         self.buffers.with_metadata_mut(index, f)
     }
 
+    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        self.buffers.advance(index, len)
+    }
+
+    pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        self.buffers.truncate_current(index, len)
+    }
+
+    pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        self.buffers.prepend(index, bytes)
+    }
+
+    pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        self.buffers.append(index, bytes)
+    }
+
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.current(index)
+    }
+
+    pub fn copy_current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.buffers.copy_current(index)
+    }
+
+    pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
+        self.buffers.is_chained(index)
+    }
+
+    pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.buffers.copy_packet(index)
     }
 
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
@@ -241,6 +282,7 @@ impl BufferPool {
             .collect();
         Self {
             inner: Rc::new(RefCell::new(BufferPoolInner {
+                pool_id: next_buffer_pool_id(),
                 slot_capacity,
                 slots,
                 free,
@@ -251,23 +293,6 @@ impl BufferPool {
 
     pub fn in_use(&self) -> usize {
         self.inner.borrow().in_use
-    }
-
-    pub fn alloc(&self, metadata: RouteMetadata) -> CoreResult<BufferHandle> {
-        self.alloc_with_bytes(metadata, &[])
-    }
-
-    pub fn alloc_with_bytes(
-        &self,
-        metadata: RouteMetadata,
-        bytes: &[u8],
-    ) -> CoreResult<BufferHandle> {
-        let index = self.inner.borrow_mut().alloc_chain(metadata, bytes)?;
-        Ok(BufferHandle {
-            pool: Rc::clone(&self.inner),
-            index,
-            armed: true,
-        })
     }
 
     pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
@@ -313,8 +338,66 @@ impl BufferPool {
         Ok(f(metadata))
     }
 
+    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        let mut pool = self.inner.borrow_mut();
+        let buffer = pool.buffer_mut(index)?;
+        if len > buffer.current_len {
+            return Err(CoreError::internal("buffer advance exceeds current length"));
+        }
+        buffer.current_data += len;
+        buffer.current_len -= len;
+        Ok(())
+    }
+
+    pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        let mut pool = self.inner.borrow_mut();
+        let buffer = pool.buffer_mut(index)?;
+        if len > buffer.current_len {
+            return Err(CoreError::internal(
+                "buffer truncate extends current length",
+            ));
+        }
+        buffer.current_len = len;
+        Ok(())
+    }
+
+    pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        let mut pool = self.inner.borrow_mut();
+        let buffer = pool.buffer_mut(index)?;
+        if bytes.len() > buffer.current_data {
+            return Err(CoreError::internal("buffer prepend exceeds headroom"));
+        }
+        buffer.current_data -= bytes.len();
+        let start = buffer.current_data;
+        let end = start + bytes.len();
+        buffer.storage[start..end].copy_from_slice(bytes);
+        buffer.current_len += bytes.len();
+        Ok(())
+    }
+
+    pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        self.inner.borrow_mut().append_chain(index, bytes)
+    }
+
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         Ok(self.inner.borrow().buffer(index)?.current().to_vec())
+    }
+
+    pub fn copy_current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        self.current(index)
+    }
+
+    pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
+        Ok(self.inner.borrow().buffer(index)?.next_buffer().is_some())
+    }
+
+    pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        let inner = self.inner.borrow();
+        let buffer = inner.buffer(index)?;
+        if buffer.next_buffer().is_none() {
+            return Ok(buffer.current().to_vec());
+        }
+        inner.copy_current_chain(index)
     }
 
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
@@ -381,12 +464,21 @@ impl BufferPoolInner {
         entry.buffer = Some(Buffer::new(self.slot_capacity, metadata, bytes)?);
         self.in_use += 1;
         Ok(BufferIndex {
+            pool_id: self.pool_id,
             slot,
             generation: entry.generation,
         })
     }
 
+    fn validate_pool_index(&self, index: BufferIndex) -> CoreResult<()> {
+        if index.pool_id != self.pool_id {
+            return Err(CoreError::internal("buffer index belongs to another pool"));
+        }
+        Ok(())
+    }
+
     fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
+        self.validate_pool_index(index)?;
         let entry = self
             .slots
             .get(index.slot as usize)
@@ -401,6 +493,7 @@ impl BufferPoolInner {
     }
 
     fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
+        self.validate_pool_index(index)?;
         let entry = self
             .slots
             .get_mut(index.slot as usize)
@@ -417,6 +510,9 @@ impl BufferPoolInner {
     fn free_chain(&mut self, index: BufferIndex) {
         let mut next = Some(index);
         while let Some(index) = next {
+            if index.pool_id != self.pool_id {
+                return;
+            }
             let Some(entry) = self.slots.get_mut(index.slot as usize) else {
                 return;
             };
@@ -474,118 +570,6 @@ impl BufferPoolInner {
         }
         self.buffer_mut(index)?.total_len_not_including_first = total;
         Ok(())
-    }
-}
-
-pub struct BufferHandle {
-    pool: Rc<RefCell<BufferPoolInner>>,
-    index: BufferIndex,
-    armed: bool,
-}
-
-impl BufferHandle {
-    pub fn index(&self) -> BufferIndex {
-        self.index
-    }
-
-    pub fn metadata(&self) -> RouteMetadata {
-        self.pool
-            .borrow()
-            .buffer(self.index)
-            .expect("live buffer handle points to valid buffer")
-            .metadata()
-            .clone()
-    }
-
-    pub fn with_metadata_mut<R>(&self, f: impl FnOnce(&mut RouteMetadata) -> R) -> R {
-        let mut pool = self.pool.borrow_mut();
-        let metadata = pool
-            .buffer_mut(self.index)
-            .expect("live buffer handle points to valid buffer")
-            .metadata_mut();
-        f(metadata)
-    }
-
-    pub fn current(&self) -> Vec<u8> {
-        self.pool
-            .borrow()
-            .buffer(self.index)
-            .expect("live buffer handle points to valid buffer")
-            .current()
-            .to_vec()
-    }
-
-    pub fn with_current_mut<R>(&self, f: impl FnOnce(&mut [u8]) -> R) -> R {
-        let mut pool = self.pool.borrow_mut();
-        let current = pool
-            .buffer_mut(self.index)
-            .expect("live buffer handle points to valid buffer")
-            .current_mut();
-        f(current)
-    }
-
-    pub fn next_buffer(&self) -> Option<BufferIndex> {
-        self.pool
-            .borrow()
-            .buffer(self.index)
-            .expect("live buffer handle points to valid buffer")
-            .next_buffer()
-    }
-
-    pub fn advance(&mut self, len: usize) -> CoreResult<()> {
-        let mut pool = self.pool.borrow_mut();
-        let buffer = pool.buffer_mut(self.index)?;
-        if len > buffer.current_len {
-            return Err(CoreError::internal("buffer advance exceeds current length"));
-        }
-        buffer.current_data += len;
-        buffer.current_len -= len;
-        Ok(())
-    }
-
-    pub fn truncate_current(&mut self, len: usize) -> CoreResult<()> {
-        let mut pool = self.pool.borrow_mut();
-        let buffer = pool.buffer_mut(self.index)?;
-        if len > buffer.current_len {
-            return Err(CoreError::internal(
-                "buffer truncate extends current length",
-            ));
-        }
-        buffer.current_len = len;
-        Ok(())
-    }
-
-    pub fn prepend(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        let mut pool = self.pool.borrow_mut();
-        let buffer = pool.buffer_mut(self.index)?;
-        if bytes.len() > buffer.current_data {
-            return Err(CoreError::internal("buffer prepend exceeds headroom"));
-        }
-        buffer.current_data -= bytes.len();
-        let start = buffer.current_data;
-        let end = start + bytes.len();
-        buffer.storage[start..end].copy_from_slice(bytes);
-        buffer.current_len += bytes.len();
-        Ok(())
-    }
-
-    pub fn append(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        self.pool.borrow_mut().append_chain(self.index, bytes)
-    }
-
-    pub fn copy_current_chain(&self) -> Vec<u8> {
-        self.pool
-            .borrow()
-            .copy_current_chain(self.index)
-            .expect("live buffer handle points to valid chain")
-    }
-}
-
-impl Drop for BufferHandle {
-    fn drop(&mut self) {
-        if self.armed {
-            self.pool.borrow_mut().free_chain(self.index);
-        }
     }
 }
 

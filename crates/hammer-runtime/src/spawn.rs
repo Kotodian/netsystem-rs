@@ -525,8 +525,7 @@ mod tests {
                     let buffer = with_data_plane_runtime(|runtime| {
                         let before = runtime.in_use_buffers();
                         let buffer = runtime
-                            .buffers()
-                            .alloc_with_bytes(Default::default(), b"packet")
+                            .alloc_index_with_bytes(Default::default(), b"packet")
                             .expect("alloc local data buffer");
                         let during = runtime.in_use_buffers();
                         (before, during, buffer)
@@ -536,8 +535,13 @@ mod tests {
                         .name()
                         .map(ToOwned::to_owned)
                         .unwrap_or_default();
-                    let payload = buffer.2.current();
-                    drop(buffer.2);
+                    let payload = with_data_plane_runtime(|runtime| {
+                        let payload = runtime
+                            .copy_current(buffer.2)
+                            .expect("copy local data buffer");
+                        runtime.free_index(buffer.2);
+                        payload
+                    });
                     let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
                     (
                         thread_before,
@@ -584,8 +588,7 @@ mod tests {
                             .unwrap_or_default();
                         let buffer = with_data_plane_runtime(|runtime| {
                             runtime
-                                .buffers()
-                                .alloc_with_bytes(Default::default(), b"packet")
+                                .alloc_index_with_bytes(Default::default(), b"packet")
                                 .expect("alloc local data buffer")
                         });
                         tokio::task::yield_now().await;
@@ -593,7 +596,14 @@ mod tests {
                             .name()
                             .map(ToOwned::to_owned)
                             .unwrap_or_default();
-                        (thread_before, thread_after, buffer.current())
+                        let payload = with_data_plane_runtime(|runtime| {
+                            let payload = runtime
+                                .copy_current(buffer)
+                                .expect("copy current local data buffer");
+                            runtime.free_index(buffer);
+                            payload
+                        });
+                        (thread_before, thread_after, payload)
                     });
                     join.await.expect("current local task joined")
                 })
