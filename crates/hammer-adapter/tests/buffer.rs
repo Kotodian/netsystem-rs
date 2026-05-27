@@ -331,6 +331,36 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
 }
 
 #[test]
+fn buffer_frame_push_indices_batches_one_wake() {
+    let pool = BufferPool::with_capacity(8, 4);
+    let mut frame = BufferFrame::with_capacity(2);
+    let first = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first frame buffer");
+    let second = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second frame buffer");
+    let wake_counter = Arc::new(WakeCounter::default());
+    let waker = Waker::from(Arc::clone(&wake_counter));
+    let mut context = Context::from_waker(&waker);
+    let mut pending = frame.pending();
+
+    assert!(matches!(
+        Pin::new(&mut pending).poll(&mut context),
+        Poll::Pending
+    ));
+
+    frame
+        .push_indices([first, second])
+        .expect("push batched frame indices");
+
+    assert_eq!(wake_counter.wakes.load(Ordering::SeqCst), 1);
+    assert_eq!(frame.pending_indices(), &[first, second]);
+
+    pool.free_frame(&mut frame);
+}
+
+#[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
     let pool = BufferPool::with_capacity(8, 2);
     let mut frame = BufferFrame::with_capacity(1);

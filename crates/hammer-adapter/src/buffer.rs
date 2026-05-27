@@ -648,6 +648,34 @@ impl BufferFrame {
         Ok(())
     }
 
+    pub fn push_indices(
+        &mut self,
+        indices: impl IntoIterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        let indices = indices.into_iter();
+        let (lower, upper) = indices.size_hint();
+        if let Some(upper) = upper {
+            if self.indices.len() + upper > self.indices.capacity() {
+                return Err(CoreError::internal("buffer frame capacity exceeded"));
+            }
+        } else if self.indices.len() + lower > self.indices.capacity() {
+            return Err(CoreError::internal("buffer frame capacity exceeded"));
+        }
+
+        let original_len = self.indices.len();
+        for index in indices {
+            if self.indices.len() == self.indices.capacity() {
+                self.indices.truncate(original_len);
+                return Err(CoreError::internal("buffer frame capacity exceeded"));
+            }
+            self.indices.push(index);
+        }
+        if self.indices.len() != original_len {
+            self.readiness.mark_pending();
+        }
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.indices.len()
     }
