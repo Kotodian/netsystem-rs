@@ -296,6 +296,7 @@ outbound = "hysteria2"
             target: RouteTarget::Outbound("direct".to_owned())
         }
     );
+    assert_eq!(flow.metadata.route_decision.as_ref(), Some(&flow.decision));
 }
 
 #[test]
@@ -316,6 +317,7 @@ fn packet_stack_facade_routes_packets_through_router() {
     assert_eq!(flow.decision, RouteDecision::HijackDns);
     assert_eq!(flow.metadata.network, Network::Udp);
     assert_eq!(flow.metadata.protocol, "dns");
+    assert_eq!(flow.metadata.route_decision.as_ref(), Some(&flow.decision));
 }
 
 #[test]

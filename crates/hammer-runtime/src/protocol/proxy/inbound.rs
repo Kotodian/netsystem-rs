@@ -1235,7 +1235,9 @@ async fn route_tcp(
         route_decision: None,
     };
     router.prepare_route_metadata(&mut metadata)?;
-    match router.match_route(&mut metadata)? {
+    let decision = router.match_route(&mut metadata)?;
+    metadata.route_decision = Some(decision.clone());
+    match decision {
         RouteDecision::Route {
             target: RouteTarget::Outbound(id),
         } => {
@@ -1289,7 +1291,9 @@ fn route_udp(
 ) -> HammerResult<String> {
     let decision = runtime.with_metadata_mut(buffer, |metadata| {
         router.prepare_route_metadata(metadata)?;
-        router.match_route(metadata)
+        let decision = router.match_route(metadata)?;
+        metadata.route_decision = Some(decision.clone());
+        Ok(decision)
     })??;
     match decision {
         RouteDecision::Route {

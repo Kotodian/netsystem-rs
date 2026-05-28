@@ -2037,6 +2037,7 @@ where
             self.dns_router.as_deref(),
         )?;
         let decision = self.router.match_route(&mut tun_packet.metadata)?;
+        tun_packet.metadata.route_decision = Some(decision.clone());
         debug!("handled TUN {:?} packet", tun_packet.metadata.network);
         Ok(PacketFlow {
             metadata: tun_packet.metadata,
@@ -2052,6 +2053,7 @@ where
             self.dns_router.as_deref(),
         )?;
         let decision = self.router.match_route(&mut tun_packet.metadata)?;
+        tun_packet.metadata.route_decision = Some(decision.clone());
         match decision {
             RouteDecision::HijackDns => self.dispatch_dns(tun_packet).await,
             RouteDecision::Reject { method } => Ok(TunDispatch::Dropped {
@@ -3316,6 +3318,7 @@ where
 {
     prepare_route_metadata(router, metadata, Some(dns_router))?;
     let decision = router.match_route(metadata)?;
+    metadata.route_decision = Some(decision.clone());
     debug!(
         "system TCP route decision: source={} destination={} domain={} protocol={} decision={decision:?}",
         metadata
@@ -3411,6 +3414,7 @@ where
     }
     prepare_route_metadata(router, &mut metadata, Some(dns_router))?;
     let decision = router.match_route(&mut metadata)?;
+    metadata.route_decision = Some(decision.clone());
     if metadata.domain.is_some()
         || matches!(
             decision,
@@ -3937,8 +3941,11 @@ where
         metrics.counters.udp_route_prepare_error_total.increment(1);
         return Err(err);
     }
-    let decision = match runtime.with_metadata_mut(buffer, |metadata| router.match_route(metadata))
-    {
+    let decision = match runtime.with_metadata_mut(buffer, |metadata| {
+        let decision = router.match_route(metadata)?;
+        metadata.route_decision = Some(decision.clone());
+        Ok(decision)
+    }) {
         Ok(Ok(decision)) => decision,
         Ok(Err(err)) | Err(err) => {
             runtime.free_index(buffer);
@@ -4934,6 +4941,7 @@ where
     };
     prepare_route_metadata(router.as_ref(), &mut metadata, Some(dns_router.as_ref()))?;
     let decision = router.match_route(&mut metadata)?;
+    metadata.route_decision = Some(decision.clone());
     match decision {
         RouteDecision::HijackDns => {
             // ICMP is not routable to the DNS hijack; this should not be
