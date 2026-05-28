@@ -291,7 +291,9 @@ impl Future for DataLocalDriver {
         DATA_LOCAL_DRIVER_WAKER.with(|waker| {
             *waker.borrow_mut() = Some(cx.waker().clone());
         });
+        poll_data_plane_nodes(cx);
         poll_data_local_tasks(cx);
+        poll_data_plane_nodes(cx);
         Poll::Pending
     }
 }
@@ -476,6 +478,27 @@ fn poll_data_local_tasks(cx: &mut Context<'_>) {
     }
 }
 
+fn poll_data_plane_nodes(cx: &mut Context<'_>) {
+    loop {
+        let ready = with_data_plane_runtime(|runtime| {
+            let mut ready = runtime.nodes().ready();
+            Pin::new(&mut ready).poll(cx)
+        });
+        if !matches!(ready, Poll::Ready(())) {
+            break;
+        }
+        let result = with_data_plane_runtime(DataPlaneRuntime::run_ready_nodes);
+        match result {
+            Ok(0) => continue,
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!("data plane node scheduler failed: {err}");
+                break;
+            }
+        }
+    }
+}
+
 fn wake_data_local_driver() {
     DATA_LOCAL_DRIVER_WAKER.with(|waker| {
         if let Some(waker) = waker.borrow().as_ref().cloned() {
@@ -608,6 +631,8 @@ fn next_data_runtime_context_id() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_adapter::{BufferFrame, Node, NodeResult};
+    use hammer_core::error::CoreResult;
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -620,6 +645,24 @@ mod tests {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .expect("spawn test lock poisoned")
+    }
+
+    struct SchedulerCountNode {
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Node for SchedulerCountNode {
+        fn process(
+            &mut self,
+            runtime: &DataPlaneRuntime,
+            frame: &mut BufferFrame,
+        ) -> CoreResult<NodeResult> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            for buffer in frame.drain_pending() {
+                runtime.free_index(buffer);
+            }
+            Ok(NodeResult::drop())
+        }
     }
 
     #[test]
@@ -706,6 +749,66 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(during, 1);
         assert_eq!(after, 0);
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_local_driver_runs_scheduled_nodes() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-scheduler", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let processed = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    let count = Arc::new(AtomicUsize::new(0));
+                    with_data_plane_runtime(|runtime| {
+                        let node = runtime.nodes().register(SchedulerCountNode {
+                            count: Arc::clone(&count),
+                        });
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        let buffer = runtime
+                            .alloc_index_with_bytes(Default::default(), b"packet")
+                            .expect("alloc data buffer");
+                        runtime
+                            .with_frame_mut(frame, |frame| frame.push_index(buffer))
+                            .expect("mutate frame")
+                            .expect("push packet");
+                        assert!(runtime.schedule_frame(node, frame).expect("schedule frame"));
+                    });
+
+                    for _ in 0..16 {
+                        if count.load(Ordering::SeqCst) != 0 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    count.load(Ordering::SeqCst)
+                })
+                .await
+                .expect("data task finished")
+            })
+        });
+
+        assert_eq!(processed, 1);
+        let remaining = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    with_data_plane_runtime(|runtime| {
+                        (runtime.frames_in_use(), runtime.in_use_buffers())
+                    })
+                })
+                .await
+                .expect("data task finished")
+            })
+        });
+        assert_eq!(remaining, (0, 0));
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
