@@ -470,8 +470,11 @@ impl fmt::Display for DataLocalJoinError {
 impl Error for DataLocalJoinError {}
 
 fn poll_data_local_tasks(cx: &mut Context<'_>) {
-    let tasks = DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().drain(..).collect::<Vec<_>>());
-    for task in tasks {
+    let initial_len = DATA_LOCAL_TASKS.with(|queue| queue.borrow().len());
+    for _ in 0..initial_len {
+        let Some(task) = DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().pop_front()) else {
+            break;
+        };
         if task.poll(cx) {
             DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().push_back(task));
         }
