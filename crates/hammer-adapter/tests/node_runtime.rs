@@ -8,8 +8,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Node, NodeId, NodeResult, RouteDecision, RouteMetadata,
-    RouteTarget, Router, RouterNode,
+    BufferFrame, DataPlaneRuntime, Network, Node, NodeId, NodeResult, RouteDecision,
+    RouteDispatchNode, RouteMetadata, RouteTarget, Router, RouterNode,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
@@ -295,6 +295,75 @@ fn router_node_stores_decision_in_metadata_and_forwards_frame() {
             target: RouteTarget::Outbound("direct".to_owned())
         }]
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn route_dispatch_node_splits_frame_by_route_decision() {
+    let runtime = DataPlaneRuntime::with_capacities(16, 8, 4, 4);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let direct_payloads = Rc::new(RefCell::new(Vec::new()));
+    let block_payloads = Rc::new(RefCell::new(Vec::new()));
+    let direct = runtime.nodes().register(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&direct_payloads),
+    });
+    let block = runtime.nodes().register(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&block_payloads),
+    });
+    let dispatch = runtime.nodes().register(
+        RouteDispatchNode::new()
+            .with_outbound("direct", direct)
+            .with_outbound("block", block),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    for (target, payload) in [
+        ("direct", b"first".as_slice()),
+        ("block", b"second".as_slice()),
+        ("direct", b"third".as_slice()),
+    ] {
+        let buffer = runtime
+            .alloc_index_with_bytes(
+                RouteMetadata {
+                    route_decision: Some(RouteDecision::Route {
+                        target: RouteTarget::Outbound(target.to_owned()),
+                    }),
+                    ..Default::default()
+                },
+                payload,
+            )
+            .expect("alloc packet");
+        runtime
+            .with_frame_mut(frame, |frame| frame.push_index(buffer))
+            .expect("mutate frame")
+            .expect("push packet");
+    }
+    let rejected = runtime
+        .alloc_index_with_bytes(
+            RouteMetadata {
+                route_decision: Some(RouteDecision::Reject {
+                    method: "drop".to_owned(),
+                }),
+                ..Default::default()
+            },
+            b"reject",
+        )
+        .expect("alloc rejected packet");
+    runtime
+        .with_frame_mut(frame, |frame| frame.push_index(rejected))
+        .expect("mutate frame")
+        .expect("push rejected packet");
+
+    assert!(runtime.schedule_frame(dispatch, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(
+        &*direct_payloads.borrow(),
+        &[b"first".to_vec(), b"third".to_vec()]
+    );
+    assert_eq!(&*block_payloads.borrow(), &[b"second".to_vec()]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

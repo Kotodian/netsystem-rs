@@ -377,6 +377,14 @@ impl DataPlaneRuntime {
         self.buffers.metadata(index)
     }
 
+    pub fn with_metadata<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&RouteMetadata) -> R,
+    ) -> CoreResult<R> {
+        self.buffers.with_metadata(index, f)
+    }
+
     pub fn with_metadata_mut<R>(
         &self,
         index: BufferIndex,
@@ -480,6 +488,16 @@ impl BufferPool {
 
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
         Ok(self.inner.borrow().buffer(index)?.metadata().clone())
+    }
+
+    pub fn with_metadata<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&RouteMetadata) -> R,
+    ) -> CoreResult<R> {
+        let pool = self.inner.borrow();
+        let metadata = pool.buffer(index)?.metadata();
+        Ok(f(metadata))
     }
 
     pub fn with_metadata_mut<R>(
@@ -1134,6 +1152,29 @@ impl BufferFrame {
     pub fn drain_pending(&mut self) -> std::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
+    }
+
+    pub fn retain_indices(
+        &mut self,
+        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let mut write = 0usize;
+        for read in 0..self.indices.len() {
+            let index = self.indices[read];
+            if keep(index)? {
+                if write != read {
+                    self.indices[write] = index;
+                }
+                write += 1;
+            }
+        }
+        self.indices.truncate(write);
+        if self.indices.is_empty() {
+            self.readiness.clear_pending();
+        } else {
+            self.readiness.mark_pending();
+        }
+        Ok(())
     }
 
     pub fn pending(&self) -> BufferFramePending {
