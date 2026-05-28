@@ -785,28 +785,49 @@ mod tests {
     ) -> CoreResult<()> {
         let mut metadata = RouteMetadata::default();
         metadata.destination = Some(destination);
-        let mut frame = runtime.frame_with_capacity(1);
+        let mut frame = runtime.alloc_pooled_frame()?;
         let index = runtime.alloc_index_with_bytes(metadata, payload)?;
         if let Err(err) = frame.push_index(index) {
             runtime.free_index(index);
+            let _ = runtime.release_pooled_frame(frame);
             return Err(err);
         }
-        conn.send(runtime, &mut frame).await
+        let result = conn.send(runtime, &mut frame).await;
+        runtime.release_pooled_frame(frame)?;
+        result
     }
 
     async fn recv_packet(
         conn: &mut dyn ProxyPacketConn,
         runtime: &DataPlaneRuntime,
     ) -> CoreResult<TestDatagram> {
-        let mut frame = runtime.frame_with_capacity(1);
-        conn.recv(runtime, &mut frame, 1).await?;
-        let index = frame
-            .drain_indices()
-            .next()
-            .ok_or_else(|| CoreError::internal("test packet recv returned empty frame"))?;
-        let metadata = runtime.metadata(index)?;
-        let payload = runtime.copy_current_chain(index)?;
+        let mut frame = runtime.alloc_pooled_frame()?;
+        if let Err(err) = conn.recv(runtime, &mut frame, 1).await {
+            let _ = runtime.release_pooled_frame(frame);
+            return Err(err);
+        }
+        let Some(index) = frame.drain_indices().next() else {
+            runtime.release_pooled_frame(frame)?;
+            return Err(CoreError::internal("test packet recv returned empty frame"));
+        };
+        let metadata = match runtime.metadata(index) {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                runtime.free_index(index);
+                let _ = runtime.release_pooled_frame(frame);
+                return Err(err);
+            }
+        };
+        let payload = match runtime.copy_current_chain(index) {
+            Ok(payload) => payload,
+            Err(err) => {
+                runtime.free_index(index);
+                let _ = runtime.release_pooled_frame(frame);
+                return Err(err);
+            }
+        };
         runtime.free_index(index);
+        runtime.release_pooled_frame(frame)?;
         let destination = metadata
             .destination
             .ok_or_else(|| CoreError::internal("test packet recv missing destination"))?;

@@ -186,7 +186,7 @@ mod tests {
     #[tokio::test]
     async fn packet_conn_send_uses_borrowed_frame() {
         let runtime = DataPlaneRuntime::with_buffer_capacity(128, 1);
-        let mut frame = runtime.frame_with_capacity(1);
+        let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let mut metadata = RouteMetadata::default();
         metadata.destination = Some(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53));
         frame
@@ -203,5 +203,8 @@ mod tests {
         assert!(frame.is_empty());
         assert_eq!(conn.last, Some(b"borrowed udp payload".to_vec()));
         assert_eq!(runtime.in_use_buffers(), 0);
+        runtime
+            .release_pooled_frame(frame)
+            .expect("release pooled frame");
     }
 }

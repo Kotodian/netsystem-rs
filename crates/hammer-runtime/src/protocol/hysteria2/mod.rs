@@ -1376,7 +1376,7 @@ mod tests {
 
         client.close(b"simulate suspended connection loss");
         let runtime = hammer_adapter::DataPlaneRuntime::with_buffer_capacity(2048, 8);
-        let mut frame = runtime.frame_with_capacity(1);
+        let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let err = tokio::time::timeout(
             Duration::from_millis(200),
             packet.recv(&runtime, &mut frame, 1),
@@ -1386,6 +1386,9 @@ mod tests {
         .expect_err("UDP recv should report connection closure");
 
         assert!(err.to_string().contains("hysteria2 UDP connection closed"));
+        runtime
+            .release_pooled_frame(frame)
+            .expect("release pooled frame");
     }
 
     #[tokio::test]
