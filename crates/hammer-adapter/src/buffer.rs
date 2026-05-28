@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
+use crate::node::{NodeId, NodeRuntime};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -222,6 +223,7 @@ pub struct PooledBufferFrame {
 pub struct DataPlaneRuntime {
     buffers: BufferPool,
     frames: FramePool,
+    nodes: NodeRuntime,
 }
 
 static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -254,6 +256,7 @@ impl DataPlaneRuntime {
         Self {
             buffers: BufferPool::with_capacity(buffer_slot_capacity, buffer_slots),
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
+            nodes: NodeRuntime::default(),
         }
     }
 
@@ -263,6 +266,10 @@ impl DataPlaneRuntime {
 
     pub fn frames(&self) -> &FramePool {
         &self.frames
+    }
+
+    pub fn nodes(&self) -> &NodeRuntime {
+        &self.nodes
     }
 
     pub fn in_use_buffers(&self) -> usize {
@@ -317,6 +324,19 @@ impl DataPlaneRuntime {
         self.frames.free_index(&self.buffers, index)
     }
 
+    pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
+        if !self.with_frame(frame, BufferFrame::has_pending)? {
+            return Ok(false);
+        }
+        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+        self.nodes.schedule_frame(node, frame)?;
+        Ok(true)
+    }
+
+    pub fn run_ready_nodes(&self) -> CoreResult<usize> {
+        self.nodes.run_ready(self)
+    }
+
     pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
@@ -330,6 +350,26 @@ impl DataPlaneRuntime {
 
     pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
         let PooledBufferFrame { index, frame } = frame;
+        self.frames.free_taken_index(&self.buffers, index, frame)
+    }
+
+    pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
+        self.frames.take_index(index)
+    }
+
+    pub(crate) fn return_taken_frame_index(
+        &self,
+        index: FrameIndex,
+        frame: BufferFrame,
+    ) -> CoreResult<()> {
+        self.frames.return_taken_index(index, frame)
+    }
+
+    pub(crate) fn release_taken_frame_index(
+        &self,
+        index: FrameIndex,
+        frame: BufferFrame,
+    ) -> CoreResult<()> {
         self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
@@ -517,7 +557,6 @@ impl BufferPool {
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.inner.borrow().copy_current_chain(index)
     }
-
 }
 
 impl FramePool {
@@ -594,6 +633,10 @@ impl FramePool {
         self.inner
             .borrow_mut()
             .return_frame_and_release(index, frame)
+    }
+
+    pub fn return_taken_index(&self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
+        self.inner.borrow_mut().return_frame(index, frame)
     }
 }
 
@@ -726,6 +769,25 @@ impl FramePoolInner {
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
         self.free.push(index.slot);
+        Ok(())
+    }
+
+    fn return_frame(&mut self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
+        self.validate_index(index)?;
+        let entry = self
+            .slots
+            .get_mut(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        if entry.frame.is_some() {
+            return Err(CoreError::internal("frame slot already has a frame"));
+        }
+        entry.frame = Some(frame);
         Ok(())
     }
 }
@@ -913,6 +975,7 @@ impl BufferPoolInner {
 #[derive(Debug)]
 pub struct BufferFrame {
     indices: Vec<BufferIndex>,
+    next_node: Option<NodeId>,
     readiness: Rc<FrameReadiness>,
 }
 
@@ -973,6 +1036,7 @@ impl BufferFrame {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             indices: Vec::with_capacity(capacity),
+            next_node: None,
             readiness: Rc::new(FrameReadiness::default()),
         }
     }
@@ -1036,11 +1100,13 @@ impl BufferFrame {
 
     pub fn reset(&mut self) {
         self.indices.clear();
+        self.next_node = None;
         self.readiness.clear_pending();
     }
 
     fn reset_for_pool_reuse(&mut self) {
         self.indices.clear();
+        self.next_node = None;
         self.readiness.reset_for_pool_reuse();
     }
 
@@ -1074,6 +1140,18 @@ impl BufferFrame {
         BufferFramePending {
             readiness: Rc::clone(&self.readiness),
         }
+    }
+
+    pub fn next_node(&self) -> Option<NodeId> {
+        self.next_node
+    }
+
+    pub fn set_next_node(&mut self, node: NodeId) {
+        self.next_node = Some(node);
+    }
+
+    pub fn clear_next_node(&mut self) {
+        self.next_node = None;
     }
 }
 
