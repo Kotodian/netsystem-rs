@@ -273,14 +273,6 @@ impl DataPlaneRuntime {
         self.frames.in_use()
     }
 
-    pub fn frame(&self) -> BufferFrame {
-        self.buffers.frame()
-    }
-
-    pub fn frame_with_capacity(&self, capacity: usize) -> BufferFrame {
-        self.buffers.frame_with_capacity(capacity)
-    }
-
     pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
         self.buffers.alloc_index(metadata)
     }
@@ -526,13 +518,6 @@ impl BufferPool {
         self.inner.borrow().copy_current_chain(index)
     }
 
-    pub fn frame(&self) -> BufferFrame {
-        self.frame_with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY)
-    }
-
-    pub fn frame_with_capacity(&self, capacity: usize) -> BufferFrame {
-        BufferFrame::with_capacity(capacity)
-    }
 }
 
 impl FramePool {
@@ -985,7 +970,7 @@ impl FrameReadiness {
 }
 
 impl BufferFrame {
-    pub fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
             indices: Vec::with_capacity(capacity),
             readiness: Rc::new(FrameReadiness::default()),

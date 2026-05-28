@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use hammer_adapter::{BufferFrame, BufferPool, DataPlaneRuntime, RouteMetadata};
+use hammer_adapter::{BufferPool, DataPlaneRuntime, RouteMetadata};
 
 #[derive(Default)]
 struct WakeCounter {
@@ -170,8 +170,9 @@ fn buffer_pool_rejects_index_from_another_runtime() {
 
 #[test]
 fn buffer_frame_reset_does_not_free_buffers() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(2);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"one")
         .expect("alloc first frame buffer");
@@ -199,14 +200,18 @@ fn buffer_frame_reset_does_not_free_buffers() {
         b"two"
     );
 
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
     pool.free_index(first);
     pool.free_index(second);
 }
 
 #[test]
 fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(2);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"one")
         .expect("alloc first frame buffer");
@@ -231,12 +236,16 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     frame.push_index(next).expect("reuse frame allocation");
     assert_eq!(frame.indices(), &[next]);
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
 }
 
 #[test]
 fn buffer_frame_drain_indices_preserves_order_without_freeing() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(2);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"first")
         .expect("alloc first frame buffer");
@@ -265,13 +274,17 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     for index in drained {
         pool.free_index(index);
     }
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
     assert_eq!(pool.in_use(), 0);
 }
 
 #[test]
 fn buffer_frame_tracks_pending_indices_until_drained() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(2);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"first")
         .expect("alloc first frame buffer");
@@ -298,13 +311,17 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
     for index in drained {
         pool.free_index(index);
     }
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
     assert_eq!(pool.in_use(), 0);
 }
 
 #[test]
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
-    let pool = BufferPool::with_capacity(8, 2);
-    let mut frame = BufferFrame::with_capacity(1);
+    let runtime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let index = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
         .expect("alloc frame buffer");
@@ -328,12 +345,16 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
     ));
 
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
 }
 
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(2);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"first")
         .expect("alloc first frame buffer");
@@ -358,12 +379,16 @@ fn buffer_frame_push_indices_batches_one_wake() {
     assert_eq!(frame.pending_indices(), &[first, second]);
 
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
 }
 
 #[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
-    let pool = BufferPool::with_capacity(8, 2);
-    let mut frame = BufferFrame::with_capacity(1);
+    let runtime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"first")
         .expect("alloc first frame buffer");
@@ -397,12 +422,16 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
     ));
 
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
 }
 
 #[test]
 fn buffer_frame_push_index_respects_preallocated_capacity() {
-    let pool = BufferPool::with_capacity(8, 4);
-    let mut frame = BufferFrame::with_capacity(1);
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 1, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"first")
         .expect("alloc first frame buffer");
@@ -416,6 +445,9 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
     assert_eq!(pool.in_use(), 2);
 
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
     pool.free_index(second);
 }
 
@@ -460,7 +492,7 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
     assert!(runtime.with_frame(frame_index, |_| ()).is_err());
     assert!(
         runtime
-            .with_frame(reused_frame_index, BufferFrame::is_empty)
+            .with_frame(reused_frame_index, |frame| frame.is_empty())
             .expect("read reused frame")
     );
 
