@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use hammer_adapter::{BufferFrame, BufferPool, RouteMetadata};
+use hammer_adapter::{BufferFrame, BufferPool, DataPlaneRuntime, RouteMetadata};
 
 #[derive(Default)]
 struct WakeCounter {
@@ -417,4 +417,54 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
 
     pool.free_frame(&mut frame);
     pool.free_index(second);
+}
+
+#[test]
+fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .expect("alloc first buffer");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .expect("alloc second buffer");
+
+    runtime
+        .with_frame_mut(frame_index, |frame| frame.push_indices([first, second]))
+        .expect("mutate frame")
+        .expect("push frame indices");
+
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(runtime.in_use_buffers(), 2);
+    assert!(runtime.alloc_frame_index().is_err());
+    assert_eq!(
+        runtime
+            .with_frame(frame_index, |frame| frame.indices().to_vec())
+            .expect("read frame"),
+        vec![first, second]
+    );
+
+    runtime
+        .free_frame_index(frame_index)
+        .expect("free pooled frame");
+
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert!(runtime.copy_packet(first).is_err());
+    assert!(runtime.copy_packet(second).is_err());
+
+    let reused_frame_index = runtime.alloc_frame_index().expect("reuse pooled frame");
+    assert_eq!(reused_frame_index.slot(), frame_index.slot());
+    assert_ne!(reused_frame_index.generation(), frame_index.generation());
+    assert!(runtime.with_frame(frame_index, |_| ()).is_err());
+    assert!(
+        runtime
+            .with_frame(reused_frame_index, BufferFrame::is_empty)
+            .expect("read reused frame")
+    );
+
+    runtime
+        .free_frame_index(reused_frame_index)
+        .expect("free reused frame");
 }

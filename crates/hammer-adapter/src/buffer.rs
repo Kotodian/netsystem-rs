@@ -11,12 +11,34 @@ use hammer_core::error::{CoreError, CoreResult};
 use crate::RouteMetadata;
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
+pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
     pool_id: u64,
     slot: u32,
     generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FrameIndex {
+    pool_id: u64,
+    slot: u32,
+    generation: u32,
+}
+
+impl FrameIndex {
+    pub fn pool_id(self) -> u64 {
+        self.pool_id
+    }
+
+    pub fn slot(self) -> u32 {
+        self.slot
+    }
+
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 impl BufferIndex {
@@ -169,21 +191,62 @@ pub struct BufferPool {
     inner: Rc<RefCell<BufferPoolInner>>,
 }
 
+#[derive(Debug)]
+struct FrameSlot {
+    generation: u32,
+    allocated: bool,
+    frame: BufferFrame,
+}
+
+#[derive(Debug)]
+struct FramePoolInner {
+    pool_id: u64,
+    slots: Vec<FrameSlot>,
+    free: Vec<u32>,
+    in_use: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FramePool {
+    inner: Rc<RefCell<FramePoolInner>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DataPlaneRuntime {
     buffers: BufferPool,
+    frames: FramePool,
 }
 
 static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FRAME_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_buffer_pool_id() -> u64 {
     NEXT_BUFFER_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+fn next_frame_pool_id() -> u64 {
+    NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 impl DataPlaneRuntime {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
+        Self::with_capacities(
+            slot_capacity,
+            slots,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+        )
+    }
+
+    pub fn with_capacities(
+        buffer_slot_capacity: usize,
+        buffer_slots: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+    ) -> Self {
         Self {
-            buffers: BufferPool::with_capacity(slot_capacity, slots),
+            buffers: BufferPool::with_capacity(buffer_slot_capacity, buffer_slots),
+            frames: FramePool::with_capacity(frame_capacity, frame_slots),
         }
     }
 
@@ -191,8 +254,16 @@ impl DataPlaneRuntime {
         &self.buffers
     }
 
+    pub fn frames(&self) -> &FramePool {
+        &self.frames
+    }
+
     pub fn in_use_buffers(&self) -> usize {
         self.buffers.in_use()
+    }
+
+    pub fn frames_in_use(&self) -> usize {
+        self.frames.in_use()
     }
 
     pub fn frame(&self) -> BufferFrame {
@@ -221,6 +292,30 @@ impl DataPlaneRuntime {
 
     pub fn free_frame(&self, frame: &mut BufferFrame) {
         self.buffers.free_frame(frame);
+    }
+
+    pub fn alloc_frame_index(&self) -> CoreResult<FrameIndex> {
+        self.frames.alloc_index()
+    }
+
+    pub fn with_frame<R>(
+        &self,
+        index: FrameIndex,
+        f: impl FnOnce(&BufferFrame) -> R,
+    ) -> CoreResult<R> {
+        self.frames.with_frame(index, f)
+    }
+
+    pub fn with_frame_mut<R>(
+        &self,
+        index: FrameIndex,
+        f: impl FnOnce(&mut BufferFrame) -> R,
+    ) -> CoreResult<R> {
+        self.frames.with_frame_mut(index, f)
+    }
+
+    pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
+        self.frames.free_index(&self.buffers, index)
     }
 
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
@@ -417,6 +512,142 @@ impl BufferPool {
     }
 }
 
+impl FramePool {
+    pub fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
+        let free = (0..slots)
+            .rev()
+            .map(|slot| u32::try_from(slot).expect("frame slot index fits u32"))
+            .collect();
+        let slots = (0..slots)
+            .map(|_| FrameSlot {
+                generation: 0,
+                allocated: false,
+                frame: BufferFrame::with_capacity(frame_capacity),
+            })
+            .collect();
+        Self {
+            inner: Rc::new(RefCell::new(FramePoolInner {
+                pool_id: next_frame_pool_id(),
+                slots,
+                free,
+                in_use: 0,
+            })),
+        }
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.inner.borrow().in_use
+    }
+
+    pub fn alloc_index(&self) -> CoreResult<FrameIndex> {
+        self.inner.borrow_mut().alloc_index()
+    }
+
+    pub fn with_frame<R>(
+        &self,
+        index: FrameIndex,
+        f: impl FnOnce(&BufferFrame) -> R,
+    ) -> CoreResult<R> {
+        let pool = self.inner.borrow();
+        let frame = pool.frame(index)?;
+        Ok(f(frame))
+    }
+
+    pub fn with_frame_mut<R>(
+        &self,
+        index: FrameIndex,
+        f: impl FnOnce(&mut BufferFrame) -> R,
+    ) -> CoreResult<R> {
+        let mut pool = self.inner.borrow_mut();
+        let frame = pool.frame_mut(index)?;
+        Ok(f(frame))
+    }
+
+    pub fn free_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
+        let mut pool = self.inner.borrow_mut();
+        let frame = pool.frame_mut(index)?;
+        buffers.free_frame(frame);
+        frame.reset_for_pool_reuse();
+        pool.release_index(index)
+    }
+}
+
+impl FramePoolInner {
+    fn alloc_index(&mut self) -> CoreResult<FrameIndex> {
+        let slot = self
+            .free
+            .pop()
+            .ok_or_else(|| CoreError::internal("frame pool exhausted"))?;
+        let entry = self
+            .slots
+            .get_mut(slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        entry.generation = entry.generation.wrapping_add(1).max(1);
+        entry.allocated = true;
+        entry.frame.reset_for_pool_reuse();
+        self.in_use += 1;
+        Ok(FrameIndex {
+            pool_id: self.pool_id,
+            slot,
+            generation: entry.generation,
+        })
+    }
+
+    fn validate_index(&self, index: FrameIndex) -> CoreResult<()> {
+        if index.pool_id != self.pool_id {
+            return Err(CoreError::internal("frame index belongs to another pool"));
+        }
+        Ok(())
+    }
+
+    fn frame(&self, index: FrameIndex) -> CoreResult<&BufferFrame> {
+        self.validate_index(index)?;
+        let entry = self
+            .slots
+            .get(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        Ok(&entry.frame)
+    }
+
+    fn frame_mut(&mut self, index: FrameIndex) -> CoreResult<&mut BufferFrame> {
+        self.validate_index(index)?;
+        let entry = self
+            .slots
+            .get_mut(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        Ok(&mut entry.frame)
+    }
+
+    fn release_index(&mut self, index: FrameIndex) -> CoreResult<()> {
+        let entry = self
+            .slots
+            .get_mut(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        entry.allocated = false;
+        self.in_use = self.in_use.saturating_sub(1);
+        self.free.push(index.slot);
+        Ok(())
+    }
+}
+
 impl BufferPoolInner {
     fn alloc_chain(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
         if self.slot_capacity == 0 {
@@ -610,6 +841,11 @@ impl FrameReadiness {
         self.pending.set(false);
     }
 
+    fn reset_for_pool_reuse(&self) {
+        self.pending.set(false);
+        self.waker.borrow_mut().take();
+    }
+
     fn poll_pending(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.pending.get() {
             return Poll::Ready(());
@@ -699,6 +935,11 @@ impl BufferFrame {
     pub fn reset(&mut self) {
         self.indices.clear();
         self.readiness.clear_pending();
+    }
+
+    fn reset_for_pool_reuse(&mut self) {
+        self.indices.clear();
+        self.readiness.reset_for_pool_reuse();
     }
 
     pub fn clear(&mut self) {
