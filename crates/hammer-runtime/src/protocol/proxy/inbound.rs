@@ -1232,6 +1232,7 @@ async fn route_tcp(
         domain_strategy: None,
         udp_disable_domain_unmapping: false,
         override_destination: false,
+        route_decision: None,
     };
     router.prepare_route_metadata(&mut metadata)?;
     match router.match_route(&mut metadata)? {
@@ -1277,6 +1278,7 @@ fn udp_route_metadata(
         domain_strategy: None,
         udp_disable_domain_unmapping: false,
         override_destination: false,
+        route_decision: None,
     }
 }
 

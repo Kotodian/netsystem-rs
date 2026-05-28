@@ -18,6 +18,7 @@ pub struct RouteMetadata {
     pub domain_strategy: Option<DomainStrategy>,
     pub udp_disable_domain_unmapping: bool,
     pub override_destination: bool,
+    pub route_decision: Option<RouteDecision>,
 }
 
 /// Where a `RouteDecision::Route` points. Outbounds and endpoints live in

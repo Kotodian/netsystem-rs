@@ -39,7 +39,7 @@ pub use endpoint::{Endpoint, EndpointComponent, EndpointLocalFlow, EndpointManag
 pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
-pub use node::{NextFrame, Node, NodeId, NodeResult, NodeRuntime, NodeRuntimeReady};
+pub use node::{NextFrame, Node, NodeId, NodeResult, NodeRuntime, NodeRuntimeReady, RouterNode};
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,
     ProxyStream,

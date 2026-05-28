@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::Future;
+use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -8,6 +9,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
+use crate::router::Router;
 
 pub const MAX_NODE_NEXT_FRAMES: usize = 4;
 
@@ -26,6 +28,39 @@ pub trait Node {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult>;
+}
+
+pub struct RouterNode<R> {
+    router: R,
+    next: NodeId,
+}
+
+impl<R> RouterNode<R> {
+    pub fn new(router: R, next: NodeId) -> Self {
+        Self { router, next }
+    }
+}
+
+impl<R, T> Node for RouterNode<R>
+where
+    R: Deref<Target = T>,
+    T: Router + ?Sized,
+{
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.pending_indices().iter().copied() {
+            runtime.with_metadata_mut(index, |metadata| {
+                self.router.prepare_route_metadata(metadata)?;
+                let decision = self.router.match_route(metadata)?;
+                metadata.route_decision = Some(decision);
+                Ok(())
+            })??;
+        }
+        Ok(NodeResult::next_current(self.next))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
