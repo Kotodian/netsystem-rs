@@ -2147,26 +2147,51 @@ where
                 let mut packet = outbound.listen_packet().await?;
                 let mut metadata = tun_packet.metadata.clone();
                 metadata.destination = Some(destination);
-                let mut request = runtime.frame_with_capacity(1);
+                let mut request = runtime.alloc_pooled_frame()?;
                 let buffer = runtime.alloc_index_with_bytes(metadata, &tun_packet.payload)?;
                 if let Err(err) = request.push_index(buffer) {
                     runtime.free_index(buffer);
+                    let _ = runtime.release_pooled_frame(request);
                     return Err(err);
                 }
-                packet.send(&runtime, &mut request).await?;
-                let mut response = runtime.frame_with_capacity(1);
-                timeout(
+                let send_result = packet.send(&runtime, &mut request).await;
+                let release_result = runtime.release_pooled_frame(request);
+                if let Err(err) = send_result {
+                    let _ = release_result;
+                    return Err(err);
+                }
+                release_result?;
+                let mut response = runtime.alloc_pooled_frame()?;
+                match timeout(
                     Duration::from_secs(2),
                     packet.recv(&runtime, &mut response, 1),
                 )
                 .await
-                .map_err(|_| HammerError::internal("TUN routed UDP response timed out"))??;
-                let response = response
-                    .drain_indices()
-                    .next()
-                    .ok_or_else(|| HammerError::internal("TUN routed UDP response empty frame"))?;
-                let payload = runtime.copy_current_chain(response)?;
-                runtime.free_index(response);
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        let _ = runtime.release_pooled_frame(response);
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        let _ = runtime.release_pooled_frame(response);
+                        return Err(HammerError::internal("TUN routed UDP response timed out"));
+                    }
+                }
+                let Some(response_index) = response.drain_indices().next() else {
+                    runtime.release_pooled_frame(response)?;
+                    return Err(HammerError::internal("TUN routed UDP response empty frame"));
+                };
+                let payload = match runtime.copy_current_chain(response_index) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        runtime.free_index(response_index);
+                        let _ = runtime.release_pooled_frame(response);
+                        return Err(err);
+                    }
+                };
+                runtime.free_index(response_index);
+                runtime.release_pooled_frame(response)?;
                 Ok(TunDispatch::RoutedResponse {
                     metadata: tun_packet.metadata,
                     payload: Bytes::from(payload),

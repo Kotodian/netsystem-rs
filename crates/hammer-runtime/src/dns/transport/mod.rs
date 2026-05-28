@@ -204,18 +204,30 @@ async fn udp_exchange_via_with_timeout(
     let mut metadata = hammer_adapter::RouteMetadata::default();
     metadata.destination = Some(destination.clone());
     let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
-    let mut request = runtime.frame_with_capacity(1);
+    let mut request = runtime.alloc_pooled_frame()?;
     let request_index = runtime.alloc_index_with_bytes(metadata, payload)?;
     if let Err(err) = request.push_index(request_index) {
         runtime.free_index(request_index);
+        let _ = runtime.release_pooled_frame(request);
         return Err(err);
     }
-    conn.send(&runtime, &mut request).await?;
+    let send_result = conn.send(&runtime, &mut request).await;
+    let release_result = runtime.release_pooled_frame(request);
+    if let Err(err) = send_result {
+        let _ = release_result;
+        return Err(err);
+    }
+    release_result?;
     debug!("dns udp via outbound={via} sent dest={destination}");
-    let mut response = runtime.frame_with_capacity(1);
+    let mut response = runtime.alloc_pooled_frame()?;
     match timeout(response_timeout, conn.recv(&runtime, &mut response, 1)).await {
-        Ok(response) => response?,
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let _ = runtime.release_pooled_frame(response);
+            return Err(err);
+        }
         Err(_) => {
+            let _ = runtime.release_pooled_frame(response);
             debug!(
                 "dns udp via timeout outbound={via} dest={destination} elapsed={response_timeout:?}"
             );
@@ -225,13 +237,28 @@ async fn udp_exchange_via_with_timeout(
             )));
         }
     };
-    let index = response
-        .drain_indices()
-        .next()
-        .ok_or_else(|| HammerError::internal("dns udp via returned empty frame"))?;
-    let metadata = runtime.metadata(index)?;
-    let payload = Bytes::from(runtime.copy_current_chain(index)?);
+    let Some(index) = response.drain_indices().next() else {
+        runtime.release_pooled_frame(response)?;
+        return Err(HammerError::internal("dns udp via returned empty frame"));
+    };
+    let metadata = match runtime.metadata(index) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            runtime.free_index(index);
+            let _ = runtime.release_pooled_frame(response);
+            return Err(err);
+        }
+    };
+    let payload = match runtime.copy_current_chain(index) {
+        Ok(payload) => Bytes::from(payload),
+        Err(err) => {
+            runtime.free_index(index);
+            let _ = runtime.release_pooled_frame(response);
+            return Err(err);
+        }
+    };
     runtime.free_index(index);
+    runtime.release_pooled_frame(response)?;
     debug!(
         "dns udp via outbound={via} received from {} bytes={}",
         metadata

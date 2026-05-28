@@ -7,8 +7,8 @@ use std::time::Duration;
 use base64::Engine;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Inbound, Network,
-    OutboundManager as OutboundManagerTrait, ProxyPacketConn, ProxyStream, RouteDecision,
-    RouteMetadata, RouteTarget, SocksAddr,
+    OutboundManager as OutboundManagerTrait, PooledBufferFrame, ProxyPacketConn, ProxyStream,
+    RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
 };
 use hammer_core::config::{
     HttpInboundOptions, InboundKind, InboundUser, ListenInboundOptions, MixedInboundOptions,
@@ -19,7 +19,7 @@ use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
 use hammer_core::metrics::MetricsRegistry;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -910,45 +910,14 @@ async fn handle_socks5_udp_associate(
                 }
             }
             result = response_rx.recv() => {
-                let Some(mut response) = result else {
+                let Some(response) = result else {
                     break;
                 };
                 if let Some(client) = client_addr {
-                    let mut handled = false;
-                    for buffer in response.frame.drain_indices() {
-                        if handled {
-                            runtime.free_index(buffer);
-                            continue;
-                        }
-                        handled = true;
-                        let metadata = match runtime.metadata(buffer) {
-                            Ok(metadata) => metadata,
-                            Err(err) => {
-                                runtime.free_index(buffer);
-                                return Err(err);
-                            }
-                        };
-                        let Some(destination) = metadata.destination.as_ref() else {
-                            runtime.free_index(buffer);
-                            continue;
-                        };
-                        let payload = match runtime.copy_current_chain(buffer) {
-                            Ok(payload) => payload,
-                            Err(err) => {
-                                runtime.free_index(buffer);
-                                return Err(err);
-                            }
-                        };
-                        runtime.free_index(buffer);
-                        let response = encode_socks5_udp(destination, &payload)?;
-                        socket
-                            .send_to(&response, client)
-                            .await
-                            .map_err(|err| HammerError::internal(format!("send SOCKS5 UDP response: {err}")))?;
-                    }
-                }
-                if response.recycle.try_send(response.frame).is_err() {
-                    debug!("SOCKS5 UDP response frame recycle channel closed for {inbound_id}");
+                    handle_udp_relay_response(&runtime, &socket, client, response.frame, &inbound_id)
+                        .await?;
+                } else {
+                    runtime.release_pooled_frame(response.frame)?;
                 }
             }
             _ = tokio::time::sleep(timeout) => break,
@@ -969,8 +938,62 @@ struct UdpRelaySend {
 }
 
 struct UdpRelayResponse {
-    frame: BufferFrame,
-    recycle: mpsc::Sender<BufferFrame>,
+    frame: PooledBufferFrame,
+}
+
+async fn handle_udp_relay_response(
+    runtime: &DataPlaneRuntime,
+    socket: &UdpSocket,
+    client: SocketAddr,
+    mut frame: PooledBufferFrame,
+    inbound_id: &str,
+) -> HammerResult<()> {
+    let result = async {
+        let mut handled = false;
+        for buffer in frame.drain_indices() {
+            if handled {
+                runtime.free_index(buffer);
+                continue;
+            }
+            handled = true;
+            let metadata = match runtime.metadata(buffer) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+            };
+            let Some(destination) = metadata.destination.as_ref() else {
+                runtime.free_index(buffer);
+                continue;
+            };
+            let payload = match runtime.copy_current_chain(buffer) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    runtime.free_index(buffer);
+                    return Err(err);
+                }
+            };
+            runtime.free_index(buffer);
+            let response = encode_socks5_udp(destination, &payload)?;
+            socket
+                .send_to(&response, client)
+                .await
+                .map_err(|err| HammerError::internal(format!("send SOCKS5 UDP response: {err}")))?;
+        }
+        Ok(())
+    }
+    .await;
+    let release_result = runtime.release_pooled_frame(frame);
+    match result {
+        Ok(()) => release_result,
+        Err(err) => {
+            if let Err(release_err) = release_result {
+                debug!("release SOCKS5 UDP response frame for {inbound_id}: {release_err}");
+            }
+            Err(err)
+        }
+    }
 }
 
 async fn udp_relay_sender(
@@ -1000,14 +1023,21 @@ fn spawn_udp_relay(
 ) {
     crate::spawn::spawn_current_local(async move {
         let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
-        let mut outbound_frame = runtime.frame_with_capacity(1);
-        let mut inbound_frame = runtime.frame_with_capacity(1);
-        let (recycle_tx, mut recycle_rx) = mpsc::channel(UDP_RELAY_CHANNEL_CAPACITY);
-        for _ in 0..UDP_RELAY_CHANNEL_CAPACITY {
-            if recycle_tx.try_send(runtime.frame_with_capacity(1)).is_err() {
-                break;
+        let mut outbound_frame = match runtime.alloc_pooled_frame() {
+            Ok(frame) => frame,
+            Err(err) => {
+                debug!("allocate SOCKS5 UDP outbound frame via outbound={outbound_id}: {err}");
+                return;
             }
-        }
+        };
+        let mut inbound_frame = match runtime.alloc_pooled_frame() {
+            Ok(frame) => frame,
+            Err(err) => {
+                debug!("allocate SOCKS5 UDP inbound frame via outbound={outbound_id}: {err}");
+                let _ = runtime.release_pooled_frame(outbound_frame);
+                return;
+            }
+        };
         let mut can_recv = false;
         loop {
             if !can_recv {
@@ -1047,32 +1077,24 @@ fn spawn_udp_relay(
                             if inbound_frame.is_empty() {
                                 continue;
                             }
-                            let mut response_frame = match recycle_rx.try_recv() {
+                            let mut response_frame = match runtime.alloc_pooled_frame() {
                                 Ok(frame) => frame,
-                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                                Err(err) => {
                                     runtime.free_frame(&mut inbound_frame);
-                                    debug!("SOCKS5 UDP response dropped via outbound={outbound_id}: no reusable frame available");
+                                    debug!("SOCKS5 UDP response dropped via outbound={outbound_id}: no pooled frame available: {err}");
                                     continue;
-                                }
-                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                    runtime.free_frame(&mut inbound_frame);
-                                    debug!("SOCKS5 UDP response frame pool closed via outbound={outbound_id}");
-                                    break;
                                 }
                             };
                             std::mem::swap(&mut response_frame, &mut inbound_frame);
                             if let Err(err) = response_tx.try_send(UdpRelayResponse {
                                 frame: response_frame,
-                                recycle: recycle_tx.clone(),
                             }) {
-                                let mut response = err.into_inner();
-                                runtime.free_frame(&mut response.frame);
-                                let recycle = response.recycle;
-                                let frame = response.frame;
-                                if recycle.try_send(frame).is_err() {
-                                    debug!("SOCKS5 UDP response frame recycle channel closed via outbound={outbound_id}");
-                                }
+                                let response = err.into_inner();
+                                let release_result = runtime.release_pooled_frame(response.frame);
                                 debug!("SOCKS5 UDP response dropped via outbound={outbound_id}: relay channel full or closed");
+                                if let Err(err) = release_result {
+                                    debug!("release dropped SOCKS5 UDP response frame via outbound={outbound_id}: {err}");
+                                }
                             }
                         }
                         Err(err) => {
@@ -1082,6 +1104,12 @@ fn spawn_udp_relay(
                     }
                 }
             }
+        }
+        if let Err(err) = runtime.release_pooled_frame(outbound_frame) {
+            debug!("release SOCKS5 UDP outbound frame via outbound={outbound_id}: {err}");
+        }
+        if let Err(err) = runtime.release_pooled_frame(inbound_frame) {
+            debug!("release SOCKS5 UDP inbound frame via outbound={outbound_id}: {err}");
         }
     });
 }
