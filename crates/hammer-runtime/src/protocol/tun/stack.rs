@@ -4513,8 +4513,25 @@ async fn system_udp_flow_loop(
         }
     };
     let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
-    let mut outbound_frame = runtime.frame_with_capacity(1);
-    let mut inbound_frame = runtime.frame_with_capacity(1);
+    let mut outbound_frame = match runtime.alloc_pooled_frame() {
+        Ok(frame) => frame,
+        Err(err) => {
+            metrics.counters.udp_listen_error_total.increment(1);
+            debug!("allocate system UDP outbound frame: {err}");
+            udp_flows.borrow_mut().remove(&key);
+            return;
+        }
+    };
+    let mut inbound_frame = match runtime.alloc_pooled_frame() {
+        Ok(frame) => frame,
+        Err(err) => {
+            metrics.counters.udp_listen_error_total.increment(1);
+            debug!("allocate system UDP inbound frame: {err}");
+            let _ = runtime.release_pooled_frame(outbound_frame);
+            udp_flows.borrow_mut().remove(&key);
+            return;
+        }
+    };
     let idle_timer = time::sleep(udp_timeout);
     tokio::pin!(idle_timer);
     loop {
@@ -4592,6 +4609,12 @@ async fn system_udp_flow_loop(
                 break;
             }
         }
+    }
+    if let Err(err) = runtime.release_pooled_frame(outbound_frame) {
+        debug!("release system UDP outbound frame: {err}");
+    }
+    if let Err(err) = runtime.release_pooled_frame(inbound_frame) {
+        debug!("release system UDP inbound frame: {err}");
     }
     udp_flows.borrow_mut().remove(&key);
 }

@@ -468,3 +468,35 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
         .free_frame_index(reused_frame_index)
         .expect("free reused frame");
 }
+
+#[test]
+fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
+    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let frame_index = frame.index();
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"pkt")
+        .expect("alloc packet buffer");
+
+    frame.push_index(buffer).expect("push packet buffer");
+
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert!(runtime.alloc_pooled_frame().is_err());
+    assert_eq!(frame.indices(), &[buffer]);
+
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
+
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert!(runtime.copy_packet(buffer).is_err());
+
+    let reused_frame = runtime.alloc_pooled_frame().expect("reuse pooled frame");
+    assert_eq!(reused_frame.index().slot(), frame_index.slot());
+    assert_ne!(reused_frame.index().generation(), frame_index.generation());
+    assert!(reused_frame.is_empty());
+    runtime
+        .release_pooled_frame(reused_frame)
+        .expect("release reused pooled frame");
+}

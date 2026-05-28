@@ -1,6 +1,7 @@
 use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 use std::future::Future;
+use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,7 +196,7 @@ pub struct BufferPool {
 struct FrameSlot {
     generation: u32,
     allocated: bool,
-    frame: BufferFrame,
+    frame: Option<BufferFrame>,
 }
 
 #[derive(Debug)]
@@ -209,6 +210,12 @@ struct FramePoolInner {
 #[derive(Debug, Clone)]
 pub struct FramePool {
     inner: Rc<RefCell<FramePoolInner>>,
+}
+
+#[derive(Debug)]
+pub struct PooledBufferFrame {
+    index: FrameIndex,
+    frame: BufferFrame,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +323,22 @@ impl DataPlaneRuntime {
 
     pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
         self.frames.free_index(&self.buffers, index)
+    }
+
+    pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
+        let index = self.frames.alloc_index()?;
+        match self.frames.take_index(index) {
+            Ok(frame) => Ok(PooledBufferFrame { index, frame }),
+            Err(err) => {
+                let _ = self.frames.free_index(&self.buffers, index);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
+        let PooledBufferFrame { index, frame } = frame;
+        self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
@@ -522,7 +545,7 @@ impl FramePool {
             .map(|_| FrameSlot {
                 generation: 0,
                 allocated: false,
-                frame: BufferFrame::with_capacity(frame_capacity),
+                frame: Some(BufferFrame::with_capacity(frame_capacity)),
             })
             .collect();
         Self {
@@ -570,6 +593,23 @@ impl FramePool {
         frame.reset_for_pool_reuse();
         pool.release_index(index)
     }
+
+    pub fn take_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
+        self.inner.borrow_mut().take_frame(index)
+    }
+
+    pub fn free_taken_index(
+        &self,
+        buffers: &BufferPool,
+        index: FrameIndex,
+        mut frame: BufferFrame,
+    ) -> CoreResult<()> {
+        buffers.free_frame(&mut frame);
+        frame.reset_for_pool_reuse();
+        self.inner
+            .borrow_mut()
+            .return_frame_and_release(index, frame)
+    }
 }
 
 impl FramePoolInner {
@@ -584,7 +624,11 @@ impl FramePoolInner {
             .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
         entry.generation = entry.generation.wrapping_add(1).max(1);
         entry.allocated = true;
-        entry.frame.reset_for_pool_reuse();
+        let frame = entry
+            .frame
+            .as_mut()
+            .ok_or_else(|| CoreError::internal("frame slot is checked out"))?;
+        frame.reset_for_pool_reuse();
         self.in_use += 1;
         Ok(FrameIndex {
             pool_id: self.pool_id,
@@ -612,7 +656,10 @@ impl FramePoolInner {
         if !entry.allocated {
             return Err(CoreError::internal("frame slot is free"));
         }
-        Ok(&entry.frame)
+        entry
+            .frame
+            .as_ref()
+            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
     fn frame_mut(&mut self, index: FrameIndex) -> CoreResult<&mut BufferFrame> {
@@ -627,7 +674,28 @@ impl FramePoolInner {
         if !entry.allocated {
             return Err(CoreError::internal("frame slot is free"));
         }
-        Ok(&mut entry.frame)
+        entry
+            .frame
+            .as_mut()
+            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
+    }
+
+    fn take_frame(&mut self, index: FrameIndex) -> CoreResult<BufferFrame> {
+        self.validate_index(index)?;
+        let entry = self
+            .slots
+            .get_mut(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        entry
+            .frame
+            .take()
+            .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
     fn release_index(&mut self, index: FrameIndex) -> CoreResult<()> {
@@ -641,10 +709,59 @@ impl FramePoolInner {
         if !entry.allocated {
             return Err(CoreError::internal("frame slot is free"));
         }
+        if entry.frame.is_none() {
+            return Err(CoreError::internal("frame slot is checked out"));
+        }
         entry.allocated = false;
         self.in_use = self.in_use.saturating_sub(1);
         self.free.push(index.slot);
         Ok(())
+    }
+
+    fn return_frame_and_release(
+        &mut self,
+        index: FrameIndex,
+        frame: BufferFrame,
+    ) -> CoreResult<()> {
+        self.validate_index(index)?;
+        let entry = self
+            .slots
+            .get_mut(index.slot as usize)
+            .ok_or_else(|| CoreError::internal("frame slot out of bounds"))?;
+        if entry.generation != index.generation {
+            return Err(CoreError::internal("stale frame index"));
+        }
+        if !entry.allocated {
+            return Err(CoreError::internal("frame slot is free"));
+        }
+        if entry.frame.is_some() {
+            return Err(CoreError::internal("frame slot already has a frame"));
+        }
+        entry.frame = Some(frame);
+        entry.allocated = false;
+        self.in_use = self.in_use.saturating_sub(1);
+        self.free.push(index.slot);
+        Ok(())
+    }
+}
+
+impl PooledBufferFrame {
+    pub fn index(&self) -> FrameIndex {
+        self.index
+    }
+}
+
+impl Deref for PooledBufferFrame {
+    type Target = BufferFrame;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl DerefMut for PooledBufferFrame {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frame
     }
 }
 
