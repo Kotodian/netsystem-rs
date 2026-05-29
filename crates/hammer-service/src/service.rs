@@ -16,7 +16,12 @@ impl RuntimeService {
         platform: Arc<dyn PlatformInterface>,
         writer: Arc<dyn LogWriter>,
     ) -> HammerResult<Arc<Self>> {
-        let inner = hammer_runtime::RuntimeService::new(config_content, platform, writer)?;
+        let inner = hammer_runtime::RuntimeService::new_with_event_subscribers(
+            config_content,
+            platform,
+            writer,
+            crate::event_subscribers::build_standard_event_subscribers,
+        )?;
         Ok(Arc::new(Self { inner }))
     }
 

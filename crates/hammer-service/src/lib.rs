@@ -1,3 +1,4 @@
+mod event_subscribers;
 mod service;
 
 pub mod adapter {

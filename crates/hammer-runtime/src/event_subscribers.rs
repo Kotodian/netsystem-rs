@@ -1,21 +1,24 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
 
-#[cfg(any(feature = "endpoint-wireguard", feature = "outbound-hysteria2"))]
+#[cfg(test)]
 use crate::component_registry::register_components;
 use crate::{ControlEventSubscriptionHandle, ControlThreadHandle};
 
 pub type EventSubscriberBuilder =
     fn(Logger, Arc<ControlThreadHandle>) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
 
+#[cfg(test)]
 #[derive(Clone)]
 struct EventSubscriberFactorySet {
     builders: Arc<HashMap<&'static str, EventSubscriberBuilder>>,
 }
 
+#[cfg(test)]
 impl EventSubscriberFactorySet {
     fn standard() -> Self {
         let mut builders = HashMap::new();
@@ -38,6 +41,7 @@ impl EventSubscriberFactorySet {
     }
 }
 
+#[cfg(test)]
 fn register_standard_event_subscriber_builders(
     _builders: &mut HashMap<&'static str, EventSubscriberBuilder>,
 ) {
@@ -58,6 +62,7 @@ fn register_standard_event_subscriber_builders(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn build_standard_event_subscribers(
     logger: Logger,
     control_handle: Arc<ControlThreadHandle>,

@@ -16,6 +16,7 @@ use crate::EndpointManager;
 use crate::ProbeManager;
 use crate::control_thread::ControlEventSubscriptionHandle;
 use crate::data_plane::RuntimeDataPlaneGraph;
+use crate::event_subscribers::EventSubscriberBuilder;
 #[cfg(feature = "endpoint")]
 use crate::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
@@ -153,6 +154,15 @@ impl RuntimeService {
         platform: Arc<dyn PlatformInterface>,
         writer: Arc<dyn LogWriter>,
     ) -> HammerResult<Arc<Self>> {
+        Self::new_with_event_subscribers(config_content, platform, writer, no_event_subscribers)
+    }
+
+    pub fn new_with_event_subscribers(
+        config_content: &str,
+        platform: Arc<dyn PlatformInterface>,
+        writer: Arc<dyn LogWriter>,
+        build_event_subscribers: EventSubscriberBuilder,
+    ) -> HammerResult<Arc<Self>> {
         crate::install_default_crypto_provider();
 
         let options = config::parse_config(config_content)?;
@@ -193,7 +203,7 @@ impl RuntimeService {
         };
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
-        let event_subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+        let event_subscriptions = build_event_subscribers(
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
         )?;
@@ -644,6 +654,13 @@ impl RuntimeService {
             .control_handle
             .clone()
     }
+}
+
+fn no_event_subscribers(
+    _logger: Logger,
+    _control_handle: Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>> {
+    Ok(Vec::new())
 }
 
 fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
