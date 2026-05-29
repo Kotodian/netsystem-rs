@@ -2,9 +2,9 @@
 //!
 //! `ProbeProtocol` is the plug-in seam: implementations measure
 //! round-trip time to an `Outbound`'s own probe endpoint using
-//! whichever transport surface fits. The `ProbeManager` (in the
-//! runtime crate) is the orchestrator that fans probes out across
-//! every registered outbound.
+//! whichever transport surface fits. The service crate's `ProbeManager`
+//! is the orchestrator that fans probes out across every registered
+//! outbound.
 //!
 //! V1 ships an ICMP echo probe for server-backed outbounds. Future
 //! HTTP / QUIC probes drop in by adding a new `impl ProbeProtocol`.

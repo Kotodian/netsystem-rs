@@ -23,14 +23,25 @@ use hammer_runtime::adapter::{
 
 type ProbeProtocolBuilder = fn() -> ProbeProtocolComponent;
 
-/// Stateless orchestrator that runs a probe against one or every
-/// registered outbound. Service code triggers it from the control thread,
-/// then schedules it onto the data runtime before probe packet I/O starts.
+/// Stateless orchestrator that prepares probe work from control-plane
+/// state. Service code triggers it on the control thread, then moves the
+/// returned batch onto the data runtime before probe packet I/O starts.
 pub struct ProbeManager {
     outbound: Arc<OutboundManager>,
 }
 
 pub struct ProbeProtocolRegistration(ProbeProtocolComponent);
+
+pub struct ProbeBatch {
+    protocol: String,
+    targets: Vec<ProbeTarget>,
+}
+
+struct ProbeTarget {
+    outbound_id: String,
+    outbound: OutboundComponent,
+    probe: ProbeProtocolComponent,
+}
 
 impl From<ProbeProtocolComponent> for ProbeProtocolRegistration {
     fn from(probe: ProbeProtocolComponent) -> Self {
@@ -54,6 +65,42 @@ impl ProbeManager {
         Self { outbound }
     }
 
+    pub fn prepare(
+        &self,
+        outbound_id: &str,
+        probe: impl Into<ProbeProtocolRegistration>,
+    ) -> HammerResult<ProbeBatch> {
+        let probe = probe.into().0;
+        let outbound = self
+            .outbound
+            .get(outbound_id)
+            .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
+        let protocol = probe.meta().type_name().to_owned();
+        Ok(ProbeBatch {
+            protocol,
+            targets: vec![ProbeTarget {
+                outbound_id: outbound_id.to_owned(),
+                outbound,
+                probe,
+            }],
+        })
+    }
+
+    pub fn prepare_all(&self, probe: impl Into<ProbeProtocolRegistration>) -> ProbeBatch {
+        let probe = probe.into().0;
+        let outbounds = self.outbound.list();
+        let protocol = probe.meta().type_name().to_owned();
+        let targets = outbounds
+            .into_iter()
+            .map(|outbound| ProbeTarget {
+                outbound_id: outbound.meta().id().to_owned(),
+                outbound,
+                probe: probe.clone(),
+            })
+            .collect();
+        ProbeBatch { protocol, targets }
+    }
+
     /// Run `probe` once against `outbound_id`. Returns `Err` only when
     /// the outbound id is unknown; transport-level probe failures are
     /// surfaced inside the returned [`ProbeReport`]'s `result`.
@@ -63,18 +110,11 @@ impl ProbeManager {
         probe: impl Into<ProbeProtocolRegistration>,
         timeout: Duration,
     ) -> HammerResult<ProbeReport> {
-        let probe = probe.into().0;
-        let outbound = self
-            .outbound
-            .get(outbound_id)
-            .ok_or_else(|| HammerError::internal(format!("outbound not found: {outbound_id}")))?;
-        let protocol = probe.meta().type_name().to_owned();
-        let result = probe.runtime().measure(&outbound, timeout).await;
-        Ok(ProbeReport {
-            outbound_id: outbound_id.to_owned(),
-            protocol,
-            result,
-        })
+        let batch = self.prepare(outbound_id, probe)?;
+        let mut reports = batch.run(timeout).await;
+        reports
+            .pop()
+            .ok_or_else(|| HammerError::internal("probe batch returned no reports"))
     }
 
     /// Run `probe` concurrently against every registered outbound.
@@ -85,33 +125,45 @@ impl ProbeManager {
         probe: impl Into<ProbeProtocolRegistration>,
         timeout: Duration,
     ) -> Vec<ProbeReport> {
-        let probe = probe.into().0;
-        let outbounds = self.outbound.list();
-        if outbounds.is_empty() {
+        self.prepare_all(probe).run(timeout).await
+    }
+}
+
+impl ProbeBatch {
+    pub async fn run(self, timeout: Duration) -> Vec<ProbeReport> {
+        if self.targets.is_empty() {
             return Vec::new();
         }
-        let protocol = probe.meta().type_name().to_owned();
-        let mut handles = Vec::with_capacity(outbounds.len());
-        for outbound in outbounds {
-            let probe = probe.clone();
-            let outbound_id = outbound.meta().id().to_owned();
-            let protocol = protocol.clone();
-            handles.push(hammer_runtime::spawn::spawn(async move {
-                let result = probe.runtime().measure(&outbound, timeout).await;
-                ProbeReport {
-                    outbound_id,
-                    protocol,
-                    result,
-                }
-            }));
+
+        let mut handles = Vec::with_capacity(self.targets.len());
+        for target in self.targets {
+            let protocol = self.protocol.clone();
+            let ProbeTarget {
+                outbound_id,
+                outbound,
+                probe,
+            } = target;
+            handles.push((
+                outbound_id.clone(),
+                protocol.clone(),
+                hammer_runtime::spawn::spawn(async move {
+                    let result = probe.runtime().measure(&outbound, timeout).await;
+                    ProbeReport {
+                        outbound_id,
+                        protocol,
+                        result,
+                    }
+                }),
+            ));
         }
+
         let mut reports = Vec::with_capacity(handles.len());
-        for handle in handles {
+        for (outbound_id, protocol, handle) in handles {
             match handle.await {
                 Ok(report) => reports.push(report),
                 Err(err) => reports.push(ProbeReport {
-                    outbound_id: String::new(),
-                    protocol: protocol.clone(),
+                    outbound_id,
+                    protocol,
                     result: Err(HammerError::internal(format!("probe task panicked: {err}"))),
                 }),
             }
@@ -349,6 +401,39 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].outbound_id, "data-thread-probe");
         assert_eq!(outbound.threads(), vec!["probe-data-0".to_owned()]);
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn prepared_probe_batch_runs_outbound_probe_on_data_worker() {
+        let outbound = Arc::new(DataThreadProbeOutbound::default());
+        let manager = Arc::new(OutboundManager::new(
+            test_logger("outbound"),
+            "data-thread-probe",
+        ));
+        manager
+            .register_outbound(Arc::clone(&outbound))
+            .expect("register outbound");
+        let probe_manager = ProbeManager::new(manager);
+        let batch = probe_manager.prepare_all(Arc::new(IcmpOutboundProbe::new()));
+        let data_runtime =
+            hammer_runtime::spawn::DataRuntime::new(1, "probe-batch-data", 512 * 1024, 2)
+                .expect("data runtime");
+        let data = data_runtime.executor();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let reports = driver.block_on(async {
+            data.execute(async move { batch.run(Duration::from_millis(250)).await })
+                .await
+                .expect("probe batch task")
+        });
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outbound_id, "data-thread-probe");
+        assert_eq!(outbound.threads(), vec!["probe-batch-data-0".to_owned()]);
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
 }

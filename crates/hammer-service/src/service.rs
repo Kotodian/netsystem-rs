@@ -23,7 +23,7 @@ use hammer_runtime::adapter::{
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
-use hammer_runtime::spawn::{DataRuntime, DataRuntimeContext};
+use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
@@ -394,17 +394,14 @@ impl RuntimeService {
     ) -> HammerResult<Vec<ProbeReport>> {
         let protocol = protocol.to_owned();
         let outer_timeout = timeout.saturating_add(CONTROL_ASYNC_BUFFER);
-        self.control_async_call(outer_timeout, move |inner, done| {
+        self.control_async_call(outer_timeout, move |inner, data, done| {
             let probe = build_probe_protocol(&protocol)?;
             if inner.state == ServiceState::Closed {
                 return Err(HammerError::service_closed());
             }
-            let probe_mgr = Arc::clone(&inner.probe);
-            // The control thread only triggers the probe and owns the response
-            // channel. Probe packet I/O runs on the data runtime entered by
-            // `control_async_call`.
-            hammer_runtime::spawn::spawn(async move {
-                let reports = probe_mgr.probe_all(probe, timeout).await;
+            let batch = inner.probe.prepare_all(probe);
+            data.execute(async move {
+                let reports = batch.run(timeout).await;
                 let _ = done.send(Ok(reports));
             });
             Ok(())
@@ -452,7 +449,7 @@ impl RuntimeService {
 
         let outbound_id = outbound_id.to_owned();
         let outer_timeout = effective_timeout.saturating_add(CONTROL_ASYNC_BUFFER);
-        self.control_async_call(outer_timeout, move |inner, done| {
+        self.control_async_call(outer_timeout, move |inner, data, done| {
             if inner.state == ServiceState::Closed {
                 return Err(HammerError::service_closed());
             }
@@ -461,7 +458,7 @@ impl RuntimeService {
                     "outbound '{outbound_id}' is not registered"
                 ))
             })?;
-            hammer_runtime::spawn::spawn(async move {
+            data.execute(async move {
                 let reports = outbound.runtime().probe_group(timeout).await;
                 let _ = done.send(reports);
             });
@@ -586,7 +583,11 @@ impl RuntimeService {
     fn control_async_call<R>(
         &self,
         timeout: Duration,
-        f: impl FnOnce(&mut ServiceInner, std::sync::mpsc::Sender<HammerResult<R>>) -> HammerResult<()>
+        f: impl FnOnce(
+            &mut ServiceInner,
+            DataPlaneExecutor,
+            std::sync::mpsc::Sender<HammerResult<R>>,
+        ) -> HammerResult<()>
         + Send
         + 'static,
     ) -> HammerResult<R>
@@ -600,8 +601,8 @@ impl RuntimeService {
         control_handle.call_async(timeout, move |done| {
             let mut inner = inner.lock().expect("service mutex poisoned");
             let _dispatch_guard = tracing::dispatcher::set_default(inner.log_factory.dispatch());
-            let data_context = inner.data_context.clone();
-            data_context.enter(|| f(&mut inner, done))
+            let data = inner.data_context.executor();
+            f(&mut inner, data, done)
         })
     }
 
