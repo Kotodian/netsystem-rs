@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
-use crate::node::{NodeId, NodeRuntime};
+use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -219,11 +219,21 @@ pub struct PooledBufferFrame {
     frame: BufferFrame,
 }
 
-#[derive(Debug, Clone)]
-pub struct DataPlaneRuntime {
+#[derive(Debug)]
+pub struct DataPlaneRuntime<N = NoopNode> {
     buffers: BufferPool,
     frames: FramePool,
-    nodes: NodeRuntime,
+    nodes: NodeRuntime<N>,
+}
+
+impl<N> Clone for DataPlaneRuntime<N> {
+    fn clone(&self) -> Self {
+        Self {
+            buffers: self.buffers.clone(),
+            frames: self.frames.clone(),
+            nodes: self.nodes.clone(),
+        }
+    }
 }
 
 static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -237,7 +247,7 @@ fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-impl DataPlaneRuntime {
+impl<N> DataPlaneRuntime<N> {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities(
             slot_capacity,
@@ -268,7 +278,7 @@ impl DataPlaneRuntime {
         &self.frames
     }
 
-    pub fn nodes(&self) -> &NodeRuntime {
+    pub fn nodes(&self) -> &NodeRuntime<N> {
         &self.nodes
     }
 
@@ -333,7 +343,10 @@ impl DataPlaneRuntime {
         Ok(true)
     }
 
-    pub fn run_ready_nodes(&self) -> CoreResult<usize> {
+    pub fn run_ready_nodes(&self) -> CoreResult<usize>
+    where
+        N: Node<N>,
+    {
         self.nodes.run_ready(self)
     }
 

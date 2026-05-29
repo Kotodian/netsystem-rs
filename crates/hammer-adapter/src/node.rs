@@ -23,12 +23,25 @@ impl NodeId {
     }
 }
 
-pub trait Node {
+pub trait Node<G = Self> {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum NoopNode {}
+
+impl Node<NoopNode> for NoopNode {
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<NoopNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        match *self {}
+    }
 }
 
 pub struct RouterNode<R> {
@@ -42,14 +55,14 @@ impl<R> RouterNode<R> {
     }
 }
 
-impl<R, T> Node for RouterNode<R>
+impl<R, T, G> Node<G> for RouterNode<R>
 where
     R: Deref<Target = T>,
     T: Router + ?Sized,
 {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         for index in frame.pending_indices().iter().copied() {
@@ -105,9 +118,9 @@ impl RouteDispatchNode {
         self.endpoints.insert(id.into(), node);
     }
 
-    fn target_for_index(
+    fn target_for_index<G>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<G>,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
         runtime.with_metadata(index, |metadata| self.target_for_metadata(metadata))?
@@ -143,9 +156,9 @@ impl RouteDispatchNode {
         }
     }
 
-    fn collect_groups(
+    fn collect_groups<G>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<G>,
         frame: &BufferFrame,
     ) -> CoreResult<RouteDispatchGroups> {
         let mut groups = RouteDispatchGroups::default();
@@ -158,10 +171,10 @@ impl RouteDispatchNode {
     }
 }
 
-impl Node for RouteDispatchNode {
+impl<G> Node<G> for RouteDispatchNode {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let groups = self.collect_groups(runtime, frame)?;
@@ -355,10 +368,29 @@ impl NodeResult {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct NodeRuntime {
-    inner: Rc<RefCell<NodeRuntimeInner>>,
+pub struct NodeRuntime<N = NoopNode> {
+    inner: Rc<RefCell<NodeRuntimeInner<N>>>,
     readiness: Rc<NodeReadiness>,
+}
+
+impl<N> Clone for NodeRuntime<N> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+            readiness: Rc::clone(&self.readiness),
+        }
+    }
+}
+
+impl<N> std::fmt::Debug for NodeRuntime<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.borrow();
+        f.debug_struct("NodeRuntime")
+            .field("nodes_len", &inner.nodes.len())
+            .field("queue_len", &inner.queue.len())
+            .field("readiness", &self.readiness)
+            .finish()
+    }
 }
 
 #[derive(Default)]
@@ -409,16 +441,9 @@ impl NodeReadiness {
     }
 }
 
-#[derive(Debug)]
-struct NodeRuntimeInner {
-    nodes: Vec<Rc<RefCell<Box<dyn Node>>>>,
+struct NodeRuntimeInner<N> {
+    nodes: Vec<Option<N>>,
     queue: VecDeque<ScheduledFrame>,
-}
-
-impl std::fmt::Debug for dyn Node {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Node")
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -427,7 +452,7 @@ struct ScheduledFrame {
     frame: FrameIndex,
 }
 
-impl Default for NodeRuntime {
+impl<N> Default for NodeRuntime<N> {
     fn default() -> Self {
         Self {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
@@ -439,14 +464,11 @@ impl Default for NodeRuntime {
     }
 }
 
-impl NodeRuntime {
-    pub fn register<N>(&self, node: N) -> NodeId
-    where
-        N: Node + 'static,
-    {
+impl<N> NodeRuntime<N> {
+    pub fn register(&self, node: N) -> NodeId {
         let mut inner = self.inner.borrow_mut();
         let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
-        inner.nodes.push(Rc::new(RefCell::new(Box::new(node))));
+        inner.nodes.push(Some(node));
         id
     }
 
@@ -465,7 +487,7 @@ impl NodeRuntime {
     }
 
     pub(crate) fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
-        self.node(node)?;
+        self.validate_node(node)?;
         self.inner
             .borrow_mut()
             .queue
@@ -474,18 +496,24 @@ impl NodeRuntime {
         Ok(())
     }
 
-    pub(crate) fn run_ready(&self, runtime: &DataPlaneRuntime) -> CoreResult<usize> {
+    pub(crate) fn run_ready(&self, runtime: &DataPlaneRuntime<N>) -> CoreResult<usize>
+    where
+        N: Node<N>,
+    {
         let mut processed = 0usize;
         while let Some(scheduled) = self.pop_scheduled() {
-            let node = self.node(scheduled.node)?;
+            let mut node = self.take_node(scheduled.node)?;
             let mut frame = runtime.take_frame_index(scheduled.frame)?;
             if !frame.has_pending() {
+                self.return_node(scheduled.node, node)?;
                 runtime.release_taken_frame_index(scheduled.frame, frame)?;
                 continue;
             }
 
             frame.clear_next_node();
-            let result = match node.borrow_mut().process(runtime, &mut frame) {
+            let result = node.process(runtime, &mut frame);
+            self.return_node(scheduled.node, node)?;
+            let result = match result {
                 Ok(result) => result,
                 Err(err) => {
                     let _ = runtime.release_taken_frame_index(scheduled.frame, frame);
@@ -499,13 +527,34 @@ impl NodeRuntime {
         Ok(processed)
     }
 
-    fn node(&self, node: NodeId) -> CoreResult<Rc<RefCell<Box<dyn Node>>>> {
+    fn validate_node(&self, node: NodeId) -> CoreResult<()> {
+        if self.inner.borrow().nodes.get(node.0 as usize).is_none() {
+            return Err(CoreError::internal("node id out of bounds"));
+        }
+        Ok(())
+    }
+
+    fn take_node(&self, node: NodeId) -> CoreResult<N> {
         self.inner
-            .borrow()
+            .borrow_mut()
             .nodes
-            .get(node.0 as usize)
-            .cloned()
-            .ok_or_else(|| CoreError::internal("node id out of bounds"))
+            .get_mut(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?
+            .take()
+            .ok_or_else(|| CoreError::internal("node is already running"))
+    }
+
+    fn return_node(&self, node: NodeId, value: N) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        let slot = inner
+            .nodes
+            .get_mut(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+        if slot.is_some() {
+            return Err(CoreError::internal("node slot is already occupied"));
+        }
+        *slot = Some(value);
+        Ok(())
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {
@@ -519,7 +568,7 @@ impl NodeRuntime {
 
     fn dispatch_result(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<N>,
         current_index: FrameIndex,
         current_frame: BufferFrame,
         result: NodeResult,

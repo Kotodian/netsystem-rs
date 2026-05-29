@@ -34,10 +34,10 @@ struct ForwardNode {
     trace: Rc<RefCell<Vec<&'static str>>>,
 }
 
-impl Node for ForwardNode {
+impl Node<TestNode> for ForwardNode {
     fn process(
         &mut self,
-        _runtime: &DataPlaneRuntime,
+        _runtime: &DataPlaneRuntime<TestNode>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         self.trace.borrow_mut().push("forward");
@@ -51,10 +51,10 @@ struct SinkNode {
     payloads: Rc<RefCell<Vec<Vec<u8>>>>,
 }
 
-impl Node for SinkNode {
+impl Node<TestNode> for SinkNode {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<TestNode>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         self.trace.borrow_mut().push("sink");
@@ -72,10 +72,10 @@ struct DecisionSinkNode {
     decisions: Rc<RefCell<Vec<RouteDecision>>>,
 }
 
-impl Node for DecisionSinkNode {
+impl Node<TestNode> for DecisionSinkNode {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<TestNode>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         for buffer in frame.drain_pending() {
@@ -94,10 +94,10 @@ struct CountNode {
     count: Rc<Cell<usize>>,
 }
 
-impl Node for CountNode {
+impl Node<TestNode> for CountNode {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneRuntime<TestNode>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         self.count.set(self.count.get() + 1);
@@ -161,19 +161,45 @@ impl Router for StaticRouter {
     }
 }
 
+enum TestNode {
+    Forward(ForwardNode),
+    Sink(SinkNode),
+    DecisionSink(DecisionSinkNode),
+    Count(CountNode),
+    Router(RouterNode<Arc<StaticRouter>>),
+    RouteDispatch(RouteDispatchNode),
+}
+
+impl Node<TestNode> for TestNode {
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        match self {
+            Self::Forward(node) => node.process(runtime, frame),
+            Self::Sink(node) => node.process(runtime, frame),
+            Self::DecisionSink(node) => node.process(runtime, frame),
+            Self::Count(node) => node.process(runtime, frame),
+            Self::Router(node) => node.process(runtime, frame),
+            Self::RouteDispatch(node) => node.process(runtime, frame),
+        }
+    }
+}
+
 #[test]
 fn node_runtime_dispatches_pending_frame_to_next_node() {
-    let runtime = DataPlaneRuntime::with_capacities(8, 4, 2, 2);
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let payloads = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register(SinkNode {
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&payloads),
-    });
-    let forward = runtime.nodes().register(ForwardNode {
+    }));
+    let forward = runtime.nodes().register(TestNode::Forward(ForwardNode {
         next: sink,
         trace: Rc::clone(&trace),
-    });
+    }));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
@@ -199,11 +225,11 @@ fn node_runtime_dispatches_pending_frame_to_next_node() {
 
 #[test]
 fn node_runtime_does_not_schedule_empty_frame() {
-    let runtime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
     let count = Rc::new(Cell::new(0));
-    let node = runtime.nodes().register(CountNode {
+    let node = runtime.nodes().register(TestNode::Count(CountNode {
         count: Rc::clone(&count),
-    });
+    }));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     assert!(!runtime.schedule_frame(node, frame).expect("schedule empty"));
@@ -216,11 +242,11 @@ fn node_runtime_does_not_schedule_empty_frame() {
 
 #[test]
 fn node_runtime_ready_future_wakes_on_local_schedule() {
-    let runtime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
     let count = Rc::new(Cell::new(0));
-    let node = runtime.nodes().register(CountNode {
+    let node = runtime.nodes().register(TestNode::Count(CountNode {
         count: Rc::clone(&count),
-    });
+    }));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
@@ -253,17 +279,19 @@ fn node_runtime_ready_future_wakes_on_local_schedule() {
 
 #[test]
 fn router_node_stores_decision_in_metadata_and_forwards_frame() {
-    let runtime = DataPlaneRuntime::with_capacities(8, 4, 1, 2);
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 1, 2);
     let decisions = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register(DecisionSinkNode {
-        decisions: Rc::clone(&decisions),
-    });
+    let sink = runtime
+        .nodes()
+        .register(TestNode::DecisionSink(DecisionSinkNode {
+            decisions: Rc::clone(&decisions),
+        }));
     let router = Arc::new(StaticRouter::new(RouteDecision::Route {
         target: RouteTarget::Outbound("direct".to_owned()),
     }));
     let router_node = runtime
         .nodes()
-        .register(RouterNode::new(Arc::clone(&router), sink));
+        .register(TestNode::Router(RouterNode::new(Arc::clone(&router), sink)));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let buffer = runtime
         .alloc_index_with_bytes(
@@ -301,23 +329,23 @@ fn router_node_stores_decision_in_metadata_and_forwards_frame() {
 
 #[test]
 fn route_dispatch_node_splits_frame_by_route_decision() {
-    let runtime = DataPlaneRuntime::with_capacities(16, 8, 4, 4);
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(16, 8, 4, 4);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let direct_payloads = Rc::new(RefCell::new(Vec::new()));
     let block_payloads = Rc::new(RefCell::new(Vec::new()));
-    let direct = runtime.nodes().register(SinkNode {
+    let direct = runtime.nodes().register(TestNode::Sink(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&direct_payloads),
-    });
-    let block = runtime.nodes().register(SinkNode {
+    }));
+    let block = runtime.nodes().register(TestNode::Sink(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&block_payloads),
-    });
-    let dispatch = runtime.nodes().register(
+    }));
+    let dispatch = runtime.nodes().register(TestNode::RouteDispatch(
         RouteDispatchNode::new()
             .with_outbound("direct", direct)
             .with_outbound("block", block),
-    );
+    ));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     for (target, payload) in [
         ("direct", b"first".as_slice()),
