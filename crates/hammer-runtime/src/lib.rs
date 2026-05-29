@@ -32,8 +32,6 @@ mod event_subscribers;
 pub mod inbounds;
 mod macros;
 pub mod outbounds;
-#[cfg(feature = "probe")]
-pub mod probe;
 pub mod protocol;
 pub mod route;
 mod socket_protector;
@@ -93,8 +91,6 @@ pub use hammer_core::{
 };
 pub use inbounds::InboundManager;
 pub use outbounds::OutboundManager;
-#[cfg(feature = "probe")]
-pub use probe::{IcmpOutboundProbe, ProbeManager};
 #[cfg(feature = "outbound-hysteria2")]
 pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
 #[cfg(feature = "inbound-tun")]

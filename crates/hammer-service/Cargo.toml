@@ -20,7 +20,7 @@ default = [
     "dns-local",
     "probe",
 ]
-probe = ["hammer-runtime/probe"]
+probe = ["hammer-runtime/probe", "dep:async-trait"]
 inbound-tun = ["hammer-runtime/inbound-tun"]
 inbound-socks = ["hammer-runtime/inbound-socks"]
 inbound-http = ["hammer-runtime/inbound-http"]
@@ -47,6 +47,7 @@ endpoint-wireguard = ["hammer-runtime/endpoint-wireguard"]
 endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
 
 [dependencies]
+async-trait = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 tokio = { workspace = true }

@@ -15,8 +15,6 @@ use hammer_core::registry::RuntimeRegistry;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::EndpointManager;
 #[cfg(feature = "probe")]
-use hammer_runtime::ProbeManager;
-#[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
@@ -34,6 +32,9 @@ use hammer_runtime::{
     OutboundManager, Router,
 };
 use std::time::Duration;
+
+#[cfg(feature = "probe")]
+use crate::ProbeManager;
 
 #[cfg(feature = "endpoint")]
 type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
@@ -399,6 +400,9 @@ impl RuntimeService {
                 return Err(HammerError::service_closed());
             }
             let probe_mgr = Arc::clone(&inner.probe);
+            // The control thread only triggers the probe and owns the response
+            // channel. Probe packet I/O runs on the data runtime entered by
+            // `control_async_call`.
             hammer_runtime::spawn::spawn(async move {
                 let reports = probe_mgr.probe_all(probe, timeout).await;
                 let _ = done.send(Ok(reports));
@@ -842,7 +846,7 @@ fn combine_close_error(result: HammerResult<()>, message: impl Into<String>) -> 
 
 #[cfg(feature = "probe")]
 fn build_probe_protocol(protocol: &str) -> HammerResult<ProbeProtocolComponent> {
-    hammer_runtime::probe::ProbeProtocolFactorySet::standard().build(protocol)
+    crate::ProbeProtocolFactorySet::standard().build(protocol)
 }
 
 #[cfg(test)]

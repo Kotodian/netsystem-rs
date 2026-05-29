@@ -1342,6 +1342,7 @@ dependencies = [
 name = "hammer-service"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hammer-core",
  "hammer-runtime",
  "tokio",

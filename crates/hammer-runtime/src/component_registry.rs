@@ -161,22 +161,6 @@ pub(crate) fn register_route_matcher_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-#[cfg(feature = "probe")]
-pub(crate) trait ProbeComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build() -> hammer_adapter::probe::ProbeProtocolComponent;
-}
-
-#[cfg(feature = "probe")]
-pub(crate) fn register_probe_component<C>(
-    builders: &mut HashMap<&'static str, crate::probe::ProbeProtocolBuilder>,
-) where
-    C: ProbeComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
 pub trait EventSubscriberComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -212,9 +196,6 @@ macro_rules! register_components {
     };
     (matcher, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_route_matcher_component::<$component>($builders);)*
-    };
-    (probe, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_probe_component::<$component>($builders);)*
     };
     (event, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_event_subscriber_component::<$component>($builders);)*
