@@ -3,9 +3,7 @@ use std::sync::Arc;
 
 use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
-use hammer_runtime::{
-    ControlEventSubscriptionHandle, ControlThreadHandle, EventSubscriberBuilder,
-};
+use hammer_runtime::{ControlEventSubscriptionHandle, ControlThreadHandle, EventSubscriberBuilder};
 
 #[derive(Clone)]
 struct EventSubscriberFactorySet {

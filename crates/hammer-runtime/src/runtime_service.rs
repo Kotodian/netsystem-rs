@@ -16,9 +16,9 @@ use crate::EndpointManager;
 use crate::ProbeManager;
 use crate::control_thread::ControlEventSubscriptionHandle;
 use crate::data_plane::RuntimeDataPlaneGraph;
-use crate::event_subscribers::EventSubscriberBuilder;
 #[cfg(feature = "endpoint")]
 use crate::endpoints::EndpointOutboundAdapter;
+use crate::event_subscribers::EventSubscriberBuilder;
 #[cfg(feature = "endpoint")]
 use crate::protocol::tun::RuntimeTunInbound;
 use crate::spawn::{DataRuntime, DataRuntimeContext};

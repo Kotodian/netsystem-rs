@@ -27,13 +27,13 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(test)]
+use hammer_adapter::DataPlaneRuntime;
 use hammer_adapter::{
     BufferFrame, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, DataPlaneBuffers,
     Endpoint, EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
     RouteMetadata, SocksAddr,
 };
-#[cfg(test)]
-use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
 use tokio::sync::mpsc;
