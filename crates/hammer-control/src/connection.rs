@@ -3,10 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::debug;
 
-use hammer_core::error::HammerResult;
-use hammer_runtime::adapter::{
+use hammer_adapter::{
     ConnectionHandle, ConnectionManager as ConnectionManagerTrait, Lifecycle, StartStage,
 };
+use hammer_core::error::HammerResult;
 
 pub struct ConnectionRegistration(Arc<dyn ConnectionHandle>);
 

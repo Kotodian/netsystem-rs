@@ -2,13 +2,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, error, info, trace};
 
-use hammer_core::error::HammerResult;
-use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_core::log::Logger;
-use hammer_runtime::adapter::{
+use hammer_adapter::{
     DefaultInterfaceUpdateListener, NetworkInterface, NetworkManager as NetworkManagerTrait,
     PlatformInterface, WifiState,
 };
+use hammer_core::error::HammerResult;
+use hammer_core::lifecycle::{Lifecycle, StartStage};
+use hammer_core::log::Logger;
 
 use crate::{ConnectionManager, PauseManager};
 

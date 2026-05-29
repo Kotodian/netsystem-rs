@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use hammer_adapter::{LifecycleService, ServiceManager as ServiceManagerTrait};
 use hammer_core::error::HammerResult;
 use hammer_core::log::Logger;
-use hammer_runtime::adapter::{LifecycleService, ServiceManager as ServiceManagerTrait};
 
 use crate::impl_logging_lifecycle;
 

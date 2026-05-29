@@ -4,6 +4,7 @@ members = [
     "crates/hammer-core",
     "crates/hammer-adapter",
     "crates/hammer-component-macros",
+    "crates/hammer-control",
     "crates/hammer-runtime",
     "crates/hammer-service",
     "crates/hammer-ffi",

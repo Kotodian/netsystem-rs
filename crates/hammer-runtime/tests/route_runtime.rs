@@ -7,13 +7,12 @@ use hammer_adapter::{
     ConnectionHandle, Network, PlatformInterface, RouteDecision, RouteMetadata, RouteTarget,
     SocksAddr,
 };
+use hammer_control::{ConnectionManager, NetworkManager, PauseManager};
 use hammer_core::config::{self, DomainStrategy, Options, RuleActionKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{
-    ConnectionManager, MetricsRegistry, NetworkManager, OutboundManager, PauseManager, Router,
-};
+use hammer_runtime::{MetricsRegistry, OutboundManager, Router};
 
 #[cfg(feature = "endpoint")]
 use async_trait::async_trait;
@@ -900,10 +899,11 @@ fn network_manager_tracks_platform_default_interface_and_pause_state() {
     let connection = Arc::new(ConnectionManager::new());
     let tracked = Arc::new(FakeHandle::default());
     connection.track(Arc::clone(&tracked));
+    let platform_iface: Arc<dyn PlatformInterface> = platform.clone();
     let network = NetworkManager::with_platform(
         logger("network"),
         true,
-        Arc::clone(&platform),
+        platform_iface,
         Arc::clone(&pause),
         Arc::clone(&connection),
     );
@@ -940,10 +940,11 @@ fn network_manager_ignores_duplicate_default_interface_updates() {
     let connection = Arc::new(ConnectionManager::new());
     let first = Arc::new(FakeHandle::default());
     connection.track(Arc::clone(&first));
+    let platform_iface: Arc<dyn PlatformInterface> = platform.clone();
     let network = NetworkManager::with_platform(
         logger("network"),
         true,
-        Arc::clone(&platform),
+        platform_iface,
         Arc::clone(&pause),
         Arc::clone(&connection),
     );

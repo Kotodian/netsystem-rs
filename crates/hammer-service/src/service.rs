@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use crate::{
+use hammer_control::{
     CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
     ServiceManager,
 };

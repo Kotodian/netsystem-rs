@@ -49,6 +49,7 @@ endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
 [dependencies]
 async-trait = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
+hammer-control = { path = "../hammer-control" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 tokio = { workspace = true }
 tracing = { workspace = true }
