@@ -18,7 +18,7 @@ use etherparse::{
 #[cfg(feature = "endpoint")]
 use hammer_adapter::Endpoint as EndpointTrait;
 use hammer_adapter::{
-    BufferIndex, DataPlaneRuntime, DnsQueryOptions, DnsRouter as DnsRouterTrait, Network,
+    BufferIndex, DataPlaneBuffers, DnsQueryOptions, DnsRouter as DnsRouterTrait, Network,
     OutboundManager as OutboundManagerTrait, ProxyStream, RouteDecision, RouteMetadata,
     RouteTarget, Router as RouterTrait, SocksAddr,
 };
@@ -4184,7 +4184,7 @@ fn try_enqueue_existing_udp_flow(
 
 fn enqueue_udp_payload(
     sender: &mpsc::Sender<UdpFlowPayload>,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneBuffers,
     buffer: BufferIndex,
     metrics: &TunMetrics,
 ) -> HammerResult<UdpPayloadEnqueueResult> {

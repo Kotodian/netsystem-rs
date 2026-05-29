@@ -27,6 +27,7 @@ mod certificate;
 mod component_registry;
 mod connection;
 mod control_thread;
+mod data_plane;
 pub mod dns;
 pub mod endpoints;
 mod event_subscribers;
