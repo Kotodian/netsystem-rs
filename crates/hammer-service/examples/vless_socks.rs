@@ -2,12 +2,12 @@ use std::env;
 use std::fs;
 use std::sync::Arc;
 
-use hammer_adapter::{
-    DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
-};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::{Level, LogWriter};
-use hammer_runtime::RuntimeService;
+use hammer_service::RuntimeService;
+use hammer_service::adapter::{
+    DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
+};
 
 struct ExamplePlatform;
 
@@ -60,7 +60,7 @@ impl LogWriter for StderrWriter {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = env::args().nth(1).ok_or_else(|| {
         CoreError::config_validation(
-            "usage: cargo run -p hammer-runtime --example vless_socks -- <config.toml>",
+            "usage: cargo run -p hammer-service --example vless_socks -- <config.toml>",
         )
     })?;
     let config = fs::read_to_string(&config_path)?;

@@ -1344,6 +1344,8 @@ version = "0.1.0"
 dependencies = [
  "hammer-core",
  "hammer-runtime",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

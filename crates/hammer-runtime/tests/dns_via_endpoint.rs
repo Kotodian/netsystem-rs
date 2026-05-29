@@ -259,7 +259,7 @@ async fn dns_via_endpoint_udp_round_trip() {
     });
 
     // 3. Build OutboundManager and register the endpoint-adapter under
-    //    the endpoint id `wg-out`. Bypass the full RuntimeService path
+    //    the endpoint id `wg-out`. Bypass the full service-facade path
     //    — we just need outbound.get("wg-out") to return our adapter.
     let outbound = Arc::new(OutboundManager::new(logger("outbound-test"), String::new()));
     let adapter = EndpointOutboundAdapter::arc(

@@ -10,7 +10,7 @@ name = "hammer_runtime"
 [features]
 default = []
 # Outbound-level latency probing. Adds `ProbeManager` + `IcmpOutboundProbe`
-# under `crate::probe`, plus the `RuntimeService::probe_outbounds` API.
+# under `crate::probe`, plus the hammer-service probe facade.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
 probe = ["dep:socket2"]
 inbound-tun = ["dep:libc", "dep:tun-rs", "dep:socket2"]

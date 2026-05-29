@@ -11,7 +11,7 @@
 //!
 //! On top of tracing propagation, this module also routes spawns to the
 //! current service's **data-plane runtime** so the control-plane runtime
-//! stays isolated from business work. `RuntimeService` enters a
+//! stays isolated from business work. The service crate enters a
 //! [`DataRuntimeContext`] while it runs lifecycle/control closures, and
 //! spawned data tasks carry that context through Tokio task-local storage.
 //! Calls made outside a service context — for example from `#[tokio::test]`

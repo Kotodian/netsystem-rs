@@ -932,7 +932,7 @@ mod tests {
         let lines = inner.lines.lock().unwrap();
         assert!(
             !lines.iter().any(|line| line.contains("metrics_snapshot")),
-            "metrics are exposed through RuntimeService::metrics_snapshot, not control logs: {lines:?}"
+            "metrics snapshots are exposed through the service facade, not control logs: {lines:?}"
         );
     }
 

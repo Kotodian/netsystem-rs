@@ -189,7 +189,7 @@ impl OutboundManager {
         )
     }
 
-    pub(crate) fn from_options_with_platform_metrics_and_control(
+    pub fn from_options_with_platform_metrics_and_control(
         logger: Logger,
         default_id: impl Into<String>,
         options: &[OutboundOptions],
@@ -705,7 +705,7 @@ mod tests {
 
     /// Bare-bones Outbound that only counts how many times `reset` was called
     /// so we can prove `OutboundManager::reset_network` actually fans out to
-    /// every registered outbound. Required because `runtime_service::reset_network`
+    /// every registered outbound. Required because service reset-network handling
     /// previously skipped this fan-out, leaving cached hysteria2 clients stale
     /// after iOS sleep/wake.
     struct CountingOutbound {

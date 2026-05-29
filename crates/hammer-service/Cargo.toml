@@ -49,3 +49,5 @@ endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
+tokio = { workspace = true }
+tracing = { workspace = true }

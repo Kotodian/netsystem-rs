@@ -124,12 +124,12 @@ impl ProbeManager {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProbeProtocolFactorySet {
+pub struct ProbeProtocolFactorySet {
     builders: Arc<std::collections::HashMap<&'static str, ProbeProtocolBuilder>>,
 }
 
 impl ProbeProtocolFactorySet {
-    pub(crate) fn standard() -> Self {
+    pub fn standard() -> Self {
         let mut builders = std::collections::HashMap::new();
         register_components!(probe, &mut builders, [IcmpOutboundProbe]);
         Self {
@@ -137,7 +137,7 @@ impl ProbeProtocolFactorySet {
         }
     }
 
-    pub(crate) fn build(&self, protocol: &str) -> HammerResult<ProbeProtocolComponent> {
+    pub fn build(&self, protocol: &str) -> HammerResult<ProbeProtocolComponent> {
         let builder = self
             .builders
             .get(protocol)
