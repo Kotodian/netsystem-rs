@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Inbound, Network,
+    BufferFrame, BufferIndex, DataPlaneBuffers, Inbound, Network,
     OutboundManager as OutboundManagerTrait, PooledBufferFrame, ProxyPacketConn, ProxyStream,
     RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
 };
@@ -942,7 +942,7 @@ struct UdpRelayResponse {
 }
 
 async fn handle_udp_relay_response(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneBuffers,
     socket: &UdpSocket,
     client: SocketAddr,
     mut frame: PooledBufferFrame,
@@ -1116,7 +1116,7 @@ fn spawn_udp_relay(
 
 async fn send_udp_buffer(
     packet_conn: &mut dyn ProxyPacketConn,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneBuffers,
     frame: &mut BufferFrame,
     destination: SocksAddr,
     buffer: BufferIndex,
@@ -1286,7 +1286,7 @@ fn udp_route_metadata(
 
 fn route_udp(
     router: &Router,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneBuffers,
     buffer: BufferIndex,
 ) -> HammerResult<String> {
     let decision = runtime.with_metadata_mut(buffer, |metadata| {

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, DataPlaneBuffers, DataPlaneRuntime, DefaultInterfaceUpdateListener,
-    Network, NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
+    BufferFrame, ComponentMeta, DataPlaneBuffers, DefaultInterfaceUpdateListener, Network,
+    NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
     ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, TunOptions,
     WifiState,
 };
