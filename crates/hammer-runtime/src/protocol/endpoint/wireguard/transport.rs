@@ -44,6 +44,9 @@ use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handsh
 use super::endpoint::{
     WireguardPeerHandshakeReceivedArgs, WireguardPeerKeepaliveReceivedArgs,
     WireguardPeerPacketReceivedArgs, WireguardPeerPacketSentArgs, WireguardPeerStartArgs,
+};
+#[cfg(test)]
+use super::endpoint::{
     build_wireguard_inbound_control_subscriber, build_wireguard_start_handshake_subscriber,
 };
 use crate::socket_protector::SocketProtector;

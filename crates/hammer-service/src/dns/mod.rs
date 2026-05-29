@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use hammer_adapter::{
     ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, DnsTransport,
@@ -34,8 +36,12 @@ use lru::LruCache;
     feature = "dns-local"
 ))]
 use crate::component_registry::register_components;
-use crate::socket_protector::SocketProtector;
-use crate::{OutboundManager, RuntimePlatform};
+use hammer_runtime::{
+    ControlEventFilter, ControlEventSubscriptionHandle, ControlThreadHandle, RuntimePlatform,
+    SocketProtector,
+};
+
+use crate::OutboundManager;
 
 mod transport;
 #[cfg(feature = "dns-https")]
@@ -169,23 +175,237 @@ struct CacheKey {
     record_type: RecordType,
 }
 
+#[derive(Clone)]
 struct CacheValue {
     response: Message,
     expires_at: Instant,
 }
 
+#[derive(Clone)]
+struct ReverseValue {
+    domain: String,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct DnsSnapshot {
+    responses: HashMap<CacheKey, CacheValue>,
+    reverse: HashMap<IpAddr, ReverseValue>,
+    match_cache: HashMap<String, MatchedAction>,
+}
+
+impl DnsSnapshot {
+    fn empty() -> Self {
+        Self {
+            responses: HashMap::new(),
+            reverse: HashMap::new(),
+            match_cache: HashMap::new(),
+        }
+    }
+}
+
+struct DnsControlState {
+    responses: LruCache<CacheKey, CacheValue>,
+    reverse: LruCache<IpAddr, ReverseValue>,
+    match_cache: LruCache<String, MatchedAction>,
+}
+
+pub(crate) struct DnsControlCache {
+    state: Mutex<DnsControlState>,
+    snapshot: ArcSwap<DnsSnapshot>,
+}
+
+impl fmt::Debug for DnsControlCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DnsControlCache").finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+enum DnsCacheUpdate {
+    StoreResponse {
+        key: CacheKey,
+        response: Message,
+        ttl: u32,
+    },
+    StoreReverseBatch {
+        entries: Vec<(IpAddr, String, Instant)>,
+    },
+    StoreMatch {
+        qname: String,
+        action: MatchedAction,
+    },
+    Clear,
+}
+
+impl fmt::Debug for DnsCacheUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StoreResponse { .. } => f.write_str("StoreResponse"),
+            Self::StoreReverseBatch { entries } => f
+                .debug_tuple("StoreReverseBatch")
+                .field(&entries.len())
+                .finish(),
+            Self::StoreMatch { qname, .. } => f.debug_tuple("StoreMatch").field(qname).finish(),
+            Self::Clear => f.write_str("Clear"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DnsCacheUpdateArgs {
+    cache: Arc<DnsControlCache>,
+    update: DnsCacheUpdate,
+}
+
+impl DnsControlCache {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(DnsControlState {
+                responses: LruCache::new(
+                    NonZeroUsize::new(DNS_CLIENT_CACHE_MAX_ENTRIES)
+                        .expect("DNS client cache capacity must be non-zero"),
+                ),
+                reverse: LruCache::new(
+                    NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
+                        .expect("DNS reverse cache capacity must be non-zero"),
+                ),
+                match_cache: LruCache::new(
+                    NonZeroUsize::new(DNS_MATCH_CACHE_CAPACITY)
+                        .expect("DNS match cache capacity must be non-zero"),
+                ),
+            }),
+            snapshot: ArcSwap::from_pointee(DnsSnapshot::empty()),
+        }
+    }
+
+    fn load_response(&self, key: &CacheKey) -> Option<Message> {
+        let snapshot = self.snapshot.load();
+        let value = snapshot.responses.get(key)?;
+        let now = Instant::now();
+        if now >= value.expires_at {
+            return None;
+        }
+        let ttl = value.expires_at.saturating_duration_since(now).as_secs() as u32;
+        let mut response = value.response.clone();
+        normalize_ttl(&mut response, ttl);
+        Some(response)
+    }
+
+    fn apply_update(&self, update: DnsCacheUpdate) {
+        match update {
+            DnsCacheUpdate::StoreResponse { key, response, ttl } => {
+                self.store_response_direct(key, &response, ttl);
+            }
+            DnsCacheUpdate::StoreReverseBatch { entries } => {
+                self.store_reverse_batch_direct(entries);
+            }
+            DnsCacheUpdate::StoreMatch { qname, action } => {
+                self.store_match_direct(qname, action);
+            }
+            DnsCacheUpdate::Clear => {
+                self.clear_direct();
+            }
+        }
+    }
+
+    fn store_response_direct(&self, key: CacheKey, response: &Message, ttl: u32) {
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("DNS control cache poisoned");
+        prune_cache(&mut state.responses, now);
+        state.responses.put(
+            key,
+            CacheValue {
+                response: response.clone(),
+                expires_at: now + Duration::from_secs(u64::from(ttl)),
+            },
+        );
+        self.publish_snapshot_locked(&state);
+    }
+
+    fn lookup_reverse(&self, ip: IpAddr) -> Option<String> {
+        let snapshot = self.snapshot.load();
+        let value = snapshot.reverse.get(&ip)?;
+        if Instant::now() >= value.expires_at {
+            return None;
+        }
+        Some(value.domain.clone())
+    }
+
+    fn store_reverse_batch_direct<I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (IpAddr, String, Instant)>,
+    {
+        let mut state = self.state.lock().expect("DNS control cache poisoned");
+        prune_reverse_cache(&mut state.reverse, Instant::now());
+        for (addr, domain, expires_at) in entries {
+            state.reverse.put(addr, ReverseValue { domain, expires_at });
+        }
+        self.publish_snapshot_locked(&state);
+    }
+
+    fn load_match(&self, qname: &str) -> Option<MatchedAction> {
+        self.snapshot.load().match_cache.get(qname).cloned()
+    }
+
+    fn store_match_direct(&self, qname: String, action: MatchedAction) {
+        let mut state = self.state.lock().expect("DNS control cache poisoned");
+        state.match_cache.put(qname, action);
+        self.publish_snapshot_locked(&state);
+    }
+
+    fn clear(&self) {
+        self.apply_update(DnsCacheUpdate::Clear);
+    }
+
+    fn clear_direct(&self) {
+        let mut state = self.state.lock().expect("DNS control cache poisoned");
+        state.responses.clear();
+        state.reverse.clear();
+        state.match_cache.clear();
+        self.publish_snapshot_locked(&state);
+    }
+
+    fn publish_snapshot_locked(&self, state: &DnsControlState) {
+        self.snapshot.store(Arc::new(DnsSnapshot {
+            responses: state
+                .responses
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            reverse: state
+                .reverse
+                .iter()
+                .map(|(addr, value)| (*addr, value.clone()))
+                .collect(),
+            match_cache: state
+                .match_cache
+                .iter()
+                .map(|(qname, action)| (qname.clone(), action.clone()))
+                .collect(),
+        }));
+    }
+}
+
 pub struct DnsClient {
-    cache: Mutex<LruCache<CacheKey, CacheValue>>,
+    cache: Arc<DnsControlCache>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
 }
 
 impl DnsClient {
     pub fn new(_logger: Logger) -> Self {
+        Self::with_cache(Arc::new(DnsControlCache::new()))
+    }
+
+    fn with_cache(cache: Arc<DnsControlCache>) -> Self {
         Self {
-            cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DNS_CLIENT_CACHE_MAX_ENTRIES)
-                    .expect("DNS client cache capacity must be non-zero"),
-            )),
+            cache,
+            control_handle: None,
         }
+    }
+
+    fn set_control_handle(&mut self, control_handle: Arc<ControlThreadHandle>) {
+        self.control_handle = Some(control_handle);
     }
 
     pub async fn exchange(
@@ -299,7 +519,7 @@ impl DnsClient {
     }
 
     pub fn clear_cache(&self) {
-        self.cache.lock().expect("DnsClient cache poisoned").clear();
+        self.cache.clear();
     }
 
     async fn lookup_type(
@@ -338,30 +558,29 @@ impl DnsClient {
     }
 
     fn load_cache(&self, key: &CacheKey) -> Option<Message> {
-        let mut cache = self.cache.lock().expect("DnsClient cache poisoned");
-        let value = cache.get_mut(key)?;
-        let now = Instant::now();
-        if now >= value.expires_at {
-            cache.pop(key);
-            return None;
-        }
-        let ttl = value.expires_at.saturating_duration_since(now).as_secs() as u32;
-        let mut response = value.response.clone();
-        normalize_ttl(&mut response, ttl);
-        Some(response)
+        self.cache.load_response(key)
     }
 
     fn store_cache(&self, key: CacheKey, response: &Message, ttl: u32) {
-        let now = Instant::now();
-        let mut cache = self.cache.lock().expect("DnsClient cache poisoned");
-        prune_cache(&mut cache, now);
-        cache.put(
+        self.publish_or_apply(DnsCacheUpdate::StoreResponse {
             key,
-            CacheValue {
-                response: response.clone(),
-                expires_at: now + Duration::from_secs(u64::from(ttl)),
-            },
-        );
+            response: response.clone(),
+            ttl,
+        });
+    }
+
+    fn publish_or_apply(&self, update: DnsCacheUpdate) {
+        if let Some(control_handle) = &self.control_handle
+            && control_handle
+                .publish_event(DnsCacheUpdateArgs {
+                    cache: Arc::clone(&self.cache),
+                    update: update.clone(),
+                })
+                .is_ok()
+        {
+            return;
+        }
+        self.cache.apply_update(update);
     }
 }
 
@@ -860,24 +1079,20 @@ impl DnsTransportManagerTrait for DnsTransportManager {
     }
 }
 
-struct ReverseValue {
-    domain: String,
-    expires_at: Instant,
-}
-
 pub struct DnsRouter {
     transport: Arc<DnsTransportManager>,
     client: DnsClient,
+    cache: Arc<DnsControlCache>,
+    control_handle: Option<Arc<ControlThreadHandle>>,
+    _control_subscription: Option<ControlEventSubscriptionHandle>,
     default_strategy: DomainStrategy,
     /// Resolved `[[dns.rules]]`. Empty = default-only behaviour, the
     /// pre-feature path. Populated once at construction; never mutated.
     rules: Vec<ResolvedDnsRule>,
-    reverse: Mutex<LruCache<IpAddr, ReverseValue>>,
-    /// Per-qname LRU of the rule-walk outcome. Same role as the
+    /// Per-qname RCU snapshot of the rule-walk outcome. Same role as the
     /// `Router::cache` for proxy routing — sustained traffic to the same
     /// host hits the same set of qnames repeatedly, so a 256-entry LRU
     /// collapses N rule walks into one hashmap lookup.
-    match_cache: Mutex<LruCache<String, MatchedAction>>,
     match_cache_hits: AtomicU64,
     match_cache_misses: AtomicU64,
 }
@@ -915,23 +1130,19 @@ impl DnsRouter {
     }
 
     pub fn new_with_manager(
-        logger: Logger,
+        _logger: Logger,
         transport: Arc<DnsTransportManager>,
         default_strategy: DomainStrategy,
     ) -> Self {
+        let cache = Arc::new(DnsControlCache::new());
         Self {
-            client: DnsClient::new(logger.clone()),
+            client: DnsClient::with_cache(Arc::clone(&cache)),
+            cache,
+            control_handle: None,
+            _control_subscription: None,
             transport,
             default_strategy,
             rules: Vec::new(),
-            reverse: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
-                    .expect("DNS reverse cache capacity must be non-zero"),
-            )),
-            match_cache: Mutex::new(LruCache::new(
-                NonZeroUsize::new(DNS_MATCH_CACHE_CAPACITY)
-                    .expect("DNS match cache capacity must be non-zero"),
-            )),
             match_cache_hits: AtomicU64::new(0),
             match_cache_misses: AtomicU64::new(0),
         }
@@ -965,25 +1176,37 @@ impl DnsRouter {
         Ok(self)
     }
 
+    pub fn with_control_handle(
+        mut self,
+        control_handle: Arc<ControlThreadHandle>,
+    ) -> HammerResult<Self> {
+        let subscription = control_handle.subscribe_event(
+            ControlEventFilter::event::<DnsCacheUpdateArgs>(),
+            move |event| async move {
+                if let Some(args) = event.args::<DnsCacheUpdateArgs>() {
+                    args.cache.apply_update(args.update.clone());
+                }
+            },
+        )?;
+        self.client.set_control_handle(Arc::clone(&control_handle));
+        self.control_handle = Some(control_handle);
+        self._control_subscription = Some(subscription);
+        Ok(self)
+    }
+
     #[inline]
     fn match_rules(&self, qname: &str) -> MatchedAction {
-        if let Some(cached) = self
-            .match_cache
-            .lock()
-            .expect("DNS match cache poisoned")
-            .get(qname)
-            .cloned()
-        {
+        if let Some(cached) = self.cache.load_match(qname) {
             self.match_cache_hits.fetch_add(1, Ordering::Relaxed);
             return cached;
         }
         self.match_cache_misses.fetch_add(1, Ordering::Relaxed);
 
         let action = self.compute_match(qname);
-        self.match_cache
-            .lock()
-            .expect("DNS match cache poisoned")
-            .put(qname.to_owned(), action.clone());
+        self.publish_or_apply(DnsCacheUpdate::StoreMatch {
+            qname: qname.to_owned(),
+            action: action.clone(),
+        });
         action
     }
 
@@ -1130,38 +1353,21 @@ impl DnsRouter {
         let addresses = self.client.lookup(&transport, domain, options).await?;
         let expires_at = Instant::now() + Duration::from_secs(u64::from(DEFAULT_DNS_TTL));
         let domain = normalize_domain(domain);
-        let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
-        prune_reverse_cache(&mut reverse, Instant::now());
-        for addr in &addresses {
-            self.store_reverse_mapping_locked(&mut reverse, *addr, domain.clone(), expires_at);
-        }
+        self.publish_or_apply(DnsCacheUpdate::StoreReverseBatch {
+            entries: addresses
+                .iter()
+                .map(|addr| (*addr, domain.clone(), expires_at))
+                .collect(),
+        });
         Ok(addresses)
     }
 
     pub fn clear_cache(&self) {
-        self.client.clear_cache();
-        self.reverse
-            .lock()
-            .expect("DnsRouter reverse poisoned")
-            .clear();
-        // Match-cache entries point at `Arc<dyn DnsTransport>` clones from
-        // the manager; on a network flip the underlying transports may
-        // have been replaced or reset, so drop the cache to force a fresh
-        // walk on the next query.
-        self.match_cache
-            .lock()
-            .expect("DNS match cache poisoned")
-            .clear();
+        self.publish_or_apply(DnsCacheUpdate::Clear);
     }
 
     pub fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String> {
-        let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
-        let value = reverse.get_mut(&ip)?;
-        if Instant::now() >= value.expires_at {
-            reverse.pop(&ip);
-            return None;
-        }
-        Some(value.domain.clone())
+        self.cache.lookup_reverse(ip)
     }
 
     pub fn reset_network(&self) {
@@ -1181,31 +1387,37 @@ impl DnsRouter {
     }
 
     fn save_reverse_mapping(&self, response: &Message) {
-        let mut reverse = self.reverse.lock().expect("DnsRouter reverse poisoned");
-        prune_reverse_cache(&mut reverse, Instant::now());
-        for record in &response.answers {
-            if let Some(addr) = record_addr(record) {
-                if record.ttl == 0 {
-                    continue;
-                }
-                self.store_reverse_mapping_locked(
-                    &mut reverse,
-                    addr,
-                    domain_from_name(&record.name),
-                    Instant::now() + Duration::from_secs(u64::from(record.ttl)),
-                );
-            }
-        }
+        self.publish_or_apply(DnsCacheUpdate::StoreReverseBatch {
+            entries: response
+                .answers
+                .iter()
+                .filter_map(|record| {
+                    if record.ttl == 0 {
+                        return None;
+                    }
+                    let addr = record_addr(record)?;
+                    Some((
+                        addr,
+                        domain_from_name(&record.name),
+                        Instant::now() + Duration::from_secs(u64::from(record.ttl)),
+                    ))
+                })
+                .collect(),
+        });
     }
 
-    fn store_reverse_mapping_locked(
-        &self,
-        reverse: &mut LruCache<IpAddr, ReverseValue>,
-        addr: IpAddr,
-        domain: String,
-        expires_at: Instant,
-    ) {
-        reverse.put(addr, ReverseValue { domain, expires_at });
+    fn publish_or_apply(&self, update: DnsCacheUpdate) {
+        if let Some(control_handle) = &self.control_handle
+            && control_handle
+                .publish_event(DnsCacheUpdateArgs {
+                    cache: Arc::clone(&self.cache),
+                    update: update.clone(),
+                })
+                .is_ok()
+        {
+            return;
+        }
+        self.cache.apply_update(update);
     }
 }
 

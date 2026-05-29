@@ -1,29 +1,81 @@
 #![cfg(feature = "inbound-mixed")]
 
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, DataPlaneBuffers, DefaultInterfaceUpdateListener, Network,
-    NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
-    ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, TunOptions,
-    WifiState,
+    BufferFrame, ComponentMeta, DataPlaneBuffers, DefaultInterfaceUpdateListener, DnsQueryOptions,
+    DnsRouter as AdapterDnsRouter, Network, NetworkInterface, Outbound as AdapterOutbound,
+    OutboundComponent, PlatformInterface, ProxyPacketConn, ProxyStream, RouteMetadata,
+    RuntimeComponent, SocksAddr, TunOptions, WifiState,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{
-    DnsRouter, MetricsRegistry, OutboundManager, Router, inbounds::InboundManager,
-    spawn::DataRuntime,
+    MetricsRegistry, OutboundManager, Router, inbounds::InboundManager, spawn::DataRuntime,
 };
+use hickory_proto::op::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+struct NoopDnsRouter;
+
+impl Lifecycle for NoopDnsRouter {
+    fn name(&self) -> &str {
+        "noop-dns"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+#[async_trait(?Send)]
+impl AdapterDnsRouter for NoopDnsRouter {
+    async fn exchange(
+        &self,
+        message: Message,
+        _options: DnsQueryOptions,
+    ) -> Result<Message, HammerError> {
+        Ok(message)
+    }
+
+    async fn lookup(
+        &self,
+        _domain: &str,
+        _options: DnsQueryOptions,
+    ) -> Result<Vec<IpAddr>, HammerError> {
+        Ok(Vec::new())
+    }
+
+    fn try_exchange_fast(
+        &self,
+        _message: &Message,
+        _options: DnsQueryOptions,
+    ) -> Result<Option<Message>, HammerError> {
+        Ok(None)
+    }
+
+    fn clear_cache(&self) {}
+
+    fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+        None
+    }
+
+    fn reset_network(&self) {}
 }
 
 fn proxy_options(kind: &str, port: u16) -> Options {
@@ -338,7 +390,7 @@ async fn start_proxy(kind: &str, port: u16, outbound: Arc<RecordingOutbound>) ->
         )
         .expect("router"),
     );
-    let dns_router = Arc::new(DnsRouter::new(logger("dns")));
+    let dns_router: Arc<dyn AdapterDnsRouter> = Arc::new(NoopDnsRouter);
     let manager = InboundManager::from_options_with_runtime_and_metrics(
         logger("inbound"),
         &options.inbounds,

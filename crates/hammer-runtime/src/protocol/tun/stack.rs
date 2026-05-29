@@ -5319,16 +5319,15 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> HammerResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::FixedResponseCode;
-    use crate::{DnsRouter, DnsTransportManager, OutboundManager, Router};
+    use crate::{OutboundManager, Router};
     use async_trait::async_trait;
     use hammer_adapter::{
-        ComponentMeta, DnsRouter as AdapterDnsRouter, DnsTransport, DnsTransportComponent,
-        Lifecycle, OutboundManager as AdapterOutboundManager, Router as AdapterRouter,
-        RuntimeComponent, StartStage,
+        DnsRouter as AdapterDnsRouter, Lifecycle, OutboundManager as AdapterOutboundManager,
+        Router as AdapterRouter, StartStage,
     };
     use hammer_core::config;
     use hammer_core::log::{DiscardWriter, Factory};
+    use hammer_core::protocol::dns::FixedResponseCode;
     use hickory_proto::op::ResponseCode;
     use hickory_proto::rr::{RData, Record};
     use std::collections::VecDeque;
@@ -5343,25 +5342,10 @@ mod tests {
         Factory::new(StdInstant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
-    fn dns_transport_component<T>(
-        id: &str,
-        type_name: &'static str,
-        transport: Arc<T>,
-    ) -> DnsTransportComponent
-    where
-        T: DnsTransport + 'static,
-    {
-        let runtime: Arc<dyn DnsTransport> = transport;
-        RuntimeComponent::new(
-            ComponentMeta::new("dns_transport", type_name, id, Vec::new(), Vec::new(), None),
-            runtime,
-        )
-    }
-
     #[test]
     fn system_tun_stack_type_carries_concrete_device() {
         let _ = std::any::type_name::<
-            SystemTunStack<MemoryTunDevice, Router, DnsRouter, OutboundManager>,
+            SystemTunStack<MemoryTunDevice, Router, StubDnsRouter, OutboundManager>,
         >();
     }
 
@@ -5931,9 +5915,9 @@ mod tests {
         let _second = limiter.try_acquire().expect("permit released after drop");
     }
 
-    struct DelayedDnsTransport;
+    struct DelayedDnsRouter;
 
-    impl Lifecycle for DelayedDnsTransport {
+    impl Lifecycle for DelayedDnsRouter {
         fn name(&self) -> &str {
             "delayed-dns"
         }
@@ -5948,10 +5932,12 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl DnsTransport for DelayedDnsTransport {
-        fn reset(&self) {}
-
-        async fn exchange(&self, message: Message) -> HammerResult<Message> {
+    impl AdapterDnsRouter for DelayedDnsRouter {
+        async fn exchange(
+            &self,
+            message: Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Message> {
             tokio::time::sleep(Duration::from_millis(200)).await;
             let query = message.queries[0].clone();
             let mut response = message.fixed_response(FixedResponseCode::NoError);
@@ -5962,10 +5948,35 @@ mod tests {
             ));
             Ok(response)
         }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Vec<IpAddr>> {
+            Ok(Vec::new())
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Option<Message>> {
+            Ok(None)
+        }
+
+        fn clear_cache(&self) {}
+
+        fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        fn reset_network(&self) {}
     }
 
-    struct CountingDnsTransport {
+    struct CountingDnsRouter {
         queries: Arc<AtomicUsize>,
+        cached_response: StdMutex<Option<Message>>,
     }
 
     struct BlockingDnsRouter {
@@ -5975,7 +5986,16 @@ mod tests {
         release: Notify,
     }
 
-    impl Lifecycle for CountingDnsTransport {
+    impl CountingDnsRouter {
+        fn new(queries: Arc<AtomicUsize>) -> Self {
+            Self {
+                queries,
+                cached_response: StdMutex::new(None),
+            }
+        }
+    }
+
+    impl Lifecycle for CountingDnsRouter {
         fn name(&self) -> &str {
             "counting-dns"
         }
@@ -5990,10 +6010,12 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl DnsTransport for CountingDnsTransport {
-        fn reset(&self) {}
-
-        async fn exchange(&self, message: Message) -> HammerResult<Message> {
+    impl AdapterDnsRouter for CountingDnsRouter {
+        async fn exchange(
+            &self,
+            message: Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Message> {
             self.queries.fetch_add(1, Ordering::Relaxed);
             let query = message.queries[0].clone();
             let mut response = message.fixed_response(FixedResponseCode::NoError);
@@ -6002,7 +6024,46 @@ mod tests {
                 60,
                 RData::A(std::net::Ipv4Addr::new(203, 0, 113, 53).into()),
             ));
+            *self
+                .cached_response
+                .lock()
+                .expect("counting DNS cache poisoned") = Some(response.clone());
             Ok(response)
+        }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Vec<IpAddr>> {
+            Ok(vec![IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53))])
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Option<Message>> {
+            Ok(self
+                .cached_response
+                .lock()
+                .expect("counting DNS cache poisoned")
+                .clone())
+        }
+
+        fn clear_cache(&self) {
+            *self
+                .cached_response
+                .lock()
+                .expect("counting DNS cache poisoned") = None;
+        }
+
+        fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        fn reset_network(&self) {
+            self.clear_cache();
         }
     }
 
@@ -6892,10 +6953,9 @@ hijack_dns = true
 [dns]
 server = "hosts"
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "direct"
+id = "direct"
 
 [route]
 final = "direct"
@@ -6914,20 +6974,7 @@ final = "direct"
             Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
                 .expect("router"),
         );
-        let dns_transport = Arc::new(DnsTransportManager::new(
-            test_logger("dns-transport"),
-            "slow",
-        ));
-        dns_transport.insert(dns_transport_component(
-            "slow",
-            "mock",
-            Arc::new(DelayedDnsTransport),
-        ));
-        let dns_router = Arc::new(DnsRouter::new_with_manager(
-            test_logger("dns-router"),
-            dns_transport,
-            config::DomainStrategy::AsIs,
-        ));
+        let dns_router = Arc::new(DelayedDnsRouter);
         let device = ScriptedBatchTunDevice::new(vec![vec![dns_query_packet("example.com")]]);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
 
@@ -6981,10 +7028,9 @@ hijack_dns = true
 [dns]
 server = "hosts"
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "direct"
+id = "direct"
 
 [route]
 final = "direct"
@@ -7003,23 +7049,8 @@ final = "direct"
             Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
                 .expect("router"),
         );
-        let dns_transport = Arc::new(DnsTransportManager::new(
-            test_logger("dns-transport"),
-            "counting",
-        ));
         let queries = Arc::new(AtomicUsize::new(0));
-        dns_transport.insert(dns_transport_component(
-            "counting",
-            "mock",
-            Arc::new(CountingDnsTransport {
-                queries: Arc::clone(&queries),
-            }),
-        ));
-        let dns_router = Arc::new(DnsRouter::new_with_manager(
-            test_logger("dns-router"),
-            dns_transport,
-            config::DomainStrategy::AsIs,
-        ));
+        let dns_router = Arc::new(CountingDnsRouter::new(Arc::clone(&queries)));
 
         let request = dns_query_packet("example.com");
         dns_router

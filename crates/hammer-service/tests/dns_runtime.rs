@@ -14,8 +14,9 @@ use hammer_adapter::{
 use hammer_core::config::{self, DomainStrategy};
 use hammer_core::error::HammerError;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{
-    DnsClient, DnsRouter, DnsTransportManager, OutboundManager,
+use hammer_runtime::OutboundManager;
+use hammer_service::{
+    DnsClient, DnsRouter, DnsTransportManager,
     dns::{FixedResponseCode, HostsTransport, MessageExt, TcpDnsTransport, UdpDnsTransport},
 };
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -426,7 +427,7 @@ async fn dns_client_applies_rewrite_ttl_to_cache_hits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
+async fn dns_client_bounds_cache_without_promoting_rcu_reads() {
     let transport = Arc::new(CountingTransport::new(
         60,
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11)),
@@ -463,13 +464,13 @@ async fn dns_client_bounds_cache_and_promotes_touched_lru_entry() {
         .lookup(&transport_component, "bounded-0.test", options.clone())
         .await
         .unwrap();
-    assert_eq!(transport.calls.load(Ordering::SeqCst), 1025);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
 
     let _ = client
         .lookup(&transport_component, "bounded-1.test", options)
         .await
         .unwrap();
-    assert_eq!(transport.calls.load(Ordering::SeqCst), 1026);
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 1027);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -769,7 +770,7 @@ async fn router_lookup_uses_default_transport_and_tracks_reverse_mapping() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn router_reverse_cache_bounds_and_promotes_touched_lru_mapping() {
+async fn router_reverse_cache_bounds_without_promoting_rcu_reads() {
     let manager = Arc::new(DnsTransportManager::new(logger("dns-transport"), "indexed"));
     manager.insert(dns_transport_component(
         "indexed",
@@ -788,8 +789,8 @@ async fn router_reverse_cache_bounds_and_promotes_touched_lru_mapping() {
     }
 
     assert_eq!(
-        router.lookup_reverse_mapping(indexed_addr(0)),
-        Some("reverse-0.test".to_owned())
+        router.lookup_reverse_mapping(indexed_addr(2047)),
+        Some("reverse-2047.test".to_owned())
     );
 
     let _ = router
@@ -797,9 +798,9 @@ async fn router_reverse_cache_bounds_and_promotes_touched_lru_mapping() {
         .await
         .unwrap();
 
+    assert_eq!(router.lookup_reverse_mapping(indexed_addr(0)), None);
     assert_eq!(
-        router.lookup_reverse_mapping(indexed_addr(0)),
-        Some("reverse-0.test".to_owned())
+        router.lookup_reverse_mapping(indexed_addr(2048)),
+        Some("reverse-2048.test".to_owned())
     );
-    assert_eq!(router.lookup_reverse_mapping(indexed_addr(1)), None);
 }

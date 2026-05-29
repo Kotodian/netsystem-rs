@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 use tracing::{debug, info};
 
 use crate::OutboundManager;
-use crate::socket_protector::SocketProtector;
+use hammer_runtime::SocketProtector;
 
 use super::tcp::{tcp_exchange_direct, tcp_exchange_via_or_direct};
 use super::{
@@ -104,7 +104,7 @@ impl Lifecycle for UdpDnsTransport {
         };
         let id = self.id.clone();
         let via = self.via.clone();
-        crate::spawn::spawn(async move {
+        hammer_runtime::spawn::spawn(async move {
             let Some(outbound) = outbound.get(&via) else {
                 debug!("dns udp warm-up skipped server={id} via={via}: outbound not found");
                 return;

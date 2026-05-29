@@ -1,19 +1,23 @@
+#![cfg(feature = "inbound-tun")]
+
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    ComponentMeta, DnsTransport, DnsTransportComponent, InboundManager as _, Lifecycle, Network,
-    RouteDecision, RouteTarget, RuntimeComponent, SocksAddr,
+    DnsQueryOptions, DnsRouter as AdapterDnsRouter, InboundManager as _, Lifecycle, Network,
+    RouteDecision, RouteTarget, SocksAddr,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
+use hammer_core::protocol::dns::{FixedResponseCode, MessageExt};
 use hammer_runtime::{
-    DnsRouter, DnsTransportManager, EndpointManager, InboundManager, OutboundManager, Router,
-    dns::{FixedResponseCode, MessageExt},
+    EndpointManager, InboundManager, OutboundManager, Router,
+    inbounds::RuntimeDnsRouter,
     tun::{
         MemoryTunDevice, PacketTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
         icmp_echo_reply_packet, icmp_unreachable_packet, parse_ip_packet,
@@ -26,25 +30,12 @@ use hickory_proto::rr::{RData, Record};
 use tokio::net::UdpSocket;
 
 type RuntimePacketTunStack = PacketTunStack<Router, DnsRouter, OutboundManager>;
-type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
+type RuntimeTunInbound = TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
+
+type DnsRouter = FixedDnsRouter;
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
-}
-
-fn dns_transport_component<T>(
-    id: &str,
-    type_name: &'static str,
-    transport: Arc<T>,
-) -> DnsTransportComponent
-where
-    T: DnsTransport + 'static,
-{
-    let runtime: Arc<dyn DnsTransport> = transport;
-    RuntimeComponent::new(
-        ComponentMeta::new("dns_transport", type_name, id, Vec::new(), Vec::new(), None),
-        runtime,
-    )
 }
 
 fn options() -> Options {
@@ -59,16 +50,15 @@ block_quic = true
 domain_strategy = "prefer_ipv4"
 udp_disable_domain_unmapping = true
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "block"
+id = "blocked"
 
 [dns]
 server = "https://1.1.1.1/dns-query"
 
 [route]
-final = "hysteria2"
+final = "blocked"
 "#,
     )
     .expect("parse config")
@@ -101,17 +91,7 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimePacketTunSta
         Router::from_options(logger("router"), route_options, Arc::clone(&outbound))
             .expect("router"),
     );
-    let dns_transport = Arc::new(DnsTransportManager::new(logger("dns-transport"), "mock"));
-    dns_transport.insert(dns_transport_component(
-        "mock",
-        "mock",
-        Arc::new(FixedDnsTransport),
-    ));
-    let dns_router = Arc::new(DnsRouter::new_with_manager(
-        logger("dns-router"),
-        dns_transport,
-        hammer_core::config::DomainStrategy::AsIs,
-    ));
+    let dns_router = Arc::new(FixedDnsRouter::default());
     PacketTunStack::new_with_runtime(
         logger("tun"),
         router,
@@ -130,10 +110,9 @@ address = ["172.19.0.1/30"]
 sniff = true
 hijack_dns = true
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "block"
+id = "blocked"
 
 [dns]
 server = "https://1.1.1.1/dns-query"
@@ -143,7 +122,7 @@ final = "direct"
 
 [[route.rules]]
 domain_suffix = ["example.com"]
-outbound = "hysteria2"
+outbound = "blocked"
 "#,
     )
     .expect("parse config");
@@ -174,7 +153,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            target: RouteTarget::Outbound("hysteria2".to_owned())
+            target: RouteTarget::Outbound("blocked".to_owned())
         }
     );
 }
@@ -260,10 +239,9 @@ fn tun_stack_does_not_sniff_when_sniff_rule_is_disabled() {
 [tun]
 address = ["172.19.0.1/30"]
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "block"
+id = "blocked"
 
 [dns]
 server = "hosts"
@@ -273,7 +251,7 @@ final = "direct"
 
 [[route.rules]]
 protocol = ["dns"]
-outbound = "hysteria2"
+outbound = "blocked"
 "#,
     )
     .expect("parse config");
@@ -327,10 +305,9 @@ fn packet_stack_facade_sets_icmp_protocol_metadata_for_routing() {
 [tun]
 address = ["172.19.0.1/30"]
 
-[hysteria2]
-server = "example.com"
-password = "secret"
-sni = "example.com"
+[[outbounds]]
+type = "block"
+id = "blocked"
 
 [dns]
 server = "hosts"
@@ -340,11 +317,11 @@ final = "direct"
 
 [[route.rules]]
 protocol = ["icmp"]
-outbound = "hysteria2"
+outbound = "blocked"
 
 [[route.rules]]
 protocol = ["icmpv6"]
-outbound = "hysteria2"
+outbound = "blocked"
 "#,
     )
     .expect("parse config");
@@ -357,7 +334,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            target: RouteTarget::Outbound("hysteria2".to_owned())
+            target: RouteTarget::Outbound("blocked".to_owned())
         }
     );
 
@@ -373,7 +350,7 @@ outbound = "hysteria2"
     assert_eq!(
         flow.decision,
         RouteDecision::Route {
-            target: RouteTarget::Outbound("hysteria2".to_owned())
+            target: RouteTarget::Outbound("blocked".to_owned())
         }
     );
 }
@@ -648,9 +625,12 @@ fn inbound_manager_register_accepts_concrete_component_arc() {
     assert!(registered.as_any().is::<RuntimeTunInbound>());
 }
 
-struct FixedDnsTransport;
+#[derive(Default)]
+struct FixedDnsRouter {
+    reverse: Mutex<HashMap<IpAddr, String>>,
+}
 
-impl Lifecycle for FixedDnsTransport {
+impl Lifecycle for FixedDnsRouter {
     fn name(&self) -> &str {
         "fixed-dns"
     }
@@ -665,18 +645,60 @@ impl Lifecycle for FixedDnsTransport {
 }
 
 #[async_trait(?Send)]
-impl DnsTransport for FixedDnsTransport {
-    fn reset(&self) {}
-
-    async fn exchange(&self, message: Message) -> Result<Message, HammerError> {
+impl AdapterDnsRouter for FixedDnsRouter {
+    async fn exchange(
+        &self,
+        message: Message,
+        _options: DnsQueryOptions,
+    ) -> Result<Message, HammerError> {
         let query = message.queries[0].clone();
         let mut response = message.fixed_response(FixedResponseCode::NoError);
+        let addr = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53));
         response.add_answer(Record::from_rdata(
             query.name().clone(),
             60,
-            RData::A(std::net::Ipv4Addr::new(203, 0, 113, 53).into()),
+            RData::A(match addr {
+                IpAddr::V4(ip) => ip.into(),
+                IpAddr::V6(_) => unreachable!("fixed test DNS is IPv4"),
+            }),
         ));
+        self.reverse.lock().expect("reverse mutex").insert(
+            addr,
+            query.name().to_ascii().trim_end_matches('.').to_owned(),
+        );
         Ok(response)
+    }
+
+    async fn lookup(
+        &self,
+        _domain: &str,
+        _options: DnsQueryOptions,
+    ) -> Result<Vec<IpAddr>, HammerError> {
+        Ok(vec![IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 53))])
+    }
+
+    fn try_exchange_fast(
+        &self,
+        _message: &Message,
+        _options: DnsQueryOptions,
+    ) -> Result<Option<Message>, HammerError> {
+        Ok(None)
+    }
+
+    fn clear_cache(&self) {
+        self.reverse.lock().expect("reverse mutex").clear();
+    }
+
+    fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String> {
+        self.reverse
+            .lock()
+            .expect("reverse mutex")
+            .get(&ip)
+            .cloned()
+    }
+
+    fn reset_network(&self) {
+        self.clear_cache();
     }
 }
 
@@ -889,9 +911,9 @@ fn icmp_echo_reply_packet_restores_ipv6_identifier_and_sequence() {
 
 #[tokio::test]
 async fn tun_dispatch_falls_back_to_dest_unreachable_when_outbound_rejects_icmp() {
-    // Hysteria2 outbound's default `listen_icmp` impl returns Err, so
-    // routing ICMP to it exercises the fallback path.
-    let stack = runtime_stack(&options(), "hysteria2");
+    // Block outbound's default `listen_icmp` impl returns Err, so routing
+    // ICMP to it exercises the fallback path.
+    let stack = runtime_stack(&options(), "blocked");
     let request = ipv4_icmp_echo_request([10, 0, 0, 2], [8, 8, 8, 8], 0xbeef, 1, b"ping");
 
     let dispatch = stack

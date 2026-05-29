@@ -1,3 +1,5 @@
+#![cfg(feature = "outbound-direct")]
+
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,13 +12,15 @@ use hammer_adapter::{
     PlatformInterface, ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr,
     TunOptions, WifiState,
 };
-use hammer_core::config::{
-    DirectOutboundOptions, Hysteria2OutboundOptions, Outbound, OutboundKind,
-};
+#[cfg(feature = "outbound-hysteria2")]
+use hammer_core::config::Hysteria2OutboundOptions;
+use hammer_core::config::{DirectOutboundOptions, Outbound, OutboundKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::Lifecycle;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{MetricsRegistry, OutboundManager, outbounds::BlockOutbound};
+#[cfg(feature = "outbound-block")]
+use hammer_runtime::outbounds::BlockOutbound;
+use hammer_runtime::{MetricsRegistry, OutboundManager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -461,6 +465,7 @@ async fn direct_outbound_protects_tcp_and_udp_sockets() {
 }
 
 #[tokio::test]
+#[cfg(feature = "outbound-block")]
 async fn block_outbound_returns_protocol_errors() {
     let manager = OutboundManager::from_options(
         logger("outbound"),
@@ -488,6 +493,7 @@ async fn block_outbound_returns_protocol_errors() {
 }
 
 #[test]
+#[cfg(all(feature = "outbound-block", feature = "outbound-hysteria2"))]
 fn outbound_manager_registers_concrete_m7_outbounds() {
     let manager = OutboundManager::from_options(
         logger("outbound"),
@@ -516,6 +522,7 @@ fn outbound_manager_registers_concrete_m7_outbounds() {
 }
 
 #[test]
+#[cfg(feature = "outbound-block")]
 fn outbound_manager_rejects_duplicate_registered_endpoint_view_id() {
     let manager = OutboundManager::from_options(
         logger("outbound"),

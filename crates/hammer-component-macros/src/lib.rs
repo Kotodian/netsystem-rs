@@ -300,7 +300,7 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                     logger: ::hammer_core::log::Logger,
                     kind: &::hammer_core::config::InboundKind,
                     router: ::std::sync::Arc<crate::Router>,
-                    dns_router: Option<::std::sync::Arc<crate::DnsRouter>>,
+                    dns_router: Option<::std::sync::Arc<crate::inbounds::RuntimeDnsRouter>>,
                     outbound: Option<::std::sync::Arc<crate::OutboundManager>>,
                     platform: Option<::std::sync::Arc<dyn ::hammer_adapter::PlatformInterface>>,
                     metrics: ::std::sync::Arc<::hammer_core::metrics::MetricsRegistry>,

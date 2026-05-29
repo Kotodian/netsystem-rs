@@ -1,23 +1,32 @@
+#[cfg(feature = "outbound-block")]
+use hammer_runtime::protocol::block::BlockOutbound;
+#[cfg(feature = "outbound-direct")]
+use hammer_runtime::protocol::direct::DirectOutbound;
 #[cfg(feature = "endpoint-wireguard")]
 use hammer_runtime::protocol::endpoint::wireguard::WireguardEndpoint;
-use hammer_runtime::{
-    dns::{DnsRouter, DnsTransportManager},
-    endpoints::EndpointManager,
-    inbounds::InboundManager,
-    outbounds::OutboundManager,
-    protocol::{
-        block::BlockOutbound, direct::DirectOutbound, hysteria2::Hysteria2Outbound, tun::TunInbound,
-    },
-    route::Router,
-};
+#[cfg(feature = "outbound-hysteria2")]
+use hammer_runtime::protocol::hysteria2::Hysteria2Outbound;
+use hammer_runtime::{inbounds::InboundManager, outbounds::OutboundManager, route::Router};
+#[cfg(feature = "inbound-tun")]
+use hammer_runtime::{inbounds::RuntimeDnsRouter, protocol::tun::TunInbound};
 
 #[test]
 fn protocol_namespace_exposes_runtime_protocols() {
+    #[cfg(feature = "outbound-block")]
     let _ = std::any::type_name::<BlockOutbound>();
+    #[cfg(feature = "outbound-direct")]
     let _ = std::any::type_name::<DirectOutbound>();
+    #[cfg(feature = "outbound-hysteria2")]
     let _ = std::any::type_name::<Hysteria2Outbound>();
-    let _ =
-        std::any::type_name::<TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>>();
+    #[cfg(feature = "inbound-tun")]
+    let _ = std::any::type_name::<
+        TunInbound<
+            Router,
+            RuntimeDnsRouter,
+            OutboundManager,
+            hammer_runtime::endpoints::EndpointManager,
+        >,
+    >();
 
     #[cfg(feature = "endpoint-wireguard")]
     let _ = std::any::type_name::<WireguardEndpoint>();
@@ -25,10 +34,8 @@ fn protocol_namespace_exposes_runtime_protocols() {
 
 #[test]
 fn domain_namespaces_expose_runtime_managers() {
-    let _ = std::any::type_name::<DnsRouter>();
-    let _ = std::any::type_name::<DnsTransportManager>();
     #[cfg(feature = "endpoint")]
-    let _ = std::any::type_name::<EndpointManager>();
+    let _ = std::any::type_name::<hammer_runtime::endpoints::EndpointManager>();
     let _ = std::any::type_name::<InboundManager>();
     let _ = std::any::type_name::<OutboundManager>();
     let _ = std::any::type_name::<Router>();

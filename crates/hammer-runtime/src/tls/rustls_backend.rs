@@ -1,4 +1,4 @@
-#[cfg(feature = "tls-client")]
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
 use super::client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 use super::client::OutboundClientTlsConfig;
@@ -11,7 +11,7 @@ use super::fragment::FragmentedTcpStream;
 #[cfg(feature = "tls-outbound")]
 use super::material::load_client_auth;
 use super::provider::default_provider;
-#[cfg(feature = "tls-client")]
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
 use super::roots::client_verifier_builder;
 #[cfg(feature = "tls-outbound")]
 use super::verifier::outbound_client_verifier_builder;
@@ -33,7 +33,7 @@ pub(super) static RUSTLS_AWS_LC_BACKEND: RustlsAwsLcBackend = RustlsAwsLcBackend
 
 #[async_trait]
 impl TlsBackend for RustlsAwsLcBackend {
-    #[cfg(feature = "dns-https")]
+    #[cfg(feature = "tls-basic-client")]
     fn tls13_client_config(&self, options: BasicClientTlsConfig) -> HammerResult<ClientConfig> {
         let builder = ClientConfig::builder_with_provider(default_provider())
             .with_protocol_versions(&[&rustls::version::TLS13])

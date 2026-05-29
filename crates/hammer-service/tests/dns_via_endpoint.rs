@@ -20,8 +20,8 @@ use hammer_adapter::{Endpoint, Lifecycle, Outbound, StartStage};
 use hammer_core::config;
 use hammer_core::error::CoreResult;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::dns::MessageExt;
-use hammer_runtime::{DnsTransportManager, OutboundManager, endpoints::EndpointOutboundAdapter};
+use hammer_runtime::{OutboundManager, endpoints::EndpointOutboundAdapter};
+use hammer_service::{DnsTransportManager, dns::MessageExt};
 use hickory_proto::op::{Message, MessageType, OpCode, Query};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use ipnet::{IpNet, Ipv4Net};
@@ -44,7 +44,7 @@ fn dns_query(name: &str) -> Message {
 }
 
 fn fixed_a_response(request: &Message, addr: Ipv4Addr) -> Message {
-    use hammer_runtime::dns::{FixedResponseCode, MessageExt as _};
+    use hammer_service::dns::{FixedResponseCode, MessageExt as _};
     let q = request.queries[0].clone();
     let mut response = request.fixed_response(FixedResponseCode::NoError);
     response.add_answer(Record::from_rdata(

@@ -1,15 +1,18 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use hammer_adapter::{
-    ComponentMetadata, Inbound, InboundComponent, InboundManager as InboundManagerTrait, Lifecycle,
-    PlatformInterface, RuntimeComponent,
+    ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, Inbound, InboundComponent,
+    InboundManager as InboundManagerTrait, Lifecycle, PlatformInterface, RuntimeComponent,
 };
 use hammer_core::config::{Inbound as InboundOptions, InboundKind};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
 use hammer_core::metrics::MetricsRegistry;
+use hickory_proto::op::Message;
 use tracing::debug;
 
 #[cfg(any(
@@ -21,14 +24,69 @@ use tracing::debug;
 use crate::component_registry::register_components;
 #[cfg(feature = "inbound-tun")]
 use crate::protocol::tun;
-use crate::{DnsRouter, OutboundManager, Router, RuntimePlatform};
+use crate::{OutboundManager, Router, RuntimePlatform};
+
+pub struct RuntimeDnsRouter {
+    inner: Arc<dyn DnsRouterTrait>,
+}
+
+impl RuntimeDnsRouter {
+    fn new(inner: Arc<dyn DnsRouterTrait>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Lifecycle for RuntimeDnsRouter {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
+        self.inner.start(stage)
+    }
+
+    fn close(&self) -> HammerResult<()> {
+        self.inner.close()
+    }
+}
+
+#[async_trait(?Send)]
+impl DnsRouterTrait for RuntimeDnsRouter {
+    async fn exchange(&self, message: Message, options: DnsQueryOptions) -> HammerResult<Message> {
+        self.inner.exchange(message, options).await
+    }
+
+    async fn lookup(&self, domain: &str, options: DnsQueryOptions) -> HammerResult<Vec<IpAddr>> {
+        self.inner.lookup(domain, options).await
+    }
+
+    fn try_exchange_fast(
+        &self,
+        message: &Message,
+        options: DnsQueryOptions,
+    ) -> HammerResult<Option<Message>> {
+        self.inner.try_exchange_fast(message, options)
+    }
+
+    fn clear_cache(&self) {
+        self.inner.clear_cache();
+    }
+
+    fn lookup_reverse_mapping(&self, ip: IpAddr) -> Option<String> {
+        self.inner.lookup_reverse_mapping(ip)
+    }
+
+    fn reset_network(&self) {
+        self.inner.reset_network();
+    }
+}
 
 pub(crate) type InboundBuilder = fn(
     String,
     Logger,
     &InboundKind,
     Arc<Router>,
-    Option<Arc<DnsRouter>>,
+    Option<Arc<RuntimeDnsRouter>>,
     Option<Arc<OutboundManager>>,
     Option<Arc<dyn PlatformInterface>>,
     Arc<MetricsRegistry>,
@@ -54,7 +112,7 @@ impl InboundFactorySet {
         logger: Logger,
         option: &InboundOptions,
         router: Arc<Router>,
-        dns_router: Option<Arc<DnsRouter>>,
+        dns_router: Option<Arc<RuntimeDnsRouter>>,
         outbound: Option<Arc<OutboundManager>>,
         platform: Option<Arc<dyn PlatformInterface>>,
         metrics: Arc<MetricsRegistry>,
@@ -157,7 +215,7 @@ impl InboundManager {
         logger: Logger,
         options: &[InboundOptions],
         router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
+        dns_router: Arc<dyn DnsRouterTrait>,
         outbound: Arc<OutboundManager>,
         platform: impl Into<RuntimePlatform>,
     ) -> HammerResult<Self> {
@@ -176,12 +234,13 @@ impl InboundManager {
         logger: Logger,
         options: &[InboundOptions],
         router: Arc<Router>,
-        dns_router: Arc<DnsRouter>,
+        dns_router: Arc<dyn DnsRouterTrait>,
         outbound: Arc<OutboundManager>,
         platform: impl Into<RuntimePlatform>,
         metrics: Arc<MetricsRegistry>,
     ) -> HammerResult<Self> {
         let platform = platform.into().into_inner();
+        let dns_router = Arc::new(RuntimeDnsRouter::new(dns_router));
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(

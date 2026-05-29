@@ -49,7 +49,7 @@ pub(crate) trait InboundComponentDeclaration {
         logger: hammer_core::log::Logger,
         kind: &hammer_core::config::InboundKind,
         router: std::sync::Arc<crate::Router>,
-        dns_router: Option<std::sync::Arc<crate::DnsRouter>>,
+        dns_router: Option<std::sync::Arc<crate::inbounds::RuntimeDnsRouter>>,
         outbound: Option<std::sync::Arc<crate::OutboundManager>>,
         platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
         metrics: std::sync::Arc<hammer_core::metrics::MetricsRegistry>,
@@ -87,41 +87,6 @@ pub(crate) fn register_endpoint_component<C>(
     builders: &mut HashMap<&'static str, crate::endpoints::EndpointBuilder>,
 ) where
     C: EndpointComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
-#[cfg(any(
-    feature = "dns-udp",
-    feature = "dns-tcp",
-    feature = "dns-https",
-    feature = "dns-hosts",
-    feature = "dns-local"
-))]
-pub(crate) trait DnsTransportComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build(
-        id: String,
-        kind: &hammer_core::config::DnsServerKind,
-        logger: hammer_core::log::Logger,
-        outbound: Option<std::sync::Arc<crate::OutboundManager>>,
-        bootstrap: Option<hammer_adapter::dns::DnsTransportComponent>,
-        protector: crate::socket_protector::SocketProtector,
-    ) -> hammer_core::error::HammerResult<hammer_adapter::dns::DnsTransportComponent>;
-}
-
-#[cfg(any(
-    feature = "dns-udp",
-    feature = "dns-tcp",
-    feature = "dns-https",
-    feature = "dns-hosts",
-    feature = "dns-local"
-))]
-pub(crate) fn register_dns_transport_component<C>(
-    builders: &mut HashMap<&'static str, crate::dns::DnsTransportBuilder>,
-) where
-    C: DnsTransportComponentDeclaration,
 {
     builders.insert(C::TYPE_NAME, C::build);
 }
@@ -187,9 +152,6 @@ macro_rules! register_components {
     };
     (endpoint, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_endpoint_component::<$component>($builders);)*
-    };
-    (dns_transport, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_dns_transport_component::<$component>($builders);)*
     };
     (router, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_router_component::<$component>($builders);)*

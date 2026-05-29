@@ -225,6 +225,7 @@ impl Hysteria2Outbound {
         })
     }
 
+    #[cfg(feature = "probe")]
     pub(super) async fn resolve_probe_server(&self) -> HammerResult<SocketAddr> {
         resolve_server(&self.options.server, self.options.server_port).await
     }

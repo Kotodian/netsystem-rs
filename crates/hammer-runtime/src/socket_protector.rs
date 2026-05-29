@@ -29,23 +29,21 @@ impl From<Arc<dyn PlatformInterface>> for RuntimePlatform {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Default)]
-pub(crate) struct SocketProtector {
+pub struct SocketProtector {
     platform: Option<Arc<dyn PlatformInterface>>,
 }
 
-#[allow(dead_code)]
 impl SocketProtector {
-    pub(crate) fn new(platform: impl Into<Self>) -> Self {
+    pub fn new(platform: impl Into<Self>) -> Self {
         platform.into()
     }
 
-    pub(crate) fn platform(&self) -> Option<Arc<dyn PlatformInterface>> {
+    pub fn platform(&self) -> Option<Arc<dyn PlatformInterface>> {
         self.platform.clone()
     }
 
-    pub(crate) fn protect<T: AsRawFd>(&self, socket: &T) -> HammerResult<()> {
+    pub fn protect<T: AsRawFd>(&self, socket: &T) -> HammerResult<()> {
         let Some(platform) = &self.platform else {
             return Ok(());
         };

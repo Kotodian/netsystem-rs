@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
@@ -26,13 +28,10 @@ pub use probe::HttpUrltestProbe;
 
 const TCP_AND_UDP: [Network; 2] = [Network::Tcp, Network::Udp];
 
-/// Latency sample for one child outbound. `at` lets future ticker variants
-/// reason about cache freshness; V1 only uses the most recent sample.
+/// Latency sample for one child outbound.
 #[derive(Clone, Copy)]
 struct Sample {
     delay: Duration,
-    #[allow(dead_code)]
-    at: Instant,
 }
 
 /// Mutable urltest state. The outer `Mutex` is taken only for short
@@ -169,17 +168,12 @@ impl UrltestOutbound {
         // Update history and re-pick selected outbounds. Mutex is taken
         // synchronously and dropped before the function returns.
         let mut state = self.state.lock().expect("urltest state poisoned");
-        let now = Instant::now();
         for sample in &samples {
             match &sample.result {
                 Ok(delay) => {
-                    state.history.insert(
-                        sample.id.clone(),
-                        Sample {
-                            delay: *delay,
-                            at: now,
-                        },
-                    );
+                    state
+                        .history
+                        .insert(sample.id.clone(), Sample { delay: *delay });
                 }
                 Err(_) => {
                     state.history.remove(&sample.id);
@@ -490,7 +484,6 @@ mod tests {
             SocketProtector::default(),
         )
         .expect("urltest outbound");
-        let now = Instant::now();
         let state = UrltestState {
             selected_tcp: Some("current".to_owned()),
             selected_udp: None,
@@ -499,14 +492,12 @@ mod tests {
                     "current".to_owned(),
                     Sample {
                         delay: Duration::from_millis(100),
-                        at: now,
                     },
                 ),
                 (
                     "candidate".to_owned(),
                     Sample {
                         delay: Duration::from_millis(50),
-                        at: now,
                     },
                 ),
             ]),

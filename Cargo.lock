@@ -1353,11 +1353,25 @@ dependencies = [
 name = "hammer-service"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
+ "bytes",
+ "hammer-adapter",
+ "hammer-component-macros",
  "hammer-control",
  "hammer-core",
  "hammer-runtime",
+ "hickory-proto",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "lru 0.18.0",
+ "rustls",
+ "smoltcp",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

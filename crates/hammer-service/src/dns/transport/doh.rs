@@ -16,8 +16,8 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio_rustls::TlsConnector;
 
 use crate::OutboundManager;
-use crate::socket_protector::SocketProtector;
-use crate::tls::{BasicClientTlsConfig, tls13_client_config};
+use hammer_runtime::SocketProtector;
+use hammer_runtime::tls::{BasicClientTlsConfig, tls13_client_config};
 
 use super::{
     dependency_with_bootstrap, destination_via_bootstrap, direct_tcp_connect, host_header,
@@ -179,7 +179,7 @@ async fn doh_exchange_http2(
     let (mut sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
         .await
         .map_err(|err| HammerError::internal(format!("start HTTPS DNS h2: {err}")))?;
-    crate::spawn::spawn(async move {
+    hammer_runtime::spawn::spawn(async move {
         let _ = connection.await;
     });
     let request = Request::post(path)

@@ -12,7 +12,7 @@ use hammer_core::protocol::dns::{
 use hickory_proto::op::Message;
 
 use crate::OutboundManager;
-use crate::socket_protector::SocketProtector;
+use hammer_runtime::SocketProtector;
 
 use super::{
     dependency_with_bootstrap, destination_via_bootstrap, direct_tcp_connect, outbound_by_id,

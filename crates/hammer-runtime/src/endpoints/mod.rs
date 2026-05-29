@@ -74,7 +74,7 @@ fn register_standard_endpoint_builders(builders: &mut HashMap<&'static str, Endp
 }
 
 pub struct EndpointManager {
-    #[cfg_attr(not(feature = "endpoint-wireguard"), allow(dead_code))]
+    #[cfg(feature = "endpoint-wireguard")]
     logger: Logger,
     items: Mutex<HashMap<String, EndpointComponent>>,
     #[cfg(feature = "endpoint-wireguard")]
@@ -83,7 +83,10 @@ pub struct EndpointManager {
 
 impl EndpointManager {
     pub fn new(logger: Logger) -> Self {
+        #[cfg(not(feature = "endpoint-wireguard"))]
+        let _ = logger;
         Self {
+            #[cfg(feature = "endpoint-wireguard")]
             logger,
             items: Mutex::new(HashMap::new()),
             #[cfg(feature = "endpoint-wireguard")]

@@ -35,7 +35,7 @@ use tracing::debug;
 #[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
 use crate::OutboundManager;
 #[cfg(any(feature = "dns-tcp", feature = "dns-https"))]
-use crate::socket_protector::SocketProtector;
+use hammer_runtime::SocketProtector;
 
 #[cfg(feature = "dns-udp")]
 const DNS_UDP_VIA_RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -53,22 +53,10 @@ pub(super) async fn resolve_first(server: &str, port: u16) -> HammerResult<Socke
         .ok_or_else(|| HammerError::internal(format!("resolve DNS server {server}: empty result")))
 }
 
-// Subsumed by `destination_via_bootstrap`; left in place for direct callers
-// that don't need bootstrap-aware resolution.
-#[cfg(any(feature = "dns-udp", feature = "dns-tcp", feature = "dns-https"))]
-#[allow(dead_code)]
-pub(super) fn server_destination(server: &str, port: u16) -> SocksAddr {
-    if let Ok(ip) = server.parse::<IpAddr>() {
-        SocksAddr::ip(ip, port)
-    } else {
-        SocksAddr::domain(server, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
-    }
-}
-
 /// Resolve `server` into a `SocksAddr` suitable for handing to an outbound's
-/// dial / packet send. IP literal → returned directly. Domain → if a
-/// `bootstrap` DNS transport is configured, query it for an A record and
-/// return an IP-resolved `SocksAddr`. With no bootstrap, fall back to a
+/// dial / packet send. IP literals are returned directly. Domain names use a
+/// configured `bootstrap` DNS transport to query an A record and return an
+/// IP-resolved `SocksAddr`. With no bootstrap, fall back to a
 /// domain `SocksAddr` (host field unspecified) — direct outbounds can still
 /// resolve domains themselves; outbounds that require IPs (wireguard) will
 /// reject it, but the config validator should already have caught that case
@@ -203,7 +191,7 @@ async fn udp_exchange_via_with_timeout(
     debug!("dns udp via outbound={via} packet conn ready");
     let mut metadata = hammer_adapter::RouteMetadata::default();
     metadata.destination = Some(destination.clone());
-    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
+    let runtime = hammer_runtime::spawn::with_data_plane_buffers(Clone::clone);
     let mut request = runtime.alloc_pooled_frame()?;
     let request_index = runtime.alloc_index_with_bytes(metadata, payload)?;
     if let Err(err) = request.push_index(request_index) {
@@ -364,7 +352,10 @@ mod tests {
 
     #[tokio::test]
     async fn udp_exchange_via_times_out_and_resets_outbound() {
-        let manager = Arc::new(crate::OutboundManager::new(logger("outbound"), "proxy"));
+        let manager = Arc::new(hammer_runtime::OutboundManager::new(
+            logger("outbound"),
+            "proxy",
+        ));
         let outbound = Arc::new(HangingOutbound::default());
         manager
             .register_outbound(hanging_outbound_component(Arc::clone(&outbound)))

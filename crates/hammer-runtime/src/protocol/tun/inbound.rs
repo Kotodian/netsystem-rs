@@ -19,7 +19,8 @@ use hammer_core::metrics::MetricsRegistry;
 
 use super::stack::*;
 
-use crate::{DnsRouter, EndpointManager, OutboundManager, Router};
+use crate::inbounds::RuntimeDnsRouter;
+use crate::{EndpointManager, OutboundManager, Router};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
@@ -27,7 +28,8 @@ type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 type PlatformTunDevice = AsyncTunDevice;
 
-pub(crate) type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
+pub(crate) type RuntimeTunInbound =
+    TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
 
 #[hammer_component_macros::hammer_component(
     inbound,
@@ -314,7 +316,7 @@ pub(crate) fn build_inbound(
     logger: Logger,
     kind: &InboundKind,
     router: Arc<Router>,
-    dns_router: Option<Arc<DnsRouter>>,
+    dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     platform: Option<Arc<dyn PlatformInterface>>,
     metrics: Arc<MetricsRegistry>,

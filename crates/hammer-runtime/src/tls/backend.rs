@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use rustls::ClientConfig;
 
-#[cfg(feature = "tls-client")]
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
 use super::client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 use super::client::OutboundClientTlsConfig;
@@ -15,7 +15,7 @@ use tokio::net::TcpStream;
 
 #[async_trait]
 pub(super) trait TlsBackend: Sync {
-    #[cfg(feature = "dns-https")]
+    #[cfg(feature = "tls-basic-client")]
     fn tls13_client_config(&self, options: BasicClientTlsConfig) -> HammerResult<ClientConfig>;
 
     #[cfg(feature = "outbound-urltest")]

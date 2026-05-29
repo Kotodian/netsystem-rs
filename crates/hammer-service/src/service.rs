@@ -16,28 +16,31 @@ use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::EndpointManager;
 #[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
-#[cfg(feature = "endpoint")]
-use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
 use hammer_runtime::adapter::{
-    Lifecycle, NetworkManager as _, OutboundManager as _, PlatformInterface, ProbeReport,
+    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, OutboundManager as _,
+    PlatformInterface, ProbeReport,
 };
 #[cfg(feature = "endpoint")]
+use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
+#[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
+#[cfg(feature = "endpoint")]
+use hammer_runtime::inbounds::RuntimeDnsRouter;
 use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
-    ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, DnsRouter,
-    DnsTransportManager, EventSubscriberBuilder, InboundManager, MetricSample, MetricsRegistry,
-    OutboundManager, Router,
+    ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, EventSubscriberBuilder,
+    InboundManager, MetricSample, MetricsRegistry, OutboundManager, Router,
 };
 use std::time::Duration;
 
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
+use crate::{DnsRouter, DnsTransportManager};
 
 #[cfg(feature = "endpoint")]
-type RuntimeTunInbound = TunInbound<Router, DnsRouter, OutboundManager, EndpointManager>;
+type RuntimeTunInbound = TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;
@@ -251,7 +254,8 @@ impl RuntimeService {
                 Arc::clone(&dns_transport),
                 options.dns.strategy,
             )
-            .with_rules(&options.dns.rules)?,
+            .with_rules(&options.dns.rules)?
+            .with_control_handle(Arc::clone(&control_handle))?,
         );
         #[cfg(feature = "endpoint")]
         let router = Arc::new(Router::from_options_with_metrics_and_endpoint_ids(
@@ -268,11 +272,12 @@ impl RuntimeService {
             Arc::clone(&outbound),
             Arc::clone(&metrics),
         )?);
+        let inbound_dns_router: Arc<dyn AdapterDnsRouter> = dns_router.clone();
         let inbound = Arc::new(InboundManager::from_options_with_runtime_and_metrics(
             new_logger(&log_factory, "inbound"),
             &options.inbounds,
             Arc::clone(&router),
-            Arc::clone(&dns_router),
+            inbound_dns_router,
             Arc::clone(&outbound),
             Arc::clone(&platform),
             Arc::clone(&metrics),

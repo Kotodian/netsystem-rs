@@ -23,6 +23,7 @@ tls = [
     "dep:rustls-platform-verifier",
 ]
 tls-client = ["tls"]
+tls-basic-client = ["tls-client"]
 tls-outbound = ["tls", "hammer-core/tls", "dep:hickory-resolver"]
 tls-outbound-stream = ["tls-outbound", "dep:tokio-rustls"]
 tls-quic = ["tls-outbound", "dep:quinn"]
@@ -61,18 +62,6 @@ outbound-urltest = [
     "dep:tokio-rustls",
     "dep:url",
 ]
-dns-udp = ["dns-tcp"]
-dns-tcp = []
-dns-https = [
-    "tls-client",
-    "dep:http",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-util",
-    "dep:tokio-rustls",
-]
-dns-hosts = []
-dns-local = []
 # Enables the generic L3 endpoint domain (Endpoint trait, manager, packet-loop
 # fast path). Concrete endpoint protocols opt into this parent feature.
 endpoint = ["inbound-tun", "hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]

@@ -18,16 +18,16 @@ mod utls;
 #[cfg(feature = "tls-outbound")]
 mod verifier;
 
-#[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
-pub(crate) use client::BasicClientTlsConfig;
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
+pub use client::BasicClientTlsConfig;
 #[cfg(feature = "tls-outbound")]
 pub(crate) use client::OutboundClientTlsConfig;
 #[cfg(all(feature = "tls-quic", feature = "outbound-hysteria2"))]
 pub(crate) use client::outbound_quic_client_config;
 #[cfg(feature = "outbound-urltest")]
 pub(crate) use client::safe_default_client_config;
-#[cfg(feature = "dns-https")]
-pub(crate) use client::tls13_client_config;
+#[cfg(feature = "tls-basic-client")]
+pub use client::tls13_client_config;
 #[cfg(feature = "tls-outbound-stream")]
 pub(crate) use client::{TlsClientStream, outbound_client_stream};
 #[cfg(any(feature = "outbound-hysteria2", feature = "outbound-vless"))]

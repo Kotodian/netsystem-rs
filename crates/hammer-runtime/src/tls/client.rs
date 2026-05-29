@@ -23,7 +23,7 @@ use hammer_core::config::{CertificateFingerprint, ClientTlsAuth, EchOptions, Utl
 ))]
 use hammer_core::error::HammerError;
 use hammer_core::error::HammerResult;
-#[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
 use rustls::ClientConfig;
 #[cfg(feature = "tls-outbound-stream")]
 use rustls::pki_types::ServerName;
@@ -41,14 +41,14 @@ use super::backend::utls_backend;
 #[cfg(feature = "tls-utls-stream")]
 use super::ech::EchRetryConfigStore;
 
-#[cfg(any(feature = "dns-https", feature = "outbound-urltest"))]
-pub(crate) struct BasicClientTlsConfig {
+#[cfg(any(feature = "tls-basic-client", feature = "outbound-urltest"))]
+pub struct BasicClientTlsConfig {
     pub platform: Option<Arc<dyn PlatformInterface>>,
     pub alpn_protocols: Vec<Vec<u8>>,
 }
 
-#[cfg(feature = "dns-https")]
-pub(crate) fn tls13_client_config(options: BasicClientTlsConfig) -> HammerResult<ClientConfig> {
+#[cfg(feature = "tls-basic-client")]
+pub fn tls13_client_config(options: BasicClientTlsConfig) -> HammerResult<ClientConfig> {
     default_backend().tls13_client_config(options)
 }
 

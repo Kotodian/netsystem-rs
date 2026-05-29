@@ -26,7 +26,6 @@ pub fn install_default_crypto_provider() {}
 mod component_registry;
 mod control_thread;
 mod data_plane;
-pub mod dns;
 pub mod endpoints;
 pub mod inbounds;
 mod macros;
@@ -36,7 +35,7 @@ pub mod route;
 mod socket_protector;
 pub mod spawn;
 #[cfg(any(
-    feature = "dns-https",
+    feature = "tls-basic-client",
     feature = "outbound-urltest",
     feature = "tls-outbound",
     feature = "tls-quic"
@@ -81,7 +80,6 @@ pub use control_thread::{
     ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
     ControlThread, ControlThreadHandle, ControlTimerHandle, EventSubscriberBuilder, LogEventArgs,
 };
-pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
@@ -94,4 +92,4 @@ pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use route::Router;
-pub use socket_protector::RuntimePlatform;
+pub use socket_protector::{RuntimePlatform, SocketProtector};

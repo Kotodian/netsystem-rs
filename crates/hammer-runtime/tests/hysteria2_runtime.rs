@@ -1,3 +1,5 @@
+#![cfg(feature = "outbound-hysteria2")]
+
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

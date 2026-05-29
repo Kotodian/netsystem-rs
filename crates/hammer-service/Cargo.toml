@@ -20,7 +20,7 @@ default = [
     "dns-local",
     "probe",
 ]
-probe = ["hammer-runtime/probe", "dep:async-trait"]
+probe = ["hammer-runtime/probe"]
 inbound-tun = ["hammer-runtime/inbound-tun"]
 inbound-socks = ["hammer-runtime/inbound-socks"]
 inbound-http = ["hammer-runtime/inbound-http"]
@@ -37,19 +37,44 @@ outbound-vless = ["hammer-runtime/outbound-vless"]
 outbound-direct = ["hammer-runtime/outbound-direct"]
 outbound-block = ["hammer-runtime/outbound-block"]
 outbound-urltest = ["hammer-runtime/outbound-urltest"]
-dns-udp = ["hammer-runtime/dns-udp"]
-dns-tcp = ["hammer-runtime/dns-tcp"]
-dns-https = ["hammer-runtime/dns-https"]
-dns-hosts = ["hammer-runtime/dns-hosts"]
-dns-local = ["hammer-runtime/dns-local"]
+dns-udp = ["dns-tcp", "dep:bytes"]
+dns-tcp = []
+dns-https = [
+    "hammer-runtime/tls-basic-client",
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:rustls",
+    "dep:tokio-rustls",
+]
+dns-hosts = []
+dns-local = []
 endpoint = ["hammer-runtime/endpoint"]
 endpoint-wireguard = ["hammer-runtime/endpoint-wireguard"]
 endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
 
 [dependencies]
-async-trait = { workspace = true, optional = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
 hammer-control = { path = "../hammer-control" }
+hammer-adapter = { path = "../hammer-adapter" }
+hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
+hickory-proto = { workspace = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+lru = { workspace = true }
+rustls = { workspace = true, optional = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+ipnet = { workspace = true }
+smoltcp = { workspace = true }

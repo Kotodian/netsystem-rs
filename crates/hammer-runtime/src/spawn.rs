@@ -37,13 +37,6 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(any(
-    feature = "dns-udp",
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-tun",
-    test
-))]
 use hammer_adapter::DataPlaneBuffers;
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
@@ -683,14 +676,7 @@ pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime
     DATA_PLANE_RUNTIME.with(f)
 }
 
-#[cfg(any(
-    feature = "dns-udp",
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-tun",
-    test
-))]
-pub(crate) fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
+pub fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
     DATA_PLANE_RUNTIME.with(|runtime| f(runtime.packet_buffers()))
 }
 

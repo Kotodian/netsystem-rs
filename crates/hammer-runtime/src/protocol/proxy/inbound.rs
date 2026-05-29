@@ -24,7 +24,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use crate::{DnsRouter, OutboundManager, Router};
+use crate::inbounds::RuntimeDnsRouter;
+use crate::{OutboundManager, Router};
 
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_RELAY_CHANNEL_CAPACITY: usize = 128;
@@ -212,7 +213,7 @@ pub(crate) fn build_socks_inbound(
     _logger: Logger,
     kind: &InboundKind,
     router: Arc<Router>,
-    _dns_router: Option<Arc<DnsRouter>>,
+    _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
     _metrics: Arc<MetricsRegistry>,
@@ -238,7 +239,7 @@ pub(crate) fn build_http_inbound(
     _logger: Logger,
     kind: &InboundKind,
     router: Arc<Router>,
-    _dns_router: Option<Arc<DnsRouter>>,
+    _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
     _metrics: Arc<MetricsRegistry>,
@@ -262,7 +263,7 @@ pub(crate) fn build_mixed_inbound(
     _logger: Logger,
     kind: &InboundKind,
     router: Arc<Router>,
-    _dns_router: Option<Arc<DnsRouter>>,
+    _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
     _metrics: Arc<MetricsRegistry>,
