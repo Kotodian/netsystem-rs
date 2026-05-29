@@ -37,6 +37,8 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hammer_adapter::DataPlaneBuffers;
+
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::runtime::Handle;
@@ -620,6 +622,10 @@ pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime
     DATA_PLANE_RUNTIME.with(f)
 }
 
+pub(crate) fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
+    DATA_PLANE_RUNTIME.with(|runtime| f(runtime.packet_buffers()))
+}
+
 fn current_data_context() -> Option<DataRuntimeContext> {
     TASK_DATA_CONTEXT
         .try_with(Clone::clone)
@@ -921,7 +927,7 @@ mod tests {
             driver.block_on(async {
                 spawn(async {
                     spawn_local(|| async {
-                        let runtime = with_data_plane_runtime(Clone::clone);
+                        let runtime = with_data_plane_buffers(Clone::clone);
                         let frame = std::rc::Rc::new(RefCell::new(
                             runtime.alloc_pooled_frame().expect("alloc pooled frame"),
                         ));

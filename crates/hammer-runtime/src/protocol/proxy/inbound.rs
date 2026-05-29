@@ -848,7 +848,7 @@ async fn handle_socks5_udp_associate(
     let timeout = options.listen.udp_timeout.unwrap_or(DEFAULT_UDP_TIMEOUT);
     let mut buf = vec![0_u8; 64 * 1024];
     let mut client_addr = None;
-    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
     loop {
         tokio::select! {
             result = socket.recv_from(&mut buf) => {
@@ -1022,7 +1022,7 @@ fn spawn_udp_relay(
     response_tx: mpsc::Sender<UdpRelayResponse>,
 ) {
     crate::spawn::spawn_current_local(async move {
-        let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+        let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
         let mut outbound_frame = match runtime.alloc_pooled_frame() {
             Ok(frame) => frame,
             Err(err) => {

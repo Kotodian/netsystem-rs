@@ -203,7 +203,7 @@ async fn udp_exchange_via_with_timeout(
     debug!("dns udp via outbound={via} packet conn ready");
     let mut metadata = hammer_adapter::RouteMetadata::default();
     metadata.destination = Some(destination.clone());
-    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
     let mut request = runtime.alloc_pooled_frame()?;
     let request_index = runtime.alloc_index_with_bytes(metadata, payload)?;
     if let Err(err) = request.push_index(request_index) {

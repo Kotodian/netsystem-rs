@@ -2145,7 +2145,7 @@ where
                 })
             }
             Network::Udp => {
-                let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+                let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
                 let mut packet = outbound.listen_packet().await?;
                 let mut metadata = tun_packet.metadata.clone();
                 metadata.destination = Some(destination);
@@ -3921,7 +3921,7 @@ where
         return Ok(());
     }
 
-    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
     let metadata = RouteMetadata {
         inbound: inbound_id,
         network: Network::Udp,
@@ -4161,7 +4161,7 @@ fn try_enqueue_existing_udp_flow(
         return Ok(false);
     };
 
-    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
     let metadata = RouteMetadata {
         inbound: inbound_id.to_owned(),
         network: Network::Udp,
@@ -4544,7 +4544,7 @@ async fn system_udp_flow_loop(
             return;
         }
     };
-    let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+    let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
     let mut outbound_frame = match runtime.alloc_pooled_frame() {
         Ok(frame) => frame,
         Err(err) => {
@@ -7254,7 +7254,7 @@ final = "direct"
         assert_eq!(router.match_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             {
-                let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+                let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
                 let buffer = timeout(Duration::from_millis(50), rx.recv())
                     .await
                     .expect("flow payload")
@@ -7278,7 +7278,7 @@ final = "direct"
             destination: (parsed.destination.host, parsed.destination.port),
         };
         let (tx, mut rx) = mpsc::channel(1);
-        let runtime = crate::spawn::with_data_plane_runtime(Clone::clone);
+        let runtime = crate::spawn::with_data_plane_buffers(Clone::clone);
         let queued = runtime
             .alloc_index_with_bytes(RouteMetadata::default(), b"queued")
             .expect("alloc queued UDP payload");
