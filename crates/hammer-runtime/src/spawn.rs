@@ -245,6 +245,60 @@ impl DataRuntimeContext {
         }
     }
 
+    pub(crate) fn for_each_worker<F, R>(&self, f: F) -> HammerResult<Vec<R>>
+    where
+        F: Fn(usize) -> R + Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        let f = Arc::new(f);
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (index, worker) in self.inner.workers.iter().cloned().enumerate() {
+            let tx = tx.clone();
+            let f = Arc::clone(&f);
+            let context = self.clone();
+            drop(
+                worker
+                    .handle
+                    .spawn(TASK_DATA_CONTEXT.scope(context, async move {
+                        let _ = tx.send((index, f(index)));
+                    })),
+            );
+        }
+        drop(tx);
+
+        let mut results = (0..self.inner.workers.len())
+            .map(|_| None)
+            .collect::<Vec<_>>();
+        for _ in 0..results.len() {
+            let (index, result) = rx.recv().map_err(|err| {
+                HammerError::internal(format!("receive data worker initializer result: {err}"))
+            })?;
+            let slot = results.get_mut(index).ok_or_else(|| {
+                HammerError::internal(format!(
+                    "data worker initializer index out of range: {index}"
+                ))
+            })?;
+            if slot.is_some() {
+                return Err(HammerError::internal(format!(
+                    "duplicate data worker initializer result: {index}"
+                )));
+            }
+            *slot = Some(result);
+        }
+
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.ok_or_else(|| {
+                    HammerError::internal(format!(
+                        "missing data worker initializer result: {index}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
     fn first_handle(&self) -> &Handle {
         &self.inner.workers[0].handle
     }
@@ -694,6 +748,35 @@ mod tests {
         assert!(
             names.iter().any(|name| name == "spawn-test-data-1"),
             "{names:?}"
+        );
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_context_runs_initializer_on_each_worker() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-init", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+
+        let mut names = context
+            .for_each_worker(|index| {
+                let name = thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                (index, name)
+            })
+            .expect("run worker initializer");
+        names.sort();
+
+        assert_eq!(
+            names,
+            vec![
+                (0, "spawn-test-init-0".to_owned()),
+                (1, "spawn-test-init-1".to_owned()),
+            ]
         );
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));

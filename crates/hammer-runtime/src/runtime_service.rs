@@ -75,6 +75,13 @@ fn debug_assert_lifecycle_order(lifecycles: &[Arc<dyn Lifecycle>]) {
     }
 }
 
+fn initialize_data_workers(data_context: &DataRuntimeContext) -> HammerResult<()> {
+    let _: Vec<usize> = data_context.for_each_worker(|_| {
+        crate::spawn::with_data_plane_runtime(|runtime| runtime.nodes().pending_len())
+    })?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceState {
     NotStarted,
@@ -138,6 +145,10 @@ impl RuntimeService {
             DATA_MAX_BLOCKING_THREADS,
         )?;
         let data_context = data_runtime.context();
+        if let Err(err) = initialize_data_workers(&data_context) {
+            data_runtime.shutdown_timeout(DATA_SHUTDOWN_TIMEOUT);
+            return Err(err);
+        }
         let writer: Arc<dyn LogWriter> = if options.log.disabled {
             Arc::new(DiscardWriter)
         } else {
