@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, Network,
-    NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
+    BufferFrame, ComponentMeta, DataPlaneBuffers, DataPlaneRuntime, DefaultInterfaceUpdateListener,
+    Network, NetworkInterface, Outbound as AdapterOutbound, OutboundComponent, PlatformInterface,
     ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, TunOptions,
     WifiState,
 };
@@ -218,7 +218,7 @@ struct RecordingPacketConn {
 impl ProxyPacketConn for RecordingPacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> Result<(), HammerError> {
         for index in frame.drain_indices() {
@@ -241,7 +241,7 @@ impl ProxyPacketConn for RecordingPacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> Result<(), HammerError> {

@@ -4,7 +4,7 @@ use std::{io, pin::Pin};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Outbound, ProxyPacketConn, ProxyStream, RouteMetadata,
+    BufferFrame, DataPlaneBuffers, Network, Outbound, ProxyPacketConn, ProxyStream, RouteMetadata,
     SocksAddr,
 };
 use hammer_core::config::{OutboundKind, VlessOutboundOptions};
@@ -280,7 +280,7 @@ impl VlessPacketConn {
 impl ProxyPacketConn for VlessPacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> HammerResult<()> {
         let mut result = Ok(());
@@ -313,7 +313,7 @@ impl ProxyPacketConn for VlessPacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> HammerResult<()> {

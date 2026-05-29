@@ -28,9 +28,9 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use async_trait::async_trait;
 use bytes::Bytes;
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, DataPlaneRuntime,
-    Endpoint, EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
-    RouteMetadata, SocksAddr,
+    BufferFrame, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, DataPlaneBuffers,
+    DataPlaneRuntime, Endpoint, EndpointLocalFlow, Network, Outbound, ProxyIcmpConn,
+    ProxyPacketConn, ProxyStream, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
@@ -506,7 +506,7 @@ impl Drop for EndpointUdpConn {
 impl ProxyPacketConn for EndpointUdpConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> CoreResult<()> {
         let mut result = Ok(());
@@ -529,7 +529,7 @@ impl ProxyPacketConn for EndpointUdpConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> CoreResult<()> {
@@ -779,7 +779,7 @@ mod tests {
 
     async fn send_packet(
         conn: &mut dyn ProxyPacketConn,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         destination: SocksAddr,
         payload: &[u8],
     ) -> CoreResult<()> {
@@ -799,7 +799,7 @@ mod tests {
 
     async fn recv_packet(
         conn: &mut dyn ProxyPacketConn,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
     ) -> CoreResult<TestDatagram> {
         let mut frame = runtime.alloc_pooled_frame()?;
         if let Err(err) = conn.recv(runtime, &mut frame, 1).await {

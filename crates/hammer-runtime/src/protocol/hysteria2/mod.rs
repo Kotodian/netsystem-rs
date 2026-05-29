@@ -13,7 +13,7 @@ use bytes::Bytes;
 use futures::future;
 use h3::client;
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Outbound, PlatformInterface, ProxyPacketConn,
+    BufferFrame, DataPlaneBuffers, Network, Outbound, PlatformInterface, ProxyPacketConn,
     ProxyStream, RouteMetadata, SocksAddr,
 };
 use hammer_core::config::{
@@ -434,7 +434,7 @@ struct Hysteria2Datagram {
 impl ProxyPacketConn for Hysteria2PacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> HammerResult<()> {
         let mut result = Ok(());
@@ -480,7 +480,7 @@ impl ProxyPacketConn for Hysteria2PacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> HammerResult<()> {
@@ -1375,7 +1375,10 @@ mod tests {
         let mut packet = client.listen_udp().await.expect("open UDP session");
 
         client.close(b"simulate suspended connection loss");
-        let runtime = hammer_adapter::DataPlaneRuntime::with_buffer_capacity(2048, 8);
+        let runtime =
+            hammer_adapter::DataPlaneRuntime::<hammer_adapter::NoopNode>::with_buffer_capacity(
+                2048, 8,
+            );
         let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let err = tokio::time::timeout(
             Duration::from_millis(200),

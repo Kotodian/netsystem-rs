@@ -4,7 +4,7 @@ use tracing::info;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
+    BufferFrame, DataPlaneBuffers, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
     RouteMetadata, SocksAddr,
 };
 use hammer_core::config::OutboundKind;
@@ -154,7 +154,7 @@ impl DirectPacketConn {
 impl ProxyPacketConn for DirectPacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> HammerResult<()> {
         let mut result = Ok(());
@@ -182,7 +182,7 @@ impl ProxyPacketConn for DirectPacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> HammerResult<()> {
@@ -228,7 +228,7 @@ fn bind_udp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> HammerResult
 }
 
 fn push_datagram_from_recv(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneBuffers,
     frame: &mut BufferFrame,
     result: std::io::Result<(usize, SocketAddr)>,
     buf: &[u8],

@@ -289,7 +289,7 @@ mod tests {
 
     use async_trait::async_trait;
     use hammer_adapter::{
-        BufferFrame, ComponentMeta, DataPlaneRuntime, Network, Outbound, ProxyPacketConn,
+        BufferFrame, ComponentMeta, DataPlaneBuffers, Network, Outbound, ProxyPacketConn,
         ProxyStream, RuntimeComponent,
     };
     use hammer_core::log::{DiscardWriter, Factory, Logger};
@@ -329,7 +329,7 @@ mod tests {
     impl ProxyPacketConn for HangingPacketConn {
         async fn send(
             &mut self,
-            runtime: &DataPlaneRuntime,
+            runtime: &DataPlaneBuffers,
             frame: &mut BufferFrame,
         ) -> HammerResult<()> {
             runtime.free_frame(frame);
@@ -338,7 +338,7 @@ mod tests {
 
         async fn recv(
             &mut self,
-            _runtime: &DataPlaneRuntime,
+            _runtime: &DataPlaneBuffers,
             _frame: &mut BufferFrame,
             _max: usize,
         ) -> HammerResult<()> {

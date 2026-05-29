@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, ComponentMetadata, DataPlaneRuntime, IcmpReply, Lifecycle, Network,
+    BufferFrame, ComponentMeta, ComponentMetadata, DataPlaneBuffers, IcmpReply, Lifecycle, Network,
     Outbound, OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport,
     ProxyIcmpConn, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
@@ -569,7 +569,7 @@ struct InstrumentedPacketConn {
 impl ProxyPacketConn for InstrumentedPacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> HammerResult<()> {
         match self.inner.send(runtime, frame).await {
@@ -583,7 +583,7 @@ impl ProxyPacketConn for InstrumentedPacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> HammerResult<()> {

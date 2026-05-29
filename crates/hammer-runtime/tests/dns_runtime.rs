@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    BufferFrame, ComponentMeta, DataPlaneRuntime, DefaultInterfaceUpdateListener, DnsQueryOptions,
+    BufferFrame, ComponentMeta, DataPlaneBuffers, DefaultInterfaceUpdateListener, DnsQueryOptions,
     DnsTransport, DnsTransportComponent, Lifecycle, Network, NetworkInterface,
     Outbound as AdapterOutbound, OutboundComponent, OutboundManager as _, PlatformInterface,
     ProxyPacketConn, ProxyStream, RouteMetadata, RuntimeComponent, SocksAddr, StartStage,
@@ -254,7 +254,7 @@ impl AdapterOutbound for CapturingOutbound {
 impl ProxyPacketConn for CapturingPacketConn {
     async fn send(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
     ) -> Result<(), HammerError> {
         let index = frame
@@ -279,7 +279,7 @@ impl ProxyPacketConn for CapturingPacketConn {
 
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         _max: usize,
     ) -> Result<(), HammerError> {

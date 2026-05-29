@@ -9,7 +9,7 @@ use hammer_core::lifecycle::Lifecycle;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::RuntimeComponent;
-use crate::buffer::{BufferFrame, DataPlaneRuntime};
+use crate::buffer::{BufferFrame, DataPlaneBuffers};
 use crate::dialer::Network;
 use crate::rule::SocksAddr;
 
@@ -21,11 +21,11 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Send + Unpin + 'stat
 
 #[async_trait(?Send)]
 pub trait ProxyPacketConn: 'static {
-    async fn send(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame)
+    async fn send(&mut self, runtime: &DataPlaneBuffers, frame: &mut BufferFrame)
     -> CoreResult<()>;
     async fn recv(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneBuffers,
         frame: &mut BufferFrame,
         max: usize,
     ) -> CoreResult<()>;
@@ -152,6 +152,8 @@ pub trait OutboundManager: Lifecycle {
 mod tests {
     use super::*;
     use crate::RouteMetadata;
+    use crate::buffer::DataPlaneRuntime;
+    use crate::node::NoopNode;
 
     struct CapturePacketConn {
         last: Option<Vec<u8>>,
@@ -161,7 +163,7 @@ mod tests {
     impl ProxyPacketConn for CapturePacketConn {
         async fn send(
             &mut self,
-            runtime: &DataPlaneRuntime,
+            runtime: &DataPlaneBuffers,
             frame: &mut BufferFrame,
         ) -> CoreResult<()> {
             let index = frame
@@ -175,7 +177,7 @@ mod tests {
 
         async fn recv(
             &mut self,
-            _runtime: &DataPlaneRuntime,
+            _runtime: &DataPlaneBuffers,
             _frame: &mut BufferFrame,
             _max: usize,
         ) -> CoreResult<()> {
@@ -185,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn packet_conn_send_uses_borrowed_frame() {
-        let runtime = DataPlaneRuntime::with_buffer_capacity(128, 1);
+        let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(128, 1);
         let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let mut metadata = RouteMetadata::default();
         metadata.destination = Some(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53));
