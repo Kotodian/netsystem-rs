@@ -8,18 +8,7 @@ publish.workspace = true
 name = "hammer_runtime"
 
 [features]
-default = [
-    "inbound-tun",
-    "outbound-hysteria2",
-    "outbound-direct",
-    "outbound-block",
-    "outbound-urltest",
-    "dns-udp",
-    "dns-tcp",
-    "dns-hosts",
-    "dns-local",
-    "probe",
-]
+default = []
 # Outbound-level latency probing. Adds `ProbeManager` + `IcmpOutboundProbe`
 # under `crate::probe`, plus the `RuntimeService::probe_outbounds` API.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
