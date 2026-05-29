@@ -88,10 +88,9 @@ pub use component_registry::{
     EventSubscriberComponentDeclaration, register_event_subscriber_component,
 };
 pub use connection::{ConnectionManager, ConnectionRegistration};
-pub(crate) use control_thread::ControlThread;
 pub use control_thread::{
     ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
-    ControlThreadHandle, ControlTimerHandle, LogEventArgs,
+    ControlThread, ControlThreadHandle, ControlTimerHandle, LogEventArgs,
 };
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;

@@ -34,7 +34,7 @@ const CONTROL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// those paths are synchronous and non-cancelable, so timing out the caller
 /// while the control thread keeps mutating service state would be worse than
 /// waiting for the lifecycle operation to finish.
-pub(crate) const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_CONTROL_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct ControlThreadHandle {
     event_tx: Sender<ControlEvent>,
@@ -64,7 +64,7 @@ impl ControlThreadHandle {
     /// Acknowledge after the control loop drains log records that are queued
     /// when the flush command is handled. This is a log-drain point, not a
     /// global command barrier for records produced concurrently with flush.
-    pub(crate) fn flush_timeout(&self, timeout: Duration) -> bool {
+    pub fn flush_timeout(&self, timeout: Duration) -> bool {
         if self.closed.load(Ordering::Relaxed) {
             return false;
         }
@@ -79,7 +79,7 @@ impl ControlThreadHandle {
         done_rx.recv_timeout(timeout).is_ok()
     }
 
-    pub(crate) fn shutdown_timeout(&self, timeout: Duration) -> bool {
+    pub fn shutdown_timeout(&self, timeout: Duration) -> bool {
         if self.closed.swap(true, Ordering::Relaxed) {
             return true;
         }
@@ -94,7 +94,7 @@ impl ControlThreadHandle {
         done_rx.recv_timeout(timeout).is_ok()
     }
 
-    pub(crate) fn is_closed(&self) -> bool {
+    pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
 
@@ -220,7 +220,7 @@ impl ControlThreadHandle {
 
     /// Dispatch `f` onto the control thread and block until it completes,
     /// using `DEFAULT_CONTROL_CALL_TIMEOUT` as the upper bound.
-    pub(crate) fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
+    pub fn call<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -231,7 +231,7 @@ impl ControlThreadHandle {
     /// completes. Use this only for synchronous, non-cancelable state
     /// transitions where returning a timeout would leave background work
     /// continuing after the public API reported failure.
-    pub(crate) fn call_blocking<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
+    pub fn call_blocking<R>(&self, f: impl FnOnce() -> R + Send + 'static) -> HammerResult<R>
     where
         R: Send + 'static,
     {
@@ -255,7 +255,7 @@ impl ControlThreadHandle {
     /// complete in time, and `internal("control closure panicked")` if it
     /// unwinds — the control thread itself stays alive in either case so
     /// subsequent calls can still proceed.
-    pub(crate) fn call_with_timeout<R>(
+    pub fn call_with_timeout<R>(
         &self,
         timeout: Duration,
         f: impl FnOnce() -> R + Send + 'static,
@@ -299,7 +299,7 @@ impl ControlThreadHandle {
     /// `internal("control async closure panicked")`; the control thread
     /// stays alive. A panic inside a spawned future is observed as a
     /// `Disconnected` channel and reported as `canceled`.
-    pub(crate) fn call_async<R>(
+    pub fn call_async<R>(
         &self,
         timeout: Duration,
         f: impl FnOnce(mpsc::Sender<HammerResult<R>>) -> HammerResult<()> + Send + 'static,
@@ -359,7 +359,7 @@ impl LogWriter for ControlThreadHandle {
     }
 }
 
-pub(crate) struct ControlThread {
+pub struct ControlThread {
     event_rx: Receiver<ControlEvent>,
     command_rx: UnboundedReceiver<ControlCommand>,
     inner: Arc<dyn LogWriter>,
@@ -368,7 +368,7 @@ pub(crate) struct ControlThread {
 }
 
 impl ControlThread {
-    pub(crate) fn new(
+    pub fn new(
         _base_time: Instant,
         inner: Arc<dyn LogWriter>,
         metrics: Arc<MetricsRegistry>,
@@ -396,7 +396,7 @@ impl ControlThread {
         (handle, thread)
     }
 
-    pub(crate) async fn run(mut self) {
+    pub async fn run(mut self) {
         // Once every `ControlThreadHandle` is dropped, `event_rx.recv()` returns
         // `None` permanently. Disable that branch instead of `continue`-ing,
         // which would re-poll a ready-`None` future on every loop iteration
