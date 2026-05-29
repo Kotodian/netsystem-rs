@@ -15,6 +15,7 @@ use crate::EndpointManager;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 use crate::control_thread::ControlEventSubscriptionHandle;
+use crate::data_plane::RuntimeDataPlaneGraph;
 #[cfg(feature = "endpoint")]
 use crate::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
@@ -75,10 +76,33 @@ fn debug_assert_lifecycle_order(lifecycles: &[Arc<dyn Lifecycle>]) {
     }
 }
 
-fn initialize_data_workers(data_context: &DataRuntimeContext) -> HammerResult<()> {
-    let _: Vec<usize> = data_context.for_each_worker(|_| {
-        crate::spawn::with_data_plane_runtime(|runtime| runtime.nodes().pending_len())
+fn install_data_plane_route_graph(
+    data_context: &DataRuntimeContext,
+    router: Arc<Router>,
+    outbound_ids: Vec<String>,
+    endpoint_ids: Vec<String>,
+) -> HammerResult<()> {
+    let graphs = data_context.for_each_worker(move |_| {
+        let router = Arc::clone(&router);
+        let outbound_ids = outbound_ids.clone();
+        let endpoint_ids = endpoint_ids.clone();
+        crate::spawn::with_data_plane_runtime(|runtime| {
+            crate::data_plane::install_route_graph(runtime, router, outbound_ids, endpoint_ids)
+        })
     })?;
+    let mut expected: Option<RuntimeDataPlaneGraph> = None;
+    for graph in graphs {
+        let graph = graph?;
+        if let Some(expected) = expected {
+            if !expected.has_same_layout(graph) {
+                return Err(HammerError::internal(
+                    "data worker route graph layout is inconsistent",
+                ));
+            }
+        } else {
+            expected = Some(graph);
+        }
+    }
     Ok(())
 }
 
@@ -145,10 +169,6 @@ impl RuntimeService {
             DATA_MAX_BLOCKING_THREADS,
         )?;
         let data_context = data_runtime.context();
-        if let Err(err) = initialize_data_workers(&data_context) {
-            data_runtime.shutdown_timeout(DATA_SHUTDOWN_TIMEOUT);
-            return Err(err);
-        }
         let writer: Arc<dyn LogWriter> = if options.log.disabled {
             Arc::new(DiscardWriter)
         } else {
@@ -261,6 +281,28 @@ impl RuntimeService {
             Arc::clone(&outbound),
             Arc::clone(&metrics),
         )?);
+        let outbound_ids = outbound
+            .list()
+            .into_iter()
+            .map(|outbound| outbound.id().to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(feature = "endpoint")]
+        let endpoint_ids = endpoint
+            .list()
+            .into_iter()
+            .map(|endpoint| endpoint.id().to_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(feature = "endpoint"))]
+        let endpoint_ids = Vec::new();
+        if let Err(err) = install_data_plane_route_graph(
+            &data_context,
+            Arc::clone(&router),
+            outbound_ids,
+            endpoint_ids,
+        ) {
+            data_runtime.shutdown_timeout(DATA_SHUTDOWN_TIMEOUT);
+            return Err(err);
+        }
         let inbound = Arc::new(InboundManager::from_options_with_runtime_and_metrics(
             new_logger(&log_factory, "inbound"),
             &options.inbounds,

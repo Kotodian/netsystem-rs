@@ -6721,7 +6721,7 @@ mod tests {
         let data_runtime = crate::spawn::DataRuntime::new(1, "tun-test-data", 512 * 1024, 2)
             .expect("data runtime");
         let loop_router = Arc::clone(&router);
-        let task = data_runtime.context().enter(|| {
+        let mut task = data_runtime.context().enter(|| {
             crate::spawn::spawn_local(move || {
                 packet_loop(
                     test_logger("tun"),
@@ -6820,7 +6820,7 @@ mod tests {
                         },
                     );
                     let udp_flows = Rc::new(std::cell::RefCell::new(flows));
-                    let task = crate::spawn::spawn_current_local(packet_loop_with_tcp_sink(
+                    let mut task = crate::spawn::spawn_current_local(packet_loop_with_tcp_sink(
                         loop_router,
                         Arc::new(StubDnsRouter),
                         Arc::new(StubOutboundManager),
