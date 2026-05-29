@@ -1,5 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(any(feature = "outbound-hysteria2", test))]
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+#[cfg(any(feature = "outbound-hysteria2", test))]
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -8,13 +10,17 @@ use hammer_adapter::{IcmpReply, ProxyIcmpConn};
 use hammer_core::error::{HammerError, HammerResult};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
+#[cfg(any(feature = "outbound-hysteria2", test))]
 use tokio::time::timeout;
 
 use crate::socket_protector::SocketProtector;
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 const PROBE_TOKEN_PREFIX: &[u8] = b"hammer-icmp-probe";
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 static NEXT_SEQUENCE: AtomicU16 = AtomicU16::new(1);
+#[cfg(any(feature = "outbound-hysteria2", test))]
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// ICMP echo conduit backed by unprivileged ping sockets.
@@ -99,6 +105,7 @@ impl ProxyIcmpConn for IcmpSocketConn {
     }
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 pub(crate) async fn probe_echo(
     destination: IpAddr,
     timeout_duration: Duration,
@@ -108,6 +115,7 @@ pub(crate) async fn probe_echo(
     measure_echo(&mut conn, destination, timeout_duration).await
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 async fn measure_echo(
     conn: &mut dyn ProxyIcmpConn,
     destination: IpAddr,
@@ -118,6 +126,7 @@ async fn measure_echo(
     measure_echo_with_token(conn, destination, sequence, &token, timeout_duration).await
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 async fn measure_echo_with_token(
     conn: &mut dyn ProxyIcmpConn,
     destination: IpAddr,
@@ -146,6 +155,7 @@ async fn measure_echo_with_token(
     }
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 fn next_probe_token() -> Vec<u8> {
     let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
     let mut token = Vec::with_capacity(PROBE_TOKEN_PREFIX.len() + 8);
@@ -154,6 +164,7 @@ fn next_probe_token() -> Vec<u8> {
     token
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 fn echo_request_body(destination: IpAddr, sequence: u16, payload: &[u8]) -> Vec<u8> {
     let request_type = if destination.is_ipv6() { 128 } else { 8 };
     let mut body = Vec::with_capacity(8 + payload.len());
@@ -170,6 +181,7 @@ fn echo_request_body(destination: IpAddr, sequence: u16, payload: &[u8]) -> Vec<
     body
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 fn echo_reply_matches(
     destination: IpAddr,
     sequence: u16,
@@ -249,6 +261,7 @@ fn strip_ipv6_header(packet: &[u8]) -> Option<&[u8]> {
     Some(&packet[40..])
 }
 
+#[cfg(any(feature = "outbound-hysteria2", test))]
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = data.chunks_exact(2);

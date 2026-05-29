@@ -5,6 +5,7 @@ members = [
     "crates/hammer-adapter",
     "crates/hammer-component-macros",
     "crates/hammer-runtime",
+    "crates/hammer-service",
     "crates/hammer-ffi",
     "crates/hammer-uniffi-bindgen",
 ]

@@ -1278,7 +1278,7 @@ dependencies = [
  "async-trait",
  "hammer-adapter",
  "hammer-core",
- "hammer-runtime",
+ "hammer-service",
  "indoc",
  "libc",
  "thiserror",
@@ -1336,6 +1336,13 @@ dependencies = [
  "tracing",
  "tun-rs",
  "url",
+]
+
+[[package]]
+name = "hammer-service"
+version = "0.1.0"
+dependencies = [
+ "hammer-runtime",
 ]
 
 [[package]]

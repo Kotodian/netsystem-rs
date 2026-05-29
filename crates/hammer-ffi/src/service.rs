@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hammer_core::log::LogWriter;
-use hammer_runtime::RuntimeService;
+use hammer_service::RuntimeService;
 
 use crate::HammerPlatform;
 use crate::error::HammerError;
@@ -123,8 +123,8 @@ impl HammerService {
     }
 }
 
-fn probe_report_to_ffi(report: hammer_runtime::adapter::ProbeReport) -> HammerProbeReport {
-    let hammer_runtime::adapter::ProbeReport {
+fn probe_report_to_ffi(report: hammer_service::adapter::ProbeReport) -> HammerProbeReport {
+    let hammer_service::adapter::ProbeReport {
         outbound_id,
         protocol,
         result,

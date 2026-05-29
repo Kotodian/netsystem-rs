@@ -1,0 +1,50 @@
+[package]
+name = "hammer-service"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_service"
+
+[features]
+default = [
+    "inbound-tun",
+    "outbound-hysteria2",
+    "outbound-direct",
+    "outbound-block",
+    "outbound-urltest",
+    "dns-udp",
+    "dns-tcp",
+    "dns-hosts",
+    "dns-local",
+    "probe",
+]
+probe = ["hammer-runtime/probe"]
+inbound-tun = ["hammer-runtime/inbound-tun"]
+inbound-socks = ["hammer-runtime/inbound-socks"]
+inbound-http = ["hammer-runtime/inbound-http"]
+inbound-mixed = ["hammer-runtime/inbound-mixed"]
+tls = ["hammer-runtime/tls"]
+tls-client = ["hammer-runtime/tls-client"]
+tls-outbound = ["hammer-runtime/tls-outbound"]
+tls-outbound-stream = ["hammer-runtime/tls-outbound-stream"]
+tls-quic = ["hammer-runtime/tls-quic"]
+tls-utls-stream = ["hammer-runtime/tls-utls-stream"]
+tls-utls = ["hammer-runtime/tls-utls"]
+outbound-hysteria2 = ["hammer-runtime/outbound-hysteria2"]
+outbound-vless = ["hammer-runtime/outbound-vless"]
+outbound-direct = ["hammer-runtime/outbound-direct"]
+outbound-block = ["hammer-runtime/outbound-block"]
+outbound-urltest = ["hammer-runtime/outbound-urltest"]
+dns-udp = ["hammer-runtime/dns-udp"]
+dns-tcp = ["hammer-runtime/dns-tcp"]
+dns-https = ["hammer-runtime/dns-https"]
+dns-hosts = ["hammer-runtime/dns-hosts"]
+dns-local = ["hammer-runtime/dns-local"]
+endpoint = ["hammer-runtime/endpoint"]
+endpoint-wireguard = ["hammer-runtime/endpoint-wireguard"]
+endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
+
+[dependencies]
+hammer-runtime = { path = "../hammer-runtime", default-features = false }
