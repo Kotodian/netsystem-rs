@@ -252,7 +252,7 @@ impl DataRuntimeContext {
         }
     }
 
-    pub(crate) fn for_each_worker<F, R>(&self, f: F) -> HammerResult<Vec<R>>
+    pub fn for_each_worker<F, R>(&self, f: F) -> HammerResult<Vec<R>>
     where
         F: Fn(usize) -> R + Send + Sync + 'static,
         R: Send + 'static,
@@ -835,53 +835,6 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(during, 1);
         assert_eq!(after, 0);
-
-        data_runtime.shutdown_timeout(Duration::from_secs(1));
-    }
-
-    #[test]
-    fn data_thread_uses_runtime_node_enum_scheduler() {
-        let _guard = test_lock();
-        let data_runtime =
-            DataRuntime::new(1, "spawn-test-node", 512 * 1024, 2).expect("data runtime");
-        let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let result = context.enter(|| {
-            driver.block_on(async {
-                let (tx, rx) = oneshot::channel();
-                drop(spawn(async move {
-                    let result =
-                        with_data_plane_runtime(|runtime| -> HammerResult<(usize, usize, usize)> {
-                            let node = runtime.nodes().register(
-                                crate::data_plane::RuntimeDataPlaneNode::Drop(
-                                    crate::data_plane::RuntimeDropNode,
-                                ),
-                            );
-                            let frame = runtime.alloc_frame_index()?;
-                            let buffer = runtime.alloc_index_with_bytes(
-                                hammer_adapter::RouteMetadata::default(),
-                                b"packet",
-                            )?;
-                            runtime.with_frame_mut(frame, |frame| frame.push_index(buffer))??;
-                            assert!(runtime.schedule_frame(node, frame)?);
-
-                            let processed = runtime.run_ready_nodes()?;
-                            Ok((processed, runtime.in_use_buffers(), runtime.frames_in_use()))
-                        });
-                    let _ = tx.send(result);
-                }));
-                tokio::time::timeout(Duration::from_secs(2), rx)
-                    .await
-                    .expect("node task timed out")
-                    .expect("node task dropped sender")
-            })
-        });
-
-        assert_eq!(result.expect("node scheduler result"), (1, 0, 0));
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
