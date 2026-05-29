@@ -219,10 +219,15 @@ pub struct PooledBufferFrame {
     frame: BufferFrame,
 }
 
-#[derive(Debug)]
-pub struct DataPlaneRuntime<N = NoopNode> {
+#[derive(Debug, Clone)]
+pub struct DataPlaneBuffers {
     buffers: BufferPool,
     frames: FramePool,
+}
+
+#[derive(Debug)]
+pub struct DataPlaneRuntime<N = NoopNode> {
+    buffers: DataPlaneBuffers,
     nodes: NodeRuntime<N>,
 }
 
@@ -230,9 +235,16 @@ impl<N> Clone for DataPlaneRuntime<N> {
     fn clone(&self) -> Self {
         Self {
             buffers: self.buffers.clone(),
-            frames: self.frames.clone(),
             nodes: self.nodes.clone(),
         }
+    }
+}
+
+impl<N> Deref for DataPlaneRuntime<N> {
+    type Target = DataPlaneBuffers;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffers
     }
 }
 
@@ -247,7 +259,7 @@ fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-impl<N> DataPlaneRuntime<N> {
+impl DataPlaneBuffers {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities(
             slot_capacity,
@@ -266,7 +278,6 @@ impl<N> DataPlaneRuntime<N> {
         Self {
             buffers: BufferPool::with_capacity(buffer_slot_capacity, buffer_slots),
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
-            nodes: NodeRuntime::default(),
         }
     }
 
@@ -276,10 +287,6 @@ impl<N> DataPlaneRuntime<N> {
 
     pub fn frames(&self) -> &FramePool {
         &self.frames
-    }
-
-    pub fn nodes(&self) -> &NodeRuntime<N> {
-        &self.nodes
     }
 
     pub fn in_use_buffers(&self) -> usize {
@@ -332,22 +339,6 @@ impl<N> DataPlaneRuntime<N> {
 
     pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
         self.frames.free_index(&self.buffers, index)
-    }
-
-    pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
-        if !self.with_frame(frame, BufferFrame::has_pending)? {
-            return Ok(false);
-        }
-        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
-        self.nodes.schedule_frame(node, frame)?;
-        Ok(true)
-    }
-
-    pub fn run_ready_nodes(&self) -> CoreResult<usize>
-    where
-        N: Node<N>,
-    {
-        self.nodes.run_ready(self)
     }
 
     pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
@@ -440,6 +431,78 @@ impl<N> DataPlaneRuntime<N> {
 
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_current_chain(index)
+    }
+}
+
+impl<N> DataPlaneRuntime<N> {
+    pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
+        Self::with_capacities(
+            slot_capacity,
+            slots,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+        )
+    }
+
+    pub fn with_capacities(
+        buffer_slot_capacity: usize,
+        buffer_slots: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+    ) -> Self {
+        Self {
+            buffers: DataPlaneBuffers::with_capacities(
+                buffer_slot_capacity,
+                buffer_slots,
+                frame_capacity,
+                frame_slots,
+            ),
+            nodes: NodeRuntime::default(),
+        }
+    }
+
+    pub fn packet_buffers(&self) -> &DataPlaneBuffers {
+        &self.buffers
+    }
+
+    pub fn nodes(&self) -> &NodeRuntime<N> {
+        &self.nodes
+    }
+
+    pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
+        if !self.with_frame(frame, BufferFrame::has_pending)? {
+            return Ok(false);
+        }
+        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+        self.nodes.schedule_frame(node, frame)?;
+        Ok(true)
+    }
+
+    pub fn run_ready_nodes(&self) -> CoreResult<usize>
+    where
+        N: Node<N>,
+    {
+        self.nodes.run_ready(self)
+    }
+
+    pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
+        self.buffers.take_frame_index(index)
+    }
+
+    pub(crate) fn return_taken_frame_index(
+        &self,
+        index: FrameIndex,
+        frame: BufferFrame,
+    ) -> CoreResult<()> {
+        self.buffers.return_taken_frame_index(index, frame)
+    }
+
+    pub(crate) fn release_taken_frame_index(
+        &self,
+        index: FrameIndex,
+        frame: BufferFrame,
+    ) -> CoreResult<()> {
+        self.buffers.release_taken_frame_index(index, frame)
     }
 }
 

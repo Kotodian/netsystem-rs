@@ -17,8 +17,8 @@ pub mod rule;
 pub mod service;
 
 pub use buffer::{
-    Buffer, BufferFlags, BufferFrame, BufferIndex, BufferPool, BufferRef, DataPlaneRuntime,
-    FrameIndex, FramePool, PooledBufferFrame,
+    Buffer, BufferFlags, BufferFrame, BufferIndex, BufferPool, BufferRef, DataPlaneBuffers,
+    DataPlaneRuntime, FrameIndex, FramePool, PooledBufferFrame,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
