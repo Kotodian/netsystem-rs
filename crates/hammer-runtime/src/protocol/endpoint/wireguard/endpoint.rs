@@ -989,11 +989,11 @@ mod tests {
                 .expect("control thread runtime");
             runtime.block_on(control_thread.run());
         });
-        let _subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+        let _subscriptions = build_wireguard_start_handshake_subscriber(
             logger("wg-start-event"),
             Arc::clone(&control_handle),
         )
-        .expect("build standard event subscribers");
+        .expect("build wireguard start subscriber");
 
         let peer_socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await

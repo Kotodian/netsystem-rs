@@ -28,6 +28,11 @@ use self::event::{
 pub use self::timer::ControlTimerHandle;
 use self::timer::{ControlTimerId, ControlTimerRegistration, TimerCallback, TimerRegistry};
 
+pub type EventSubscriberBuilder = fn(
+    hammer_core::log::Logger,
+    Arc<ControlThreadHandle>,
+) -> HammerResult<Vec<ControlEventSubscriptionHandle>>;
+
 const CONTROL_EVENT_QUEUE_CAPACITY: usize = 4096;
 /// Default ceiling for regular synchronous `call` round-trips. Lifecycle
 /// start/close is deliberately dispatched through `call_blocking` instead:

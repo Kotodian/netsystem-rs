@@ -44,6 +44,7 @@ use super::amnezia2::{decode_inbound_packet, encode_outbound_packet, make_handsh
 use super::endpoint::{
     WireguardPeerHandshakeReceivedArgs, WireguardPeerKeepaliveReceivedArgs,
     WireguardPeerPacketReceivedArgs, WireguardPeerPacketSentArgs, WireguardPeerStartArgs,
+    build_wireguard_inbound_control_subscriber, build_wireguard_start_handshake_subscriber,
 };
 use crate::socket_protector::SocketProtector;
 use crate::{ControlThreadHandle, ControlTimerHandle};
@@ -2482,11 +2483,18 @@ mod tests {
                 .expect("control thread runtime");
             runtime.block_on(control_thread.run());
         });
-        let _subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+        let mut _subscriptions = build_wireguard_start_handshake_subscriber(
             logger("transport-control-split"),
             Arc::clone(&control_thread_handle),
         )
-        .expect("build standard event subscribers");
+        .expect("build wireguard start subscriber");
+        _subscriptions.extend(
+            build_wireguard_inbound_control_subscriber(
+                logger("transport-control-split"),
+                Arc::clone(&control_thread_handle),
+            )
+            .expect("build wireguard inbound subscriber"),
+        );
 
         let a_priv = [111u8; 32];
         let b_priv = [122u8; 32];
@@ -2618,11 +2626,11 @@ mod tests {
                 .expect("control thread runtime");
             runtime.block_on(control_thread.run());
         });
-        let _subscriptions = crate::event_subscribers::build_standard_event_subscribers(
+        let _subscriptions = build_wireguard_inbound_control_subscriber(
             logger("transport-inbound-control"),
             Arc::clone(&control_thread_handle),
         )
-        .expect("build standard event subscribers");
+        .expect("build wireguard inbound subscriber");
 
         let local_priv = [123u8; 32];
         let remote_priv = [124u8; 32];

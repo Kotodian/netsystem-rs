@@ -28,7 +28,6 @@ mod control_thread;
 mod data_plane;
 pub mod dns;
 pub mod endpoints;
-mod event_subscribers;
 pub mod inbounds;
 mod macros;
 pub mod outbounds;
@@ -80,11 +79,10 @@ pub use component_registry::{
 };
 pub use control_thread::{
     ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
-    ControlThread, ControlThreadHandle, ControlTimerHandle, LogEventArgs,
+    ControlThread, ControlThreadHandle, ControlTimerHandle, EventSubscriberBuilder, LogEventArgs,
 };
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use endpoints::EndpointManager;
-pub use event_subscribers::EventSubscriberBuilder;
 pub use hammer_core::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope,
