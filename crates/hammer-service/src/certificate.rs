@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{
+use hammer_core::error::HammerResult;
+use hammer_core::log::Logger;
+use hammer_runtime::adapter::{
     CertificateProviderManager as CertificateProviderManagerTrait, CertificateProviderService,
     CertificateStore as CertificateStoreTrait,
 };
-use hammer_core::error::HammerResult;
-use hammer_core::log::Logger;
 
 use crate::impl_logging_lifecycle;
 

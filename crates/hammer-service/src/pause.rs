@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 
-/// `runtime/service/pause` PauseManager port. Two independent pause sources
+/// Pause manager for service-level pause state. Two independent pause sources
 /// (device-level pause, e.g. iOS app sleeping; and network-level pause,
 /// e.g. radio off) drive a single "active" condition that callers can `await`
 /// on via `wait_active`.
@@ -120,7 +120,7 @@ mod tests {
         let pm = Arc::new(PauseManager::new());
         pm.device_pause();
         let pm2 = Arc::clone(&pm);
-        let waker = crate::spawn::spawn(async move {
+        let waker = hammer_runtime::spawn::spawn(async move {
             tokio::time::sleep(Duration::from_millis(40)).await;
             pm2.device_wake();
         });
@@ -137,7 +137,7 @@ mod tests {
         pm.device_pause();
         pm.network_pause();
         let pm2 = Arc::clone(&pm);
-        crate::spawn::spawn(async move {
+        hammer_runtime::spawn::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             pm2.device_wake();
             tokio::time::sleep(Duration::from_millis(20)).await;

@@ -2,15 +2,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::{debug, error, info, trace};
 
-use hammer_adapter::{
-    DefaultInterfaceUpdateListener, NetworkInterface, NetworkManager as NetworkManagerTrait,
-    PlatformInterface, WifiState,
-};
 use hammer_core::error::HammerResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::Logger;
+use hammer_runtime::adapter::{
+    DefaultInterfaceUpdateListener, NetworkInterface, NetworkManager as NetworkManagerTrait,
+    PlatformInterface, WifiState,
+};
 
-use crate::{ConnectionManager, PauseManager, RuntimePlatform};
+use crate::{ConnectionManager, PauseManager};
 
 /// `route.NetworkManager` skeleton. The real interface monitor + autoDetect
 /// path land in M4 once the Platform.get_interfaces / start_default_interface_monitor
@@ -47,11 +47,10 @@ impl NetworkManager {
     pub fn with_platform(
         _logger: Logger,
         auto_detect_interface: bool,
-        platform: impl Into<RuntimePlatform>,
+        platform: Arc<dyn PlatformInterface>,
         pause: Arc<PauseManager>,
         connection: Arc<ConnectionManager>,
     ) -> Arc<Self> {
-        let platform = platform.into().into_inner();
         Arc::new_cyclic(|weak| Self {
             auto_detect_interface,
             need_wifi_state: AtomicBool::new(false),

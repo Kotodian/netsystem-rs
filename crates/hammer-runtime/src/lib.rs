@@ -23,9 +23,7 @@ pub fn install_default_crypto_provider() {
 #[cfg(not(feature = "tls"))]
 pub fn install_default_crypto_provider() {}
 
-mod certificate;
 mod component_registry;
-mod connection;
 mod control_thread;
 mod data_plane;
 pub mod dns;
@@ -33,14 +31,11 @@ pub mod endpoints;
 mod event_subscribers;
 pub mod inbounds;
 mod macros;
-mod network;
 pub mod outbounds;
-pub mod pause;
 #[cfg(feature = "probe")]
 pub mod probe;
 pub mod protocol;
 pub mod route;
-mod service_mgr;
 mod socket_protector;
 pub mod spawn;
 #[cfg(any(
@@ -82,11 +77,9 @@ pub mod wireguard {
 ))]
 mod apple_utun;
 
-pub use certificate::{CertificateProviderManager, CertificateStore};
 pub use component_registry::{
     EventSubscriberComponentDeclaration, register_event_subscriber_component,
 };
-pub use connection::{ConnectionManager, ConnectionRegistration};
 pub use control_thread::{
     ControlEvent, ControlEventArgs, ControlEventFilter, ControlEventSubscriptionHandle,
     ControlThread, ControlThreadHandle, ControlTimerHandle, LogEventArgs,
@@ -99,9 +92,7 @@ pub use hammer_core::{
     MetricsScope,
 };
 pub use inbounds::InboundManager;
-pub use network::NetworkManager;
 pub use outbounds::OutboundManager;
-pub use pause::PauseManager;
 #[cfg(feature = "probe")]
 pub use probe::{IcmpOutboundProbe, ProbeManager};
 #[cfg(feature = "outbound-hysteria2")]
@@ -109,5 +100,4 @@ pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use route::Router;
-pub use service_mgr::ServiceManager;
 pub use socket_protector::RuntimePlatform;

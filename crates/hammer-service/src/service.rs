@@ -3,6 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use crate::{
+    CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
+    ServiceManager,
+};
 use hammer_core::config::{self, Options};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
@@ -25,10 +29,9 @@ use hammer_runtime::spawn::{DataRuntime, DataRuntimeContext};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
-    CertificateProviderManager, CertificateStore, ConnectionManager,
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, DnsRouter,
     DnsTransportManager, EventSubscriberBuilder, InboundManager, MetricSample, MetricsRegistry,
-    NetworkManager, OutboundManager, PauseManager, Router, ServiceManager,
+    OutboundManager, Router,
 };
 use std::time::Duration;
 
