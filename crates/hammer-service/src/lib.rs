@@ -1,4 +1,5 @@
 mod component_registry;
+pub mod data_plane;
 pub mod dns;
 mod event_subscribers;
 #[cfg(feature = "probe")]

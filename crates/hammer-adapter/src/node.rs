@@ -1,16 +1,13 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
-use crate::router::Router;
-use crate::rule::{RouteDecision, RouteMetadata, RouteTarget};
+use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
 
 pub const MAX_NODE_NEXT_FRAMES: usize = 4;
 
@@ -31,6 +28,25 @@ pub trait Node<G = Self> {
     ) -> CoreResult<NodeResult>;
 }
 
+/// Packet graph node that produces frames from an external I/O source.
+pub trait InputDriverNode<G = Self>: Node<G> {}
+
+/// Packet graph node that consumes frames and writes them to external I/O.
+pub trait OutputDriverNode<G = Self>: Node<G> {}
+
+/// Packet graph node that performs protocol ingress work.
+pub trait InboundNode<G = Self>: Node<G> {}
+
+/// Packet graph node that performs dataplane-internal work.
+///
+/// Internal nodes are neither packet I/O drivers nor protocol outbounds. They
+/// transform frame metadata, split frames, or select the next graph edge while
+/// keeping packet ownership on the current data worker.
+pub trait InternalNode<G = Self>: Node<G> {}
+
+/// Packet graph node that consumes frames through a configured egress path.
+pub trait OutboundNode<G = Self>: Node<G> {}
+
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
 
@@ -41,264 +57,6 @@ impl Node<NoopNode> for NoopNode {
         _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         match *self {}
-    }
-}
-
-pub struct RouterNode<R> {
-    router: R,
-    next: NodeId,
-}
-
-impl<R> RouterNode<R> {
-    pub fn new(router: R, next: NodeId) -> Self {
-        Self { router, next }
-    }
-}
-
-impl<R, T, G> Node<G> for RouterNode<R>
-where
-    R: Deref<Target = T>,
-    T: Router + ?Sized,
-{
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            runtime.with_metadata_mut(index, |metadata| {
-                self.router.prepare_route_metadata(metadata)?;
-                let decision = self.router.match_route(metadata)?;
-                metadata.route_decision = Some(decision);
-                Ok(())
-            })??;
-        }
-        Ok(NodeResult::next_current(self.next))
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct RouteDispatchNode {
-    outbounds: HashMap<String, NodeId>,
-    endpoints: HashMap<String, NodeId>,
-    reject: Option<NodeId>,
-    hijack_dns: Option<NodeId>,
-}
-
-impl RouteDispatchNode {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_outbound(mut self, id: impl Into<String>, node: NodeId) -> Self {
-        self.register_outbound(id, node);
-        self
-    }
-
-    pub fn with_endpoint(mut self, id: impl Into<String>, node: NodeId) -> Self {
-        self.register_endpoint(id, node);
-        self
-    }
-
-    pub fn with_reject(mut self, node: NodeId) -> Self {
-        self.reject = Some(node);
-        self
-    }
-
-    pub fn with_hijack_dns(mut self, node: NodeId) -> Self {
-        self.hijack_dns = Some(node);
-        self
-    }
-
-    pub fn register_outbound(&mut self, id: impl Into<String>, node: NodeId) {
-        self.outbounds.insert(id.into(), node);
-    }
-
-    pub fn register_endpoint(&mut self, id: impl Into<String>, node: NodeId) {
-        self.endpoints.insert(id.into(), node);
-    }
-
-    fn target_for_index<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<Option<NodeId>> {
-        runtime.with_metadata(index, |metadata| self.target_for_metadata(metadata))?
-    }
-
-    fn target_for_metadata(&self, metadata: &RouteMetadata) -> CoreResult<Option<NodeId>> {
-        let decision = metadata
-            .route_decision
-            .as_ref()
-            .ok_or_else(|| CoreError::internal("route decision is missing"))?;
-        match decision {
-            RouteDecision::Route {
-                target: RouteTarget::Outbound(id),
-            } => self
-                .outbounds
-                .get(id.as_str())
-                .copied()
-                .map(Some)
-                .ok_or_else(|| CoreError::internal(format!("outbound route node not found: {id}"))),
-            RouteDecision::Route {
-                target: RouteTarget::Endpoint(id),
-            } => self
-                .endpoints
-                .get(id.as_str())
-                .copied()
-                .map(Some)
-                .ok_or_else(|| CoreError::internal(format!("endpoint route node not found: {id}"))),
-            RouteDecision::Reject { .. } => Ok(self.reject),
-            RouteDecision::HijackDns => self
-                .hijack_dns
-                .map(Some)
-                .ok_or_else(|| CoreError::internal("dns hijack route node not configured")),
-        }
-    }
-
-    fn collect_groups<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &BufferFrame,
-    ) -> CoreResult<RouteDispatchGroups> {
-        let mut groups = RouteDispatchGroups::default();
-        for index in frame.pending_indices().iter().copied() {
-            if let Some(node) = self.target_for_index(runtime, index)? {
-                groups.push(node)?;
-            }
-        }
-        Ok(groups)
-    }
-}
-
-impl<G> Node<G> for RouteDispatchNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let groups = self.collect_groups(runtime, frame)?;
-        if groups.is_empty() {
-            for index in frame.drain_pending() {
-                runtime.free_index(index);
-            }
-            return Ok(NodeResult::drop());
-        }
-
-        let first = groups.node(0)?;
-        if groups.len() == 1 {
-            frame.retain_indices(|index| match self.target_for_index(runtime, index)? {
-                Some(node) if node == first => Ok(true),
-                Some(_) => Err(CoreError::internal("route dispatch group changed")),
-                None => {
-                    runtime.free_index(index);
-                    Ok(false)
-                }
-            })?;
-            return if frame.has_pending() {
-                Ok(NodeResult::next_current(first))
-            } else {
-                Ok(NodeResult::drop())
-            };
-        }
-
-        let mut extra_frames = [None; MAX_NODE_NEXT_FRAMES];
-        for group_index in 1..groups.len() {
-            extra_frames[group_index] = Some(runtime.alloc_frame_index()?);
-        }
-
-        let retain_result = frame.retain_indices(|index| {
-            let Some(node) = self.target_for_index(runtime, index)? else {
-                runtime.free_index(index);
-                return Ok(false);
-            };
-            if node == first {
-                return Ok(true);
-            }
-            let group_index = groups
-                .position(node)
-                .ok_or_else(|| CoreError::internal("route dispatch group changed"))?;
-            let frame_index = extra_frames[group_index]
-                .ok_or_else(|| CoreError::internal("route dispatch frame missing"))?;
-            runtime.with_frame_mut(frame_index, |frame| frame.push_index(index))??;
-            Ok(false)
-        });
-        if let Err(err) = retain_result {
-            for frame_index in extra_frames.iter().flatten().copied() {
-                let _ = runtime.free_frame_index(frame_index);
-            }
-            return Err(err);
-        }
-
-        let mut result = NodeResult::drop();
-        if frame.has_pending() {
-            result.push(NextFrame::Current(first))?;
-        }
-        for group_index in 1..groups.len() {
-            let frame_index = extra_frames[group_index]
-                .ok_or_else(|| CoreError::internal("route dispatch frame missing"))?;
-            if runtime.with_frame(frame_index, BufferFrame::has_pending)? {
-                result.push(NextFrame::Frame {
-                    node: groups.node(group_index)?,
-                    frame: frame_index,
-                })?;
-            } else {
-                runtime.free_frame_index(frame_index)?;
-            }
-        }
-        Ok(result)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RouteDispatchGroups {
-    nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
-    len: usize,
-}
-
-impl Default for RouteDispatchGroups {
-    fn default() -> Self {
-        Self {
-            nodes: [None; MAX_NODE_NEXT_FRAMES],
-            len: 0,
-        }
-    }
-}
-
-impl RouteDispatchGroups {
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn push(&mut self, node: NodeId) -> CoreResult<()> {
-        if self.position(node).is_some() {
-            return Ok(());
-        }
-        if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal(
-                "route dispatch next frame capacity exceeded",
-            ));
-        }
-        self.nodes[self.len] = Some(node);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn node(&self, index: usize) -> CoreResult<NodeId> {
-        self.nodes
-            .get(index)
-            .and_then(|node| *node)
-            .ok_or_else(|| CoreError::internal("route dispatch group index out of bounds"))
-    }
-
-    fn position(&self, node: NodeId) -> Option<usize> {
-        self.nodes[..self.len]
-            .iter()
-            .position(|candidate| *candidate == Some(node))
     }
 }
 
@@ -470,6 +228,41 @@ impl<N> NodeRuntime<N> {
         let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
         inner.nodes.push(Some(node));
         id
+    }
+
+    pub fn register_input_driver<I>(&self, node: I) -> NodeId
+    where
+        I: InputDriverNode<N> + Into<N>,
+    {
+        self.register(node.into())
+    }
+
+    pub fn register_output_driver<I>(&self, node: I) -> NodeId
+    where
+        I: OutputDriverNode<N> + Into<N>,
+    {
+        self.register(node.into())
+    }
+
+    pub fn register_inbound<I>(&self, node: I) -> NodeId
+    where
+        I: InboundNode<N> + Into<N>,
+    {
+        self.register(node.into())
+    }
+
+    pub fn register_internal<I>(&self, node: I) -> NodeId
+    where
+        I: InternalNode<N> + Into<N>,
+    {
+        self.register(node.into())
+    }
+
+    pub fn register_outbound<I>(&self, node: I) -> NodeId
+    where
+        I: OutboundNode<N> + Into<N>,
+    {
+        self.register(node.into())
     }
 
     pub fn pending_len(&self) -> usize {

@@ -5,14 +5,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
-use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Network, Node, NodeId, NodeResult, RouteDecision,
-    RouteDispatchNode, RouteMetadata, RouteTarget, Router, RouterNode,
+    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeId, NodeResult, RouteMetadata,
 };
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::lifecycle::{Lifecycle, StartStage};
+use hammer_core::error::CoreResult;
 
 #[derive(Default)]
 struct WakeCounter {
@@ -68,28 +65,6 @@ impl Node<TestNode> for SinkNode {
     }
 }
 
-struct DecisionSinkNode {
-    decisions: Rc<RefCell<Vec<RouteDecision>>>,
-}
-
-impl Node<TestNode> for DecisionSinkNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        for buffer in frame.drain_pending() {
-            let metadata = runtime.metadata(buffer)?;
-            let decision = metadata
-                .route_decision
-                .ok_or_else(|| CoreError::internal("missing route decision"))?;
-            self.decisions.borrow_mut().push(decision);
-            runtime.free_index(buffer);
-        }
-        Ok(NodeResult::drop())
-    }
-}
-
 struct CountNode {
     count: Rc<Cell<usize>>,
 }
@@ -108,66 +83,18 @@ impl Node<TestNode> for CountNode {
     }
 }
 
-struct StaticRouter {
-    decision: RouteDecision,
-    prepare_count: AtomicUsize,
-    match_count: AtomicUsize,
-}
-
-impl StaticRouter {
-    fn new(decision: RouteDecision) -> Self {
-        Self {
-            decision,
-            prepare_count: AtomicUsize::new(0),
-            match_count: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Lifecycle for StaticRouter {
-    fn name(&self) -> &str {
-        "static-router"
-    }
-
-    fn start(&self, _stage: StartStage) -> CoreResult<()> {
-        Ok(())
-    }
-
-    fn close(&self) -> CoreResult<()> {
-        Ok(())
-    }
-}
-
-impl Router for StaticRouter {
-    fn reset_network(&self) {}
-
-    fn match_route(&self, _metadata: &mut RouteMetadata) -> CoreResult<RouteDecision> {
-        self.match_count.fetch_add(1, Ordering::SeqCst);
-        Ok(self.decision.clone())
-    }
-
-    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> CoreResult<()> {
-        self.prepare_count.fetch_add(1, Ordering::SeqCst);
-        metadata.protocol = "prepared".to_owned();
-        Ok(())
-    }
-
-    fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
-        None
-    }
-
-    fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
-        false
-    }
-}
+impl InternalNode<TestNode> for CountNode {}
 
 enum TestNode {
     Forward(ForwardNode),
     Sink(SinkNode),
-    DecisionSink(DecisionSinkNode),
     Count(CountNode),
-    Router(RouterNode<Arc<StaticRouter>>),
-    RouteDispatch(RouteDispatchNode),
+}
+
+impl From<CountNode> for TestNode {
+    fn from(node: CountNode) -> Self {
+        Self::Count(node)
+    }
 }
 
 impl Node<TestNode> for TestNode {
@@ -179,12 +106,16 @@ impl Node<TestNode> for TestNode {
         match self {
             Self::Forward(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
-            Self::DecisionSink(node) => node.process(runtime, frame),
             Self::Count(node) => node.process(runtime, frame),
-            Self::Router(node) => node.process(runtime, frame),
-            Self::RouteDispatch(node) => node.process(runtime, frame),
         }
     }
+}
+
+fn assert_internal_node<I>(node: &I)
+where
+    I: InternalNode<TestNode>,
+{
+    let _ = node;
 }
 
 #[test]
@@ -241,6 +172,32 @@ fn node_runtime_does_not_schedule_empty_frame() {
 }
 
 #[test]
+fn node_runtime_registers_internal_role_node() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let count = Rc::new(Cell::new(0));
+    let node = CountNode {
+        count: Rc::clone(&count),
+    };
+    assert_internal_node(&node);
+    let node = runtime.nodes().register_internal(node);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    runtime
+        .with_frame_mut(frame, |frame| frame.push_index(buffer))
+        .expect("mutate frame")
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(node, frame).expect("schedule frame"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(count.get(), 1);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn node_runtime_ready_future_wakes_on_local_schedule() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
     let count = Rc::new(Cell::new(0));
@@ -275,123 +232,4 @@ fn node_runtime_ready_future_wakes_on_local_schedule() {
     ));
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(count.get(), 1);
-}
-
-#[test]
-fn router_node_stores_decision_in_metadata_and_forwards_frame() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 1, 2);
-    let decisions = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime
-        .nodes()
-        .register(TestNode::DecisionSink(DecisionSinkNode {
-            decisions: Rc::clone(&decisions),
-        }));
-    let router = Arc::new(StaticRouter::new(RouteDecision::Route {
-        target: RouteTarget::Outbound("direct".to_owned()),
-    }));
-    let router_node = runtime
-        .nodes()
-        .register(TestNode::Router(RouterNode::new(Arc::clone(&router), sink)));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    let buffer = runtime
-        .alloc_index_with_bytes(
-            RouteMetadata {
-                inbound: "in".to_owned(),
-                network: Network::Udp,
-                ..Default::default()
-            },
-            b"packet",
-        )
-        .expect("alloc packet");
-    runtime
-        .with_frame_mut(frame, |frame| frame.push_index(buffer))
-        .expect("mutate frame")
-        .expect("push packet");
-
-    assert!(
-        runtime
-            .schedule_frame(router_node, frame)
-            .expect("schedule router")
-    );
-
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(router.prepare_count.load(Ordering::SeqCst), 1);
-    assert_eq!(router.match_count.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        &*decisions.borrow(),
-        &[RouteDecision::Route {
-            target: RouteTarget::Outbound("direct".to_owned())
-        }]
-    );
-    assert_eq!(runtime.frames_in_use(), 0);
-    assert_eq!(runtime.in_use_buffers(), 0);
-}
-
-#[test]
-fn route_dispatch_node_splits_frame_by_route_decision() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(16, 8, 4, 4);
-    let trace = Rc::new(RefCell::new(Vec::new()));
-    let direct_payloads = Rc::new(RefCell::new(Vec::new()));
-    let block_payloads = Rc::new(RefCell::new(Vec::new()));
-    let direct = runtime.nodes().register(TestNode::Sink(SinkNode {
-        trace: Rc::clone(&trace),
-        payloads: Rc::clone(&direct_payloads),
-    }));
-    let block = runtime.nodes().register(TestNode::Sink(SinkNode {
-        trace: Rc::clone(&trace),
-        payloads: Rc::clone(&block_payloads),
-    }));
-    let dispatch = runtime.nodes().register(TestNode::RouteDispatch(
-        RouteDispatchNode::new()
-            .with_outbound("direct", direct)
-            .with_outbound("block", block),
-    ));
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    for (target, payload) in [
-        ("direct", b"first".as_slice()),
-        ("block", b"second".as_slice()),
-        ("direct", b"third".as_slice()),
-    ] {
-        let buffer = runtime
-            .alloc_index_with_bytes(
-                RouteMetadata {
-                    route_decision: Some(RouteDecision::Route {
-                        target: RouteTarget::Outbound(target.to_owned()),
-                    }),
-                    ..Default::default()
-                },
-                payload,
-            )
-            .expect("alloc packet");
-        runtime
-            .with_frame_mut(frame, |frame| frame.push_index(buffer))
-            .expect("mutate frame")
-            .expect("push packet");
-    }
-    let rejected = runtime
-        .alloc_index_with_bytes(
-            RouteMetadata {
-                route_decision: Some(RouteDecision::Reject {
-                    method: "drop".to_owned(),
-                }),
-                ..Default::default()
-            },
-            b"reject",
-        )
-        .expect("alloc rejected packet");
-    runtime
-        .with_frame_mut(frame, |frame| frame.push_index(rejected))
-        .expect("mutate frame")
-        .expect("push rejected packet");
-
-    assert!(runtime.schedule_frame(dispatch, frame).expect("schedule"));
-
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
-    assert_eq!(
-        &*direct_payloads.borrow(),
-        &[b"first".to_vec(), b"third".to_vec()]
-    );
-    assert_eq!(&*block_payloads.borrow(), &[b"second".to_vec()]);
-    assert_eq!(runtime.frames_in_use(), 0);
-    assert_eq!(runtime.in_use_buffers(), 0);
 }
