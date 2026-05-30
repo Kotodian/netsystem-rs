@@ -1367,7 +1367,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
- "lru 0.18.0",
  "rustls",
  "smoltcp",
  "tokio",

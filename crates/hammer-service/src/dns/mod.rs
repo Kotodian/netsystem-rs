@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -26,7 +25,6 @@ pub use hammer_core::protocol::dns::{
 };
 use hickory_proto::op::{Message, Query, ResponseCode};
 use hickory_proto::rr::RecordType;
-use lru::LruCache;
 
 #[cfg(any(
     feature = "dns-udp",
@@ -204,14 +202,7 @@ impl DnsSnapshot {
     }
 }
 
-struct DnsControlState {
-    responses: LruCache<CacheKey, CacheValue>,
-    reverse: LruCache<IpAddr, ReverseValue>,
-    match_cache: LruCache<String, MatchedAction>,
-}
-
 pub(crate) struct DnsControlCache {
-    state: Mutex<DnsControlState>,
     snapshot: ArcSwap<DnsSnapshot>,
 }
 
@@ -261,20 +252,6 @@ struct DnsCacheUpdateArgs {
 impl DnsControlCache {
     fn new() -> Self {
         Self {
-            state: Mutex::new(DnsControlState {
-                responses: LruCache::new(
-                    NonZeroUsize::new(DNS_CLIENT_CACHE_MAX_ENTRIES)
-                        .expect("DNS client cache capacity must be non-zero"),
-                ),
-                reverse: LruCache::new(
-                    NonZeroUsize::new(DNS_REVERSE_CACHE_MAX_ENTRIES)
-                        .expect("DNS reverse cache capacity must be non-zero"),
-                ),
-                match_cache: LruCache::new(
-                    NonZeroUsize::new(DNS_MATCH_CACHE_CAPACITY)
-                        .expect("DNS match cache capacity must be non-zero"),
-                ),
-            }),
             snapshot: ArcSwap::from_pointee(DnsSnapshot::empty()),
         }
     }
@@ -311,16 +288,17 @@ impl DnsControlCache {
 
     fn store_response_direct(&self, key: CacheKey, response: &Message, ttl: u32) {
         let now = Instant::now();
-        let mut state = self.state.lock().expect("DNS control cache poisoned");
-        prune_cache(&mut state.responses, now);
-        state.responses.put(
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        prune_response_snapshot(&mut snapshot.responses, now);
+        snapshot.responses.insert(
             key,
             CacheValue {
                 response: response.clone(),
                 expires_at: now + Duration::from_secs(u64::from(ttl)),
             },
         );
-        self.publish_snapshot_locked(&state);
+        trim_response_snapshot(&mut snapshot.responses, DNS_CLIENT_CACHE_MAX_ENTRIES);
+        self.snapshot.store(Arc::new(snapshot));
     }
 
     fn lookup_reverse(&self, ip: IpAddr) -> Option<String> {
@@ -336,12 +314,15 @@ impl DnsControlCache {
     where
         I: IntoIterator<Item = (IpAddr, String, Instant)>,
     {
-        let mut state = self.state.lock().expect("DNS control cache poisoned");
-        prune_reverse_cache(&mut state.reverse, Instant::now());
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        prune_reverse_snapshot(&mut snapshot.reverse, Instant::now());
         for (addr, domain, expires_at) in entries {
-            state.reverse.put(addr, ReverseValue { domain, expires_at });
+            snapshot
+                .reverse
+                .insert(addr, ReverseValue { domain, expires_at });
         }
-        self.publish_snapshot_locked(&state);
+        trim_reverse_snapshot(&mut snapshot.reverse, DNS_REVERSE_CACHE_MAX_ENTRIES);
+        self.snapshot.store(Arc::new(snapshot));
     }
 
     fn load_match(&self, qname: &str) -> Option<MatchedAction> {
@@ -349,9 +330,10 @@ impl DnsControlCache {
     }
 
     fn store_match_direct(&self, qname: String, action: MatchedAction) {
-        let mut state = self.state.lock().expect("DNS control cache poisoned");
-        state.match_cache.put(qname, action);
-        self.publish_snapshot_locked(&state);
+        let mut snapshot = self.snapshot.load_full().as_ref().clone();
+        snapshot.match_cache.insert(qname, action);
+        trim_match_snapshot(&mut snapshot.match_cache, DNS_MATCH_CACHE_CAPACITY);
+        self.snapshot.store(Arc::new(snapshot));
     }
 
     fn clear(&self) {
@@ -359,31 +341,7 @@ impl DnsControlCache {
     }
 
     fn clear_direct(&self) {
-        let mut state = self.state.lock().expect("DNS control cache poisoned");
-        state.responses.clear();
-        state.reverse.clear();
-        state.match_cache.clear();
-        self.publish_snapshot_locked(&state);
-    }
-
-    fn publish_snapshot_locked(&self, state: &DnsControlState) {
-        self.snapshot.store(Arc::new(DnsSnapshot {
-            responses: state
-                .responses
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect(),
-            reverse: state
-                .reverse
-                .iter()
-                .map(|(addr, value)| (*addr, value.clone()))
-                .collect(),
-            match_cache: state
-                .match_cache
-                .iter()
-                .map(|(qname, action)| (qname.clone(), action.clone()))
-                .collect(),
-        }));
+        self.snapshot.store(Arc::new(DnsSnapshot::empty()));
     }
 }
 
@@ -570,28 +528,38 @@ impl DnsClient {
     }
 
     fn publish_or_apply(&self, update: DnsCacheUpdate) {
-        if let Some(control_handle) = &self.control_handle
-            && control_handle
-                .publish_event(DnsCacheUpdateArgs {
-                    cache: Arc::clone(&self.cache),
-                    update: update.clone(),
-                })
-                .is_ok()
-        {
+        if let Some(control_handle) = &self.control_handle {
+            let _ = control_handle.publish_event(DnsCacheUpdateArgs {
+                cache: Arc::clone(&self.cache),
+                update,
+            });
             return;
         }
         self.cache.apply_update(update);
     }
 }
 
-fn prune_cache(cache: &mut LruCache<CacheKey, CacheValue>, now: Instant) {
+fn prune_response_snapshot(cache: &mut HashMap<CacheKey, CacheValue>, now: Instant) {
     let expired: Vec<CacheKey> = cache
         .iter()
         .filter(|(_, value)| now >= value.expires_at)
         .map(|(key, _)| key.clone())
         .collect();
     for key in expired {
-        cache.pop(&key);
+        cache.remove(&key);
+    }
+}
+
+fn trim_response_snapshot(cache: &mut HashMap<CacheKey, CacheValue>, capacity: usize) {
+    while cache.len() > capacity {
+        let Some(key) = cache
+            .iter()
+            .min_by_key(|(_, value)| value.expires_at)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        cache.remove(&key);
     }
 }
 
@@ -747,7 +715,7 @@ impl DnsTransport for LocalDnsTransport {
 }
 
 pub struct DnsTransportManager {
-    items: Mutex<HashMap<String, DnsTransportComponent>>,
+    items: ArcSwap<HashMap<String, DnsTransportComponent>>,
     default_id: String,
     factories: DnsTransportFactorySet,
 }
@@ -836,7 +804,7 @@ fn register_standard_dns_transport_builders(
 impl DnsTransportManager {
     pub fn new(_logger: Logger, default_id: impl Into<String>) -> Self {
         Self {
-            items: Mutex::new(HashMap::new()),
+            items: ArcSwap::from_pointee(HashMap::new()),
             default_id: default_id.into(),
             factories: DnsTransportFactorySet::standard(),
         }
@@ -892,27 +860,17 @@ impl DnsTransportManager {
     pub fn insert(&self, transport: impl Into<DnsTransportRegistration>) {
         let transport = transport.into().0;
         let id = transport.meta().id().to_owned();
-        self.items
-            .lock()
-            .expect("DnsTransportManager poisoned")
-            .insert(id, transport);
+        let mut items = self.items.load_full().as_ref().clone();
+        items.insert(id, transport);
+        self.items.store(Arc::new(items));
     }
 
     pub fn list(&self) -> Vec<DnsTransportComponent> {
-        self.items
-            .lock()
-            .expect("DnsTransportManager poisoned")
-            .values()
-            .cloned()
-            .collect()
+        self.items.load().values().cloned().collect()
     }
 
     pub fn get(&self, id: &str) -> Option<DnsTransportComponent> {
-        self.items
-            .lock()
-            .expect("DnsTransportManager poisoned")
-            .get(id)
-            .cloned()
+        self.items.load().get(id).cloned()
     }
 
     pub fn default(&self) -> Option<DnsTransportComponent> {
@@ -1071,10 +1029,9 @@ impl DnsTransportManagerTrait for DnsTransportManager {
     }
 
     fn remove(&self, id: &str) -> HammerResult<()> {
-        self.items
-            .lock()
-            .expect("DnsTransportManager poisoned")
-            .remove(id);
+        let mut items = self.items.load_full().as_ref().clone();
+        items.remove(id);
+        self.items.store(Arc::new(items));
         Ok(())
     }
 }
@@ -1407,28 +1364,47 @@ impl DnsRouter {
     }
 
     fn publish_or_apply(&self, update: DnsCacheUpdate) {
-        if let Some(control_handle) = &self.control_handle
-            && control_handle
-                .publish_event(DnsCacheUpdateArgs {
-                    cache: Arc::clone(&self.cache),
-                    update: update.clone(),
-                })
-                .is_ok()
-        {
+        if let Some(control_handle) = &self.control_handle {
+            let _ = control_handle.publish_event(DnsCacheUpdateArgs {
+                cache: Arc::clone(&self.cache),
+                update,
+            });
             return;
         }
         self.cache.apply_update(update);
     }
 }
 
-fn prune_reverse_cache(reverse: &mut LruCache<IpAddr, ReverseValue>, now: Instant) {
+fn prune_reverse_snapshot(reverse: &mut HashMap<IpAddr, ReverseValue>, now: Instant) {
     let expired: Vec<IpAddr> = reverse
         .iter()
         .filter(|(_, value)| now >= value.expires_at)
         .map(|(addr, _)| *addr)
         .collect();
     for addr in expired {
-        reverse.pop(&addr);
+        reverse.remove(&addr);
+    }
+}
+
+fn trim_reverse_snapshot(reverse: &mut HashMap<IpAddr, ReverseValue>, capacity: usize) {
+    while reverse.len() > capacity {
+        let Some(addr) = reverse
+            .iter()
+            .min_by_key(|(_, value)| value.expires_at)
+            .map(|(addr, _)| *addr)
+        else {
+            return;
+        };
+        reverse.remove(&addr);
+    }
+}
+
+fn trim_match_snapshot(match_cache: &mut HashMap<String, MatchedAction>, capacity: usize) {
+    while match_cache.len() > capacity {
+        let Some(qname) = match_cache.keys().min().cloned() else {
+            return;
+        };
+        match_cache.remove(&qname);
     }
 }
 

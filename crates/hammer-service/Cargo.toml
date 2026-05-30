@@ -69,7 +69,6 @@ http = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
-lru = { workspace = true }
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
