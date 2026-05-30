@@ -65,14 +65,17 @@ pub struct BufferFlags(u32);
 impl BufferFlags {
     pub const NEXT_PRESENT: Self = Self(1 << 0);
 
+    #[inline]
     pub fn empty() -> Self {
         Self(0)
     }
 
+    #[inline]
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    #[inline]
     fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
@@ -89,51 +92,62 @@ pub struct BufferPacketCursor {
 }
 
 impl BufferPacketCursor {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[inline]
     pub fn packet_len(self) -> usize {
         self.packet_len
     }
 
+    #[inline]
     pub fn network_header_offset(self) -> usize {
         self.network_header_offset
     }
 
+    #[inline]
     pub fn network_header_len(self) -> usize {
         self.network_header_len
     }
 
+    #[inline]
     pub fn transport_header_offset(self) -> usize {
         self.transport_header_offset
     }
 
+    #[inline]
     pub fn transport_header_len(self) -> usize {
         self.transport_header_len
     }
 
+    #[inline]
     pub fn transport_payload_offset(self) -> usize {
         self.transport_payload_offset
     }
 
+    #[inline]
     pub fn with_packet_len(mut self, packet_len: usize) -> Self {
         self.packet_len = packet_len;
         self
     }
 
+    #[inline]
     pub fn with_network_header(mut self, offset: usize, len: usize) -> Self {
         self.network_header_offset = offset;
         self.network_header_len = len;
         self
     }
 
+    #[inline]
     pub fn with_transport_header(mut self, offset: usize, len: usize) -> Self {
         self.transport_header_offset = offset;
         self.transport_header_len = len;
         self
     }
 
+    #[inline]
     pub fn with_transport_payload_offset(mut self, offset: usize) -> Self {
         self.transport_payload_offset = offset;
         self
@@ -164,6 +178,7 @@ impl fmt::Debug for CacheAlignedStorage {
 }
 
 impl CacheAlignedStorage {
+    #[inline]
     fn with_len(len: usize) -> Self {
         let line_count = len.div_ceil(BUFFER_CACHE_LINE_SIZE).max(1);
         Self {
@@ -172,10 +187,12 @@ impl CacheAlignedStorage {
         }
     }
 
+    #[inline]
     fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     fn as_slice(&self) -> &[u8] {
         let ptr = self.lines.as_ptr().cast::<u8>();
         // SAFETY: CacheLine is a repr(C, align(64)) wrapper around contiguous
@@ -183,6 +200,7 @@ impl CacheAlignedStorage {
         unsafe { std::slice::from_raw_parts(ptr, self.len) }
     }
 
+    #[inline]
     fn as_mut_slice(&mut self) -> &mut [u8] {
         let ptr = self.lines.as_mut_ptr().cast::<u8>();
         // SAFETY: Same layout guarantee as `as_slice`, with unique access via
@@ -206,6 +224,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    #[inline]
     fn with_slot_capacity(slot_capacity: usize) -> Self {
         Self {
             metadata: RouteMetadata::default(),
@@ -220,6 +239,7 @@ impl Buffer {
         }
     }
 
+    #[inline]
     fn reset(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<()> {
         if bytes.len() > self.storage.len() {
             return Err(CoreError::internal(format!(
@@ -240,6 +260,7 @@ impl Buffer {
         Ok(())
     }
 
+    #[inline]
     fn reset_for_free(&mut self) {
         self.metadata = RouteMetadata::default();
         self.packet_cursor = BufferPacketCursor::default();
@@ -251,62 +272,76 @@ impl Buffer {
         self.total_len_not_including_first = 0;
     }
 
+    #[inline]
     pub fn metadata(&self) -> &RouteMetadata {
         &self.metadata
     }
 
+    #[inline]
     pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
         &mut self.metadata
     }
 
+    #[inline]
     pub fn packet_cursor(&self) -> BufferPacketCursor {
         self.packet_cursor
     }
 
+    #[inline]
     pub fn packet_cursor_mut(&mut self) -> &mut BufferPacketCursor {
         &mut self.packet_cursor
     }
 
+    #[inline]
     pub fn flags(&self) -> BufferFlags {
         self.flags
     }
 
+    #[inline]
     pub fn current_data(&self) -> usize {
         self.current_data
     }
 
+    #[inline]
     pub fn current_len(&self) -> usize {
         self.current_len
     }
 
+    #[inline]
     pub fn data_len(&self) -> usize {
         self.data_len
     }
 
+    #[inline]
     pub fn next_buffer(&self) -> Option<BufferIndex> {
         self.next_buffer
     }
 
+    #[inline]
     pub fn total_len_not_including_first(&self) -> usize {
         self.total_len_not_including_first
     }
 
+    #[inline]
     pub fn current(&self) -> &[u8] {
         &self.storage.as_slice()[self.current_data..self.current_data + self.current_len]
     }
 
+    #[inline]
     pub fn current_mut(&mut self) -> &mut [u8] {
         let start = self.current_data;
         let end = start + self.current_len;
         &mut self.storage.as_mut_slice()[start..end]
     }
 
+    #[inline]
     fn available_tail(&self) -> usize {
         self.storage
             .len()
             .saturating_sub(self.current_data + self.current_len)
     }
 
+    #[inline]
     fn append_in_place(&mut self, bytes: &[u8]) -> usize {
         let take = bytes.len().min(self.available_tail());
         if take == 0 {
@@ -401,10 +436,12 @@ impl<N> Deref for DataPlaneRuntime<N> {
 static NEXT_BUFFER_POOL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_FRAME_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
+#[inline]
 fn next_buffer_pool_id() -> u64 {
     NEXT_BUFFER_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+#[inline]
 fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -442,6 +479,7 @@ fn prefetch_read_l1(ptr: *const u8) {
 fn prefetch_read_l1(_ptr: *const u8) {}
 
 impl DataPlaneBuffers {
+    #[inline]
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities_and_instruction_set(
             slot_capacity,
@@ -452,6 +490,7 @@ impl DataPlaneBuffers {
         )
     }
 
+    #[inline]
     pub fn with_capacities(
         buffer_slot_capacity: usize,
         buffer_slots: usize,
@@ -467,6 +506,7 @@ impl DataPlaneBuffers {
         )
     }
 
+    #[inline]
     pub fn with_buffer_capacity_and_instruction_set(
         slot_capacity: usize,
         slots: usize,
@@ -481,6 +521,7 @@ impl DataPlaneBuffers {
         )
     }
 
+    #[inline]
     pub fn with_capacities_and_instruction_set(
         buffer_slot_capacity: usize,
         buffer_slots: usize,
@@ -495,34 +536,42 @@ impl DataPlaneBuffers {
         }
     }
 
+    #[inline]
     pub fn buffers(&self) -> &BufferPool {
         &self.buffers
     }
 
+    #[inline]
     pub fn frames(&self) -> &FramePool {
         &self.frames
     }
 
+    #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.instruction_set
     }
 
+    #[inline]
     pub fn preferred_frame_batch_width(&self) -> FrameBatchWidth {
         self.instruction_set.preferred_frame_batch_width()
     }
 
+    #[inline]
     pub fn in_use_buffers(&self) -> usize {
         self.buffers.in_use()
     }
 
+    #[inline]
     pub fn frames_in_use(&self) -> usize {
         self.frames.in_use()
     }
 
+    #[inline]
     pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
         self.buffers.alloc_index(metadata)
     }
 
+    #[inline]
     pub fn alloc_index_with_bytes(
         &self,
         metadata: RouteMetadata,
@@ -531,22 +580,27 @@ impl DataPlaneBuffers {
         self.buffers.alloc_index_with_bytes(metadata, bytes)
     }
 
+    #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         self.buffers.free_index(index);
     }
 
+    #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.buffers.prefetch_read(index);
     }
 
+    #[inline]
     pub fn free_frame(&self, frame: &mut BufferFrame) {
         self.buffers.free_frame(frame);
     }
 
+    #[inline]
     pub fn alloc_frame_index(&self) -> CoreResult<FrameIndex> {
         self.frames.alloc_index()
     }
 
+    #[inline]
     pub fn with_frame<R>(
         &self,
         index: FrameIndex,
@@ -555,6 +609,7 @@ impl DataPlaneBuffers {
         self.frames.with_frame(index, f)
     }
 
+    #[inline]
     pub fn with_frame_mut<R>(
         &self,
         index: FrameIndex,
@@ -563,10 +618,12 @@ impl DataPlaneBuffers {
         self.frames.with_frame_mut(index, f)
     }
 
+    #[inline]
     pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
         self.frames.free_index(&self.buffers, index)
     }
 
+    #[inline]
     pub fn alloc_pooled_frame(&self) -> CoreResult<PooledBufferFrame> {
         let index = self.frames.alloc_index()?;
         match self.frames.take_index(index) {
@@ -578,15 +635,18 @@ impl DataPlaneBuffers {
         }
     }
 
+    #[inline]
     pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
         let PooledBufferFrame { index, frame } = frame;
         self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
+    #[inline]
     pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.frames.take_index(index)
     }
 
+    #[inline]
     pub(crate) fn return_taken_frame_index(
         &self,
         index: FrameIndex,
@@ -595,6 +655,7 @@ impl DataPlaneBuffers {
         self.frames.return_taken_index(index, frame)
     }
 
+    #[inline]
     pub(crate) fn release_taken_frame_index(
         &self,
         index: FrameIndex,
@@ -603,10 +664,12 @@ impl DataPlaneBuffers {
         self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
+    #[inline]
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
         self.buffers.metadata(index)
     }
 
+    #[inline]
     pub fn with_buffer<R>(
         &self,
         index: BufferIndex,
@@ -615,6 +678,7 @@ impl DataPlaneBuffers {
         self.buffers.with_buffer(index, f)
     }
 
+    #[inline]
     pub fn with_buffer_mut<R>(
         &self,
         index: BufferIndex,
@@ -623,10 +687,12 @@ impl DataPlaneBuffers {
         self.buffers.with_buffer_mut(index, f)
     }
 
+    #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
         self.buffers.packet_cursor(index)
     }
 
+    #[inline]
     pub fn with_metadata<R>(
         &self,
         index: BufferIndex,
@@ -635,6 +701,7 @@ impl DataPlaneBuffers {
         self.buffers.with_metadata(index, f)
     }
 
+    #[inline]
     pub fn with_metadata_mut<R>(
         &self,
         index: BufferIndex,
@@ -643,44 +710,54 @@ impl DataPlaneBuffers {
         self.buffers.with_metadata_mut(index, f)
     }
 
+    #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.advance(index, len)
     }
 
+    #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.truncate_current(index, len)
     }
 
+    #[inline]
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         self.buffers.prepend(index, bytes)
     }
 
+    #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         self.buffers.append(index, bytes)
     }
 
+    #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.current(index)
     }
 
+    #[inline]
     pub fn copy_current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_current(index)
     }
 
+    #[inline]
     pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
         self.buffers.is_chained(index)
     }
 
+    #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_packet(index)
     }
 
+    #[inline]
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_current_chain(index)
     }
 }
 
 impl<N> DataPlaneRuntime<N> {
+    #[inline]
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities_and_instruction_set(
             slot_capacity,
@@ -691,6 +768,7 @@ impl<N> DataPlaneRuntime<N> {
         )
     }
 
+    #[inline]
     pub fn with_capacities(
         buffer_slot_capacity: usize,
         buffer_slots: usize,
@@ -706,6 +784,7 @@ impl<N> DataPlaneRuntime<N> {
         )
     }
 
+    #[inline]
     pub fn with_buffer_capacity_and_instruction_set(
         slot_capacity: usize,
         slots: usize,
@@ -720,6 +799,7 @@ impl<N> DataPlaneRuntime<N> {
         )
     }
 
+    #[inline]
     pub fn with_capacities_and_instruction_set(
         buffer_slot_capacity: usize,
         buffer_slots: usize,
@@ -739,22 +819,27 @@ impl<N> DataPlaneRuntime<N> {
         }
     }
 
+    #[inline]
     pub fn packet_buffers(&self) -> &DataPlaneBuffers {
         &self.buffers
     }
 
+    #[inline]
     pub fn nodes(&self) -> &NodeRuntime<N> {
         &self.nodes
     }
 
+    #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.buffers.instruction_set()
     }
 
+    #[inline]
     pub fn preferred_frame_batch_width(&self) -> FrameBatchWidth {
         self.buffers.preferred_frame_batch_width()
     }
 
+    #[inline]
     pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
         if !self.with_frame(frame, BufferFrame::has_pending)? {
             return Ok(false);
@@ -764,11 +849,13 @@ impl<N> DataPlaneRuntime<N> {
         Ok(true)
     }
 
+    #[inline]
     pub fn schedule_driver_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
         self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
         self.nodes.schedule_frame(node, frame, true)
     }
 
+    #[inline]
     pub fn run_ready_nodes(&self) -> CoreResult<usize>
     where
         N: Node<N>,
@@ -776,10 +863,12 @@ impl<N> DataPlaneRuntime<N> {
         self.nodes.run_ready(self)
     }
 
+    #[inline]
     pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.buffers.take_frame_index(index)
     }
 
+    #[inline]
     pub(crate) fn return_taken_frame_index(
         &self,
         index: FrameIndex,
@@ -788,6 +877,7 @@ impl<N> DataPlaneRuntime<N> {
         self.buffers.return_taken_frame_index(index, frame)
     }
 
+    #[inline]
     pub(crate) fn release_taken_frame_index(
         &self,
         index: FrameIndex,
@@ -798,6 +888,7 @@ impl<N> DataPlaneRuntime<N> {
 }
 
 impl BufferPool {
+    #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
         let free = (0..slots)
             .rev()
@@ -821,14 +912,17 @@ impl BufferPool {
         }
     }
 
+    #[inline]
     pub fn in_use(&self) -> usize {
         self.inner.borrow().in_use
     }
 
+    #[inline]
     pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
         self.alloc_index_with_bytes(metadata, &[])
     }
 
+    #[inline]
     pub fn alloc_index_with_bytes(
         &self,
         metadata: RouteMetadata,
@@ -837,14 +931,17 @@ impl BufferPool {
         self.inner.borrow_mut().alloc_chain(metadata, bytes)
     }
 
+    #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         self.inner.borrow_mut().free_chain(index);
     }
 
+    #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.inner.borrow().prefetch_read(index);
     }
 
+    #[inline]
     pub fn free_frame(&self, frame: &mut BufferFrame) {
         let mut pool = self.inner.borrow_mut();
         for index in frame.drain_indices() {
@@ -852,12 +949,14 @@ impl BufferPool {
         }
     }
 
+    #[inline]
     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
         let guard = self.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
     }
 
+    #[inline]
     pub fn with_buffer<R>(
         &self,
         index: BufferIndex,
@@ -868,6 +967,7 @@ impl BufferPool {
         Ok(f(buffer))
     }
 
+    #[inline]
     pub fn with_buffer_mut<R>(
         &self,
         index: BufferIndex,
@@ -878,14 +978,17 @@ impl BufferPool {
         Ok(f(buffer))
     }
 
+    #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
         self.with_buffer(index, Buffer::packet_cursor)
     }
 
+    #[inline]
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
         Ok(self.inner.borrow().buffer(index)?.metadata().clone())
     }
 
+    #[inline]
     pub fn with_metadata<R>(
         &self,
         index: BufferIndex,
@@ -896,6 +999,7 @@ impl BufferPool {
         Ok(f(metadata))
     }
 
+    #[inline]
     pub fn with_metadata_mut<R>(
         &self,
         index: BufferIndex,
@@ -906,6 +1010,7 @@ impl BufferPool {
         Ok(f(metadata))
     }
 
+    #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
@@ -917,6 +1022,7 @@ impl BufferPool {
         Ok(())
     }
 
+    #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
@@ -929,6 +1035,7 @@ impl BufferPool {
         Ok(())
     }
 
+    #[inline]
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
@@ -943,22 +1050,27 @@ impl BufferPool {
         Ok(())
     }
 
+    #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         self.inner.borrow_mut().append_chain(index, bytes)
     }
 
+    #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         Ok(self.inner.borrow().buffer(index)?.current().to_vec())
     }
 
+    #[inline]
     pub fn copy_current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.current(index)
     }
 
+    #[inline]
     pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
         Ok(self.inner.borrow().buffer(index)?.next_buffer().is_some())
     }
 
+    #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let inner = self.inner.borrow();
         let buffer = inner.buffer(index)?;
@@ -968,12 +1080,14 @@ impl BufferPool {
         inner.copy_current_chain(index)
     }
 
+    #[inline]
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.inner.borrow().copy_current_chain(index)
     }
 }
 
 impl FramePool {
+    #[inline]
     pub fn with_capacity(frame_capacity: usize, slots: usize) -> Self {
         let free = (0..slots)
             .rev()
@@ -996,14 +1110,17 @@ impl FramePool {
         }
     }
 
+    #[inline]
     pub fn in_use(&self) -> usize {
         self.inner.borrow().in_use
     }
 
+    #[inline]
     pub fn alloc_index(&self) -> CoreResult<FrameIndex> {
         self.inner.borrow_mut().alloc_index()
     }
 
+    #[inline]
     pub fn with_frame<R>(
         &self,
         index: FrameIndex,
@@ -1014,6 +1131,7 @@ impl FramePool {
         Ok(f(frame))
     }
 
+    #[inline]
     pub fn with_frame_mut<R>(
         &self,
         index: FrameIndex,
@@ -1024,6 +1142,7 @@ impl FramePool {
         Ok(f(frame))
     }
 
+    #[inline]
     pub fn free_index(&self, buffers: &BufferPool, index: FrameIndex) -> CoreResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
@@ -1032,10 +1151,12 @@ impl FramePool {
         pool.release_index(index)
     }
 
+    #[inline]
     pub fn take_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.inner.borrow_mut().take_frame(index)
     }
 
+    #[inline]
     pub fn free_taken_index(
         &self,
         buffers: &BufferPool,
@@ -1049,12 +1170,14 @@ impl FramePool {
             .return_frame_and_release(index, frame)
     }
 
+    #[inline]
     pub fn return_taken_index(&self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
         self.inner.borrow_mut().return_frame(index, frame)
     }
 }
 
 impl FramePoolInner {
+    #[inline]
     fn alloc_index(&mut self) -> CoreResult<FrameIndex> {
         let slot = self
             .free
@@ -1079,6 +1202,7 @@ impl FramePoolInner {
         })
     }
 
+    #[inline]
     fn validate_index(&self, index: FrameIndex) -> CoreResult<()> {
         if index.pool_id != self.pool_id {
             return Err(CoreError::internal("frame index belongs to another pool"));
@@ -1086,6 +1210,7 @@ impl FramePoolInner {
         Ok(())
     }
 
+    #[inline]
     fn frame(&self, index: FrameIndex) -> CoreResult<&BufferFrame> {
         self.validate_index(index)?;
         let entry = self
@@ -1104,6 +1229,7 @@ impl FramePoolInner {
             .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
+    #[inline]
     fn frame_mut(&mut self, index: FrameIndex) -> CoreResult<&mut BufferFrame> {
         self.validate_index(index)?;
         let entry = self
@@ -1122,6 +1248,7 @@ impl FramePoolInner {
             .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
+    #[inline]
     fn take_frame(&mut self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.validate_index(index)?;
         let entry = self
@@ -1140,6 +1267,7 @@ impl FramePoolInner {
             .ok_or_else(|| CoreError::internal("frame slot is checked out"))
     }
 
+    #[inline]
     fn release_index(&mut self, index: FrameIndex) -> CoreResult<()> {
         let entry = self
             .slots
@@ -1160,6 +1288,7 @@ impl FramePoolInner {
         Ok(())
     }
 
+    #[inline]
     fn return_frame_and_release(
         &mut self,
         index: FrameIndex,
@@ -1186,6 +1315,7 @@ impl FramePoolInner {
         Ok(())
     }
 
+    #[inline]
     fn return_frame(&mut self, index: FrameIndex, frame: BufferFrame) -> CoreResult<()> {
         self.validate_index(index)?;
         let entry = self
@@ -1207,6 +1337,7 @@ impl FramePoolInner {
 }
 
 impl PooledBufferFrame {
+    #[inline]
     pub fn index(&self) -> FrameIndex {
         self.index
     }
@@ -1227,6 +1358,7 @@ impl DerefMut for PooledBufferFrame {
 }
 
 impl BufferPoolInner {
+    #[inline]
     fn alloc_chain(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
@@ -1257,6 +1389,7 @@ impl BufferPoolInner {
         Ok(first)
     }
 
+    #[inline]
     fn alloc_slot(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
         if bytes.len() > self.slot_capacity {
             return Err(CoreError::internal(format!(
@@ -1284,6 +1417,7 @@ impl BufferPoolInner {
         })
     }
 
+    #[inline]
     fn validate_pool_index(&self, index: BufferIndex) -> CoreResult<()> {
         if index.pool_id != self.pool_id {
             return Err(CoreError::internal("buffer index belongs to another pool"));
@@ -1291,6 +1425,7 @@ impl BufferPoolInner {
         Ok(())
     }
 
+    #[inline]
     fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
         self.validate_pool_index(index)?;
         let entry = self
@@ -1306,6 +1441,7 @@ impl BufferPoolInner {
         Ok(&entry.buffer)
     }
 
+    #[inline]
     fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
         self.validate_pool_index(index)?;
         let entry = self
@@ -1321,6 +1457,7 @@ impl BufferPoolInner {
         Ok(&mut entry.buffer)
     }
 
+    #[inline]
     fn prefetch_read(&self, index: BufferIndex) {
         let Ok(buffer) = self.buffer(index) else {
             return;
@@ -1340,6 +1477,7 @@ impl BufferPoolInner {
         }
     }
 
+    #[inline]
     fn free_chain(&mut self, index: BufferIndex) {
         let mut next = Some(index);
         while let Some(index) = next {
@@ -1364,6 +1502,7 @@ impl BufferPoolInner {
         }
     }
 
+    #[inline]
     fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut next = Some(index);
@@ -1375,6 +1514,7 @@ impl BufferPoolInner {
         Ok(bytes)
     }
 
+    #[inline]
     fn append_chain(&mut self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         let mut tail = index;
         while let Some(next) = self.buffer(tail)?.next_buffer {
@@ -1397,6 +1537,7 @@ impl BufferPoolInner {
         self.refresh_chain_lengths(index)
     }
 
+    #[inline]
     fn refresh_chain_lengths(&mut self, index: BufferIndex) -> CoreResult<()> {
         let mut total = 0usize;
         let mut next = self.buffer(index)?.next_buffer;
@@ -1431,6 +1572,7 @@ pub enum BufferFrameQuadBatch {
 }
 
 impl BufferFramePairBatch {
+    #[inline]
     pub fn indices(self) -> BufferFrameBatchIndices {
         match self {
             Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
@@ -1440,6 +1582,7 @@ impl BufferFramePairBatch {
 }
 
 impl BufferFrameQuadBatch {
+    #[inline]
     pub fn indices(self) -> BufferFrameBatchIndices {
         match self {
             Self::Quad(indices) => BufferFrameBatchIndices::new(&indices),
@@ -1456,6 +1599,7 @@ pub struct BufferFrameBatchIndices {
 }
 
 impl BufferFrameBatchIndices {
+    #[inline]
     fn new(indices: &[BufferIndex]) -> Self {
         let mut values = [None; 4];
         for (offset, index) in indices.iter().copied().enumerate() {
@@ -1472,6 +1616,7 @@ impl BufferFrameBatchIndices {
 impl Iterator for BufferFrameBatchIndices {
     type Item = BufferIndex;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset == self.len {
             return None;
@@ -1510,6 +1655,7 @@ impl fmt::Debug for FrameReadiness {
 }
 
 impl FrameReadiness {
+    #[inline]
     fn mark_pending(&self) {
         self.pending.set(true);
         if let Some(waker) = self.waker.borrow_mut().take() {
@@ -1517,15 +1663,18 @@ impl FrameReadiness {
         }
     }
 
+    #[inline]
     fn clear_pending(&self) {
         self.pending.set(false);
     }
 
+    #[inline]
     fn reset_for_pool_reuse(&self) {
         self.pending.set(false);
         self.waker.borrow_mut().take();
     }
 
+    #[inline]
     fn poll_pending(&self, cx: &mut Context<'_>) -> Poll<()> {
         if self.pending.get() {
             return Poll::Ready(());
@@ -1548,6 +1697,7 @@ impl FrameReadiness {
 }
 
 impl BufferFrame {
+    #[inline]
     fn with_capacity(capacity: usize) -> Self {
         Self {
             indices: Vec::with_capacity(capacity),
@@ -1556,6 +1706,7 @@ impl BufferFrame {
         }
     }
 
+    #[inline]
     pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
         if self.indices.len() == self.indices.capacity() {
             return Err(CoreError::internal("buffer frame capacity exceeded"));
@@ -1565,6 +1716,7 @@ impl BufferFrame {
         Ok(())
     }
 
+    #[inline]
     pub fn push_indices(
         &mut self,
         indices: impl IntoIterator<Item = BufferIndex>,
@@ -1593,54 +1745,66 @@ impl BufferFrame {
         Ok(())
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.indices.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
 
+    #[inline]
     pub fn has_pending(&self) -> bool {
         !self.indices.is_empty()
     }
 
+    #[inline]
     pub fn pending_len(&self) -> usize {
         self.indices.len()
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.indices.capacity()
     }
 
+    #[inline]
     pub fn remaining_capacity(&self) -> usize {
         self.capacity().saturating_sub(self.len())
     }
 
+    #[inline]
     pub fn reset(&mut self) {
         self.indices.clear();
         self.next_node = None;
         self.readiness.clear_pending();
     }
 
+    #[inline]
     fn reset_for_pool_reuse(&mut self) {
         self.indices.clear();
         self.next_node = None;
         self.readiness.reset_for_pool_reuse();
     }
 
+    #[inline]
     pub fn clear(&mut self) {
         self.reset();
     }
 
+    #[inline]
     pub fn indices(&self) -> &[BufferIndex] {
         &self.indices
     }
 
+    #[inline]
     pub fn pending_indices(&self) -> &[BufferIndex] {
         &self.indices
     }
 
+    #[inline]
     pub fn pair_batch_cursor(&self) -> BufferFramePairBatchCursor<'_> {
         BufferFramePairBatchCursor {
             indices: self.pending_indices(),
@@ -1648,6 +1812,7 @@ impl BufferFrame {
         }
     }
 
+    #[inline]
     pub fn quad_batch_cursor(&self) -> BufferFrameQuadBatchCursor<'_> {
         BufferFrameQuadBatchCursor {
             indices: self.pending_indices(),
@@ -1655,20 +1820,24 @@ impl BufferFrame {
         }
     }
 
+    #[inline]
     pub fn iter_indices(&self) -> std::slice::Iter<'_, BufferIndex> {
         self.indices.iter()
     }
 
+    #[inline]
     pub fn drain_indices(&mut self) -> std::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
     }
 
+    #[inline]
     pub fn drain_pending(&mut self) -> std::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
     }
 
+    #[inline]
     pub fn retain_indices(
         &mut self,
         mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
@@ -1692,26 +1861,31 @@ impl BufferFrame {
         Ok(())
     }
 
+    #[inline]
     pub fn pending(&self) -> BufferFramePending {
         BufferFramePending {
             readiness: Rc::clone(&self.readiness),
         }
     }
 
+    #[inline]
     pub fn next_node(&self) -> Option<NodeId> {
         self.next_node
     }
 
+    #[inline]
     pub fn set_next_node(&mut self, node: NodeId) {
         self.next_node = Some(node);
     }
 
+    #[inline]
     pub fn clear_next_node(&mut self) {
         self.next_node = None;
     }
 }
 
 impl BufferFramePairBatchCursor<'_> {
+    #[inline]
     pub fn prefetch_next_pair<G>(&self, runtime: &DataPlaneRuntime<G>) {
         for index in self.indices[self.offset..].iter().take(2).copied() {
             runtime.prefetch_read(index);
@@ -1722,6 +1896,7 @@ impl BufferFramePairBatchCursor<'_> {
 impl Iterator for BufferFramePairBatchCursor<'_> {
     type Item = BufferFramePairBatch;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let remaining = self.indices.len().saturating_sub(self.offset);
         if remaining >= 2 {
@@ -1742,6 +1917,7 @@ impl Iterator for BufferFramePairBatchCursor<'_> {
 }
 
 impl BufferFrameQuadBatchCursor<'_> {
+    #[inline]
     pub fn prefetch_next_quad<G>(&self, runtime: &DataPlaneRuntime<G>) {
         for index in self.indices[self.offset..].iter().take(4).copied() {
             runtime.prefetch_read(index);
@@ -1752,6 +1928,7 @@ impl BufferFrameQuadBatchCursor<'_> {
 impl Iterator for BufferFrameQuadBatchCursor<'_> {
     type Item = BufferFrameQuadBatch;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let remaining = self.indices.len().saturating_sub(self.offset);
         if remaining >= 4 {

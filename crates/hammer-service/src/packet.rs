@@ -22,12 +22,14 @@ pub struct IpInputNode {
 }
 
 impl IpInputNode {
+    #[inline]
     pub fn new(udp_next: NodeId) -> Self {
         Self { udp_next }
     }
 }
 
 impl<G> Node<G> for IpInputNode {
+    #[inline]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -49,12 +51,14 @@ pub struct UdpInputNode {
 }
 
 impl UdpInputNode {
+    #[inline]
     pub fn new(next: NodeId) -> Self {
         Self { next }
     }
 }
 
 impl<G> Node<G> for UdpInputNode {
+    #[inline]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -71,18 +75,19 @@ impl<G> Node<G> for UdpInputNode {
 
 impl<G> InternalNode<G> for UdpInputNode {}
 
+#[inline]
 pub fn packet_route_metadata(interface_id: &str, packet: &[u8]) -> CoreResult<RouteMetadata> {
     let parsed = parse_packet(packet)?;
     Ok(RouteMetadata {
         inbound: interface_id.to_owned(),
         network: parsed.network,
-        protocol: parsed.protocol,
         source: Some(parsed.source),
         destination: Some(parsed.destination),
         ..Default::default()
     })
 }
 
+#[inline]
 fn process_frame<G>(
     runtime: &DataPlaneRuntime<G>,
     frame: &mut BufferFrame,
@@ -101,6 +106,7 @@ fn process_frame<G>(
     frame.retain_indices(|index| Ok(runtime.with_buffer(index, |_| ()).is_ok()))
 }
 
+#[inline]
 fn process_ip_input_index<G>(
     runtime: &DataPlaneRuntime<G>,
     index: BufferIndex,
@@ -118,11 +124,11 @@ fn process_ip_input_index<G>(
         let metadata = buffer.metadata_mut();
         metadata.source = Some(SocksAddr::ip(parsed.source, 0));
         metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
-        metadata.protocol.clear();
         Ok(true)
     })?
 }
 
+#[inline]
 fn process_udp_input_index<G>(
     runtime: &DataPlaneRuntime<G>,
     index: BufferIndex,
@@ -144,7 +150,6 @@ fn process_udp_input_index<G>(
             .with_transport_payload_offset(parsed.payload_offset);
         let metadata = buffer.metadata_mut();
         metadata.network = Network::Udp;
-        metadata.protocol.clear();
         metadata.source = Some(SocksAddr::ip(source, parsed.source_port));
         metadata.destination = Some(SocksAddr::ip(destination, parsed.destination_port));
         Ok(true)
@@ -153,7 +158,6 @@ fn process_udp_input_index<G>(
 
 struct ParsedPacket {
     network: Network,
-    protocol: String,
     source: SocksAddr,
     destination: SocksAddr,
 }
@@ -169,6 +173,7 @@ enum IpProtocol {
 impl TryFrom<u8> for IpProtocol {
     type Error = CoreError;
 
+    #[inline]
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             1 => Ok(Self::Icmpv4),
@@ -197,6 +202,7 @@ struct ParsedUdpPacket {
     payload_offset: usize,
 }
 
+#[inline]
 fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
     let first = *packet
         .first()
@@ -215,6 +221,7 @@ fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
     Ok(parsed)
 }
 
+#[inline]
 fn parse_ipv4_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
     let packet_len = input.len();
     let (input, version_ihl) = be_u8(input)?;
@@ -264,6 +271,7 @@ fn parse_ipv4_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
     ))
 }
 
+#[inline]
 fn parse_ipv6_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
     let (input, version_traffic) = be_u8(input)?;
     if version_traffic >> 4 != 6 {
@@ -300,6 +308,7 @@ fn parse_ipv6_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
     ))
 }
 
+#[inline]
 fn parse_packet(packet: &[u8]) -> CoreResult<ParsedPacket> {
     let parsed = parse_ip_packet(packet)?;
     let transport = packet
@@ -310,19 +319,18 @@ fn parse_packet(packet: &[u8]) -> CoreResult<ParsedPacket> {
         IpProtocol::Udp => parse_udp_route_packet(parsed.source, parsed.destination, transport),
         IpProtocol::Icmpv4 => Ok(ParsedPacket {
             network: Network::Icmp,
-            protocol: "icmp".to_owned(),
             source: SocksAddr::ip(parsed.source, 0),
             destination: SocksAddr::ip(parsed.destination, 0),
         }),
         IpProtocol::Icmpv6 => Ok(ParsedPacket {
             network: Network::Icmp,
-            protocol: "ipv6-icmp".to_owned(),
             source: SocksAddr::ip(parsed.source, 0),
             destination: SocksAddr::ip(parsed.destination, 0),
         }),
     }
 }
 
+#[inline]
 fn parse_tcp_packet(
     source: IpAddr,
     destination: IpAddr,
@@ -332,12 +340,12 @@ fn parse_tcp_packet(
         .map_err(|err| CoreError::internal(format!("invalid TCP segment: {err}")))?;
     Ok(ParsedPacket {
         network: Network::Tcp,
-        protocol: String::new(),
         source: SocksAddr::ip(source, header.source_port),
         destination: SocksAddr::ip(destination, header.destination_port),
     })
 }
 
+#[inline]
 fn parse_udp_route_packet(
     source: IpAddr,
     destination: IpAddr,
@@ -347,12 +355,12 @@ fn parse_udp_route_packet(
         .map_err(|err| CoreError::internal(format!("invalid UDP datagram: {err}")))?;
     Ok(ParsedPacket {
         network: Network::Udp,
-        protocol: String::new(),
         source: SocksAddr::ip(source, header.source_port),
         destination: SocksAddr::ip(destination, header.destination_port),
     })
 }
 
+#[inline]
 fn parse_udp_packet(packet: &[u8], cursor: BufferPacketCursor) -> CoreResult<ParsedUdpPacket> {
     let transport_offset = cursor.transport_header_offset();
     let packet_len = cursor.packet_len();
@@ -374,6 +382,7 @@ struct TcpHeader {
     destination_port: u16,
 }
 
+#[inline]
 fn parse_tcp_header(input: &[u8]) -> ParseResult<'_, TcpHeader> {
     let segment_len = input.len();
     let (input, source_port) = be_u16(input)?;
@@ -403,6 +412,7 @@ struct UdpHeader {
     destination_port: u16,
 }
 
+#[inline]
 fn parse_udp_header(input: &[u8]) -> ParseResult<'_, UdpHeader> {
     let datagram_len = input.len();
     let (input, source_port) = be_u16(input)?;
@@ -426,12 +436,14 @@ fn parse_udp_header(input: &[u8]) -> ParseResult<'_, UdpHeader> {
     ))
 }
 
+#[inline]
 fn parse_ipv4_addr(input: &[u8]) -> ParseResult<'_, Ipv4Addr> {
     let (input, bytes) = take(4usize).parse(input)?;
     let bytes = <[u8; 4]>::try_from(bytes).expect("nom take returned four bytes");
     Ok((input, Ipv4Addr::from(bytes)))
 }
 
+#[inline]
 fn parse_ipv6_addr(input: &[u8]) -> ParseResult<'_, Ipv6Addr> {
     let (input, bytes) = take(16usize).parse(input)?;
     let bytes = <[u8; 16]>::try_from(bytes).expect("nom take returned sixteen bytes");

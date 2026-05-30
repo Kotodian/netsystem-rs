@@ -37,6 +37,7 @@ pub struct TunInputDriverNode<I> {
 }
 
 impl<I> TunInputDriverNode<I> {
+    #[inline]
     pub fn new(input: I, interface_id: impl Into<String>, next: NodeId) -> Self {
         Self {
             input,
@@ -46,6 +47,7 @@ impl<I> TunInputDriverNode<I> {
         }
     }
 
+    #[inline]
     pub fn with_max_batch(mut self, max_batch: usize) -> Self {
         self.max_batch = max_batch;
         self
@@ -56,6 +58,7 @@ impl<I, G> Node<G> for TunInputDriverNode<I>
 where
     I: TunPacketSource,
 {
+    #[inline]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -79,6 +82,7 @@ pub struct TunOutputNode<O> {
 }
 
 impl<O> TunOutputNode<O> {
+    #[inline]
     pub fn new(output: O) -> Self {
         Self { output }
     }
@@ -88,6 +92,7 @@ impl<O, G> Node<G> for TunOutputNode<O>
 where
     O: TunPacketSink,
 {
+    #[inline]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -124,22 +129,26 @@ pub struct MemoryTunOutput {
 }
 
 impl MemoryTunDevice {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[inline]
     pub fn input(&self) -> MemoryTunInput {
         MemoryTunInput {
             inner: Rc::clone(&self.inner),
         }
     }
 
+    #[inline]
     pub fn output(&self) -> MemoryTunOutput {
         MemoryTunOutput {
             inner: Rc::clone(&self.inner),
         }
     }
 
+    #[inline]
     pub fn inject(&self, packet: Vec<u8>) -> CoreResult<()> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
@@ -149,10 +158,12 @@ impl MemoryTunDevice {
         Ok(())
     }
 
+    #[inline]
     pub fn drain_output(&self) -> Vec<Vec<u8>> {
         self.inner.borrow_mut().output.drain(..).collect()
     }
 
+    #[inline]
     pub fn drain_output_batch_sizes(&self) -> Vec<usize> {
         self.inner
             .borrow_mut()
@@ -161,12 +172,14 @@ impl MemoryTunDevice {
             .collect()
     }
 
+    #[inline]
     pub fn close(&self) {
         self.inner.borrow_mut().closed = true;
     }
 }
 
 impl TunPacketSource for MemoryTunInput {
+    #[inline]
     fn recv_frame<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -191,6 +204,7 @@ impl TunPacketSource for MemoryTunInput {
 }
 
 impl TunPacketSink for MemoryTunOutput {
+    #[inline]
     fn send_frame<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -237,6 +251,7 @@ impl TunPacketSink for MemoryTunOutput {
     }
 }
 
+#[inline]
 fn push_packet_to_frame<G>(
     runtime: &DataPlaneRuntime<G>,
     frame: &mut BufferFrame,
