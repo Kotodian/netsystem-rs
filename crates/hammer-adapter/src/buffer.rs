@@ -10,6 +10,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
+use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
@@ -223,6 +224,7 @@ pub struct PooledBufferFrame {
 pub struct DataPlaneBuffers {
     buffers: BufferPool,
     frames: FramePool,
+    instruction_set: DataPlaneInstructionSet,
 }
 
 #[derive(Debug)]
@@ -293,11 +295,12 @@ fn prefetch_read_l1(_ptr: *const u8) {}
 
 impl DataPlaneBuffers {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacities(
+        Self::with_capacities_and_instruction_set(
             slot_capacity,
             slots,
             DEFAULT_BUFFER_FRAME_CAPACITY,
             DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            DataPlaneInstructionSet::native(),
         )
     }
 
@@ -307,9 +310,40 @@ impl DataPlaneBuffers {
         frame_capacity: usize,
         frame_slots: usize,
     ) -> Self {
+        Self::with_capacities_and_instruction_set(
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            DataPlaneInstructionSet::native(),
+        )
+    }
+
+    pub fn with_buffer_capacity_and_instruction_set(
+        slot_capacity: usize,
+        slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
+        Self::with_capacities_and_instruction_set(
+            slot_capacity,
+            slots,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            instruction_set,
+        )
+    }
+
+    pub fn with_capacities_and_instruction_set(
+        buffer_slot_capacity: usize,
+        buffer_slots: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
         Self {
             buffers: BufferPool::with_capacity(buffer_slot_capacity, buffer_slots),
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
+            instruction_set,
         }
     }
 
@@ -319,6 +353,14 @@ impl DataPlaneBuffers {
 
     pub fn frames(&self) -> &FramePool {
         &self.frames
+    }
+
+    pub fn instruction_set(&self) -> DataPlaneInstructionSet {
+        self.instruction_set
+    }
+
+    pub fn preferred_frame_batch_width(&self) -> FrameBatchWidth {
+        self.instruction_set.preferred_frame_batch_width()
     }
 
     pub fn in_use_buffers(&self) -> usize {
@@ -472,11 +514,12 @@ impl DataPlaneBuffers {
 
 impl<N> DataPlaneRuntime<N> {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_capacities(
+        Self::with_capacities_and_instruction_set(
             slot_capacity,
             slots,
             DEFAULT_BUFFER_FRAME_CAPACITY,
             DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            DataPlaneInstructionSet::native(),
         )
     }
 
@@ -486,12 +529,43 @@ impl<N> DataPlaneRuntime<N> {
         frame_capacity: usize,
         frame_slots: usize,
     ) -> Self {
+        Self::with_capacities_and_instruction_set(
+            buffer_slot_capacity,
+            buffer_slots,
+            frame_capacity,
+            frame_slots,
+            DataPlaneInstructionSet::native(),
+        )
+    }
+
+    pub fn with_buffer_capacity_and_instruction_set(
+        slot_capacity: usize,
+        slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
+        Self::with_capacities_and_instruction_set(
+            slot_capacity,
+            slots,
+            DEFAULT_BUFFER_FRAME_CAPACITY,
+            DEFAULT_BUFFER_FRAME_POOL_SIZE,
+            instruction_set,
+        )
+    }
+
+    pub fn with_capacities_and_instruction_set(
+        buffer_slot_capacity: usize,
+        buffer_slots: usize,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
         Self {
-            buffers: DataPlaneBuffers::with_capacities(
+            buffers: DataPlaneBuffers::with_capacities_and_instruction_set(
                 buffer_slot_capacity,
                 buffer_slots,
                 frame_capacity,
                 frame_slots,
+                instruction_set,
             ),
             nodes: NodeRuntime::default(),
         }
@@ -503,6 +577,14 @@ impl<N> DataPlaneRuntime<N> {
 
     pub fn nodes(&self) -> &NodeRuntime<N> {
         &self.nodes
+    }
+
+    pub fn instruction_set(&self) -> DataPlaneInstructionSet {
+        self.buffers.instruction_set()
+    }
+
+    pub fn preferred_frame_batch_width(&self) -> FrameBatchWidth {
+        self.buffers.preferred_frame_batch_width()
     }
 
     pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {

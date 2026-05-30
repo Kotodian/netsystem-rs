@@ -7,6 +7,7 @@ pub mod dns;
 pub mod endpoint;
 pub mod handler;
 pub mod inbound;
+pub mod instruction_set;
 pub mod network;
 pub mod node;
 pub mod outbound;
@@ -25,6 +26,7 @@ pub use buffer::{
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
+pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 
 // Re-exports used by the runtime crate so it doesn't have to know which
 // sub-module each trait lives in.

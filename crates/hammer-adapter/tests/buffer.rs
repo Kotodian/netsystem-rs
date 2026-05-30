@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFramePairBatch, BufferFrameQuadBatch, BufferPool, DataPlaneRuntime, NoopNode,
-    RouteMetadata,
+    BufferFramePairBatch, BufferFrameQuadBatch, BufferPool, DataPlaneInstructionSet,
+    DataPlaneRuntime, FrameBatchWidth, NoopNode, RouteMetadata,
 };
 
 #[derive(Default)]
@@ -161,6 +161,51 @@ fn buffer_pool_prefetch_read_is_best_effort_for_live_and_stale_indices() {
     pool.prefetch_read(buffer);
 
     assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn instruction_set_selects_preferred_frame_batch_width() {
+    assert_eq!(
+        DataPlaneInstructionSet::Scalar.preferred_frame_batch_width(),
+        FrameBatchWidth::Pair
+    );
+    assert_eq!(
+        DataPlaneInstructionSet::Sse2.preferred_frame_batch_width(),
+        FrameBatchWidth::Pair
+    );
+    assert_eq!(
+        DataPlaneInstructionSet::Avx2.preferred_frame_batch_width(),
+        FrameBatchWidth::Quad
+    );
+    assert_eq!(
+        DataPlaneInstructionSet::Neon.preferred_frame_batch_width(),
+        FrameBatchWidth::Quad
+    );
+}
+
+#[test]
+fn data_plane_runtime_can_use_explicit_instruction_set() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+        8,
+        4,
+        2,
+        1,
+        DataPlaneInstructionSet::Avx2,
+    );
+
+    assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::Avx2);
+    assert_eq!(runtime.preferred_frame_batch_width(), FrameBatchWidth::Quad);
+}
+
+#[test]
+fn data_plane_runtime_defaults_to_native_instruction_set() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+
+    assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::native());
+    assert_eq!(
+        runtime.preferred_frame_batch_width(),
+        runtime.instruction_set().preferred_frame_batch_width()
+    );
 }
 
 #[test]
