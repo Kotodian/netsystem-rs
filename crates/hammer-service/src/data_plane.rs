@@ -30,16 +30,18 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        runtime.prefetch_frame_read_window(frame);
-        for offset in 0..frame.pending_len() {
-            runtime.prefetch_frame_read_at(frame, offset);
-            let index = frame.pending_indices()[offset];
-            runtime.with_metadata_mut(index, |metadata| {
-                self.router.prepare_route_metadata(metadata)?;
-                let decision = self.router.match_route(metadata)?;
-                metadata.route_decision = Some(decision);
-                Ok(())
-            })??;
+        let mut cursor = frame.pair_batch_cursor();
+        cursor.prefetch_next_pair(runtime);
+        while let Some(batch) = cursor.next() {
+            cursor.prefetch_next_pair(runtime);
+            for index in batch.indices() {
+                runtime.with_metadata_mut(index, |metadata| {
+                    self.router.prepare_route_metadata(metadata)?;
+                    let decision = self.router.match_route(metadata)?;
+                    metadata.route_decision = Some(decision);
+                    Ok(())
+                })??;
+            }
         }
         Ok(NodeResult::next_current(self.next))
     }
@@ -136,11 +138,13 @@ impl RouteDispatchNode {
         frame: &BufferFrame,
     ) -> CoreResult<RouteDispatchGroups> {
         let mut groups = RouteDispatchGroups::default();
-        runtime.prefetch_frame_read_window(frame);
-        for offset in 0..frame.pending_len() {
-            runtime.prefetch_frame_read_at(frame, offset);
-            let index = frame.pending_indices()[offset];
-            groups.push(self.target_for_index(runtime, index)?)?;
+        let mut cursor = frame.pair_batch_cursor();
+        cursor.prefetch_next_pair(runtime);
+        while let Some(batch) = cursor.next() {
+            cursor.prefetch_next_pair(runtime);
+            for index in batch.indices() {
+                groups.push(self.target_for_index(runtime, index)?)?;
+            }
         }
         Ok(groups)
     }

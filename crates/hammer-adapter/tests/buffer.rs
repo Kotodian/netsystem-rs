@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
-use hammer_adapter::{BufferPool, DataPlaneRuntime, NoopNode, RouteMetadata};
+use hammer_adapter::{
+    BufferFramePairBatch, BufferFrameQuadBatch, BufferPool, DataPlaneRuntime, NoopNode,
+    RouteMetadata,
+};
 
 #[derive(Default)]
 struct WakeCounter {
@@ -393,6 +396,83 @@ fn buffer_frame_push_indices_batches_one_wake() {
     assert_eq!(frame.pending_indices(), &[first, second]);
 
     pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
+}
+
+#[test]
+fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let indices = (0..5)
+        .map(|value| {
+            pool.alloc_index_with_bytes(RouteMetadata::default(), &[value])
+                .expect("alloc packet buffer")
+        })
+        .collect::<Vec<_>>();
+    frame
+        .push_indices(indices.iter().copied())
+        .expect("push frame indices");
+
+    let batches = frame.pair_batch_cursor().collect::<Vec<_>>();
+
+    assert_eq!(
+        batches,
+        vec![
+            BufferFramePairBatch::Pair([indices[0], indices[1]]),
+            BufferFramePairBatch::Pair([indices[2], indices[3]]),
+            BufferFramePairBatch::Single(indices[4]),
+        ]
+    );
+
+    pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
+}
+
+#[test]
+fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let pool = runtime.buffers();
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let indices = (0..7)
+        .map(|value| {
+            pool.alloc_index_with_bytes(RouteMetadata::default(), &[value])
+                .expect("alloc packet buffer")
+        })
+        .collect::<Vec<_>>();
+    frame
+        .push_indices(indices.iter().copied())
+        .expect("push frame indices");
+
+    let batches = frame.quad_batch_cursor().collect::<Vec<_>>();
+
+    assert_eq!(
+        batches,
+        vec![
+            BufferFrameQuadBatch::Quad([indices[0], indices[1], indices[2], indices[3]]),
+            BufferFrameQuadBatch::Pair([indices[4], indices[5]]),
+            BufferFrameQuadBatch::Single(indices[6]),
+        ]
+    );
+
+    pool.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
+}
+
+#[test]
+fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 2, 8, 1);
+    let frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+
+    assert_eq!(frame.pair_batch_cursor().next(), None);
+    assert_eq!(frame.quad_batch_cursor().next(), None);
+
     runtime
         .release_pooled_frame(frame)
         .expect("release pooled frame");

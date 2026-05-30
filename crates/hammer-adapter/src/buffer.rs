@@ -14,7 +14,6 @@ use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
-pub const DEFAULT_FRAME_PREFETCH_DISTANCE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -348,26 +347,6 @@ impl DataPlaneBuffers {
 
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.buffers.prefetch_read(index);
-    }
-
-    pub fn prefetch_frame_read_window(&self, frame: &BufferFrame) {
-        for index in frame
-            .pending_indices()
-            .iter()
-            .take(DEFAULT_FRAME_PREFETCH_DISTANCE)
-            .copied()
-        {
-            self.prefetch_read(index);
-        }
-    }
-
-    pub fn prefetch_frame_read_at(&self, frame: &BufferFrame, offset: usize) {
-        if let Some(index) = frame
-            .pending_indices()
-            .get(offset.saturating_add(DEFAULT_FRAME_PREFETCH_DISTANCE))
-        {
-            self.prefetch_read(*index);
-        }
     }
 
     pub fn free_frame(&self, frame: &mut BufferFrame) {
@@ -1158,6 +1137,83 @@ pub struct BufferFrame {
     readiness: Rc<FrameReadiness>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFramePairBatch {
+    Pair([BufferIndex; 2]),
+    Single(BufferIndex),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFrameQuadBatch {
+    Quad([BufferIndex; 4]),
+    Pair([BufferIndex; 2]),
+    Single(BufferIndex),
+}
+
+impl BufferFramePairBatch {
+    pub fn indices(self) -> BufferFrameBatchIndices {
+        match self {
+            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
+            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
+        }
+    }
+}
+
+impl BufferFrameQuadBatch {
+    pub fn indices(self) -> BufferFrameBatchIndices {
+        match self {
+            Self::Quad(indices) => BufferFrameBatchIndices::new(&indices),
+            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
+            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
+        }
+    }
+}
+
+pub struct BufferFrameBatchIndices {
+    indices: [Option<BufferIndex>; 4],
+    len: usize,
+    offset: usize,
+}
+
+impl BufferFrameBatchIndices {
+    fn new(indices: &[BufferIndex]) -> Self {
+        let mut values = [None; 4];
+        for (offset, index) in indices.iter().copied().enumerate() {
+            values[offset] = Some(index);
+        }
+        Self {
+            indices: values,
+            len: indices.len(),
+            offset: 0,
+        }
+    }
+}
+
+impl Iterator for BufferFrameBatchIndices {
+    type Item = BufferIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset == self.len {
+            return None;
+        }
+        let index = self.indices[self.offset];
+        self.offset += 1;
+        index
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferFramePairBatchCursor<'frame> {
+    indices: &'frame [BufferIndex],
+    offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferFrameQuadBatchCursor<'frame> {
+    indices: &'frame [BufferIndex],
+    offset: usize,
+}
+
 #[derive(Default)]
 struct FrameReadiness {
     pending: Cell<bool>,
@@ -1305,6 +1361,20 @@ impl BufferFrame {
         &self.indices
     }
 
+    pub fn pair_batch_cursor(&self) -> BufferFramePairBatchCursor<'_> {
+        BufferFramePairBatchCursor {
+            indices: self.pending_indices(),
+            offset: 0,
+        }
+    }
+
+    pub fn quad_batch_cursor(&self) -> BufferFrameQuadBatchCursor<'_> {
+        BufferFrameQuadBatchCursor {
+            indices: self.pending_indices(),
+            offset: 0,
+        }
+    }
+
     pub fn iter_indices(&self) -> std::slice::Iter<'_, BufferIndex> {
         self.indices.iter()
     }
@@ -1358,6 +1428,75 @@ impl BufferFrame {
 
     pub fn clear_next_node(&mut self) {
         self.next_node = None;
+    }
+}
+
+impl BufferFramePairBatchCursor<'_> {
+    pub fn prefetch_next_pair<G>(&self, runtime: &DataPlaneRuntime<G>) {
+        for index in self.indices[self.offset..].iter().take(2).copied() {
+            runtime.prefetch_read(index);
+        }
+    }
+}
+
+impl Iterator for BufferFramePairBatchCursor<'_> {
+    type Item = BufferFramePairBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let remaining = self.indices.len().saturating_sub(self.offset);
+        if remaining >= 2 {
+            let batch = BufferFramePairBatch::Pair([
+                self.indices[self.offset],
+                self.indices[self.offset + 1],
+            ]);
+            self.offset += 2;
+            Some(batch)
+        } else if remaining == 1 {
+            let batch = BufferFramePairBatch::Single(self.indices[self.offset]);
+            self.offset += 1;
+            Some(batch)
+        } else {
+            None
+        }
+    }
+}
+
+impl BufferFrameQuadBatchCursor<'_> {
+    pub fn prefetch_next_quad<G>(&self, runtime: &DataPlaneRuntime<G>) {
+        for index in self.indices[self.offset..].iter().take(4).copied() {
+            runtime.prefetch_read(index);
+        }
+    }
+}
+
+impl Iterator for BufferFrameQuadBatchCursor<'_> {
+    type Item = BufferFrameQuadBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let remaining = self.indices.len().saturating_sub(self.offset);
+        if remaining >= 4 {
+            let batch = BufferFrameQuadBatch::Quad([
+                self.indices[self.offset],
+                self.indices[self.offset + 1],
+                self.indices[self.offset + 2],
+                self.indices[self.offset + 3],
+            ]);
+            self.offset += 4;
+            Some(batch)
+        } else if remaining >= 2 {
+            let batch = BufferFrameQuadBatch::Pair([
+                self.indices[self.offset],
+                self.indices[self.offset + 1],
+            ]);
+            self.offset += 2;
+            Some(batch)
+        } else if remaining == 1 {
+            let batch = BufferFrameQuadBatch::Single(self.indices[self.offset]);
+            self.offset += 1;
+            Some(batch)
+        } else {
+            None
+        }
     }
 }
 

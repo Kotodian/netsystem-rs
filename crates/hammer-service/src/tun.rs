@@ -222,22 +222,33 @@ impl TunPacketSink for MemoryTunOutput {
         if batch_len != 0 {
             inner.output_batch_sizes.push(batch_len);
         }
-        runtime.prefetch_frame_read_window(frame);
-        for offset in 0..batch_len {
-            runtime.prefetch_frame_read_at(frame, offset);
-            let index = frame.pending_indices()[offset];
-            let packet = runtime.copy_current_chain(index);
-            runtime.free_index(index);
-            match packet {
-                Ok(packet) => inner.output.push_back(packet),
-                Err(err) => {
-                    for index in frame.pending_indices()[offset + 1..].iter().copied() {
-                        runtime.free_index(index);
+        let mut processed = 0usize;
+        let mut send_result = Ok(());
+        {
+            let mut cursor = frame.pair_batch_cursor();
+            cursor.prefetch_next_pair(runtime);
+            'send: while let Some(batch) = cursor.next() {
+                cursor.prefetch_next_pair(runtime);
+                for index in batch.indices() {
+                    let packet = runtime.copy_current_chain(index);
+                    runtime.free_index(index);
+                    processed += 1;
+                    match packet {
+                        Ok(packet) => inner.output.push_back(packet),
+                        Err(err) => {
+                            send_result = Err(err);
+                            break 'send;
+                        }
                     }
-                    frame.clear();
-                    return Err(err);
                 }
             }
+        }
+        if let Err(err) = send_result {
+            for index in frame.pending_indices()[processed..].iter().copied() {
+                runtime.free_index(index);
+            }
+            frame.clear();
+            return Err(err);
         }
         frame.clear();
         Ok(batch_len)

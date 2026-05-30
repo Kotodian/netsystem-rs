@@ -17,8 +17,9 @@ pub mod rule;
 pub mod service;
 
 pub use buffer::{
-    Buffer, BufferFlags, BufferFrame, BufferIndex, BufferPool, BufferRef,
-    DEFAULT_FRAME_PREFETCH_DISTANCE, DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool,
+    Buffer, BufferFlags, BufferFrame, BufferFrameBatchIndices, BufferFramePairBatch,
+    BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferIndex,
+    BufferPool, BufferRef, DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool,
     PooledBufferFrame,
 };
 pub use hammer_core::lifecycle::{
