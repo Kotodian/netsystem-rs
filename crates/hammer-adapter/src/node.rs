@@ -37,13 +37,13 @@ pub trait DriverNode<G = Self>: Node<G> {}
 
 /// Packet graph node that performs dataplane-internal work.
 ///
-/// Internal nodes are neither packet I/O drivers nor protocol outbounds. They
-/// transform frame metadata, split frames, or select the next graph edge while
-/// keeping packet ownership on the current data worker.
+/// Internal nodes are not external I/O drivers. They transform frame metadata,
+/// split frames, or select the next graph edge while keeping packet ownership on
+/// the current data worker.
 pub trait InternalNode<G = Self>: Node<G> {}
 
-/// Packet graph node that consumes frames through a configured egress path.
-pub trait OutboundNode<G = Self>: Node<G> {}
+/// Packet graph node that writes completed frames to an external output.
+pub trait OutputNode<G = Self>: Node<G> {}
 
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
@@ -242,9 +242,9 @@ impl<N> NodeRuntime<N> {
         self.register(node.into())
     }
 
-    pub fn register_outbound<I>(&self, node: I) -> NodeId
+    pub fn register_output<I>(&self, node: I) -> NodeId
     where
-        I: OutboundNode<N> + Into<N>,
+        I: OutputNode<N> + Into<N>,
     {
         self.register(node.into())
     }

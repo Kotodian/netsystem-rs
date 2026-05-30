@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult,
-    OutboundNode, RouteMetadata,
+    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult, OutputNode,
+    RouteMetadata,
 };
 use hammer_core::error::CoreResult;
 
@@ -68,7 +68,7 @@ impl Node<TestNode> for SinkNode {
     }
 }
 
-impl OutboundNode<TestNode> for SinkNode {}
+impl OutputNode<TestNode> for SinkNode {}
 
 struct CountNode {
     count: Rc<Cell<usize>>,
@@ -142,9 +142,9 @@ where
     let _ = node;
 }
 
-fn assert_outbound_node<I>(node: &I)
+fn assert_output_node<I>(node: &I)
 where
-    I: OutboundNode<TestNode>,
+    I: OutputNode<TestNode>,
 {
     let _ = node;
 }
@@ -233,7 +233,7 @@ fn node_runtime_registers_driver_role_node() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let payloads = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register_outbound(SinkNode {
+    let sink = runtime.nodes().register_output(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&payloads),
     });
@@ -266,16 +266,16 @@ fn node_runtime_registers_driver_role_node() {
 }
 
 #[test]
-fn node_runtime_registers_outbound_role_node() {
+fn node_runtime_registers_output_role_node() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let payloads = Rc::new(RefCell::new(Vec::new()));
-    let outbound = SinkNode {
+    let output = SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&payloads),
     };
-    assert_outbound_node(&outbound);
-    let outbound = runtime.nodes().register_outbound(outbound);
+    assert_output_node(&output);
+    let output = runtime.nodes().register_output(output);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
@@ -287,7 +287,7 @@ fn node_runtime_registers_outbound_role_node() {
 
     assert!(
         runtime
-            .schedule_frame(outbound, frame)
+            .schedule_frame(output, frame)
             .expect("schedule frame")
     );
 
