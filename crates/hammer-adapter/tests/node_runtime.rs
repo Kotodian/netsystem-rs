@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult, OutputNode,
+    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult,
     RouteMetadata,
 };
 use hammer_core::error::CoreResult;
@@ -88,7 +88,7 @@ impl Node<TestNode> for SinkNode {
     }
 }
 
-impl OutputNode<TestNode> for SinkNode {}
+impl DriverNode<TestNode> for SinkNode {}
 
 struct CountNode {
     count: Rc<Cell<usize>>,
@@ -166,13 +166,6 @@ where
 fn assert_driver_node<I>(node: &I)
 where
     I: DriverNode<TestNode>,
-{
-    let _ = node;
-}
-
-fn assert_output_node<I>(node: &I)
-where
-    I: OutputNode<TestNode>,
 {
     let _ = node;
 }
@@ -261,7 +254,7 @@ fn node_runtime_registers_driver_role_node() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let payloads = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register_output(SinkNode {
+    let sink = runtime.nodes().register_driver(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&payloads),
     });
@@ -298,7 +291,7 @@ fn node_runtime_schedules_empty_driver_frame() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
     let payloads = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register_output(SinkNode {
+    let sink = runtime.nodes().register_driver(SinkNode {
         trace: Rc::clone(&trace),
         payloads: Rc::clone(&payloads),
     });
@@ -313,39 +306,6 @@ fn node_runtime_schedules_empty_driver_frame() {
         .expect("schedule driver");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(&*trace.borrow(), &["sink"]);
-    assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
-    assert_eq!(runtime.frames_in_use(), 0);
-    assert_eq!(runtime.in_use_buffers(), 0);
-}
-
-#[test]
-fn node_runtime_registers_output_role_node() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
-    let trace = Rc::new(RefCell::new(Vec::new()));
-    let payloads = Rc::new(RefCell::new(Vec::new()));
-    let output = SinkNode {
-        trace: Rc::clone(&trace),
-        payloads: Rc::clone(&payloads),
-    };
-    assert_output_node(&output);
-    let output = runtime.nodes().register_output(output);
-    let frame = runtime.alloc_frame_index().expect("alloc frame");
-    let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
-        .expect("alloc packet");
-    runtime
-        .with_frame_mut(frame, |frame| frame.push_index(buffer))
-        .expect("mutate frame")
-        .expect("push packet");
-
-    assert!(
-        runtime
-            .schedule_frame(output, frame)
-            .expect("schedule frame")
-    );
-
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(&*trace.borrow(), &["sink"]);
     assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
     assert_eq!(runtime.frames_in_use(), 0);

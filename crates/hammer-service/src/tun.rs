@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeResult, OutputNode, RouteMetadata,
+    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -77,18 +77,18 @@ where
 
 impl<I, G> DriverNode<G> for TunInputDriverNode<I> where I: TunPacketSource {}
 
-pub struct TunOutputNode<O> {
+pub struct TunOutputDriverNode<O> {
     output: O,
 }
 
-impl<O> TunOutputNode<O> {
+impl<O> TunOutputDriverNode<O> {
     #[inline]
     pub fn new(output: O) -> Self {
         Self { output }
     }
 }
 
-impl<O, G> Node<G> for TunOutputNode<O>
+impl<O, G> Node<G> for TunOutputDriverNode<O>
 where
     O: TunPacketSink,
 {
@@ -103,7 +103,7 @@ where
     }
 }
 
-impl<O, G> OutputNode<G> for TunOutputNode<O> where O: TunPacketSink {}
+impl<O, G> DriverNode<G> for TunOutputDriverNode<O> where O: TunPacketSink {}
 
 #[derive(Clone, Default)]
 pub struct MemoryTunDevice {

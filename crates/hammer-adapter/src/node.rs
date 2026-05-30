@@ -42,9 +42,6 @@ pub trait DriverNode<G = Self>: Node<G> {}
 /// the current data worker.
 pub trait InternalNode<G = Self>: Node<G> {}
 
-/// Packet graph node that writes completed frames to an external output.
-pub trait OutputNode<G = Self>: Node<G> {}
-
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
 
@@ -239,13 +236,6 @@ impl<N> NodeRuntime<N> {
     pub fn register_internal<I>(&self, node: I) -> NodeId
     where
         I: InternalNode<N> + Into<N>,
-    {
-        self.register(node.into())
-    }
-
-    pub fn register_output<I>(&self, node: I) -> NodeId
-    where
-        I: OutputNode<N> + Into<N>,
     {
         self.register(node.into())
     }

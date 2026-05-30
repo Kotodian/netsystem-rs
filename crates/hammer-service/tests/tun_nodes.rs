@@ -13,7 +13,7 @@ use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_service::data_plane::{RouteDispatchNode, RouteMatchNode};
 use hammer_service::packet::{IpInputNode, UdpInputNode};
-use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputNode};
+use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 
 struct StaticRouter {
     decision: RouteDecision,
@@ -99,7 +99,7 @@ enum TestNode {
     Capture(CaptureNode),
     RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
     RouteDispatch(RouteDispatchNode),
-    TunOutput(TunOutputNode<hammer_service::tun::MemoryTunOutput>),
+    TunOutputDriver(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
 }
 
 impl From<TunInputDriverNode<hammer_service::tun::MemoryTunInput>> for TestNode {
@@ -138,9 +138,9 @@ impl From<RouteDispatchNode> for TestNode {
     }
 }
 
-impl From<TunOutputNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
-    fn from(node: TunOutputNode<hammer_service::tun::MemoryTunOutput>) -> Self {
-        Self::TunOutput(node)
+impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
+    fn from(node: TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>) -> Self {
+        Self::TunOutputDriver(node)
     }
 }
 
@@ -157,7 +157,7 @@ impl Node<TestNode> for TestNode {
             Self::Capture(node) => node.process(runtime, frame),
             Self::RouteMatch(node) => node.process(runtime, frame),
             Self::RouteDispatch(node) => node.process(runtime, frame),
-            Self::TunOutput(node) => node.process(runtime, frame),
+            Self::TunOutputDriver(node) => node.process(runtime, frame),
         }
     }
 }
@@ -177,7 +177,7 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
 
     let output = runtime
         .nodes()
-        .register_output(TunOutputNode::new(device.output()));
+        .register_driver(TunOutputDriverNode::new(device.output()));
     let captured = Rc::new(RefCell::new(Vec::new()));
     let cursors = Rc::new(RefCell::new(Vec::new()));
     let capture = runtime.nodes().register_internal(CaptureNode {
@@ -247,7 +247,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
 
     let output = runtime
         .nodes()
-        .register_output(TunOutputNode::new(device.output()));
+        .register_driver(TunOutputDriverNode::new(device.output()));
     let dispatch = runtime
         .nodes()
         .register_internal(RouteDispatchNode::new().with_outbound("tun-output", output));
@@ -297,7 +297,7 @@ fn tun_driver_batch_respects_frame_capacity() {
 
     let output = runtime
         .nodes()
-        .register_output(TunOutputNode::new(device.output()));
+        .register_driver(TunOutputDriverNode::new(device.output()));
     let driver = runtime
         .nodes()
         .register_driver(TunInputDriverNode::new(device.input(), "tun0", output).with_max_batch(8));
