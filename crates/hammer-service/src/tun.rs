@@ -30,11 +30,21 @@ const UDP_DESTINATION_PORT_OFFSET: usize = 2;
 const UDP_LENGTH_OFFSET: usize = 4;
 
 pub trait TunPacketSource {
-    fn recv_batch(&mut self, packets: &mut Vec<Vec<u8>>, max: usize) -> CoreResult<usize>;
+    fn recv_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        interface_id: &str,
+        max: usize,
+    ) -> CoreResult<usize>;
 }
 
 pub trait TunPacketSink {
-    fn send_batch(&mut self, packets: &mut Vec<Vec<u8>>) -> CoreResult<()>;
+    fn send_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<usize>;
 }
 
 pub struct TunInputDriverNode<I> {
@@ -70,16 +80,8 @@ where
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let max_batch = self.max_batch.min(frame.remaining_capacity());
-        let mut packets = Vec::with_capacity(max_batch);
-        self.input.recv_batch(&mut packets, max_batch)?;
-        for packet in packets {
-            let metadata = packet_route_metadata(&self.interface_id, &packet)?;
-            let index = runtime.alloc_index_with_bytes(metadata, &packet)?;
-            if let Err(err) = frame.push_index(index) {
-                runtime.free_index(index);
-                return Err(err);
-            }
-        }
+        self.input
+            .recv_frame(runtime, frame, &self.interface_id, max_batch)?;
         if frame.has_pending() {
             Ok(NodeResult::next_current(self.next))
         } else {
@@ -109,15 +111,7 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut packets = Vec::with_capacity(frame.pending_len());
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index);
-            runtime.free_index(index);
-            packets.push(packet?);
-        }
-        if !packets.is_empty() {
-            self.output.send_batch(&mut packets)?;
-        }
+        self.output.send_frame(runtime, frame)?;
         Ok(NodeResult::drop())
     }
 }
@@ -191,34 +185,78 @@ impl MemoryTunDevice {
 }
 
 impl TunPacketSource for MemoryTunInput {
-    fn recv_batch(&mut self, packets: &mut Vec<Vec<u8>>, max: usize) -> CoreResult<usize> {
+    fn recv_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        interface_id: &str,
+        max: usize,
+    ) -> CoreResult<usize> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
             return Err(CoreError::internal("memory TUN is closed"));
         }
-        let start_len = packets.len();
-        while packets.len() - start_len < max {
+        let mut received = 0usize;
+        while received < max {
             let Some(packet) = inner.input.pop_front() else {
                 break;
             };
-            packets.push(packet);
+            push_packet_to_frame(runtime, frame, interface_id, &packet)?;
+            received += 1;
         }
-        Ok(packets.len() - start_len)
+        Ok(received)
     }
 }
 
 impl TunPacketSink for MemoryTunOutput {
-    fn send_batch(&mut self, packets: &mut Vec<Vec<u8>>) -> CoreResult<()> {
+    fn send_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<usize> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
             return Err(CoreError::internal("memory TUN is closed"));
         }
-        if !packets.is_empty() {
-            inner.output_batch_sizes.push(packets.len());
+        let batch_len = frame.pending_len();
+        if batch_len != 0 {
+            inner.output_batch_sizes.push(batch_len);
         }
-        inner.output.extend(packets.drain(..));
-        Ok(())
+        runtime.prefetch_frame_read_window(frame);
+        for offset in 0..batch_len {
+            runtime.prefetch_frame_read_at(frame, offset);
+            let index = frame.pending_indices()[offset];
+            let packet = runtime.copy_current_chain(index);
+            runtime.free_index(index);
+            match packet {
+                Ok(packet) => inner.output.push_back(packet),
+                Err(err) => {
+                    for index in frame.pending_indices()[offset + 1..].iter().copied() {
+                        runtime.free_index(index);
+                    }
+                    frame.clear();
+                    return Err(err);
+                }
+            }
+        }
+        frame.clear();
+        Ok(batch_len)
     }
+}
+
+fn push_packet_to_frame<G>(
+    runtime: &DataPlaneRuntime<G>,
+    frame: &mut BufferFrame,
+    interface_id: &str,
+    packet: &[u8],
+) -> CoreResult<()> {
+    let metadata = packet_route_metadata(interface_id, packet)?;
+    let index = runtime.alloc_index_with_bytes(metadata, packet)?;
+    if let Err(err) = frame.push_index(index) {
+        runtime.free_index(index);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn packet_route_metadata(interface_id: &str, packet: &[u8]) -> CoreResult<RouteMetadata> {

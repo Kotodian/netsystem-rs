@@ -30,7 +30,10 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
+        runtime.prefetch_frame_read_window(frame);
+        for offset in 0..frame.pending_len() {
+            runtime.prefetch_frame_read_at(frame, offset);
+            let index = frame.pending_indices()[offset];
             runtime.with_metadata_mut(index, |metadata| {
                 self.router.prepare_route_metadata(metadata)?;
                 let decision = self.router.match_route(metadata)?;
@@ -133,7 +136,10 @@ impl RouteDispatchNode {
         frame: &BufferFrame,
     ) -> CoreResult<RouteDispatchGroups> {
         let mut groups = RouteDispatchGroups::default();
-        for index in frame.pending_indices().iter().copied() {
+        runtime.prefetch_frame_read_window(frame);
+        for offset in 0..frame.pending_len() {
+            runtime.prefetch_frame_read_at(frame, offset);
+            let index = frame.pending_indices()[offset];
             groups.push(self.target_for_index(runtime, index)?)?;
         }
         Ok(groups)

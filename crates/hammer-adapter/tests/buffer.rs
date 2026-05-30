@@ -147,6 +147,20 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
 }
 
 #[test]
+fn buffer_pool_prefetch_read_is_best_effort_for_live_and_stale_indices() {
+    let pool = BufferPool::with_capacity(4, 4);
+    let buffer = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefgh")
+        .expect("alloc chained buffer");
+
+    pool.prefetch_read(buffer);
+    pool.free_index(buffer);
+    pool.prefetch_read(buffer);
+
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn buffer_pool_rejects_index_from_another_runtime() {
     let first_pool = BufferPool::with_capacity(8, 2);
     let second_pool = BufferPool::with_capacity(8, 2);

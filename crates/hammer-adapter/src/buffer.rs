@@ -14,6 +14,7 @@ use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
+pub const DEFAULT_FRAME_PREFETCH_DISTANCE: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -259,6 +260,38 @@ fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+#[cfg(target_arch = "x86")]
+#[inline]
+fn prefetch_read_l1(ptr: *const u8) {
+    unsafe {
+        core::arch::x86::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86::_MM_HINT_T0);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn prefetch_read_l1(ptr: *const u8) {
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn prefetch_read_l1(ptr: *const u8) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline]
+fn prefetch_read_l1(_ptr: *const u8) {}
+
 impl DataPlaneBuffers {
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities(
@@ -311,6 +344,30 @@ impl DataPlaneBuffers {
 
     pub fn free_index(&self, index: BufferIndex) {
         self.buffers.free_index(index);
+    }
+
+    pub fn prefetch_read(&self, index: BufferIndex) {
+        self.buffers.prefetch_read(index);
+    }
+
+    pub fn prefetch_frame_read_window(&self, frame: &BufferFrame) {
+        for index in frame
+            .pending_indices()
+            .iter()
+            .take(DEFAULT_FRAME_PREFETCH_DISTANCE)
+            .copied()
+        {
+            self.prefetch_read(index);
+        }
+    }
+
+    pub fn prefetch_frame_read_at(&self, frame: &BufferFrame, offset: usize) {
+        if let Some(index) = frame
+            .pending_indices()
+            .get(offset.saturating_add(DEFAULT_FRAME_PREFETCH_DISTANCE))
+        {
+            self.prefetch_read(*index);
+        }
     }
 
     pub fn free_frame(&self, frame: &mut BufferFrame) {
@@ -552,6 +609,10 @@ impl BufferPool {
 
     pub fn free_index(&self, index: BufferIndex) {
         self.inner.borrow_mut().free_chain(index);
+    }
+
+    pub fn prefetch_read(&self, index: BufferIndex) {
+        self.inner.borrow().prefetch_read(index);
     }
 
     pub fn free_frame(&self, frame: &mut BufferFrame) {
@@ -1003,6 +1064,25 @@ impl BufferPoolInner {
             .buffer
             .as_mut()
             .ok_or_else(|| CoreError::internal("buffer slot is free"))
+    }
+
+    fn prefetch_read(&self, index: BufferIndex) {
+        let Ok(buffer) = self.buffer(index) else {
+            return;
+        };
+        prefetch_read_l1(std::ptr::from_ref(buffer).cast::<u8>());
+        prefetch_read_l1(std::ptr::from_ref(buffer.metadata()).cast::<u8>());
+        if !buffer.current().is_empty() {
+            prefetch_read_l1(buffer.current().as_ptr());
+            if buffer.current().len() > 64 {
+                prefetch_read_l1(unsafe { buffer.current().as_ptr().add(64) });
+            }
+        }
+        if let Some(next) = buffer.next_buffer()
+            && let Ok(next_buffer) = self.buffer(next)
+        {
+            prefetch_read_l1(std::ptr::from_ref(next_buffer).cast::<u8>());
+        }
     }
 
     fn free_chain(&mut self, index: BufferIndex) {
