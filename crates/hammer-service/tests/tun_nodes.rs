@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteDecision,
-    RouteMetadata, RouteTarget, Router, SocksAddr,
+    BufferFrame, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node, NodeId,
+    NodeResult, RouteDecision, RouteMetadata, RouteTarget, Router, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_service::data_plane::{RouteDispatchNode, RouteMatchNode};
+use hammer_service::packet::{IpInputNode, UdpInputNode};
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputNode};
 
 struct StaticRouter {
@@ -70,6 +71,7 @@ impl Router for StaticRouter {
 struct CaptureNode {
     next: NodeId,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+    cursors: Rc<RefCell<Vec<BufferPacketCursor>>>,
 }
 
 impl Node<TestNode> for CaptureNode {
@@ -80,6 +82,9 @@ impl Node<TestNode> for CaptureNode {
     ) -> CoreResult<NodeResult> {
         for index in frame.pending_indices().iter().copied() {
             self.metadata.borrow_mut().push(runtime.metadata(index)?);
+            self.cursors
+                .borrow_mut()
+                .push(runtime.packet_cursor(index)?);
         }
         Ok(NodeResult::next_current(self.next))
     }
@@ -89,6 +94,8 @@ impl InternalNode<TestNode> for CaptureNode {}
 
 enum TestNode {
     TunInput(TunInputDriverNode<hammer_service::tun::MemoryTunInput>),
+    IpInput(IpInputNode),
+    UdpInput(UdpInputNode),
     Capture(CaptureNode),
     RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
     RouteDispatch(RouteDispatchNode),
@@ -98,6 +105,18 @@ enum TestNode {
 impl From<TunInputDriverNode<hammer_service::tun::MemoryTunInput>> for TestNode {
     fn from(node: TunInputDriverNode<hammer_service::tun::MemoryTunInput>) -> Self {
         Self::TunInput(node)
+    }
+}
+
+impl From<IpInputNode> for TestNode {
+    fn from(node: IpInputNode) -> Self {
+        Self::IpInput(node)
+    }
+}
+
+impl From<UdpInputNode> for TestNode {
+    fn from(node: UdpInputNode) -> Self {
+        Self::UdpInput(node)
     }
 }
 
@@ -133,6 +152,8 @@ impl Node<TestNode> for TestNode {
     ) -> CoreResult<NodeResult> {
         match self {
             Self::TunInput(node) => node.process(runtime, frame),
+            Self::IpInput(node) => node.process(runtime, frame),
+            Self::UdpInput(node) => node.process(runtime, frame),
             Self::Capture(node) => node.process(runtime, frame),
             Self::RouteMatch(node) => node.process(runtime, frame),
             Self::RouteDispatch(node) => node.process(runtime, frame),
@@ -158,27 +179,42 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         .nodes()
         .register_output(TunOutputNode::new(device.output()));
     let captured = Rc::new(RefCell::new(Vec::new()));
+    let cursors = Rc::new(RefCell::new(Vec::new()));
     let capture = runtime.nodes().register_internal(CaptureNode {
         next: output,
         metadata: Rc::clone(&captured),
+        cursors: Rc::clone(&cursors),
     });
+    let udp_input = runtime
+        .nodes()
+        .register_internal(UdpInputNode::new(capture));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(udp_input));
     let driver =
         runtime
             .nodes()
-            .register_driver(TunInputDriverNode::new(device.input(), "tun0", capture));
+            .register_driver(TunInputDriverNode::new(device.input(), "tun0", ip_input));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     runtime
         .schedule_driver_frame(driver, frame)
         .expect("schedule tun driver");
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
     assert_eq!(device.drain_output_batch_sizes(), vec![3]);
     assert_eq!(device.drain_output(), packets);
     assert_eq!(captured.borrow().len(), 3);
     let metadata = &captured.borrow()[0];
     assert_eq!(metadata.inbound, "tun0");
     assert_eq!(metadata.network, Network::Udp);
+    let cursor = cursors.borrow()[0];
+    assert_eq!(cursor.network_header_offset(), 0);
+    assert_eq!(cursor.network_header_len(), 20);
+    assert_eq!(cursor.transport_header_offset(), 20);
+    assert_eq!(cursor.transport_header_len(), 8);
+    assert_eq!(cursor.transport_payload_offset(), 28);
+    assert_eq!(cursor.packet_len(), packets[0].len());
     assert_eq!(
         metadata.source,
         Some(SocksAddr::ip(
@@ -221,18 +257,23 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let route_match = runtime
         .nodes()
         .register_internal(RouteMatchNode::new(Arc::clone(&router), dispatch));
-    let driver = runtime.nodes().register_driver(TunInputDriverNode::new(
-        device.input(),
-        "tun0",
-        route_match,
-    ));
+    let udp_input = runtime
+        .nodes()
+        .register_internal(UdpInputNode::new(route_match));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(udp_input));
+    let driver =
+        runtime
+            .nodes()
+            .register_driver(TunInputDriverNode::new(device.input(), "tun0", ip_input));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     runtime
         .schedule_driver_frame(driver, frame)
         .expect("schedule tun driver");
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
     assert_eq!(device.drain_output_batch_sizes(), vec![2]);
     assert_eq!(device.drain_output(), packets);
     assert_eq!(router.prepare_count.load(Ordering::SeqCst), 2);

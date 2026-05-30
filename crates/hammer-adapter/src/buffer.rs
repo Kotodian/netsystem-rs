@@ -15,6 +15,7 @@ use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
+pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -77,39 +78,177 @@ impl BufferFlags {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferPacketCursor {
+    packet_len: usize,
+    network_header_offset: usize,
+    network_header_len: usize,
+    transport_header_offset: usize,
+    transport_header_len: usize,
+    transport_payload_offset: usize,
+}
+
+impl BufferPacketCursor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn packet_len(self) -> usize {
+        self.packet_len
+    }
+
+    pub fn network_header_offset(self) -> usize {
+        self.network_header_offset
+    }
+
+    pub fn network_header_len(self) -> usize {
+        self.network_header_len
+    }
+
+    pub fn transport_header_offset(self) -> usize {
+        self.transport_header_offset
+    }
+
+    pub fn transport_header_len(self) -> usize {
+        self.transport_header_len
+    }
+
+    pub fn transport_payload_offset(self) -> usize {
+        self.transport_payload_offset
+    }
+
+    pub fn with_packet_len(mut self, packet_len: usize) -> Self {
+        self.packet_len = packet_len;
+        self
+    }
+
+    pub fn with_network_header(mut self, offset: usize, len: usize) -> Self {
+        self.network_header_offset = offset;
+        self.network_header_len = len;
+        self
+    }
+
+    pub fn with_transport_header(mut self, offset: usize, len: usize) -> Self {
+        self.transport_header_offset = offset;
+        self.transport_header_len = len;
+        self
+    }
+
+    pub fn with_transport_payload_offset(mut self, offset: usize) -> Self {
+        self.transport_payload_offset = offset;
+        self
+    }
+}
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct CacheLine([u8; BUFFER_CACHE_LINE_SIZE]);
+
+impl Default for CacheLine {
+    fn default() -> Self {
+        Self([0; BUFFER_CACHE_LINE_SIZE])
+    }
+}
+
+struct CacheAlignedStorage {
+    lines: Box<[CacheLine]>,
+    len: usize,
+}
+
+impl fmt::Debug for CacheAlignedStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CacheAlignedStorage")
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl CacheAlignedStorage {
+    fn with_len(len: usize) -> Self {
+        let line_count = len.div_ceil(BUFFER_CACHE_LINE_SIZE).max(1);
+        Self {
+            lines: vec![CacheLine::default(); line_count].into_boxed_slice(),
+            len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        let ptr = self.lines.as_ptr().cast::<u8>();
+        // SAFETY: CacheLine is a repr(C, align(64)) wrapper around contiguous
+        // bytes. `len` never exceeds the allocated line byte capacity.
+        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        let ptr = self.lines.as_mut_ptr().cast::<u8>();
+        // SAFETY: Same layout guarantee as `as_slice`, with unique access via
+        // `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
+    }
+}
+
 #[derive(Debug)]
+#[repr(C, align(64))]
 pub struct Buffer {
     metadata: RouteMetadata,
+    packet_cursor: BufferPacketCursor,
     flags: BufferFlags,
     current_data: usize,
     current_len: usize,
     data_len: usize,
     next_buffer: Option<BufferIndex>,
     total_len_not_including_first: usize,
-    storage: Vec<u8>,
+    storage: CacheAlignedStorage,
 }
 
 impl Buffer {
-    fn new(slot_capacity: usize, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<Self> {
-        if bytes.len() > slot_capacity {
+    fn with_slot_capacity(slot_capacity: usize) -> Self {
+        Self {
+            metadata: RouteMetadata::default(),
+            packet_cursor: BufferPacketCursor::default(),
+            flags: BufferFlags::empty(),
+            current_data: 0,
+            current_len: 0,
+            data_len: 0,
+            next_buffer: None,
+            total_len_not_including_first: 0,
+            storage: CacheAlignedStorage::with_len(slot_capacity),
+        }
+    }
+
+    fn reset(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<()> {
+        if bytes.len() > self.storage.len() {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
                 bytes.len(),
-                slot_capacity
+                self.storage.len()
             )));
         }
-        let mut storage = vec![0; slot_capacity];
-        storage[..bytes.len()].copy_from_slice(bytes);
-        Ok(Self {
-            metadata,
-            flags: BufferFlags::empty(),
-            current_data: 0,
-            current_len: bytes.len(),
-            data_len: bytes.len(),
-            next_buffer: None,
-            total_len_not_including_first: 0,
-            storage,
-        })
+        self.metadata = metadata;
+        self.packet_cursor = BufferPacketCursor::default();
+        self.flags = BufferFlags::empty();
+        self.current_data = 0;
+        self.current_len = bytes.len();
+        self.data_len = bytes.len();
+        self.next_buffer = None;
+        self.total_len_not_including_first = 0;
+        self.storage.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn reset_for_free(&mut self) {
+        self.metadata = RouteMetadata::default();
+        self.packet_cursor = BufferPacketCursor::default();
+        self.flags = BufferFlags::empty();
+        self.current_data = 0;
+        self.current_len = 0;
+        self.data_len = 0;
+        self.next_buffer = None;
+        self.total_len_not_including_first = 0;
     }
 
     pub fn metadata(&self) -> &RouteMetadata {
@@ -118,6 +257,14 @@ impl Buffer {
 
     pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
         &mut self.metadata
+    }
+
+    pub fn packet_cursor(&self) -> BufferPacketCursor {
+        self.packet_cursor
+    }
+
+    pub fn packet_cursor_mut(&mut self) -> &mut BufferPacketCursor {
+        &mut self.packet_cursor
     }
 
     pub fn flags(&self) -> BufferFlags {
@@ -145,13 +292,13 @@ impl Buffer {
     }
 
     pub fn current(&self) -> &[u8] {
-        &self.storage[self.current_data..self.current_data + self.current_len]
+        &self.storage.as_slice()[self.current_data..self.current_data + self.current_len]
     }
 
     pub fn current_mut(&mut self) -> &mut [u8] {
         let start = self.current_data;
         let end = start + self.current_len;
-        &mut self.storage[start..end]
+        &mut self.storage.as_mut_slice()[start..end]
     }
 
     fn available_tail(&self) -> usize {
@@ -167,7 +314,7 @@ impl Buffer {
         }
         let start = self.current_data + self.current_len;
         let end = start + take;
-        self.storage[start..end].copy_from_slice(&bytes[..take]);
+        self.storage.as_mut_slice()[start..end].copy_from_slice(&bytes[..take]);
         self.current_len += take;
         self.data_len = self.data_len.max(end);
         take
@@ -177,7 +324,8 @@ impl Buffer {
 #[derive(Debug)]
 struct BufferSlot {
     generation: u32,
-    buffer: Option<Buffer>,
+    allocated: bool,
+    buffer: Buffer,
 }
 
 #[derive(Debug)]
@@ -459,6 +607,26 @@ impl DataPlaneBuffers {
         self.buffers.metadata(index)
     }
 
+    pub fn with_buffer<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&Buffer) -> R,
+    ) -> CoreResult<R> {
+        self.buffers.with_buffer(index, f)
+    }
+
+    pub fn with_buffer_mut<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&mut Buffer) -> R,
+    ) -> CoreResult<R> {
+        self.buffers.with_buffer_mut(index, f)
+    }
+
+    pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
+        self.buffers.packet_cursor(index)
+    }
+
     pub fn with_metadata<R>(
         &self,
         index: BufferIndex,
@@ -638,7 +806,8 @@ impl BufferPool {
         let slots = (0..slots)
             .map(|_| BufferSlot {
                 generation: 0,
-                buffer: None,
+                allocated: false,
+                buffer: Buffer::with_slot_capacity(slot_capacity),
             })
             .collect();
         Self {
@@ -687,6 +856,30 @@ impl BufferPool {
         let guard = self.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
+    }
+
+    pub fn with_buffer<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&Buffer) -> R,
+    ) -> CoreResult<R> {
+        let pool = self.inner.borrow();
+        let buffer = pool.buffer(index)?;
+        Ok(f(buffer))
+    }
+
+    pub fn with_buffer_mut<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&mut Buffer) -> R,
+    ) -> CoreResult<R> {
+        let mut pool = self.inner.borrow_mut();
+        let buffer = pool.buffer_mut(index)?;
+        Ok(f(buffer))
+    }
+
+    pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
+        self.with_buffer(index, Buffer::packet_cursor)
     }
 
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
@@ -745,7 +938,7 @@ impl BufferPool {
         buffer.current_data -= bytes.len();
         let start = buffer.current_data;
         let end = start + bytes.len();
-        buffer.storage[start..end].copy_from_slice(bytes);
+        buffer.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
         buffer.current_len += bytes.len();
         Ok(())
     }
@@ -1081,7 +1274,8 @@ impl BufferPoolInner {
             .get_mut(slot as usize)
             .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
         entry.generation = entry.generation.wrapping_add(1).max(1);
-        entry.buffer = Some(Buffer::new(self.slot_capacity, metadata, bytes)?);
+        entry.allocated = true;
+        entry.buffer.reset(metadata, bytes)?;
         self.in_use += 1;
         Ok(BufferIndex {
             pool_id: self.pool_id,
@@ -1106,10 +1300,10 @@ impl BufferPoolInner {
         if entry.generation != index.generation {
             return Err(CoreError::internal("stale buffer index"));
         }
-        entry
-            .buffer
-            .as_ref()
-            .ok_or_else(|| CoreError::internal("buffer slot is free"))
+        if !entry.allocated {
+            return Err(CoreError::internal("buffer slot is free"));
+        }
+        Ok(&entry.buffer)
     }
 
     fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
@@ -1121,10 +1315,10 @@ impl BufferPoolInner {
         if entry.generation != index.generation {
             return Err(CoreError::internal("stale buffer index"));
         }
-        entry
-            .buffer
-            .as_mut()
-            .ok_or_else(|| CoreError::internal("buffer slot is free"))
+        if !entry.allocated {
+            return Err(CoreError::internal("buffer slot is free"));
+        }
+        Ok(&mut entry.buffer)
     }
 
     fn prefetch_read(&self, index: BufferIndex) {
@@ -1158,10 +1352,14 @@ impl BufferPoolInner {
             if entry.generation != index.generation {
                 return;
             }
-            next = entry.buffer.as_ref().and_then(Buffer::next_buffer);
-            if entry.buffer.take().is_some() {
+            if entry.allocated {
+                next = entry.buffer.next_buffer();
+                entry.allocated = false;
+                entry.buffer.reset_for_free();
                 self.in_use = self.in_use.saturating_sub(1);
                 self.free.push(index.slot);
+            } else {
+                next = None;
             }
         }
     }
@@ -1605,6 +1803,13 @@ impl BufferRef<'_> {
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .metadata()
+    }
+
+    pub fn packet_cursor(&self) -> BufferPacketCursor {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .packet_cursor()
     }
 
     pub fn current(&self) -> &[u8] {

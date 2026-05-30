@@ -2,6 +2,7 @@ mod component_registry;
 pub mod data_plane;
 pub mod dns;
 mod event_subscribers;
+pub mod packet;
 #[cfg(feature = "probe")]
 mod probe;
 pub mod route;

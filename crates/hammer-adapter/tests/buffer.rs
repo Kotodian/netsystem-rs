@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFramePairBatch, BufferFrameQuadBatch, BufferPool, DataPlaneInstructionSet,
-    DataPlaneRuntime, FrameBatchWidth, NoopNode, RouteMetadata,
+    BufferFramePairBatch, BufferFrameQuadBatch, BufferPacketCursor, BufferPool,
+    DataPlaneInstructionSet, DataPlaneRuntime, FrameBatchWidth, NoopNode, RouteMetadata,
 };
 
 #[derive(Default)]
@@ -83,6 +83,48 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
         pool.copy_current(buffer).expect("truncated current"),
         b"preload"
     );
+    pool.free_index(buffer);
+}
+
+#[test]
+fn buffer_header_and_packet_data_start_cacheline_aligned() {
+    let pool = BufferPool::with_capacity(128, 1);
+    let buffer = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc buffer");
+
+    pool.with_buffer(buffer, |buffer| {
+        assert_eq!((std::ptr::from_ref(buffer) as usize) % 64, 0);
+        assert_eq!(buffer.current().as_ptr() as usize % 64, 0);
+    })
+    .expect("inspect buffer");
+
+    pool.free_index(buffer);
+}
+
+#[test]
+fn buffer_packet_cursor_lives_in_buffer_control_area() {
+    let pool = BufferPool::with_capacity(128, 1);
+    let buffer = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc buffer");
+    let cursor = BufferPacketCursor::new()
+        .with_packet_len(64)
+        .with_network_header(0, 20)
+        .with_transport_header(20, 8)
+        .with_transport_payload_offset(28);
+
+    pool.with_buffer_mut(buffer, |buffer| {
+        *buffer.packet_cursor_mut() = cursor;
+    })
+    .expect("write cursor");
+
+    assert_eq!(pool.packet_cursor(buffer).expect("read cursor"), cursor);
+    assert_eq!(
+        pool.metadata(buffer).expect("metadata"),
+        RouteMetadata::default()
+    );
+
     pool.free_index(buffer);
 }
 

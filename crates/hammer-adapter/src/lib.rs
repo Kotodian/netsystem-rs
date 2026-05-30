@@ -18,10 +18,10 @@ pub mod rule;
 pub mod service;
 
 pub use buffer::{
-    Buffer, BufferFlags, BufferFrame, BufferFrameBatchIndices, BufferFramePairBatch,
-    BufferFramePairBatchCursor, BufferFrameQuadBatch, BufferFrameQuadBatchCursor, BufferIndex,
-    BufferPool, BufferRef, DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool,
-    PooledBufferFrame,
+    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferFrameBatchIndices,
+    BufferFramePairBatch, BufferFramePairBatchCursor, BufferFrameQuadBatch,
+    BufferFrameQuadBatchCursor, BufferIndex, BufferPacketCursor, BufferPool, BufferRef,
+    DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool, PooledBufferFrame,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
