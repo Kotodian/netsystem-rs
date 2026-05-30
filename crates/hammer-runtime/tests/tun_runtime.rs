@@ -3,20 +3,20 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hammer_adapter::{
     DnsQueryOptions, DnsRouter as AdapterDnsRouter, InboundManager as _, Lifecycle, Network,
-    RouteDecision, RouteTarget, SocksAddr,
+    RouteDecision, RouteMetadata, RouteTarget, Router as AdapterRouter, SocksAddr,
 };
-use hammer_core::config::{self, Options};
+use hammer_core::config::{self, Options, RouteOptions, RuleActionKind, RuleMatcher};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_core::protocol::dns::{FixedResponseCode, MessageExt};
 use hammer_runtime::{
-    EndpointManager, InboundManager, OutboundManager, Router,
+    EndpointManager, InboundManager, OutboundManager,
     inbounds::RuntimeDnsRouter,
     tun::{
         MemoryTunDevice, PacketTunStack, SystemTcpNat, TunDispatch, TunInbound, TunPacket,
@@ -29,13 +29,153 @@ use hickory_proto::op::Message;
 use hickory_proto::rr::{RData, Record};
 use tokio::net::UdpSocket;
 
-type RuntimePacketTunStack = PacketTunStack<Router, DnsRouter, OutboundManager>;
-type RuntimeTunInbound = TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
+type RuntimePacketTunStack = PacketTunStack<TestRouter, DnsRouter, OutboundManager>;
+type RuntimeTunInbound = TunInbound<TestRouter, RuntimeDnsRouter, OutboundManager, EndpointManager>;
+type ManagedRuntimeTunInbound =
+    TunInbound<dyn AdapterRouter, RuntimeDnsRouter, OutboundManager, EndpointManager>;
 
 type DnsRouter = FixedDnsRouter;
 
 fn logger(id: &str) -> Logger {
     Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+}
+
+struct TestRouter {
+    final_outbound: String,
+    rules: Vec<hammer_core::config::Rule>,
+}
+
+impl TestRouter {
+    fn from_route_options(options: &RouteOptions) -> Self {
+        Self {
+            final_outbound: options.final_.clone(),
+            rules: options.rules.clone(),
+        }
+    }
+
+    fn matches_rule(matcher: &RuleMatcher, metadata: &RouteMetadata) -> bool {
+        match matcher {
+            RuleMatcher::Any => true,
+            RuleMatcher::Inbound(values) => values.is_empty() || values.contains(&metadata.inbound),
+            RuleMatcher::Protocol(values) => {
+                values.is_empty() || values.contains(&metadata.protocol)
+            }
+            RuleMatcher::Domain(values) => metadata
+                .domain
+                .as_ref()
+                .is_some_and(|domain| values.iter().any(|value| value == domain)),
+            RuleMatcher::DomainSuffix(values) => metadata.domain.as_ref().is_some_and(|domain| {
+                values
+                    .iter()
+                    .any(|suffix| domain == suffix || domain.ends_with(&format!(".{suffix}")))
+            }),
+            RuleMatcher::DomainKeyword(values) => metadata
+                .domain
+                .as_ref()
+                .is_some_and(|domain| values.iter().any(|keyword| domain.contains(keyword))),
+            RuleMatcher::IpCidr(values) => {
+                metadata.destination.as_ref().is_some_and(|destination| {
+                    values.iter().any(|net| net.contains(&destination.host))
+                })
+            }
+        }
+    }
+
+    fn apply_non_terminal(action: &RuleActionKind, metadata: &mut RouteMetadata) {
+        match action {
+            RuleActionKind::Sniff(options) => {
+                if options.override_destination {
+                    metadata.override_destination = true;
+                }
+            }
+            RuleActionKind::Resolve(options) => {
+                metadata.domain_strategy = Some(options.strategy);
+            }
+            RuleActionKind::RouteOptions(options) => {
+                if options.udp_disable_domain_unmapping {
+                    metadata.udp_disable_domain_unmapping = true;
+                }
+            }
+            RuleActionKind::HijackDns | RuleActionKind::Reject(_) | RuleActionKind::Route(_) => {}
+        }
+    }
+}
+
+impl Lifecycle for TestRouter {
+    fn name(&self) -> &str {
+        "test-router"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+impl AdapterRouter for TestRouter {
+    fn reset_network(&self) {}
+
+    fn match_route(&self, metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+        for rule in &self.rules {
+            let default = &rule.default_options;
+            if !Self::matches_rule(&default.matcher, metadata) {
+                continue;
+            }
+            match &default.action {
+                RuleActionKind::HijackDns => return Ok(RouteDecision::HijackDns),
+                RuleActionKind::Reject(options) => {
+                    return Ok(RouteDecision::Reject {
+                        method: options.method.clone(),
+                    });
+                }
+                RuleActionKind::Route(options) => {
+                    return Ok(RouteDecision::Route {
+                        target: RouteTarget::Outbound(options.outbound.clone()),
+                    });
+                }
+                action => Self::apply_non_terminal(action, metadata),
+            }
+        }
+        Ok(RouteDecision::Route {
+            target: RouteTarget::Outbound(self.final_outbound.clone()),
+        })
+    }
+
+    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+        for rule in &self.rules {
+            let default = &rule.default_options;
+            if !Self::matches_rule(&default.matcher, metadata) {
+                continue;
+            }
+            match default.action {
+                RuleActionKind::HijackDns
+                | RuleActionKind::Reject(_)
+                | RuleActionKind::Route(_) => return Ok(()),
+                _ => Self::apply_non_terminal(&default.action, metadata),
+            }
+        }
+        Ok(())
+    }
+
+    fn sniff_timeout(&self, metadata: &RouteMetadata) -> Option<Duration> {
+        self.rules.iter().find_map(|rule| {
+            let default = &rule.default_options;
+            if !Self::matches_rule(&default.matcher, metadata) {
+                return None;
+            }
+            match &default.action {
+                RuleActionKind::Sniff(options) => Some(options.timeout.unwrap_or_default()),
+                _ => None,
+            }
+        })
+    }
+
+    fn should_sniff(&self, metadata: &RouteMetadata) -> bool {
+        self.sniff_timeout(metadata).is_some()
+    }
 }
 
 fn options() -> Options {
@@ -64,18 +204,8 @@ final = "blocked"
     .expect("parse config")
 }
 
-fn router_from_options(options: &Options) -> Arc<Router> {
-    let outbound = Arc::new(
-        OutboundManager::from_options(
-            logger("outbound"),
-            options.route.final_.clone(),
-            &options.outbounds,
-        )
-        .expect("outbound manager"),
-    );
-    Arc::new(
-        Router::from_options(logger("router"), options.route.clone(), outbound).expect("router"),
-    )
+fn router_from_options(options: &Options) -> Arc<TestRouter> {
+    Arc::new(TestRouter::from_route_options(&options.route))
 }
 
 fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimePacketTunStack {
@@ -87,10 +217,7 @@ fn runtime_stack(options: &Options, final_outbound: &str) -> RuntimePacketTunSta
         final_: final_outbound.to_owned(),
         ..options.route.clone()
     };
-    let router = Arc::new(
-        Router::from_options(logger("router"), route_options, Arc::clone(&outbound))
-            .expect("router"),
-    );
+    let router = Arc::new(TestRouter::from_route_options(&route_options));
     let dns_router = Arc::new(FixedDnsRouter::default());
     PacketTunStack::new_with_runtime(
         logger("tun"),
@@ -600,7 +727,7 @@ fn inbound_manager_registers_tun_inbound_from_options() {
 
     let inbound = manager.get("tun").expect("tun inbound registered");
     assert_eq!(inbound.type_name(), "tun");
-    assert!(inbound.as_any().is::<RuntimeTunInbound>());
+    assert!(inbound.as_any().is::<ManagedRuntimeTunInbound>());
 }
 
 #[test]

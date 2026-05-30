@@ -20,7 +20,7 @@ use hammer_core::metrics::MetricsRegistry;
 use super::stack::*;
 
 use crate::inbounds::RuntimeDnsRouter;
-use crate::{EndpointManager, OutboundManager, Router};
+use crate::{EndpointManager, OutboundManager};
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
@@ -29,7 +29,7 @@ type PlatformTunDevice = crate::apple_utun::AppleTunDevice;
 type PlatformTunDevice = AsyncTunDevice;
 
 pub(crate) type RuntimeTunInbound =
-    TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
+    TunInbound<dyn RouterTrait, RuntimeDnsRouter, OutboundManager, EndpointManager>;
 
 #[hammer_component_macros::hammer_component(
     inbound,
@@ -40,7 +40,7 @@ pub(crate) type RuntimeTunInbound =
 )]
 pub struct TunInbound<R, Q, O, E>
 where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
     E: EndpointManagerTrait + 'static,
@@ -72,7 +72,7 @@ where
 
 impl<R, Q, O, E> TunInbound<R, Q, O, E>
 where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
     E: EndpointManagerTrait + 'static,
@@ -315,7 +315,7 @@ pub(crate) fn build_inbound(
     id: String,
     logger: Logger,
     kind: &InboundKind,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     platform: Option<Arc<dyn PlatformInterface>>,
@@ -346,7 +346,7 @@ pub(crate) fn build_inbound(
 
 impl<R, Q, O, E> Lifecycle for TunInbound<R, Q, O, E>
 where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
     E: EndpointManagerTrait + 'static,
@@ -411,7 +411,7 @@ unsafe fn open_system_tun_device(fd: i32, mtu: usize) -> HammerResult<Arc<Platfo
 
 impl<R, Q, O, E> Inbound for TunInbound<R, Q, O, E>
 where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
     E: EndpointManagerTrait + 'static,

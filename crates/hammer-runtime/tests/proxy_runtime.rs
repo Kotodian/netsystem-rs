@@ -9,15 +9,16 @@ use bytes::{BufMut, Bytes, BytesMut};
 use hammer_adapter::{
     BufferFrame, ComponentMeta, DataPlaneBuffers, DefaultInterfaceUpdateListener, DnsQueryOptions,
     DnsRouter as AdapterDnsRouter, Network, NetworkInterface, Outbound as AdapterOutbound,
-    OutboundComponent, PlatformInterface, ProxyPacketConn, ProxyStream, RouteMetadata,
-    RuntimeComponent, SocksAddr, TunOptions, WifiState,
+    OutboundComponent, PlatformInterface, ProxyPacketConn, ProxyStream, RouteDecision,
+    RouteMetadata, RouteTarget, Router as AdapterRouter, RuntimeComponent, SocksAddr, TunOptions,
+    WifiState,
 };
 use hammer_core::config::{self, Options};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
 use hammer_runtime::{
-    MetricsRegistry, OutboundManager, Router, inbounds::InboundManager, spawn::DataRuntime,
+    MetricsRegistry, OutboundManager, inbounds::InboundManager, spawn::DataRuntime,
 };
 use hickory_proto::op::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +29,7 @@ fn logger(id: &str) -> Logger {
 }
 
 struct NoopDnsRouter;
+struct DirectRouter;
 
 impl Lifecycle for NoopDnsRouter {
     fn name(&self) -> &str {
@@ -76,6 +78,42 @@ impl AdapterDnsRouter for NoopDnsRouter {
     }
 
     fn reset_network(&self) {}
+}
+
+impl Lifecycle for DirectRouter {
+    fn name(&self) -> &str {
+        "direct-router"
+    }
+
+    fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn close(&self) -> Result<(), HammerError> {
+        Ok(())
+    }
+}
+
+impl AdapterRouter for DirectRouter {
+    fn reset_network(&self) {}
+
+    fn match_route(&self, _metadata: &mut RouteMetadata) -> Result<RouteDecision, HammerError> {
+        Ok(RouteDecision::Route {
+            target: RouteTarget::Outbound("direct".to_owned()),
+        })
+    }
+
+    fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> Result<(), HammerError> {
+        Ok(())
+    }
+
+    fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
+        None
+    }
+
+    fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+        false
+    }
 }
 
 fn proxy_options(kind: &str, port: u16) -> Options {
@@ -381,15 +419,7 @@ async fn start_proxy(kind: &str, port: u16, outbound: Arc<RecordingOutbound>) ->
         .register_outbound(RecordingOutbound::component(outbound))
         .expect("register outbound");
     let outbound_manager = Arc::new(outbound_manager);
-    let router = Arc::new(
-        Router::from_options_with_metrics(
-            logger("router"),
-            options.route.clone(),
-            Arc::clone(&outbound_manager),
-            MetricsRegistry::new(),
-        )
-        .expect("router"),
-    );
+    let router = Arc::new(DirectRouter);
     let dns_router: Arc<dyn AdapterDnsRouter> = Arc::new(NoopDnsRouter);
     let manager = InboundManager::from_options_with_runtime_and_metrics(
         logger("inbound"),

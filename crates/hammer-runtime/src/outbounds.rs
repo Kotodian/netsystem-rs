@@ -95,8 +95,15 @@ impl OutboundFactorySet {
     }
 }
 
-#[allow(unused_variables)]
 fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, OutboundBuilder>) {
+    #[cfg(not(any(
+        feature = "outbound-hysteria2",
+        feature = "outbound-vless",
+        feature = "outbound-direct",
+        feature = "outbound-block",
+        feature = "outbound-urltest"
+    )))]
+    let _ = builders;
     #[cfg(feature = "outbound-hysteria2")]
     register_components!(
         outbound,

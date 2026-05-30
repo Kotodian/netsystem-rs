@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use hammer_adapter::{
     ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, Inbound, InboundComponent,
-    InboundManager as InboundManagerTrait, Lifecycle, PlatformInterface, RuntimeComponent,
+    InboundManager as InboundManagerTrait, Lifecycle, PlatformInterface, Router as RouterTrait,
+    RuntimeComponent,
 };
 use hammer_core::config::{Inbound as InboundOptions, InboundKind};
 use hammer_core::error::{HammerError, HammerResult};
@@ -24,7 +25,7 @@ use tracing::debug;
 use crate::component_registry::register_components;
 #[cfg(feature = "inbound-tun")]
 use crate::protocol::tun;
-use crate::{OutboundManager, Router, RuntimePlatform};
+use crate::{OutboundManager, RuntimePlatform};
 
 pub struct RuntimeDnsRouter {
     inner: Arc<dyn DnsRouterTrait>,
@@ -85,7 +86,7 @@ pub(crate) type InboundBuilder = fn(
     String,
     Logger,
     &InboundKind,
-    Arc<Router>,
+    Arc<dyn RouterTrait>,
     Option<Arc<RuntimeDnsRouter>>,
     Option<Arc<OutboundManager>>,
     Option<Arc<dyn PlatformInterface>>,
@@ -111,7 +112,7 @@ impl InboundFactorySet {
         &self,
         logger: Logger,
         option: &InboundOptions,
-        router: Arc<Router>,
+        router: Arc<dyn RouterTrait>,
         dns_router: Option<Arc<RuntimeDnsRouter>>,
         outbound: Option<Arc<OutboundManager>>,
         platform: Option<Arc<dyn PlatformInterface>>,
@@ -134,8 +135,14 @@ impl InboundFactorySet {
     }
 }
 
-#[allow(unused_variables)]
 fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, InboundBuilder>) {
+    #[cfg(not(any(
+        feature = "inbound-tun",
+        feature = "inbound-socks",
+        feature = "inbound-http",
+        feature = "inbound-mixed"
+    )))]
+    let _ = builders;
     #[cfg(feature = "inbound-tun")]
     register_components!(inbound, builders, [tun::RuntimeTunInbound]);
     #[cfg(feature = "inbound-socks")]
@@ -191,11 +198,15 @@ impl InboundManager {
         }
     }
 
-    pub fn from_options(
+    pub fn from_options<R>(
         logger: Logger,
         options: &[InboundOptions],
-        router: Arc<Router>,
-    ) -> HammerResult<Self> {
+        router: Arc<R>,
+    ) -> HammerResult<Self>
+    where
+        R: RouterTrait + 'static,
+    {
+        let router: Arc<dyn RouterTrait> = router;
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(
@@ -211,14 +222,17 @@ impl InboundManager {
         Ok(manager)
     }
 
-    pub fn from_options_with_runtime(
+    pub fn from_options_with_runtime<R>(
         logger: Logger,
         options: &[InboundOptions],
-        router: Arc<Router>,
+        router: Arc<R>,
         dns_router: Arc<dyn DnsRouterTrait>,
         outbound: Arc<OutboundManager>,
         platform: impl Into<RuntimePlatform>,
-    ) -> HammerResult<Self> {
+    ) -> HammerResult<Self>
+    where
+        R: RouterTrait + 'static,
+    {
         Self::from_options_with_runtime_and_metrics(
             logger,
             options,
@@ -230,17 +244,21 @@ impl InboundManager {
         )
     }
 
-    pub fn from_options_with_runtime_and_metrics(
+    pub fn from_options_with_runtime_and_metrics<R>(
         logger: Logger,
         options: &[InboundOptions],
-        router: Arc<Router>,
+        router: Arc<R>,
         dns_router: Arc<dyn DnsRouterTrait>,
         outbound: Arc<OutboundManager>,
         platform: impl Into<RuntimePlatform>,
         metrics: Arc<MetricsRegistry>,
-    ) -> HammerResult<Self> {
+    ) -> HammerResult<Self>
+    where
+        R: RouterTrait + 'static,
+    {
         let platform = platform.into().into_inner();
         let dns_router = Arc::new(RuntimeDnsRouter::new(dns_router));
+        let router: Arc<dyn RouterTrait> = router;
         let manager = Self::new(logger.clone());
         for option in options {
             manager.register(manager.factories.build(

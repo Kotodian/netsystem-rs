@@ -120,7 +120,6 @@ socket2 = { workspace = true, optional = true }
 tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
 libc = { workspace = true, optional = true }
-lru = { workspace = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 rustls-platform-verifier = { workspace = true, optional = true }

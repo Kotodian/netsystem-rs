@@ -31,7 +31,6 @@ pub mod inbounds;
 mod macros;
 pub mod outbounds;
 pub mod protocol;
-pub mod route;
 mod socket_protector;
 pub mod spawn;
 #[cfg(any(
@@ -91,5 +90,4 @@ pub use outbounds::OutboundManager;
 pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
-pub use route::Router;
 pub use socket_protector::{RuntimePlatform, SocketProtector};

@@ -1330,7 +1330,6 @@ dependencies = [
  "indoc",
  "ipnet",
  "libc",
- "lru 0.18.0",
  "metrics",
  "metrics-derive",
  "quinn",
@@ -1988,12 +1987,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lru"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2464,7 +2457,7 @@ dependencies = [
  "btls-sys",
  "bytes",
  "foreign-types-shared",
- "lru 0.16.4",
+ "lru",
  "quinn",
  "quinn-proto",
  "rand 0.10.1",

@@ -31,16 +31,21 @@ use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, EventSubscriberBuilder,
-    InboundManager, MetricSample, MetricsRegistry, OutboundManager, Router,
+    InboundManager, MetricSample, MetricsRegistry, OutboundManager,
 };
 use std::time::Duration;
 
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
-use crate::{DnsRouter, DnsTransportManager};
+use crate::{DnsRouter, DnsTransportManager, Router};
 
 #[cfg(feature = "endpoint")]
-type RuntimeTunInbound = TunInbound<Router, RuntimeDnsRouter, OutboundManager, EndpointManager>;
+type RuntimeTunInbound = TunInbound<
+    dyn hammer_runtime::adapter::Router,
+    RuntimeDnsRouter,
+    OutboundManager,
+    EndpointManager,
+>;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;

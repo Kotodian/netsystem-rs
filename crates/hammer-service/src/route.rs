@@ -1,27 +1,25 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata, RouteTarget,
-    Router as RouterTrait, SocksAddr,
+    Lifecycle, Network, OutboundManager as OutboundManagerTrait, RouteDecision, RouteMetadata,
+    RouteTarget, Router as RouterTrait, SocksAddr, StartStage,
 };
 use hammer_core::config::{RouteOptions, Rule as RuleOptions, RuleActionKind, RuleMatcher};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::log::Logger;
 use hammer_core::metrics::{MetricsRegistry, MetricsScope, NetworkCounters};
 use ipnet::IpNet;
-use lru::LruCache;
 
 use crate::OutboundManager;
 use crate::component_registry::register_components;
-use crate::impl_logging_lifecycle;
 
 const DEFAULT_SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// Capacity of the metadata→decision LRU. Sized like `SYSTEM_UDP_FLOW_CAPACITY`
+/// Capacity of the metadata-to-decision cache. Sized like `SYSTEM_UDP_FLOW_CAPACITY`
 /// (`tun/stack.rs`) so a sustained UDP flow set fits without thrashing while
 /// staying below ~100 KiB on the NetExt heap (each entry ≤ ~250 B with the
 /// owned `String` keys).
@@ -70,20 +68,17 @@ pub struct Router {
     outbound: Option<Arc<OutboundManager>>,
     default_target: RouteTarget,
     metrics: RouterMetrics,
-    /// Per-(metadata-snapshot) cache of the terminal decision. UDP/ICMP
-    /// dispatch calls `match_route` on every packet; the same 5-tuple
-    /// repeats for the lifetime of a flow, so a small LRU collapses N
-    /// rule walks into a single hashmap lookup. TCP gets one match per
-    /// accepted connection so its hit rate is lower but still positive
-    /// for repeated dials to the same target.
-    cache: Mutex<LruCache<MatchKey, RouteDecision>>,
+    cache: ArcSwap<RouteCacheSnapshot>,
+}
+
+#[derive(Clone, Default)]
+struct RouteCacheSnapshot {
+    decisions: HashMap<MatchKey, RouteDecision>,
 }
 
 #[inline]
-fn new_router_cache() -> Mutex<LruCache<MatchKey, RouteDecision>> {
-    Mutex::new(LruCache::new(
-        NonZeroUsize::new(ROUTER_CACHE_CAPACITY).expect("router cache capacity must be non-zero"),
-    ))
+fn new_router_cache() -> ArcSwap<RouteCacheSnapshot> {
+    ArcSwap::from_pointee(RouteCacheSnapshot::default())
 }
 
 pub(crate) type RouterBuilder =
@@ -129,7 +124,6 @@ impl RouterFactorySet {
     }
 }
 
-#[allow(unused_variables)]
 fn register_standard_router_builders(builders: &mut HashMap<&'static str, RouterBuilder>) {
     register_components!(router, builders, [Router]);
 }
@@ -165,7 +159,6 @@ impl RouteMatcherFactorySet {
     }
 }
 
-#[allow(unused_variables)]
 fn register_standard_route_matcher_builders(builders: &mut HashMap<&'static str, MatcherBuilder>) {
     register_components!(
         matcher,
@@ -323,13 +316,7 @@ impl Router {
         // RouteOptions udp_disable_domain_unmapping) are already applied
         // by the time we land here — a hit can safely skip the second walk.
         let key = MatchKey::from(&*metadata);
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .expect("router cache poisoned")
-            .get(&key)
-            .cloned()
-        {
+        if let Some(cached) = self.cache.load().decisions.get(&key).cloned() {
             self.metrics.cache_hit_total.inc(network);
             return Ok(cached);
         }
@@ -342,10 +329,7 @@ impl Router {
             match rule.apply(metadata) {
                 Ok(RuleApply::Continue) => {}
                 Ok(RuleApply::Decision(decision)) => {
-                    self.cache
-                        .lock()
-                        .expect("router cache poisoned")
-                        .put(key, decision.clone());
+                    self.store_cache_decision(key, decision.clone());
                     return Ok(decision);
                 }
                 Err(err) => {
@@ -357,10 +341,7 @@ impl Router {
         }
         match self.route_to_default(network) {
             Ok(decision) => {
-                self.cache
-                    .lock()
-                    .expect("router cache poisoned")
-                    .put(key, decision.clone());
+                self.store_cache_decision(key, decision.clone());
                 Ok(decision)
             }
             Err(err) => {
@@ -431,6 +412,13 @@ impl Router {
         self.sniff_timeout(metadata).is_some()
     }
 
+    fn store_cache_decision(&self, key: MatchKey, decision: RouteDecision) {
+        let mut snapshot = self.cache.load_full().as_ref().clone();
+        snapshot.decisions.insert(key, decision);
+        trim_route_cache(&mut snapshot.decisions);
+        self.cache.store(Arc::new(snapshot));
+    }
+
     fn route_to_default(&self, network: Network) -> HammerResult<RouteDecision> {
         let Some(outbound) = &self.outbound else {
             return Ok(RouteDecision::Route {
@@ -466,7 +454,30 @@ impl Router {
     }
 }
 
-impl_logging_lifecycle!(Router, "router");
+fn trim_route_cache(cache: &mut HashMap<MatchKey, RouteDecision>) {
+    while cache.len() > ROUTER_CACHE_CAPACITY {
+        let Some(key) = cache.keys().next().cloned() else {
+            return;
+        };
+        cache.remove(&key);
+    }
+}
+
+impl Lifecycle for Router {
+    fn name(&self) -> &str {
+        "router"
+    }
+
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
+        tracing::debug!(target: "router", "stage {}", stage.name());
+        Ok(())
+    }
+
+    fn close(&self) -> HammerResult<()> {
+        tracing::debug!(target: "router", "close");
+        Ok(())
+    }
+}
 
 impl RouterTrait for Router {
     fn reset_network(&self) {
@@ -474,7 +485,7 @@ impl RouterTrait for Router {
         // network-aware matcher; flush the metadata→decision cache so the
         // next packet picks up the new view. No matcher state needs
         // resetting yet.
-        self.cache.lock().expect("router cache poisoned").clear();
+        self.cache.store(Arc::new(RouteCacheSnapshot::default()));
     }
 
     fn match_route(&self, metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {

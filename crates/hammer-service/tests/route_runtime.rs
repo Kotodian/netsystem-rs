@@ -12,7 +12,8 @@ use hammer_core::config::{self, DomainStrategy, Options, RuleActionKind};
 use hammer_core::error::HammerError;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_core::log::{DiscardWriter, Factory, Logger};
-use hammer_runtime::{MetricsRegistry, OutboundManager, Router};
+use hammer_runtime::{MetricsRegistry, OutboundManager};
+use hammer_service::Router;
 
 #[cfg(feature = "endpoint")]
 use async_trait::async_trait;

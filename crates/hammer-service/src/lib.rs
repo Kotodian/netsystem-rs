@@ -3,6 +3,7 @@ pub mod dns;
 mod event_subscribers;
 #[cfg(feature = "probe")]
 mod probe;
+pub mod route;
 mod service;
 
 pub mod adapter {
@@ -11,10 +12,11 @@ pub mod adapter {
 
 pub use dns::{DnsClient, DnsRouter, DnsTransportManager};
 pub use hammer_core::error::{HammerError, HammerResult};
-pub(crate) use hammer_runtime::OutboundManager;
+pub use hammer_runtime::OutboundManager;
 pub use hammer_runtime::{RuntimePlatform, install_default_crypto_provider};
 #[cfg(feature = "probe")]
 pub use probe::{IcmpOutboundProbe, ProbeManager, ProbeProtocolFactorySet};
+pub use route::Router;
 pub use service::RuntimeService;
 
 mod socket_protector {

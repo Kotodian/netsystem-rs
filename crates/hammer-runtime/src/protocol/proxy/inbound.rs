@@ -8,7 +8,7 @@ use base64::Engine;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneBuffers, Inbound, Network,
     OutboundManager as OutboundManagerTrait, PooledBufferFrame, ProxyPacketConn, ProxyStream,
-    RouteDecision, RouteMetadata, RouteTarget, SocksAddr,
+    RouteDecision, RouteMetadata, RouteTarget, Router as RouterTrait, SocksAddr,
 };
 use hammer_core::config::{
     HttpInboundOptions, InboundKind, InboundUser, ListenInboundOptions, MixedInboundOptions,
@@ -24,8 +24,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use crate::OutboundManager;
 use crate::inbounds::RuntimeDnsRouter;
-use crate::{OutboundManager, Router};
 
 const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_RELAY_CHANNEL_CAPACITY: usize = 128;
@@ -46,7 +46,7 @@ enum ProxyMode {
 pub struct SocksInbound {
     id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     closed: Arc<AtomicBool>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -61,7 +61,7 @@ pub struct SocksInbound {
 pub struct HttpInbound {
     id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     closed: Arc<AtomicBool>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -76,7 +76,7 @@ pub struct HttpInbound {
 pub struct MixedInbound {
     id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     closed: Arc<AtomicBool>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -93,7 +93,7 @@ impl SocksInbound {
     fn new(
         id: String,
         options: SocksInboundOptions,
-        router: Arc<Router>,
+        router: Arc<dyn RouterTrait>,
         outbound: Arc<OutboundManager>,
     ) -> Self {
         Self {
@@ -115,7 +115,7 @@ impl HttpInbound {
     fn new(
         id: String,
         options: HttpInboundOptions,
-        router: Arc<Router>,
+        router: Arc<dyn RouterTrait>,
         outbound: Arc<OutboundManager>,
     ) -> Self {
         Self {
@@ -137,7 +137,7 @@ impl MixedInbound {
     fn new(
         id: String,
         options: MixedInboundOptions,
-        router: Arc<Router>,
+        router: Arc<dyn RouterTrait>,
         outbound: Arc<OutboundManager>,
     ) -> Self {
         Self {
@@ -212,7 +212,7 @@ pub(crate) fn build_socks_inbound(
     id: String,
     _logger: Logger,
     kind: &InboundKind,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
@@ -238,7 +238,7 @@ pub(crate) fn build_http_inbound(
     id: String,
     _logger: Logger,
     kind: &InboundKind,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
@@ -262,7 +262,7 @@ pub(crate) fn build_mixed_inbound(
     id: String,
     _logger: Logger,
     kind: &InboundKind,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     _dns_router: Option<Arc<RuntimeDnsRouter>>,
     outbound: Option<Arc<OutboundManager>>,
     _platform: Option<Arc<dyn hammer_adapter::PlatformInterface>>,
@@ -286,7 +286,7 @@ pub(crate) fn build_mixed_inbound(
 fn start_listener(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     closed: Arc<AtomicBool>,
 ) -> HammerResult<JoinHandle<()>> {
@@ -335,7 +335,7 @@ fn start_listener(
 async fn handle_proxy_stream(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     stream: TcpStream,
     source: SocketAddr,
@@ -370,7 +370,7 @@ async fn handle_proxy_stream(
 async fn handle_http_stream(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     mut stream: TcpStream,
     source: SocketAddr,
@@ -517,7 +517,7 @@ fn rewrite_http_request(method: &str, path: &str, version: &str, headers: &[&str
 async fn handle_socks_stream(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     mut stream: TcpStream,
     source: SocketAddr,
@@ -536,7 +536,7 @@ async fn handle_socks_stream(
 async fn handle_socks5_stream(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     mut stream: TcpStream,
     source: SocketAddr,
@@ -673,7 +673,7 @@ async fn authenticate_socks5(
 async fn handle_socks4_stream(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     mut stream: TcpStream,
     source: SocketAddr,
@@ -827,7 +827,7 @@ async fn write_socks5_reply(
 async fn handle_socks5_udp_associate(
     inbound_id: String,
     options: ProxyInboundOptions,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     mut stream: TcpStream,
     _source: SocketAddr,
@@ -871,7 +871,7 @@ async fn handle_socks5_udp_associate(
                     ),
                     payload,
                 )?;
-                let outbound_id = match route_udp(&router, &runtime, buffer) {
+                let outbound_id = match route_udp(router.as_ref(), &runtime, buffer) {
                     Ok(outbound_id) => outbound_id,
                     Err(err) => {
                         runtime.free_index(buffer);
@@ -1215,7 +1215,7 @@ fn encode_socks5_udp(destination: &SocksAddr, payload: &[u8]) -> HammerResult<Ve
 
 async fn route_tcp(
     inbound_id: String,
-    router: Arc<Router>,
+    router: Arc<dyn RouterTrait>,
     outbound: Arc<OutboundManager>,
     source: SocketAddr,
     destination: SocksAddr,
@@ -1286,7 +1286,7 @@ fn udp_route_metadata(
 }
 
 fn route_udp(
-    router: &Router,
+    router: &dyn RouterTrait,
     runtime: &DataPlaneBuffers,
     buffer: BufferIndex,
 ) -> HammerResult<String> {

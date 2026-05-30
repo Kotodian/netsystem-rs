@@ -1129,7 +1129,7 @@ fn first_endpoint_ip(addresses: &[IpNet], version: IpVersion) -> Option<IpAddr> 
 pub struct SystemTunStack<D, R, Q, O>
 where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -1156,7 +1156,7 @@ where
 impl<D, R, Q, O> SystemTunStack<D, R, Q, O>
 where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -1351,7 +1351,7 @@ fn spawn_system_packet_loop<D, R, Q, O>(
 ) -> TunTaskHandle
 where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -3126,7 +3126,7 @@ async fn accept_tcp_loop<R, Q, O>(
     listener: TcpListener,
     metrics: TunMetrics,
 ) where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -3516,7 +3516,7 @@ async fn packet_loop<D, R, Q, O>(
     metrics: TunMetrics,
 ) where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -3555,7 +3555,7 @@ async fn packet_loop_with_tcp_sink<D, R, Q, O>(
     metrics: TunMetrics,
 ) where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -3912,7 +3912,7 @@ fn handle_system_udp_packet<R, Q, O>(
     metrics: TunMetrics,
 ) -> HammerResult<()>
 where
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -4926,7 +4926,7 @@ async fn handle_system_icmp_packet<D, R, Q, O>(
 ) -> HammerResult<()>
 where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -5022,7 +5022,7 @@ fn spawn_icmp_workers<D, R, Q, O>(
     rx: mpsc::Receiver<IcmpJob>,
 ) where
     D: TunDevice,
-    R: RouterTrait + 'static,
+    R: RouterTrait + ?Sized + 'static,
     Q: DnsRouterTrait + 'static,
     O: OutboundManagerTrait + 'static,
 {
@@ -5319,7 +5319,7 @@ fn ipv6_icmp_echo_reply_packet(request: &[u8], reply_body: &[u8]) -> HammerResul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OutboundManager, Router};
+    use crate::OutboundManager;
     use async_trait::async_trait;
     use hammer_adapter::{
         DnsRouter as AdapterDnsRouter, Lifecycle, OutboundManager as AdapterOutboundManager,
@@ -5345,7 +5345,7 @@ mod tests {
     #[test]
     fn system_tun_stack_type_carries_concrete_device() {
         let _ = std::any::type_name::<
-            SystemTunStack<MemoryTunDevice, Router, StubDnsRouter, OutboundManager>,
+            SystemTunStack<MemoryTunDevice, StubRouter, StubDnsRouter, OutboundManager>,
         >();
     }
 
@@ -6970,10 +6970,12 @@ final = "direct"
             )
             .expect("outbound manager"),
         );
-        let router = Arc::new(
-            Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
-                .expect("router"),
-        );
+        let router = Arc::new(CountingRouter {
+            should_sniff_calls: AtomicUsize::new(0),
+            prepare_calls: AtomicUsize::new(0),
+            match_calls: AtomicUsize::new(0),
+            decision: RouteDecision::HijackDns,
+        });
         let dns_router = Arc::new(DelayedDnsRouter);
         let device = ScriptedBatchTunDevice::new(vec![vec![dns_query_packet("example.com")]]);
         let metrics = TunMetrics::new(MetricsRegistry::new().scope("inbound", "tun", "test"));
@@ -7045,10 +7047,12 @@ final = "direct"
             )
             .expect("outbound manager"),
         );
-        let router = Arc::new(
-            Router::from_options(test_logger("router"), options.route, Arc::clone(&outbound))
-                .expect("router"),
-        );
+        let router = Arc::new(CountingRouter {
+            should_sniff_calls: AtomicUsize::new(0),
+            prepare_calls: AtomicUsize::new(0),
+            match_calls: AtomicUsize::new(0),
+            decision: RouteDecision::HijackDns,
+        });
         let queries = Arc::new(AtomicUsize::new(0));
         let dns_router = Arc::new(CountingDnsRouter::new(Arc::clone(&queries)));
 

@@ -48,7 +48,7 @@ pub(crate) trait InboundComponentDeclaration {
         id: String,
         logger: hammer_core::log::Logger,
         kind: &hammer_core::config::InboundKind,
-        router: std::sync::Arc<crate::Router>,
+        router: std::sync::Arc<dyn hammer_adapter::Router>,
         dns_router: Option<std::sync::Arc<crate::inbounds::RuntimeDnsRouter>>,
         outbound: Option<std::sync::Arc<crate::OutboundManager>>,
         platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
@@ -91,41 +91,6 @@ pub(crate) fn register_endpoint_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-pub(crate) trait RouterComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build(
-        logger: hammer_core::log::Logger,
-        options: hammer_core::config::RouteOptions,
-        outbound: std::sync::Arc<crate::OutboundManager>,
-        metrics: std::sync::Arc<hammer_core::metrics::MetricsRegistry>,
-    ) -> hammer_core::error::HammerResult<crate::Router>;
-}
-
-pub(crate) fn register_router_component<C>(
-    builders: &mut HashMap<&'static str, crate::route::RouterBuilder>,
-) where
-    C: RouterComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
-pub(crate) trait RouteMatcherComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    fn build(
-        matcher: hammer_core::config::RuleMatcher,
-    ) -> hammer_core::error::HammerResult<crate::route::RuntimeMatcher>;
-}
-
-pub(crate) fn register_route_matcher_component<C>(
-    builders: &mut HashMap<&'static str, crate::route::MatcherBuilder>,
-) where
-    C: RouteMatcherComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
 pub trait EventSubscriberComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -143,6 +108,19 @@ pub fn register_event_subscriber_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
+#[cfg(any(
+    test,
+    feature = "outbound-hysteria2",
+    feature = "outbound-vless",
+    feature = "outbound-direct",
+    feature = "outbound-block",
+    feature = "outbound-urltest",
+    feature = "inbound-tun",
+    feature = "inbound-socks",
+    feature = "inbound-http",
+    feature = "inbound-mixed",
+    feature = "endpoint-wireguard",
+))]
 macro_rules! register_components {
     (outbound, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_outbound_component::<$component>($builders);)*
@@ -153,17 +131,23 @@ macro_rules! register_components {
     (endpoint, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_endpoint_component::<$component>($builders);)*
     };
-    (router, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_router_component::<$component>($builders);)*
-    };
-    (matcher, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_route_matcher_component::<$component>($builders);)*
-    };
     (event, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_event_subscriber_component::<$component>($builders);)*
     };
 }
 
+#[cfg(any(
+    feature = "outbound-hysteria2",
+    feature = "outbound-vless",
+    feature = "outbound-direct",
+    feature = "outbound-block",
+    feature = "outbound-urltest",
+    feature = "inbound-tun",
+    feature = "inbound-socks",
+    feature = "inbound-http",
+    feature = "inbound-mixed",
+    feature = "endpoint-wireguard",
+))]
 pub(crate) use register_components;
 
 #[cfg(test)]

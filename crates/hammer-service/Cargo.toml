@@ -69,11 +69,11 @@ http = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
+ipnet = { workspace = true }
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-ipnet = { workspace = true }
 smoltcp = { workspace = true }

@@ -785,10 +785,17 @@ impl DnsTransportFactorySet {
     }
 }
 
-#[allow(unused_variables)]
 fn register_standard_dns_transport_builders(
     builders: &mut HashMap<&'static str, DnsTransportBuilder>,
 ) {
+    #[cfg(not(any(
+        feature = "dns-udp",
+        feature = "dns-tcp",
+        feature = "dns-https",
+        feature = "dns-hosts",
+        feature = "dns-local"
+    )))]
+    let _ = builders;
     #[cfg(feature = "dns-udp")]
     register_components!(dns_transport, builders, [transport::udp::UdpDnsTransport]);
     #[cfg(feature = "dns-tcp")]
