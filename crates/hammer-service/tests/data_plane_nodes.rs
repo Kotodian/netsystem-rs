@@ -70,6 +70,7 @@ struct DecisionSinkNode {
 }
 
 impl Node<TestNode> for DecisionSinkNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -92,6 +93,7 @@ struct SinkNode {
 }
 
 impl Node<TestNode> for SinkNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -127,6 +129,7 @@ impl From<RouteDispatchNode> for TestNode {
 }
 
 impl Node<TestNode> for TestNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,

@@ -33,6 +33,7 @@ struct ForwardNode {
 }
 
 impl Node<TestNode> for ForwardNode {
+    #[inline(always)]
     fn process(
         &mut self,
         _runtime: &DataPlaneRuntime<TestNode>,
@@ -52,6 +53,7 @@ struct SourceDriverNode {
 }
 
 impl Node<TestNode> for SourceDriverNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -72,6 +74,7 @@ struct SinkNode {
 }
 
 impl Node<TestNode> for SinkNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -95,6 +98,7 @@ struct CountNode {
 }
 
 impl Node<TestNode> for CountNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -142,6 +146,7 @@ impl From<CountNode> for TestNode {
 }
 
 impl Node<TestNode> for TestNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,

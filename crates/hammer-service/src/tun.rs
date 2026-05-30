@@ -58,7 +58,7 @@ impl<I, G> Node<G> for TunInputDriverNode<I>
 where
     I: TunPacketSource,
 {
-    #[inline]
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -92,7 +92,7 @@ impl<O, G> Node<G> for TunOutputDriverNode<O>
 where
     O: TunPacketSink,
 {
-    #[inline]
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,

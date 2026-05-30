@@ -75,6 +75,7 @@ struct CaptureNode {
 }
 
 impl Node<TestNode> for CaptureNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,
@@ -145,6 +146,7 @@ impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNod
 }
 
 impl Node<TestNode> for TestNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<TestNode>,

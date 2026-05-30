@@ -46,6 +46,7 @@ pub trait InternalNode<G = Self>: Node<G> {}
 pub enum NoopNode {}
 
 impl Node<NoopNode> for NoopNode {
+    #[inline(always)]
     fn process(
         &mut self,
         _runtime: &DataPlaneRuntime<NoopNode>,

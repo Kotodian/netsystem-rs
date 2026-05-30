@@ -25,6 +25,7 @@ where
     R: Deref<Target = T>,
     T: Router + ?Sized,
 {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -151,6 +152,7 @@ impl RouteDispatchNode {
 }
 
 impl<G> Node<G> for RouteDispatchNode {
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,

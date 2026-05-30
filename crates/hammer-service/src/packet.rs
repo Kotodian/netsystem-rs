@@ -29,7 +29,7 @@ impl IpInputNode {
 }
 
 impl<G> Node<G> for IpInputNode {
-    #[inline]
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -58,7 +58,7 @@ impl UdpInputNode {
 }
 
 impl<G> Node<G> for UdpInputNode {
-    #[inline]
+    #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
