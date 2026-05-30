@@ -6,6 +6,7 @@ mod event_subscribers;
 mod probe;
 pub mod route;
 mod service;
+pub mod tun;
 
 pub mod adapter {
     pub use hammer_runtime::adapter::*;

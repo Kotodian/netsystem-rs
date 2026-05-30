@@ -28,11 +28,11 @@ pub trait Node<G = Self> {
     ) -> CoreResult<NodeResult>;
 }
 
-/// Packet graph node that owns an external I/O boundary.
+/// Packet graph node that drives an external input boundary.
 ///
 /// Driver nodes are responsible for bringing packets into the data plane from
-/// the operating system or protocol I/O, or for flushing completed frames back
-/// to that boundary. They are runtime roles, not business protocol roles.
+/// the operating system or protocol I/O. They are runtime roles, not business
+/// protocol roles.
 pub trait DriverNode<G = Self>: Node<G> {}
 
 /// Packet graph node that performs dataplane-internal work.
@@ -206,6 +206,7 @@ struct NodeRuntimeInner<N> {
 struct ScheduledFrame {
     node: NodeId,
     frame: FrameIndex,
+    allow_empty: bool,
 }
 
 impl<N> Default for NodeRuntime<N> {
@@ -263,12 +264,18 @@ impl<N> NodeRuntime<N> {
         }
     }
 
-    pub(crate) fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
+    pub(crate) fn schedule_frame(
+        &self,
+        node: NodeId,
+        frame: FrameIndex,
+        allow_empty: bool,
+    ) -> CoreResult<()> {
         self.validate_node(node)?;
-        self.inner
-            .borrow_mut()
-            .queue
-            .push_back(ScheduledFrame { node, frame });
+        self.inner.borrow_mut().queue.push_back(ScheduledFrame {
+            node,
+            frame,
+            allow_empty,
+        });
         self.readiness.mark_pending();
         Ok(())
     }
@@ -281,7 +288,7 @@ impl<N> NodeRuntime<N> {
         while let Some(scheduled) = self.pop_scheduled() {
             let mut node = self.take_node(scheduled.node)?;
             let mut frame = runtime.take_frame_index(scheduled.frame)?;
-            if !frame.has_pending() {
+            if !scheduled.allow_empty && !frame.has_pending() {
                 self.return_node(scheduled.node, node)?;
                 runtime.release_taken_frame_index(scheduled.frame, frame)?;
                 continue;
@@ -362,7 +369,7 @@ impl<N> NodeRuntime<N> {
                     if frame.has_pending() {
                         frame.set_next_node(node);
                         runtime.return_taken_frame_index(current_index, frame)?;
-                        self.schedule_frame(node, current_index)?;
+                        self.schedule_frame(node, current_index, false)?;
                     } else {
                         runtime.release_taken_frame_index(current_index, frame)?;
                     }
@@ -370,7 +377,7 @@ impl<N> NodeRuntime<N> {
                 NextFrame::Frame { node, frame } => {
                     if runtime.with_frame(frame, BufferFrame::has_pending)? {
                         runtime.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
-                        self.schedule_frame(node, frame)?;
+                        self.schedule_frame(node, frame, false)?;
                     }
                 }
             }

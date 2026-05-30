@@ -474,8 +474,13 @@ impl<N> DataPlaneRuntime<N> {
             return Ok(false);
         }
         self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
-        self.nodes.schedule_frame(node, frame)?;
+        self.nodes.schedule_frame(node, frame, false)?;
         Ok(true)
+    }
+
+    pub fn schedule_driver_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
+        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+        self.nodes.schedule_frame(node, frame, true)
     }
 
     pub fn run_ready_nodes(&self) -> CoreResult<usize>
@@ -1190,6 +1195,10 @@ impl BufferFrame {
 
     pub fn capacity(&self) -> usize {
         self.indices.capacity()
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        self.capacity().saturating_sub(self.len())
     }
 
     pub fn reset(&mut self) {

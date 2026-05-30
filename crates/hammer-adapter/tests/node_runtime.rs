@@ -46,6 +46,26 @@ impl Node<TestNode> for ForwardNode {
 
 impl DriverNode<TestNode> for ForwardNode {}
 
+struct SourceDriverNode {
+    next: NodeId,
+    payload: Vec<u8>,
+}
+
+impl Node<TestNode> for SourceDriverNode {
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        assert!(!frame.has_pending());
+        let buffer = runtime.alloc_index_with_bytes(RouteMetadata::default(), &self.payload)?;
+        frame.push_index(buffer)?;
+        Ok(NodeResult::next_current(self.next))
+    }
+}
+
+impl DriverNode<TestNode> for SourceDriverNode {}
+
 struct SinkNode {
     trace: Rc<RefCell<Vec<&'static str>>>,
     payloads: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -92,6 +112,7 @@ impl InternalNode<TestNode> for CountNode {}
 
 enum TestNode {
     Forward(ForwardNode),
+    SourceDriver(SourceDriverNode),
     Sink(SinkNode),
     Count(CountNode),
 }
@@ -105,6 +126,12 @@ impl From<ForwardNode> for TestNode {
 impl From<SinkNode> for TestNode {
     fn from(node: SinkNode) -> Self {
         Self::Sink(node)
+    }
+}
+
+impl From<SourceDriverNode> for TestNode {
+    fn from(node: SourceDriverNode) -> Self {
+        Self::SourceDriver(node)
     }
 }
 
@@ -122,6 +149,7 @@ impl Node<TestNode> for TestNode {
     ) -> CoreResult<NodeResult> {
         match self {
             Self::Forward(node) => node.process(runtime, frame),
+            Self::SourceDriver(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
             Self::Count(node) => node.process(runtime, frame),
         }
@@ -260,6 +288,32 @@ fn node_runtime_registers_driver_role_node() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(&*trace.borrow(), &["forward", "sink"]);
+    assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_schedules_empty_driver_frame() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register_output(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&payloads),
+    });
+    let driver = runtime.nodes().register_driver(SourceDriverNode {
+        next: sink,
+        payload: b"packet".to_vec(),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(&*trace.borrow(), &["sink"]);
     assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
