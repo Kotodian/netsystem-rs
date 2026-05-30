@@ -21,7 +21,8 @@ pub use buffer::{
     BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferFrameBatchIndices,
     BufferFramePairBatch, BufferFramePairBatchCursor, BufferFrameQuadBatch,
     BufferFrameQuadBatchCursor, BufferIndex, BufferPacketCursor, BufferPool, BufferRef,
-    DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool, PooledBufferFrame,
+    BufferRefMut, DataPlaneBuffers, DataPlaneRuntime, FrameIndex, FramePool, FrameRef, FrameRefMut,
+    PooledBufferFrame,
 };
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
@@ -44,8 +45,8 @@ pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, NextFrame, Node, NodeId, NodeResult, NodeRuntime, NodeRuntimeReady,
-    NoopNode,
+    DriverNode, InternalNode, NextFrame, Node, NodeId, NodeNext, NodeNextFrames, NodeNextGroups,
+    NodeNextTable, NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,

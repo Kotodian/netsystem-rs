@@ -10,7 +10,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_service::data_plane::{RouteDispatchNode, RouteMatchNode};
+use hammer_service::data_plane::{RouteLookupNode, RouteMatchNode};
 
 struct StaticRouter {
     decision: RouteDecision,
@@ -113,7 +113,7 @@ enum TestNode {
     DecisionSink(DecisionSinkNode),
     Sink(SinkNode),
     RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
-    RouteDispatch(RouteDispatchNode),
+    RouteLookup(RouteLookupNode),
 }
 
 impl From<RouteMatchNode<Arc<StaticRouter>>> for TestNode {
@@ -122,9 +122,9 @@ impl From<RouteMatchNode<Arc<StaticRouter>>> for TestNode {
     }
 }
 
-impl From<RouteDispatchNode> for TestNode {
-    fn from(node: RouteDispatchNode) -> Self {
-        Self::RouteDispatch(node)
+impl From<RouteLookupNode> for TestNode {
+    fn from(node: RouteLookupNode) -> Self {
+        Self::RouteLookup(node)
     }
 }
 
@@ -139,7 +139,7 @@ impl Node<TestNode> for TestNode {
             Self::DecisionSink(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
             Self::RouteMatch(node) => node.process(runtime, frame),
-            Self::RouteDispatch(node) => node.process(runtime, frame),
+            Self::RouteLookup(node) => node.process(runtime, frame),
         }
     }
 }
@@ -178,8 +178,9 @@ fn route_match_node_is_service_internal_node() {
         )
         .expect("alloc packet");
     runtime
-        .with_frame_mut(frame, |frame| frame.push_index(buffer))
+        .get_frame_mut(frame)
         .expect("mutate frame")
+        .push_index(buffer)
         .expect("push packet");
 
     assert!(
@@ -202,7 +203,7 @@ fn route_match_node_is_service_internal_node() {
 }
 
 #[test]
-fn route_dispatch_node_uses_explicit_reject_output() {
+fn route_lookup_node_uses_explicit_reject_output() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(16, 8, 4, 4);
     let direct_payloads = Rc::new(RefCell::new(Vec::new()));
     let block_payloads = Rc::new(RefCell::new(Vec::new()));
@@ -216,12 +217,12 @@ fn route_dispatch_node_uses_explicit_reject_output() {
     let drop = runtime.nodes().register(TestNode::Sink(SinkNode {
         payloads: Rc::clone(&drop_payloads),
     }));
-    let dispatch = RouteDispatchNode::new()
+    let lookup = RouteLookupNode::new()
         .with_outbound("direct", direct)
         .with_outbound("block", block)
         .with_reject(drop);
-    assert_internal_node(&dispatch);
-    let dispatch = runtime.nodes().register_internal(dispatch);
+    assert_internal_node(&lookup);
+    let lookup = runtime.nodes().register_internal(lookup);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     for (decision, payload) in [
         (
@@ -253,12 +254,13 @@ fn route_dispatch_node_uses_explicit_reject_output() {
             )
             .expect("alloc packet");
         runtime
-            .with_frame_mut(frame, |frame| frame.push_index(buffer))
+            .get_frame_mut(frame)
             .expect("mutate frame")
+            .push_index(buffer)
             .expect("push packet");
     }
 
-    assert!(runtime.schedule_frame(dispatch, frame).expect("schedule"));
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_eq!(&*direct_payloads.borrow(), &[b"first".to_vec()]);

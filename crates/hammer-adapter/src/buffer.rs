@@ -1,4 +1,4 @@
-use std::cell::{Cell, Ref, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::future::Future;
 use std::ops::{Deref, DerefMut};
@@ -610,6 +610,16 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn get_frame(&self, index: FrameIndex) -> CoreResult<FrameRef<'_>> {
+        self.frames.get(index)
+    }
+
+    #[inline]
+    pub fn get_frame_mut(&self, index: FrameIndex) -> CoreResult<FrameRefMut<'_>> {
+        self.frames.get_mut(index)
+    }
+
+    #[inline]
     pub fn with_frame_mut<R>(
         &self,
         index: FrameIndex,
@@ -676,6 +686,16 @@ impl DataPlaneBuffers {
         f: impl FnOnce(&Buffer) -> R,
     ) -> CoreResult<R> {
         self.buffers.with_buffer(index, f)
+    }
+
+    #[inline]
+    pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+        self.buffers.get(index)
+    }
+
+    #[inline]
+    pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+        self.buffers.get_mut(index)
     }
 
     #[inline]
@@ -841,17 +861,17 @@ impl<N> DataPlaneRuntime<N> {
 
     #[inline]
     pub fn schedule_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<bool> {
-        if !self.with_frame(frame, BufferFrame::has_pending)? {
+        if !self.get_frame(frame)?.has_pending() {
             return Ok(false);
         }
-        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+        self.get_frame_mut(frame)?.set_next_node(node);
         self.nodes.schedule_frame(node, frame, false)?;
         Ok(true)
     }
 
     #[inline]
     pub fn schedule_driver_frame(&self, node: NodeId, frame: FrameIndex) -> CoreResult<()> {
-        self.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+        self.get_frame_mut(frame)?.set_next_node(node);
         self.nodes.schedule_frame(node, frame, true)
     }
 
@@ -954,6 +974,13 @@ impl BufferPool {
         let guard = self.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
+    }
+
+    #[inline]
+    pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+        let mut guard = self.inner.borrow_mut();
+        guard.buffer_mut(index)?;
+        Ok(BufferRefMut { guard, index })
     }
 
     #[inline]
@@ -1129,6 +1156,20 @@ impl FramePool {
         let pool = self.inner.borrow();
         let frame = pool.frame(index)?;
         Ok(f(frame))
+    }
+
+    #[inline]
+    pub fn get(&self, index: FrameIndex) -> CoreResult<FrameRef<'_>> {
+        let guard = self.inner.borrow();
+        guard.frame(index)?;
+        Ok(FrameRef { guard, index })
+    }
+
+    #[inline]
+    pub fn get_mut(&self, index: FrameIndex) -> CoreResult<FrameRefMut<'_>> {
+        let mut guard = self.inner.borrow_mut();
+        guard.frame_mut(index)?;
+        Ok(FrameRefMut { guard, index })
     }
 
     #[inline]
@@ -1969,6 +2010,60 @@ impl Future for BufferFramePending {
     }
 }
 
+pub struct FrameRef<'pool> {
+    guard: Ref<'pool, FramePoolInner>,
+    index: FrameIndex,
+}
+
+impl FrameRef<'_> {
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.guard
+            .frame(self.index)
+            .expect("frame ref points to valid frame")
+            .has_pending()
+    }
+
+    #[inline]
+    pub fn pending_len(&self) -> usize {
+        self.guard
+            .frame(self.index)
+            .expect("frame ref points to valid frame")
+            .pending_len()
+    }
+}
+
+pub struct FrameRefMut<'pool> {
+    guard: RefMut<'pool, FramePoolInner>,
+    index: FrameIndex,
+}
+
+impl FrameRefMut<'_> {
+    #[inline]
+    pub fn push_index(&mut self, index: BufferIndex) -> CoreResult<()> {
+        self.guard
+            .frame_mut(self.index)
+            .expect("frame ref points to valid frame")
+            .push_index(index)
+    }
+
+    #[inline]
+    pub fn has_pending(&self) -> bool {
+        self.guard
+            .frame(self.index)
+            .expect("frame ref points to valid frame")
+            .has_pending()
+    }
+
+    #[inline]
+    pub fn set_next_node(&mut self, node: NodeId) {
+        self.guard
+            .frame_mut(self.index)
+            .expect("frame ref points to valid frame")
+            .set_next_node(node);
+    }
+}
+
 pub struct BufferRef<'pool> {
     guard: Ref<'pool, BufferPoolInner>,
     index: BufferIndex,
@@ -1989,6 +2084,54 @@ impl BufferRef<'_> {
             .packet_cursor()
     }
 
+    pub fn current(&self) -> &[u8] {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current()
+    }
+}
+
+pub struct BufferRefMut<'pool> {
+    guard: RefMut<'pool, BufferPoolInner>,
+    index: BufferIndex,
+}
+
+impl BufferRefMut<'_> {
+    #[inline]
+    pub fn metadata(&self) -> &RouteMetadata {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .metadata()
+    }
+
+    #[inline]
+    pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .metadata_mut()
+    }
+
+    #[inline]
+    pub fn packet_cursor(&self) -> BufferPacketCursor {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .packet_cursor()
+    }
+
+    #[inline]
+    pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
+        *self
+            .guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .packet_cursor_mut() = cursor;
+    }
+
+    #[inline]
     pub fn current(&self) -> &[u8] {
         self.guard
             .buffer(self.index)

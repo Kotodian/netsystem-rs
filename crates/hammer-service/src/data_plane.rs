@@ -2,12 +2,10 @@ use std::collections::HashMap;
 use std::ops::Deref;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, NextFrame, Node, NodeId, NodeResult,
-    RouteDecision, RouteMetadata, RouteTarget, Router,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
+    NodeResult, RouteDecision, RouteMetadata, RouteTarget, Router,
 };
 use hammer_core::error::{CoreError, CoreResult};
-
-const MAX_ROUTE_DISPATCH_GROUPS: usize = hammer_adapter::node::MAX_NODE_NEXT_FRAMES;
 
 pub struct RouteMatchNode<R> {
     router: R,
@@ -36,12 +34,11 @@ where
         while let Some(batch) = cursor.next() {
             cursor.prefetch_next_pair(runtime);
             for index in batch.indices() {
-                runtime.with_metadata_mut(index, |metadata| {
-                    self.router.prepare_route_metadata(metadata)?;
-                    let decision = self.router.match_route(metadata)?;
-                    metadata.route_decision = Some(decision);
-                    Ok(())
-                })??;
+                let mut buffer = runtime.get_buffer_mut(index)?;
+                let metadata = buffer.metadata_mut();
+                self.router.prepare_route_metadata(metadata)?;
+                let decision = self.router.match_route(metadata)?;
+                metadata.route_decision = Some(decision);
             }
         }
         Ok(NodeResult::next_current(self.next))
@@ -56,14 +53,14 @@ where
 }
 
 #[derive(Debug, Default)]
-pub struct RouteDispatchNode {
+pub struct RouteLookupNode {
     outbounds: HashMap<String, NodeId>,
     endpoints: HashMap<String, NodeId>,
     reject: Option<NodeId>,
     hijack_dns: Option<NodeId>,
 }
 
-impl RouteDispatchNode {
+impl RouteLookupNode {
     pub fn new() -> Self {
         Self::default()
     }
@@ -101,7 +98,8 @@ impl RouteDispatchNode {
         runtime: &DataPlaneRuntime<G>,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
-        runtime.with_metadata(index, |metadata| self.target_for_metadata(metadata))?
+        let buffer = runtime.get_buffer(index)?;
+        self.target_for_metadata(buffer.metadata())
     }
 
     fn target_for_metadata(&self, metadata: &RouteMetadata) -> CoreResult<NodeId> {
@@ -132,149 +130,32 @@ impl RouteDispatchNode {
                 .ok_or_else(|| CoreError::internal("dns hijack route node not configured")),
         }
     }
-
-    fn collect_groups<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &BufferFrame,
-    ) -> CoreResult<RouteDispatchGroups> {
-        let mut groups = RouteDispatchGroups::default();
-        let mut cursor = frame.pair_batch_cursor();
-        cursor.prefetch_next_pair(runtime);
-        while let Some(batch) = cursor.next() {
-            cursor.prefetch_next_pair(runtime);
-            for index in batch.indices() {
-                groups.push(self.target_for_index(runtime, index)?)?;
-            }
-        }
-        Ok(groups)
-    }
 }
 
-impl<G> Node<G> for RouteDispatchNode {
+impl<G> Node<G> for RouteLookupNode {
     #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let groups = self.collect_groups(runtime, frame)?;
-        if groups.is_empty() {
-            return Ok(NodeResult::drop());
-        }
-
-        let first = groups.node(0)?;
-        if groups.len() == 1 {
-            frame.retain_indices(|index| {
+        let mut next_frames = NodeNextFrames::default();
+        let indices = frame.pending_indices().to_vec();
+        frame.clear();
+        let mut cursor = indices.as_slice().chunks_exact(2);
+        for batch in cursor.by_ref() {
+            for index in batch.iter().copied() {
                 let node = self.target_for_index(runtime, index)?;
-                if node == first {
-                    Ok(true)
-                } else {
-                    Err(CoreError::internal("route dispatch group changed"))
-                }
-            })?;
-            return if frame.has_pending() {
-                Ok(NodeResult::next_current(first))
-            } else {
-                Ok(NodeResult::drop())
-            };
+                next_frames.enqueue(runtime, node, index)?;
+            }
         }
-
-        let mut extra_frames = [None; MAX_ROUTE_DISPATCH_GROUPS];
-        for group_index in 1..groups.len() {
-            extra_frames[group_index] = Some(runtime.alloc_frame_index()?);
-        }
-
-        let retain_result = frame.retain_indices(|index| {
+        for index in cursor.remainder().iter().copied() {
             let node = self.target_for_index(runtime, index)?;
-            if node == first {
-                return Ok(true);
-            }
-            let group_index = groups
-                .position(node)
-                .ok_or_else(|| CoreError::internal("route dispatch group changed"))?;
-            let frame_index = extra_frames[group_index]
-                .ok_or_else(|| CoreError::internal("route dispatch frame missing"))?;
-            runtime.with_frame_mut(frame_index, |frame| frame.push_index(index))??;
-            Ok(false)
-        });
-        if let Err(err) = retain_result {
-            for frame_index in extra_frames.iter().flatten().copied() {
-                let _ = runtime.free_frame_index(frame_index);
-            }
-            return Err(err);
+            next_frames.enqueue(runtime, node, index)?;
         }
-
-        let mut result = NodeResult::drop();
-        if frame.has_pending() {
-            result.push(NextFrame::Current(first))?;
-        }
-        for group_index in 1..groups.len() {
-            let frame_index = extra_frames[group_index]
-                .ok_or_else(|| CoreError::internal("route dispatch frame missing"))?;
-            if runtime.with_frame(frame_index, BufferFrame::has_pending)? {
-                result.push(NextFrame::Frame {
-                    node: groups.node(group_index)?,
-                    frame: frame_index,
-                })?;
-            } else {
-                runtime.free_frame_index(frame_index)?;
-            }
-        }
-        Ok(result)
+        next_frames.schedule(runtime)?;
+        Ok(NodeResult::drop())
     }
 }
 
-impl<G> InternalNode<G> for RouteDispatchNode {}
-
-#[derive(Debug, Clone, Copy)]
-struct RouteDispatchGroups {
-    nodes: [Option<NodeId>; MAX_ROUTE_DISPATCH_GROUPS],
-    len: usize,
-}
-
-impl Default for RouteDispatchGroups {
-    fn default() -> Self {
-        Self {
-            nodes: [None; MAX_ROUTE_DISPATCH_GROUPS],
-            len: 0,
-        }
-    }
-}
-
-impl RouteDispatchGroups {
-    fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn push(&mut self, node: NodeId) -> CoreResult<()> {
-        if self.position(node).is_some() {
-            return Ok(());
-        }
-        if self.len == MAX_ROUTE_DISPATCH_GROUPS {
-            return Err(CoreError::internal(
-                "route dispatch next frame capacity exceeded",
-            ));
-        }
-        self.nodes[self.len] = Some(node);
-        self.len += 1;
-        Ok(())
-    }
-
-    fn node(&self, index: usize) -> CoreResult<NodeId> {
-        self.nodes
-            .get(index)
-            .and_then(|node| *node)
-            .ok_or_else(|| CoreError::internal("route dispatch group index out of bounds"))
-    }
-
-    fn position(&self, node: NodeId) -> Option<usize> {
-        self.nodes[..self.len]
-            .iter()
-            .position(|candidate| *candidate == Some(node))
-    }
-}
+impl<G> InternalNode<G> for RouteLookupNode {}

@@ -7,7 +7,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-pub use crate::packet::packet_route_metadata;
+pub use crate::net::packet_route_metadata;
 
 const DEFAULT_TUN_RECV_BATCH: usize = 256;
 
@@ -258,10 +258,10 @@ fn push_packet_to_frame<G>(
     interface_id: &str,
     packet: &[u8],
 ) -> CoreResult<()> {
-    let metadata = RouteMetadata {
+    let metadata = packet_route_metadata(interface_id, packet).unwrap_or_else(|_| RouteMetadata {
         inbound: interface_id.to_owned(),
         ..Default::default()
-    };
+    });
     let index = runtime.alloc_index_with_bytes(metadata, packet)?;
     if let Err(err) = frame.push_index(index) {
         runtime.free_index(index);

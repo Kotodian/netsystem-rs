@@ -9,7 +9,11 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
 
+pub mod next;
+
 pub const MAX_NODE_NEXT_FRAMES: usize = 4;
+
+pub use next::{NodeNext, NodeNextFrames, NodeNextGroups, NodeNextTable};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
@@ -366,8 +370,8 @@ impl<N> NodeRuntime<N> {
                     }
                 }
                 NextFrame::Frame { node, frame } => {
-                    if runtime.with_frame(frame, BufferFrame::has_pending)? {
-                        runtime.with_frame_mut(frame, |frame| frame.set_next_node(node))?;
+                    if runtime.get_frame(frame)?.has_pending() {
+                        runtime.get_frame_mut(frame)?.set_next_node(node);
                         self.schedule_frame(node, frame, false)?;
                     }
                 }
