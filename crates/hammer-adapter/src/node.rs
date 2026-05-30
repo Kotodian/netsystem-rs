@@ -28,14 +28,12 @@ pub trait Node<G = Self> {
     ) -> CoreResult<NodeResult>;
 }
 
-/// Packet graph node that produces frames from an external I/O source.
-pub trait InputDriverNode<G = Self>: Node<G> {}
-
-/// Packet graph node that consumes frames and writes them to external I/O.
-pub trait OutputDriverNode<G = Self>: Node<G> {}
-
-/// Packet graph node that performs protocol ingress work.
-pub trait InboundNode<G = Self>: Node<G> {}
+/// Packet graph node that owns an external I/O boundary.
+///
+/// Driver nodes are responsible for bringing packets into the data plane from
+/// the operating system or protocol I/O, or for flushing completed frames back
+/// to that boundary. They are runtime roles, not business protocol roles.
+pub trait DriverNode<G = Self>: Node<G> {}
 
 /// Packet graph node that performs dataplane-internal work.
 ///
@@ -230,23 +228,9 @@ impl<N> NodeRuntime<N> {
         id
     }
 
-    pub fn register_input_driver<I>(&self, node: I) -> NodeId
+    pub fn register_driver<I>(&self, node: I) -> NodeId
     where
-        I: InputDriverNode<N> + Into<N>,
-    {
-        self.register(node.into())
-    }
-
-    pub fn register_output_driver<I>(&self, node: I) -> NodeId
-    where
-        I: OutputDriverNode<N> + Into<N>,
-    {
-        self.register(node.into())
-    }
-
-    pub fn register_inbound<I>(&self, node: I) -> NodeId
-    where
-        I: InboundNode<N> + Into<N>,
+        I: DriverNode<N> + Into<N>,
     {
         self.register(node.into())
     }

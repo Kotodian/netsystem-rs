@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeId, NodeResult, RouteMetadata,
+    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult,
+    OutboundNode, RouteMetadata,
 };
 use hammer_core::error::CoreResult;
 
@@ -43,6 +44,8 @@ impl Node<TestNode> for ForwardNode {
     }
 }
 
+impl DriverNode<TestNode> for ForwardNode {}
+
 struct SinkNode {
     trace: Rc<RefCell<Vec<&'static str>>>,
     payloads: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -64,6 +67,8 @@ impl Node<TestNode> for SinkNode {
         Ok(NodeResult::drop())
     }
 }
+
+impl OutboundNode<TestNode> for SinkNode {}
 
 struct CountNode {
     count: Rc<Cell<usize>>,
@@ -91,6 +96,18 @@ enum TestNode {
     Count(CountNode),
 }
 
+impl From<ForwardNode> for TestNode {
+    fn from(node: ForwardNode) -> Self {
+        Self::Forward(node)
+    }
+}
+
+impl From<SinkNode> for TestNode {
+    fn from(node: SinkNode) -> Self {
+        Self::Sink(node)
+    }
+}
+
 impl From<CountNode> for TestNode {
     fn from(node: CountNode) -> Self {
         Self::Count(node)
@@ -114,6 +131,20 @@ impl Node<TestNode> for TestNode {
 fn assert_internal_node<I>(node: &I)
 where
     I: InternalNode<TestNode>,
+{
+    let _ = node;
+}
+
+fn assert_driver_node<I>(node: &I)
+where
+    I: DriverNode<TestNode>,
+{
+    let _ = node;
+}
+
+fn assert_outbound_node<I>(node: &I)
+where
+    I: OutboundNode<TestNode>,
 {
     let _ = node;
 }
@@ -193,6 +224,76 @@ fn node_runtime_registers_internal_role_node() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(count.get(), 1);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_registers_driver_role_node() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register_outbound(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&payloads),
+    });
+    let driver = ForwardNode {
+        next: sink,
+        trace: Rc::clone(&trace),
+    };
+    assert_driver_node(&driver);
+    let driver = runtime.nodes().register_driver(driver);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    runtime
+        .with_frame_mut(frame, |frame| frame.push_index(buffer))
+        .expect("mutate frame")
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(driver, frame)
+            .expect("schedule frame")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(&*trace.borrow(), &["forward", "sink"]);
+    assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_registers_outbound_role_node() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let outbound = SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&payloads),
+    };
+    assert_outbound_node(&outbound);
+    let outbound = runtime.nodes().register_outbound(outbound);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    runtime
+        .with_frame_mut(frame, |frame| frame.push_index(buffer))
+        .expect("mutate frame")
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(outbound, frame)
+            .expect("schedule frame")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(&*trace.borrow(), &["sink"]);
+    assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
