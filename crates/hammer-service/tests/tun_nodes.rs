@@ -179,7 +179,9 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         metadata: Rc::clone(&captured),
         cursors: Rc::clone(&cursors),
     });
-    let ip_input = runtime.nodes().register_internal(IpInputNode::new(capture));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(capture, capture));
     let driver =
         runtime
             .nodes()

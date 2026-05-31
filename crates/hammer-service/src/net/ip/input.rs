@@ -1,7 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, DataPlaneRuntime,
-    FrameBatchWidth, InternalNode, Node, NodeId, NodeNextFrames, NodeNextTable, NodeResult,
-    SocksAddr, define_node_next,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
+    NodeNextTable, NodeResult, SocksAddr, define_node_next, for_each_buffer_frame_index,
 };
 use hammer_core::error::CoreResult;
 
@@ -20,16 +19,10 @@ pub struct IpInputNode {
 
 impl IpInputNode {
     #[inline]
-    pub fn new(lookup_next: NodeId) -> Self {
+    pub fn new(lookup_next: NodeId, reassembly_next: NodeId) -> Self {
         Self {
-            next: NodeNextTable::new(lookup_next),
+            next: NodeNextTable::new(lookup_next).with(IpInputNext::Reassembly, reassembly_next),
         }
-    }
-
-    #[inline]
-    pub fn with_next(mut self, next: IpInputNext, node: NodeId) -> Self {
-        self.next = self.next.with(next, node);
-        self
     }
 }
 
@@ -53,71 +46,12 @@ fn dispatch_ip_input_frame<G>(
     next: NodeNextTable<IpInputNext>,
 ) -> CoreResult<NodeResult> {
     let mut next_frames = NodeNextFrames::default();
-    match runtime.preferred_frame_batch_width() {
-        FrameBatchWidth::Quad => {
-            dispatch_ip_input_frame_quad(runtime, frame, next, &mut next_frames)?
-        }
-        FrameBatchWidth::Pair => {
-            dispatch_ip_input_frame_pair(runtime, frame, next, &mut next_frames)?
-        }
-    }
+    for_each_buffer_frame_index!(runtime, frame, |index| {
+        enqueue_index(runtime, &mut next_frames, index, next)
+    })?;
     frame.clear();
     next_frames.schedule(runtime)?;
     Ok(NodeResult::drop())
-}
-
-#[inline]
-fn dispatch_ip_input_frame_quad<G>(
-    runtime: &DataPlaneRuntime<G>,
-    frame: &BufferFrame,
-    next: NodeNextTable<IpInputNext>,
-    next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
-    let mut cursor = frame.quad_batch_cursor();
-    cursor.prefetch_next_quad(runtime);
-    while let Some(batch) = cursor.next() {
-        cursor.prefetch_next_quad(runtime);
-        match batch {
-            BufferFrameQuadBatch::Quad(indices) => {
-                enqueue_index(runtime, next_frames, indices[0], next)?;
-                enqueue_index(runtime, next_frames, indices[1], next)?;
-                enqueue_index(runtime, next_frames, indices[2], next)?;
-                enqueue_index(runtime, next_frames, indices[3], next)?;
-            }
-            BufferFrameQuadBatch::Pair(indices) => {
-                enqueue_index(runtime, next_frames, indices[0], next)?;
-                enqueue_index(runtime, next_frames, indices[1], next)?;
-            }
-            BufferFrameQuadBatch::Single(index) => {
-                enqueue_index(runtime, next_frames, index, next)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[inline]
-fn dispatch_ip_input_frame_pair<G>(
-    runtime: &DataPlaneRuntime<G>,
-    frame: &BufferFrame,
-    next: NodeNextTable<IpInputNext>,
-    next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
-    let mut cursor = frame.pair_batch_cursor();
-    cursor.prefetch_next_pair(runtime);
-    while let Some(batch) = cursor.next() {
-        cursor.prefetch_next_pair(runtime);
-        match batch {
-            BufferFramePairBatch::Pair(indices) => {
-                enqueue_index(runtime, next_frames, indices[0], next)?;
-                enqueue_index(runtime, next_frames, indices[1], next)?;
-            }
-            BufferFramePairBatch::Single(index) => {
-                enqueue_index(runtime, next_frames, index, next)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 #[inline(always)]

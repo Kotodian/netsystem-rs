@@ -8,7 +8,7 @@ use hammer_adapter::{
     SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_service::net::{IpInputNext, IpInputNode, IpReassemblyNode};
+use hammer_service::net::{IpInputNode, IpReassemblyNode};
 
 struct SinkNode {
     packets: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -93,7 +93,7 @@ fn ip_input_drops_ipv4_options_packets() {
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(sink));
-    let input = IpInputNode::new(sink).with_next(IpInputNext::Reassembly, reassembly);
+    let input = IpInputNode::new(sink, reassembly);
     assert_internal_node(&input);
     let input = runtime.nodes().register_internal(input);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -129,7 +129,7 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(sink).with_next(IpInputNext::Reassembly, reassembly));
+        .register_internal(IpInputNode::new(sink, reassembly));
     let original = ipv4_udp_packet(
         [10, 0, 0, 2],
         12_345,
@@ -177,7 +177,7 @@ fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(sink).with_next(IpInputNext::Reassembly, reassembly));
+        .register_internal(IpInputNode::new(sink, reassembly));
     let original = ipv4_udp_packet(
         [10, 0, 0, 3],
         12_346,
@@ -216,7 +216,7 @@ fn ipv4_reassembly_drops_context_on_partial_overlap() {
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(sink).with_next(IpInputNext::Reassembly, reassembly));
+        .register_internal(IpInputNode::new(sink, reassembly));
     let original = ipv4_udp_packet(
         [10, 0, 0, 4],
         12_347,
@@ -252,7 +252,7 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(sink).with_next(IpInputNext::Reassembly, reassembly));
+        .register_internal(IpInputNode::new(sink, reassembly));
     let original = ipv6_udp_packet(
         Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1),
         20_000,

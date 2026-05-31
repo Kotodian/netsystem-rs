@@ -1633,6 +1633,67 @@ impl BufferFrameQuadBatch {
     }
 }
 
+#[macro_export]
+macro_rules! for_each_buffer_frame_index {
+    ($runtime:expr, $frame:expr, |$index:ident| $body:block) => {{
+        use $crate::{BufferFramePairBatch, BufferFrameQuadBatch, FrameBatchWidth};
+
+        (|| -> hammer_core::error::CoreResult<()> {
+            match $runtime.preferred_frame_batch_width() {
+                FrameBatchWidth::Quad => {
+                    let mut cursor = $frame.quad_batch_cursor();
+                    cursor.prefetch_next_quad($runtime);
+                    while let Some(batch) = cursor.next() {
+                        cursor.prefetch_next_quad($runtime);
+                        match batch {
+                            BufferFrameQuadBatch::Quad(indices) => {
+                                let $index = indices[0];
+                                $body?;
+                                let $index = indices[1];
+                                $body?;
+                                let $index = indices[2];
+                                $body?;
+                                let $index = indices[3];
+                                $body?;
+                            }
+                            BufferFrameQuadBatch::Pair(indices) => {
+                                let $index = indices[0];
+                                $body?;
+                                let $index = indices[1];
+                                $body?;
+                            }
+                            BufferFrameQuadBatch::Single(value) => {
+                                let $index = value;
+                                $body?;
+                            }
+                        }
+                    }
+                }
+                FrameBatchWidth::Pair => {
+                    let mut cursor = $frame.pair_batch_cursor();
+                    cursor.prefetch_next_pair($runtime);
+                    while let Some(batch) = cursor.next() {
+                        cursor.prefetch_next_pair($runtime);
+                        match batch {
+                            BufferFramePairBatch::Pair(indices) => {
+                                let $index = indices[0];
+                                $body?;
+                                let $index = indices[1];
+                                $body?;
+                            }
+                            BufferFramePairBatch::Single(value) => {
+                                let $index = value;
+                                $body?;
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })()
+    }};
+}
+
 pub struct BufferFrameBatchIndices {
     indices: [Option<BufferIndex>; 4],
     len: usize,

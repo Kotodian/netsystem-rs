@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFramePairBatch, BufferFrameQuadBatch, BufferPacketCursor, BufferPool,
-    DataPlaneInstructionSet, DataPlaneRuntime, FrameBatchWidth, NoopNode, RouteMetadata,
+    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
+    BufferPool, DataPlaneInstructionSet, DataPlaneRuntime, FrameBatchWidth, NoopNode,
+    RouteMetadata, for_each_buffer_frame_index,
 };
 
 #[derive(Default)]
@@ -566,6 +567,61 @@ fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
 }
 
 #[test]
+fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
+    let quad_runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+        8,
+        8,
+        8,
+        1,
+        DataPlaneInstructionSet::Avx2,
+    );
+    let pair_runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+        8,
+        8,
+        8,
+        1,
+        DataPlaneInstructionSet::Scalar,
+    );
+    let mut quad_frame = quad_runtime.alloc_pooled_frame().expect("quad frame");
+    let mut pair_frame = pair_runtime.alloc_pooled_frame().expect("pair frame");
+    let quad_indices = push_numbered_indices(&quad_runtime, &mut quad_frame, 7);
+    let pair_indices = push_numbered_indices(&pair_runtime, &mut pair_frame, 5);
+
+    let mut quad_seen = Vec::new();
+    for_each_buffer_frame_index!(&quad_runtime, &quad_frame, |index| {
+        quad_seen.push(index);
+        Ok(())
+    })
+    .expect("quad dispatch");
+    let mut pair_seen = Vec::new();
+    for_each_buffer_frame_index!(&pair_runtime, &pair_frame, |index| {
+        pair_seen.push(index);
+        Ok(())
+    })
+    .expect("pair dispatch");
+
+    assert_eq!(
+        quad_runtime.preferred_frame_batch_width(),
+        FrameBatchWidth::Quad
+    );
+    assert_eq!(
+        pair_runtime.preferred_frame_batch_width(),
+        FrameBatchWidth::Pair
+    );
+    assert_eq!(quad_seen, quad_indices);
+    assert_eq!(pair_seen, pair_indices);
+
+    quad_runtime.free_frame(&mut quad_frame);
+    pair_runtime.free_frame(&mut pair_frame);
+    quad_runtime
+        .release_pooled_frame(quad_frame)
+        .expect("release quad frame");
+    pair_runtime
+        .release_pooled_frame(pair_frame)
+        .expect("release pair frame");
+}
+
+#[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
     let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 2, 1, 1);
     let pool = runtime.buffers();
@@ -712,4 +768,22 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     runtime
         .release_pooled_frame(reused_frame)
         .expect("release reused pooled frame");
+}
+
+fn push_numbered_indices(
+    runtime: &DataPlaneRuntime<NoopNode>,
+    frame: &mut BufferFrame,
+    count: u8,
+) -> Vec<BufferIndex> {
+    let indices = (0..count)
+        .map(|value| {
+            runtime
+                .alloc_index_with_bytes(RouteMetadata::default(), &[value])
+                .expect("alloc numbered buffer")
+        })
+        .collect::<Vec<_>>();
+    frame
+        .push_indices(indices.iter().copied())
+        .expect("push numbered indices");
+    indices
 }
