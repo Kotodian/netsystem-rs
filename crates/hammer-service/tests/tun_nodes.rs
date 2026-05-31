@@ -11,8 +11,8 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_service::data_plane::{RouteLookupNode, RouteMatchNode};
-use hammer_service::net::IpInputNode;
+use hammer_service::data_plane::{RouteMatchNext, RouteMatchNode};
+use hammer_service::net::{IpInputNext, IpInputNode, RouteLookupNode};
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 
 struct StaticRouter {
@@ -181,7 +181,7 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     });
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(capture, capture));
+        .register_internal(IpInputNode::new(IpInputNext::nodes(capture, capture)));
     let driver =
         runtime
             .nodes()
@@ -239,9 +239,10 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let router = Arc::new(StaticRouter::new(RouteDecision::Route {
         target: RouteTarget::Outbound("tun-output".to_owned()),
     }));
-    let route_match = runtime
-        .nodes()
-        .register_internal(RouteMatchNode::new(Arc::clone(&router), lookup));
+    let route_match = runtime.nodes().register_internal(RouteMatchNode::new(
+        Arc::clone(&router),
+        RouteMatchNext::nodes(lookup),
+    ));
     let driver = runtime.nodes().register_driver(TunInputDriverNode::new(
         device.input(),
         "tun0",

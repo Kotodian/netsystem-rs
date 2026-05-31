@@ -13,7 +13,7 @@ pub mod next;
 
 pub const MAX_NODE_NEXT_FRAMES: usize = 4;
 
-pub use next::{NodeNext, NodeNextFrames, NodeNextGroups, NodeNextTable};
+pub use next::{NodeNext, NodeNextFrames, NodeNextGroups};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);

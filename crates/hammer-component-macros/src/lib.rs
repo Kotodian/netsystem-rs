@@ -1,10 +1,10 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Error, ExprPath, Ident, Item, LitStr, Result, Token, Type, parenthesized, parse_macro_input,
-    spanned::Spanned,
+    Error, ExprPath, Fields, Ident, Item, ItemEnum, LitStr, Result, Token, Type, parenthesized,
+    parse_macro_input, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -422,4 +422,135 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
         #declaration_impl
     }
     .into()
+}
+
+/// Defines a dataplane node-next enum and its compact NodeId table builder.
+///
+/// Example:
+///
+/// ```ignore
+/// #[hammer_component_macros::node_next]
+/// pub enum IpInputNext {
+///     Lookup,
+///     Reassembly,
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn node_next(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(Span::call_site(), "`node_next` does not accept arguments")
+            .to_compile_error()
+            .into();
+    }
+    let item = parse_macro_input!(input as ItemEnum);
+    expand_node_next(item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
+        return Err(Error::new(
+            item.generics.span(),
+            "`node_next` does not support generic next enums",
+        ));
+    }
+    if item.variants.is_empty() {
+        return Err(Error::new(
+            item.ident.span(),
+            "`node_next` requires at least one variant",
+        ));
+    }
+
+    let attrs = item.attrs;
+    let vis = item.vis;
+    let ident = item.ident;
+    let mut variant_defs = Vec::with_capacity(item.variants.len());
+    let mut variant_idents = Vec::with_capacity(item.variants.len());
+    let mut node_params = Vec::with_capacity(item.variants.len());
+
+    for variant in item.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(Error::new(
+                variant.fields.span(),
+                "`node_next` variants must be unit variants",
+            ));
+        }
+        if let Some((eq_token, _)) = variant.discriminant {
+            return Err(Error::new(
+                eq_token.span(),
+                "`node_next` assigns variant slots automatically",
+            ));
+        }
+
+        let variant_attrs = variant.attrs;
+        let variant_ident = variant.ident;
+        let node_param = format_ident!("{}", to_snake_case(&variant_ident.to_string()));
+        variant_defs.push(quote! {
+            #(#variant_attrs)*
+            #variant_ident
+        });
+        variant_idents.push(variant_ident);
+        node_params.push(node_param);
+    }
+
+    let count = variant_idents.len();
+    Ok(quote! {
+        #(#attrs)*
+        #[repr(usize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #vis enum #ident {
+            #(#variant_defs),*
+        }
+
+        impl #ident {
+            pub const COUNT: usize = #count;
+            pub const VARIANTS: [Self; Self::COUNT] = [
+                #(Self::#variant_idents),*
+            ];
+
+            #[inline(always)]
+            pub const fn slot(self) -> usize {
+                self as usize
+            }
+
+            #[inline(always)]
+            pub const fn nodes(
+                #(#node_params: ::hammer_adapter::node::NodeId),*
+            ) -> [::hammer_adapter::node::NodeId; Self::COUNT] {
+                [#(#node_params),*]
+            }
+        }
+
+        impl ::hammer_adapter::node::NodeNext for #ident {
+            const COUNT: usize = #ident::COUNT;
+
+            #[inline(always)]
+            fn slot(self) -> usize {
+                self as usize
+            }
+        }
+
+        const _: () = {
+            assert!(#ident::COUNT <= ::hammer_adapter::node::MAX_NODE_NEXT_FRAMES);
+        };
+    })
+}
+
+fn to_snake_case(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut previous_was_lower_or_digit = false;
+    for ch in input.chars() {
+        if ch.is_ascii_uppercase() {
+            if previous_was_lower_or_digit {
+                output.push('_');
+            }
+            output.push(ch.to_ascii_lowercase());
+            previous_was_lower_or_digit = false;
+        } else {
+            previous_was_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+            output.push(ch);
+        }
+    }
+    output
 }

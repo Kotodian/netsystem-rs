@@ -1,90 +1,13 @@
-use std::marker::PhantomData;
-
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::buffer::{BufferIndex, DataPlaneRuntime, FrameIndex};
 
 use super::{MAX_NODE_NEXT_FRAMES, NodeId};
 
-#[macro_export]
-macro_rules! define_node_next {
-    (
-        $(#[$meta:meta])*
-        $vis:vis enum $name:ident {
-            $($variant:ident),+ $(,)?
-        }
-    ) => {
-        $(#[$meta])*
-        #[repr(usize)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        $vis enum $name {
-            $($variant),+
-        }
-
-        impl $crate::node::NodeNext for $name {
-            const COUNT: usize = <[()]>::len(&[$($crate::define_node_next!(@unit $variant)),+]);
-
-            #[inline]
-            fn slot(self) -> usize {
-                self as usize
-            }
-        }
-
-        const _: () = {
-            assert!(
-                <$name as $crate::node::NodeNext>::COUNT
-                    <= $crate::node::MAX_NODE_NEXT_FRAMES
-            );
-        };
-    };
-    (@unit $variant:ident) => {
-        {
-            let _ = stringify!($variant);
-            ()
-        }
-    };
-}
-
 pub trait NodeNext: Copy + Eq {
     const COUNT: usize;
 
     fn slot(self) -> usize;
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct NodeNextTable<N>
-where
-    N: NodeNext,
-{
-    nodes: [NodeId; MAX_NODE_NEXT_FRAMES],
-    _marker: PhantomData<fn() -> N>,
-}
-
-impl<N> NodeNextTable<N>
-where
-    N: NodeNext,
-{
-    #[inline]
-    pub fn new(default: NodeId) -> Self {
-        debug_assert!(N::COUNT <= MAX_NODE_NEXT_FRAMES);
-        Self {
-            nodes: [default; MAX_NODE_NEXT_FRAMES],
-            _marker: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub fn with(mut self, next: N, node: NodeId) -> Self {
-        debug_assert!(next.slot() < N::COUNT);
-        self.nodes[next.slot()] = node;
-        self
-    }
-
-    #[inline]
-    pub fn node(self, next: N) -> NodeId {
-        debug_assert!(next.slot() < N::COUNT);
-        self.nodes[next.slot()]
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +44,20 @@ impl NodeNextFrames {
     ) -> CoreResult<()> {
         let frame_index = self.frame_for(runtime, node)?;
         runtime.get_frame_mut(frame_index)?.push_index(index)
+    }
+
+    #[inline]
+    pub fn enqueue_optional<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+        node: Option<NodeId>,
+    ) -> CoreResult<()> {
+        let Some(node) = node else {
+            runtime.free_index(index);
+            return Ok(());
+        };
+        self.enqueue(runtime, node, index)
     }
 
     #[inline]
