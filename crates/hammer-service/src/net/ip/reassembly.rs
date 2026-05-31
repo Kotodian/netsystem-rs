@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,6 +40,7 @@ pub struct IpReassemblyNode {
     max_reassemblies: usize,
     max_fragments_per_reassembly: usize,
     contexts: HashMap<IpFragmentKey, ReassemblyContext>,
+    failed_keys: Vec<IpFragmentKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +83,7 @@ impl IpReassemblyNode {
             max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
             max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
             contexts: HashMap::new(),
+            failed_keys: Vec::new(),
         }
     }
 
@@ -136,7 +137,6 @@ impl IpReassemblyNode {
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         next_frames: &mut NodeNextFrames,
-        failed_keys: &mut HashSet<IpFragmentKey>,
         index: BufferIndex,
         now: Instant,
     ) -> CoreResult<()> {
@@ -155,7 +155,7 @@ impl IpReassemblyNode {
         drop(buffer);
 
         let key = fragment.key;
-        if failed_keys.contains(&key) {
+        if self.failed_keys.contains(&key) {
             next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
             return Ok(());
         }
@@ -221,7 +221,9 @@ impl IpReassemblyNode {
                 }
             }
             next_frames.enqueue(runtime, drop_node, failed_index)?;
-            failed_keys.insert(key);
+            if !self.failed_keys.contains(&key) {
+                self.failed_keys.push(key);
+            }
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
@@ -327,9 +329,9 @@ impl<G> Node<G> for IpReassemblyNode {
     ) -> CoreResult<NodeResult> {
         let now = Instant::now();
         let mut next_frames = NodeNextFrames::default();
-        let mut failed_keys = HashSet::new();
+        self.failed_keys.clear();
         for_each_buffer_frame_index!(runtime, frame, |index| {
-            self.process_index(runtime, &mut next_frames, &mut failed_keys, index, now)?;
+            self.process_index(runtime, &mut next_frames, index, now)?;
             Ok(())
         })?;
         frame.clear();
