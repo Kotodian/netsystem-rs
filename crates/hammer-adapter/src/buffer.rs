@@ -445,9 +445,19 @@ struct BufferPoolInner {
 }
 
 #[derive(Debug, Clone)]
-pub struct BufferPool {
+pub struct BufferPoolArena {
     inner: Rc<RefCell<BufferPoolInner>>,
-    handoff: Option<DataPlaneHandoffWorker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferThreadCache {
+    free: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferPool {
+    arena: BufferPoolArena,
+    thread_cache: Rc<RefCell<BufferThreadCache>>,
 }
 
 #[derive(Debug)]
@@ -606,8 +616,23 @@ impl DataPlaneBuffers {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
+        Self::with_buffer_arena_and_frame_capacity(
+            BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+        )
+    }
+
+    #[inline]
+    pub fn with_buffer_arena_and_frame_capacity(
+        buffer_arena: BufferPoolArena,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
         Self {
-            buffers: BufferPool::with_capacity(buffer_slot_capacity, buffer_slots),
+            buffers: BufferPool::with_arena(buffer_arena),
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
             instruction_set,
         }
@@ -615,7 +640,8 @@ impl DataPlaneBuffers {
 
     #[inline]
     fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
-        self.buffers = self.buffers.with_handoff(handoff);
+        self.buffers =
+            BufferPool::with_arena(handoff.set_or_get_buffer_arena(self.buffers.arena()));
         self
     }
 
@@ -642,6 +668,11 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn in_use_buffers(&self) -> usize {
         self.buffers.in_use()
+    }
+
+    #[inline]
+    pub fn cached_free_buffers(&self) -> usize {
+        self.buffers.cached_free_len()
     }
 
     #[inline]
@@ -974,10 +1005,24 @@ impl<N> DataPlaneRuntime<N> {
         frame_slots: usize,
         instruction_set: DataPlaneInstructionSet,
     ) -> Self {
+        Self::with_buffer_arena_and_frame_capacity(
+            BufferPoolArena::with_capacity(buffer_slot_capacity, buffer_slots),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+        )
+    }
+
+    #[inline]
+    pub fn with_buffer_arena_and_frame_capacity(
+        buffer_arena: BufferPoolArena,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
         Self {
-            buffers: DataPlaneBuffers::with_capacities_and_instruction_set(
-                buffer_slot_capacity,
-                buffer_slots,
+            buffers: DataPlaneBuffers::with_buffer_arena_and_frame_capacity(
+                buffer_arena,
                 frame_capacity,
                 frame_slots,
                 instruction_set,
@@ -998,6 +1043,24 @@ impl<N> DataPlaneRuntime<N> {
         runtime.buffers = runtime.buffers.with_handoff(handoff.clone());
         runtime.handoff = Some(handoff);
         runtime
+    }
+
+    #[inline]
+    pub fn with_handoff_capacities(
+        worker: DataWorkerId,
+        handoff: DataPlaneHandoffWorker,
+        frame_capacity: usize,
+        frame_slots: usize,
+        instruction_set: DataPlaneInstructionSet,
+    ) -> Self {
+        debug_assert_eq!(worker, handoff.worker());
+        let runtime = Self::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            frame_capacity,
+            frame_slots,
+            instruction_set,
+        );
+        Self::with_handoff(runtime, worker, handoff)
     }
 
     #[inline]
@@ -1148,7 +1211,7 @@ impl<N> DataPlaneRuntime<N> {
     }
 }
 
-impl BufferPool {
+impl BufferPoolArena {
     #[inline]
     pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
         let free = (0..slots)
@@ -1170,7 +1233,6 @@ impl BufferPool {
                 free,
                 in_use: 0,
             })),
-            handoff: None,
         }
     }
 
@@ -1178,17 +1240,52 @@ impl BufferPool {
     pub fn pool_id(&self) -> u64 {
         self.inner.borrow().pool_id
     }
+}
+
+impl BufferThreadCache {
+    #[inline]
+    fn new() -> Self {
+        Self { free: Vec::new() }
+    }
 
     #[inline]
-    fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
-        handoff.register_buffer_pool(self.clone());
-        self.handoff = Some(handoff);
-        self
+    pub fn cached_free_len(&self) -> usize {
+        self.free.len()
+    }
+}
+
+impl BufferPool {
+    #[inline]
+    pub fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
+        Self::with_arena(BufferPoolArena::with_capacity(slot_capacity, slots))
+    }
+
+    #[inline]
+    pub fn with_arena(arena: BufferPoolArena) -> Self {
+        Self {
+            arena,
+            thread_cache: Rc::new(RefCell::new(BufferThreadCache::new())),
+        }
+    }
+
+    #[inline]
+    pub fn arena(&self) -> BufferPoolArena {
+        self.arena.clone()
+    }
+
+    #[inline]
+    pub fn pool_id(&self) -> u64 {
+        self.arena.pool_id()
+    }
+
+    #[inline]
+    pub fn cached_free_len(&self) -> usize {
+        self.thread_cache.borrow().cached_free_len()
     }
 
     #[inline]
     pub fn in_use(&self) -> usize {
-        self.inner.borrow().in_use
+        self.arena.inner.borrow().in_use
     }
 
     #[inline]
@@ -1202,69 +1299,41 @@ impl BufferPool {
         metadata: RouteMetadata,
         bytes: &[u8],
     ) -> CoreResult<BufferIndex> {
-        self.inner.borrow_mut().alloc_chain(metadata, bytes)
+        let mut cache = self.thread_cache.borrow_mut();
+        let mut arena = self.arena.inner.borrow_mut();
+        arena.alloc_chain(&mut cache, metadata, bytes)
     }
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
-        let pool_id = self.inner.borrow().pool_id;
-        if index.pool_id == pool_id {
-            self.inner.borrow_mut().free_chain(index);
-            return;
-        }
-        if let Some(pool) = self
-            .handoff
-            .as_ref()
-            .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            pool.free_index(index);
-        }
+        let mut cache = self.thread_cache.borrow_mut();
+        self.arena.inner.borrow_mut().free_chain(&mut cache, index);
     }
 
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
-        let pool_id = self.inner.borrow().pool_id;
-        if index.pool_id == pool_id {
-            self.inner.borrow().prefetch_read(index);
-            return;
-        }
-        if let Some(pool) = self
-            .handoff
-            .as_ref()
-            .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            pool.prefetch_read(index);
-        }
+        self.arena.inner.borrow().prefetch_read(index);
     }
 
     #[inline]
     pub fn free_frame(&self, frame: &mut BufferFrame) {
-        let mut pool = self.inner.borrow_mut();
+        let mut cache = self.thread_cache.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         for index in frame.drain_indices() {
-            pool.free_chain(index);
+            pool.free_chain(&mut cache, index);
         }
     }
 
     #[inline]
     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
-        if index.pool_id != self.inner.borrow().pool_id {
-            return Err(CoreError::internal(
-                "foreign buffer index cannot be borrowed directly",
-            ));
-        }
-        let guard = self.inner.borrow();
+        let guard = self.arena.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
     }
 
     #[inline]
     pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
-        if index.pool_id != self.inner.borrow().pool_id {
-            return Err(CoreError::internal(
-                "foreign buffer index cannot be borrowed directly",
-            ));
-        }
-        let mut guard = self.inner.borrow_mut();
+        let mut guard = self.arena.inner.borrow_mut();
         guard.buffer_mut(index)?;
         Ok(BufferRefMut { guard, index })
     }
@@ -1275,15 +1344,7 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&Buffer) -> R,
     ) -> CoreResult<R> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.with_buffer(index, f);
-        }
-        let pool = self.inner.borrow();
+        let pool = self.arena.inner.borrow();
         let buffer = pool.buffer(index)?;
         Ok(f(buffer))
     }
@@ -1294,15 +1355,7 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&mut Buffer) -> R,
     ) -> CoreResult<R> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.with_buffer_mut(index, f);
-        }
-        let mut pool = self.inner.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         Ok(f(buffer))
     }
@@ -1324,28 +1377,17 @@ impl BufferPool {
 
     #[inline]
     pub fn current_ptr(&self, index: BufferIndex) -> CoreResult<*const u8> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.current_ptr(index);
-        }
-        Ok(self.inner.borrow().buffer(index)?.current_ptr())
+        Ok(self.arena.inner.borrow().buffer(index)?.current_ptr())
     }
 
     #[inline]
     pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.current_mut_ptr(index);
-        }
-        Ok(self.inner.borrow_mut().buffer_mut(index)?.current_mut_ptr())
+        Ok(self
+            .arena
+            .inner
+            .borrow_mut()
+            .buffer_mut(index)?
+            .current_mut_ptr())
     }
 
     #[inline]
@@ -1359,15 +1401,8 @@ impl BufferPool {
         index: BufferIndex,
         worker: DataWorkerId,
     ) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.mark_handoff_source_worker(index, worker);
-        }
-        self.inner
+        self.arena
+            .inner
             .borrow_mut()
             .buffer_mut(index)?
             .set_handoff_source_worker(worker);
@@ -1381,15 +1416,7 @@ impl BufferPool {
 
     #[inline]
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.metadata(index);
-        }
-        Ok(self.inner.borrow().buffer(index)?.metadata().clone())
+        Ok(self.arena.inner.borrow().buffer(index)?.metadata().clone())
     }
 
     #[inline]
@@ -1398,15 +1425,7 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&RouteMetadata) -> R,
     ) -> CoreResult<R> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.with_metadata(index, f);
-        }
-        let pool = self.inner.borrow();
+        let pool = self.arena.inner.borrow();
         let metadata = pool.buffer(index)?.metadata();
         Ok(f(metadata))
     }
@@ -1417,30 +1436,14 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&mut RouteMetadata) -> R,
     ) -> CoreResult<R> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.with_metadata_mut(index, f);
-        }
-        let mut pool = self.inner.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         let metadata = pool.buffer_mut(index)?.metadata_mut();
         Ok(f(metadata))
     }
 
     #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.advance(index, len);
-        }
-        let mut pool = self.inner.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if len > buffer.current_len {
             return Err(CoreError::internal("buffer advance exceeds current length"));
@@ -1452,15 +1455,7 @@ impl BufferPool {
 
     #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.truncate_current(index, len);
-        }
-        let mut pool = self.inner.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if len > buffer.current_len {
             return Err(CoreError::internal(
@@ -1473,15 +1468,7 @@ impl BufferPool {
 
     #[inline]
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.prepend(index, bytes);
-        }
-        let mut pool = self.inner.borrow_mut();
+        let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if bytes.len() > buffer.current_data {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
@@ -1496,54 +1483,33 @@ impl BufferPool {
 
     #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.append(index, bytes);
-        }
-        self.inner.borrow_mut().append_chain(index, bytes)
+        let mut cache = self.thread_cache.borrow_mut();
+        self.arena
+            .inner
+            .borrow_mut()
+            .append_chain(&mut cache, index, bytes)
     }
 
     #[inline]
     pub fn detach_next(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.detach_next(index);
-        }
-        self.inner.borrow_mut().detach_next(index)
+        self.arena.inner.borrow_mut().detach_next(index)
     }
 
     #[inline]
     pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        if head.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(head.pool_id))
-        {
-            return pool.append_existing_chain(head, tail);
-        }
-        self.inner.borrow_mut().append_existing_chain(head, tail)
+        self.arena
+            .inner
+            .borrow_mut()
+            .append_existing_chain(head, tail)
     }
 
     #[inline]
     pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.truncate_chain(index, len);
-        }
-        self.inner.borrow_mut().truncate_chain(index, len)
+        let mut cache = self.thread_cache.borrow_mut();
+        self.arena
+            .inner
+            .borrow_mut()
+            .truncate_chain(&mut cache, index, len)
     }
 
     #[inline]
@@ -1553,30 +1519,15 @@ impl BufferPool {
         offset: usize,
         len: usize,
     ) -> CoreResult<()> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.remove_current_range(index, offset, len);
-        }
-        self.inner
+        self.arena
+            .inner
             .borrow_mut()
             .remove_current_range(index, offset, len)
     }
 
     #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.current(index);
-        }
-        Ok(self.inner.borrow().buffer(index)?.current().to_vec())
+        Ok(self.arena.inner.borrow().buffer(index)?.current().to_vec())
     }
 
     #[inline]
@@ -1586,28 +1537,18 @@ impl BufferPool {
 
     #[inline]
     pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.is_chained(index);
-        }
-        Ok(self.inner.borrow().buffer(index)?.next_buffer().is_some())
+        Ok(self
+            .arena
+            .inner
+            .borrow()
+            .buffer(index)?
+            .next_buffer()
+            .is_some())
     }
 
     #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.copy_packet(index);
-        }
-        let inner = self.inner.borrow();
+        let inner = self.arena.inner.borrow();
         let buffer = inner.buffer(index)?;
         if buffer.next_buffer().is_none() {
             return Ok(buffer.current().to_vec());
@@ -1617,15 +1558,7 @@ impl BufferPool {
 
     #[inline]
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        if index.pool_id != self.inner.borrow().pool_id
-            && let Some(pool) = self
-                .handoff
-                .as_ref()
-                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
-        {
-            return pool.copy_current_chain(index);
-        }
-        self.inner.borrow().copy_current_chain(index)
+        self.arena.inner.borrow().copy_current_chain(index)
     }
 }
 
@@ -1916,23 +1849,28 @@ impl DerefMut for PooledBufferFrame {
 
 impl BufferPoolInner {
     #[inline]
-    fn alloc_chain(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
+    fn alloc_chain(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        metadata: RouteMetadata,
+        bytes: &[u8],
+    ) -> CoreResult<BufferIndex> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
         if bytes.len() <= self.slot_capacity {
-            return self.alloc_slot(metadata, bytes);
+            return self.alloc_slot(cache, metadata, bytes);
         }
 
         let first_len = self.slot_capacity;
-        let first = self.alloc_slot(metadata, &bytes[..first_len])?;
+        let first = self.alloc_slot(cache, metadata, &bytes[..first_len])?;
         let mut tail = first;
         let mut offset = first_len;
         let mut total_tail_len = 0usize;
 
         while offset < bytes.len() {
             let end = (offset + self.slot_capacity).min(bytes.len());
-            let next = self.alloc_slot(RouteMetadata::default(), &bytes[offset..end])?;
+            let next = self.alloc_slot(cache, RouteMetadata::default(), &bytes[offset..end])?;
             {
                 let tail_buffer = self.buffer_mut(tail)?;
                 tail_buffer.next_buffer = Some(next);
@@ -1947,7 +1885,12 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn alloc_slot(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<BufferIndex> {
+    fn alloc_slot(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        metadata: RouteMetadata,
+        bytes: &[u8],
+    ) -> CoreResult<BufferIndex> {
         if bytes.len() > self.slot_capacity {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
@@ -1955,9 +1898,10 @@ impl BufferPoolInner {
                 self.slot_capacity
             )));
         }
-        let slot = self
+        let slot = cache
             .free
             .pop()
+            .or_else(|| self.free.pop())
             .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?;
         let entry = self
             .slots
@@ -2035,7 +1979,7 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn free_chain(&mut self, index: BufferIndex) {
+    fn free_chain(&mut self, cache: &mut BufferThreadCache, index: BufferIndex) {
         let mut next = Some(index);
         while let Some(index) = next {
             if index.pool_id != self.pool_id {
@@ -2052,7 +1996,7 @@ impl BufferPoolInner {
                 entry.allocated = false;
                 entry.buffer.reset_for_free();
                 self.in_use = self.in_use.saturating_sub(1);
-                self.free.push(index.slot);
+                cache.free.push(index.slot);
             } else {
                 next = None;
             }
@@ -2072,7 +2016,12 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn append_chain(&mut self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+    fn append_chain(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        index: BufferIndex,
+        bytes: &[u8],
+    ) -> CoreResult<()> {
         let mut tail = index;
         while let Some(next) = self.buffer(tail)?.next_buffer {
             tail = next;
@@ -2082,7 +2031,7 @@ impl BufferPoolInner {
         let mut remaining = &bytes[taken..];
         while !remaining.is_empty() {
             let take = remaining.len().min(self.slot_capacity);
-            let next = self.alloc_slot(RouteMetadata::default(), &remaining[..take])?;
+            let next = self.alloc_slot(cache, RouteMetadata::default(), &remaining[..take])?;
             {
                 let tail_buffer = self.buffer_mut(tail)?;
                 tail_buffer.next_buffer = Some(next);
@@ -2124,7 +2073,12 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn truncate_chain(&mut self, index: BufferIndex, len: usize) -> CoreResult<()> {
+    fn truncate_chain(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        index: BufferIndex,
+        len: usize,
+    ) -> CoreResult<()> {
         let mut remaining = len;
         let mut current = Some(index);
         while let Some(current_index) = current {
@@ -2144,7 +2098,7 @@ impl BufferPoolInner {
                 tail
             };
             if let Some(tail) = tail {
-                self.free_chain(tail);
+                self.free_chain(cache, tail);
             }
             return self.refresh_chain_lengths(index);
         }
@@ -2166,7 +2120,9 @@ impl BufferPoolInner {
             .checked_add(len)
             .ok_or_else(|| CoreError::internal("buffer remove range overflow"))?;
         if end > buffer.current_len {
-            return Err(CoreError::internal("buffer remove range exceeds current length"));
+            return Err(CoreError::internal(
+                "buffer remove range exceeds current length",
+            ));
         }
         let current_data = buffer.current_data;
         let current_end = current_data + buffer.current_len;
@@ -2868,6 +2824,14 @@ impl BufferRefMut<'_> {
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .current()
+    }
+
+    #[inline]
+    pub fn current_mut(&mut self) -> &mut [u8] {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_mut()
     }
 
     #[inline]

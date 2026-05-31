@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, DriverNode,
-    InternalNode, Node, NodeHandle, NodeId, NodeResult, RouteMetadata,
+    BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneRuntime,
+    DataWorkerId, DriverNode, InternalNode, Node, NodeHandle, NodeId, NodeResult, RouteMetadata,
 };
 use hammer_core::error::CoreResult;
 
@@ -402,14 +402,24 @@ fn node_runtime_counts_errors_per_runtime_node() {
 #[test]
 fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storage() {
     const SINK_HANDLE: NodeHandle = NodeHandle::new(1);
-    let handoff = DataPlaneHandoff::new(2, 8);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
     let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
-        DataPlaneRuntime::with_capacities(64, 4, 4, 4),
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
     let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
-        DataPlaneRuntime::with_capacities(64, 4, 4, 4),
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
     );

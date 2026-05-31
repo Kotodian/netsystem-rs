@@ -6,8 +6,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
-    BufferPool, DataPlaneInstructionSet, DataPlaneRuntime, FrameBatchWidth, NoopNode,
-    RouteMetadata, for_each_buffer_frame_index,
+    BufferPool, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
+    DataWorkerId, FrameBatchWidth, NoopNode, RouteMetadata, for_each_buffer_frame_index,
 };
 
 #[derive(Default)]
@@ -213,7 +213,10 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
         pool.copy_current_chain(head).expect("combined chain"),
         b"headtail-data"
     );
-    assert_eq!(pool.current_ptr(tail).expect("tail ptr after append") as usize, tail_ptr);
+    assert_eq!(
+        pool.current_ptr(tail).expect("tail ptr after append") as usize,
+        tail_ptr
+    );
 
     let detached = pool.detach_next(head).expect("detach next");
 
@@ -358,6 +361,89 @@ fn buffer_pool_rejects_index_from_another_runtime() {
 
     first_pool.free_index(first_index);
     second_pool.free_index(second_index);
+}
+
+#[test]
+fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
+    let arena = BufferPoolArena::with_capacity(8, 4);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 4, arena);
+    let first = DataPlaneRuntime::<NoopNode>::with_handoff_capacities(
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+        2,
+        2,
+        DataPlaneInstructionSet::Scalar,
+    );
+    let second = DataPlaneRuntime::<NoopNode>::with_handoff_capacities(
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+        2,
+        2,
+        DataPlaneInstructionSet::Scalar,
+    );
+
+    let first_buffer = first
+        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .expect("alloc first worker buffer");
+    let second_buffer = second
+        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .expect("alloc second worker buffer");
+
+    assert_eq!(first_buffer.pool_id(), second_buffer.pool_id());
+    assert_eq!(first.in_use_buffers(), 2);
+    assert_eq!(second.in_use_buffers(), 2);
+
+    first.free_index(first_buffer);
+    second.free_index(second_buffer);
+
+    assert_eq!(first.cached_free_buffers(), 1);
+    assert_eq!(second.cached_free_buffers(), 1);
+    assert_eq!(first.in_use_buffers(), 0);
+
+    let first_reused = first
+        .alloc_index_with_bytes(RouteMetadata::default(), b"uno")
+        .expect("first worker reuses its cache");
+    let second_reused = second
+        .alloc_index_with_bytes(RouteMetadata::default(), b"dos")
+        .expect("second worker reuses its cache");
+
+    assert_eq!(first_reused.slot(), first_buffer.slot());
+    assert_eq!(second_reused.slot(), second_buffer.slot());
+    assert_ne!(first_reused.generation(), first_buffer.generation());
+    assert_ne!(second_reused.generation(), second_buffer.generation());
+
+    first.free_index(first_reused);
+    second.free_index(second_reused);
+}
+
+#[test]
+fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
+    let handoff = DataPlaneHandoff::new(2, 4);
+    let first = DataPlaneRuntime::<NoopNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(8, 4, 2, 2),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second = DataPlaneRuntime::<NoopNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(8, 4, 2, 2),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+
+    let first_buffer = first
+        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .expect("alloc first worker buffer");
+    let second_buffer = second
+        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .expect("alloc second worker buffer");
+
+    assert_eq!(first_buffer.pool_id(), second_buffer.pool_id());
+    assert_eq!(first.in_use_buffers(), 2);
+    assert_eq!(second.in_use_buffers(), 2);
+
+    first.free_index(first_buffer);
+    second.free_index(second_buffer);
+    assert_eq!(first.in_use_buffers(), 0);
 }
 
 #[test]
