@@ -18,6 +18,8 @@ struct SinkNode {
     packets: Rc<RefCell<Vec<Vec<u8>>>>,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
     node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
+    buffer_indices: Rc<RefCell<Vec<hammer_adapter::BufferIndex>>>,
+    chained: Rc<RefCell<Vec<bool>>>,
 }
 
 impl Node<TestNode> for SinkNode {
@@ -28,6 +30,8 @@ impl Node<TestNode> for SinkNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         for index in frame.drain_pending() {
+            self.buffer_indices.borrow_mut().push(index);
+            self.chained.borrow_mut().push(runtime.is_chained(index)?);
             self.packets
                 .borrow_mut()
                 .push(runtime.copy_current_chain(index)?);
@@ -48,6 +52,8 @@ struct SinkCapture {
     packets: Rc<RefCell<Vec<Vec<u8>>>>,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
     node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
+    buffer_indices: Rc<RefCell<Vec<hammer_adapter::BufferIndex>>>,
+    chained: Rc<RefCell<Vec<bool>>>,
 }
 
 impl SinkCapture {
@@ -56,6 +62,8 @@ impl SinkCapture {
             packets: Rc::new(RefCell::new(Vec::new())),
             metadata: Rc::new(RefCell::new(Vec::new())),
             node_errors: Rc::new(RefCell::new(Vec::new())),
+            buffer_indices: Rc::new(RefCell::new(Vec::new())),
+            chained: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -64,6 +72,8 @@ impl SinkCapture {
             packets: Rc::clone(&self.packets),
             metadata: Rc::clone(&self.metadata),
             node_errors: Rc::clone(&self.node_errors),
+            buffer_indices: Rc::clone(&self.buffer_indices),
+            chained: Rc::clone(&self.chained),
         }
     }
 
@@ -414,10 +424,14 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
     let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let buffer_indices = Rc::new(RefCell::new(Vec::new()));
+    let chained = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata: Rc::clone(&metadata),
         node_errors,
+        buffer_indices: Rc::clone(&buffer_indices),
+        chained: Rc::clone(&chained),
     });
     let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -436,7 +450,7 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let fragments = ipv4_fragments(&original, 100, 16);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(&runtime, frame, &fragments[1]);
-    push_packet(&runtime, frame, &fragments[0]);
+    let first_fragment = push_packet(&runtime, frame, &fragments[0]);
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
@@ -455,6 +469,8 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
         metadata[0].destination,
         Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 0))
     );
+    assert_eq!(&*buffer_indices.borrow(), &[first_fragment]);
+    assert_eq!(&*chained.borrow(), &[true]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -469,6 +485,8 @@ fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
         packets: Rc::clone(&packets),
         metadata,
         node_errors,
+        buffer_indices: Rc::new(RefCell::new(Vec::new())),
+        chained: Rc::new(RefCell::new(Vec::new())),
     });
     let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -511,6 +529,8 @@ fn ipv4_reassembly_drops_context_on_partial_overlap() {
         packets: Rc::clone(&packets),
         metadata,
         node_errors,
+        buffer_indices: Rc::new(RefCell::new(Vec::new())),
+        chained: Rc::new(RefCell::new(Vec::new())),
     });
     let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -546,10 +566,14 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
     let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let buffer_indices = Rc::new(RefCell::new(Vec::new()));
+    let chained = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata: Rc::clone(&metadata),
         node_errors,
+        buffer_indices: Rc::clone(&buffer_indices),
+        chained: Rc::clone(&chained),
     });
     let reassembly = runtime
         .nodes()
@@ -567,7 +591,7 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let fragments = ipv6_fragments(&original, 0x0102_0304, 16);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(&runtime, frame, &fragments[1]);
-    push_packet(&runtime, frame, &fragments[0]);
+    let first_fragment = push_packet(&runtime, frame, &fragments[0]);
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
@@ -589,6 +613,8 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
             0
         ))
     );
+    assert_eq!(&*buffer_indices.borrow(), &[first_fragment]);
+    assert_eq!(&*chained.borrow(), &[true]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -603,6 +629,8 @@ fn reassembly_expire_frees_incomplete_fragments() {
         packets,
         metadata,
         node_errors,
+        buffer_indices: Rc::new(RefCell::new(Vec::new())),
+        chained: Rc::new(RefCell::new(Vec::new())),
     }));
     let mut reassembly = IpReassemblyNode::new(ip_reassembly_nexts(sink, sink))
         .with_timeout(Duration::from_millis(100));
@@ -661,6 +689,8 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
                 packets: Rc::clone(&packets),
                 metadata: Rc::clone(&metadata),
                 node_errors: Rc::clone(&node_errors),
+                buffer_indices: Rc::new(RefCell::new(Vec::new())),
+                chained: Rc::new(RefCell::new(Vec::new())),
             },
         )
         .expect("register first sink");
@@ -693,6 +723,8 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
                 packets: Rc::clone(&packets),
                 metadata: Rc::clone(&metadata),
                 node_errors: Rc::clone(&node_errors),
+                buffer_indices: Rc::new(RefCell::new(Vec::new())),
+                chained: Rc::new(RefCell::new(Vec::new())),
             },
         )
         .expect("register second sink");
@@ -779,7 +811,7 @@ fn push_packet(
     runtime: &DataPlaneRuntime<TestNode>,
     frame: hammer_adapter::FrameIndex,
     packet: &[u8],
-) {
+) -> hammer_adapter::BufferIndex {
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), packet)
         .expect("alloc packet");
@@ -788,6 +820,7 @@ fn push_packet(
         .expect("mutate frame")
         .push_index(index)
         .expect("push packet");
+    index
 }
 
 fn ip_input_nexts(

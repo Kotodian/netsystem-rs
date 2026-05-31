@@ -6,12 +6,13 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Network, Node,
-    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr,
+    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::net::ip::{
-    IpFragmentKey, IpVersion, ParsedIpFragment, parse_ip_fragment, parse_ip_packet,
+    IpFragmentKey, IpVersion, ParsedIpFragment, parse_ip_fragment_with_chain_len,
+    parse_ip_packet_with_chain_len,
 };
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
@@ -131,14 +132,19 @@ impl IpReassemblyNode {
         index: BufferIndex,
         now: Instant,
     ) -> CoreResult<()> {
-        let packet = runtime.copy_current_chain(index)?;
-        let fragment = match parse_ip_fragment(&packet) {
+        let buffer = runtime.get_buffer(index)?;
+        let fragment = match parse_ip_fragment_with_chain_len(
+            buffer.current(),
+            buffer.total_len_not_including_first(),
+        ) {
             Ok(fragment) => fragment,
             Err(_) => {
+                drop(buffer);
                 next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
                 return Ok(());
             }
         };
+        drop(buffer);
 
         let key = fragment.key;
         let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
@@ -308,17 +314,11 @@ impl<G> Node<G> for IpReassemblyNode {
     ) -> CoreResult<NodeResult> {
         let now = Instant::now();
         let mut next_frames = NodeNextFrames::default();
-        let indices = frame.pending_indices().to_vec();
-        frame.clear();
-        let mut cursor = indices.as_slice().chunks_exact(2);
-        for batch in cursor.by_ref() {
-            for index in batch.iter().copied() {
-                self.process_index(runtime, &mut next_frames, index, now)?;
-            }
-        }
-        for index in cursor.remainder().iter().copied() {
+        for_each_buffer_frame_index!(runtime, frame, |index| {
             self.process_index(runtime, &mut next_frames, index, now)?;
-        }
+            Ok(())
+        })?;
+        frame.clear();
         next_frames.schedule(runtime)?;
         Ok(NodeResult::drop())
     }
@@ -429,32 +429,22 @@ impl ReassemblyContext {
         runtime: &DataPlaneRuntime<G>,
         total_payload_len: usize,
     ) -> CoreResult<ReassemblyInsert> {
-        let packet = match self.version {
-            IpVersion::V4 => self.assemble_ipv4(runtime, total_payload_len)?,
-            IpVersion::V6 => self.assemble_ipv6(runtime, total_payload_len)?,
-        };
-        let metadata = runtime.metadata(self.fragments[0].index)?;
-        let complete = runtime.alloc_index_with_bytes(metadata, &packet)?;
-        for fragment in self.fragments.drain(..) {
-            runtime.free_index(fragment.index);
+        match self.version {
+            IpVersion::V4 => self.assemble_ipv4_chain(runtime, total_payload_len),
+            IpVersion::V6 => self.assemble_ipv6_chain(runtime, total_payload_len),
         }
-        Ok(ReassemblyInsert::Reassembled(complete))
     }
 
     #[inline]
-    fn assemble_ipv4<G>(
-        &self,
+    fn assemble_ipv4_chain<G>(
+        &mut self,
         runtime: &DataPlaneRuntime<G>,
         total_payload_len: usize,
-    ) -> CoreResult<Vec<u8>> {
-        let first = self
-            .fragments
-            .iter()
-            .find(|fragment| fragment.start == 0)
-            .ok_or_else(|| CoreError::internal("missing first IPv4 fragment"))?;
-        let first_packet = runtime.copy_current_chain(first.index)?;
+    ) -> CoreResult<ReassemblyInsert> {
+        let first_offset = self.first_fragment_offset()?;
+        let first = self.fragments[first_offset];
         let header_len = first.header_len;
-        if header_len < IPV4_HEADER_MIN_LEN || first_packet.len() < header_len {
+        if header_len < IPV4_HEADER_MIN_LEN || runtime.current_len(first.index)? < header_len {
             return Err(CoreError::internal("invalid IPv4 fragment header"));
         }
         let total_len = header_len
@@ -464,57 +454,92 @@ impl ReassemblyContext {
             return Err(CoreError::internal("IPv4 reassembled packet too large"));
         }
 
-        let mut packet = Vec::with_capacity(total_len);
-        packet.extend_from_slice(&first_packet[..header_len]);
-        for fragment in &self.fragments {
-            let fragment_packet = runtime.copy_current_chain(fragment.index)?;
-            let start = fragment.header_len;
-            let end = start + (fragment.end - fragment.start);
-            packet.extend_from_slice(&fragment_packet[start..end]);
+        let complete = first.index;
+        let mut fragments = std::mem::take(&mut self.fragments);
+        fragments.sort_by_key(|fragment| fragment.start);
+        for fragment in fragments.iter().copied() {
+            if fragment.index == complete {
+                runtime.truncate_chain(
+                    complete,
+                    fragment.header_len + (fragment.end - fragment.start),
+                )?;
+            } else {
+                trim_fragment_payload_chain(runtime, fragment)?;
+                runtime.append_existing_chain(complete, fragment.index)?;
+            }
         }
-        packet[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(total_len as u16).to_be_bytes());
-        packet[IPV4_FLAGS_FRAGMENT_OFFSET..IPV4_FLAGS_FRAGMENT_OFFSET + 2]
-            .copy_from_slice(&0u16.to_be_bytes());
-        update_ipv4_header_checksum(&mut packet, header_len);
-        Ok(packet)
+        runtime.truncate_chain(complete, total_len)?;
+        {
+            let mut buffer = runtime.get_buffer_mut(complete)?;
+            let header = buffer.current();
+            if header.len() < header_len {
+                return Err(CoreError::internal("invalid IPv4 reassembled header"));
+            }
+            let header = &mut buffer.current_mut()[..header_len];
+            header[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
+                .copy_from_slice(&(total_len as u16).to_be_bytes());
+            header[IPV4_FLAGS_FRAGMENT_OFFSET..IPV4_FLAGS_FRAGMENT_OFFSET + 2]
+                .copy_from_slice(&0u16.to_be_bytes());
+            update_ipv4_header_checksum(header, header_len);
+        }
+        Ok(ReassemblyInsert::Reassembled(complete))
     }
 
     #[inline]
-    fn assemble_ipv6<G>(
-        &self,
+    fn assemble_ipv6_chain<G>(
+        &mut self,
         runtime: &DataPlaneRuntime<G>,
         total_payload_len: usize,
-    ) -> CoreResult<Vec<u8>> {
-        let first = self
-            .fragments
-            .iter()
-            .find(|fragment| fragment.start == 0)
-            .ok_or_else(|| CoreError::internal("missing first IPv6 fragment"))?;
-        let first_packet = runtime.copy_current_chain(first.index)?;
-        if first_packet.len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
+    ) -> CoreResult<ReassemblyInsert> {
+        let first_offset = self.first_fragment_offset()?;
+        let first = self.fragments[first_offset];
+        if runtime.current_len(first.index)? < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
             return Err(CoreError::internal("invalid IPv6 fragment header"));
         }
         let payload_len = total_payload_len;
         if payload_len > u16::MAX as usize {
             return Err(CoreError::internal("IPv6 reassembled packet too large"));
         }
-        let fragment_next_header = first_packet[IPV6_HEADER_LEN];
+        let complete = first.index;
+        let fragment_next_header = {
+            let buffer = runtime.get_buffer(complete)?;
+            buffer.current()[IPV6_HEADER_LEN]
+        };
+        let mut fragments = std::mem::take(&mut self.fragments);
+        fragments.sort_by_key(|fragment| fragment.start);
+        for fragment in fragments.iter().copied() {
+            if fragment.index == complete {
+                runtime.remove_current_range(
+                    complete,
+                    IPV6_HEADER_LEN,
+                    IPV6_FRAGMENT_HEADER_LEN,
+                )?;
+                let mut buffer = runtime.get_buffer_mut(complete)?;
+                let header = &mut buffer.current_mut()[..IPV6_HEADER_LEN];
+                header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
+                    .copy_from_slice(&(payload_len as u16).to_be_bytes());
+                header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
+                drop(buffer);
+                runtime
+                    .truncate_chain(complete, IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
+            } else {
+                trim_fragment_payload_chain(runtime, fragment)?;
+                runtime.append_existing_chain(complete, fragment.index)?;
+            }
+        }
         let total_len = IPV6_HEADER_LEN
             .checked_add(payload_len)
             .ok_or_else(|| CoreError::internal("IPv6 reassembled length overflow"))?;
-        let mut packet = Vec::with_capacity(total_len);
-        packet.extend_from_slice(&first_packet[..IPV6_HEADER_LEN]);
-        packet[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        packet[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
-        for fragment in &self.fragments {
-            let fragment_packet = runtime.copy_current_chain(fragment.index)?;
-            let start = fragment.header_len;
-            let end = start + (fragment.end - fragment.start);
-            packet.extend_from_slice(&fragment_packet[start..end]);
-        }
-        Ok(packet)
+        runtime.truncate_chain(complete, total_len)?;
+        Ok(ReassemblyInsert::Reassembled(complete))
+    }
+
+    #[inline]
+    fn first_fragment_offset(&self) -> CoreResult<usize> {
+        self.fragments
+            .iter()
+            .position(|fragment| fragment.start == 0)
+            .ok_or_else(|| CoreError::internal("missing first IP fragment"))
     }
 
     #[inline]
@@ -525,6 +550,7 @@ impl ReassemblyContext {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct ReassemblyFragment {
     index: BufferIndex,
     start: usize,
@@ -541,8 +567,10 @@ enum ReassemblyInsert {
 
 #[inline(always)]
 fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> CoreResult<()> {
-    let packet = runtime.copy_current_chain(index)?;
-    let parsed = parse_ip_packet(&packet)?;
+    let buffer = runtime.get_buffer(index)?;
+    let parsed =
+        parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())?;
+    drop(buffer);
     let network = match parsed.protocol {
         crate::net::ip::IpProtocol::Tcp => Network::Tcp,
         crate::net::ip::IpProtocol::Udp => Network::Udp,
@@ -559,6 +587,16 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));
     metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
     Ok(())
+}
+
+#[inline(always)]
+fn trim_fragment_payload_chain<G>(
+    runtime: &DataPlaneRuntime<G>,
+    fragment: ReassemblyFragment,
+) -> CoreResult<()> {
+    let payload_len = fragment.end - fragment.start;
+    runtime.advance(fragment.index, fragment.header_len)?;
+    runtime.truncate_chain(fragment.index, payload_len)
 }
 
 #[inline(always)]
