@@ -154,12 +154,21 @@ pub fn parse_ip_packet_with_chain_len(
 
 #[inline(always)]
 pub fn parse_ip_fragment(packet: &[u8]) -> CoreResult<ParsedIpFragment> {
+    parse_ip_fragment_with_chain_len(packet, 0)
+}
+
+#[inline(always)]
+pub fn parse_ip_fragment_with_chain_len(
+    packet: &[u8],
+    tail_len: usize,
+) -> CoreResult<ParsedIpFragment> {
     let first = *packet
         .first()
         .ok_or_else(|| CoreError::internal("empty IP packet"))?;
+    let chain_len = packet.len().saturating_add(tail_len);
     let parsed = match first >> 4 {
-        4 => parse_ipv4_fragment(packet),
-        6 => parse_ipv6_fragment(packet),
+        4 => parse_ipv4_fragment(packet, chain_len),
+        6 => parse_ipv6_fragment(packet, chain_len),
         other => {
             return Err(CoreError::internal(format!(
                 "unsupported IP version: {other}"
@@ -256,8 +265,7 @@ fn parse_ipv4_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeade
 }
 
 #[inline(always)]
-fn parse_ipv4_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
-    let packet_len = input.len();
+fn parse_ipv4_fragment(input: &[u8], packet_len: usize) -> ParseResult<'_, ParsedIpFragment> {
     let (input, version_ihl) = be_u8(input)?;
     if version_ihl >> 4 != 4 {
         return Err(nom::Err::Failure(nom::error::Error::new(
@@ -291,7 +299,6 @@ fn parse_ipv4_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     let options_len = ihl - IPV4_HEADER_MIN_LEN;
     let (input, _) = take(options_len).parse(input)?;
     let payload_len = total_len - ihl;
-    let (_, _) = take(payload_len).parse(input)?;
     let payload_offset = ((fragment & IPV4_FRAGMENT_OFFSET_MASK) as usize) * 8;
     let more_fragments = fragment & IPV4_FLAG_MORE_FRAGMENTS != 0;
     if payload_offset == 0 && !more_fragments {
@@ -400,13 +407,13 @@ fn parse_ipv6_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeade
                 transport_header_offset: transport_offset,
                 transport_header_len: 0,
             },
-            required_len: IPV6_HEADER_LEN,
+            required_len: total_len,
         },
     ))
 }
 
 #[inline(always)]
-fn parse_ipv6_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
+fn parse_ipv6_fragment(input: &[u8], packet_len: usize) -> ParseResult<'_, ParsedIpFragment> {
     let (input, version_traffic) = be_u8(input)?;
     if version_traffic >> 4 != 6 {
         return Err(nom::Err::Failure(nom::error::Error::new(
@@ -417,6 +424,15 @@ fn parse_ipv6_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     let (input, _) = take(3usize).parse(input)?;
     let (input, payload_len) = be_u16(input)?;
     let payload_len = payload_len as usize;
+    let total_len = IPV6_HEADER_LEN.checked_add(payload_len).ok_or_else(|| {
+        nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
+    })?;
+    if total_len > packet_len {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     if payload_len < IPV6_FRAGMENT_HEADER_LEN {
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
@@ -438,7 +454,6 @@ fn parse_ipv6_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     let (input, offset_more) = be_u16(input)?;
     let (input, identification) = be_u32(input)?;
     let payload_len = payload_len - IPV6_FRAGMENT_HEADER_LEN;
-    let (_, _) = take(payload_len).parse(input)?;
     let payload_offset = ((offset_more >> 3) as usize) * 8;
     let more_fragments = offset_more & 1 != 0;
     if payload_offset == 0 && !more_fragments {
