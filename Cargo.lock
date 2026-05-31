@@ -1269,6 +1269,7 @@ dependencies = [
  "indoc",
  "ipnet",
  "metrics",
+ "nom 8.0.0",
  "rand 0.8.6",
  "serde",
  "serde_path_to_error",

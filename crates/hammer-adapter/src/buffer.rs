@@ -370,10 +370,20 @@ impl Buffer {
     }
 
     #[inline]
+    pub fn current_ptr(&self) -> *const u8 {
+        self.current().as_ptr()
+    }
+
+    #[inline]
     pub fn current_mut(&mut self) -> &mut [u8] {
         let start = self.current_data;
         let end = start + self.current_len;
         &mut self.storage.as_mut_slice()[start..end]
+    }
+
+    #[inline]
+    pub fn current_mut_ptr(&mut self) -> *mut u8 {
+        self.current_mut().as_mut_ptr()
     }
 
     #[inline]
@@ -785,6 +795,16 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn current_data(&self, index: BufferIndex) -> CoreResult<usize> {
+        self.buffers.current_data(index)
+    }
+
+    #[inline]
+    pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
+        self.buffers.current_len(index)
+    }
+
+    #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.truncate_current(index, len)
     }
@@ -1082,6 +1102,16 @@ impl BufferPool {
     #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
         self.with_buffer(index, Buffer::packet_cursor)
+    }
+
+    #[inline]
+    pub fn current_data(&self, index: BufferIndex) -> CoreResult<usize> {
+        self.with_buffer(index, Buffer::current_data)
+    }
+
+    #[inline]
+    pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
+        self.with_buffer(index, Buffer::current_len)
     }
 
     #[inline]
@@ -2243,6 +2273,30 @@ impl BufferRef<'_> {
     }
 
     #[inline]
+    pub fn current_ptr(&self) -> *const u8 {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_ptr()
+    }
+
+    #[inline]
+    pub fn current_data(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_data()
+    }
+
+    #[inline]
+    pub fn current_len(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_len()
+    }
+
+    #[inline]
     pub fn total_len_not_including_first(&self) -> usize {
         self.guard
             .buffer(self.index)
@@ -2320,6 +2374,38 @@ impl BufferRefMut<'_> {
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .current()
+    }
+
+    #[inline]
+    pub fn current_ptr(&self) -> *const u8 {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_ptr()
+    }
+
+    #[inline]
+    pub fn current_mut_ptr(&mut self) -> *mut u8 {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_mut_ptr()
+    }
+
+    #[inline]
+    pub fn current_data(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_data()
+    }
+
+    #[inline]
+    pub fn current_len(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_len()
     }
 
     #[inline]

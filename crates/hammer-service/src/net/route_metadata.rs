@@ -34,7 +34,7 @@ pub fn packet_route_metadata(interface_id: &str, packet: &[u8]) -> CoreResult<Ro
 fn parse_packet(packet: &[u8]) -> CoreResult<ParsedPacket> {
     let parsed = parse_ip_packet(packet)?;
     let transport = packet
-        .get(parsed.cursor.transport_header_offset()..parsed.cursor.packet_len())
+        .get(parsed.transport_header_offset..parsed.packet_len)
         .ok_or_else(|| {
             hammer_core::error::CoreError::internal("invalid transport packet cursor")
         })?;

@@ -104,6 +104,35 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 }
 
 #[test]
+fn buffer_exposes_vpp_style_current_pointer_and_advance() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(128, 1, 1, 1);
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"network-transport")
+        .expect("alloc buffer");
+    {
+        let buffer_ref = runtime.get_buffer(buffer).expect("buffer ref");
+        assert_eq!(buffer_ref.current_data(), 0);
+        assert_eq!(buffer_ref.current_len(), b"network-transport".len());
+        assert_eq!(unsafe { *buffer_ref.current_ptr() }, b'n');
+    }
+
+    runtime.advance(buffer, b"network-".len()).expect("advance");
+
+    {
+        let mut buffer_ref = runtime.get_buffer_mut(buffer).expect("buffer ref mut");
+        assert_eq!(buffer_ref.current_data(), b"network-".len());
+        assert_eq!(buffer_ref.current_len(), b"transport".len());
+        assert_eq!(unsafe { *buffer_ref.current_ptr() }, b't');
+        unsafe {
+            *buffer_ref.current_mut_ptr() = b'T';
+        }
+    }
+
+    assert_eq!(runtime.copy_current(buffer).expect("current"), b"Transport");
+    runtime.free_index(buffer);
+}
+
+#[test]
 fn buffer_packet_cursor_lives_in_buffer_control_area() {
     let pool = BufferPool::with_capacity(128, 1);
     let buffer = pool

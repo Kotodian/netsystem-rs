@@ -1,7 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use hammer_adapter::BufferPacketCursor;
-use hammer_core::error::{CoreError, CoreResult};
+use crate::error::{CoreError, CoreResult};
 use nom::IResult;
 use nom::Parser;
 use nom::bytes::complete::take;
@@ -83,7 +82,11 @@ pub struct ParsedIpPacket {
     pub input_error: IpInputError,
     pub source: IpAddr,
     pub destination: IpAddr,
-    pub cursor: BufferPacketCursor,
+    pub packet_len: usize,
+    pub network_header_offset: usize,
+    pub network_header_len: usize,
+    pub transport_header_offset: usize,
+    pub transport_header_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -241,10 +244,11 @@ fn parse_ipv4_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeade
                 input_error,
                 source: IpAddr::V4(source),
                 destination: IpAddr::V4(destination),
-                cursor: BufferPacketCursor::new()
-                    .with_packet_len(total_len)
-                    .with_network_header(0, ihl)
-                    .with_transport_header(ihl, 0),
+                packet_len: total_len,
+                network_header_offset: 0,
+                network_header_len: ihl,
+                transport_header_offset: ihl,
+                transport_header_len: 0,
             },
             required_len: total_len,
         },
@@ -390,10 +394,11 @@ fn parse_ipv6_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeade
                 input_error,
                 source: IpAddr::V6(source),
                 destination: IpAddr::V6(destination),
-                cursor: BufferPacketCursor::new()
-                    .with_packet_len(total_len)
-                    .with_network_header(0, IPV6_HEADER_LEN)
-                    .with_transport_header(transport_offset, 0),
+                packet_len: total_len,
+                network_header_offset: 0,
+                network_header_len: IPV6_HEADER_LEN,
+                transport_header_offset: transport_offset,
+                transport_header_len: 0,
             },
             required_len: IPV6_HEADER_LEN,
         },

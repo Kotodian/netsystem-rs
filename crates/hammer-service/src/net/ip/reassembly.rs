@@ -399,7 +399,6 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
         }
     };
     let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.set_packet_cursor(parsed.cursor);
     let metadata = buffer.metadata_mut();
     metadata.network = network;
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));

@@ -65,7 +65,6 @@ fn next_node_for_index<G>(
             return Ok(next[IpInputNext::Drop.slot()]);
         }
     };
-    buffer.set_packet_cursor(parsed.cursor);
     if parsed.input_error == IpInputError::None {
         buffer.clear_node_error();
     } else {

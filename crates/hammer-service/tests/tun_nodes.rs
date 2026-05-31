@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node, NodeId,
-    NodeResult, RouteDecision, RouteMetadata, RouteTarget, Router, SocksAddr,
+    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteDecision,
+    RouteMetadata, RouteTarget, Router, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::lifecycle::{Lifecycle, StartStage};
@@ -71,7 +71,6 @@ impl Router for StaticRouter {
 struct CaptureNode {
     next: NodeId,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
-    cursors: Rc<RefCell<Vec<BufferPacketCursor>>>,
 }
 
 impl Node<TestNode> for CaptureNode {
@@ -83,9 +82,6 @@ impl Node<TestNode> for CaptureNode {
     ) -> CoreResult<NodeResult> {
         for index in frame.pending_indices().iter().copied() {
             self.metadata.borrow_mut().push(runtime.metadata(index)?);
-            self.cursors
-                .borrow_mut()
-                .push(runtime.packet_cursor(index)?);
         }
         Ok(NodeResult::next_current(self.next))
     }
@@ -173,11 +169,9 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
     let captured = Rc::new(RefCell::new(Vec::new()));
-    let cursors = Rc::new(RefCell::new(Vec::new()));
     let capture = runtime.nodes().register_internal(CaptureNode {
         next: output,
         metadata: Rc::clone(&captured),
-        cursors: Rc::clone(&cursors),
     });
     let ip_input = runtime
         .nodes()
@@ -201,13 +195,6 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     let metadata = &captured.borrow()[0];
     assert_eq!(metadata.inbound, "tun0");
     assert_eq!(metadata.network, Network::Udp);
-    let cursor = cursors.borrow()[0];
-    assert_eq!(cursor.network_header_offset(), 0);
-    assert_eq!(cursor.network_header_len(), 20);
-    assert_eq!(cursor.transport_header_offset(), 20);
-    assert_eq!(cursor.transport_header_len(), 0);
-    assert_eq!(cursor.transport_payload_offset(), 0);
-    assert_eq!(cursor.packet_len(), packets[0].len());
     assert_eq!(
         metadata.source,
         Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 0))
