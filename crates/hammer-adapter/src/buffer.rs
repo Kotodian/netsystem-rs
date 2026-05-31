@@ -154,6 +154,23 @@ impl BufferPacketCursor {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferNodeError {
+    code: u16,
+}
+
+impl BufferNodeError {
+    #[inline(always)]
+    pub const fn new(code: u16) -> Self {
+        Self { code }
+    }
+
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self.code
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct CacheLine([u8; BUFFER_CACHE_LINE_SIZE]);
@@ -214,6 +231,7 @@ impl CacheAlignedStorage {
 pub struct Buffer {
     metadata: RouteMetadata,
     packet_cursor: BufferPacketCursor,
+    node_error: Option<BufferNodeError>,
     flags: BufferFlags,
     current_data: usize,
     current_len: usize,
@@ -229,6 +247,7 @@ impl Buffer {
         Self {
             metadata: RouteMetadata::default(),
             packet_cursor: BufferPacketCursor::default(),
+            node_error: None,
             flags: BufferFlags::empty(),
             current_data: 0,
             current_len: 0,
@@ -250,6 +269,7 @@ impl Buffer {
         }
         self.metadata = metadata;
         self.packet_cursor = BufferPacketCursor::default();
+        self.node_error = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = bytes.len();
@@ -264,6 +284,7 @@ impl Buffer {
     fn reset_for_free(&mut self) {
         self.metadata = RouteMetadata::default();
         self.packet_cursor = BufferPacketCursor::default();
+        self.node_error = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = 0;
@@ -290,6 +311,21 @@ impl Buffer {
     #[inline]
     pub fn packet_cursor_mut(&mut self) -> &mut BufferPacketCursor {
         &mut self.packet_cursor
+    }
+
+    #[inline]
+    pub fn node_error(&self) -> Option<BufferNodeError> {
+        self.node_error
+    }
+
+    #[inline]
+    pub fn set_node_error(&mut self, error: BufferNodeError) {
+        self.node_error = Some(error);
+    }
+
+    #[inline]
+    pub fn clear_node_error(&mut self) {
+        self.node_error = None;
     }
 
     #[inline]
@@ -713,6 +749,11 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
+        self.buffers.node_error(index)
+    }
+
+    #[inline]
     pub fn with_metadata<R>(
         &self,
         index: BufferIndex,
@@ -1008,6 +1049,11 @@ impl BufferPool {
     #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
         self.with_buffer(index, Buffer::packet_cursor)
+    }
+
+    #[inline]
+    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
+        self.with_buffer(index, Buffer::node_error)
     }
 
     #[inline]
@@ -2131,6 +2177,7 @@ pub struct BufferRef<'pool> {
 }
 
 impl BufferRef<'_> {
+    #[inline]
     pub fn metadata(&self) -> &RouteMetadata {
         self.guard
             .buffer(self.index)
@@ -2138,6 +2185,7 @@ impl BufferRef<'_> {
             .metadata()
     }
 
+    #[inline]
     pub fn packet_cursor(&self) -> BufferPacketCursor {
         self.guard
             .buffer(self.index)
@@ -2145,11 +2193,28 @@ impl BufferRef<'_> {
             .packet_cursor()
     }
 
+    #[inline]
+    pub fn node_error(&self) -> Option<BufferNodeError> {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .node_error()
+    }
+
+    #[inline]
     pub fn current(&self) -> &[u8] {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .current()
+    }
+
+    #[inline]
+    pub fn total_len_not_including_first(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .total_len_not_including_first()
     }
 }
 
@@ -2184,6 +2249,30 @@ impl BufferRefMut<'_> {
     }
 
     #[inline]
+    pub fn node_error(&self) -> Option<BufferNodeError> {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .node_error()
+    }
+
+    #[inline]
+    pub fn set_node_error(&mut self, error: BufferNodeError) {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .set_node_error(error);
+    }
+
+    #[inline]
+    pub fn clear_node_error(&mut self) {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .clear_node_error();
+    }
+
+    #[inline]
     pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
         *self
             .guard
@@ -2198,5 +2287,13 @@ impl BufferRefMut<'_> {
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .current()
+    }
+
+    #[inline]
+    pub fn total_len_not_including_first(&self) -> usize {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .total_len_not_including_first()
     }
 }

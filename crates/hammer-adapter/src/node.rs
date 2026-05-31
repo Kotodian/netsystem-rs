@@ -11,7 +11,7 @@ use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
 
 pub mod next;
 
-pub const MAX_NODE_NEXT_FRAMES: usize = 4;
+pub const MAX_NODE_NEXT_FRAMES: usize = 8;
 
 pub use next::{NodeNext, NodeNextFrames, NodeNextGroups};
 

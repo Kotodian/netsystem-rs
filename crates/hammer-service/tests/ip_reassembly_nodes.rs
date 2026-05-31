@@ -4,15 +4,16 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeResult, RouteMetadata,
-    SocksAddr,
+    BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Network, Node, NodeResult,
+    RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_service::net::{IpInputNext, IpInputNode, IpReassemblyNode};
+use hammer_service::net::{IpInputError, IpInputNext, IpInputNode, IpReassemblyNode};
 
 struct SinkNode {
     packets: Rc<RefCell<Vec<Vec<u8>>>>,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+    node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
 }
 
 impl Node<TestNode> for SinkNode {
@@ -27,6 +28,9 @@ impl Node<TestNode> for SinkNode {
                 .borrow_mut()
                 .push(runtime.copy_current_chain(index)?);
             self.metadata.borrow_mut().push(runtime.metadata(index)?);
+            self.node_errors
+                .borrow_mut()
+                .push(runtime.node_error(index)?);
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
@@ -34,6 +38,43 @@ impl Node<TestNode> for SinkNode {
 }
 
 impl InternalNode<TestNode> for SinkNode {}
+
+#[derive(Clone)]
+struct SinkCapture {
+    packets: Rc<RefCell<Vec<Vec<u8>>>>,
+    metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+    node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
+}
+
+impl SinkCapture {
+    fn new() -> Self {
+        Self {
+            packets: Rc::new(RefCell::new(Vec::new())),
+            metadata: Rc::new(RefCell::new(Vec::new())),
+            node_errors: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn node(&self) -> SinkNode {
+        SinkNode {
+            packets: Rc::clone(&self.packets),
+            metadata: Rc::clone(&self.metadata),
+            node_errors: Rc::clone(&self.node_errors),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.packets.borrow().len()
+    }
+
+    fn packets(&self) -> Vec<Vec<u8>> {
+        self.packets.borrow().clone()
+    }
+
+    fn node_errors(&self) -> Vec<Option<BufferNodeError>> {
+        self.node_errors.borrow().clone()
+    }
+}
 
 enum TestNode {
     IpInput(IpInputNode),
@@ -82,18 +123,18 @@ where
 }
 
 #[test]
-fn ip_input_drops_ipv4_options_packets() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let packets = Rc::new(RefCell::new(Vec::new()));
-    let metadata = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime.nodes().register_internal(SinkNode {
-        packets: Rc::clone(&packets),
-        metadata,
-    });
+fn ip_input_routes_ipv4_options_to_options_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let lookup_capture = SinkCapture::new();
+    let options_capture = SinkCapture::new();
+    let lookup = runtime.nodes().register_internal(lookup_capture.node());
+    let options = runtime.nodes().register_internal(options_capture.node());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(sink));
-    let input = IpInputNode::new(IpInputNext::nodes(sink, reassembly));
+        .register_internal(IpReassemblyNode::new(lookup));
+    let input = IpInputNode::new(IpInputNext::nodes(
+        lookup, lookup, options, lookup, lookup, lookup, reassembly,
+    ));
     assert_internal_node(&input);
     let input = runtime.nodes().register_internal(input);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -109,8 +150,194 @@ fn ip_input_drops_ipv4_options_packets() {
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
-    assert!(packets.borrow().is_empty());
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(options_capture.packets(), vec![packet]);
+    assert_eq!(lookup_capture.len(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_input_matches_vpp_ipv4_validation_nexts() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 16);
+    let drop_capture = SinkCapture::new();
+    let lookup_capture = SinkCapture::new();
+    let mcast_capture = SinkCapture::new();
+    let icmp_capture = SinkCapture::new();
+    let reassembly_capture = SinkCapture::new();
+    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let lookup = runtime.nodes().register_internal(lookup_capture.node());
+    let mcast = runtime.nodes().register_internal(mcast_capture.node());
+    let icmp = runtime.nodes().register_internal(icmp_capture.node());
+    let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(reassembly_sink));
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            drop, drop, drop, lookup, mcast, icmp, reassembly,
+        )));
+    let unknown_protocol = ipv4_protocol_packet([10, 0, 0, 2], [198, 51, 100, 7], 143, b"opaque");
+    let multicast = ipv4_udp_packet([10, 0, 0, 3], 12_346, [224, 0, 0, 1], 53, b"mcast");
+    let ttl_expired = ipv4_with_ttl(
+        ipv4_udp_packet([10, 0, 0, 4], 12_347, [198, 51, 100, 8], 53, b"ttl"),
+        0,
+    );
+    let bad_checksum = ipv4_bad_checksum(ipv4_udp_packet(
+        [10, 0, 0, 5],
+        12_348,
+        [198, 51, 100, 9],
+        53,
+        b"bad",
+    ));
+    let fragment_offset_one = ipv4_fragment_offset_one(ipv4_udp_packet(
+        [10, 0, 0, 6],
+        12_349,
+        [198, 51, 100, 10],
+        53,
+        b"frag-offset-one",
+    ));
+    let fragmented = ipv4_fragment(
+        &ipv4_udp_packet([10, 0, 0, 7], 12_350, [198, 51, 100, 11], 53, b"fragmented"),
+        104,
+        0,
+        8,
+        true,
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &unknown_protocol);
+    push_packet(&runtime, frame, &multicast);
+    push_packet(&runtime, frame, &ttl_expired);
+    push_packet(&runtime, frame, &bad_checksum);
+    push_packet(&runtime, frame, &fragment_offset_one);
+    push_packet(&runtime, frame, &fragmented);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
+    assert_eq!(lookup_capture.packets(), vec![unknown_protocol]);
+    assert_eq!(mcast_capture.packets(), vec![multicast]);
+    assert_eq!(icmp_capture.packets(), vec![ttl_expired]);
+    assert_eq!(
+        drop_capture.packets(),
+        vec![bad_checksum, fragment_offset_one]
+    );
+    assert_eq!(
+        icmp_capture.node_errors(),
+        vec![Some(BufferNodeError::new(IpInputError::TimeExpired.code()))]
+    );
+    assert_eq!(
+        drop_capture.node_errors(),
+        vec![
+            Some(BufferNodeError::new(IpInputError::BadChecksum.code())),
+            Some(BufferNodeError::new(IpInputError::FragmentOffsetOne.code()))
+        ]
+    );
+    assert_eq!(reassembly_capture.len(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 1);
+}
+
+#[test]
+fn ip_input_matches_vpp_ipv6_validation_nexts() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 16);
+    let drop_capture = SinkCapture::new();
+    let lookup_capture = SinkCapture::new();
+    let mcast_capture = SinkCapture::new();
+    let icmp_capture = SinkCapture::new();
+    let reassembly_capture = SinkCapture::new();
+    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let lookup = runtime.nodes().register_internal(lookup_capture.node());
+    let mcast = runtime.nodes().register_internal(mcast_capture.node());
+    let icmp = runtime.nodes().register_internal(icmp_capture.node());
+    let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(reassembly_sink));
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            drop, drop, drop, lookup, mcast, icmp, reassembly,
+        )));
+    let lookup_packet = ipv6_protocol_packet(
+        Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1),
+        Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 2),
+        143,
+        64,
+        b"opaque",
+    );
+    let multicast = ipv6_udp_packet(
+        Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 3),
+        12_345,
+        Ipv6Addr::from([0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        53,
+        b"mcast",
+    );
+    let hop_expired = ipv6_protocol_packet(
+        Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 4),
+        Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 5),
+        143,
+        0,
+        b"expired",
+    );
+    let too_short = vec![0x60, 0, 0, 0, 0, 0, 17, 64];
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &lookup_packet);
+    push_packet(&runtime, frame, &multicast);
+    push_packet(&runtime, frame, &hop_expired);
+    push_packet(&runtime, frame, &too_short);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
+    assert_eq!(lookup_capture.packets(), vec![lookup_packet]);
+    assert_eq!(mcast_capture.packets(), vec![multicast]);
+    assert_eq!(icmp_capture.packets(), vec![hop_expired]);
+    assert_eq!(drop_capture.packets(), vec![too_short]);
+    assert_eq!(
+        icmp_capture.node_errors(),
+        vec![Some(BufferNodeError::new(IpInputError::TimeExpired.code()))]
+    );
+    assert_eq!(
+        drop_capture.node_errors(),
+        vec![Some(BufferNodeError::new(IpInputError::BadLength.code()))]
+    );
+    assert_eq!(reassembly_capture.len(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_input_validates_chain_length_like_vpp_current_chain() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(24, 16, 8, 8);
+    let drop_capture = SinkCapture::new();
+    let lookup_capture = SinkCapture::new();
+    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let lookup = runtime.nodes().register_internal(lookup_capture.node());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(lookup));
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            drop, drop, drop, lookup, lookup, drop, reassembly,
+        )));
+    let packet = ipv4_protocol_packet(
+        [10, 0, 0, 8],
+        [198, 51, 100, 12],
+        143,
+        b"payload-spans-more-than-one-buffer",
+    );
+    assert!(packet.len() > 24);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &packet);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(lookup_capture.packets(), vec![packet]);
+    assert_eq!(drop_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -120,16 +347,18 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata: Rc::clone(&metadata),
+        node_errors,
     });
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(sink, reassembly)));
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
     let original = ipv4_udp_packet(
         [10, 0, 0, 2],
         12_345,
@@ -168,16 +397,18 @@ fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata,
+        node_errors,
     });
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(sink, reassembly)));
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
     let original = ipv4_udp_packet(
         [10, 0, 0, 3],
         12_346,
@@ -207,16 +438,18 @@ fn ipv4_reassembly_drops_context_on_partial_overlap() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata,
+        node_errors,
     });
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(sink, reassembly)));
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
     let original = ipv4_udp_packet(
         [10, 0, 0, 4],
         12_347,
@@ -243,16 +476,18 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register_internal(SinkNode {
         packets: Rc::clone(&packets),
         metadata: Rc::clone(&metadata),
+        node_errors,
     });
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(sink));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(sink, reassembly)));
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
     let original = ipv6_udp_packet(
         Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 1),
         20_000,
@@ -294,9 +529,12 @@ fn reassembly_expire_frees_incomplete_fragments() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
     let metadata = Rc::new(RefCell::new(Vec::new()));
-    let sink = runtime
-        .nodes()
-        .register(TestNode::Sink(SinkNode { packets, metadata }));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        packets,
+        metadata,
+        node_errors,
+    }));
     let mut reassembly = IpReassemblyNode::new(sink).with_timeout(Duration::from_millis(100));
     let packet = ipv4_udp_packet(
         [10, 0, 0, 5],
@@ -341,6 +579,15 @@ fn push_packet(
         .expect("push packet");
 }
 
+fn ip_input_nexts(
+    default: hammer_adapter::NodeId,
+    reassembly: hammer_adapter::NodeId,
+) -> [hammer_adapter::NodeId; IpInputNext::COUNT] {
+    IpInputNext::nodes(
+        default, default, default, default, default, default, reassembly,
+    )
+}
+
 fn ipv4_options_packet() -> Vec<u8> {
     let payload = b"option";
     let total_len = 24 + payload.len();
@@ -376,6 +623,42 @@ fn ipv4_udp_packet(
     packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
     packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
+    update_ipv4_checksum(&mut packet);
+    packet
+}
+
+fn ipv4_protocol_packet(
+    source: [u8; 4],
+    destination: [u8; 4],
+    protocol: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let total_len = 20 + payload.len();
+    let mut packet = vec![0; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = protocol;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    packet[20..].copy_from_slice(payload);
+    update_ipv4_checksum(&mut packet);
+    packet
+}
+
+fn ipv4_with_ttl(mut packet: Vec<u8>, ttl: u8) -> Vec<u8> {
+    packet[8] = ttl;
+    update_ipv4_checksum(&mut packet);
+    packet
+}
+
+fn ipv4_bad_checksum(mut packet: Vec<u8>) -> Vec<u8> {
+    packet[10] ^= 0xff;
+    packet
+}
+
+fn ipv4_fragment_offset_one(mut packet: Vec<u8>) -> Vec<u8> {
+    packet[6..8].copy_from_slice(&1u16.to_be_bytes());
     update_ipv4_checksum(&mut packet);
     packet
 }
@@ -434,6 +717,25 @@ fn ipv6_udp_packet(
     packet[42..44].copy_from_slice(&destination_port.to_be_bytes());
     packet[44..46].copy_from_slice(&(payload_len as u16).to_be_bytes());
     packet[48..].copy_from_slice(payload);
+    packet
+}
+
+fn ipv6_protocol_packet(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    protocol: u8,
+    hop_limit: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let payload_len = payload.len();
+    let mut packet = vec![0; 40 + payload_len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[6] = protocol;
+    packet[7] = hop_limit;
+    packet[8..24].copy_from_slice(&source.octets());
+    packet[24..40].copy_from_slice(&destination.octets());
+    packet[40..].copy_from_slice(payload);
     packet
 }
 

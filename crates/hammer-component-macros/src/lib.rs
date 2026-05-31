@@ -485,7 +485,7 @@ fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {
 
         let variant_attrs = variant.attrs;
         let variant_ident = variant.ident;
-        let node_param = format_ident!("{}", to_snake_case(&variant_ident.to_string()));
+        let node_param = format_ident!("{}_node", to_snake_case(&variant_ident.to_string()));
         variant_defs.push(quote! {
             #(#variant_attrs)*
             #variant_ident

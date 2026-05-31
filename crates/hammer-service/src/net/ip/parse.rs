@@ -22,13 +22,38 @@ pub enum IpProtocol {
     Tcp,
     Udp,
     Icmpv6,
+    Other(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpInputTarget {
-    Lookup,
+    Drop,
+    Punt,
     Options,
+    Lookup,
+    LookupMulticast,
+    IcmpError,
     Reassembly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpInputError {
+    None,
+    Version,
+    HeaderTooShort,
+    Options,
+    BadChecksum,
+    TimeExpired,
+    FragmentOffsetOne,
+    TooShort,
+    BadLength,
+}
+
+impl IpInputError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,19 +62,15 @@ pub enum IpVersion {
     V6,
 }
 
-impl TryFrom<u8> for IpProtocol {
-    type Error = CoreError;
-
-    #[inline]
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+impl From<u8> for IpProtocol {
+    #[inline(always)]
+    fn from(value: u8) -> Self {
         match value {
-            1 => Ok(Self::Icmpv4),
-            6 => Ok(Self::Tcp),
-            17 => Ok(Self::Udp),
-            58 => Ok(Self::Icmpv6),
-            other => Err(CoreError::internal(format!(
-                "unsupported transport protocol: {other}"
-            ))),
+            1 => Self::Icmpv4,
+            6 => Self::Tcp,
+            17 => Self::Udp,
+            58 => Self::Icmpv6,
+            other => Self::Other(other),
         }
     }
 }
@@ -59,9 +80,16 @@ pub struct ParsedIpPacket {
     pub version: IpVersion,
     pub protocol: IpProtocol,
     pub input_target: IpInputTarget,
+    pub input_error: IpInputError,
     pub source: IpAddr,
     pub destination: IpAddr,
     pub cursor: BufferPacketCursor,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParsedIpPacketHeader {
+    parsed: ParsedIpPacket,
+    required_len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,14 +118,22 @@ pub enum IpFragmentKey {
     },
 }
 
-#[inline]
+#[inline(always)]
 pub fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
+    parse_ip_packet_with_chain_len(packet, 0)
+}
+
+#[inline(always)]
+pub fn parse_ip_packet_with_chain_len(
+    packet: &[u8],
+    tail_len: usize,
+) -> CoreResult<ParsedIpPacket> {
     let first = *packet
         .first()
         .ok_or_else(|| CoreError::internal("empty IP packet"))?;
     let parsed = match first >> 4 {
-        4 => parse_ipv4_packet(packet),
-        6 => parse_ipv6_packet(packet),
+        4 => parse_ipv4_packet_header(packet),
+        6 => parse_ipv6_packet_header(packet),
         other => {
             return Err(CoreError::internal(format!(
                 "unsupported IP version: {other}"
@@ -106,10 +142,14 @@ pub fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
     };
     let (_, parsed) =
         parsed.map_err(|err| CoreError::internal(format!("invalid IP packet: {err}")))?;
-    Ok(parsed)
+    let chain_len = packet.len().saturating_add(tail_len);
+    if chain_len < parsed.required_len {
+        return Err(CoreError::internal("invalid IP packet length"));
+    }
+    Ok(parsed.parsed)
 }
 
-#[inline]
+#[inline(always)]
 pub fn parse_ip_fragment(packet: &[u8]) -> CoreResult<ParsedIpFragment> {
     let first = *packet
         .first()
@@ -128,10 +168,16 @@ pub fn parse_ip_fragment(packet: &[u8]) -> CoreResult<ParsedIpFragment> {
     Ok(parsed)
 }
 
-#[inline]
-fn parse_ipv4_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
-    let packet_len = input.len();
+#[inline(always)]
+fn parse_ipv4_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeader> {
+    let packet = input;
     let (input, version_ihl) = be_u8(input)?;
+    if version_ihl >> 4 != 4 {
+        return Err(nom::Err::Failure(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
     let ihl = ((version_ihl & 0x0f) as usize) * 4;
     if ihl < IPV4_HEADER_MIN_LEN {
         return Err(nom::Err::Failure(nom::error::Error::new(
@@ -143,7 +189,7 @@ fn parse_ipv4_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
     let (input, _) = be_u8(input)?;
     let (input, total_len) = be_u16(input)?;
     let total_len = total_len as usize;
-    if total_len < ihl || total_len > packet_len {
+    if total_len < ihl {
         return Err(nom::Err::Failure(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Verify,
@@ -152,42 +198,60 @@ fn parse_ipv4_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
 
     let (input, _) = be_u16(input)?;
     let (input, fragment) = be_u16(input)?;
-    let (input, _) = be_u8(input)?;
+    let (input, ttl) = be_u8(input)?;
     let (input, protocol) = be_u8(input)?;
     let (input, _) = be_u16(input)?;
     let (input, source) = parse_ipv4_addr(input)?;
     let (input, destination) = parse_ipv4_addr(input)?;
     let options_len = ihl - IPV4_HEADER_MIN_LEN;
     let (input, _) = take(options_len).parse(input)?;
-    let transport_len = total_len - ihl;
-    let (input, _) = take(transport_len).parse(input)?;
-    let input_target = if options_len != 0 {
-        IpInputTarget::Options
-    } else if fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
-        IpInputTarget::Reassembly
-    } else {
-        IpInputTarget::Lookup
-    };
+    let fragment_offset = fragment & IPV4_FRAGMENT_OFFSET_MASK;
+    let checksum_bad = internet_checksum(&packet[..ihl]) != 0;
+    let (input_target, input_error) =
+        if fragment_offset == 1 || checksum_bad || total_len < IPV4_HEADER_MIN_LEN {
+            (
+                IpInputTarget::Drop,
+                if fragment_offset == 1 {
+                    IpInputError::FragmentOffsetOne
+                } else if checksum_bad {
+                    IpInputError::BadChecksum
+                } else {
+                    IpInputError::TooShort
+                },
+            )
+        } else if ttl < 1 {
+            (IpInputTarget::IcmpError, IpInputError::TimeExpired)
+        } else if options_len != 0 {
+            (IpInputTarget::Options, IpInputError::Options)
+        } else if fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
+            (IpInputTarget::Reassembly, IpInputError::None)
+        } else if destination.is_multicast() {
+            (IpInputTarget::LookupMulticast, IpInputError::None)
+        } else {
+            (IpInputTarget::Lookup, IpInputError::None)
+        };
 
     Ok((
         input,
-        ParsedIpPacket {
-            version: IpVersion::V4,
-            protocol: IpProtocol::try_from(protocol).map_err(|_| {
-                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-            })?,
-            input_target,
-            source: IpAddr::V4(source),
-            destination: IpAddr::V4(destination),
-            cursor: BufferPacketCursor::new()
-                .with_packet_len(total_len)
-                .with_network_header(0, ihl)
-                .with_transport_header(ihl, 0),
+        ParsedIpPacketHeader {
+            parsed: ParsedIpPacket {
+                version: IpVersion::V4,
+                protocol: IpProtocol::from(protocol),
+                input_target,
+                input_error,
+                source: IpAddr::V4(source),
+                destination: IpAddr::V4(destination),
+                cursor: BufferPacketCursor::new()
+                    .with_packet_len(total_len)
+                    .with_network_header(0, ihl)
+                    .with_transport_header(ihl, 0),
+            },
+            required_len: total_len,
         },
     ))
 }
 
-#[inline]
+#[inline(always)]
 fn parse_ipv4_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     let packet_len = input.len();
     let (input, version_ihl) = be_u8(input)?;
@@ -251,8 +315,8 @@ fn parse_ipv4_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     ))
 }
 
-#[inline]
-fn parse_ipv6_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
+#[inline(always)]
+fn parse_ipv6_packet_header(input: &[u8]) -> ParseResult<'_, ParsedIpPacketHeader> {
     let (input, version_traffic) = be_u8(input)?;
     if version_traffic >> 4 != 6 {
         return Err(nom::Err::Failure(nom::error::Error::new(
@@ -267,45 +331,76 @@ fn parse_ipv6_packet(input: &[u8]) -> ParseResult<'_, ParsedIpPacket> {
         nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
     })?;
     let (input, next_header) = be_u8(input)?;
-    let (input, _) = be_u8(input)?;
+    let (input, hop_limit) = be_u8(input)?;
     let (input, source) = parse_ipv6_addr(input)?;
     let (input, destination) = parse_ipv6_addr(input)?;
-    let (input, payload) = take(payload_len).parse(input)?;
-    let (protocol, input_target, transport_offset) = if next_header == IPV6_NEXT_HEADER_FRAGMENT {
-        if payload.len() < IPV6_FRAGMENT_HEADER_LEN {
-            return Err(nom::Err::Failure(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Verify,
-            )));
-        }
-        (
-            payload[0],
-            IpInputTarget::Reassembly,
-            IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
-        )
-    } else {
-        (next_header, IpInputTarget::Lookup, IPV6_HEADER_LEN)
-    };
+    let (protocol, input_target, input_error, transport_offset) =
+        if next_header == IPV6_NEXT_HEADER_FRAGMENT {
+            if payload_len < IPV6_FRAGMENT_HEADER_LEN {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Verify,
+                )));
+            }
+            let (_, fragment_next_header) = be_u8(input)?;
+            (
+                fragment_next_header,
+                if hop_limit < 1 {
+                    IpInputTarget::IcmpError
+                } else {
+                    IpInputTarget::Reassembly
+                },
+                if hop_limit < 1 {
+                    IpInputError::TimeExpired
+                } else {
+                    IpInputError::None
+                },
+                IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
+            )
+        } else if hop_limit < 1 {
+            (
+                next_header,
+                IpInputTarget::IcmpError,
+                IpInputError::TimeExpired,
+                IPV6_HEADER_LEN,
+            )
+        } else if destination.is_multicast() {
+            (
+                next_header,
+                IpInputTarget::LookupMulticast,
+                IpInputError::None,
+                IPV6_HEADER_LEN,
+            )
+        } else {
+            (
+                next_header,
+                IpInputTarget::Lookup,
+                IpInputError::None,
+                IPV6_HEADER_LEN,
+            )
+        };
 
     Ok((
         input,
-        ParsedIpPacket {
-            version: IpVersion::V6,
-            protocol: IpProtocol::try_from(protocol).map_err(|_| {
-                nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
-            })?,
-            input_target,
-            source: IpAddr::V6(source),
-            destination: IpAddr::V6(destination),
-            cursor: BufferPacketCursor::new()
-                .with_packet_len(total_len)
-                .with_network_header(0, IPV6_HEADER_LEN)
-                .with_transport_header(transport_offset, 0),
+        ParsedIpPacketHeader {
+            parsed: ParsedIpPacket {
+                version: IpVersion::V6,
+                protocol: IpProtocol::from(protocol),
+                input_target,
+                input_error,
+                source: IpAddr::V6(source),
+                destination: IpAddr::V6(destination),
+                cursor: BufferPacketCursor::new()
+                    .with_packet_len(total_len)
+                    .with_network_header(0, IPV6_HEADER_LEN)
+                    .with_transport_header(transport_offset, 0),
+            },
+            required_len: IPV6_HEADER_LEN,
         },
     ))
 }
 
-#[inline]
+#[inline(always)]
 fn parse_ipv6_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     let (input, version_traffic) = be_u8(input)?;
     if version_traffic >> 4 != 6 {
@@ -366,16 +461,33 @@ fn parse_ipv6_fragment(input: &[u8]) -> ParseResult<'_, ParsedIpFragment> {
     ))
 }
 
-#[inline]
+#[inline(always)]
 fn parse_ipv4_addr(input: &[u8]) -> ParseResult<'_, Ipv4Addr> {
     let (input, bytes) = take(4usize).parse(input)?;
     let bytes = <[u8; 4]>::try_from(bytes).expect("nom take returned four bytes");
     Ok((input, Ipv4Addr::from(bytes)))
 }
 
-#[inline]
+#[inline(always)]
 fn parse_ipv6_addr(input: &[u8]) -> ParseResult<'_, Ipv6Addr> {
     let (input, bytes) = take(16usize).parse(input)?;
     let bytes = <[u8; 16]>::try_from(bytes).expect("nom take returned sixteen bytes");
     Ok((input, Ipv6Addr::from(bytes)))
+}
+
+#[inline(always)]
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in bytes.chunks(2) {
+        let word = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
+        } else {
+            (chunk[0] as u32) << 8
+        };
+        sum += word;
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    !(sum as u16)
 }

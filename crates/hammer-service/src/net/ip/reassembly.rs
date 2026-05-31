@@ -384,7 +384,7 @@ enum ReassemblyInsert {
     Failed,
 }
 
-#[inline]
+#[inline(always)]
 fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> CoreResult<()> {
     let packet = runtime.copy_current_chain(index)?;
     let parsed = parse_ip_packet(&packet)?;
@@ -392,6 +392,11 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
         crate::net::ip::IpProtocol::Tcp => Network::Tcp,
         crate::net::ip::IpProtocol::Udp => Network::Udp,
         crate::net::ip::IpProtocol::Icmpv4 | crate::net::ip::IpProtocol::Icmpv6 => Network::Icmp,
+        crate::net::ip::IpProtocol::Other(protocol) => {
+            return Err(CoreError::internal(format!(
+                "unsupported reassembled transport protocol: {protocol}"
+            )));
+        }
     };
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.set_packet_cursor(parsed.cursor);
@@ -402,7 +407,7 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
     Ok(())
 }
 
-#[inline]
+#[inline(always)]
 fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
     packet[IPV4_HEADER_CHECKSUM_OFFSET] = 0;
     packet[IPV4_HEADER_CHECKSUM_OFFSET + 1] = 0;
@@ -411,7 +416,7 @@ fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
         .copy_from_slice(&checksum.to_be_bytes());
 }
 
-#[inline]
+#[inline(always)]
 fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum = 0u32;
     for chunk in bytes.chunks(2) {

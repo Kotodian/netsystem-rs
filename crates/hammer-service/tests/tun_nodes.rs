@@ -181,7 +181,9 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     });
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(capture, capture)));
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            capture, capture, capture, capture, capture, capture, capture,
+        )));
     let driver =
         runtime
             .nodes()

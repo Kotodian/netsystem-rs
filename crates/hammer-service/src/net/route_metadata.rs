@@ -60,6 +60,9 @@ fn parse_packet(packet: &[u8]) -> CoreResult<ParsedPacket> {
             source: SocksAddr::ip(parsed.source, 0),
             destination: SocksAddr::ip(parsed.destination, 0),
         }),
+        IpProtocol::Other(protocol) => Err(CoreError::internal(format!(
+            "unsupported transport protocol: {protocol}"
+        ))),
     }
 }
 
