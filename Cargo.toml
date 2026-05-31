@@ -63,6 +63,7 @@ serde_with = { version = "3.18", default-features = false, features = ["std"] }
 hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
 hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 bytes = "1.11"
+crossbeam-queue = "0.3"
 etherparse = "0.20.1"
 arc-swap = "1"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "socket-tcp"] }

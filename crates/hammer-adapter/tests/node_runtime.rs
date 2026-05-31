@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId,
-    NodeResult, RouteMetadata,
+    BufferFrame, BufferNodeError, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, DriverNode,
+    InternalNode, Node, NodeHandle, NodeId, NodeResult, RouteMetadata,
 };
 use hammer_core::error::CoreResult;
 
@@ -140,12 +140,59 @@ impl Node<TestNode> for ErrorNode {
 
 impl InternalNode<TestNode> for ErrorNode {}
 
+struct HandoffNode {
+    target_worker: DataWorkerId,
+    target: NodeHandle,
+}
+
+impl Node<TestNode> for HandoffNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        runtime.handoff_frame(self.target_worker, self.target, frame)?;
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for HandoffNode {}
+
+struct PointerSinkNode {
+    payloads: Rc<RefCell<Vec<Vec<u8>>>>,
+    current_ptrs: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Node<TestNode> for PointerSinkNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for buffer in frame.drain_pending() {
+            let current_ptr = runtime.current_ptr(buffer)? as usize;
+            self.current_ptrs.borrow_mut().push(current_ptr);
+            self.payloads
+                .borrow_mut()
+                .push(runtime.copy_current_chain(buffer)?);
+            runtime.free_index(buffer);
+        }
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for PointerSinkNode {}
+
 enum TestNode {
     Forward(ForwardNode),
     SourceDriver(SourceDriverNode),
     Sink(SinkNode),
     Count(CountNode),
     Error(ErrorNode),
+    Handoff(HandoffNode),
+    PointerSink(PointerSinkNode),
 }
 
 impl From<ForwardNode> for TestNode {
@@ -178,6 +225,18 @@ impl From<ErrorNode> for TestNode {
     }
 }
 
+impl From<HandoffNode> for TestNode {
+    fn from(node: HandoffNode) -> Self {
+        Self::Handoff(node)
+    }
+}
+
+impl From<PointerSinkNode> for TestNode {
+    fn from(node: PointerSinkNode) -> Self {
+        Self::PointerSink(node)
+    }
+}
+
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -191,6 +250,8 @@ impl Node<TestNode> for TestNode {
             Self::Sink(node) => node.process(runtime, frame),
             Self::Count(node) => node.process(runtime, frame),
             Self::Error(node) => node.process(runtime, frame),
+            Self::Handoff(node) => node.process(runtime, frame),
+            Self::PointerSink(node) => node.process(runtime, frame),
         }
     }
 }
@@ -336,6 +397,69 @@ fn node_runtime_counts_errors_per_runtime_node() {
         &[Some(BufferNodeError::new(first_node, 7))]
     );
     assert!(second_errors.borrow().is_empty());
+}
+
+#[test]
+fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storage() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(1);
+    let handoff = DataPlaneHandoff::new(2, 8);
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(64, 4, 4, 4),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(64, 4, 4, 4),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let current_ptrs = Rc::new(RefCell::new(Vec::new()));
+    let sink = second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            PointerSinkNode {
+                payloads: Rc::clone(&payloads),
+                current_ptrs: Rc::clone(&current_ptrs),
+            },
+        )
+        .expect("register sink handle");
+    let handoff_node = first_runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    let original_ptr = first_runtime
+        .get_buffer(buffer)
+        .expect("buffer ref")
+        .current_ptr() as usize;
+    first_runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(
+        first_runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run source"), 1);
+    assert_eq!(first_runtime.in_use_buffers(), 1);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run target"), 1);
+    assert_eq!(
+        sink,
+        second_runtime.nodes().node_for_handle(SINK_HANDLE).unwrap()
+    );
+    assert_eq!(&*payloads.borrow(), &[b"packet".to_vec()]);
+    assert_eq!(&*current_ptrs.borrow(), &[original_ptr]);
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
 }
 
 #[test]

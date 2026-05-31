@@ -6,6 +6,7 @@ pub mod dialer;
 pub mod dns;
 pub mod endpoint;
 pub mod handler;
+pub mod handoff;
 pub mod inbound;
 pub mod instruction_set;
 pub mod network;
@@ -27,6 +28,7 @@ pub use buffer::{
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
+pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 
 // Re-exports used by the runtime crate so it doesn't have to know which
@@ -45,8 +47,8 @@ pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, NextFrame, Node, NodeErrorCounters, NodeId, NodeNext, NodeNextFrames,
-    NodeNextGroups, NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode,
+    DriverNode, InternalNode, NextFrame, Node, NodeErrorCounters, NodeHandle, NodeId, NodeNext,
+    NodeNextFrames, NodeNextGroups, NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,

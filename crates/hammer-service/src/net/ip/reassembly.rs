@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Network, Node, NodeId,
-    NodeNextFrames, NodeResult, SocksAddr,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Network, Node,
+    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -25,10 +28,41 @@ const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 3;
 
 pub struct IpReassemblyNode {
     next: NodeId,
+    handoff: Option<IpReassemblyHandoff>,
     timeout: Duration,
     max_reassemblies: usize,
     max_fragments_per_reassembly: usize,
     contexts: HashMap<IpFragmentKey, ReassemblyContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IpReassemblyHandoff {
+    reassembly: NodeHandle,
+    complete: NodeHandle,
+    worker: DataWorkerId,
+    directory: IpReassemblyDirectory,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IpReassemblyDirectory {
+    inner: Arc<ArcSwap<HashMap<IpFragmentKey, DataWorkerId>>>,
+}
+
+impl IpReassemblyHandoff {
+    #[inline]
+    pub fn new(
+        reassembly: NodeHandle,
+        complete: NodeHandle,
+        worker: DataWorkerId,
+        directory: IpReassemblyDirectory,
+    ) -> Self {
+        Self {
+            reassembly,
+            complete,
+            worker,
+            directory,
+        }
+    }
 }
 
 impl IpReassemblyNode {
@@ -36,11 +70,19 @@ impl IpReassemblyNode {
     pub fn new(next: NodeId) -> Self {
         Self {
             next,
+            handoff: None,
             timeout: DEFAULT_REASSEMBLY_TIMEOUT,
             max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
             max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
             contexts: HashMap::new(),
         }
+    }
+
+    #[inline]
+    pub fn with_handoff(next: NodeId, handoff: IpReassemblyHandoff) -> Self {
+        let mut node = Self::new(next);
+        node.handoff = Some(handoff);
+        node
     }
 
     #[inline]
@@ -64,6 +106,9 @@ impl IpReassemblyNode {
         for key in expired {
             if let Some(context) = self.contexts.remove(&key) {
                 context.free(runtime);
+            }
+            if let Some(handoff) = &self.handoff {
+                handoff.directory.remove(key);
             }
         }
         expired_len
@@ -110,13 +155,27 @@ impl IpReassemblyNode {
         };
 
         let key = fragment.key;
+        let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
+        if let Some(handoff) = &self.handoff {
+            let owner = handoff.directory.owner_or_insert(key, handoff.worker);
+            if owner != handoff.worker {
+                runtime.handoff_index(owner, handoff.reassembly, index)?;
+                return Ok(());
+            }
+        }
         if !self.contexts.contains_key(&key) {
             if self.contexts.len() == self.max_reassemblies {
                 runtime.free_index(index);
                 return Ok(());
             }
-            self.contexts
-                .insert(key, ReassemblyContext::new(fragment.version, now));
+            self.contexts.insert(
+                key,
+                ReassemblyContext::new(
+                    fragment.version,
+                    now,
+                    fragment_first_worker.unwrap_or_else(|| self.current_worker()),
+                ),
+            );
         }
 
         let mut completed = None;
@@ -126,6 +185,9 @@ impl IpReassemblyNode {
                 .contexts
                 .get_mut(&key)
                 .ok_or_else(|| CoreError::internal("missing reassembly context"))?;
+            if let Some(worker) = fragment_first_worker {
+                context.first_fragment_worker = worker;
+            }
             let outcome = context.insert_fragment(
                 runtime,
                 index,
@@ -144,15 +206,95 @@ impl IpReassemblyNode {
             if let Some(context) = self.contexts.remove(&key) {
                 context.free(runtime);
             }
+            if let Some(handoff) = &self.handoff {
+                handoff.directory.remove(key);
+            }
             return Ok(());
         }
 
         if let Some(index) = completed {
+            let first_worker = self
+                .contexts
+                .get(&key)
+                .map(|context| context.first_fragment_worker);
             self.contexts.remove(&key);
+            if let Some(handoff) = &self.handoff {
+                handoff.directory.remove(key);
+            }
             refresh_metadata(runtime, index)?;
-            next_frames.enqueue(runtime, self.next, index)?;
+            if let Some(handoff) = &self.handoff {
+                let first_worker = first_worker.unwrap_or(handoff.worker);
+                if first_worker != handoff.worker {
+                    runtime.handoff_index(first_worker, handoff.complete, index)?;
+                } else {
+                    next_frames.enqueue(runtime, self.next, index)?;
+                }
+            } else {
+                next_frames.enqueue(runtime, self.next, index)?;
+            }
         }
         Ok(())
+    }
+
+    #[inline(always)]
+    fn fragment_first_worker<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+        fragment: ParsedIpFragment,
+    ) -> CoreResult<Option<DataWorkerId>> {
+        if fragment.payload_offset != 0 {
+            return Ok(None);
+        }
+        if fragment.payload_offset == 0
+            && let Some(worker) = runtime.handoff_source_worker(index)?
+        {
+            return Ok(Some(worker));
+        }
+        Ok(Some(self.current_worker()))
+    }
+
+    #[inline(always)]
+    fn current_worker(&self) -> DataWorkerId {
+        self.handoff
+            .as_ref()
+            .map(|handoff| handoff.worker)
+            .unwrap_or_else(|| DataWorkerId::new(0))
+    }
+}
+
+impl IpReassemblyDirectory {
+    #[inline]
+    fn owner_or_insert(&self, key: IpFragmentKey, worker: DataWorkerId) -> DataWorkerId {
+        if let Some(owner) = self.inner.load().get(&key).copied() {
+            return owner;
+        }
+
+        let mut inserted = None;
+        self.inner.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            match next.entry(key) {
+                Entry::Occupied(entry) => inserted = Some(*entry.get()),
+                Entry::Vacant(entry) => {
+                    entry.insert(worker);
+                    inserted = Some(worker);
+                }
+            }
+            next
+        });
+        inserted.unwrap_or(worker)
+    }
+
+    #[inline]
+    fn remove(&self, key: IpFragmentKey) {
+        if !self.inner.load().contains_key(&key) {
+            return;
+        }
+        self.inner.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            next.remove(&key);
+            next
+        });
     }
 }
 
@@ -171,6 +313,7 @@ impl<G> InternalNode<G> for IpReassemblyNode {}
 
 struct ReassemblyContext {
     version: IpVersion,
+    first_fragment_worker: DataWorkerId,
     updated_at: Instant,
     total_payload_len: Option<usize>,
     fragments: Vec<ReassemblyFragment>,
@@ -178,9 +321,10 @@ struct ReassemblyContext {
 
 impl ReassemblyContext {
     #[inline]
-    fn new(version: IpVersion, now: Instant) -> Self {
+    fn new(version: IpVersion, now: Instant, first_fragment_worker: DataWorkerId) -> Self {
         Self {
             version,
+            first_fragment_worker,
             updated_at: now,
             total_payload_len: None,
             fragments: Vec::new(),

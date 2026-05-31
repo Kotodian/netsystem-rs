@@ -4,11 +4,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Network, Node, NodeResult,
-    RouteMetadata, SocksAddr,
+    BufferFrame, BufferNodeError, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode,
+    Network, Node, NodeHandle, NodeResult, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_service::net::{IpInputError, IpInputNext, IpInputNode, IpReassemblyNode};
+use hammer_service::net::{
+    IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory, IpReassemblyHandoff,
+    IpReassemblyNode,
+};
 
 struct SinkNode {
     packets: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -632,6 +635,147 @@ fn reassembly_expire_frees_incomplete_fragments() {
         1
     );
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_storage() {
+    const REASSEMBLY_HANDLE: NodeHandle = NodeHandle::new(1);
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(2);
+    let handoff = DataPlaneHandoff::new(2, 8);
+    let directory = IpReassemblyDirectory::default();
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let packets = Rc::new(RefCell::new(Vec::new()));
+    let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let first_sink = first_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            SinkNode {
+                packets: Rc::clone(&packets),
+                metadata: Rc::clone(&metadata),
+                node_errors: Rc::clone(&node_errors),
+            },
+        )
+        .expect("register first sink");
+    let first_reassembly = first_runtime
+        .nodes()
+        .register_internal_with_handle(
+            REASSEMBLY_HANDLE,
+            IpReassemblyNode::with_handoff(
+                first_sink,
+                IpReassemblyHandoff::new(
+                    REASSEMBLY_HANDLE,
+                    SINK_HANDLE,
+                    DataWorkerId::new(0),
+                    directory.clone(),
+                ),
+            ),
+        )
+        .expect("register first reassembly");
+    let first_input = first_runtime
+        .nodes()
+        .register_internal(IpInputNode::new(ip_input_nexts(
+            first_sink,
+            first_reassembly,
+        )));
+    let second_sink = second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            SinkNode {
+                packets: Rc::clone(&packets),
+                metadata: Rc::clone(&metadata),
+                node_errors: Rc::clone(&node_errors),
+            },
+        )
+        .expect("register second sink");
+    let second_reassembly = second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            REASSEMBLY_HANDLE,
+            IpReassemblyNode::with_handoff(
+                second_sink,
+                IpReassemblyHandoff::new(
+                    REASSEMBLY_HANDLE,
+                    SINK_HANDLE,
+                    DataWorkerId::new(1),
+                    directory.clone(),
+                ),
+            ),
+        )
+        .expect("register second reassembly");
+    let second_input = second_runtime
+        .nodes()
+        .register_internal(IpInputNode::new(ip_input_nexts(
+            second_sink,
+            second_reassembly,
+        )));
+    let original = ipv4_udp_packet(
+        [10, 0, 0, 9],
+        40_000,
+        [198, 51, 100, 13],
+        53,
+        b"abcdefghijklmnopqrstuvwx",
+    );
+    let fragments = ipv4_fragments(&original, 104, 16);
+    let first_frame = first_runtime
+        .alloc_frame_index()
+        .expect("alloc first frame");
+    let first_fragment = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), &fragments[0])
+        .expect("alloc first fragment");
+    let first_fragment_ptr = first_runtime
+        .current_ptr(first_fragment)
+        .expect("first ptr") as usize;
+    first_runtime
+        .get_frame_mut(first_frame)
+        .expect("mutate first frame")
+        .push_index(first_fragment)
+        .expect("push first fragment");
+    let second_frame = second_runtime
+        .alloc_frame_index()
+        .expect("alloc second frame");
+    let second_fragment = second_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), &fragments[1])
+        .expect("alloc second fragment");
+    second_runtime
+        .get_frame_mut(second_frame)
+        .expect("mutate second frame")
+        .push_index(second_fragment)
+        .expect("push second fragment");
+
+    assert!(
+        second_runtime
+            .schedule_frame(second_input, second_frame)
+            .expect("schedule second")
+    );
+    assert_eq!(second_runtime.run_ready_nodes().expect("run second"), 2);
+    assert!(
+        first_runtime
+            .schedule_frame(first_input, first_frame)
+            .expect("schedule first")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 2);
+    assert_eq!(second_runtime.run_ready_nodes().expect("drain owner"), 1);
+    assert_eq!(first_runtime.run_ready_nodes().expect("drain return"), 1);
+    assert_eq!(
+        &*packets.borrow(),
+        &[ipv4_reassembled_packet(&original, 104)]
+    );
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
+    assert_ne!(first_fragment_ptr, 0);
 }
 
 fn push_packet(

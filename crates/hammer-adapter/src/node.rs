@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -22,6 +22,16 @@ impl NodeId {
     #[inline]
     pub fn slot(self) -> u32 {
         self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeHandle(u32);
+
+impl NodeHandle {
+    #[inline(always)]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
     }
 }
 
@@ -204,6 +214,7 @@ struct NodeRuntimeInner<N> {
     nodes: Vec<Option<N>>,
     error_counters: Vec<NodeErrorCounters>,
     queue: VecDeque<ScheduledFrame>,
+    handles: HashMap<NodeHandle, NodeId>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -241,6 +252,7 @@ impl<N> Default for NodeRuntime<N> {
                 nodes: Vec::new(),
                 error_counters: Vec::new(),
                 queue: VecDeque::new(),
+                handles: HashMap::new(),
             })),
             readiness: Rc::new(NodeReadiness::default()),
         }
@@ -268,6 +280,39 @@ impl<N> NodeRuntime<N> {
         I: InternalNode<N> + Into<N>,
     {
         self.register(node.into())
+    }
+
+    pub fn register_internal_with_handle<I>(
+        &self,
+        handle: NodeHandle,
+        node: I,
+    ) -> CoreResult<NodeId>
+    where
+        I: InternalNode<N> + Into<N>,
+    {
+        self.register_with_handle(handle, node.into())
+    }
+
+    pub fn register_with_handle(&self, handle: NodeHandle, node: N) -> CoreResult<NodeId> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.handles.contains_key(&handle) {
+            return Err(CoreError::internal("node handle already registered"));
+        }
+        let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
+        inner.nodes.push(Some(node));
+        inner.error_counters.push(NodeErrorCounters::default());
+        inner.handles.insert(handle, id);
+        Ok(id)
+    }
+
+    #[inline]
+    pub fn node_for_handle(&self, handle: NodeHandle) -> CoreResult<NodeId> {
+        self.inner
+            .borrow()
+            .handles
+            .get(&handle)
+            .copied()
+            .ok_or_else(|| CoreError::internal("node handle is not registered"))
     }
 
     pub fn pending_len(&self) -> usize {

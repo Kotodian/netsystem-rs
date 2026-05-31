@@ -10,8 +10,9 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
+use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{Node, NodeId, NodeRuntime, NoopNode};
+use crate::node::{Node, NodeHandle, NodeId, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -238,6 +239,7 @@ pub struct Buffer {
     metadata: RouteMetadata,
     packet_cursor: BufferPacketCursor,
     node_error: Option<BufferNodeError>,
+    handoff_source_worker: Option<DataWorkerId>,
     flags: BufferFlags,
     current_data: usize,
     current_len: usize,
@@ -254,6 +256,7 @@ impl Buffer {
             metadata: RouteMetadata::default(),
             packet_cursor: BufferPacketCursor::default(),
             node_error: None,
+            handoff_source_worker: None,
             flags: BufferFlags::empty(),
             current_data: 0,
             current_len: 0,
@@ -276,6 +279,7 @@ impl Buffer {
         self.metadata = metadata;
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
+        self.handoff_source_worker = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = bytes.len();
@@ -291,6 +295,7 @@ impl Buffer {
         self.metadata = RouteMetadata::default();
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
+        self.handoff_source_worker = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = 0;
@@ -322,6 +327,16 @@ impl Buffer {
     #[inline]
     pub fn node_error(&self) -> Option<BufferNodeError> {
         self.node_error
+    }
+
+    #[inline]
+    pub fn handoff_source_worker(&self) -> Option<DataWorkerId> {
+        self.handoff_source_worker
+    }
+
+    #[inline]
+    pub fn set_handoff_source_worker(&mut self, worker: DataWorkerId) {
+        self.handoff_source_worker = Some(worker);
     }
 
     #[inline]
@@ -427,6 +442,7 @@ struct BufferPoolInner {
 #[derive(Debug, Clone)]
 pub struct BufferPool {
     inner: Rc<RefCell<BufferPoolInner>>,
+    handoff: Option<DataPlaneHandoffWorker>,
 }
 
 #[derive(Debug)]
@@ -467,6 +483,7 @@ pub struct DataPlaneRuntime<N = NoopNode> {
     buffers: DataPlaneBuffers,
     nodes: NodeRuntime<N>,
     current_node: Rc<Cell<Option<NodeId>>>,
+    handoff: Option<DataPlaneHandoffWorker>,
 }
 
 impl<N> Clone for DataPlaneRuntime<N> {
@@ -475,6 +492,7 @@ impl<N> Clone for DataPlaneRuntime<N> {
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),
+            handoff: self.handoff.clone(),
         }
     }
 }
@@ -588,6 +606,12 @@ impl DataPlaneBuffers {
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
             instruction_set,
         }
+    }
+
+    #[inline]
+    fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
+        self.buffers = self.buffers.with_handoff(handoff);
+        self
     }
 
     #[inline]
@@ -805,6 +829,30 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn current_ptr(&self, index: BufferIndex) -> CoreResult<*const u8> {
+        self.buffers.current_ptr(index)
+    }
+
+    #[inline]
+    pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
+        self.buffers.current_mut_ptr(index)
+    }
+
+    #[inline]
+    pub fn handoff_source_worker(&self, index: BufferIndex) -> CoreResult<Option<DataWorkerId>> {
+        self.buffers.handoff_source_worker(index)
+    }
+
+    #[inline]
+    pub fn mark_handoff_source_worker(
+        &self,
+        index: BufferIndex,
+        worker: DataWorkerId,
+    ) -> CoreResult<()> {
+        self.buffers.mark_handoff_source_worker(index, worker)
+    }
+
+    #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.truncate_current(index, len)
     }
@@ -906,7 +954,20 @@ impl<N> DataPlaneRuntime<N> {
             ),
             nodes: NodeRuntime::default(),
             current_node: Rc::new(Cell::new(None)),
+            handoff: None,
         }
+    }
+
+    #[inline]
+    pub fn with_handoff(
+        mut runtime: Self,
+        worker: DataWorkerId,
+        handoff: DataPlaneHandoffWorker,
+    ) -> Self {
+        debug_assert_eq!(worker, handoff.worker());
+        runtime.buffers = runtime.buffers.with_handoff(handoff.clone());
+        runtime.handoff = Some(handoff);
+        runtime
     }
 
     #[inline]
@@ -974,7 +1035,63 @@ impl<N> DataPlaneRuntime<N> {
     where
         N: Node<N>,
     {
+        self.drain_handoff_frames()?;
         self.nodes.run_ready(self)
+    }
+
+    #[inline]
+    fn drain_handoff_frames(&self) -> CoreResult<()> {
+        let Some(handoff) = &self.handoff else {
+            return Ok(());
+        };
+        while let Some(handoff_frame) = handoff.pop() {
+            let node = self.nodes.node_for_handle(handoff_frame.target)?;
+            let frame = self.alloc_frame_index()?;
+            {
+                let mut frame_ref = self.get_frame_mut(frame)?;
+                for index in handoff_frame.indices {
+                    frame_ref.push_index(index)?;
+                }
+            }
+            if !self.schedule_frame(node, frame)? {
+                self.free_frame_index(frame)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn handoff_frame(
+        &self,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<()> {
+        let Some(handoff) = &self.handoff else {
+            return Err(CoreError::internal("data plane handoff is not configured"));
+        };
+        let indices = frame.drain_pending().collect::<Vec<_>>();
+        for index in indices.iter().copied() {
+            self.mark_handoff_source_worker(index, handoff.worker())?;
+        }
+        if indices.is_empty() {
+            return Ok(());
+        }
+        handoff.enqueue(worker, target, indices)
+    }
+
+    #[inline]
+    pub fn handoff_index(
+        &self,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        let Some(handoff) = &self.handoff else {
+            return Err(CoreError::internal("data plane handoff is not configured"));
+        };
+        self.mark_handoff_source_worker(index, handoff.worker())?;
+        handoff.enqueue(worker, target, vec![index])
     }
 
     #[inline]
@@ -1023,7 +1140,20 @@ impl BufferPool {
                 free,
                 in_use: 0,
             })),
+            handoff: None,
         }
+    }
+
+    #[inline]
+    pub fn pool_id(&self) -> u64 {
+        self.inner.borrow().pool_id
+    }
+
+    #[inline]
+    fn with_handoff(mut self, handoff: DataPlaneHandoffWorker) -> Self {
+        handoff.register_buffer_pool(self.clone());
+        self.handoff = Some(handoff);
+        self
     }
 
     #[inline]
@@ -1047,12 +1177,34 @@ impl BufferPool {
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
-        self.inner.borrow_mut().free_chain(index);
+        let pool_id = self.inner.borrow().pool_id;
+        if index.pool_id == pool_id {
+            self.inner.borrow_mut().free_chain(index);
+            return;
+        }
+        if let Some(pool) = self
+            .handoff
+            .as_ref()
+            .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            pool.free_index(index);
+        }
     }
 
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
-        self.inner.borrow().prefetch_read(index);
+        let pool_id = self.inner.borrow().pool_id;
+        if index.pool_id == pool_id {
+            self.inner.borrow().prefetch_read(index);
+            return;
+        }
+        if let Some(pool) = self
+            .handoff
+            .as_ref()
+            .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            pool.prefetch_read(index);
+        }
     }
 
     #[inline]
@@ -1065,6 +1217,11 @@ impl BufferPool {
 
     #[inline]
     pub fn get(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
+        if index.pool_id != self.inner.borrow().pool_id {
+            return Err(CoreError::internal(
+                "foreign buffer index cannot be borrowed directly",
+            ));
+        }
         let guard = self.inner.borrow();
         guard.buffer(index)?;
         Ok(BufferRef { guard, index })
@@ -1072,6 +1229,11 @@ impl BufferPool {
 
     #[inline]
     pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
+        if index.pool_id != self.inner.borrow().pool_id {
+            return Err(CoreError::internal(
+                "foreign buffer index cannot be borrowed directly",
+            ));
+        }
         let mut guard = self.inner.borrow_mut();
         guard.buffer_mut(index)?;
         Ok(BufferRefMut { guard, index })
@@ -1083,6 +1245,14 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&Buffer) -> R,
     ) -> CoreResult<R> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.with_buffer(index, f);
+        }
         let pool = self.inner.borrow();
         let buffer = pool.buffer(index)?;
         Ok(f(buffer))
@@ -1094,6 +1264,14 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&mut Buffer) -> R,
     ) -> CoreResult<R> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.with_buffer_mut(index, f);
+        }
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         Ok(f(buffer))
@@ -1115,12 +1293,72 @@ impl BufferPool {
     }
 
     #[inline]
+    pub fn current_ptr(&self, index: BufferIndex) -> CoreResult<*const u8> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.current_ptr(index);
+        }
+        Ok(self.inner.borrow().buffer(index)?.current_ptr())
+    }
+
+    #[inline]
+    pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.current_mut_ptr(index);
+        }
+        Ok(self.inner.borrow_mut().buffer_mut(index)?.current_mut_ptr())
+    }
+
+    #[inline]
+    pub fn handoff_source_worker(&self, index: BufferIndex) -> CoreResult<Option<DataWorkerId>> {
+        self.with_buffer(index, Buffer::handoff_source_worker)
+    }
+
+    #[inline]
+    pub fn mark_handoff_source_worker(
+        &self,
+        index: BufferIndex,
+        worker: DataWorkerId,
+    ) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.mark_handoff_source_worker(index, worker);
+        }
+        self.inner
+            .borrow_mut()
+            .buffer_mut(index)?
+            .set_handoff_source_worker(worker);
+        Ok(())
+    }
+
+    #[inline]
     pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
         self.with_buffer(index, Buffer::node_error)
     }
 
     #[inline]
     pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.metadata(index);
+        }
         Ok(self.inner.borrow().buffer(index)?.metadata().clone())
     }
 
@@ -1130,6 +1368,14 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&RouteMetadata) -> R,
     ) -> CoreResult<R> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.with_metadata(index, f);
+        }
         let pool = self.inner.borrow();
         let metadata = pool.buffer(index)?.metadata();
         Ok(f(metadata))
@@ -1141,6 +1387,14 @@ impl BufferPool {
         index: BufferIndex,
         f: impl FnOnce(&mut RouteMetadata) -> R,
     ) -> CoreResult<R> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.with_metadata_mut(index, f);
+        }
         let mut pool = self.inner.borrow_mut();
         let metadata = pool.buffer_mut(index)?.metadata_mut();
         Ok(f(metadata))
@@ -1148,6 +1402,14 @@ impl BufferPool {
 
     #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.advance(index, len);
+        }
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if len > buffer.current_len {
@@ -1160,6 +1422,14 @@ impl BufferPool {
 
     #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.truncate_current(index, len);
+        }
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if len > buffer.current_len {
@@ -1173,6 +1443,14 @@ impl BufferPool {
 
     #[inline]
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.prepend(index, bytes);
+        }
         let mut pool = self.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         if bytes.len() > buffer.current_data {
@@ -1188,11 +1466,27 @@ impl BufferPool {
 
     #[inline]
     pub fn append(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.append(index, bytes);
+        }
         self.inner.borrow_mut().append_chain(index, bytes)
     }
 
     #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.current(index);
+        }
         Ok(self.inner.borrow().buffer(index)?.current().to_vec())
     }
 
@@ -1203,11 +1497,27 @@ impl BufferPool {
 
     #[inline]
     pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.is_chained(index);
+        }
         Ok(self.inner.borrow().buffer(index)?.next_buffer().is_some())
     }
 
     #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.copy_packet(index);
+        }
         let inner = self.inner.borrow();
         let buffer = inner.buffer(index)?;
         if buffer.next_buffer().is_none() {
@@ -1218,6 +1528,14 @@ impl BufferPool {
 
     #[inline]
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.copy_current_chain(index);
+        }
         self.inner.borrow().copy_current_chain(index)
     }
 }

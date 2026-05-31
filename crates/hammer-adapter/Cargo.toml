@@ -11,6 +11,7 @@ name = "hammer_adapter"
 hammer-core = { path = "../hammer-core" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+crossbeam-queue = { workspace = true }
 hickory-proto = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }
