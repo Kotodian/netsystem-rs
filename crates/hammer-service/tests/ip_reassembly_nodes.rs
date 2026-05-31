@@ -476,6 +476,93 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
 }
 
 #[test]
+fn ipv4_reassembly_accepts_more_than_three_fragments_by_default() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 4);
+    let packets = Rc::new(RefCell::new(Vec::new()));
+    let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register_internal(SinkNode {
+        packets: Rc::clone(&packets),
+        metadata,
+        node_errors,
+        buffer_indices: Rc::new(RefCell::new(Vec::new())),
+        chained: Rc::new(RefCell::new(Vec::new())),
+    });
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
+    let original = ipv4_udp_packet(
+        [10, 0, 0, 12],
+        12_355,
+        [198, 51, 100, 17],
+        53,
+        b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+    );
+    let fragments = ipv4_fragments_by_payload_lengths(&original, 105, &[16, 16, 16, 28]);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &fragments[2]);
+    push_packet(&runtime, frame, &fragments[0]);
+    push_packet(&runtime, frame, &fragments[3]);
+    push_packet(&runtime, frame, &fragments[1]);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(
+        &*packets.borrow(),
+        &[ipv4_reassembled_packet(&original, 105)]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ipv4_reassembly_drops_context_when_fragment_limit_is_exceeded() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 4);
+    let packets = Rc::new(RefCell::new(Vec::new()));
+    let metadata = Rc::new(RefCell::new(Vec::new()));
+    let node_errors = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register_internal(SinkNode {
+        packets: Rc::clone(&packets),
+        metadata,
+        node_errors,
+        buffer_indices: Rc::new(RefCell::new(Vec::new())),
+        chained: Rc::new(RefCell::new(Vec::new())),
+    });
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let reassembly = runtime.nodes().register_internal(
+        IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)).with_max_fragments_per_reassembly(2),
+    );
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
+    let original = ipv4_udp_packet(
+        [10, 0, 0, 13],
+        12_356,
+        [198, 51, 100, 18],
+        53,
+        b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+    );
+    let fragments = ipv4_fragments_by_payload_lengths(&original, 106, &[16, 16, 16, 28]);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &fragments[0]);
+    push_packet(&runtime, frame, &fragments[1]);
+    push_packet(&runtime, frame, &fragments[2]);
+    push_packet(&runtime, frame, &fragments[3]);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert!(packets.borrow().is_empty());
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
@@ -920,6 +1007,26 @@ fn ipv4_fragments(packet: &[u8], identification: u16, split: usize) -> Vec<Vec<u
         ipv4_fragment(packet, identification, 0, split, true),
         ipv4_fragment(packet, identification, split, payload_len - split, false),
     ]
+}
+
+fn ipv4_fragments_by_payload_lengths(
+    packet: &[u8],
+    identification: u16,
+    lengths: &[usize],
+) -> Vec<Vec<u8>> {
+    let payload_len = packet.len() - 20;
+    assert_eq!(lengths.iter().sum::<usize>(), payload_len);
+    let mut offset = 0usize;
+    let last = lengths.len().saturating_sub(1);
+    lengths
+        .iter()
+        .enumerate()
+        .map(|(index, len)| {
+            let fragment = ipv4_fragment(packet, identification, offset, *len, index != last);
+            offset += *len;
+            fragment
+        })
+        .collect()
 }
 
 fn ipv4_reassembled_packet(packet: &[u8], identification: u16) -> Vec<u8> {

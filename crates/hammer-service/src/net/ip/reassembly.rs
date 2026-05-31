@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,7 +26,7 @@ const IPV6_PAYLOAD_LENGTH_OFFSET: usize = 4;
 const IPV6_NEXT_HEADER_OFFSET: usize = 6;
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
-const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 3;
+const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 64;
 
 #[hammer_component_macros::node_next]
 pub enum IpReassemblyNext {
@@ -102,6 +103,12 @@ impl IpReassemblyNode {
     }
 
     #[inline]
+    pub fn with_max_fragments_per_reassembly(mut self, max_fragments: usize) -> Self {
+        self.max_fragments_per_reassembly = max_fragments;
+        self
+    }
+
+    #[inline]
     pub fn expire<G>(&mut self, runtime: &DataPlaneRuntime<G>, now: Instant) -> usize {
         let timeout = self.timeout;
         let expired = self
@@ -129,6 +136,7 @@ impl IpReassemblyNode {
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         next_frames: &mut NodeNextFrames,
+        failed_keys: &mut HashSet<IpFragmentKey>,
         index: BufferIndex,
         now: Instant,
     ) -> CoreResult<()> {
@@ -147,6 +155,10 @@ impl IpReassemblyNode {
         drop(buffer);
 
         let key = fragment.key;
+        if failed_keys.contains(&key) {
+            next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
+            return Ok(());
+        }
         let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
         if let Some(handoff) = &self.handoff {
             let owner = handoff.directory.owner_or_insert(key, handoff.worker);
@@ -209,6 +221,7 @@ impl IpReassemblyNode {
                 }
             }
             next_frames.enqueue(runtime, drop_node, failed_index)?;
+            failed_keys.insert(key);
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
@@ -314,8 +327,9 @@ impl<G> Node<G> for IpReassemblyNode {
     ) -> CoreResult<NodeResult> {
         let now = Instant::now();
         let mut next_frames = NodeNextFrames::default();
+        let mut failed_keys = HashSet::new();
         for_each_buffer_frame_index!(runtime, frame, |index| {
-            self.process_index(runtime, &mut next_frames, index, now)?;
+            self.process_index(runtime, &mut next_frames, &mut failed_keys, index, now)?;
             Ok(())
         })?;
         frame.clear();
