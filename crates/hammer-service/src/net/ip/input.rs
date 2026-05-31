@@ -1,6 +1,7 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeNextTable, NodeResult, SocksAddr, define_node_next,
+    BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, DataPlaneRuntime,
+    FrameBatchWidth, InternalNode, Node, NodeId, NodeNextFrames, NodeNextTable, NodeResult,
+    SocksAddr, define_node_next,
 };
 use hammer_core::error::CoreResult;
 
@@ -9,7 +10,6 @@ use crate::net::ip::{IpInputTarget, parse_ip_packet};
 define_node_next! {
     pub enum IpInputNext {
         Lookup,
-        Options,
         Reassembly,
     }
 }
@@ -53,22 +53,74 @@ fn dispatch_ip_input_frame<G>(
     next: NodeNextTable<IpInputNext>,
 ) -> CoreResult<NodeResult> {
     let mut next_frames = NodeNextFrames::default();
-    let indices = frame.pending_indices().to_vec();
-    frame.clear();
-    let mut cursor = indices.as_slice().chunks_exact(2);
-    for batch in cursor.by_ref() {
-        for index in batch.iter().copied() {
-            enqueue_index(runtime, &mut next_frames, index, next)?;
+    match runtime.preferred_frame_batch_width() {
+        FrameBatchWidth::Quad => {
+            dispatch_ip_input_frame_quad(runtime, frame, next, &mut next_frames)?
+        }
+        FrameBatchWidth::Pair => {
+            dispatch_ip_input_frame_pair(runtime, frame, next, &mut next_frames)?
         }
     }
-    for index in cursor.remainder().iter().copied() {
-        enqueue_index(runtime, &mut next_frames, index, next)?;
-    }
+    frame.clear();
     next_frames.schedule(runtime)?;
     Ok(NodeResult::drop())
 }
 
 #[inline]
+fn dispatch_ip_input_frame_quad<G>(
+    runtime: &DataPlaneRuntime<G>,
+    frame: &BufferFrame,
+    next: NodeNextTable<IpInputNext>,
+    next_frames: &mut NodeNextFrames,
+) -> CoreResult<()> {
+    let mut cursor = frame.quad_batch_cursor();
+    cursor.prefetch_next_quad(runtime);
+    while let Some(batch) = cursor.next() {
+        cursor.prefetch_next_quad(runtime);
+        match batch {
+            BufferFrameQuadBatch::Quad(indices) => {
+                enqueue_index(runtime, next_frames, indices[0], next)?;
+                enqueue_index(runtime, next_frames, indices[1], next)?;
+                enqueue_index(runtime, next_frames, indices[2], next)?;
+                enqueue_index(runtime, next_frames, indices[3], next)?;
+            }
+            BufferFrameQuadBatch::Pair(indices) => {
+                enqueue_index(runtime, next_frames, indices[0], next)?;
+                enqueue_index(runtime, next_frames, indices[1], next)?;
+            }
+            BufferFrameQuadBatch::Single(index) => {
+                enqueue_index(runtime, next_frames, index, next)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn dispatch_ip_input_frame_pair<G>(
+    runtime: &DataPlaneRuntime<G>,
+    frame: &BufferFrame,
+    next: NodeNextTable<IpInputNext>,
+    next_frames: &mut NodeNextFrames,
+) -> CoreResult<()> {
+    let mut cursor = frame.pair_batch_cursor();
+    cursor.prefetch_next_pair(runtime);
+    while let Some(batch) = cursor.next() {
+        cursor.prefetch_next_pair(runtime);
+        match batch {
+            BufferFramePairBatch::Pair(indices) => {
+                enqueue_index(runtime, next_frames, indices[0], next)?;
+                enqueue_index(runtime, next_frames, indices[1], next)?;
+            }
+            BufferFramePairBatch::Single(index) => {
+                enqueue_index(runtime, next_frames, index, next)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
 fn enqueue_index<G>(
     runtime: &DataPlaneRuntime<G>,
     next_frames: &mut NodeNextFrames,
@@ -83,7 +135,7 @@ fn enqueue_index<G>(
     Ok(())
 }
 
-#[inline]
+#[inline(always)]
 fn next_node_for_index<G>(
     runtime: &DataPlaneRuntime<G>,
     index: BufferIndex,
@@ -100,7 +152,7 @@ fn next_node_for_index<G>(
     metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
     let next = match parsed.input_target {
         IpInputTarget::Lookup => IpInputNext::Lookup,
-        IpInputTarget::Options => IpInputNext::Options,
+        IpInputTarget::Options => return Ok(None),
         IpInputTarget::Reassembly => IpInputNext::Reassembly,
     };
     Ok(Some(next_table.node(next)))
