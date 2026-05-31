@@ -6,4 +6,6 @@ pub use hammer_core::protocol::ip::{
     ParsedIpPacket, parse_ip_fragment, parse_ip_packet, parse_ip_packet_with_chain_len,
 };
 pub use input::{IpInputNext, IpInputNode};
-pub use reassembly::{IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNode};
+pub use reassembly::{
+    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+};

@@ -5,6 +5,32 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DropNode;
+
+impl DropNode {
+    #[inline(always)]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl<G> Node<G> for DropNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.drain_pending() {
+            runtime.free_index(index);
+        }
+        Ok(NodeResult::drop())
+    }
+}
+
+impl<G> InternalNode<G> for DropNode {}
+
 #[hammer_component_macros::node_next]
 pub enum RouteMatchNext {
     Lookup,

@@ -26,8 +26,14 @@ const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
 const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 3;
 
+#[hammer_component_macros::node_next]
+pub enum IpReassemblyNext {
+    Lookup,
+    Drop,
+}
+
 pub struct IpReassemblyNode {
-    next: NodeId,
+    next: [NodeId; IpReassemblyNext::COUNT],
     handoff: Option<IpReassemblyHandoff>,
     timeout: Duration,
     max_reassemblies: usize,
@@ -38,7 +44,7 @@ pub struct IpReassemblyNode {
 #[derive(Debug, Clone)]
 pub struct IpReassemblyHandoff {
     reassembly: NodeHandle,
-    complete: NodeHandle,
+    lookup: NodeHandle,
     worker: DataWorkerId,
     directory: IpReassemblyDirectory,
 }
@@ -52,13 +58,13 @@ impl IpReassemblyHandoff {
     #[inline]
     pub fn new(
         reassembly: NodeHandle,
-        complete: NodeHandle,
+        lookup: NodeHandle,
         worker: DataWorkerId,
         directory: IpReassemblyDirectory,
     ) -> Self {
         Self {
             reassembly,
-            complete,
+            lookup,
             worker,
             directory,
         }
@@ -67,7 +73,7 @@ impl IpReassemblyHandoff {
 
 impl IpReassemblyNode {
     #[inline]
-    pub fn new(next: NodeId) -> Self {
+    pub fn new(next: [NodeId; IpReassemblyNext::COUNT]) -> Self {
         Self {
             next,
             handoff: None,
@@ -79,7 +85,10 @@ impl IpReassemblyNode {
     }
 
     #[inline]
-    pub fn with_handoff(next: NodeId, handoff: IpReassemblyHandoff) -> Self {
+    pub fn with_handoff(
+        next: [NodeId; IpReassemblyNext::COUNT],
+        handoff: IpReassemblyHandoff,
+    ) -> Self {
         let mut node = Self::new(next);
         node.handoff = Some(handoff);
         node
@@ -115,29 +124,6 @@ impl IpReassemblyNode {
     }
 
     #[inline]
-    pub fn process_at<G>(
-        &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
-        now: Instant,
-    ) -> CoreResult<NodeResult> {
-        let mut next_frames = NodeNextFrames::default();
-        let indices = frame.pending_indices().to_vec();
-        frame.clear();
-        let mut cursor = indices.as_slice().chunks_exact(2);
-        for batch in cursor.by_ref() {
-            for index in batch.iter().copied() {
-                self.process_index(runtime, &mut next_frames, index, now)?;
-            }
-        }
-        for index in cursor.remainder().iter().copied() {
-            self.process_index(runtime, &mut next_frames, index, now)?;
-        }
-        next_frames.schedule(runtime)?;
-        Ok(NodeResult::drop())
-    }
-
-    #[inline]
     fn process_index<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -149,7 +135,7 @@ impl IpReassemblyNode {
         let fragment = match parse_ip_fragment(&packet) {
             Ok(fragment) => fragment,
             Err(_) => {
-                runtime.free_index(index);
+                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
                 return Ok(());
             }
         };
@@ -165,7 +151,7 @@ impl IpReassemblyNode {
         }
         if !self.contexts.contains_key(&key) {
             if self.contexts.len() == self.max_reassemblies {
-                runtime.free_index(index);
+                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
                 return Ok(());
             }
             self.contexts.insert(
@@ -178,8 +164,8 @@ impl IpReassemblyNode {
             );
         }
 
-        let mut completed = None;
-        let mut failed = false;
+        let mut reassembled = None;
+        let mut failed = None;
         {
             let context = self
                 .contexts
@@ -197,22 +183,33 @@ impl IpReassemblyNode {
             )?;
             match outcome {
                 ReassemblyInsert::Pending => {}
-                ReassemblyInsert::Complete(index) => completed = Some(index),
-                ReassemblyInsert::Failed => failed = true,
+                ReassemblyInsert::Drop(index) => {
+                    next_frames.enqueue(
+                        runtime,
+                        self.next[IpReassemblyNext::Drop.slot()],
+                        index,
+                    )?;
+                }
+                ReassemblyInsert::Reassembled(index) => reassembled = Some(index),
+                ReassemblyInsert::Failed(index) => failed = Some(index),
             }
         }
 
-        if failed {
+        if let Some(failed_index) = failed {
+            let drop_node = self.next[IpReassemblyNext::Drop.slot()];
             if let Some(context) = self.contexts.remove(&key) {
-                context.free(runtime);
+                for fragment in context.fragments {
+                    next_frames.enqueue(runtime, drop_node, fragment.index)?;
+                }
             }
+            next_frames.enqueue(runtime, drop_node, failed_index)?;
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
             return Ok(());
         }
 
-        if let Some(index) = completed {
+        if let Some(index) = reassembled {
             let first_worker = self
                 .contexts
                 .get(&key)
@@ -225,12 +222,16 @@ impl IpReassemblyNode {
             if let Some(handoff) = &self.handoff {
                 let first_worker = first_worker.unwrap_or(handoff.worker);
                 if first_worker != handoff.worker {
-                    runtime.handoff_index(first_worker, handoff.complete, index)?;
+                    runtime.handoff_index(first_worker, handoff.lookup, index)?;
                 } else {
-                    next_frames.enqueue(runtime, self.next, index)?;
+                    next_frames.enqueue(
+                        runtime,
+                        self.next[IpReassemblyNext::Lookup.slot()],
+                        index,
+                    )?;
                 }
             } else {
-                next_frames.enqueue(runtime, self.next, index)?;
+                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Lookup.slot()], index)?;
             }
         }
         Ok(())
@@ -305,7 +306,21 @@ impl<G> Node<G> for IpReassemblyNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        self.process_at(runtime, frame, Instant::now())
+        let now = Instant::now();
+        let mut next_frames = NodeNextFrames::default();
+        let indices = frame.pending_indices().to_vec();
+        frame.clear();
+        let mut cursor = indices.as_slice().chunks_exact(2);
+        for batch in cursor.by_ref() {
+            for index in batch.iter().copied() {
+                self.process_index(runtime, &mut next_frames, index, now)?;
+            }
+        }
+        for index in cursor.remainder().iter().copied() {
+            self.process_index(runtime, &mut next_frames, index, now)?;
+        }
+        next_frames.schedule(runtime)?;
+        Ok(NodeResult::drop())
     }
 }
 
@@ -346,25 +361,20 @@ impl ReassemblyContext {
             .checked_add(fragment.payload_len)
             .ok_or_else(|| CoreError::internal("fragment payload length overflow"))?;
         if start == end {
-            runtime.free_index(index);
-            return Ok(ReassemblyInsert::Pending);
+            return Ok(ReassemblyInsert::Drop(index));
         }
         if self.is_duplicate_covered(start, end) {
-            runtime.free_index(index);
-            return Ok(ReassemblyInsert::Pending);
+            return Ok(ReassemblyInsert::Drop(index));
         }
         if self.overlaps_existing(start, end) {
-            runtime.free_index(index);
-            return Ok(ReassemblyInsert::Failed);
+            return Ok(ReassemblyInsert::Failed(index));
         }
         if self.fragments.len() == max_fragments {
-            runtime.free_index(index);
-            return Ok(ReassemblyInsert::Failed);
+            return Ok(ReassemblyInsert::Failed(index));
         }
         if !fragment.more_fragments {
             if self.total_payload_len.is_some_and(|total| total != end) {
-                runtime.free_index(index);
-                return Ok(ReassemblyInsert::Failed);
+                return Ok(ReassemblyInsert::Failed(index));
             }
             self.total_payload_len = Some(end);
         }
@@ -428,7 +438,7 @@ impl ReassemblyContext {
         for fragment in self.fragments.drain(..) {
             runtime.free_index(fragment.index);
         }
-        Ok(ReassemblyInsert::Complete(complete))
+        Ok(ReassemblyInsert::Reassembled(complete))
     }
 
     #[inline]
@@ -524,8 +534,9 @@ struct ReassemblyFragment {
 
 enum ReassemblyInsert {
     Pending,
-    Complete(BufferIndex),
-    Failed,
+    Drop(BufferIndex),
+    Reassembled(BufferIndex),
+    Failed(BufferIndex),
 }
 
 #[inline(always)]

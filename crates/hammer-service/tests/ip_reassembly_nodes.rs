@@ -8,9 +8,10 @@ use hammer_adapter::{
     Network, Node, NodeHandle, NodeResult, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
+use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory, IpReassemblyHandoff,
-    IpReassemblyNode,
+    IpReassemblyNext, IpReassemblyNode,
 };
 
 struct SinkNode {
@@ -80,9 +81,16 @@ impl SinkCapture {
 }
 
 enum TestNode {
+    Drop(DropNode),
     IpInput(IpInputNode),
     Reassembly(IpReassemblyNode),
     Sink(SinkNode),
+}
+
+impl From<DropNode> for TestNode {
+    fn from(node: DropNode) -> Self {
+        Self::Drop(node)
+    }
 }
 
 impl From<IpInputNode> for TestNode {
@@ -111,6 +119,7 @@ impl Node<TestNode> for TestNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         match self {
+            Self::Drop(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::Reassembly(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
@@ -132,9 +141,10 @@ fn ip_input_routes_ipv4_options_to_options_next() {
     let options_capture = SinkCapture::new();
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let options = runtime.nodes().register_internal(options_capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(lookup));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(lookup, drop)));
     let input = IpInputNode::new(IpInputNext::nodes(
         lookup, lookup, options, lookup, lookup, lookup, reassembly,
     ));
@@ -176,19 +186,22 @@ fn ip_input_routes_ipv4_options_to_options_next() {
 #[test]
 fn ip_input_matches_vpp_ipv4_validation_nexts() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 16);
-    let drop_capture = SinkCapture::new();
     let lookup_capture = SinkCapture::new();
     let mcast_capture = SinkCapture::new();
     let icmp_capture = SinkCapture::new();
     let reassembly_capture = SinkCapture::new();
-    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
     let icmp = runtime.nodes().register_internal(icmp_capture.node());
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
+    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(reassembly_sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
+            reassembly_sink,
+            reassembly_drop,
+        )));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(IpInputNext::nodes(
@@ -236,28 +249,11 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
     assert_eq!(mcast_capture.packets(), vec![multicast]);
     assert_eq!(icmp_capture.packets(), vec![ttl_expired]);
     assert_eq!(
-        drop_capture.packets(),
-        vec![bad_checksum, fragment_offset_one]
-    );
-    assert_eq!(
         icmp_capture.node_errors(),
         vec![Some(BufferNodeError::new(
             input,
             IpInputError::TimeExpired.code()
         ))]
-    );
-    assert_eq!(
-        drop_capture.node_errors(),
-        vec![
-            Some(BufferNodeError::new(
-                input,
-                IpInputError::BadChecksum.code()
-            )),
-            Some(BufferNodeError::new(
-                input,
-                IpInputError::FragmentOffsetOne.code()
-            ))
-        ]
     );
     assert_eq!(
         runtime
@@ -291,19 +287,22 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
 #[test]
 fn ip_input_matches_vpp_ipv6_validation_nexts() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 16);
-    let drop_capture = SinkCapture::new();
     let lookup_capture = SinkCapture::new();
     let mcast_capture = SinkCapture::new();
     let icmp_capture = SinkCapture::new();
     let reassembly_capture = SinkCapture::new();
-    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
     let icmp = runtime.nodes().register_internal(icmp_capture.node());
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
+    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(reassembly_sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
+            reassembly_sink,
+            reassembly_drop,
+        )));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(IpInputNext::nodes(
@@ -343,19 +342,11 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
     assert_eq!(lookup_capture.packets(), vec![lookup_packet]);
     assert_eq!(mcast_capture.packets(), vec![multicast]);
     assert_eq!(icmp_capture.packets(), vec![hop_expired]);
-    assert_eq!(drop_capture.packets(), vec![too_short]);
     assert_eq!(
         icmp_capture.node_errors(),
         vec![Some(BufferNodeError::new(
             input,
             IpInputError::TimeExpired.code()
-        ))]
-    );
-    assert_eq!(
-        drop_capture.node_errors(),
-        vec![Some(BufferNodeError::new(
-            input,
-            IpInputError::BadLength.code()
         ))]
     );
     assert_eq!(
@@ -378,13 +369,16 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
 #[test]
 fn ip_input_validates_chain_length_like_vpp_current_chain() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(24, 16, 8, 8);
-    let drop_capture = SinkCapture::new();
     let lookup_capture = SinkCapture::new();
-    let drop = runtime.nodes().register_internal(drop_capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
+    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(lookup));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
+            lookup,
+            reassembly_drop,
+        )));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(IpInputNext::nodes(
@@ -410,7 +404,6 @@ fn ip_input_validates_chain_length_like_vpp_current_chain() {
             .expect("bad length counter"),
         0
     );
-    assert_eq!(drop_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -426,9 +419,10 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
         metadata: Rc::clone(&metadata),
         node_errors,
     });
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
@@ -476,9 +470,10 @@ fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
         metadata,
         node_errors,
     });
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
@@ -497,7 +492,7 @@ fn ipv4_reassembly_ignores_duplicate_covered_fragment() {
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_eq!(
         &*packets.borrow(),
         &[ipv4_reassembled_packet(&original, 101)]
@@ -517,9 +512,10 @@ fn ipv4_reassembly_drops_context_on_partial_overlap() {
         metadata,
         node_errors,
     });
+    let drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
@@ -538,7 +534,7 @@ fn ipv4_reassembly_drops_context_on_partial_overlap() {
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert!(packets.borrow().is_empty());
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -557,7 +553,7 @@ fn ipv6_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     });
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(sink));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, sink)));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
@@ -608,7 +604,8 @@ fn reassembly_expire_frees_incomplete_fragments() {
         metadata,
         node_errors,
     }));
-    let mut reassembly = IpReassemblyNode::new(sink).with_timeout(Duration::from_millis(100));
+    let mut reassembly = IpReassemblyNode::new(ip_reassembly_nexts(sink, sink))
+        .with_timeout(Duration::from_millis(100));
     let packet = ipv4_udp_packet(
         [10, 0, 0, 5],
         12_348,
@@ -625,13 +622,13 @@ fn reassembly_expire_frees_incomplete_fragments() {
 
     let started = Instant::now();
     reassembly
-        .process_at(&runtime, &mut frame, started)
+        .process(&runtime, &mut frame)
         .expect("process fragment");
     runtime.release_pooled_frame(frame).expect("release frame");
 
     assert_eq!(runtime.in_use_buffers(), 1);
     assert_eq!(
-        reassembly.expire(&runtime, started + Duration::from_millis(101)),
+        reassembly.expire(&runtime, started + Duration::from_secs(1)),
         1
     );
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -672,7 +669,7 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
         .register_internal_with_handle(
             REASSEMBLY_HANDLE,
             IpReassemblyNode::with_handoff(
-                first_sink,
+                ip_reassembly_nexts(first_sink, first_sink),
                 IpReassemblyHandoff::new(
                     REASSEMBLY_HANDLE,
                     SINK_HANDLE,
@@ -704,7 +701,7 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
         .register_internal_with_handle(
             REASSEMBLY_HANDLE,
             IpReassemblyNode::with_handoff(
-                second_sink,
+                ip_reassembly_nexts(second_sink, second_sink),
                 IpReassemblyHandoff::new(
                     REASSEMBLY_HANDLE,
                     SINK_HANDLE,
@@ -800,6 +797,13 @@ fn ip_input_nexts(
     IpInputNext::nodes(
         default, default, default, default, default, default, reassembly,
     )
+}
+
+fn ip_reassembly_nexts(
+    lookup: hammer_adapter::NodeId,
+    drop: hammer_adapter::NodeId,
+) -> [hammer_adapter::NodeId; IpReassemblyNext::COUNT] {
+    IpReassemblyNext::nodes(lookup, drop)
 }
 
 fn ipv4_options_packet() -> Vec<u8> {

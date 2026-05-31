@@ -10,7 +10,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_service::data_plane::{RouteMatchNext, RouteMatchNode};
+use hammer_service::data_plane::{DropNode, RouteMatchNext, RouteMatchNode};
 
 struct StaticRouter {
     decision: RouteDecision,
@@ -90,7 +90,14 @@ impl Node<TestNode> for DecisionSinkNode {
 
 enum TestNode {
     DecisionSink(DecisionSinkNode),
+    Drop(DropNode),
     RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
+}
+
+impl From<DropNode> for TestNode {
+    fn from(node: DropNode) -> Self {
+        Self::Drop(node)
+    }
 }
 
 impl From<RouteMatchNode<Arc<StaticRouter>>> for TestNode {
@@ -108,6 +115,7 @@ impl Node<TestNode> for TestNode {
     ) -> CoreResult<NodeResult> {
         match self {
             Self::DecisionSink(node) => node.process(runtime, frame),
+            Self::Drop(node) => node.process(runtime, frame),
             Self::RouteMatch(node) => node.process(runtime, frame),
         }
     }
@@ -167,6 +175,36 @@ fn route_match_node_is_service_internal_node() {
             target: RouteTarget::Outbound("direct".to_owned())
         }]
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn drop_node_frees_frame_buffers() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(64, 4, 2, 4);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(first)
+        .expect("push first");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(second)
+        .expect("push second");
+
+    assert_eq!(runtime.in_use_buffers(), 2);
+    assert!(runtime.schedule_frame(drop, frame).expect("schedule drop"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
