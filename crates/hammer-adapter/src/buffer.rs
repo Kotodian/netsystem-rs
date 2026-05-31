@@ -80,6 +80,11 @@ impl BufferFlags {
     fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
+
+    #[inline]
+    fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -868,6 +873,31 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn detach_next(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+        self.buffers.detach_next(index)
+    }
+
+    #[inline]
+    pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        self.buffers.append_existing_chain(head, tail)
+    }
+
+    #[inline]
+    pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        self.buffers.truncate_chain(index, len)
+    }
+
+    #[inline]
+    pub fn remove_current_range(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+    ) -> CoreResult<()> {
+        self.buffers.remove_current_range(index, offset, len)
+    }
+
+    #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.current(index)
     }
@@ -1478,6 +1508,65 @@ impl BufferPool {
     }
 
     #[inline]
+    pub fn detach_next(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.detach_next(index);
+        }
+        self.inner.borrow_mut().detach_next(index)
+    }
+
+    #[inline]
+    pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        if head.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(head.pool_id))
+        {
+            return pool.append_existing_chain(head, tail);
+        }
+        self.inner.borrow_mut().append_existing_chain(head, tail)
+    }
+
+    #[inline]
+    pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.truncate_chain(index, len);
+        }
+        self.inner.borrow_mut().truncate_chain(index, len)
+    }
+
+    #[inline]
+    pub fn remove_current_range(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+    ) -> CoreResult<()> {
+        if index.pool_id != self.inner.borrow().pool_id
+            && let Some(pool) = self
+                .handoff
+                .as_ref()
+                .and_then(|handoff| handoff.buffer_pool(index.pool_id))
+        {
+            return pool.remove_current_range(index, offset, len);
+        }
+        self.inner
+            .borrow_mut()
+            .remove_current_range(index, offset, len)
+    }
+
+    #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         if index.pool_id != self.inner.borrow().pool_id
             && let Some(pool) = self
@@ -2003,6 +2092,93 @@ impl BufferPoolInner {
             remaining = &remaining[take..];
         }
         self.refresh_chain_lengths(index)
+    }
+
+    #[inline]
+    fn detach_next(&mut self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+        let next = {
+            let buffer = self.buffer_mut(index)?;
+            let next = buffer.next_buffer.take();
+            buffer.flags.remove(BufferFlags::NEXT_PRESENT);
+            buffer.total_len_not_including_first = 0;
+            next
+        };
+        self.refresh_chain_lengths(index)?;
+        Ok(next)
+    }
+
+    #[inline]
+    fn append_existing_chain(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        self.buffer(head)?;
+        self.buffer(tail)?;
+        let mut current = head;
+        while let Some(next) = self.buffer(current)?.next_buffer {
+            current = next;
+        }
+        {
+            let current_buffer = self.buffer_mut(current)?;
+            current_buffer.next_buffer = Some(tail);
+            current_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+        }
+        self.refresh_chain_lengths(head)
+    }
+
+    #[inline]
+    fn truncate_chain(&mut self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        let mut remaining = len;
+        let mut current = Some(index);
+        while let Some(current_index) = current {
+            let current_len = self.buffer(current_index)?.current_len;
+            if remaining > current_len {
+                remaining -= current_len;
+                current = self.buffer(current_index)?.next_buffer;
+                continue;
+            }
+
+            let tail = {
+                let buffer = self.buffer_mut(current_index)?;
+                buffer.current_len = remaining;
+                let tail = buffer.next_buffer.take();
+                buffer.flags.remove(BufferFlags::NEXT_PRESENT);
+                buffer.total_len_not_including_first = 0;
+                tail
+            };
+            if let Some(tail) = tail {
+                self.free_chain(tail);
+            }
+            return self.refresh_chain_lengths(index);
+        }
+        Err(CoreError::internal("buffer chain truncate exceeds length"))
+    }
+
+    #[inline]
+    fn remove_current_range(
+        &mut self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+    ) -> CoreResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let buffer = self.buffer_mut(index)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CoreError::internal("buffer remove range overflow"))?;
+        if end > buffer.current_len {
+            return Err(CoreError::internal("buffer remove range exceeds current length"));
+        }
+        let current_data = buffer.current_data;
+        let current_end = current_data + buffer.current_len;
+        let remove_start = current_data + offset;
+        let remove_end = current_data + end;
+        buffer
+            .storage
+            .as_mut_slice()
+            .copy_within(remove_end..current_end, remove_start);
+        buffer.current_len -= len;
+        buffer.data_len = buffer.data_len.saturating_sub(len);
+        Ok(())
     }
 
     #[inline]

@@ -195,6 +195,64 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
 }
 
 #[test]
+fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
+    let pool = BufferPool::with_capacity(8, 8);
+    let head = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc head");
+    let tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"tail-data")
+        .expect("alloc tail chain");
+    let tail_ptr = pool.current_ptr(tail).expect("tail ptr") as usize;
+
+    pool.append_existing_chain(head, tail)
+        .expect("append existing chain");
+
+    assert!(pool.is_chained(head).expect("head is chained"));
+    assert_eq!(
+        pool.copy_current_chain(head).expect("combined chain"),
+        b"headtail-data"
+    );
+    assert_eq!(pool.current_ptr(tail).expect("tail ptr after append") as usize, tail_ptr);
+
+    let detached = pool.detach_next(head).expect("detach next");
+
+    assert_eq!(detached, Some(tail));
+    assert!(!pool.is_chained(head).expect("head detached"));
+    assert_eq!(pool.copy_current_chain(head).expect("head packet"), b"head");
+    assert_eq!(
+        pool.copy_current_chain(tail).expect("tail packet"),
+        b"tail-data"
+    );
+
+    pool.free_index(head);
+    pool.free_index(tail);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
+    let pool = BufferPool::with_capacity(4, 8);
+    let packet = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .expect("alloc chained packet");
+
+    assert_eq!(pool.in_use(), 3);
+
+    pool.truncate_chain(packet, 6).expect("truncate chain");
+
+    assert!(pool.is_chained(packet).expect("packet still chained"));
+    assert_eq!(
+        pool.copy_current_chain(packet).expect("truncated packet"),
+        b"abcdef"
+    );
+    assert_eq!(pool.in_use(), 2);
+
+    pool.free_index(packet);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn buffer_pool_reports_single_segment_and_chained_packets() {
     let pool = BufferPool::with_capacity(4, 8);
     let single = pool
