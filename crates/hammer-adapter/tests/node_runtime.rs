@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId, NodeResult,
-    RouteMetadata,
+    BufferFrame, BufferNodeError, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeId,
+    NodeResult, RouteMetadata,
 };
 use hammer_core::error::CoreResult;
 
@@ -114,11 +114,38 @@ impl Node<TestNode> for CountNode {
 
 impl InternalNode<TestNode> for CountNode {}
 
+struct ErrorNode {
+    code: u16,
+    errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
+}
+
+impl Node<TestNode> for ErrorNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for buffer in frame.drain_pending() {
+            let mut buffer_ref = runtime.get_buffer_mut(buffer)?;
+            let error = runtime.record_current_node_error(self.code)?;
+            buffer_ref.set_node_error(error);
+            self.errors.borrow_mut().push(buffer_ref.node_error());
+            drop(buffer_ref);
+            runtime.free_index(buffer);
+        }
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for ErrorNode {}
+
 enum TestNode {
     Forward(ForwardNode),
     SourceDriver(SourceDriverNode),
     Sink(SinkNode),
     Count(CountNode),
+    Error(ErrorNode),
 }
 
 impl From<ForwardNode> for TestNode {
@@ -145,6 +172,12 @@ impl From<CountNode> for TestNode {
     }
 }
 
+impl From<ErrorNode> for TestNode {
+    fn from(node: ErrorNode) -> Self {
+        Self::Error(node)
+    }
+}
+
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -157,6 +190,7 @@ impl Node<TestNode> for TestNode {
             Self::SourceDriver(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
             Self::Count(node) => node.process(runtime, frame),
+            Self::Error(node) => node.process(runtime, frame),
         }
     }
 }
@@ -252,6 +286,56 @@ fn node_runtime_registers_internal_role_node() {
     assert_eq!(count.get(), 1);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_counts_errors_per_runtime_node() {
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let first_errors = Rc::new(RefCell::new(Vec::new()));
+    let second_errors = Rc::new(RefCell::new(Vec::new()));
+    let first_node = first_runtime.nodes().register_internal(ErrorNode {
+        code: 7,
+        errors: Rc::clone(&first_errors),
+    });
+    let second_node = second_runtime.nodes().register_internal(ErrorNode {
+        code: 7,
+        errors: Rc::clone(&second_errors),
+    });
+    let first_frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    let first_buffer = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    first_runtime
+        .get_frame_mut(first_frame)
+        .expect("mutate frame")
+        .push_index(first_buffer)
+        .expect("push packet");
+
+    assert!(
+        first_runtime
+            .schedule_frame(first_node, first_frame)
+            .expect("schedule frame")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(
+        first_runtime
+            .node_error_count(first_node, 7)
+            .expect("first counter"),
+        1
+    );
+    assert_eq!(
+        second_runtime
+            .node_error_count(second_node, 7)
+            .expect("second counter"),
+        0
+    );
+    assert_eq!(
+        &*first_errors.borrow(),
+        &[Some(BufferNodeError::new(first_node, 7))]
+    );
+    assert!(second_errors.borrow().is_empty());
 }
 
 #[test]

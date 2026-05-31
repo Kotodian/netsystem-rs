@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferNodeError, BufferRefMut, DataPlaneRuntime, InternalNode, Node,
-    NodeId, NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
+    BufferFrame, BufferIndex, BufferRefMut, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
 };
 use hammer_core::error::CoreResult;
 
@@ -61,7 +61,7 @@ fn next_node_for_index<G>(
     ) {
         Ok(parsed) => parsed,
         Err(_) => {
-            set_node_error(&mut buffer, IpInputError::BadLength);
+            set_node_error(runtime, &mut buffer, IpInputError::BadLength)?;
             return Ok(next[IpInputNext::Drop.slot()]);
         }
     };
@@ -69,7 +69,7 @@ fn next_node_for_index<G>(
     if parsed.input_error == IpInputError::None {
         buffer.clear_node_error();
     } else {
-        set_node_error(&mut buffer, parsed.input_error);
+        set_node_error(runtime, &mut buffer, parsed.input_error)?;
     }
     let metadata = buffer.metadata_mut();
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));
@@ -86,6 +86,12 @@ fn next_node_for_index<G>(
 }
 
 #[inline(always)]
-fn set_node_error(buffer: &mut BufferRefMut<'_>, error: IpInputError) {
-    buffer.set_node_error(BufferNodeError::new(error.code()));
+fn set_node_error<G>(
+    runtime: &DataPlaneRuntime<G>,
+    buffer: &mut BufferRefMut<'_>,
+    error: IpInputError,
+) -> CoreResult<()> {
+    let error = runtime.record_current_node_error(error.code())?;
+    buffer.set_node_error(error);
+    Ok(())
 }

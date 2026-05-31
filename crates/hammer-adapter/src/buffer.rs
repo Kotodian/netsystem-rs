@@ -154,15 +154,21 @@ impl BufferPacketCursor {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufferNodeError {
+    node: NodeId,
     code: u16,
 }
 
 impl BufferNodeError {
     #[inline(always)]
-    pub const fn new(code: u16) -> Self {
-        Self { code }
+    pub const fn new(node: NodeId, code: u16) -> Self {
+        Self { node, code }
+    }
+
+    #[inline(always)]
+    pub const fn node(self) -> NodeId {
+        self.node
     }
 
     #[inline(always)]
@@ -450,6 +456,7 @@ pub struct DataPlaneBuffers {
 pub struct DataPlaneRuntime<N = NoopNode> {
     buffers: DataPlaneBuffers,
     nodes: NodeRuntime<N>,
+    current_node: Rc<Cell<Option<NodeId>>>,
 }
 
 impl<N> Clone for DataPlaneRuntime<N> {
@@ -457,6 +464,7 @@ impl<N> Clone for DataPlaneRuntime<N> {
         Self {
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
+            current_node: Rc::clone(&self.current_node),
         }
     }
 }
@@ -877,6 +885,7 @@ impl<N> DataPlaneRuntime<N> {
                 instruction_set,
             ),
             nodes: NodeRuntime::default(),
+            current_node: Rc::new(Cell::new(None)),
         }
     }
 
@@ -888,6 +897,30 @@ impl<N> DataPlaneRuntime<N> {
     #[inline]
     pub fn nodes(&self) -> &NodeRuntime<N> {
         &self.nodes
+    }
+
+    #[inline]
+    pub(crate) fn set_current_node(&self, node: Option<NodeId>) {
+        self.current_node.set(node);
+    }
+
+    #[inline]
+    pub fn current_node(&self) -> Option<NodeId> {
+        self.current_node.get()
+    }
+
+    #[inline]
+    pub fn record_current_node_error(&self, code: u16) -> CoreResult<BufferNodeError> {
+        let node = self
+            .current_node()
+            .ok_or_else(|| CoreError::internal("node error set outside node processing"))?;
+        self.nodes.increment_node_error(node, code)?;
+        Ok(BufferNodeError::new(node, code))
+    }
+
+    #[inline]
+    pub fn node_error_count(&self, node: NodeId, code: u16) -> CoreResult<u64> {
+        self.nodes.node_error_count(node, code)
     }
 
     #[inline]

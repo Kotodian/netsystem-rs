@@ -152,6 +152,19 @@ fn ip_input_routes_ipv4_options_to_options_next() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(options_capture.packets(), vec![packet]);
+    assert_eq!(
+        options_capture.node_errors(),
+        vec![Some(BufferNodeError::new(
+            input,
+            IpInputError::Options.code()
+        ))]
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::Options.code())
+            .expect("options counter"),
+        1
+    );
     assert_eq!(lookup_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -225,14 +238,47 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
     );
     assert_eq!(
         icmp_capture.node_errors(),
-        vec![Some(BufferNodeError::new(IpInputError::TimeExpired.code()))]
+        vec![Some(BufferNodeError::new(
+            input,
+            IpInputError::TimeExpired.code()
+        ))]
     );
     assert_eq!(
         drop_capture.node_errors(),
         vec![
-            Some(BufferNodeError::new(IpInputError::BadChecksum.code())),
-            Some(BufferNodeError::new(IpInputError::FragmentOffsetOne.code()))
+            Some(BufferNodeError::new(
+                input,
+                IpInputError::BadChecksum.code()
+            )),
+            Some(BufferNodeError::new(
+                input,
+                IpInputError::FragmentOffsetOne.code()
+            ))
         ]
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::TimeExpired.code())
+            .expect("ttl counter"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::BadChecksum.code())
+            .expect("checksum counter"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::FragmentOffsetOne.code())
+            .expect("fragment offset counter"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(drop, IpInputError::BadChecksum.code())
+            .expect("drop counter"),
+        0
     );
     assert_eq!(reassembly_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -297,11 +343,29 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
     assert_eq!(drop_capture.packets(), vec![too_short]);
     assert_eq!(
         icmp_capture.node_errors(),
-        vec![Some(BufferNodeError::new(IpInputError::TimeExpired.code()))]
+        vec![Some(BufferNodeError::new(
+            input,
+            IpInputError::TimeExpired.code()
+        ))]
     );
     assert_eq!(
         drop_capture.node_errors(),
-        vec![Some(BufferNodeError::new(IpInputError::BadLength.code()))]
+        vec![Some(BufferNodeError::new(
+            input,
+            IpInputError::BadLength.code()
+        ))]
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::TimeExpired.code())
+            .expect("hop counter"),
+        1
+    );
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::BadLength.code())
+            .expect("bad length counter"),
+        1
     );
     assert_eq!(reassembly_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -337,6 +401,12 @@ fn ip_input_validates_chain_length_like_vpp_current_chain() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(lookup_capture.packets(), vec![packet]);
+    assert_eq!(
+        runtime
+            .node_error_count(input, IpInputError::BadLength.code())
+            .expect("bad length counter"),
+        0
+    );
     assert_eq!(drop_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);

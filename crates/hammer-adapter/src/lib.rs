@@ -45,8 +45,8 @@ pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, NextFrame, Node, NodeId, NodeNext, NodeNextFrames, NodeNextGroups,
-    NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode,
+    DriverNode, InternalNode, NextFrame, Node, NodeErrorCounters, NodeId, NodeNext, NodeNextFrames,
+    NodeNextGroups, NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,

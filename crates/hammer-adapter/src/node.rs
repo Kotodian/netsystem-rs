@@ -19,6 +19,7 @@ pub use next::{NodeNext, NodeNextFrames, NodeNextGroups};
 pub struct NodeId(u32);
 
 impl NodeId {
+    #[inline]
     pub fn slot(self) -> u32 {
         self.0
     }
@@ -201,7 +202,29 @@ impl NodeReadiness {
 
 struct NodeRuntimeInner<N> {
     nodes: Vec<Option<N>>,
+    error_counters: Vec<NodeErrorCounters>,
     queue: VecDeque<ScheduledFrame>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeErrorCounters {
+    counters: Vec<u64>,
+}
+
+impl NodeErrorCounters {
+    #[inline]
+    pub fn increment(&mut self, code: u16) {
+        let slot = code as usize;
+        if self.counters.len() <= slot {
+            self.counters.resize(slot + 1, 0);
+        }
+        self.counters[slot] += 1;
+    }
+
+    #[inline]
+    pub fn get(&self, code: u16) -> u64 {
+        self.counters.get(code as usize).copied().unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +239,7 @@ impl<N> Default for NodeRuntime<N> {
         Self {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
                 nodes: Vec::new(),
+                error_counters: Vec::new(),
                 queue: VecDeque::new(),
             })),
             readiness: Rc::new(NodeReadiness::default()),
@@ -228,6 +252,7 @@ impl<N> NodeRuntime<N> {
         let mut inner = self.inner.borrow_mut();
         let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
         inner.nodes.push(Some(node));
+        inner.error_counters.push(NodeErrorCounters::default());
         id
     }
 
@@ -257,6 +282,28 @@ impl<N> NodeRuntime<N> {
         NodeRuntimeReady {
             readiness: Rc::clone(&self.readiness),
         }
+    }
+
+    #[inline]
+    pub fn increment_node_error(&self, node: NodeId, code: u16) -> CoreResult<()> {
+        self.inner
+            .borrow_mut()
+            .error_counters
+            .get_mut(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?
+            .increment(code);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn node_error_count(&self, node: NodeId, code: u16) -> CoreResult<u64> {
+        Ok(self
+            .inner
+            .borrow()
+            .error_counters
+            .get(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?
+            .get(code))
     }
 
     pub(crate) fn schedule_frame(
@@ -290,7 +337,9 @@ impl<N> NodeRuntime<N> {
             }
 
             frame.clear_next_node();
+            runtime.set_current_node(Some(scheduled.node));
             let result = node.process(runtime, &mut frame);
+            runtime.set_current_node(None);
             self.return_node(scheduled.node, node)?;
             let result = match result {
                 Ok(result) => result,
