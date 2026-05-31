@@ -794,15 +794,6 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn with_buffer<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&Buffer) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_buffer(index, f)
-    }
-
-    #[inline]
     pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
         self.buffers.get(index)
     }
@@ -810,15 +801,6 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn get_buffer_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
         self.buffers.get_mut(index)
-    }
-
-    #[inline]
-    pub fn with_buffer_mut<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&mut Buffer) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_buffer_mut(index, f)
     }
 
     #[inline]
@@ -862,6 +844,11 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
         self.buffers.current_len(index)
+    }
+
+    #[inline]
+    pub fn total_len_not_including_first(&self, index: BufferIndex) -> CoreResult<usize> {
+        self.buffers.total_len_not_including_first(index)
     }
 
     #[inline]
@@ -1339,40 +1326,28 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn with_buffer<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&Buffer) -> R,
-    ) -> CoreResult<R> {
-        let pool = self.arena.inner.borrow();
-        let buffer = pool.buffer(index)?;
-        Ok(f(buffer))
-    }
-
-    #[inline]
-    pub fn with_buffer_mut<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&mut Buffer) -> R,
-    ) -> CoreResult<R> {
-        let mut pool = self.arena.inner.borrow_mut();
-        let buffer = pool.buffer_mut(index)?;
-        Ok(f(buffer))
-    }
-
-    #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
-        self.with_buffer(index, Buffer::packet_cursor)
+        Ok(self.arena.inner.borrow().buffer(index)?.packet_cursor())
     }
 
     #[inline]
     pub fn current_data(&self, index: BufferIndex) -> CoreResult<usize> {
-        self.with_buffer(index, Buffer::current_data)
+        Ok(self.arena.inner.borrow().buffer(index)?.current_data())
     }
 
     #[inline]
     pub fn current_len(&self, index: BufferIndex) -> CoreResult<usize> {
-        self.with_buffer(index, Buffer::current_len)
+        Ok(self.arena.inner.borrow().buffer(index)?.current_len())
+    }
+
+    #[inline]
+    pub fn total_len_not_including_first(&self, index: BufferIndex) -> CoreResult<usize> {
+        Ok(self
+            .arena
+            .inner
+            .borrow()
+            .buffer(index)?
+            .total_len_not_including_first())
     }
 
     #[inline]
@@ -1392,7 +1367,12 @@ impl BufferPool {
 
     #[inline]
     pub fn handoff_source_worker(&self, index: BufferIndex) -> CoreResult<Option<DataWorkerId>> {
-        self.with_buffer(index, Buffer::handoff_source_worker)
+        Ok(self
+            .arena
+            .inner
+            .borrow()
+            .buffer(index)?
+            .handoff_source_worker())
     }
 
     #[inline]
@@ -1411,7 +1391,7 @@ impl BufferPool {
 
     #[inline]
     pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
-        self.with_buffer(index, Buffer::node_error)
+        Ok(self.arena.inner.borrow().buffer(index)?.node_error())
     }
 
     #[inline]
@@ -2690,6 +2670,13 @@ pub struct BufferRef<'pool> {
 }
 
 impl BufferRef<'_> {
+    #[inline]
+    pub fn buffer_ptr(&self) -> *const Buffer {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer") as *const Buffer
+    }
+
     #[inline]
     pub fn metadata(&self) -> &RouteMetadata {
         self.guard

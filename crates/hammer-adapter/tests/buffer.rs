@@ -94,11 +94,11 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
         .expect("alloc buffer");
 
-    pool.with_buffer(buffer, |buffer| {
-        assert_eq!((std::ptr::from_ref(buffer) as usize) % 64, 0);
+    {
+        let buffer = pool.get(buffer).expect("buffer ref");
+        assert_eq!(buffer.buffer_ptr() as usize % 64, 0);
         assert_eq!(buffer.current().as_ptr() as usize % 64, 0);
-    })
-    .expect("inspect buffer");
+    }
 
     pool.free_index(buffer);
 }
@@ -144,10 +144,9 @@ fn buffer_packet_cursor_lives_in_buffer_control_area() {
         .with_transport_header(20, 8)
         .with_transport_payload_offset(28);
 
-    pool.with_buffer_mut(buffer, |buffer| {
-        *buffer.packet_cursor_mut() = cursor;
-    })
-    .expect("write cursor");
+    pool.get_mut(buffer)
+        .expect("buffer mut")
+        .set_packet_cursor(cursor);
 
     assert_eq!(pool.packet_cursor(buffer).expect("read cursor"), cursor);
     assert_eq!(
