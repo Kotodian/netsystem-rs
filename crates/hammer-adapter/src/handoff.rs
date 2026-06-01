@@ -145,6 +145,19 @@ impl DataPlaneHandoffWorker {
     }
 
     #[inline]
+    pub(crate) fn ensure_enqueue_capacity(&self, worker: DataWorkerId) -> CoreResult<()> {
+        let queue = self
+            .inner
+            .queues
+            .get(worker.slot())
+            .ok_or_else(|| CoreError::internal("handoff target worker out of bounds"))?;
+        if queue.is_full() {
+            return Err(CoreError::internal("handoff queue exhausted"));
+        }
+        Ok(())
+    }
+
+    #[inline]
     fn enqueue_indices(
         &self,
         worker: DataWorkerId,

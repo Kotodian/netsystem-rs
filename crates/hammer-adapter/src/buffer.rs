@@ -1205,10 +1205,11 @@ impl<N> DataPlaneRuntime<N> {
         let Some(handoff) = &self.handoff else {
             return Err(CoreError::internal("data plane handoff is not configured"));
         };
-        let indices = frame.drain_pending().collect::<Vec<_>>();
-        for index in indices.iter().copied() {
+        handoff.ensure_enqueue_capacity(worker)?;
+        for index in frame.pending_indices().iter().copied() {
             self.mark_handoff_source_worker(index, handoff.worker())?;
         }
+        let indices = frame.drain_pending().collect::<Vec<_>>();
         if indices.is_empty() {
             return Ok(());
         }
@@ -1225,6 +1226,7 @@ impl<N> DataPlaneRuntime<N> {
         let Some(handoff) = &self.handoff else {
             return Err(CoreError::internal("data plane handoff is not configured"));
         };
+        handoff.ensure_enqueue_capacity(worker)?;
         self.mark_handoff_source_worker(index, handoff.worker())?;
         handoff.enqueue_index(worker, target, index)
     }

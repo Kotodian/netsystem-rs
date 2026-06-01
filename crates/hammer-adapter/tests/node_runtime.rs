@@ -728,6 +728,125 @@ fn data_plane_handoff_cleans_up_when_target_frame_pool_is_exhausted() {
 }
 
 #[test]
+fn data_plane_handoff_preserves_source_frame_until_marking_succeeds() {
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let foreign_runtime = DataPlaneRuntime::<TestNode>::with_capacities(64, 1, 4, 1);
+    let handoff_node = runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: NodeHandle::new(4),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let local = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"local")
+        .expect("alloc local packet");
+    let foreign = foreign_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"foreign")
+        .expect("alloc foreign packet");
+    {
+        let mut frame = runtime.get_frame_mut(frame).expect("mutate frame");
+        frame.push_index(local).expect("push local packet");
+        frame.push_index(foreign).expect("push foreign packet");
+    }
+
+    assert!(
+        runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("foreign buffer cannot be marked");
+    assert!(
+        err.to_string()
+            .contains("buffer index belongs to another pool"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(foreign_runtime.in_use_buffers(), 1);
+
+    foreign_runtime.free_index(foreign);
+}
+
+#[test]
+fn data_plane_handoff_preserves_source_frame_when_target_queue_is_full() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(5);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 1, BufferPoolArena::with_capacity(64, 8));
+    let runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let target_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let received = Rc::new(Cell::new(0));
+    target_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            CountNode {
+                count: Rc::clone(&received),
+            },
+        )
+        .expect("register sink handle");
+    let queued = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"queued")
+        .expect("alloc queued packet");
+    runtime
+        .handoff_index(DataWorkerId::new(1), SINK_HANDLE, queued)
+        .expect("fill handoff queue");
+    let handoff_node = runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"blocked");
+
+    assert!(
+        runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("handoff queue exhausted");
+    assert!(
+        err.to_string().contains("handoff queue exhausted"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 1);
+
+    assert_eq!(target_runtime.run_ready_nodes().expect("drain queued"), 1);
+    assert_eq!(received.get(), 1);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(target_runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn node_runtime_registers_driver_role_node() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
