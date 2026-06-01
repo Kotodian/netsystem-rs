@@ -793,6 +793,37 @@ fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
 }
 
 #[test]
+fn buffer_frame_batch_cursor_uses_requested_width() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
+    let indices = push_numbered_indices(&runtime, &mut frame, 5);
+
+    let quad_batches = frame
+        .batch_cursor(FrameBatchWidth::Quad)
+        .map(|batch| batch.indices().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let pair_batches = frame
+        .batch_cursor(FrameBatchWidth::Pair)
+        .map(|batch| batch.indices().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+
+    assert_eq!(quad_batches, vec![indices[0..4].to_vec(), vec![indices[4]]]);
+    assert_eq!(
+        pair_batches,
+        vec![
+            indices[0..2].to_vec(),
+            indices[2..4].to_vec(),
+            vec![indices[4]]
+        ]
+    );
+
+    runtime.free_frame(&mut frame);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release pooled frame");
+}
+
+#[test]
 fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
     let quad_runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
         8,

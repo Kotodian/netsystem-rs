@@ -2274,6 +2274,13 @@ pub enum BufferFrameQuadBatch {
     Single(BufferIndex),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFrameBatch {
+    Quad([BufferIndex; 4]),
+    Pair([BufferIndex; 2]),
+    Single(BufferIndex),
+}
+
 impl BufferFramePairBatch {
     #[inline]
     pub fn indices(self) -> BufferFrameBatchIndices {
@@ -2285,6 +2292,17 @@ impl BufferFramePairBatch {
 }
 
 impl BufferFrameQuadBatch {
+    #[inline]
+    pub fn indices(self) -> BufferFrameBatchIndices {
+        match self {
+            Self::Quad(indices) => BufferFrameBatchIndices::new(&indices),
+            Self::Pair(indices) => BufferFrameBatchIndices::new(&indices),
+            Self::Single(index) => BufferFrameBatchIndices::new(&[index]),
+        }
+    }
+}
+
+impl BufferFrameBatch {
     #[inline]
     pub fn indices(self) -> BufferFrameBatchIndices {
         match self {
@@ -2340,6 +2358,13 @@ pub struct BufferFramePairBatchCursor<'frame> {
 pub struct BufferFrameQuadBatchCursor<'frame> {
     indices: &'frame [BufferIndex],
     offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BufferFrameBatchCursor<'frame> {
+    indices: &'frame [BufferIndex],
+    offset: usize,
+    width: FrameBatchWidth,
 }
 
 #[derive(Default)]
@@ -2520,6 +2545,15 @@ impl BufferFrame {
         BufferFrameQuadBatchCursor {
             indices: self.pending_indices(),
             offset: 0,
+        }
+    }
+
+    #[inline]
+    pub fn batch_cursor(&self, width: FrameBatchWidth) -> BufferFrameBatchCursor<'_> {
+        BufferFrameBatchCursor {
+            indices: self.pending_indices(),
+            offset: 0,
+            width,
         }
     }
 
@@ -3223,6 +3257,54 @@ impl Iterator for BufferFrameQuadBatchCursor<'_> {
             Some(batch)
         } else {
             None
+        }
+    }
+}
+
+impl BufferFrameBatchCursor<'_> {
+    #[inline]
+    pub fn prefetch_next<G>(&self, runtime: &DataPlaneRuntime<G>) {
+        let width = match self.width {
+            FrameBatchWidth::Quad => 4,
+            FrameBatchWidth::Pair => 2,
+        };
+        for index in self.indices[self.offset..].iter().take(width).copied() {
+            runtime.prefetch_read(index);
+        }
+    }
+}
+
+impl Iterator for BufferFrameBatchCursor<'_> {
+    type Item = BufferFrameBatch;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let remaining = self.indices.len().saturating_sub(self.offset);
+        match self.width {
+            FrameBatchWidth::Quad if remaining >= 4 => {
+                let batch = BufferFrameBatch::Quad([
+                    self.indices[self.offset],
+                    self.indices[self.offset + 1],
+                    self.indices[self.offset + 2],
+                    self.indices[self.offset + 3],
+                ]);
+                self.offset += 4;
+                Some(batch)
+            }
+            _ if remaining >= 2 => {
+                let batch = BufferFrameBatch::Pair([
+                    self.indices[self.offset],
+                    self.indices[self.offset + 1],
+                ]);
+                self.offset += 2;
+                Some(batch)
+            }
+            _ if remaining == 1 => {
+                let batch = BufferFrameBatch::Single(self.indices[self.offset]);
+                self.offset += 1;
+                Some(batch)
+            }
+            _ => None,
         }
     }
 }

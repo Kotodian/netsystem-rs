@@ -58,10 +58,10 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut cursor = frame.pair_batch_cursor();
-        cursor.prefetch_next_pair(runtime);
+        let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
+        cursor.prefetch_next(runtime);
         while let Some(batch) = cursor.next() {
-            cursor.prefetch_next_pair(runtime);
+            cursor.prefetch_next(runtime);
             for index in batch.indices() {
                 let mut buffer = runtime.get_buffer_mut(index)?;
                 let metadata = buffer.metadata_mut();

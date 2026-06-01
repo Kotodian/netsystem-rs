@@ -221,10 +221,10 @@ impl TunPacketSink for MemoryTunOutput {
         let mut processed = 0usize;
         let mut send_result = Ok(());
         {
-            let mut cursor = frame.pair_batch_cursor();
-            cursor.prefetch_next_pair(runtime);
+            let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
+            cursor.prefetch_next(runtime);
             'send: while let Some(batch) = cursor.next() {
-                cursor.prefetch_next_pair(runtime);
+                cursor.prefetch_next(runtime);
                 for index in batch.indices() {
                     let packet = runtime.copy_current_chain(index);
                     runtime.free_index(index);
