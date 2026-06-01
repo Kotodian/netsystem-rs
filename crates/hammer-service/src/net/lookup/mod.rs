@@ -148,6 +148,8 @@ impl IpLookupNode {
             .unwrap_or_else(|| FibLookupResult::terminal(snapshot.drop_dpo(parsed.version)));
         buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
             fib_index: 0,
+            route_dpo_type: forwarding_dpo_type(result.route_dpo),
+            route_dpo_index: result.route_dpo.forwarding_index(),
             load_balance_index: result.forwarding_load_balance_index(),
             bucket_index: result.forwarding_bucket_index(),
             dpo_type: forwarding_dpo_type(result.dpo),

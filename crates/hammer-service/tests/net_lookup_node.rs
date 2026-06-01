@@ -387,6 +387,8 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"receive".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    assert_eq!(forwarding.route_dpo_type, ForwardingDpoType::LoadBalance);
+    assert_eq!(forwarding.route_dpo_index, receive_lb.get());
     assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -421,6 +423,8 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, u32::MAX);
     assert_eq!(forwarding.bucket_index, u16::MAX);
+    assert_eq!(forwarding.route_dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.route_dpo_index, 0);
     assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);

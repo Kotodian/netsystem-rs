@@ -25,6 +25,8 @@ pub struct RouteMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardingMetadata {
     pub fib_index: u32,
+    pub route_dpo_type: ForwardingDpoType,
+    pub route_dpo_index: u32,
     pub load_balance_index: u32,
     pub bucket_index: u16,
     pub dpo_type: ForwardingDpoType,
