@@ -3139,6 +3139,17 @@ impl FrameRefMut<'_> {
     }
 
     #[inline]
+    pub fn push_indices(
+        &mut self,
+        indices: impl IntoIterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        self.guard
+            .frame_mut(self.index)
+            .expect("frame ref points to valid frame")
+            .push_indices(indices)
+    }
+
+    #[inline]
     pub fn has_pending(&self) -> bool {
         self.guard
             .frame(self.index)

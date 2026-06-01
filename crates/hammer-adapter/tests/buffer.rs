@@ -949,6 +949,36 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 }
 
 #[test]
+fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .expect("alloc first buffer");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .expect("alloc second buffer");
+
+    {
+        let mut frame = runtime.get_frame_mut(frame_index).expect("frame ref mut");
+        frame
+            .push_indices([first, second])
+            .expect("push frame indices");
+    }
+
+    assert_eq!(
+        runtime
+            .with_frame(frame_index, |frame| frame.indices().to_vec())
+            .expect("read frame"),
+        vec![first, second]
+    );
+    runtime
+        .free_frame_index(frame_index)
+        .expect("free pooled frame");
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");

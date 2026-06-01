@@ -323,7 +323,7 @@ impl NodeNextFrames {
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
         let frame_index = self.frame_for(runtime, node)?;
-        runtime.with_frame_mut(frame_index, |frame| frame.push_indices(indices))?
+        runtime.get_frame_mut(frame_index)?.push_indices(indices)
     }
 
     #[inline]
