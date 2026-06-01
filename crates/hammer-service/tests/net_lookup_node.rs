@@ -411,6 +411,46 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
 }
 
 #[test]
+fn ip_input_keeps_lookup_packets_in_current_frame_without_allocating_next_frame() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 1);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let sink = register_sink(&runtime, &state);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            drop, drop, drop, sink, drop, drop, drop,
+        )));
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 41_001, [198, 51, 100, 17], 853, b"one"),
+    );
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 41_002, [198, 51, 100, 18], 853, b"two"),
+    );
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 41_003, [198, 51, 100, 19], 853, b"three"),
+    );
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_payloads(
+        &state,
+        &[b"one".as_slice(), b"two".as_slice(), b"three".as_slice()],
+    );
+    assert_frame_lens(&state, &[3]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));

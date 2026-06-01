@@ -1,6 +1,6 @@
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, BufferRefMut, DataPlaneRuntime, InternalNode,
-    Network, Node, NodeId, NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
+    Network, Node, NodeId, NodeNextEnqueue, NodeResult, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 
@@ -35,14 +35,18 @@ impl<G> Node<G> for IpInputNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut next_frames = NodeNextFrames::default();
-        for_each_buffer_frame_index!(runtime, frame, |index| {
-            let node = next_node_for_index(runtime, index, self.next)?;
-            next_frames.enqueue(runtime, node, index)
-        })?;
-        frame.clear();
-        next_frames.schedule(runtime)?;
-        Ok(NodeResult::drop())
+        let Some(first) = frame.pending_indices().first().copied() else {
+            return Ok(NodeResult::drop());
+        };
+        let speculative = next_node_for_index(runtime, first, self.next)?;
+        NodeNextEnqueue::new(speculative).validate_frame_with_first_next_and_prefetch(
+            runtime,
+            frame,
+            first,
+            speculative,
+            |index| runtime.prefetch_read(index),
+            |index| next_node_for_index(runtime, index, self.next),
+        )
     }
 }
 
