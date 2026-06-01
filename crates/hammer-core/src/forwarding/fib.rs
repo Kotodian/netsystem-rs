@@ -39,6 +39,11 @@ pub enum FibRouteDpoError {
     AdjacencyMissing {
         index: AdjacencyIndex,
     },
+    AdjacencyProtoMismatch {
+        index: AdjacencyIndex,
+        expected: IpVersion,
+        actual: IpVersion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -470,9 +475,19 @@ impl<N: Copy> FibSnapshotBuilder<N> {
             let Some(index) = bucket.adjacency_index() else {
                 continue;
             };
-            if self.adjacencies.get(index.slot()).is_none() {
+            let Some(adjacency) = self.adjacencies.get(index.slot()) else {
                 return Err(LoadBalanceError::BucketAdjacencyMissing {
                     index,
+                    bucket_index: bucket_index as u16,
+                });
+            };
+            let expected = bucket.proto();
+            let actual = adjacency.proto;
+            if actual != expected {
+                return Err(LoadBalanceError::BucketAdjacencyProtoMismatch {
+                    index,
+                    expected,
+                    actual,
                     bucket_index: bucket_index as u16,
                 });
             }
@@ -488,18 +503,29 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     ) -> Result<(), FibRouteDpoError> {
         validate_route_dpo_proto(expected, dpo)?;
         if let Some(index) = dpo.adjacency_index() {
-            self.validate_route_dpo_adjacency(index)?;
+            self.validate_route_dpo_adjacency(index, dpo.proto())?;
         }
         Ok(())
     }
 
     #[inline]
-    fn validate_route_dpo_adjacency(&self, index: AdjacencyIndex) -> Result<(), FibRouteDpoError> {
-        if self.adjacencies.get(index.slot()).is_some() {
-            Ok(())
-        } else {
-            Err(FibRouteDpoError::AdjacencyMissing { index })
+    fn validate_route_dpo_adjacency(
+        &self,
+        index: AdjacencyIndex,
+        expected: IpVersion,
+    ) -> Result<(), FibRouteDpoError> {
+        let Some(adjacency) = self.adjacencies.get(index.slot()) else {
+            return Err(FibRouteDpoError::AdjacencyMissing { index });
+        };
+        let actual = adjacency.proto;
+        if actual == expected {
+            return Ok(());
         }
+        Err(FibRouteDpoError::AdjacencyProtoMismatch {
+            index,
+            expected,
+            actual,
+        })
     }
 }
 

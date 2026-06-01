@@ -386,6 +386,27 @@ fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
 }
 
 #[test]
+fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let adjacency = builder.add_adjacency(IpVersion::V6, NextHop::Direct);
+    let err = builder
+        .try_add_ip4_route_dpo(
+            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 76), 32).expect("route"),
+            DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct),
+        )
+        .expect_err("route DPO with wrong-proto adjacency should be rejected");
+
+    assert_eq!(
+        err,
+        FibRouteDpoError::AdjacencyProtoMismatch {
+            index: adjacency,
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
+        }
+    );
+}
+
+#[test]
 fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance =
@@ -432,6 +453,28 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
         err,
         LoadBalanceError::BucketAdjacencyMissing {
             index: missing,
+            bucket_index: 0,
+        }
+    );
+}
+
+#[test]
+fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let adjacency = builder.add_adjacency(IpVersion::V6, NextHop::Direct);
+    let err = builder
+        .try_add_load_balance(
+            IpVersion::V4,
+            [DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct)],
+        )
+        .expect_err("load-balance bucket with wrong-proto adjacency should be rejected");
+
+    assert_eq!(
+        err,
+        LoadBalanceError::BucketAdjacencyProtoMismatch {
+            index: adjacency,
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
             bucket_index: 0,
         }
     );
