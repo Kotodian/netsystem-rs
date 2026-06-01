@@ -2595,6 +2595,24 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    pub fn retain_indices_batched_with_prefetch_state_lazy<S>(
+        &mut self,
+        width: FrameBatchWidth,
+        state: &mut S,
+        mut prefetch: impl FnMut(&mut S, BufferIndex),
+        mut keep: impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
+                self.retain_indices_quad_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
+            }
+            FrameBatchWidth::Pair => {
+                self.retain_indices_pair_with_prefetch_state_lazy(state, &mut prefetch, &mut keep)
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn rewrite_indices_batched(
         &mut self,
         width: FrameBatchWidth,
@@ -2763,6 +2781,61 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_indices_quad_with_prefetch_state_lazy<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = None;
+        while read + 4 <= len {
+            self.prefetch_indices_state(read + 4, 4, state, prefetch);
+            self.retain_one_state_lazy(read, &mut write, state, keep)?;
+            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
+            self.retain_one_state_lazy(read + 2, &mut write, state, keep)?;
+            self.retain_one_state_lazy(read + 3, &mut write, state, keep)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            self.prefetch_indices_state(read + 2, 2, state, prefetch);
+            self.retain_one_state_lazy(read, &mut write, state, keep)?;
+            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
+            read += 2;
+        }
+        while read < len {
+            self.retain_one_state_lazy(read, &mut write, state, keep)?;
+            read += 1;
+        }
+        self.finish_retain_lazy(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_pair_with_prefetch_state_lazy<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = None;
+        while read + 2 <= len {
+            self.prefetch_indices_state(read + 2, 2, state, prefetch);
+            self.retain_one_state_lazy(read, &mut write, state, keep)?;
+            self.retain_one_state_lazy(read + 1, &mut write, state, keep)?;
+            read += 2;
+        }
+        if read < len {
+            self.retain_one_state_lazy(read, &mut write, state, keep)?;
+        }
+        self.finish_retain_lazy(write);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
         rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
@@ -2842,6 +2915,26 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_one_state_lazy<S>(
+        &mut self,
+        read: usize,
+        write: &mut Option<usize>,
+        state: &mut S,
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let index = self.indices[read];
+        if keep(state, index)? {
+            if let Some(write) = write {
+                self.indices[*write] = index;
+                *write += 1;
+            }
+        } else if write.is_none() {
+            *write = Some(read);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_one(
         &mut self,
         read: usize,
@@ -2890,6 +2983,13 @@ impl BufferFrame {
             self.readiness.clear_pending();
         } else {
             self.readiness.mark_pending();
+        }
+    }
+
+    #[inline(always)]
+    fn finish_retain_lazy(&mut self, len: Option<usize>) {
+        if let Some(len) = len {
+            self.finish_retain(len);
         }
     }
 

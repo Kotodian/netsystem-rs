@@ -266,7 +266,7 @@ impl NodeNextEnqueue {
     ) -> CoreResult<()> {
         let speculative_node = self.speculative_node;
         let mut batch = runtime.buffer_batch_mut();
-        let result = frame.retain_indices_batched_with_prefetch_state(
+        let result = frame.retain_indices_batched_with_prefetch_state_lazy(
             width,
             &mut batch,
             |batch, index| prefetch_index(batch, index),

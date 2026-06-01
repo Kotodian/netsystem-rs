@@ -980,6 +980,35 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
         .expect("release reused pooled frame");
 }
 
+#[test]
+fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+    let indices = push_numbered_indices(&runtime, &mut frame, 5);
+    let mut prefetched = 0usize;
+
+    frame
+        .retain_indices_batched_with_prefetch_state_lazy(
+            FrameBatchWidth::Quad,
+            &mut prefetched,
+            |prefetched, _index| {
+                *prefetched += 1;
+            },
+            |_, index| Ok(index != indices[1] && index != indices[3]),
+        )
+        .expect("retain frame");
+
+    assert_eq!(frame.indices(), &[indices[0], indices[2], indices[4]]);
+    assert!(prefetched > 0);
+
+    runtime.free_index(indices[1]);
+    runtime.free_index(indices[3]);
+    runtime
+        .release_pooled_frame(frame)
+        .expect("release retained frame");
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
 fn push_numbered_indices(
     runtime: &DataPlaneRuntime<NoopNode>,
     frame: &mut BufferFrame,
