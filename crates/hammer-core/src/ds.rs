@@ -3,4 +3,4 @@ mod mtrie;
 pub mod prefetch;
 
 pub use flat_hash::{FlatHashKey, FlatHashTable, PrefixLengthSearchOrder};
-pub use mtrie::{Mtrie, MtrieRoute, MtrieValue};
+pub use mtrie::{Mtrie, MtrieEntry, PackedMtrie, PackedMtrieValue};

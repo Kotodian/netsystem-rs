@@ -10,12 +10,12 @@ const MTRIE_LEAF_EMPTY: u32 = 0;
 const MTRIE_LEAF_TERMINAL: u32 = 1 << 31;
 const MTRIE_LEAF_VALUE_MASK: u32 = MTRIE_LEAF_TERMINAL - 1;
 
-pub trait MtrieValue: Copy {
+pub trait PackedMtrieValue: Copy {
     fn into_leaf_value(self) -> u32;
     fn from_leaf_value(value: u32) -> Self;
 }
 
-impl MtrieValue for u32 {
+impl PackedMtrieValue for u32 {
     #[inline(always)]
     fn into_leaf_value(self) -> u32 {
         self
@@ -28,13 +28,13 @@ impl MtrieValue for u32 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MtrieRoute<V> {
+pub struct MtrieEntry<V> {
     pub key: u32,
     pub prefix_len: u8,
     pub value: V,
 }
 
-impl<V> MtrieRoute<V> {
+impl<V> MtrieEntry<V> {
     #[inline(always)]
     pub fn new(key: u32, prefix_len: u8, value: V) -> Self {
         assert!(prefix_len <= 32, "invalid mtrie prefix length");
@@ -47,37 +47,155 @@ impl<V> MtrieRoute<V> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Mtrie<V: MtrieValue> {
-    root: Box<MtrieRoot>,
-    plies: Vec<MtriePly>,
-    _value: PhantomData<V>,
+pub struct Mtrie<V: Copy> {
+    raw: RawMtrie,
+    values: Vec<V>,
 }
 
-impl<V: MtrieValue> Mtrie<V> {
+impl<V: Copy> Mtrie<V> {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            root: Box::new(MtrieRoot::filled(MtrieLeaf::empty())),
-            plies: Vec::new(),
-            _value: PhantomData,
+            raw: RawMtrie::empty(),
+            values: Vec::new(),
         }
     }
 
     #[inline]
-    pub fn from_routes(routes: impl IntoIterator<Item = MtrieRoute<V>>) -> Self {
-        let mut routes = routes.into_iter().collect::<Vec<_>>();
-        routes.sort_by_key(|route| route.prefix_len);
+    pub fn from_entries(entries: impl IntoIterator<Item = MtrieEntry<V>>) -> Self {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.prefix_len);
         let mut trie = Self::empty();
-        for route in routes {
-            trie.insert(route.key, route.prefix_len, route.value);
+        for entry in entries {
+            trie.insert(entry.key, entry.prefix_len, entry.value);
         }
         trie
     }
 
     #[inline]
     pub fn insert(&mut self, key: u32, prefix_len: u8, value: V) {
+        let index = self.values.len();
+        assert!(
+            index <= MTRIE_LEAF_VALUE_MASK as usize,
+            "mtrie value table exceeds leaf capacity"
+        );
+        self.values.push(value);
+        self.raw.insert(key, prefix_len, index as u32);
+    }
+
+    #[inline(always)]
+    pub fn lookup(&self, key: u32) -> Option<V> {
+        let index = self.raw.lookup(key)? as usize;
+        self.values.get(index).copied()
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, key: u32) {
+        self.raw.prefetch(key);
+    }
+
+    #[inline(always)]
+    pub fn ply_count(&self) -> usize {
+        self.raw.ply_count()
+    }
+
+    #[inline(always)]
+    pub fn root_alignment(&self) -> usize {
+        self.raw.root_alignment()
+    }
+
+    #[inline(always)]
+    pub fn root_addr(&self) -> usize {
+        self.raw.root_addr()
+    }
+
+    #[inline(always)]
+    pub fn ply_addr(&self, index: usize) -> Option<usize> {
+        self.raw.ply_addr(index)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PackedMtrie<V: PackedMtrieValue> {
+    raw: RawMtrie,
+    _value: PhantomData<V>,
+}
+
+impl<V: PackedMtrieValue> PackedMtrie<V> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            raw: RawMtrie::empty(),
+            _value: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn from_entries(entries: impl IntoIterator<Item = MtrieEntry<V>>) -> Self {
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.prefix_len);
+        let mut trie = Self::empty();
+        for entry in entries {
+            trie.insert(entry.key, entry.prefix_len, entry.value);
+        }
+        trie
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: u32, prefix_len: u8, value: V) {
+        self.raw.insert(key, prefix_len, value.into_leaf_value());
+    }
+
+    #[inline(always)]
+    pub fn lookup(&self, key: u32) -> Option<V> {
+        self.raw.lookup(key).map(V::from_leaf_value)
+    }
+
+    #[inline(always)]
+    pub fn prefetch(&self, key: u32) {
+        self.raw.prefetch(key);
+    }
+
+    #[inline(always)]
+    pub fn ply_count(&self) -> usize {
+        self.raw.ply_count()
+    }
+
+    #[inline(always)]
+    pub fn root_alignment(&self) -> usize {
+        self.raw.root_alignment()
+    }
+
+    #[inline(always)]
+    pub fn root_addr(&self) -> usize {
+        self.raw.root_addr()
+    }
+
+    #[inline(always)]
+    pub fn ply_addr(&self, index: usize) -> Option<usize> {
+        self.raw.ply_addr(index)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RawMtrie {
+    root: Box<MtrieRoot>,
+    plies: Vec<MtriePly>,
+}
+
+impl RawMtrie {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            root: Box::new(MtrieRoot::filled(MtrieLeaf::empty())),
+            plies: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, prefix_len: u8, value: u32) {
         assert!(prefix_len <= 32, "invalid mtrie prefix length");
-        let terminal = MtrieLeaf::terminal(value.into_leaf_value());
+        let terminal = MtrieLeaf::terminal(value);
         let root_value = root_stride(key);
         if prefix_len <= MTRIE_ROOT_BITS {
             fill_stride(
@@ -113,23 +231,23 @@ impl<V: MtrieValue> Mtrie<V> {
     }
 
     #[inline(always)]
-    pub fn lookup(&self, key: u32) -> Option<V> {
+    fn lookup(&self, key: u32) -> Option<u32> {
         let mut leaf = self.root.leaves[root_stride(key)];
         if let Some(value) = leaf.value() {
-            return Some(V::from_leaf_value(value));
+            return Some(value);
         }
         let first_ply = leaf.ply_index()?;
         leaf = self.plies.get(first_ply)?.leaves[first_child_stride(key)];
         if let Some(value) = leaf.value() {
-            return Some(V::from_leaf_value(value));
+            return Some(value);
         }
         let second_ply = leaf.ply_index()?;
         leaf = self.plies.get(second_ply)?.leaves[second_child_stride(key)];
-        leaf.value().map(V::from_leaf_value)
+        leaf.value()
     }
 
     #[inline(always)]
-    pub fn prefetch(&self, key: u32) {
+    fn prefetch(&self, key: u32) {
         let root_leaf = &self.root.leaves[root_stride(key)];
         prefetch_read_l1(root_leaf);
         if let Some(first_ply) = root_leaf.ply_index()
@@ -146,22 +264,22 @@ impl<V: MtrieValue> Mtrie<V> {
     }
 
     #[inline(always)]
-    pub fn ply_count(&self) -> usize {
+    fn ply_count(&self) -> usize {
         self.plies.len()
     }
 
     #[inline(always)]
-    pub fn root_alignment(&self) -> usize {
+    fn root_alignment(&self) -> usize {
         std::mem::align_of_val(self.root.as_ref())
     }
 
     #[inline(always)]
-    pub fn root_addr(&self) -> usize {
+    fn root_addr(&self) -> usize {
         std::ptr::from_ref(self.root.as_ref()).addr()
     }
 
     #[inline(always)]
-    pub fn ply_addr(&self, index: usize) -> Option<usize> {
+    fn ply_addr(&self, index: usize) -> Option<usize> {
         self.plies
             .get(index)
             .map(|ply| std::ptr::from_ref(ply).addr())
