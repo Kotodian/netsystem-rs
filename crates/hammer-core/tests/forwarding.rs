@@ -1,8 +1,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    AdjacencyIndex, Dpo, DpoId, DpoType, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute,
-    Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
+    AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoId, DpoType,
+    FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -145,6 +145,47 @@ fn dpo_adjacency_carries_typed_adjacency_index() {
 #[test]
 fn dpo_keeps_compact_hot_path_layout_for_u32_next() {
     assert_eq!(std::mem::size_of::<Dpo<u32>>(), 12);
+}
+
+#[test]
+fn dpo_custom_carries_custom_type_index_and_next() {
+    let custom_type = CustomDpoType::new(42).expect("custom type");
+    let custom_index = CustomDpoIndex::new(9001);
+    let dpo = Dpo::custom(IpVersion::V6, custom_type, custom_index, NextHop::Direct);
+
+    assert_eq!(dpo.kind(), DpoType::Custom);
+    assert_eq!(dpo.proto(), IpVersion::V6);
+    assert_eq!(dpo.next(), NextHop::Direct);
+    assert_eq!(dpo.custom_type(), Some(custom_type));
+    assert_eq!(dpo.custom_index(), Some(custom_index));
+    assert_eq!(dpo.forwarding_index(), custom_index.get());
+}
+
+#[test]
+fn custom_dpo_registry_allocates_unique_nonzero_types() {
+    let mut registry = CustomDpoRegistry::new();
+
+    let first = registry.register().expect("first custom dpo type");
+    let second = registry.register().expect("second custom dpo type");
+
+    assert_ne!(first, second);
+    assert_ne!(first.get(), 0);
+    assert_ne!(second.get(), 0);
+}
+
+#[test]
+fn dpo_stack_preserves_parent_identity_and_updates_next() {
+    let custom_type = CustomDpoType::new(9).expect("custom type");
+    let custom_index = CustomDpoIndex::new(17);
+    let parent = Dpo::custom(IpVersion::V4, custom_type, custom_index, NextHop::Drop);
+    let stacked = Dpo::stack(parent, NextHop::Direct);
+
+    assert_eq!(stacked.kind(), DpoType::Custom);
+    assert_eq!(stacked.proto(), IpVersion::V4);
+    assert_eq!(stacked.custom_type(), Some(custom_type));
+    assert_eq!(stacked.custom_index(), Some(custom_index));
+    assert_eq!(stacked.forwarding_index(), custom_index.get());
+    assert_eq!(stacked.next(), NextHop::Direct);
 }
 
 #[test]

@@ -37,6 +37,7 @@ pub enum ForwardingDpoType {
     Punt,
     Adjacency,
     Receive,
+    Custom(u16),
 }
 
 /// Where a `RouteDecision::Route` points. Outbounds and endpoints live in

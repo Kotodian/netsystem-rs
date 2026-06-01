@@ -13,7 +13,9 @@ use hammer_core::forwarding::{
     FibSnapshot as CoreFibSnapshot, FibSnapshotBuilder as CoreFibSnapshotBuilder,
     LoadBalance as CoreLoadBalance,
 };
-pub use hammer_core::forwarding::{AdjacencyIndex, DpoType, FibEntry, LoadBalanceIndex};
+pub use hammer_core::forwarding::{
+    AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoType, FibEntry, LoadBalanceIndex,
+};
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
 };
@@ -151,7 +153,7 @@ impl IpLookupNode {
             fib_index: 0,
             load_balance_index: result.load_balance.get(),
             bucket_index: result.bucket_index,
-            dpo_type: forwarding_dpo_type(result.dpo.kind()),
+            dpo_type: forwarding_dpo_type(result.dpo),
             dpo_index: result.dpo.forwarding_index(),
         });
         Ok(result.dpo.next())
@@ -269,12 +271,17 @@ impl<G> Node<G> for IpLookupNode {
 impl<G> InternalNode<G> for IpLookupNode {}
 
 #[inline(always)]
-fn forwarding_dpo_type(dpo_type: DpoType) -> ForwardingDpoType {
-    match dpo_type {
+fn forwarding_dpo_type(dpo: DpoId) -> ForwardingDpoType {
+    match dpo.kind() {
         DpoType::Drop => ForwardingDpoType::Drop,
         DpoType::Punt => ForwardingDpoType::Punt,
         DpoType::Adjacency => ForwardingDpoType::Adjacency,
         DpoType::Receive => ForwardingDpoType::Receive,
+        DpoType::Custom => ForwardingDpoType::Custom(
+            dpo.custom_type()
+                .map(CustomDpoType::get)
+                .unwrap_or_default(),
+        ),
     }
 }
 

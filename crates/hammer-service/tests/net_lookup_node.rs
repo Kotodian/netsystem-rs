@@ -10,7 +10,8 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::IpVersion;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    CustomDpoIndex, CustomDpoType, Dpo, DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode,
+    IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -387,6 +388,81 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
     assert_eq!(forwarding.dpo_index, 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let receive = register_sink(&runtime, &state);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibSnapshotBuilder::new(drop);
+    let parent = Dpo::receive(IpVersion::V4, drop);
+    let stacked = Dpo::stack(parent, receive);
+    let stack_lb = builder.add_load_balance([stacked]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("stack route"),
+        stack_lb,
+    );
+    let lookup = runtime
+        .nodes()
+        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 30_012, [192, 0, 2, 20], 53, b"stack"),
+    );
+
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_payloads(&state, &[b"stack".as_slice()]);
+    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.dpo_index, 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let custom = register_sink(&runtime, &state);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let custom_type = CustomDpoType::new(7).expect("custom type");
+    let custom_index = CustomDpoIndex::new(11);
+    let mut builder = FibSnapshotBuilder::new(drop);
+    let custom_lb = builder.add_load_balance([Dpo::custom(
+        IpVersion::V4,
+        custom_type,
+        custom_index,
+        custom,
+    )]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 30), 32).expect("custom route"),
+        custom_lb,
+    );
+    let lookup = runtime
+        .nodes()
+        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 30_013, [192, 0, 2, 30], 53, b"custom"),
+    );
+
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_payloads(&state, &[b"custom".as_slice()]);
+    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Custom(7));
+    assert_eq!(forwarding.dpo_index, custom_index.get());
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
