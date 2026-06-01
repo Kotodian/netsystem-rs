@@ -88,6 +88,42 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 }
 
 #[test]
+fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(32, 2);
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
+        .expect("alloc first buffer");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"bravo")
+        .expect("alloc second buffer");
+
+    {
+        let mut batch = runtime.buffer_batch_mut();
+        batch
+            .with_buffer_mut(first, |buffer| {
+                buffer.current_mut()[0] = b'A';
+            })
+            .expect("mutate first buffer");
+        batch
+            .with_buffer_mut(second, |buffer| {
+                buffer.current_mut()[0] = b'B';
+            })
+            .expect("mutate second buffer");
+    }
+
+    assert_eq!(
+        runtime.copy_current(first).expect("first current"),
+        b"Alpha"
+    );
+    assert_eq!(
+        runtime.copy_current(second).expect("second current"),
+        b"Bravo"
+    );
+    runtime.free_index(first);
+    runtime.free_index(second);
+}
+
+#[test]
 fn buffer_header_and_packet_data_start_cacheline_aligned() {
     let pool = BufferPool::with_capacity(128, 1);
     let buffer = pool

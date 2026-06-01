@@ -814,6 +814,11 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn buffer_batch_mut(&self) -> BufferBatchMut<'_> {
+        self.buffers.batch_mut()
+    }
+
+    #[inline]
     pub fn packet_cursor(&self, index: BufferIndex) -> CoreResult<BufferPacketCursor> {
         self.buffers.packet_cursor(index)
     }
@@ -1407,6 +1412,13 @@ impl BufferPool {
         let mut guard = self.arena.inner.borrow_mut();
         guard.buffer_mut(index)?;
         Ok(BufferRefMut { guard, index })
+    }
+
+    #[inline]
+    pub fn batch_mut(&self) -> BufferBatchMut<'_> {
+        BufferBatchMut {
+            guard: self.arena.inner.borrow_mut(),
+        }
     }
 
     #[inline]
@@ -2937,6 +2949,37 @@ impl FrameRefMut<'_> {
             .frame_mut(self.index)
             .expect("frame ref points to valid frame")
             .set_next_node(node);
+    }
+}
+
+pub struct BufferBatchMut<'pool> {
+    guard: RefMut<'pool, BufferPoolInner>,
+}
+
+impl BufferBatchMut<'_> {
+    #[inline]
+    pub fn prefetch_read(&self, index: BufferIndex) {
+        self.guard.prefetch_read(index);
+    }
+
+    #[inline]
+    pub fn with_buffer<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&Buffer) -> R,
+    ) -> CoreResult<R> {
+        let buffer = self.guard.buffer(index)?;
+        Ok(f(buffer))
+    }
+
+    #[inline]
+    pub fn with_buffer_mut<R>(
+        &mut self,
+        index: BufferIndex,
+        f: impl FnOnce(&mut Buffer) -> R,
+    ) -> CoreResult<R> {
+        let buffer = self.guard.buffer_mut(index)?;
+        Ok(f(buffer))
     }
 }
 
