@@ -106,11 +106,8 @@ fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
 #[test]
 fn fib_snapshot_is_generic_over_next_target() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);
-    let load_balance = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct)],
-    );
+    let adjacency = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
+    let load_balance = builder.add_load_balance(IpVersion::V4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,
@@ -122,6 +119,21 @@ fn fib_snapshot_is_generic_over_next_target() {
         .expect("lookup result");
     assert_eq!(result.dpo.next(), NextHop::Direct);
     assert_eq!(snapshot.drop_next(), NextHop::Drop);
+}
+
+#[test]
+fn fib_snapshot_builder_adds_adjacency_dpo() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let dpo = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
+    let adjacency = dpo.adjacency_index().expect("adjacency DPO index");
+
+    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.next(), NextHop::Direct);
+
+    let snapshot = builder.build();
+    let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency entry");
+    assert_eq!(adjacency_entry.proto, IpVersion::V4);
+    assert_eq!(adjacency_entry.next, NextHop::Direct);
 }
 
 #[test]
@@ -515,11 +527,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
 #[test]
 fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);
-    let load_balance = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct)],
-    );
+    let adjacency = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
+    let load_balance = builder.add_load_balance(IpVersion::V4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,

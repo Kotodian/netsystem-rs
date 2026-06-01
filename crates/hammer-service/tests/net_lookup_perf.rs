@@ -13,7 +13,7 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::IpVersion;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -418,8 +418,8 @@ fn add_single_path(
     version: IpVersion,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
-    let adjacency = builder.add_adjacency(version, node);
-    builder.add_load_balance(version, [DpoId::adjacency(version, adjacency, node)])
+    let adjacency = builder.add_adjacency_dpo(version, node);
+    builder.add_load_balance(version, [adjacency])
 }
 
 fn build_packets(scenario: Scenario) -> Vec<Vec<u8>> {

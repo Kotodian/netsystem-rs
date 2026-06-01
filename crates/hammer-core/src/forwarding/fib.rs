@@ -266,6 +266,12 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_adjacency_dpo(&mut self, proto: IpVersion, next: N) -> DpoId<N> {
+        let adjacency = self.add_adjacency(proto, next);
+        DpoId::adjacency(proto, adjacency, next)
+    }
+
+    #[inline]
     fn add_route_dpo_entry(&mut self, dpo: DpoId<N>) -> FibRouteDpoIndex {
         let index = FibRouteDpoIndex::new(self.route_dpos.len() as u32);
         self.route_dpos.push(dpo);
