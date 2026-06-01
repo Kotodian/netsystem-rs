@@ -103,22 +103,46 @@ fn ip_lookup_frame_batch_perf_probe() {
         Scenario::Ipv6SameNext,
     ];
     for scenario in scenarios {
-        let scalar = measure_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
-        let native = measure_lookup_samples(scenario, DataPlaneInstructionSet::native());
-        assert_eq!(scalar.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
-        assert_eq!(native.best.packets, scalar.best.packets);
+        let packet_scalar = measure_packet_scalar_samples(scenario);
+        let frame_pair = measure_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
+        let frame_native = measure_lookup_samples(scenario, DataPlaneInstructionSet::native());
+        assert_eq!(packet_scalar.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
+        assert_eq!(frame_pair.best.packets, packet_scalar.best.packets);
+        assert_eq!(frame_native.best.packets, packet_scalar.best.packets);
+        assert_eq!(frame_pair.best.checksum, packet_scalar.best.checksum);
+        assert_eq!(frame_native.best.checksum, packet_scalar.best.checksum);
 
         eprintln!(
-            "{scenario:?}: samples={SAMPLE_COUNT} frames={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} scalar_best={:.2} scalar_median={:.2} ns/packet native({:?})_best={:.2} native_median={:.2} ns/packet best_ratio={:.3} checksum={} / {}",
-            scalar.best.ns_per_packet(),
-            scalar.median.ns_per_packet(),
+            "{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} packet_scalar_best={:.2} packet_scalar_median={:.2} ns/packet frame_pair_best={:.2} frame_pair_median={:.2} ns/packet frame_native({:?})_best={:.2} frame_native_median={:.2} ns/packet vector_vs_packet_best_ratio={:.3} native_vs_pair_best_ratio={:.3} checksum={} / {} / {}",
+            packet_scalar.best.ns_per_packet(),
+            packet_scalar.median.ns_per_packet(),
+            frame_pair.best.ns_per_packet(),
+            frame_pair.median.ns_per_packet(),
             DataPlaneInstructionSet::native(),
-            native.best.ns_per_packet(),
-            native.median.ns_per_packet(),
-            native.best.ns_per_packet() / scalar.best.ns_per_packet(),
-            scalar.best.checksum,
-            native.best.checksum,
+            frame_native.best.ns_per_packet(),
+            frame_native.median.ns_per_packet(),
+            frame_native.best.ns_per_packet() / packet_scalar.best.ns_per_packet(),
+            frame_native.best.ns_per_packet() / frame_pair.best.ns_per_packet(),
+            packet_scalar.best.checksum,
+            frame_pair.best.checksum,
+            frame_native.best.checksum,
         );
+    }
+}
+
+fn measure_packet_scalar_samples(scenario: Scenario) -> ProbeSummary {
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for _ in 0..SAMPLE_COUNT {
+        samples.push(measure_packet_scalar(scenario));
+    }
+    samples.sort_by(|left, right| {
+        left.ns_per_packet()
+            .partial_cmp(&right.ns_per_packet())
+            .expect("finite ns/packet")
+    });
+    ProbeSummary {
+        best: samples[0],
+        median: samples[SAMPLE_COUNT / 2],
     }
 }
 
@@ -138,6 +162,44 @@ fn measure_lookup_samples(
     ProbeSummary {
         best: samples[0],
         median: samples[SAMPLE_COUNT / 2],
+    }
+}
+
+fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
+    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+        2048,
+        1,
+        1,
+        1,
+        DataPlaneInstructionSet::Scalar,
+    );
+    let packets = Rc::new(Cell::new(0));
+    let checksum = Rc::new(Cell::new(0));
+    let lookup = build_lookup(&runtime, scenario, &packets, &checksum);
+    let packets_by_frame = build_packets(scenario);
+
+    let started = Instant::now();
+    for _ in 0..FRAME_ROUNDS {
+        for packet in packets_by_frame.iter() {
+            let frame = runtime.alloc_frame_index().expect("alloc frame");
+            {
+                let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
+                let index = runtime
+                    .alloc_index_with_bytes(RouteMetadata::default(), packet)
+                    .expect("alloc packet");
+                frame_ref.push_index(index).expect("push packet");
+            }
+            assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+            black_box(runtime.run_ready_nodes().expect("run nodes"));
+            debug_assert_eq!(runtime.in_use_buffers(), 0);
+        }
+    }
+    let elapsed = started.elapsed();
+
+    ProbeStats {
+        elapsed,
+        packets: black_box(packets.get()),
+        checksum: black_box(checksum.get()),
     }
 }
 
