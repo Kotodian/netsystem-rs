@@ -12,12 +12,6 @@ pub trait NodeNext: Copy + Eq {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct NodeNextGroups {
-    nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
-    len: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct NodeNextFrames {
     nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
     frames: [Option<FrameIndex>; MAX_NODE_NEXT_FRAMES],
@@ -253,55 +247,6 @@ impl NodeNextFrames {
 
     #[inline]
     fn position(&self, node: NodeId) -> Option<usize> {
-        self.nodes[..self.len]
-            .iter()
-            .position(|candidate| *candidate == Some(node))
-    }
-}
-
-impl Default for NodeNextGroups {
-    fn default() -> Self {
-        Self {
-            nodes: [None; MAX_NODE_NEXT_FRAMES],
-            len: 0,
-        }
-    }
-}
-
-impl NodeNextGroups {
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    pub fn push(&mut self, node: NodeId) -> CoreResult<()> {
-        if self.position(node).is_some() {
-            return Ok(());
-        }
-        if self.len == MAX_NODE_NEXT_FRAMES {
-            return Err(CoreError::internal("node next frame capacity exceeded"));
-        }
-        self.nodes[self.len] = Some(node);
-        self.len += 1;
-        Ok(())
-    }
-
-    #[inline]
-    pub fn node(&self, index: usize) -> CoreResult<NodeId> {
-        self.nodes
-            .get(index)
-            .and_then(|node| *node)
-            .ok_or_else(|| CoreError::internal("node next group index out of bounds"))
-    }
-
-    #[inline]
-    pub fn position(&self, node: NodeId) -> Option<usize> {
         self.nodes[..self.len]
             .iter()
             .position(|candidate| *candidate == Some(node))

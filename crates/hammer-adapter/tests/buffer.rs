@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
     BufferPool, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
-    DataWorkerId, FrameBatchWidth, NoopNode, RouteMetadata, for_each_buffer_frame_index,
+    DataWorkerId, FrameBatchWidth, NoopNode, RouteMetadata,
 };
 
 #[derive(Default)]
@@ -760,17 +760,19 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
     let pair_indices = push_numbered_indices(&pair_runtime, &mut pair_frame, 5);
 
     let mut quad_seen = Vec::new();
-    for_each_buffer_frame_index!(&quad_runtime, &quad_frame, |index| {
-        quad_seen.push(index);
-        Ok(())
-    })
-    .expect("quad dispatch");
+    quad_frame
+        .retain_indices_batched(quad_runtime.preferred_frame_batch_width(), |index| {
+            quad_seen.push(index);
+            Ok(true)
+        })
+        .expect("quad dispatch");
     let mut pair_seen = Vec::new();
-    for_each_buffer_frame_index!(&pair_runtime, &pair_frame, |index| {
-        pair_seen.push(index);
-        Ok(())
-    })
-    .expect("pair dispatch");
+    pair_frame
+        .retain_indices_batched(pair_runtime.preferred_frame_batch_width(), |index| {
+            pair_seen.push(index);
+            Ok(true)
+        })
+        .expect("pair dispatch");
 
     assert_eq!(
         quad_runtime.preferred_frame_batch_width(),
