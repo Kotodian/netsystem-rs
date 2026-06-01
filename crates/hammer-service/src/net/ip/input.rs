@@ -42,7 +42,7 @@ impl<G> Node<G> for IpInputNode {
             let mut batch = runtime.buffer_batch_mut();
             next_node_for_index_with_batch(runtime, &mut batch, first, self.next)?
         };
-        let mut first_seen = false;
+        let mut first_chunk = true;
         NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
             runtime,
             frame,
@@ -52,14 +52,19 @@ impl<G> Node<G> for IpInputNode {
                 }
             },
             |batch, indices, nexts| {
+                let start_offset = if first_chunk {
+                    first_chunk = false;
+                    nexts[0] = speculative;
+                    1
+                } else {
+                    0
+                };
                 next_nodes_for_indices_with_batch(
                     runtime,
                     batch,
                     indices,
                     nexts,
-                    first,
-                    speculative,
-                    &mut first_seen,
+                    start_offset,
                     self.next,
                 )
             },
@@ -128,17 +133,10 @@ fn next_nodes_for_indices_with_batch<G>(
     batch: &mut BufferBatchMut<'_>,
     indices: &[BufferIndex],
     nexts: &mut [NodeId; 4],
-    first_index: BufferIndex,
-    first_next: NodeId,
-    first_seen: &mut bool,
+    start_offset: usize,
     next: [NodeId; IpInputNext::COUNT],
 ) -> CoreResult<()> {
-    for (offset, index) in indices.iter().copied().enumerate() {
-        if !*first_seen && index == first_index {
-            *first_seen = true;
-            nexts[offset] = first_next;
-            continue;
-        }
+    for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
         nexts[offset] = next_node_for_index_with_batch(runtime, batch, index, next)?;
     }
     Ok(())

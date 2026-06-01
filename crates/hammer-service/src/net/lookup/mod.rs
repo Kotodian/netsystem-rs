@@ -210,16 +210,9 @@ impl IpLookupNode {
         snapshot: &FibSnapshot,
         indices: &[BufferIndex],
         nexts: &mut [NodeId; 4],
-        first_index: BufferIndex,
-        first_next: NodeId,
-        first_seen: &mut bool,
+        start_offset: usize,
     ) -> CoreResult<()> {
-        for (offset, index) in indices.iter().copied().enumerate() {
-            if !*first_seen && index == first_index {
-                *first_seen = true;
-                nexts[offset] = first_next;
-                continue;
-            }
+        for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
             nexts[offset] = self.process_index_with_batch(batch, snapshot, index)?;
         }
         Ok(())
@@ -244,7 +237,7 @@ impl<G> Node<G> for IpLookupNode {
             Self::prefetch_range_with_batch(&mut batch, &snapshot, indices, 0, width);
             self.process_index_with_batch(&mut batch, &snapshot, first)?
         };
-        let mut first_seen = false;
+        let mut first_chunk = true;
         NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
             runtime,
             frame,
@@ -252,15 +245,14 @@ impl<G> Node<G> for IpLookupNode {
                 Self::prefetch_indices_with_batch(batch, &snapshot, indices);
             },
             |batch, indices, nexts| {
-                self.process_indices_with_batch(
-                    batch,
-                    &snapshot,
-                    indices,
-                    nexts,
-                    first,
-                    speculative,
-                    &mut first_seen,
-                )
+                let start_offset = if first_chunk {
+                    first_chunk = false;
+                    nexts[0] = speculative;
+                    1
+                } else {
+                    0
+                };
+                self.process_indices_with_batch(batch, &snapshot, indices, nexts, start_offset)
             },
         )
     }
