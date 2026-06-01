@@ -55,6 +55,16 @@ pub enum LoadBalanceError {
         actual: IpVersion,
         bucket_index: u16,
     },
+    BucketLoadBalanceMissing {
+        index: LoadBalanceIndex,
+        bucket_index: u16,
+    },
+    BucketLoadBalanceProtoMismatch {
+        index: LoadBalanceIndex,
+        expected: IpVersion,
+        actual: IpVersion,
+        bucket_index: u16,
+    },
 }
 
 #[repr(C, align(64))]

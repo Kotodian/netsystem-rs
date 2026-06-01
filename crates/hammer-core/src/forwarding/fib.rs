@@ -296,7 +296,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     ) -> Result<LoadBalanceIndex, LoadBalanceError> {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
         let load_balance = LoadBalance::try_new(proto, buckets)?;
-        self.validate_load_balance_adjacencies(&load_balance)?;
+        self.validate_load_balance_backing(&load_balance)?;
         self.load_balances.push(load_balance);
         Ok(index)
     }
@@ -495,30 +495,62 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
-    fn validate_load_balance_adjacencies(
+    fn validate_load_balance_backing(
         &self,
         load_balance: &LoadBalance<N>,
     ) -> Result<(), LoadBalanceError> {
         for (bucket_index, bucket) in load_balance.buckets().iter().copied().enumerate() {
-            let Some(index) = bucket.adjacency_index() else {
-                continue;
-            };
-            let Some(adjacency) = self.adjacencies.get(index.slot()) else {
-                return Err(LoadBalanceError::BucketAdjacencyMissing {
-                    index,
-                    bucket_index: bucket_index as u16,
-                });
-            };
-            let expected = bucket.proto();
-            let actual = adjacency.proto;
-            if actual != expected {
-                return Err(LoadBalanceError::BucketAdjacencyProtoMismatch {
-                    index,
-                    expected,
-                    actual,
-                    bucket_index: bucket_index as u16,
-                });
+            let bucket_index = bucket_index as u16;
+            if let Some(index) = bucket.adjacency_index() {
+                let Some(adjacency) = self.adjacencies.get(index.slot()) else {
+                    return Err(LoadBalanceError::BucketAdjacencyMissing {
+                        index,
+                        bucket_index,
+                    });
+                };
+                let expected = bucket.proto();
+                let actual = adjacency.proto;
+                if actual != expected {
+                    return Err(LoadBalanceError::BucketAdjacencyProtoMismatch {
+                        index,
+                        expected,
+                        actual,
+                        bucket_index,
+                    });
+                }
             }
+            if let Some(index) = bucket.load_balance_index() {
+                self.validate_load_balance_bucket_load_balance(
+                    index,
+                    bucket.proto(),
+                    bucket_index,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_load_balance_bucket_load_balance(
+        &self,
+        index: LoadBalanceIndex,
+        expected: IpVersion,
+        bucket_index: u16,
+    ) -> Result<(), LoadBalanceError> {
+        let Some(load_balance) = self.load_balances.get(index.slot()) else {
+            return Err(LoadBalanceError::BucketLoadBalanceMissing {
+                index,
+                bucket_index,
+            });
+        };
+        let actual = load_balance.proto();
+        if actual != expected {
+            return Err(LoadBalanceError::BucketLoadBalanceProtoMismatch {
+                index,
+                expected,
+                actual,
+                bucket_index,
+            });
         }
         Ok(())
     }

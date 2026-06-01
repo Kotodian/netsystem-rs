@@ -562,6 +562,49 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
 }
 
 #[test]
+fn fib_snapshot_rejects_load_balance_bucket_with_missing_load_balance() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let missing = LoadBalanceIndex::new(99);
+    let err = builder
+        .try_add_load_balance(
+            IpVersion::V4,
+            [DpoId::load_balance(IpVersion::V4, missing, NextHop::Direct)],
+        )
+        .expect_err("load-balance bucket with missing load-balance should be rejected");
+
+    assert_eq!(
+        err,
+        LoadBalanceError::BucketLoadBalanceMissing {
+            index: missing,
+            bucket_index: 0,
+        }
+    );
+}
+
+#[test]
+fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let inner =
+        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+    let err = builder
+        .try_add_load_balance(
+            IpVersion::V4,
+            [DpoId::load_balance(IpVersion::V4, inner, NextHop::Direct)],
+        )
+        .expect_err("load-balance bucket with wrong-proto load-balance should be rejected");
+
+    assert_eq!(
+        err,
+        LoadBalanceError::BucketLoadBalanceProtoMismatch {
+            index: inner,
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
+            bucket_index: 0,
+        }
+    );
+}
+
+#[test]
 fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
