@@ -121,6 +121,24 @@ fn fib_snapshot_is_generic_over_next_target() {
 }
 
 #[test]
+fn fib_snapshot_can_route_to_receive_dpo() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let load_balance = builder.add_load_balance([DpoId::receive(IpVersion::V4, NextHop::Direct)]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive host route"),
+        load_balance,
+    );
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 10), 0)
+        .expect("lookup result");
+    assert_eq!(result.dpo.next, NextHop::Direct);
+    assert_eq!(result.dpo.proto, IpVersion::V4);
+    assert_eq!(result.dpo.index, 0);
+}
+
+#[test]
 fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);

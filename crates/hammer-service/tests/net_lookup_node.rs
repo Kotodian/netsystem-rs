@@ -359,6 +359,39 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
 }
 
 #[test]
+fn ip_lookup_node_routes_receive_dpo_to_local_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let receive = register_sink(&runtime, &state);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibSnapshotBuilder::new(drop);
+    let receive_lb = builder.add_load_balance([DpoId::receive(IpVersion::V4, receive)]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive route"),
+        receive_lb,
+    );
+    let lookup = runtime
+        .nodes()
+        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 30_011, [192, 0, 2, 10], 53, b"receive"),
+    );
+
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_payloads(&state, &[b"receive".as_slice()]);
+    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.dpo_index, 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let first_state = Rc::new(RefCell::new(SinkState::default()));

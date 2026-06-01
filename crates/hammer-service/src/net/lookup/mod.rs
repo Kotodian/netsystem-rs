@@ -274,6 +274,7 @@ fn forwarding_dpo_type(dpo_type: DpoType) -> ForwardingDpoType {
         DpoType::Drop => ForwardingDpoType::Drop,
         DpoType::Punt => ForwardingDpoType::Punt,
         DpoType::Adjacency => ForwardingDpoType::Adjacency,
+        DpoType::Receive => ForwardingDpoType::Receive,
     }
 }
 

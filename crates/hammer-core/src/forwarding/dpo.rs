@@ -26,6 +26,7 @@ pub enum DpoType {
     Drop = 0,
     Punt = 1,
     Adjacency = 2,
+    Receive = 3,
 }
 
 #[repr(C)]
@@ -54,6 +55,16 @@ impl<N> DpoId<N> {
             next,
             index: 0,
             dpo_type: DpoType::Punt,
+            proto,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn receive(proto: IpVersion, next: N) -> Self {
+        Self {
+            next,
+            index: 0,
+            dpo_type: DpoType::Receive,
             proto,
         }
     }
