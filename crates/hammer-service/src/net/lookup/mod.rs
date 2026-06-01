@@ -15,7 +15,7 @@ use hammer_core::forwarding::{
 };
 pub use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoStackRegistry, DpoType,
-    FibRouteDpoError, LoadBalanceIndex,
+    FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,

@@ -162,8 +162,10 @@ fn tun_driver_routes_through_service_internal_nodes() {
         .register_driver(TunOutputDriverNode::new(device.output()));
     let mut builder = FibSnapshotBuilder::new(output);
     let adjacency = builder.add_adjacency(IpVersion::V4, output);
-    let load_balance =
-        builder.add_load_balance([DpoId::adjacency(IpVersion::V4, adjacency, output)]);
+    let load_balance = builder.add_load_balance(
+        IpVersion::V4,
+        [DpoId::adjacency(IpVersion::V4, adjacency, output)],
+    );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         load_balance,

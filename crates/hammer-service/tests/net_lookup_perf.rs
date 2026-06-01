@@ -419,7 +419,7 @@ fn add_single_path(
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
     let adjacency = builder.add_adjacency(version, node);
-    builder.add_load_balance([DpoId::adjacency(version, adjacency, node)])
+    builder.add_load_balance(version, [DpoId::adjacency(version, adjacency, node)])
 }
 
 fn build_packets(scenario: Scenario) -> Vec<Vec<u8>> {

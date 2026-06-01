@@ -38,9 +38,19 @@ impl Ip4MtrieValue for LoadBalanceIndex {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadBalanceError {
+    BucketProtoMismatch {
+        expected: IpVersion,
+        actual: IpVersion,
+        bucket_index: u16,
+    },
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone)]
 pub struct LoadBalance<N: Copy> {
+    proto: IpVersion,
     bucket_count: u16,
     power_of_two_mask: u16,
     buckets: LoadBalanceBuckets<N>,
@@ -55,8 +65,17 @@ enum LoadBalanceBuckets<N: Copy> {
 
 impl<N: Copy> LoadBalance<N> {
     #[inline]
-    pub fn new(buckets: impl Into<Vec<DpoId<N>>>) -> Self {
+    pub fn new(proto: IpVersion, buckets: impl Into<Vec<DpoId<N>>>) -> Self {
+        Self::try_new(proto, buckets).expect("load-balance buckets must match proto")
+    }
+
+    #[inline]
+    pub fn try_new(
+        proto: IpVersion,
+        buckets: impl Into<Vec<DpoId<N>>>,
+    ) -> Result<Self, LoadBalanceError> {
         let buckets = buckets.into();
+        validate_bucket_protos(proto, &buckets)?;
         let bucket_count = buckets.len();
         let power_of_two_mask = bucket_count
             .is_power_of_two()
@@ -72,11 +91,17 @@ impl<N: Copy> LoadBalance<N> {
             }
             _ => LoadBalanceBuckets::Heap(buckets.into_boxed_slice()),
         };
-        Self {
+        Ok(Self {
+            proto,
             bucket_count: bucket_count as u16,
             power_of_two_mask,
             buckets,
-        }
+        })
+    }
+
+    #[inline(always)]
+    pub fn proto(&self) -> IpVersion {
+        self.proto
     }
 
     #[inline(always)]
@@ -134,6 +159,24 @@ impl<N: Copy> LoadBalance<N> {
     }
 }
 
+#[inline(always)]
+fn validate_bucket_protos<N: Copy>(
+    expected: IpVersion,
+    buckets: &[DpoId<N>],
+) -> Result<(), LoadBalanceError> {
+    for (bucket_index, bucket) in buckets.iter().enumerate() {
+        let actual = bucket.proto();
+        if actual != expected {
+            return Err(LoadBalanceError::BucketProtoMismatch {
+                expected,
+                actual,
+                bucket_index: bucket_index as u16,
+            });
+        }
+    }
+    Ok(())
+}
+
 impl<N: Copy> From<(IpVersion, AdjacencyIndex, N)> for DpoId<N> {
     #[inline(always)]
     fn from((proto, adjacency, next): (IpVersion, AdjacencyIndex, N)) -> Self {
@@ -153,13 +196,32 @@ mod tests {
 
     #[test]
     fn inline_buckets_handle_small_load_balances_without_heap_slice() {
-        let lb = LoadBalance::new([
-            DpoId::drop(IpVersion::V4, Next::A),
-            DpoId::drop(IpVersion::V4, Next::B),
-        ]);
+        let lb = LoadBalance::new(
+            IpVersion::V4,
+            [
+                DpoId::drop(IpVersion::V4, Next::A),
+                DpoId::drop(IpVersion::V4, Next::B),
+            ],
+        );
+        assert_eq!(lb.proto(), IpVersion::V4);
         assert_eq!(lb.bucket_count(), 2);
         assert!(matches!(lb.buckets, LoadBalanceBuckets::Inline(_)));
         assert_eq!(lb.select_hash(1).expect("bucket").1.next(), Next::B);
+    }
+
+    #[test]
+    fn load_balance_rejects_bucket_with_wrong_proto() {
+        let err = LoadBalance::try_new(IpVersion::V4, [DpoId::drop(IpVersion::V6, Next::A)])
+            .expect_err("wrong-proto bucket should be rejected");
+
+        assert_eq!(
+            err,
+            LoadBalanceError::BucketProtoMismatch {
+                expected: IpVersion::V4,
+                actual: IpVersion::V6,
+                bucket_index: 0,
+            }
+        );
     }
 
     #[test]

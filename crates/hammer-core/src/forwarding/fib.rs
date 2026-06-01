@@ -7,7 +7,7 @@ use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 use super::dpo::{Adjacency, AdjacencyIndex, DpoId};
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
-use super::load_balance::{LoadBalance, LoadBalanceIndex};
+use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
 use crate::ds::prefetch::prefetch_read_l1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,10 +258,25 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
-    pub fn add_load_balance(&mut self, buckets: impl Into<Vec<DpoId<N>>>) -> LoadBalanceIndex {
+    pub fn add_load_balance(
+        &mut self,
+        proto: IpVersion,
+        buckets: impl Into<Vec<DpoId<N>>>,
+    ) -> LoadBalanceIndex {
+        self.try_add_load_balance(proto, buckets)
+            .expect("load-balance buckets must match proto")
+    }
+
+    #[inline]
+    pub fn try_add_load_balance(
+        &mut self,
+        proto: IpVersion,
+        buckets: impl Into<Vec<DpoId<N>>>,
+    ) -> Result<LoadBalanceIndex, LoadBalanceError> {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
-        self.load_balances.push(LoadBalance::new(buckets));
-        index
+        self.load_balances
+            .push(LoadBalance::try_new(proto, buckets)?);
+        Ok(index)
     }
 
     #[inline]

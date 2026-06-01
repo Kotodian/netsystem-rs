@@ -366,7 +366,8 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let receive = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let receive_lb = builder.add_load_balance([DpoId::receive(IpVersion::V4, receive)]);
+    let receive_lb =
+        builder.add_load_balance(IpVersion::V4, [DpoId::receive(IpVersion::V4, receive)]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive route"),
         receive_lb,
@@ -435,7 +436,7 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let mut builder = FibSnapshotBuilder::new(drop);
     let parent = Dpo::receive(IpVersion::V4, drop);
     let stacked = Dpo::stack(parent, receive);
-    let stack_lb = builder.add_load_balance([stacked]);
+    let stack_lb = builder.add_load_balance(IpVersion::V4, [stacked]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("stack route"),
         stack_lb,
@@ -470,12 +471,15 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let custom_type = CustomDpoType::new(7).expect("custom type");
     let custom_index = CustomDpoIndex::new(11);
     let mut builder = FibSnapshotBuilder::new(drop);
-    let custom_lb = builder.add_load_balance([Dpo::custom(
+    let custom_lb = builder.add_load_balance(
         IpVersion::V4,
-        custom_type,
-        custom_index,
-        custom,
-    )]);
+        [Dpo::custom(
+            IpVersion::V4,
+            custom_type,
+            custom_index,
+            custom,
+        )],
+    );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 30), 32).expect("custom route"),
         custom_lb,
@@ -692,7 +696,7 @@ fn add_single_path(
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
     let adjacency = builder.add_adjacency(version, node);
-    builder.add_load_balance([DpoId::adjacency(version, adjacency, node)])
+    builder.add_load_balance(version, [DpoId::adjacency(version, adjacency, node)])
 }
 
 fn push_packet(

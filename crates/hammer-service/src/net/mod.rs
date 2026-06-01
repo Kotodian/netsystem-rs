@@ -10,6 +10,6 @@ pub use lookup::{
     Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoId,
     DpoStackRegistry, DpoType, FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot,
     FibSnapshotBuilder, FibSnapshotHandle, IpLookupControlPlane, IpLookupNode, LoadBalance,
-    LoadBalanceIndex,
+    LoadBalanceError, LoadBalanceIndex,
 };
 pub use route_metadata::packet_route_metadata;
