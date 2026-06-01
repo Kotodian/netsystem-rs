@@ -257,6 +257,25 @@ fn fib_snapshot_can_route_to_receive_dpo() {
 }
 
 #[test]
+fn fib_snapshot_exposes_route_load_balance_dpo() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let load_balance = builder.add_load_balance([DpoId::receive(IpVersion::V4, NextHop::Direct)]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 40), 32).expect("load-balance route"),
+        load_balance,
+    );
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 40), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.kind(), DpoType::LoadBalance);
+    assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
+    assert_eq!(result.load_balance, load_balance);
+    assert_eq!(result.dpo.kind(), DpoType::Receive);
+}
+
+#[test]
 fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);

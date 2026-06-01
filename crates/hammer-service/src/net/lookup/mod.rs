@@ -146,6 +146,7 @@ impl IpLookupNode {
             }
         };
         let result = snapshot.lookup_packet(&parsed).unwrap_or(FibLookupResult {
+            route_dpo: snapshot.drop_dpo(parsed.version),
             load_balance: LoadBalanceIndex::new(FORWARDING_MISS_INDEX),
             bucket_index: FORWARDING_MISS_BUCKET,
             dpo: snapshot.drop_dpo(parsed.version),

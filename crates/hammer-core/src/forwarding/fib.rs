@@ -5,7 +5,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
 use super::dpo::{Adjacency, AdjacencyIndex, DpoId};
-use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute};
+use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceIndex};
 use crate::ds::prefetch::prefetch_read_l1;
@@ -14,6 +14,33 @@ use crate::ds::prefetch::prefetch_read_l1;
 pub struct FibEntry {
     pub prefix: IpNet,
     pub load_balance: LoadBalanceIndex,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FibRouteDpoIndex(u32);
+
+impl FibRouteDpoIndex {
+    #[inline(always)]
+    const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[inline(always)]
+    const fn slot(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Ip4MtrieValue for FibRouteDpoIndex {
+    #[inline(always)]
+    fn into_leaf_value(self) -> u32 {
+        self.0
+    }
+
+    #[inline(always)]
+    fn from_leaf_value(value: u32) -> Self {
+        Self(value)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -28,8 +55,9 @@ pub struct FibSnapshot<N: Copy> {
 #[derive(Debug, Clone)]
 #[repr(C)]
 struct FibLookupTables<N: Copy> {
-    ip4: Ip4Mtrie<LoadBalanceIndex>,
-    ip6: Ip6Fib<LoadBalanceIndex>,
+    ip4: Ip4Mtrie<FibRouteDpoIndex>,
+    ip6: Ip6Fib<FibRouteDpoIndex>,
+    route_dpos: Box<[DpoId<N>]>,
     load_balances: Box<[LoadBalance<N>]>,
 }
 
@@ -53,14 +81,14 @@ impl<N: Copy> FibSnapshot<N> {
 
     #[inline(always)]
     pub fn lookup_ip4(&self, destination: Ipv4Addr, hash: usize) -> Option<FibLookupResult<N>> {
-        let load_balance = self.lookup.ip4.lookup(destination)?;
-        self.select_load_balance(load_balance, hash)
+        let route_dpo = self.lookup.ip4.lookup(destination)?;
+        self.select_route_dpo(route_dpo, hash)
     }
 
     #[inline(always)]
     pub fn lookup_ip6(&self, destination: Ipv6Addr, hash: usize) -> Option<FibLookupResult<N>> {
-        let load_balance = self.lookup.ip6.lookup(destination)?;
-        self.select_load_balance(load_balance, hash)
+        let route_dpo = self.lookup.ip6.lookup(destination)?;
+        self.select_route_dpo(route_dpo, hash)
     }
 
     #[inline(always)]
@@ -97,16 +125,19 @@ impl<N: Copy> FibSnapshot<N> {
     }
 
     #[inline(always)]
-    fn select_load_balance(
+    fn select_route_dpo(
         &self,
-        load_balance: LoadBalanceIndex,
+        route_dpo_index: FibRouteDpoIndex,
         hash: usize,
     ) -> Option<FibLookupResult<N>> {
+        let route_dpo = *self.lookup.route_dpos.get(route_dpo_index.slot())?;
+        let load_balance = route_dpo.load_balance_index()?;
         let load_balance_ref = self.load_balance(load_balance)?;
         prefetch_read_l1(load_balance_ref);
         load_balance_ref.prefetch_bucket(hash);
         let (bucket_index, dpo) = load_balance_ref.select_hash(hash)?;
         Some(FibLookupResult {
+            route_dpo,
             load_balance,
             bucket_index,
             dpo,
@@ -116,6 +147,7 @@ impl<N: Copy> FibSnapshot<N> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FibLookupResult<N> {
+    pub route_dpo: DpoId<N>,
     pub load_balance: LoadBalanceIndex,
     pub bucket_index: u16,
     pub dpo: DpoId<N>,
@@ -124,6 +156,7 @@ pub struct FibLookupResult<N> {
 pub struct FibSnapshotBuilder<N: Copy> {
     drop_next: N,
     load_balances: Vec<LoadBalance<N>>,
+    route_dpos: Vec<DpoId<N>>,
     adjacencies: Vec<Adjacency<N>>,
     ip4_routes: Vec<Ip4Route>,
     ip6_routes: Vec<Ip6Route>,
@@ -135,6 +168,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         Self {
             drop_next,
             load_balances: Vec::new(),
+            route_dpos: Vec::new(),
             adjacencies: Vec::new(),
             ip4_routes: Vec::new(),
             ip6_routes: Vec::new(),
@@ -149,6 +183,13 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    fn add_route_dpo_entry(&mut self, dpo: DpoId<N>) -> FibRouteDpoIndex {
+        let index = FibRouteDpoIndex::new(self.route_dpos.len() as u32);
+        self.route_dpos.push(dpo);
+        index
+    }
+
+    #[inline]
     pub fn add_load_balance(&mut self, buckets: impl Into<Vec<DpoId<N>>>) -> LoadBalanceIndex {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
         self.load_balances.push(LoadBalance::new(buckets));
@@ -157,18 +198,22 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_route(&mut self, prefix: Ipv4Net, load_balance: LoadBalanceIndex) {
-        self.ip4_routes.push(Ip4Route {
-            prefix,
+        let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
+            IpVersion::V4,
             load_balance,
-        });
+            self.drop_next,
+        ));
+        self.ip4_routes.push(Ip4Route { prefix, route_dpo });
     }
 
     #[inline]
     pub fn add_ip6_route(&mut self, prefix: Ipv6Net, load_balance: LoadBalanceIndex) {
-        self.ip6_routes.push(Ip6Route {
-            prefix,
+        let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
+            IpVersion::V6,
             load_balance,
-        });
+            self.drop_next,
+        ));
+        self.ip6_routes.push(Ip6Route { prefix, route_dpo });
     }
 
     #[inline]
@@ -188,13 +233,14 @@ impl<N: Copy> FibSnapshotBuilder<N> {
                 ip4: Ip4Mtrie::from_routes(
                     self.ip4_routes
                         .iter()
-                        .map(|route| Ip4MtrieRoute::new(route.prefix, route.load_balance)),
+                        .map(|route| Ip4MtrieRoute::new(route.prefix, route.route_dpo)),
                 ),
                 ip6: Ip6Fib::from_routes(
                     self.ip6_routes
                         .iter()
-                        .map(|route| (route.prefix, route.load_balance)),
+                        .map(|route| (route.prefix, route.route_dpo)),
                 ),
+                route_dpos: self.route_dpos.into_boxed_slice(),
                 load_balances: self.load_balances.into_boxed_slice(),
             },
             adjacencies: self.adjacencies.into_boxed_slice(),
@@ -208,13 +254,13 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 #[derive(Debug, Clone, Copy)]
 struct Ip4Route {
     prefix: Ipv4Net,
-    load_balance: LoadBalanceIndex,
+    route_dpo: FibRouteDpoIndex,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Ip6Route {
     prefix: Ipv6Net,
-    load_balance: LoadBalanceIndex,
+    route_dpo: FibRouteDpoIndex,
 }
 
 #[inline(always)]
