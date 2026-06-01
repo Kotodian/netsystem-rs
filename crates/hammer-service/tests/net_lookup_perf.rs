@@ -2,6 +2,7 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
@@ -19,6 +20,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 const FRAME_PACKETS: usize = 128;
 const FRAME_ROUNDS: usize = 512;
 const SAMPLE_COUNT: usize = 5;
+static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
 
 struct SinkNode {
     packets: Rc<Cell<usize>>,
@@ -105,8 +107,9 @@ enum Scenario {
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture`"]
+#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
 fn ip_lookup_frame_batch_perf_probe() {
+    let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
     let scenarios = [
         Scenario::Ipv4SameNext,
         Scenario::Ipv4MixedNext,
@@ -141,8 +144,9 @@ fn ip_lookup_frame_batch_perf_probe() {
 }
 
 #[test]
-#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture`"]
+#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture --test-threads=1`"]
 fn ip_input_lookup_frame_batch_perf_probe() {
+    let _guard = PERF_PROBE_LOCK.lock().expect("perf probe lock");
     let scenarios = [
         Scenario::Ipv4SameNext,
         Scenario::Ipv4MixedNext,
