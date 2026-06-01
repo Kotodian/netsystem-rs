@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
     DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
-    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
+    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -368,6 +368,38 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
             actual: IpVersion::V4,
         }
     );
+}
+
+#[test]
+fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let load_balance =
+        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+
+    let err = builder
+        .try_add_ip4_route(
+            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 80), 32).expect("route"),
+            load_balance,
+        )
+        .expect_err("wrong-proto load-balance route should be rejected");
+
+    assert_eq!(
+        err,
+        FibRouteDpoError::LoadBalanceProtoMismatch {
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
+        }
+    );
+
+    let missing = LoadBalanceIndex::new(99);
+    let err = builder
+        .try_add_ip6_route(
+            Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("route"),
+            missing,
+        )
+        .expect_err("missing load-balance route should be rejected");
+
+    assert_eq!(err, FibRouteDpoError::LoadBalanceMissing { index: missing });
 }
 
 #[test]

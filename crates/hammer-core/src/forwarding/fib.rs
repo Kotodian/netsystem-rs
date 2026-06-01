@@ -29,6 +29,13 @@ pub enum FibRouteDpoError {
         expected: IpVersion,
         actual: IpVersion,
     },
+    LoadBalanceMissing {
+        index: LoadBalanceIndex,
+    },
+    LoadBalanceProtoMismatch {
+        expected: IpVersion,
+        actual: IpVersion,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -281,22 +288,46 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_route(&mut self, prefix: Ipv4Net, load_balance: LoadBalanceIndex) {
+        self.try_add_ip4_route(prefix, load_balance)
+            .expect("IPv4 route load-balance must exist and carry IPv4 proto");
+    }
+
+    #[inline]
+    pub fn try_add_ip4_route(
+        &mut self,
+        prefix: Ipv4Net,
+        load_balance: LoadBalanceIndex,
+    ) -> Result<(), FibRouteDpoError> {
+        self.validate_load_balance_proto(IpVersion::V4, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
             IpVersion::V4,
             load_balance,
             self.drop_next,
         ));
         self.ip4_routes.push(Ip4Route { prefix, route_dpo });
+        Ok(())
     }
 
     #[inline]
     pub fn add_ip6_route(&mut self, prefix: Ipv6Net, load_balance: LoadBalanceIndex) {
+        self.try_add_ip6_route(prefix, load_balance)
+            .expect("IPv6 route load-balance must exist and carry IPv6 proto");
+    }
+
+    #[inline]
+    pub fn try_add_ip6_route(
+        &mut self,
+        prefix: Ipv6Net,
+        load_balance: LoadBalanceIndex,
+    ) -> Result<(), FibRouteDpoError> {
+        self.validate_load_balance_proto(IpVersion::V6, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
             IpVersion::V6,
             load_balance,
             self.drop_next,
         ));
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
+        Ok(())
     }
 
     #[inline]
@@ -355,9 +386,19 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_route(&mut self, prefix: IpNet, load_balance: LoadBalanceIndex) {
+        self.try_add_route(prefix, load_balance)
+            .expect("route load-balance must exist and match prefix IP version");
+    }
+
+    #[inline]
+    pub fn try_add_route(
+        &mut self,
+        prefix: IpNet,
+        load_balance: LoadBalanceIndex,
+    ) -> Result<(), FibRouteDpoError> {
         match prefix {
-            IpNet::V4(prefix) => self.add_ip4_route(prefix, load_balance),
-            IpNet::V6(prefix) => self.add_ip6_route(prefix, load_balance),
+            IpNet::V4(prefix) => self.try_add_ip4_route(prefix, load_balance),
+            IpNet::V6(prefix) => self.try_add_ip6_route(prefix, load_balance),
         }
     }
 
@@ -395,6 +436,24 @@ impl<N: Copy> FibSnapshotBuilder<N> {
             drop_next: self.drop_next,
             ip4_drop: DpoId::drop(IpVersion::V4, self.drop_next),
             ip6_drop: DpoId::drop(IpVersion::V6, self.drop_next),
+        }
+    }
+
+    #[inline]
+    fn validate_load_balance_proto(
+        &self,
+        expected: IpVersion,
+        index: LoadBalanceIndex,
+    ) -> Result<(), FibRouteDpoError> {
+        let load_balance = self
+            .load_balances
+            .get(index.slot())
+            .ok_or(FibRouteDpoError::LoadBalanceMissing { index })?;
+        let actual = load_balance.proto();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(FibRouteDpoError::LoadBalanceProtoMismatch { expected, actual })
         }
     }
 }
