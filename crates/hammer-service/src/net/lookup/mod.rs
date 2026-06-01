@@ -120,41 +120,37 @@ impl IpLookupNode {
         snapshot: &FibSnapshot,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
-        batch.with_buffer_mut(index, |buffer| {
-            let parsed = match packet_from_cached_metadata(
-                buffer.metadata(),
-                buffer.packet_cursor(),
-                buffer.current_ptr(),
-                buffer.current_len(),
-                buffer.total_len_not_including_first(),
-            )
-            .or_else(|| {
-                parse_ip_packet_with_chain_len(
-                    buffer.current(),
-                    buffer.total_len_not_including_first(),
-                )
+        let buffer = batch.buffer_mut(index)?;
+        let parsed = match packet_from_cached_metadata(
+            buffer.metadata(),
+            buffer.packet_cursor(),
+            buffer.current_ptr(),
+            buffer.current_len(),
+            buffer.total_len_not_including_first(),
+        )
+        .or_else(|| {
+            parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())
                 .ok()
-            }) {
-                Some(parsed) => parsed,
-                None => {
-                    buffer.metadata_mut().forwarding = None;
-                    return Ok(snapshot.drop_next());
-                }
-            };
-            let result = snapshot.lookup_packet(&parsed).unwrap_or(FibLookupResult {
-                load_balance: LoadBalanceIndex::new(FORWARDING_MISS_INDEX),
-                bucket_index: FORWARDING_MISS_BUCKET,
-                dpo: snapshot.drop_dpo(parsed.version),
-            });
-            buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
-                fib_index: 0,
-                load_balance_index: result.load_balance.get(),
-                bucket_index: result.bucket_index,
-                dpo_type: forwarding_dpo_type(result.dpo.dpo_type),
-                dpo_index: result.dpo.index,
-            });
-            Ok(result.dpo.next)
-        })?
+        }) {
+            Some(parsed) => parsed,
+            None => {
+                buffer.metadata_mut().forwarding = None;
+                return Ok(snapshot.drop_next());
+            }
+        };
+        let result = snapshot.lookup_packet(&parsed).unwrap_or(FibLookupResult {
+            load_balance: LoadBalanceIndex::new(FORWARDING_MISS_INDEX),
+            bucket_index: FORWARDING_MISS_BUCKET,
+            dpo: snapshot.drop_dpo(parsed.version),
+        });
+        buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            load_balance_index: result.load_balance.get(),
+            bucket_index: result.bucket_index,
+            dpo_type: forwarding_dpo_type(result.dpo.dpo_type),
+            dpo_index: result.dpo.index,
+        });
+        Ok(result.dpo.next)
     }
 
     #[inline(always)]
@@ -164,20 +160,19 @@ impl IpLookupNode {
         index: BufferIndex,
     ) {
         batch.prefetch_read(index);
-        let Ok(()) = batch.with_buffer(index, |buffer| {
-            let Some(parsed) = packet_from_cached_metadata(
-                buffer.metadata(),
-                buffer.packet_cursor(),
-                buffer.current_ptr(),
-                buffer.current_len(),
-                buffer.total_len_not_including_first(),
-            ) else {
-                return;
-            };
-            snapshot.prefetch_packet(&parsed);
-        }) else {
+        let Ok(buffer) = batch.buffer(index) else {
             return;
         };
+        let Some(parsed) = packet_from_cached_metadata(
+            buffer.metadata(),
+            buffer.packet_cursor(),
+            buffer.current_ptr(),
+            buffer.current_len(),
+            buffer.total_len_not_including_first(),
+        ) else {
+            return;
+        };
+        snapshot.prefetch_packet(&parsed);
     }
 
     #[inline(always)]
@@ -195,6 +190,39 @@ impl IpLookupNode {
         for index in indices[offset..end].iter().copied() {
             Self::prefetch_index_with_batch(batch, snapshot, index);
         }
+    }
+
+    #[inline(always)]
+    fn prefetch_indices_with_batch(
+        batch: &mut BufferBatchMut<'_>,
+        snapshot: &FibSnapshot,
+        indices: &[BufferIndex],
+    ) {
+        for index in indices.iter().copied() {
+            Self::prefetch_index_with_batch(batch, snapshot, index);
+        }
+    }
+
+    #[inline(always)]
+    fn process_indices_with_batch(
+        &self,
+        batch: &mut BufferBatchMut<'_>,
+        snapshot: &FibSnapshot,
+        indices: &[BufferIndex],
+        nexts: &mut [NodeId; 4],
+        first_index: BufferIndex,
+        first_next: NodeId,
+        first_seen: &mut bool,
+    ) -> CoreResult<()> {
+        for (offset, index) in indices.iter().copied().enumerate() {
+            if !*first_seen && index == first_index {
+                *first_seen = true;
+                nexts[offset] = first_next;
+                continue;
+            }
+            nexts[offset] = self.process_index_with_batch(batch, snapshot, index)?;
+        }
+        Ok(())
     }
 }
 
@@ -216,15 +244,24 @@ impl<G> Node<G> for IpLookupNode {
             Self::prefetch_range_with_batch(&mut batch, &snapshot, indices, 0, width);
             self.process_index_with_batch(&mut batch, &snapshot, first)?
         };
-        NodeNextEnqueue::new(speculative).validate_frame_with_first_next_and_buffer_batch_prefetch(
+        let mut first_seen = false;
+        NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
             runtime,
             frame,
-            first,
-            speculative,
-            |batch, index| {
-                Self::prefetch_index_with_batch(batch, &snapshot, index);
+            |batch, indices| {
+                Self::prefetch_indices_with_batch(batch, &snapshot, indices);
             },
-            |batch, index| self.process_index_with_batch(batch, &snapshot, index),
+            |batch, indices, nexts| {
+                self.process_indices_with_batch(
+                    batch,
+                    &snapshot,
+                    indices,
+                    nexts,
+                    first,
+                    speculative,
+                    &mut first_seen,
+                )
+            },
         )
     }
 }
