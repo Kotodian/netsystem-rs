@@ -11,7 +11,7 @@ use hammer_adapter::{
     DataWorkerId, DriverNode, InternalNode, Node, NodeHandle, NodeId, NodeNextEnqueue, NodeResult,
     RouteMetadata,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 
 #[derive(Default)]
 struct WakeCounter {
@@ -216,6 +216,32 @@ impl Node<TestNode> for SpeculativeSplitNode {
 
 impl InternalNode<TestNode> for SpeculativeSplitNode {}
 
+struct SpeculativeErrorAfterSplitNode {
+    speculative: NodeId,
+    alternate: NodeId,
+}
+
+impl Node<TestNode> for SpeculativeErrorAfterSplitNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let mut seen = 0usize;
+        NodeNextEnqueue::new(self.speculative).validate_frame(runtime, frame, |_index| {
+            seen += 1;
+            if seen == 1 {
+                Ok(self.alternate)
+            } else {
+                Err(CoreError::internal("split validation failed"))
+            }
+        })
+    }
+}
+
+impl InternalNode<TestNode> for SpeculativeErrorAfterSplitNode {}
+
 enum TestNode {
     Forward(ForwardNode),
     SourceDriver(SourceDriverNode),
@@ -225,6 +251,7 @@ enum TestNode {
     Handoff(HandoffNode),
     PointerSink(PointerSinkNode),
     SpeculativeSplit(SpeculativeSplitNode),
+    SpeculativeErrorAfterSplit(SpeculativeErrorAfterSplitNode),
 }
 
 impl From<ForwardNode> for TestNode {
@@ -275,6 +302,12 @@ impl From<SpeculativeSplitNode> for TestNode {
     }
 }
 
+impl From<SpeculativeErrorAfterSplitNode> for TestNode {
+    fn from(node: SpeculativeErrorAfterSplitNode) -> Self {
+        Self::SpeculativeErrorAfterSplit(node)
+    }
+}
+
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -291,6 +324,7 @@ impl Node<TestNode> for TestNode {
             Self::Handoff(node) => node.process(runtime, frame),
             Self::PointerSink(node) => node.process(runtime, frame),
             Self::SpeculativeSplit(node) => node.process(runtime, frame),
+            Self::SpeculativeErrorAfterSplit(node) => node.process(runtime, frame),
         }
     }
 }
@@ -464,6 +498,38 @@ fn speculative_enqueue_splits_mismatched_next_to_separate_frame() {
         &[b"default-1".to_vec(), b"default-2".to_vec()]
     );
     assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn speculative_enqueue_cleans_up_split_frame_when_validation_fails() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 4, 2);
+    let default = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let split = runtime
+        .nodes()
+        .register_internal(SpeculativeErrorAfterSplitNode {
+            speculative: default,
+            alternate,
+        });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"default");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("split validation failed");
+    assert!(
+        err.to_string().contains("split validation failed"),
+        "unexpected error: {err}"
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

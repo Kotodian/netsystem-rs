@@ -120,7 +120,7 @@ impl NodeNextEnqueue {
         mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
     ) -> CoreResult<()> {
         let speculative_node = self.speculative_node;
-        frame.retain_indices_batched(width, |index| {
+        let result = frame.retain_indices_batched(width, |index| {
             let node = next_for_index(index)?;
             if node == speculative_node {
                 Ok(true)
@@ -128,7 +128,11 @@ impl NodeNextEnqueue {
                 self.split.enqueue(runtime, node, index)?;
                 Ok(false)
             }
-        })
+        });
+        if result.is_err() {
+            self.split.free(runtime);
+        }
+        result
     }
 
     #[inline(always)]
@@ -141,7 +145,7 @@ impl NodeNextEnqueue {
         mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
     ) -> CoreResult<()> {
         let speculative_node = self.speculative_node;
-        frame.retain_indices_batched_with_prefetch(
+        let result = frame.retain_indices_batched_with_prefetch(
             width,
             |index| prefetch_index(index),
             |index| {
@@ -153,7 +157,11 @@ impl NodeNextEnqueue {
                     Ok(false)
                 }
             },
-        )
+        );
+        if result.is_err() {
+            self.split.free(runtime);
+        }
+        result
     }
 
     #[inline(always)]
@@ -199,15 +207,41 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn schedule<G>(self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+    pub fn schedule<G>(mut self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
         for offset in 0..self.len {
-            let node = self.node(offset)?;
-            let frame_index = self.frame(offset)?;
-            if !runtime.schedule_frame(node, frame_index)? {
-                runtime.free_frame_index(frame_index)?;
+            let node = match self.node(offset) {
+                Ok(node) => node,
+                Err(err) => {
+                    self.free_from(runtime, offset);
+                    return Err(err);
+                }
+            };
+            let frame_index = match self.take_frame(offset) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.free_from(runtime, offset + 1);
+                    return Err(err);
+                }
+            };
+            match runtime.schedule_frame(node, frame_index) {
+                Ok(true) => {}
+                Ok(false) => {
+                    runtime.free_frame_index(frame_index)?;
+                }
+                Err(err) => {
+                    let _ = runtime.free_frame_index(frame_index);
+                    self.free_from(runtime, offset + 1);
+                    return Err(err);
+                }
             }
         }
+        self.len = 0;
         Ok(())
+    }
+
+    #[inline]
+    pub fn free<G>(&mut self, runtime: &DataPlaneRuntime<G>) {
+        self.free_from(runtime, 0);
     }
 
     #[inline]
@@ -246,9 +280,29 @@ impl NodeNextFrames {
     }
 
     #[inline]
+    fn take_frame(&mut self, offset: usize) -> CoreResult<FrameIndex> {
+        self.nodes[offset] = None;
+        self.frames
+            .get_mut(offset)
+            .and_then(|frame| frame.take())
+            .ok_or_else(|| CoreError::internal("node next frame is missing"))
+    }
+
+    #[inline]
     fn position(&self, node: NodeId) -> Option<usize> {
         self.nodes[..self.len]
             .iter()
             .position(|candidate| *candidate == Some(node))
+    }
+
+    #[inline]
+    fn free_from<G>(&mut self, runtime: &DataPlaneRuntime<G>, start: usize) {
+        for offset in start..self.len {
+            self.nodes[offset] = None;
+            if let Some(frame) = self.frames[offset].take() {
+                let _ = runtime.free_frame_index(frame);
+            }
+        }
+        self.len = start.min(self.len);
     }
 }
