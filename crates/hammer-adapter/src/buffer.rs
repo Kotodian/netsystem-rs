@@ -2577,6 +2577,24 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    pub fn retain_indices_batched_with_prefetch_state<S>(
+        &mut self,
+        width: FrameBatchWidth,
+        state: &mut S,
+        mut prefetch: impl FnMut(&mut S, BufferIndex),
+        mut keep: impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
+                self.retain_indices_quad_with_prefetch_state(state, &mut prefetch, &mut keep)
+            }
+            FrameBatchWidth::Pair => {
+                self.retain_indices_pair_with_prefetch_state(state, &mut prefetch, &mut keep)
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn rewrite_indices_batched(
         &mut self,
         width: FrameBatchWidth,
@@ -2690,6 +2708,61 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_indices_quad_with_prefetch_state<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 4 <= len {
+            self.prefetch_indices_state(read + 4, 4, state, prefetch);
+            self.retain_one_state(read, &mut write, state, keep)?;
+            self.retain_one_state(read + 1, &mut write, state, keep)?;
+            self.retain_one_state(read + 2, &mut write, state, keep)?;
+            self.retain_one_state(read + 3, &mut write, state, keep)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            self.prefetch_indices_state(read + 2, 2, state, prefetch);
+            self.retain_one_state(read, &mut write, state, keep)?;
+            self.retain_one_state(read + 1, &mut write, state, keep)?;
+            read += 2;
+        }
+        while read < len {
+            self.retain_one_state(read, &mut write, state, keep)?;
+            read += 1;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_pair_with_prefetch_state<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 2 <= len {
+            self.prefetch_indices_state(read + 2, 2, state, prefetch);
+            self.retain_one_state(read, &mut write, state, keep)?;
+            self.retain_one_state(read + 1, &mut write, state, keep)?;
+            read += 2;
+        }
+        if read < len {
+            self.retain_one_state(read, &mut write, state, keep)?;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
         rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
@@ -2753,6 +2826,22 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_one_state<S>(
+        &mut self,
+        read: usize,
+        write: &mut usize,
+        state: &mut S,
+        keep: &mut impl FnMut(&mut S, BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let index = self.indices[read];
+        if keep(state, index)? {
+            self.indices[*write] = index;
+            *write += 1;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_one(
         &mut self,
         read: usize,
@@ -2777,6 +2866,20 @@ impl BufferFrame {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
             prefetch(index);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_indices_state<S>(
+        &self,
+        offset: usize,
+        width: usize,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, BufferIndex),
+    ) {
+        let end = (offset + width).min(self.indices.len());
+        for index in self.indices[offset..end].iter().copied() {
+            prefetch(state, index);
         }
     }
 

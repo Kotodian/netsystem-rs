@@ -1,6 +1,8 @@
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, PooledBufferFrame};
+use crate::buffer::{
+    BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, PooledBufferFrame,
+};
 use crate::instruction_set::FrameBatchWidth;
 
 use super::{MAX_NODE_NEXT_FRAMES, NodeId, NodeResult};
@@ -130,6 +132,35 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
+    pub fn validate_frame_with_first_next_and_buffer_batch_prefetch<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        first_index: BufferIndex,
+        first_next: NodeId,
+        mut prefetch_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex),
+        mut next_for_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        let mut first_seen = false;
+        self.validate_frame_with_width_and_buffer_batch_prefetch(
+            runtime,
+            frame,
+            width,
+            |batch, index| prefetch_index(batch, index),
+            |batch, index| {
+                if !first_seen && index == first_index {
+                    first_seen = true;
+                    return Ok(first_next);
+                }
+                next_for_index(batch, index)
+            },
+        )?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
     pub fn validate_frame_with_width<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -218,6 +249,38 @@ impl NodeNextEnqueue {
                 }
             },
         );
+        if result.is_err() {
+            self.split.free(runtime);
+        }
+        result
+    }
+
+    #[inline(always)]
+    pub fn validate_frame_with_width_and_buffer_batch_prefetch<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        width: FrameBatchWidth,
+        mut prefetch_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex),
+        mut next_for_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<()> {
+        let speculative_node = self.speculative_node;
+        let mut batch = runtime.buffer_batch_mut();
+        let result = frame.retain_indices_batched_with_prefetch_state(
+            width,
+            &mut batch,
+            |batch, index| prefetch_index(batch, index),
+            |batch, index| {
+                let node = next_for_index(batch, index)?;
+                if node == speculative_node {
+                    Ok(true)
+                } else {
+                    self.split.enqueue(runtime, node, index)?;
+                    Ok(false)
+                }
+            },
+        );
+        drop(batch);
         if result.is_err() {
             self.split.free(runtime);
         }

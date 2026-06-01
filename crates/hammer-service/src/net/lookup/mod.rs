@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, ForwardingDpoType,
-    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextEnqueue, NodeResult,
-    RouteMetadata,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
+    ForwardingDpoType, ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextEnqueue,
+    NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -114,14 +114,13 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index<G>(
+    fn process_index_with_batch(
         &self,
-        runtime: &DataPlaneRuntime<G>,
+        batch: &mut BufferBatchMut<'_>,
         snapshot: &FibSnapshot,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
-        let next_node = {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+        batch.with_buffer_mut(index, |buffer| {
             let parsed = match packet_from_cached_metadata(
                 buffer.metadata(),
                 buffer.packet_cursor(),
@@ -154,36 +153,36 @@ impl IpLookupNode {
                 dpo_type: forwarding_dpo_type(result.dpo.dpo_type),
                 dpo_index: result.dpo.index,
             });
-            result.dpo.next
-        };
-        Ok(next_node)
+            Ok(result.dpo.next)
+        })?
     }
 
     #[inline(always)]
-    fn prefetch_index<G>(
-        runtime: &DataPlaneRuntime<G>,
+    fn prefetch_index_with_batch(
+        batch: &mut BufferBatchMut<'_>,
         snapshot: &FibSnapshot,
         index: BufferIndex,
     ) {
-        let Ok(buffer) = runtime.get_buffer(index) else {
+        batch.prefetch_read(index);
+        let Ok(()) = batch.with_buffer(index, |buffer| {
+            let Some(parsed) = packet_from_cached_metadata(
+                buffer.metadata(),
+                buffer.packet_cursor(),
+                buffer.current_ptr(),
+                buffer.current_len(),
+                buffer.total_len_not_including_first(),
+            ) else {
+                return;
+            };
+            snapshot.prefetch_packet(&parsed);
+        }) else {
             return;
         };
-        buffer.prefetch_read();
-        let Some(parsed) = packet_from_cached_metadata(
-            buffer.metadata(),
-            buffer.packet_cursor(),
-            buffer.current_ptr(),
-            buffer.current_len(),
-            buffer.total_len_not_including_first(),
-        ) else {
-            return;
-        };
-        snapshot.prefetch_packet(&parsed);
     }
 
     #[inline(always)]
-    fn prefetch_range<G>(
-        runtime: &DataPlaneRuntime<G>,
+    fn prefetch_range_with_batch(
+        batch: &mut BufferBatchMut<'_>,
         snapshot: &FibSnapshot,
         indices: &[BufferIndex],
         offset: usize,
@@ -194,7 +193,7 @@ impl IpLookupNode {
         }
         let end = (offset + width).min(indices.len());
         for index in indices[offset..end].iter().copied() {
-            Self::prefetch_index(runtime, snapshot, index);
+            Self::prefetch_index_with_batch(batch, snapshot, index);
         }
     }
 }
@@ -212,17 +211,20 @@ impl<G> Node<G> for IpLookupNode {
             return Ok(NodeResult::drop());
         };
         let width = frame_batch_width(runtime);
-        Self::prefetch_range(runtime, &snapshot, indices, 0, width);
-        let speculative = self.process_index(runtime, &snapshot, first)?;
-        NodeNextEnqueue::new(speculative).validate_frame_with_first_next_and_prefetch(
+        let speculative = {
+            let mut batch = runtime.buffer_batch_mut();
+            Self::prefetch_range_with_batch(&mut batch, &snapshot, indices, 0, width);
+            self.process_index_with_batch(&mut batch, &snapshot, first)?
+        };
+        NodeNextEnqueue::new(speculative).validate_frame_with_first_next_and_buffer_batch_prefetch(
             runtime,
             frame,
             first,
             speculative,
-            |index| {
-                Self::prefetch_index(runtime, &snapshot, index);
+            |batch, index| {
+                Self::prefetch_index_with_batch(batch, &snapshot, index);
             },
-            |index| self.process_index(runtime, &snapshot, index),
+            |batch, index| self.process_index_with_batch(batch, &snapshot, index),
         )
     }
 }
