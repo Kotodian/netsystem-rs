@@ -271,8 +271,42 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
         .expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::LoadBalance);
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
-    assert_eq!(result.load_balance, load_balance);
+    assert_eq!(result.load_balance(), Some(load_balance));
+    assert_eq!(result.bucket_index(), Some(0));
     assert_eq!(result.dpo.kind(), DpoType::Receive);
+}
+
+#[test]
+fn fib_snapshot_can_route_directly_to_terminal_dpo() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    builder.add_ip4_route_dpo(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 50), 32).expect("receive route"),
+        DpoId::receive(IpVersion::V4, NextHop::Direct),
+    );
+    let ip6_destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0050);
+    builder.add_ip6_route_dpo(
+        Ipv6Net::new(ip6_destination, 128).expect("receive route"),
+        DpoId::receive(IpVersion::V6, NextHop::Direct),
+    );
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 50), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.kind(), DpoType::Receive);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
+
+    let result = snapshot
+        .lookup_ip6(ip6_destination, 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.kind(), DpoType::Receive);
+    assert_eq!(result.route_dpo.proto(), IpVersion::V6);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
 #[test]

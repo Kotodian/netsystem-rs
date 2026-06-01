@@ -131,26 +131,79 @@ impl<N: Copy> FibSnapshot<N> {
         hash: usize,
     ) -> Option<FibLookupResult<N>> {
         let route_dpo = *self.lookup.route_dpos.get(route_dpo_index.slot())?;
-        let load_balance = route_dpo.load_balance_index()?;
+        let Some(load_balance) = route_dpo.load_balance_index() else {
+            return Some(FibLookupResult::terminal(route_dpo));
+        };
         let load_balance_ref = self.load_balance(load_balance)?;
         prefetch_read_l1(load_balance_ref);
         load_balance_ref.prefetch_bucket(hash);
         let (bucket_index, dpo) = load_balance_ref.select_hash(hash)?;
-        Some(FibLookupResult {
+        Some(FibLookupResult::from_load_balance(
             route_dpo,
             load_balance,
             bucket_index,
             dpo,
-        })
+        ))
     }
 }
+
+const FIB_LOOKUP_NO_LOAD_BALANCE: u32 = u32::MAX;
+const FIB_LOOKUP_NO_BUCKET: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FibLookupResult<N> {
     pub route_dpo: DpoId<N>,
-    pub load_balance: LoadBalanceIndex,
-    pub bucket_index: u16,
+    load_balance: u32,
+    bucket_index: u16,
     pub dpo: DpoId<N>,
+}
+
+impl<N: Copy> FibLookupResult<N> {
+    #[inline(always)]
+    pub fn terminal(route_dpo: DpoId<N>) -> Self {
+        Self {
+            route_dpo,
+            load_balance: FIB_LOOKUP_NO_LOAD_BALANCE,
+            bucket_index: FIB_LOOKUP_NO_BUCKET,
+            dpo: route_dpo,
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_load_balance(
+        route_dpo: DpoId<N>,
+        load_balance: LoadBalanceIndex,
+        bucket_index: u16,
+        dpo: DpoId<N>,
+    ) -> Self {
+        Self {
+            route_dpo,
+            load_balance: load_balance.get(),
+            bucket_index,
+            dpo,
+        }
+    }
+
+    #[inline(always)]
+    pub fn load_balance(&self) -> Option<LoadBalanceIndex> {
+        (self.load_balance != FIB_LOOKUP_NO_LOAD_BALANCE)
+            .then_some(LoadBalanceIndex::new(self.load_balance))
+    }
+
+    #[inline(always)]
+    pub fn bucket_index(&self) -> Option<u16> {
+        (self.bucket_index != FIB_LOOKUP_NO_BUCKET).then_some(self.bucket_index)
+    }
+
+    #[inline(always)]
+    pub fn forwarding_load_balance_index(&self) -> u32 {
+        self.load_balance
+    }
+
+    #[inline(always)]
+    pub fn forwarding_bucket_index(&self) -> u16 {
+        self.bucket_index
+    }
 }
 
 pub struct FibSnapshotBuilder<N: Copy> {
@@ -213,6 +266,18 @@ impl<N: Copy> FibSnapshotBuilder<N> {
             load_balance,
             self.drop_next,
         ));
+        self.ip6_routes.push(Ip6Route { prefix, route_dpo });
+    }
+
+    #[inline]
+    pub fn add_ip4_route_dpo(&mut self, prefix: Ipv4Net, dpo: DpoId<N>) {
+        let route_dpo = self.add_route_dpo_entry(dpo);
+        self.ip4_routes.push(Ip4Route { prefix, route_dpo });
+    }
+
+    #[inline]
+    pub fn add_ip6_route_dpo(&mut self, prefix: Ipv6Net, dpo: DpoId<N>) {
+        let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
     }
 

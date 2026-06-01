@@ -22,9 +22,6 @@ use hammer_core::protocol::ip::{
 };
 use hammer_runtime::ControlThreadHandle;
 
-const FORWARDING_MISS_INDEX: u32 = u32::MAX;
-const FORWARDING_MISS_BUCKET: u16 = u16::MAX;
-
 pub type Adjacency = CoreAdjacency<NodeId>;
 pub type DpoId = CoreDpoId<NodeId>;
 pub type FibLookupResult = CoreFibLookupResult<NodeId>;
@@ -145,16 +142,13 @@ impl IpLookupNode {
                 return Ok(snapshot.drop_next());
             }
         };
-        let result = snapshot.lookup_packet(&parsed).unwrap_or(FibLookupResult {
-            route_dpo: snapshot.drop_dpo(parsed.version),
-            load_balance: LoadBalanceIndex::new(FORWARDING_MISS_INDEX),
-            bucket_index: FORWARDING_MISS_BUCKET,
-            dpo: snapshot.drop_dpo(parsed.version),
-        });
+        let result = snapshot
+            .lookup_packet(&parsed)
+            .unwrap_or_else(|| FibLookupResult::terminal(snapshot.drop_dpo(parsed.version)));
         buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
             fib_index: 0,
-            load_balance_index: result.load_balance.get(),
-            bucket_index: result.bucket_index,
+            load_balance_index: result.forwarding_load_balance_index(),
+            bucket_index: result.forwarding_bucket_index(),
             dpo_type: forwarding_dpo_type(result.dpo),
             dpo_index: result.dpo.forwarding_index(),
         });
