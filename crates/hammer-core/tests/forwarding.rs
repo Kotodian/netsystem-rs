@@ -174,6 +174,34 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
 }
 
 #[test]
+fn fib_snapshot_builder_adds_single_path_load_balance() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let load_balance = builder.add_single_path_load_balance(IpVersion::V4, NextHop::Direct);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 13), 32).expect("route"),
+        load_balance,
+    );
+    let snapshot = builder.build();
+
+    let load_balance_entry = snapshot.load_balance(load_balance).expect("load-balance");
+    assert_eq!(load_balance_entry.bucket_count(), 1);
+    let adjacency = load_balance_entry.buckets()[0]
+        .adjacency_index()
+        .expect("adjacency bucket");
+    let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency");
+    assert_eq!(adjacency_entry.proto, IpVersion::V4);
+    assert_eq!(adjacency_entry.next, NextHop::Direct);
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 13), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
+    assert_eq!(result.dpo.kind(), DpoType::Adjacency);
+    assert_eq!(result.dpo.adjacency_index(), Some(adjacency));
+    assert_eq!(result.dpo.next(), NextHop::Direct);
+}
+
+#[test]
 fn dpo_receive_has_no_adjacency_index() {
     let dpo = Dpo::receive(IpVersion::V4, NextHop::Direct);
 

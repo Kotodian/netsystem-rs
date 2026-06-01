@@ -302,6 +302,12 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_single_path_load_balance(&mut self, proto: IpVersion, next: N) -> LoadBalanceIndex {
+        let adjacency = self.add_adjacency_dpo(proto, next);
+        self.add_load_balance(proto, [adjacency])
+    }
+
+    #[inline]
     pub fn add_load_balance_dpo(
         &mut self,
         proto: IpVersion,

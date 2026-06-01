@@ -699,8 +699,7 @@ fn add_single_path(
     version: IpVersion,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
-    let adjacency = builder.add_adjacency_dpo(version, node);
-    builder.add_load_balance(version, [adjacency])
+    builder.add_single_path_load_balance(version, node)
 }
 
 fn push_packet(
