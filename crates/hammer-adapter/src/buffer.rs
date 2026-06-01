@@ -766,6 +766,16 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub(crate) fn return_pooled_frame_for_schedule(
+        &self,
+        frame: PooledBufferFrame,
+    ) -> CoreResult<FrameIndex> {
+        let PooledBufferFrame { index, frame } = frame;
+        self.frames.return_taken_index(index, frame)?;
+        Ok(index)
+    }
+
+    #[inline]
     pub(crate) fn take_frame_index(&self, index: FrameIndex) -> CoreResult<BufferFrame> {
         self.frames.take_index(index)
     }
@@ -1102,6 +1112,23 @@ impl<N> DataPlaneRuntime<N> {
         self.get_frame_mut(frame)?.set_next_node(node);
         self.nodes.schedule_frame(node, frame, false)?;
         Ok(true)
+    }
+
+    #[inline]
+    pub(crate) fn schedule_pooled_frame(
+        &self,
+        node: NodeId,
+        frame: PooledBufferFrame,
+    ) -> CoreResult<()> {
+        let frame_index = self.buffers.return_pooled_frame_for_schedule(frame)?;
+        match self.schedule_frame(node, frame_index) {
+            Ok(true) => Ok(()),
+            Ok(false) => self.free_frame_index(frame_index),
+            Err(err) => {
+                let _ = self.free_frame_index(frame_index);
+                Err(err)
+            }
+        }
     }
 
     #[inline]

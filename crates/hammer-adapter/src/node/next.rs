@@ -1,6 +1,6 @@
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
+use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, PooledBufferFrame};
 use crate::instruction_set::FrameBatchWidth;
 
 use super::{MAX_NODE_NEXT_FRAMES, NodeId, NodeResult};
@@ -18,10 +18,17 @@ pub struct NodeNextFrames {
     len: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
+struct NodeNextOwnedFrames {
+    nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],
+    frames: [Option<PooledBufferFrame>; MAX_NODE_NEXT_FRAMES],
+    len: usize,
+}
+
+#[derive(Debug)]
 pub struct NodeNextEnqueue {
     speculative_node: NodeId,
-    split: NodeNextFrames,
+    split: NodeNextOwnedFrames,
 }
 
 impl Default for NodeNextFrames {
@@ -35,12 +42,23 @@ impl Default for NodeNextFrames {
     }
 }
 
+impl Default for NodeNextOwnedFrames {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            nodes: [None; MAX_NODE_NEXT_FRAMES],
+            frames: std::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+}
+
 impl NodeNextEnqueue {
     #[inline]
     pub fn new(speculative_node: NodeId) -> Self {
         Self {
             speculative_node,
-            split: NodeNextFrames::default(),
+            split: NodeNextOwnedFrames::default(),
         }
     }
 
@@ -235,6 +253,17 @@ impl NodeNextFrames {
     }
 
     #[inline]
+    pub fn enqueue_indices<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        node: NodeId,
+        indices: impl IntoIterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        let frame_index = self.frame_for(runtime, node)?;
+        runtime.with_frame_mut(frame_index, |frame| frame.push_indices(indices))?
+    }
+
+    #[inline]
     pub fn enqueue_optional<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -343,6 +372,112 @@ impl NodeNextFrames {
             self.nodes[offset] = None;
             if let Some(frame) = self.frames[offset].take() {
                 let _ = runtime.free_frame_index(frame);
+            }
+        }
+        self.len = start.min(self.len);
+    }
+}
+
+impl NodeNextOwnedFrames {
+    #[inline]
+    fn enqueue<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        node: NodeId,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        self.frame_for_mut(runtime, node)?.push_index(index)
+    }
+
+    #[inline]
+    fn schedule<G>(mut self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+        for offset in 0..self.len {
+            let node = match self.node(offset) {
+                Ok(node) => node,
+                Err(err) => {
+                    self.free_from(runtime, offset);
+                    return Err(err);
+                }
+            };
+            let frame = match self.take_frame(offset) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.free_from(runtime, offset + 1);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = runtime.schedule_pooled_frame(node, frame) {
+                self.free_from(runtime, offset + 1);
+                return Err(err);
+            }
+        }
+        self.len = 0;
+        Ok(())
+    }
+
+    #[inline]
+    fn free<G>(&mut self, runtime: &DataPlaneRuntime<G>) {
+        self.free_from(runtime, 0);
+    }
+
+    #[inline]
+    fn frame_for_mut<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        node: NodeId,
+    ) -> CoreResult<&mut BufferFrame> {
+        if let Some(offset) = self.position(node) {
+            return self.frame_mut(offset);
+        }
+        if self.len == MAX_NODE_NEXT_FRAMES {
+            return Err(CoreError::internal("node next frame capacity exceeded"));
+        }
+        let offset = self.len;
+        self.nodes[offset] = Some(node);
+        self.frames[offset] = Some(runtime.alloc_pooled_frame()?);
+        self.len += 1;
+        self.frame_mut(offset)
+    }
+
+    #[inline]
+    fn node(&self, offset: usize) -> CoreResult<NodeId> {
+        self.nodes
+            .get(offset)
+            .and_then(|node| *node)
+            .ok_or_else(|| CoreError::internal("node next entry is missing"))
+    }
+
+    #[inline]
+    fn frame_mut(&mut self, offset: usize) -> CoreResult<&mut BufferFrame> {
+        self.frames
+            .get_mut(offset)
+            .and_then(Option::as_mut)
+            .map(|frame| &mut **frame)
+            .ok_or_else(|| CoreError::internal("node next frame is missing"))
+    }
+
+    #[inline]
+    fn take_frame(&mut self, offset: usize) -> CoreResult<PooledBufferFrame> {
+        self.nodes[offset] = None;
+        self.frames
+            .get_mut(offset)
+            .and_then(|frame| frame.take())
+            .ok_or_else(|| CoreError::internal("node next frame is missing"))
+    }
+
+    #[inline]
+    fn position(&self, node: NodeId) -> Option<usize> {
+        self.nodes[..self.len]
+            .iter()
+            .position(|candidate| *candidate == Some(node))
+    }
+
+    #[inline]
+    fn free_from<G>(&mut self, runtime: &DataPlaneRuntime<G>, start: usize) {
+        for offset in start..self.len {
+            self.nodes[offset] = None;
+            if let Some(frame) = self.frames[offset].take() {
+                let _ = runtime.release_pooled_frame(frame);
             }
         }
         self.len = start.min(self.len);

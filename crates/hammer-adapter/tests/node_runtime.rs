@@ -8,8 +8,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneRuntime,
-    DataWorkerId, DriverNode, InternalNode, Node, NodeHandle, NodeId, NodeNextEnqueue, NodeResult,
-    RouteMetadata,
+    DataWorkerId, DriverNode, InternalNode, Node, NodeHandle, NodeId, NodeNextEnqueue,
+    NodeNextFrames, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -631,6 +631,44 @@ fn precomputed_nexts_split_mismatched_next_to_separate_frame() {
         &[b"default-1".to_vec(), b"default-2".to_vec()]
     );
     assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_next_frames_enqueue_indices_schedules_batch_to_one_frame() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register_driver(SinkNode {
+        trace,
+        payloads: Rc::clone(&payloads),
+    });
+    let indices = [
+        runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+            .expect("alloc first packet"),
+        runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+            .expect("alloc second packet"),
+        runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"three")
+            .expect("alloc third packet"),
+    ];
+    let mut next_frames = NodeNextFrames::default();
+
+    next_frames
+        .enqueue_indices(&runtime, sink, indices.iter().copied())
+        .expect("enqueue batch");
+    assert_eq!(runtime.frames_in_use(), 1);
+
+    next_frames.schedule(&runtime).expect("schedule batch");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(
+        &*payloads.borrow(),
+        &[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
