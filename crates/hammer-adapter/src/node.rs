@@ -447,10 +447,18 @@ impl<N> NodeRuntime<N> {
         result: NodeResult,
     ) -> CoreResult<()> {
         let mut current_frame = Some(current_frame);
-        for next in result.iter() {
+        for offset in 0..result.len {
+            let Some(next) = result.next[offset] else {
+                continue;
+            };
             match next {
                 NextFrame::Current(node) => {
                     let Some(mut frame) = current_frame.take() else {
+                        Self::release_remaining_next_frames_on_dispatch_error(
+                            runtime,
+                            &result,
+                            offset + 1,
+                        );
                         return Err(CoreError::internal(
                             "current frame cannot be forwarded more than once",
                         ));
@@ -458,6 +466,11 @@ impl<N> NodeRuntime<N> {
                     if frame.has_pending() {
                         if let Err(err) = self.validate_node(node) {
                             let _ = runtime.release_taken_frame_index(current_index, frame);
+                            Self::release_remaining_next_frames_on_dispatch_error(
+                                runtime,
+                                &result,
+                                offset + 1,
+                            );
                             return Err(err);
                         }
                         frame.set_next_node(node);
@@ -476,6 +489,11 @@ impl<N> NodeRuntime<N> {
                                 current_index,
                                 &mut current_frame,
                             );
+                            Self::release_remaining_next_frames_on_dispatch_error(
+                                runtime,
+                                &result,
+                                offset + 1,
+                            );
                             return Err(err);
                         }
                     }
@@ -485,6 +503,11 @@ impl<N> NodeRuntime<N> {
                             current_index,
                             &mut current_frame,
                             frame,
+                        );
+                        Self::release_remaining_next_frames_on_dispatch_error(
+                            runtime,
+                            &result,
+                            offset + 1,
                         );
                         return Err(err);
                     }
@@ -496,6 +519,21 @@ impl<N> NodeRuntime<N> {
             runtime.release_taken_frame_index(current_index, frame)?;
         }
         Ok(())
+    }
+
+    fn release_remaining_next_frames_on_dispatch_error(
+        runtime: &DataPlaneRuntime<N>,
+        result: &NodeResult,
+        start: usize,
+    ) {
+        for next in result.next[start..result.len]
+            .iter()
+            .filter_map(|next| *next)
+        {
+            if let NextFrame::Frame { frame, .. } = next {
+                let _ = runtime.free_frame_index(frame);
+            }
+        }
     }
 
     fn release_current_frame_on_dispatch_error(

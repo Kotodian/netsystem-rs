@@ -8,7 +8,7 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet,
-    DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, Node, NodeHandle, NodeId,
+    DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
     NodeNextEnqueue, NodeNextFrames, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -179,6 +179,37 @@ impl Node<TestNode> for ExplicitNextFrameNode {
 }
 
 impl InternalNode<TestNode> for ExplicitNextFrameNode {}
+
+struct MultipleNextFrameNode {
+    first_next: NodeId,
+    second_next: NodeId,
+}
+
+impl Node<TestNode> for MultipleNextFrameNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let first = runtime.alloc_frame_index()?;
+        push_test_packet(runtime, first, b"first-next");
+        let second = runtime.alloc_frame_index()?;
+        push_test_packet(runtime, second, b"second-next");
+        NodeResult::try_next_frames([
+            NextFrame::Frame {
+                node: self.first_next,
+                frame: first,
+            },
+            NextFrame::Frame {
+                node: self.second_next,
+                frame: second,
+            },
+        ])
+    }
+}
+
+impl InternalNode<TestNode> for MultipleNextFrameNode {}
 
 struct HandoffNode {
     target_worker: DataWorkerId,
@@ -456,6 +487,7 @@ enum TestNode {
     Error(ErrorNode),
     InvalidNext(InvalidNextNode),
     ExplicitNextFrame(ExplicitNextFrameNode),
+    MultipleNextFrame(MultipleNextFrameNode),
     Handoff(HandoffNode),
     PointerSink(PointerSinkNode),
     SpeculativeSplit(SpeculativeSplitNode),
@@ -505,6 +537,12 @@ impl From<InvalidNextNode> for TestNode {
 impl From<ExplicitNextFrameNode> for TestNode {
     fn from(node: ExplicitNextFrameNode) -> Self {
         Self::ExplicitNextFrame(node)
+    }
+}
+
+impl From<MultipleNextFrameNode> for TestNode {
+    fn from(node: MultipleNextFrameNode) -> Self {
+        Self::MultipleNextFrame(node)
     }
 }
 
@@ -571,6 +609,7 @@ impl Node<TestNode> for TestNode {
             Self::Error(node) => node.process(runtime, frame),
             Self::InvalidNext(node) => node.process(runtime, frame),
             Self::ExplicitNextFrame(node) => node.process(runtime, frame),
+            Self::MultipleNextFrame(node) => node.process(runtime, frame),
             Self::Handoff(node) => node.process(runtime, frame),
             Self::PointerSink(node) => node.process(runtime, frame),
             Self::SpeculativeSplit(node) => node.process(runtime, frame),
@@ -1052,6 +1091,9 @@ fn node_runtime_releases_current_and_next_frame_when_next_frame_node_is_invalid(
     other_runtime.nodes().register_internal(CountNode {
         count: Rc::new(Cell::new(0)),
     });
+    other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
     let invalid = other_runtime.nodes().register_internal(CountNode {
         count: Rc::new(Cell::new(0)),
     });
@@ -1065,6 +1107,40 @@ fn node_runtime_releases_current_and_next_frame_when_next_frame_node_is_invalid(
     assert!(runtime.schedule_frame(node, frame).expect("schedule"));
 
     let err = runtime.run_ready_nodes().expect_err("invalid next node");
+    assert!(
+        err.to_string().contains("node id out of bounds"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_releases_unprocessed_next_frames_when_dispatch_fails() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 4, 4);
+    let other_runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 1, 4, 1);
+    other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let invalid = other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let valid = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let node = runtime.nodes().register_internal(MultipleNextFrameNode {
+        first_next: invalid,
+        second_next: valid,
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"current");
+
+    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+
+    let err = runtime.run_ready_nodes().expect_err("invalid first next");
     assert!(
         err.to_string().contains("node id out of bounds"),
         "unexpected error: {err}"
