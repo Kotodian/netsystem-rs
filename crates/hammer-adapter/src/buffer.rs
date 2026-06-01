@@ -2502,6 +2502,102 @@ impl BufferFrame {
         Ok(())
     }
 
+    #[inline(always)]
+    pub fn retain_indices_batched(
+        &mut self,
+        width: FrameBatchWidth,
+        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => self.retain_indices_quad(&mut keep),
+            FrameBatchWidth::Pair => self.retain_indices_pair(&mut keep),
+        }
+    }
+
+    #[inline(always)]
+    fn retain_indices_quad(
+        &mut self,
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 4 <= len {
+            let indices = [
+                self.indices[read],
+                self.indices[read + 1],
+                self.indices[read + 2],
+                self.indices[read + 3],
+            ];
+            for index in indices {
+                if keep(index)? {
+                    self.indices[write] = index;
+                    write += 1;
+                }
+            }
+            read += 4;
+        }
+        if read + 2 <= len {
+            let indices = [self.indices[read], self.indices[read + 1]];
+            for index in indices {
+                if keep(index)? {
+                    self.indices[write] = index;
+                    write += 1;
+                }
+            }
+            read += 2;
+        }
+        while read < len {
+            let index = self.indices[read];
+            if keep(index)? {
+                self.indices[write] = index;
+                write += 1;
+            }
+            read += 1;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_pair(
+        &mut self,
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 2 <= len {
+            let indices = [self.indices[read], self.indices[read + 1]];
+            for index in indices {
+                if keep(index)? {
+                    self.indices[write] = index;
+                    write += 1;
+                }
+            }
+            read += 2;
+        }
+        if read < len {
+            let index = self.indices[read];
+            if keep(index)? {
+                self.indices[write] = index;
+                write += 1;
+            }
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn finish_retain(&mut self, len: usize) {
+        self.indices.truncate(len);
+        if self.indices.is_empty() {
+            self.readiness.clear_pending();
+        } else {
+            self.readiness.mark_pending();
+        }
+    }
+
     #[inline]
     pub fn pending(&self) -> BufferFramePending {
         BufferFramePending {

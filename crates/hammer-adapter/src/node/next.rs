@@ -1,8 +1,9 @@
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::buffer::{BufferIndex, DataPlaneRuntime, FrameIndex};
+use crate::buffer::{BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex};
+use crate::instruction_set::FrameBatchWidth;
 
-use super::{MAX_NODE_NEXT_FRAMES, NodeId};
+use super::{MAX_NODE_NEXT_FRAMES, NodeId, NodeResult};
 
 pub trait NodeNext: Copy + Eq {
     const COUNT: usize;
@@ -23,6 +24,12 @@ pub struct NodeNextFrames {
     len: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NodeNextEnqueue {
+    speculative_node: NodeId,
+    split: NodeNextFrames,
+}
+
 impl Default for NodeNextFrames {
     #[inline]
     fn default() -> Self {
@@ -30,6 +37,89 @@ impl Default for NodeNextFrames {
             nodes: [None; MAX_NODE_NEXT_FRAMES],
             frames: [None; MAX_NODE_NEXT_FRAMES],
             len: 0,
+        }
+    }
+}
+
+impl NodeNextEnqueue {
+    #[inline]
+    pub fn new(speculative_node: NodeId) -> Self {
+        Self {
+            speculative_node,
+            split: NodeNextFrames::default(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn validate_frame<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        self.validate_frame_with_width(runtime, frame, width, |index| {
+            let node = next_for_index(index)?;
+            Ok(node)
+        })?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
+    pub fn validate_frame_with_first_next<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        first_index: BufferIndex,
+        first_next: NodeId,
+        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        let mut first_seen = false;
+        self.validate_frame_with_width(runtime, frame, width, |index| {
+            if !first_seen && index == first_index {
+                first_seen = true;
+                return Ok(first_next);
+            }
+            next_for_index(index)
+        })?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
+    pub fn validate_frame_with_width<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        width: FrameBatchWidth,
+        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<()> {
+        let speculative_node = self.speculative_node;
+        frame.retain_indices_batched(width, |index| {
+            let node = next_for_index(index)?;
+            if node == speculative_node {
+                Ok(true)
+            } else {
+                self.split.enqueue(runtime, node, index)?;
+                Ok(false)
+            }
+        })
+    }
+
+    #[inline(always)]
+    fn finish<G>(
+        self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &BufferFrame,
+        speculative_node: NodeId,
+    ) -> CoreResult<NodeResult> {
+        self.split.schedule(runtime)?;
+        if frame.has_pending() {
+            Ok(NodeResult::next_current(speculative_node))
+        } else {
+            Ok(NodeResult::drop())
         }
     }
 }

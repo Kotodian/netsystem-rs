@@ -1,9 +1,11 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, ForwardingDpoType, ForwardingMetadata,
-    FrameBatchWidth, InternalNode, Node, NodeId, NodeNextFrames, NodeResult,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, ForwardingDpoType,
+    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextEnqueue, NodeResult,
+    RouteMetadata,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -12,7 +14,9 @@ use hammer_core::forwarding::{
     LoadBalance as CoreLoadBalance,
 };
 pub use hammer_core::forwarding::{AdjacencyIndex, DpoType, FibEntry, LoadBalanceIndex};
-use hammer_core::protocol::ip::parse_ip_packet_with_chain_len;
+use hammer_core::protocol::ip::{
+    IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
+};
 use hammer_runtime::ControlThreadHandle;
 
 const FORWARDING_MISS_INDEX: u32 = u32::MAX;
@@ -114,19 +118,28 @@ impl IpLookupNode {
         &self,
         runtime: &DataPlaneRuntime<G>,
         snapshot: &FibSnapshot,
-        next_frames: &mut NodeNextFrames,
         index: BufferIndex,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<NodeId> {
         let next_node = {
             let mut buffer = runtime.get_buffer_mut(index)?;
-            let parsed = match parse_ip_packet_with_chain_len(
-                buffer.current(),
+            let parsed = match packet_from_cached_metadata(
+                buffer.metadata(),
+                buffer.packet_cursor(),
+                buffer.current_ptr(),
+                buffer.current_len(),
                 buffer.total_len_not_including_first(),
-            ) {
-                Ok(parsed) => parsed,
-                Err(_) => {
+            )
+            .or_else(|| {
+                parse_ip_packet_with_chain_len(
+                    buffer.current(),
+                    buffer.total_len_not_including_first(),
+                )
+                .ok()
+            }) {
+                Some(parsed) => parsed,
+                None => {
                     buffer.metadata_mut().forwarding = None;
-                    return next_frames.enqueue(runtime, snapshot.drop_next(), index);
+                    return Ok(snapshot.drop_next());
                 }
             };
             let result = snapshot.lookup_packet(&parsed).unwrap_or(FibLookupResult {
@@ -143,7 +156,7 @@ impl IpLookupNode {
             });
             result.dpo.next
         };
-        next_frames.enqueue(runtime, next_node, index)
+        Ok(next_node)
     }
 
     #[inline(always)]
@@ -155,10 +168,17 @@ impl IpLookupNode {
         let Ok(buffer) = runtime.get_buffer(index) else {
             return;
         };
-        let Ok(parsed) = parse_ip_packet_with_chain_len(
-            buffer.current(),
+        let Some(parsed) = packet_from_cached_metadata(
+            buffer.metadata(),
+            buffer.packet_cursor(),
+            buffer.current_ptr(),
+            buffer.current_len(),
             buffer.total_len_not_including_first(),
-        ) else {
+        )
+        .or_else(|| {
+            parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())
+                .ok()
+        }) else {
             return;
         };
         snapshot.prefetch_packet(&parsed);
@@ -181,26 +201,6 @@ impl IpLookupNode {
             Self::prefetch_index(runtime, snapshot, index);
         }
     }
-
-    #[inline(always)]
-    fn process_range<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        snapshot: &FibSnapshot,
-        next_frames: &mut NodeNextFrames,
-        indices: &[BufferIndex],
-        offset: usize,
-        width: usize,
-    ) -> CoreResult<()> {
-        if offset >= indices.len() {
-            return Ok(());
-        }
-        let end = (offset + width).min(indices.len());
-        for index in indices[offset..end].iter().copied() {
-            self.process_index(runtime, snapshot, next_frames, index)?;
-        }
-        Ok(())
-    }
 }
 
 impl<G> Node<G> for IpLookupNode {
@@ -211,22 +211,20 @@ impl<G> Node<G> for IpLookupNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
-        let mut next_frames = NodeNextFrames::default();
         let indices = frame.pending_indices();
-        let width = match runtime.preferred_frame_batch_width() {
-            FrameBatchWidth::Quad => 4,
-            FrameBatchWidth::Pair => 2,
+        let Some(first) = indices.first().copied() else {
+            return Ok(NodeResult::drop());
         };
+        let width = frame_batch_width(runtime);
         Self::prefetch_range(runtime, &snapshot, indices, 0, width);
-        let mut offset = 0usize;
-        while offset < indices.len() {
-            Self::prefetch_range(runtime, &snapshot, indices, offset + width, width);
-            self.process_range(runtime, &snapshot, &mut next_frames, indices, offset, width)?;
-            offset += width;
-        }
-        frame.clear();
-        next_frames.schedule(runtime)?;
-        Ok(NodeResult::drop())
+        let speculative = self.process_index(runtime, &snapshot, first)?;
+        NodeNextEnqueue::new(speculative).validate_frame_with_first_next(
+            runtime,
+            frame,
+            first,
+            speculative,
+            |index| self.process_index(runtime, &snapshot, index),
+        )
     }
 }
 
@@ -238,5 +236,62 @@ fn forwarding_dpo_type(dpo_type: DpoType) -> ForwardingDpoType {
         DpoType::Drop => ForwardingDpoType::Drop,
         DpoType::Punt => ForwardingDpoType::Punt,
         DpoType::Adjacency => ForwardingDpoType::Adjacency,
+    }
+}
+
+#[inline(always)]
+fn frame_batch_width<G>(runtime: &DataPlaneRuntime<G>) -> usize {
+    match runtime.preferred_frame_batch_width() {
+        hammer_adapter::FrameBatchWidth::Quad => 4,
+        hammer_adapter::FrameBatchWidth::Pair => 2,
+    }
+}
+
+#[inline(always)]
+fn packet_from_cached_metadata(
+    metadata: &RouteMetadata,
+    cursor: BufferPacketCursor,
+    current_ptr: *const u8,
+    current_len: usize,
+    tail_len: usize,
+) -> Option<ParsedIpPacket> {
+    if cursor.packet_len() == 0 || current_ptr.is_null() {
+        return None;
+    }
+    let chain_len = current_len.checked_add(tail_len)?;
+    if cursor.network_header_offset() > current_len || cursor.packet_len() > chain_len {
+        return None;
+    }
+    let source = metadata.source.as_ref()?.host;
+    let destination = metadata.destination.as_ref()?.host;
+    let version = match (source, destination) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => IpVersion::V4,
+        (IpAddr::V6(_), IpAddr::V6(_)) => IpVersion::V6,
+        _ => return None,
+    };
+    Some(ParsedIpPacket {
+        version,
+        protocol: protocol_from_network(metadata.network, version),
+        input_target: hammer_core::protocol::ip::IpInputTarget::Lookup,
+        input_error: hammer_core::protocol::ip::IpInputError::None,
+        source,
+        destination,
+        packet_len: cursor.packet_len(),
+        network_header_offset: cursor.network_header_offset(),
+        network_header_len: cursor.network_header_len(),
+        transport_header_offset: cursor.transport_header_offset(),
+        transport_header_len: cursor.transport_header_len(),
+    })
+}
+
+#[inline(always)]
+fn protocol_from_network(network: Network, version: IpVersion) -> IpProtocol {
+    match network {
+        Network::Tcp => IpProtocol::Tcp,
+        Network::Udp => IpProtocol::Udp,
+        Network::Icmp => match version {
+            IpVersion::V4 => IpProtocol::Icmpv4,
+            IpVersion::V6 => IpProtocol::Icmpv6,
+        },
     }
 }

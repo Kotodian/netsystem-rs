@@ -1,10 +1,10 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferRefMut, DataPlaneRuntime, InternalNode, Node, NodeId,
-    NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
+    BufferFrame, BufferIndex, BufferPacketCursor, BufferRefMut, DataPlaneRuntime, InternalNode,
+    Network, Node, NodeId, NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
 };
 use hammer_core::error::CoreResult;
 
-use crate::net::ip::{IpInputError, IpInputTarget, parse_ip_packet_with_chain_len};
+use crate::net::ip::{IpInputError, IpInputTarget, IpProtocol, parse_ip_packet_with_chain_len};
 
 #[hammer_component_macros::node_next]
 pub enum IpInputNext {
@@ -70,7 +70,23 @@ fn next_node_for_index<G>(
     } else {
         set_node_error(runtime, &mut buffer, parsed.input_error)?;
     }
+    let network = network_for_protocol(parsed.protocol);
+    let cursor = if network.is_some() {
+        BufferPacketCursor::new()
+            .with_packet_len(parsed.packet_len)
+            .with_network_header(parsed.network_header_offset, parsed.network_header_len)
+            .with_transport_header(parsed.transport_header_offset, parsed.transport_header_len)
+            .with_transport_payload_offset(
+                parsed.transport_header_offset + parsed.transport_header_len,
+            )
+    } else {
+        BufferPacketCursor::new()
+    };
+    buffer.set_packet_cursor(cursor);
     let metadata = buffer.metadata_mut();
+    if let Some(network) = network {
+        metadata.network = network;
+    }
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));
     metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
     match parsed.input_target {
@@ -81,6 +97,16 @@ fn next_node_for_index<G>(
         IpInputTarget::LookupMulticast => Ok(next[IpInputNext::LookupMulticast.slot()]),
         IpInputTarget::IcmpError => Ok(next[IpInputNext::IcmpError.slot()]),
         IpInputTarget::Reassembly => Ok(next[IpInputNext::Reassembly.slot()]),
+    }
+}
+
+#[inline(always)]
+fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
+    match protocol {
+        IpProtocol::Tcp => Some(Network::Tcp),
+        IpProtocol::Udp => Some(Network::Udp),
+        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => Some(Network::Icmp),
+        IpProtocol::Other(_) => None,
     }
 }
 
