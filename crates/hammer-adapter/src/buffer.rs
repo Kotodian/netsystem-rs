@@ -3025,7 +3025,7 @@ impl BufferFrame {
         state: &mut S,
         keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
     ) -> CoreResult<()> {
-        let mut keep = [false; 4];
+        let mut keep = [true; 4];
         keep_chunk(state, &chunk, &mut keep)?;
         for offset in 0..N {
             let index = chunk[offset];

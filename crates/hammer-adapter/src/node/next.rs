@@ -311,9 +311,8 @@ impl NodeNextEnqueue {
                 nexts_for_indices(batch, indices, &mut nexts)?;
                 for offset in 0..indices.len() {
                     let node = nexts[offset];
-                    if node == speculative_node {
-                        keep[offset] = true;
-                    } else {
+                    if node != speculative_node {
+                        keep[offset] = false;
                         self.split.enqueue(runtime, node, indices[offset])?;
                     }
                 }
