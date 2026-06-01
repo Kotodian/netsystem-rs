@@ -1,8 +1,8 @@
+use crate::ds::prefetch::prefetch_read_l1;
 use crate::protocol::ip::IpVersion;
 
 use super::dpo::{AdjacencyIndex, DpoId};
 use super::ip4_mtrie::Ip4MtrieValue;
-use super::prefetch::prefetch_read_l1;
 
 pub const LOAD_BALANCE_INLINE_BUCKETS: usize = 4;
 
@@ -38,6 +38,7 @@ impl Ip4MtrieValue for LoadBalanceIndex {
     }
 }
 
+#[repr(C, align(64))]
 #[derive(Debug, Clone)]
 pub struct LoadBalance<N: Copy> {
     bucket_count: u16,
@@ -159,5 +160,10 @@ mod tests {
         assert_eq!(lb.bucket_count(), 2);
         assert!(matches!(lb.buckets, LoadBalanceBuckets::Inline(_)));
         assert_eq!(lb.select_hash(1).expect("bucket").1.next, Next::B);
+    }
+
+    #[test]
+    fn load_balance_hot_object_is_cacheline_aligned() {
+        assert_eq!(std::mem::align_of::<LoadBalance<Next>>(), 64);
     }
 }

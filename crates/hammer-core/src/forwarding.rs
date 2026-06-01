@@ -3,7 +3,6 @@ mod fib;
 mod ip4_mtrie;
 mod ip6_fib;
 mod load_balance;
-pub mod prefetch;
 
 pub use dpo::{Adjacency, AdjacencyIndex, DpoId, DpoType};
 pub use fib::{FibEntry, FibLookupResult, FibSnapshot, FibSnapshotBuilder, flow_hash};

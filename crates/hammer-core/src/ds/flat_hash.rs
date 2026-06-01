@@ -1,0 +1,208 @@
+use super::prefetch::prefetch_read_l1;
+
+pub trait FlatHashKey: Copy + Eq {
+    fn hash_key(self) -> usize;
+}
+
+impl FlatHashKey for u128 {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        splitmix64((self ^ (self >> 64)) as u64) as usize
+    }
+}
+
+impl FlatHashKey for u64 {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        splitmix64(self) as usize
+    }
+}
+
+impl FlatHashKey for u32 {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        splitmix64(u64::from(self)) as usize
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlatHashTable<K: FlatHashKey, V: Copy> {
+    buckets: Box<[FlatHashBucket<K, V>]>,
+    len: usize,
+}
+
+impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self::with_capacity(1)
+    }
+
+    #[inline]
+    pub fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
+        let mut table = Self::empty();
+        for (key, value) in entries {
+            table.insert(key, value);
+        }
+        table
+    }
+
+    #[inline]
+    pub fn insert(&mut self, key: K, value: V) {
+        if (self.len + 1) * 2 >= self.buckets.len() {
+            self.grow();
+        }
+        self.insert_key_value(key, value);
+    }
+
+    #[inline(always)]
+    pub fn lookup(&self, key: &K) -> Option<V> {
+        let mut slot = self.slot(*key);
+        loop {
+            let bucket = &self.buckets[slot];
+            match bucket.entry {
+                Some(entry) if entry.key == *key => return Some(entry.value),
+                Some(_) => slot = self.next_slot(slot),
+                None => return None,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn prefetch_key(&self, key: &K) {
+        prefetch_read_l1(&self.buckets[self.slot(*key)]);
+    }
+
+    #[inline(always)]
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(1);
+        Self {
+            buckets: vec![FlatHashBucket::empty(); capacity].into_boxed_slice(),
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn grow(&mut self) {
+        let next_capacity = self.buckets.len() * 2;
+        let old_buckets = std::mem::replace(
+            &mut self.buckets,
+            vec![FlatHashBucket::empty(); next_capacity].into_boxed_slice(),
+        );
+        self.len = 0;
+        for bucket in old_buckets.iter().copied() {
+            if let Some(entry) = bucket.entry {
+                self.insert_key_value(entry.key, entry.value);
+            }
+        }
+    }
+
+    #[inline]
+    fn insert_key_value(&mut self, key: K, value: V) -> bool {
+        let mut slot = self.slot(key);
+        loop {
+            let bucket = &mut self.buckets[slot];
+            match bucket.entry {
+                Some(entry) if entry.key == key => {
+                    bucket.entry = Some(FlatHashEntry { key, value });
+                    return false;
+                }
+                Some(_) => slot = self.next_slot(slot),
+                None => {
+                    bucket.entry = Some(FlatHashEntry { key, value });
+                    self.len += 1;
+                    return true;
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn slot(&self, key: K) -> usize {
+        key.hash_key() & (self.buckets.len() - 1)
+    }
+
+    #[inline(always)]
+    fn next_slot(&self, slot: usize) -> usize {
+        (slot + 1) & (self.buckets.len() - 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct FlatHashBucket<K: FlatHashKey, V: Copy> {
+    entry: Option<FlatHashEntry<K, V>>,
+}
+
+impl<K: FlatHashKey, V: Copy> FlatHashBucket<K, V> {
+    #[inline(always)]
+    const fn empty() -> Self {
+        Self { entry: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct FlatHashEntry<K: FlatHashKey, V: Copy> {
+    key: K,
+    value: V,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefixLengthSearchOrder {
+    prefix_lengths: Box<[u8]>,
+}
+
+impl PrefixLengthSearchOrder {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            prefix_lengths: Box::new([]),
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, prefix_len: u8) {
+        if self.prefix_lengths.contains(&prefix_len) {
+            return;
+        }
+        let mut prefix_lengths = self.prefix_lengths.to_vec();
+        prefix_lengths.push(prefix_len);
+        prefix_lengths.sort_by(|a, b| b.cmp(a));
+        self.prefix_lengths = prefix_lengths.into_boxed_slice();
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.prefix_lengths
+    }
+}
+
+impl Default for PrefixLengthSearchOrder {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[inline(always)]
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}

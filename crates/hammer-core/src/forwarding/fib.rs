@@ -8,7 +8,7 @@ use super::dpo::{Adjacency, AdjacencyIndex, DpoId};
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceIndex};
-use super::prefetch::prefetch_read_l1;
+use crate::ds::prefetch::prefetch_read_l1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FibEntry {
