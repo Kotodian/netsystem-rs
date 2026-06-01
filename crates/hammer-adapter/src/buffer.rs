@@ -1200,15 +1200,11 @@ impl<N> DataPlaneRuntime<N> {
                 }
             }
             HandoffIndices::Batch(indices) => {
-                let mut indices = indices.into_iter();
-                while let Some(index) = indices.next() {
-                    if let Err(err) = frame.push_index(index) {
+                if let Err(err) = frame.push_indices(indices.iter().copied()) {
+                    for index in indices {
                         self.free_index(index);
-                        for index in indices {
-                            self.free_index(index);
-                        }
-                        return Err(err);
                     }
+                    return Err(err);
                 }
             }
         }
@@ -1242,6 +1238,27 @@ impl<N> DataPlaneRuntime<N> {
             self.mark_handoff_source_worker(index, handoff.worker())?;
         }
         let indices = frame.drain_pending().collect::<Vec<_>>();
+        if indices.is_empty() {
+            return Ok(());
+        }
+        handoff.enqueue(worker, target, indices)
+    }
+
+    #[inline]
+    pub fn handoff_indices(
+        &self,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        indices: impl IntoIterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        let Some(handoff) = &self.handoff else {
+            return Err(CoreError::internal("data plane handoff is not configured"));
+        };
+        handoff.ensure_enqueue_capacity(worker)?;
+        let indices = indices.into_iter().collect::<Vec<_>>();
+        for index in indices.iter().copied() {
+            self.mark_handoff_source_worker(index, handoff.worker())?;
+        }
         if indices.is_empty() {
             return Ok(());
         }

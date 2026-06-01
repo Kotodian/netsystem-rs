@@ -1310,6 +1310,72 @@ fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storag
 }
 
 #[test]
+fn data_plane_handoff_indices_moves_batch_between_workers_without_copying_payload_storage() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(8);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let current_ptrs = Rc::new(RefCell::new(Vec::new()));
+    second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            PointerSinkNode {
+                payloads: Rc::clone(&payloads),
+                current_ptrs: Rc::clone(&current_ptrs),
+            },
+        )
+        .expect("register sink handle");
+    let first = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first packet");
+    let second = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second packet");
+    let first_ptr = first_runtime
+        .get_buffer(first)
+        .expect("first buffer ref")
+        .current_ptr() as usize;
+    let second_ptr = first_runtime
+        .get_buffer(second)
+        .expect("second buffer ref")
+        .current_ptr() as usize;
+
+    first_runtime
+        .handoff_indices(DataWorkerId::new(1), SINK_HANDLE, [first, second])
+        .expect("handoff batch");
+
+    assert_eq!(first_runtime.in_use_buffers(), 2);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run target"), 1);
+    assert_eq!(
+        &*payloads.borrow(),
+        &[b"first".to_vec(), b"second".to_vec()]
+    );
+    assert_eq!(&*current_ptrs.borrow(), &[first_ptr, second_ptr]);
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn data_plane_handoff_cleans_up_when_target_frame_capacity_is_exceeded() {
     const SINK_HANDLE: NodeHandle = NodeHandle::new(2);
     let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
