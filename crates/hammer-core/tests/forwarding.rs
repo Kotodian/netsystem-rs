@@ -1,8 +1,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    DpoId, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable,
-    Ip6PrefixKey,
+    AdjacencyIndex, Dpo, DpoId, DpoType, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute,
+    Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -116,8 +116,35 @@ fn fib_snapshot_is_generic_over_next_target() {
     let result = snapshot
         .lookup_ip4(Ipv4Addr::new(198, 51, 100, 42), 0)
         .expect("lookup result");
-    assert_eq!(result.dpo.next, NextHop::Direct);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
     assert_eq!(snapshot.drop_next(), NextHop::Drop);
+}
+
+#[test]
+fn dpo_receive_has_no_adjacency_index() {
+    let dpo = Dpo::receive(IpVersion::V4, NextHop::Direct);
+
+    assert_eq!(dpo.kind(), DpoType::Receive);
+    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.next(), NextHop::Direct);
+    assert_eq!(dpo.adjacency_index(), None);
+}
+
+#[test]
+fn dpo_adjacency_carries_typed_adjacency_index() {
+    let adjacency = AdjacencyIndex::new(7);
+    let dpo = Dpo::adjacency(IpVersion::V6, adjacency, NextHop::Direct);
+
+    assert_eq!(dpo.kind(), DpoType::Adjacency);
+    assert_eq!(dpo.proto(), IpVersion::V6);
+    assert_eq!(dpo.next(), NextHop::Direct);
+    assert_eq!(dpo.adjacency_index(), Some(adjacency));
+    assert_eq!(dpo.forwarding_index(), adjacency.get());
+}
+
+#[test]
+fn dpo_keeps_compact_hot_path_layout_for_u32_next() {
+    assert_eq!(std::mem::size_of::<Dpo<u32>>(), 12);
 }
 
 #[test]
@@ -133,9 +160,9 @@ fn fib_snapshot_can_route_to_receive_dpo() {
     let result = snapshot
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 10), 0)
         .expect("lookup result");
-    assert_eq!(result.dpo.next, NextHop::Direct);
-    assert_eq!(result.dpo.proto, IpVersion::V4);
-    assert_eq!(result.dpo.index, 0);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
+    assert_eq!(result.dpo.proto(), IpVersion::V4);
+    assert_eq!(result.dpo.adjacency_index(), None);
 }
 
 #[test]
@@ -166,5 +193,5 @@ fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     snapshot.prefetch_packet(&packet);
 
     let result = snapshot.lookup_packet(&packet).expect("lookup result");
-    assert_eq!(result.dpo.next, NextHop::Direct);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
 }

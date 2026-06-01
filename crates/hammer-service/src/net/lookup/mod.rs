@@ -151,10 +151,10 @@ impl IpLookupNode {
             fib_index: 0,
             load_balance_index: result.load_balance.get(),
             bucket_index: result.bucket_index,
-            dpo_type: forwarding_dpo_type(result.dpo.dpo_type),
-            dpo_index: result.dpo.index,
+            dpo_type: forwarding_dpo_type(result.dpo.kind()),
+            dpo_index: result.dpo.forwarding_index(),
         });
-        Ok(result.dpo.next)
+        Ok(result.dpo.next())
     }
 
     #[inline(always)]

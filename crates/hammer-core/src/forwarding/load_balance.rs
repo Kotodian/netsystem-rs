@@ -159,7 +159,7 @@ mod tests {
         ]);
         assert_eq!(lb.bucket_count(), 2);
         assert!(matches!(lb.buckets, LoadBalanceBuckets::Inline(_)));
-        assert_eq!(lb.select_hash(1).expect("bucket").1.next, Next::B);
+        assert_eq!(lb.select_hash(1).expect("bucket").1.next(), Next::B);
     }
 
     #[test]

@@ -31,14 +31,16 @@ pub enum DpoType {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DpoId<N> {
-    pub next: N,
-    pub index: u32,
-    pub dpo_type: DpoType,
-    pub proto: IpVersion,
+pub struct Dpo<N> {
+    next: N,
+    index: u32,
+    dpo_type: DpoType,
+    proto: IpVersion,
 }
 
-impl<N> DpoId<N> {
+pub type DpoId<N> = Dpo<N>;
+
+impl<N> Dpo<N> {
     #[inline(always)]
     pub const fn drop(proto: IpVersion, next: N) -> Self {
         Self {
@@ -77,6 +79,38 @@ impl<N> DpoId<N> {
             dpo_type: DpoType::Adjacency,
             proto,
         }
+    }
+
+    #[inline(always)]
+    pub const fn proto(&self) -> IpVersion {
+        self.proto
+    }
+
+    #[inline(always)]
+    pub fn kind(&self) -> DpoType {
+        self.dpo_type
+    }
+
+    #[inline(always)]
+    pub fn adjacency_index(&self) -> Option<AdjacencyIndex> {
+        match self.dpo_type {
+            DpoType::Adjacency => Some(AdjacencyIndex::new(self.index)),
+            DpoType::Drop | DpoType::Punt | DpoType::Receive => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn forwarding_index(&self) -> u32 {
+        self.adjacency_index()
+            .map(AdjacencyIndex::get)
+            .unwrap_or_default()
+    }
+}
+
+impl<N: Copy> Dpo<N> {
+    #[inline(always)]
+    pub fn next(&self) -> N {
+        self.next
     }
 }
 
