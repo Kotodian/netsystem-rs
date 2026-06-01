@@ -41,7 +41,13 @@ pub struct DataPlaneHandoffWorker {
 #[derive(Debug, Clone)]
 pub(crate) struct HandoffFrame {
     pub(crate) target: NodeHandle,
-    pub(crate) indices: Vec<BufferIndex>,
+    pub(crate) indices: HandoffIndices,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum HandoffIndices {
+    Single(BufferIndex),
+    Batch(Vec<BufferIndex>),
 }
 
 impl DataPlaneHandoff {
@@ -125,6 +131,26 @@ impl DataPlaneHandoffWorker {
         target: NodeHandle,
         indices: Vec<BufferIndex>,
     ) -> CoreResult<()> {
+        self.enqueue_indices(worker, target, HandoffIndices::Batch(indices))
+    }
+
+    #[inline]
+    pub(crate) fn enqueue_index(
+        &self,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        self.enqueue_indices(worker, target, HandoffIndices::Single(index))
+    }
+
+    #[inline]
+    fn enqueue_indices(
+        &self,
+        worker: DataWorkerId,
+        target: NodeHandle,
+        indices: HandoffIndices,
+    ) -> CoreResult<()> {
         let queue = self
             .inner
             .queues
@@ -141,5 +167,34 @@ impl DataPlaneHandoffWorker {
             .queues
             .get(self.worker.slot())
             .and_then(|queue| queue.pop())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{DataPlaneRuntime, NoopNode, RouteMetadata};
+
+    use super::*;
+
+    #[test]
+    fn enqueue_index_uses_inline_handoff_payload() {
+        let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(64, 1);
+        let index = runtime
+            .alloc_index(RouteMetadata::default())
+            .expect("alloc index");
+        let handoff = DataPlaneHandoff::new(2, 4);
+        let source = handoff.worker(DataWorkerId::new(0));
+        let target = handoff.worker(DataWorkerId::new(1));
+        let node = NodeHandle::new(7);
+
+        source
+            .enqueue_index(DataWorkerId::new(1), node, index)
+            .expect("enqueue index");
+
+        let frame = target.pop().expect("handoff frame");
+        assert_eq!(frame.target, node);
+        assert!(matches!(frame.indices, HandoffIndices::Single(value) if value == index));
+
+        runtime.free_index(index);
     }
 }

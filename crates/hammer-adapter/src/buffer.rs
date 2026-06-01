@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::RouteMetadata;
-use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId};
+use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{Node, NodeHandle, NodeId, NodeRuntime, NoopNode};
 
@@ -1129,8 +1129,13 @@ impl<N> DataPlaneRuntime<N> {
             let frame = self.alloc_frame_index()?;
             {
                 let mut frame_ref = self.get_frame_mut(frame)?;
-                for index in handoff_frame.indices {
-                    frame_ref.push_index(index)?;
+                match handoff_frame.indices {
+                    HandoffIndices::Single(index) => frame_ref.push_index(index)?,
+                    HandoffIndices::Batch(indices) => {
+                        for index in indices {
+                            frame_ref.push_index(index)?;
+                        }
+                    }
                 }
             }
             if !self.schedule_frame(node, frame)? {
@@ -1171,7 +1176,7 @@ impl<N> DataPlaneRuntime<N> {
             return Err(CoreError::internal("data plane handoff is not configured"));
         };
         self.mark_handoff_source_worker(index, handoff.worker())?;
-        handoff.enqueue(worker, target, vec![index])
+        handoff.enqueue_index(worker, target, index)
     }
 
     #[inline]
