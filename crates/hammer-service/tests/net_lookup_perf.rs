@@ -11,7 +11,9 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::ip::IpVersion;
 use hammer_service::data_plane::DropNode;
-use hammer_service::net::{DpoId, FibSnapshotBuilder, IpLookupControlPlane, IpLookupNode};
+use hammer_service::net::{
+    DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 const FRAME_PACKETS: usize = 128;
@@ -51,6 +53,7 @@ impl InternalNode<ProbeNode> for SinkNode {}
 enum ProbeNode {
     Sink(SinkNode),
     Drop(DropNode),
+    Input(IpInputNode),
     Lookup(IpLookupNode),
 }
 
@@ -63,6 +66,12 @@ impl From<SinkNode> for ProbeNode {
 impl From<DropNode> for ProbeNode {
     fn from(node: DropNode) -> Self {
         Self::Drop(node)
+    }
+}
+
+impl From<IpInputNode> for ProbeNode {
+    fn from(node: IpInputNode) -> Self {
+        Self::Input(node)
     }
 }
 
@@ -82,6 +91,7 @@ impl Node<ProbeNode> for ProbeNode {
         match self {
             Self::Sink(node) => node.process(runtime, frame),
             Self::Drop(node) => node.process(runtime, frame),
+            Self::Input(node) => node.process(runtime, frame),
             Self::Lookup(node) => node.process(runtime, frame),
         }
     }
@@ -130,6 +140,36 @@ fn ip_lookup_frame_batch_perf_probe() {
     }
 }
 
+#[test]
+#[ignore = "performance probe; run with `cargo test -p hammer-service --release --test net_lookup_perf -- --ignored --nocapture`"]
+fn ip_input_lookup_frame_batch_perf_probe() {
+    let scenarios = [
+        Scenario::Ipv4SameNext,
+        Scenario::Ipv4MixedNext,
+        Scenario::Ipv6SameNext,
+    ];
+    for scenario in scenarios {
+        let pipeline_pair = measure_input_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
+        let pipeline_native =
+            measure_input_lookup_samples(scenario, DataPlaneInstructionSet::native());
+        assert_eq!(pipeline_pair.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
+        assert_eq!(pipeline_native.best.packets, pipeline_pair.best.packets);
+        assert_eq!(pipeline_native.best.checksum, pipeline_pair.best.checksum);
+
+        eprintln!(
+            "InputLookup::{scenario:?}: samples={SAMPLE_COUNT} rounds={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} pipeline_pair_best={:.2} pipeline_pair_median={:.2} ns/packet pipeline_native({:?})_best={:.2} pipeline_native_median={:.2} ns/packet native_vs_pair_best_ratio={:.3} checksum={} / {}",
+            pipeline_pair.best.ns_per_packet(),
+            pipeline_pair.median.ns_per_packet(),
+            DataPlaneInstructionSet::native(),
+            pipeline_native.best.ns_per_packet(),
+            pipeline_native.median.ns_per_packet(),
+            pipeline_native.best.ns_per_packet() / pipeline_pair.best.ns_per_packet(),
+            pipeline_pair.best.checksum,
+            pipeline_native.best.checksum,
+        );
+    }
+}
+
 fn measure_packet_scalar_samples(scenario: Scenario) -> ProbeSummary {
     let mut samples = Vec::with_capacity(SAMPLE_COUNT);
     for _ in 0..SAMPLE_COUNT {
@@ -153,6 +193,25 @@ fn measure_lookup_samples(
     let mut samples = Vec::with_capacity(SAMPLE_COUNT);
     for _ in 0..SAMPLE_COUNT {
         samples.push(measure_lookup(scenario, instruction_set));
+    }
+    samples.sort_by(|left, right| {
+        left.ns_per_packet()
+            .partial_cmp(&right.ns_per_packet())
+            .expect("finite ns/packet")
+    });
+    ProbeSummary {
+        best: samples[0],
+        median: samples[SAMPLE_COUNT / 2],
+    }
+}
+
+fn measure_input_lookup_samples(
+    scenario: Scenario,
+    instruction_set: DataPlaneInstructionSet,
+) -> ProbeSummary {
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for _ in 0..SAMPLE_COUNT {
+        samples.push(measure_input_lookup(scenario, instruction_set));
     }
     samples.sort_by(|left, right| {
         left.ns_per_packet()
@@ -241,6 +300,47 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
     }
 }
 
+fn measure_input_lookup(
+    scenario: Scenario,
+    instruction_set: DataPlaneInstructionSet,
+) -> ProbeStats {
+    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+        2048,
+        FRAME_PACKETS,
+        FRAME_PACKETS,
+        32,
+        instruction_set,
+    );
+    let packets = Rc::new(Cell::new(0));
+    let checksum = Rc::new(Cell::new(0));
+    let input = build_input_lookup(&runtime, scenario, &packets, &checksum);
+    let packets_by_frame = build_packets(scenario);
+
+    let started = Instant::now();
+    for _ in 0..FRAME_ROUNDS {
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        {
+            let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
+            for packet in packets_by_frame.iter() {
+                let index = runtime
+                    .alloc_index_with_bytes(RouteMetadata::default(), packet)
+                    .expect("alloc packet");
+                frame_ref.push_index(index).expect("push packet");
+            }
+        }
+        assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+        black_box(runtime.run_ready_nodes().expect("run nodes"));
+        debug_assert_eq!(runtime.in_use_buffers(), 0);
+    }
+    let elapsed = started.elapsed();
+
+    ProbeStats {
+        elapsed,
+        packets: black_box(packets.get()),
+        checksum: black_box(checksum.get()),
+    }
+}
+
 fn build_lookup(
     runtime: &DataPlaneRuntime<ProbeNode>,
     scenario: Scenario,
@@ -281,6 +381,21 @@ fn build_lookup(
     runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node())
+}
+
+fn build_input_lookup(
+    runtime: &DataPlaneRuntime<ProbeNode>,
+    scenario: Scenario,
+    packets: &Rc<Cell<usize>>,
+    checksum: &Rc<Cell<u64>>,
+) -> hammer_adapter::NodeId {
+    let lookup = build_lookup(runtime, scenario, packets, checksum);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            drop, drop, drop, lookup, drop, drop, drop,
+        )))
 }
 
 fn register_sink(
