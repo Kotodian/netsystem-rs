@@ -302,6 +302,28 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_load_balance_dpo(
+        &mut self,
+        proto: IpVersion,
+        buckets: impl Into<Vec<DpoId<N>>>,
+        next: N,
+    ) -> DpoId<N> {
+        self.try_add_load_balance_dpo(proto, buckets, next)
+            .expect("load-balance DPO buckets must match proto and valid adjacency backing")
+    }
+
+    #[inline]
+    pub fn try_add_load_balance_dpo(
+        &mut self,
+        proto: IpVersion,
+        buckets: impl Into<Vec<DpoId<N>>>,
+        next: N,
+    ) -> Result<DpoId<N>, LoadBalanceError> {
+        let load_balance = self.try_add_load_balance(proto, buckets)?;
+        Ok(DpoId::load_balance(proto, load_balance, next))
+    }
+
+    #[inline]
     pub fn add_ip4_route(&mut self, prefix: Ipv4Net, load_balance: LoadBalanceIndex) {
         self.try_add_ip4_route(prefix, load_balance)
             .expect("IPv4 route load-balance must exist and carry IPv4 proto");
