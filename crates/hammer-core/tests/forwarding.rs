@@ -1,15 +1,37 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    DpoId, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip6PrefixHashTable,
+    DpoId, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable,
+    Ip6PrefixKey,
 };
-use hammer_core::protocol::ip::IpVersion;
+use hammer_core::protocol::ip::{
+    IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
+};
 use ipnet::{Ipv4Net, Ipv6Net};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NextHop {
     Drop,
     Direct,
+}
+
+impl Ip4MtrieValue for NextHop {
+    #[inline(always)]
+    fn into_leaf_value(self) -> u32 {
+        match self {
+            Self::Drop => 0,
+            Self::Direct => 1,
+        }
+    }
+
+    #[inline(always)]
+    fn from_leaf_value(value: u32) -> Self {
+        match value {
+            0 => Self::Drop,
+            1 => Self::Direct,
+            other => panic!("unexpected next hop value: {other}"),
+        }
+    }
 }
 
 #[test]
@@ -60,6 +82,26 @@ fn ip6_prefix_hash_table_is_generic_and_uses_longest_prefix_match() {
 }
 
 #[test]
+fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
+    let table = Ip6PrefixHashTable::from_routes([
+        (
+            Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("default route"),
+            NextHop::Drop,
+        ),
+        (
+            Ipv6Net::new("2001:db8:64::".parse().expect("subnet"), 64).expect("subnet route"),
+            NextHop::Direct,
+        ),
+    ]);
+    let destination = "2001:db8:64::42".parse().expect("destination");
+
+    table.prefetch_key(Ip6PrefixKey::new(destination, 64));
+    table.prefetch_destination(destination);
+
+    assert_eq!(table.lookup(destination), Some(NextHop::Direct));
+}
+
+#[test]
 fn fib_snapshot_is_generic_over_next_target() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);
@@ -76,4 +118,35 @@ fn fib_snapshot_is_generic_over_next_target() {
         .expect("lookup result");
     assert_eq!(result.dpo.next, NextHop::Direct);
     assert_eq!(snapshot.drop_next(), NextHop::Drop);
+}
+
+#[test]
+fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let adjacency = builder.add_adjacency(IpVersion::V4, NextHop::Direct);
+    let load_balance =
+        builder.add_load_balance([DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct)]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
+        load_balance,
+    );
+    let snapshot = builder.build();
+    let packet = ParsedIpPacket {
+        version: IpVersion::V4,
+        protocol: IpProtocol::Udp,
+        input_target: IpInputTarget::Lookup,
+        input_error: IpInputError::None,
+        source: Ipv4Addr::new(10, 0, 0, 1).into(),
+        destination: Ipv4Addr::new(198, 51, 100, 42).into(),
+        packet_len: 28,
+        network_header_offset: 0,
+        network_header_len: 20,
+        transport_header_offset: 20,
+        transport_header_len: 8,
+    };
+
+    snapshot.prefetch_packet(&packet);
+
+    let result = snapshot.lookup_packet(&packet).expect("lookup result");
+    assert_eq!(result.dpo.next, NextHop::Direct);
 }

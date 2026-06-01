@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, ForwardingDpoType, ForwardingMetadata,
-    InternalNode, Node, NodeId, NodeNextFrames, NodeResult, for_each_buffer_frame_index,
+    FrameBatchWidth, InternalNode, Node, NodeId, NodeNextFrames, NodeResult,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -113,10 +113,10 @@ impl IpLookupNode {
     fn process_index<G>(
         &self,
         runtime: &DataPlaneRuntime<G>,
+        snapshot: &FibSnapshot,
         next_frames: &mut NodeNextFrames,
         index: BufferIndex,
     ) -> CoreResult<()> {
-        let snapshot = self.snapshot.load();
         let next_node = {
             let mut buffer = runtime.get_buffer_mut(index)?;
             let parsed = match parse_ip_packet_with_chain_len(
@@ -145,6 +145,62 @@ impl IpLookupNode {
         };
         next_frames.enqueue(runtime, next_node, index)
     }
+
+    #[inline(always)]
+    fn prefetch_index<G>(
+        runtime: &DataPlaneRuntime<G>,
+        snapshot: &FibSnapshot,
+        index: BufferIndex,
+    ) {
+        let Ok(buffer) = runtime.get_buffer(index) else {
+            return;
+        };
+        let Ok(parsed) = parse_ip_packet_with_chain_len(
+            buffer.current(),
+            buffer.total_len_not_including_first(),
+        ) else {
+            return;
+        };
+        snapshot.prefetch_packet(&parsed);
+    }
+
+    #[inline(always)]
+    fn prefetch_range<G>(
+        runtime: &DataPlaneRuntime<G>,
+        snapshot: &FibSnapshot,
+        indices: &[BufferIndex],
+        offset: usize,
+        width: usize,
+    ) {
+        if offset >= indices.len() {
+            return;
+        }
+        let end = (offset + width).min(indices.len());
+        for index in indices[offset..end].iter().copied() {
+            runtime.prefetch_read(index);
+            Self::prefetch_index(runtime, snapshot, index);
+        }
+    }
+
+    #[inline(always)]
+    fn process_range<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        snapshot: &FibSnapshot,
+        next_frames: &mut NodeNextFrames,
+        indices: &[BufferIndex],
+        offset: usize,
+        width: usize,
+    ) -> CoreResult<()> {
+        if offset >= indices.len() {
+            return Ok(());
+        }
+        let end = (offset + width).min(indices.len());
+        for index in indices[offset..end].iter().copied() {
+            self.process_index(runtime, snapshot, next_frames, index)?;
+        }
+        Ok(())
+    }
 }
 
 impl<G> Node<G> for IpLookupNode {
@@ -154,10 +210,20 @@ impl<G> Node<G> for IpLookupNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
+        let snapshot = self.snapshot.load();
         let mut next_frames = NodeNextFrames::default();
-        for_each_buffer_frame_index!(runtime, frame, |index| {
-            self.process_index(runtime, &mut next_frames, index)
-        })?;
+        let indices = frame.pending_indices();
+        let width = match runtime.preferred_frame_batch_width() {
+            FrameBatchWidth::Quad => 4,
+            FrameBatchWidth::Pair => 2,
+        };
+        Self::prefetch_range(runtime, &snapshot, indices, 0, width);
+        let mut offset = 0usize;
+        while offset < indices.len() {
+            Self::prefetch_range(runtime, &snapshot, indices, offset + width, width);
+            self.process_range(runtime, &snapshot, &mut next_frames, indices, offset, width)?;
+            offset += width;
+        }
         frame.clear();
         next_frames.schedule(runtime)?;
         Ok(NodeResult::drop())

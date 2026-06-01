@@ -1281,7 +1281,6 @@ dependencies = [
  "metrics",
  "nom 8.0.0",
  "rand 0.8.6",
- "rustc-hash",
  "serde",
  "serde_path_to_error",
  "serde_with",

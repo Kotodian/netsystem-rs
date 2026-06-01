@@ -1,0 +1,31 @@
+#[cfg(target_arch = "x86")]
+#[inline(always)]
+pub fn prefetch_read_l1<T>(ptr: *const T) {
+    unsafe {
+        core::arch::x86::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86::_MM_HINT_T0);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn prefetch_read_l1<T>(ptr: *const T) {
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn prefetch_read_l1<T>(ptr: *const T) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{ptr}]",
+            ptr = in(reg) ptr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+pub fn prefetch_read_l1<T>(_ptr: *const T) {}
