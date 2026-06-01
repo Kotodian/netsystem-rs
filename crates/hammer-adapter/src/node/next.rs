@@ -89,6 +89,35 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
+    pub fn validate_frame_with_first_next_and_prefetch<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        first_index: BufferIndex,
+        first_next: NodeId,
+        mut prefetch_index: impl FnMut(BufferIndex),
+        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        let mut first_seen = false;
+        self.validate_frame_with_width_and_prefetch(
+            runtime,
+            frame,
+            width,
+            |index| prefetch_index(index),
+            |index| {
+                if !first_seen && index == first_index {
+                    first_seen = true;
+                    return Ok(first_next);
+                }
+                next_for_index(index)
+            },
+        )?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
     pub fn validate_frame_with_width<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
@@ -106,6 +135,31 @@ impl NodeNextEnqueue {
                 Ok(false)
             }
         })
+    }
+
+    #[inline(always)]
+    pub fn validate_frame_with_width_and_prefetch<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        width: FrameBatchWidth,
+        mut prefetch_index: impl FnMut(BufferIndex),
+        mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
+    ) -> CoreResult<()> {
+        let speculative_node = self.speculative_node;
+        frame.retain_indices_batched_with_prefetch(
+            width,
+            |index| prefetch_index(index),
+            |index| {
+                let node = next_for_index(index)?;
+                if node == speculative_node {
+                    Ok(true)
+                } else {
+                    self.split.enqueue(runtime, node, index)?;
+                    Ok(false)
+                }
+            },
+        )
     }
 
     #[inline(always)]

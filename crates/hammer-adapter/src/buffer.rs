@@ -2515,6 +2515,23 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    pub fn retain_indices_batched_with_prefetch(
+        &mut self,
+        width: FrameBatchWidth,
+        mut prefetch: impl FnMut(BufferIndex),
+        mut keep: impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => {
+                self.retain_indices_quad_with_prefetch(&mut prefetch, &mut keep)
+            }
+            FrameBatchWidth::Pair => {
+                self.retain_indices_pair_with_prefetch(&mut prefetch, &mut keep)
+            }
+        }
+    }
+
+    #[inline(always)]
     fn retain_indices_quad(
         &mut self,
         keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
@@ -2523,36 +2540,50 @@ impl BufferFrame {
         let mut read = 0usize;
         let mut write = 0usize;
         while read + 4 <= len {
-            let indices = [
-                self.indices[read],
-                self.indices[read + 1],
-                self.indices[read + 2],
-                self.indices[read + 3],
-            ];
-            for index in indices {
-                if keep(index)? {
-                    self.indices[write] = index;
-                    write += 1;
-                }
-            }
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
+            self.retain_one(read + 2, &mut write, keep)?;
+            self.retain_one(read + 3, &mut write, keep)?;
             read += 4;
         }
         if read + 2 <= len {
-            let indices = [self.indices[read], self.indices[read + 1]];
-            for index in indices {
-                if keep(index)? {
-                    self.indices[write] = index;
-                    write += 1;
-                }
-            }
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
             read += 2;
         }
         while read < len {
-            let index = self.indices[read];
-            if keep(index)? {
-                self.indices[write] = index;
-                write += 1;
-            }
+            self.retain_one(read, &mut write, keep)?;
+            read += 1;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_quad_with_prefetch(
+        &mut self,
+        prefetch: &mut impl FnMut(BufferIndex),
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 4 <= len {
+            self.prefetch_indices(read + 4, 4, prefetch);
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
+            self.retain_one(read + 2, &mut write, keep)?;
+            self.retain_one(read + 3, &mut write, keep)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            self.prefetch_indices(read + 2, 2, prefetch);
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
+            read += 2;
+        }
+        while read < len {
+            self.retain_one(read, &mut write, keep)?;
             read += 1;
         }
         self.finish_retain(write);
@@ -2568,24 +2599,65 @@ impl BufferFrame {
         let mut read = 0usize;
         let mut write = 0usize;
         while read + 2 <= len {
-            let indices = [self.indices[read], self.indices[read + 1]];
-            for index in indices {
-                if keep(index)? {
-                    self.indices[write] = index;
-                    write += 1;
-                }
-            }
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
             read += 2;
         }
         if read < len {
-            let index = self.indices[read];
-            if keep(index)? {
-                self.indices[write] = index;
-                write += 1;
-            }
+            self.retain_one(read, &mut write, keep)?;
         }
         self.finish_retain(write);
         Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_pair_with_prefetch(
+        &mut self,
+        prefetch: &mut impl FnMut(BufferIndex),
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 2 <= len {
+            self.prefetch_indices(read + 2, 2, prefetch);
+            self.retain_one(read, &mut write, keep)?;
+            self.retain_one(read + 1, &mut write, keep)?;
+            read += 2;
+        }
+        if read < len {
+            self.retain_one(read, &mut write, keep)?;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_one(
+        &mut self,
+        read: usize,
+        write: &mut usize,
+        keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
+    ) -> CoreResult<()> {
+        let index = self.indices[read];
+        if keep(index)? {
+            self.indices[*write] = index;
+            *write += 1;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn prefetch_indices(
+        &self,
+        offset: usize,
+        width: usize,
+        prefetch: &mut impl FnMut(BufferIndex),
+    ) {
+        let end = (offset + width).min(self.indices.len());
+        for index in self.indices[offset..end].iter().copied() {
+            prefetch(index);
+        }
     }
 
     #[inline(always)]

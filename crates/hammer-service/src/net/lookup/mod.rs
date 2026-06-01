@@ -218,11 +218,15 @@ impl<G> Node<G> for IpLookupNode {
         let width = frame_batch_width(runtime);
         Self::prefetch_range(runtime, &snapshot, indices, 0, width);
         let speculative = self.process_index(runtime, &snapshot, first)?;
-        NodeNextEnqueue::new(speculative).validate_frame_with_first_next(
+        NodeNextEnqueue::new(speculative).validate_frame_with_first_next_and_prefetch(
             runtime,
             frame,
             first,
             speculative,
+            |index| {
+                runtime.prefetch_read(index);
+                Self::prefetch_index(runtime, &snapshot, index);
+            },
             |index| self.process_index(runtime, &snapshot, index),
         )
     }

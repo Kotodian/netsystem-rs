@@ -16,6 +16,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 
 const FRAME_PACKETS: usize = 128;
 const FRAME_ROUNDS: usize = 512;
+const SAMPLE_COUNT: usize = 5;
 
 struct SinkNode {
     packets: Rc<Cell<usize>>,
@@ -102,20 +103,41 @@ fn ip_lookup_frame_batch_perf_probe() {
         Scenario::Ipv6SameNext,
     ];
     for scenario in scenarios {
-        let scalar = measure_lookup(scenario, DataPlaneInstructionSet::Scalar);
-        let native = measure_lookup(scenario, DataPlaneInstructionSet::native());
-        assert_eq!(scalar.packets, FRAME_PACKETS * FRAME_ROUNDS);
-        assert_eq!(native.packets, scalar.packets);
+        let scalar = measure_lookup_samples(scenario, DataPlaneInstructionSet::Scalar);
+        let native = measure_lookup_samples(scenario, DataPlaneInstructionSet::native());
+        assert_eq!(scalar.best.packets, FRAME_PACKETS * FRAME_ROUNDS);
+        assert_eq!(native.best.packets, scalar.best.packets);
 
         eprintln!(
-            "{scenario:?}: frames={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} scalar={:.2} ns/packet native({:?})={:.2} ns/packet ratio={:.3} checksum={} / {}",
-            scalar.ns_per_packet(),
+            "{scenario:?}: samples={SAMPLE_COUNT} frames={FRAME_ROUNDS} frame_packets={FRAME_PACKETS} scalar_best={:.2} scalar_median={:.2} ns/packet native({:?})_best={:.2} native_median={:.2} ns/packet best_ratio={:.3} checksum={} / {}",
+            scalar.best.ns_per_packet(),
+            scalar.median.ns_per_packet(),
             DataPlaneInstructionSet::native(),
-            native.ns_per_packet(),
-            native.ns_per_packet() / scalar.ns_per_packet(),
-            scalar.checksum,
-            native.checksum,
+            native.best.ns_per_packet(),
+            native.median.ns_per_packet(),
+            native.best.ns_per_packet() / scalar.best.ns_per_packet(),
+            scalar.best.checksum,
+            native.best.checksum,
         );
+    }
+}
+
+fn measure_lookup_samples(
+    scenario: Scenario,
+    instruction_set: DataPlaneInstructionSet,
+) -> ProbeSummary {
+    let mut samples = Vec::with_capacity(SAMPLE_COUNT);
+    for _ in 0..SAMPLE_COUNT {
+        samples.push(measure_lookup(scenario, instruction_set));
+    }
+    samples.sort_by(|left, right| {
+        left.ns_per_packet()
+            .partial_cmp(&right.ns_per_packet())
+            .expect("finite ns/packet")
+    });
+    ProbeSummary {
+        best: samples[0],
+        median: samples[SAMPLE_COUNT / 2],
     }
 }
 
@@ -316,6 +338,12 @@ struct ProbeStats {
     elapsed: Duration,
     packets: usize,
     checksum: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProbeSummary {
+    best: ProbeStats,
+    median: ProbeStats,
 }
 
 impl ProbeStats {
