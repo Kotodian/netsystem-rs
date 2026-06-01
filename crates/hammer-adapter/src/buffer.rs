@@ -1125,17 +1125,26 @@ impl<N> DataPlaneRuntime<N> {
             return Ok(());
         };
         while let Some(handoff_frame) = handoff.pop() {
-            let node = self.nodes.node_for_handle(handoff_frame.target)?;
-            let frame = self.alloc_frame_index()?;
+            let node = match self.nodes.node_for_handle(handoff_frame.target) {
+                Ok(node) => node,
+                Err(err) => {
+                    self.free_handoff_indices(handoff_frame.indices);
+                    return Err(err);
+                }
+            };
+            let frame = match self.alloc_frame_index() {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.free_handoff_indices(handoff_frame.indices);
+                    return Err(err);
+                }
+            };
             {
                 let mut frame_ref = self.get_frame_mut(frame)?;
-                match handoff_frame.indices {
-                    HandoffIndices::Single(index) => frame_ref.push_index(index)?,
-                    HandoffIndices::Batch(indices) => {
-                        for index in indices {
-                            frame_ref.push_index(index)?;
-                        }
-                    }
+                if let Err(err) = self.push_handoff_indices(&mut frame_ref, handoff_frame.indices) {
+                    drop(frame_ref);
+                    let _ = self.free_frame_index(frame);
+                    return Err(err);
                 }
             }
             if !self.schedule_frame(node, frame)? {
@@ -1143,6 +1152,47 @@ impl<N> DataPlaneRuntime<N> {
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn push_handoff_indices(
+        &self,
+        frame: &mut FrameRefMut<'_>,
+        indices: HandoffIndices,
+    ) -> CoreResult<()> {
+        match indices {
+            HandoffIndices::Single(index) => {
+                if let Err(err) = frame.push_index(index) {
+                    self.free_index(index);
+                    return Err(err);
+                }
+            }
+            HandoffIndices::Batch(indices) => {
+                let mut indices = indices.into_iter();
+                while let Some(index) = indices.next() {
+                    if let Err(err) = frame.push_index(index) {
+                        self.free_index(index);
+                        for index in indices {
+                            self.free_index(index);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn free_handoff_indices(&self, indices: HandoffIndices) {
+        match indices {
+            HandoffIndices::Single(index) => self.free_index(index),
+            HandoffIndices::Batch(indices) => {
+                for index in indices {
+                    self.free_index(index);
+                }
+            }
+        }
     }
 
     #[inline]

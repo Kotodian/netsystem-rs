@@ -607,6 +607,127 @@ fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storag
 }
 
 #[test]
+fn data_plane_handoff_cleans_up_when_target_frame_capacity_is_exceeded() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(2);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            1,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            CountNode {
+                count: Rc::new(Cell::new(0)),
+            },
+        )
+        .expect("register sink handle");
+    let handoff_node = first_runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&first_runtime, frame, b"first");
+    push_test_packet(&first_runtime, frame, b"second");
+
+    assert!(
+        first_runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+    assert_eq!(first_runtime.run_ready_nodes().expect("run source"), 1);
+
+    let err = second_runtime
+        .run_ready_nodes()
+        .expect_err("target frame capacity exceeded");
+    assert!(
+        err.to_string().contains("buffer frame capacity exceeded"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(first_runtime.frames_in_use(), 0);
+    assert_eq!(second_runtime.frames_in_use(), 0);
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn data_plane_handoff_cleans_up_when_target_frame_pool_is_exhausted() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(3);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            1,
+            0,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    second_runtime
+        .nodes()
+        .register_internal_with_handle(
+            SINK_HANDLE,
+            CountNode {
+                count: Rc::new(Cell::new(0)),
+            },
+        )
+        .expect("register sink handle");
+    let handoff_node = first_runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&first_runtime, frame, b"packet");
+
+    assert!(
+        first_runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+    assert_eq!(first_runtime.run_ready_nodes().expect("run source"), 1);
+
+    let err = second_runtime
+        .run_ready_nodes()
+        .expect_err("target frame pool exhausted");
+    assert!(
+        err.to_string().contains("frame pool exhausted"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(first_runtime.frames_in_use(), 0);
+    assert_eq!(second_runtime.frames_in_use(), 0);
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn node_runtime_registers_driver_role_node() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let trace = Rc::new(RefCell::new(Vec::new()));
