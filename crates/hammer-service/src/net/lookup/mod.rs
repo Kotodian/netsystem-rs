@@ -174,11 +174,7 @@ impl IpLookupNode {
             buffer.current_ptr(),
             buffer.current_len(),
             buffer.total_len_not_including_first(),
-        )
-        .or_else(|| {
-            parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())
-                .ok()
-        }) else {
+        ) else {
             return;
         };
         snapshot.prefetch_packet(&parsed);
