@@ -351,8 +351,12 @@ impl NodeNextFrames {
         node: NodeId,
         index: BufferIndex,
     ) -> CoreResult<()> {
-        let frame_index = self.frame_for(runtime, node)?;
-        runtime.get_frame_mut(frame_index)?.push_index(index)
+        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
+        let result = runtime.get_frame_mut(frame_index)?.push_index(index);
+        if result.is_err() && created {
+            self.free_from(runtime, offset);
+        }
+        result
     }
 
     #[inline]
@@ -362,8 +366,12 @@ impl NodeNextFrames {
         node: NodeId,
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
-        let frame_index = self.frame_for(runtime, node)?;
-        runtime.get_frame_mut(frame_index)?.push_indices(indices)
+        let (frame_index, offset, created) = self.frame_for_enqueue(runtime, node)?;
+        let result = runtime.get_frame_mut(frame_index)?.push_indices(indices);
+        if result.is_err() && created {
+            self.free_from(runtime, offset);
+        }
+        result
     }
 
     #[inline]
@@ -419,13 +427,13 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    fn frame_for<G>(
+    fn frame_for_enqueue<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         node: NodeId,
-    ) -> CoreResult<FrameIndex> {
+    ) -> CoreResult<(FrameIndex, usize, bool)> {
         if let Some(offset) = self.position(node) {
-            return self.frame(offset);
+            return self.frame(offset).map(|frame| (frame, offset, false));
         }
         if self.len == MAX_NODE_NEXT_FRAMES {
             return Err(CoreError::internal("node next frame capacity exceeded"));
@@ -434,7 +442,7 @@ impl NodeNextFrames {
         self.nodes[offset] = Some(node);
         self.frames[offset] = Some(runtime.alloc_frame_index()?);
         self.len += 1;
-        self.frame(offset)
+        self.frame(offset).map(|frame| (frame, offset, true))
     }
 
     #[inline]

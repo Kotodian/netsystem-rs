@@ -925,6 +925,34 @@ fn node_next_frames_enqueue_indices_schedules_batch_to_one_frame() {
 }
 
 #[test]
+fn node_next_frames_enqueue_indices_cleans_new_frame_when_batch_exceeds_capacity() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 1, 1);
+    let sink = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .expect("alloc first packet");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .expect("alloc second packet");
+    let mut next_frames = NodeNextFrames::default();
+
+    let err = next_frames
+        .enqueue_indices(&runtime, sink, [first, second])
+        .expect_err("batch exceeds frame capacity");
+
+    assert!(
+        err.to_string().contains("buffer frame capacity exceeded"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    runtime.free_index(first);
+    runtime.free_index(second);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn speculative_enqueue_cleans_up_split_frame_when_validation_fails() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 4, 2);
     let default = runtime.nodes().register_internal(CountNode {
