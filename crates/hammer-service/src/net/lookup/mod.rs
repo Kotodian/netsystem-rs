@@ -168,6 +168,7 @@ impl IpLookupNode {
         let Ok(buffer) = runtime.get_buffer(index) else {
             return;
         };
+        buffer.prefetch_read();
         let Some(parsed) = packet_from_cached_metadata(
             buffer.metadata(),
             buffer.packet_cursor(),
@@ -193,7 +194,6 @@ impl IpLookupNode {
         }
         let end = (offset + width).min(indices.len());
         for index in indices[offset..end].iter().copied() {
-            runtime.prefetch_read(index);
             Self::prefetch_index(runtime, snapshot, index);
         }
     }
@@ -220,7 +220,6 @@ impl<G> Node<G> for IpLookupNode {
             first,
             speculative,
             |index| {
-                runtime.prefetch_read(index);
                 Self::prefetch_index(runtime, &snapshot, index);
             },
             |index| self.process_index(runtime, &snapshot, index),

@@ -2000,19 +2000,8 @@ impl BufferPoolInner {
         let Ok(buffer) = self.buffer(index) else {
             return;
         };
-        prefetch_read_l1(std::ptr::from_ref(buffer).cast::<u8>());
-        prefetch_read_l1(std::ptr::from_ref(buffer.metadata()).cast::<u8>());
-        if !buffer.current().is_empty() {
-            prefetch_read_l1(buffer.current().as_ptr());
-            if buffer.current().len() > 64 {
-                prefetch_read_l1(unsafe { buffer.current().as_ptr().add(64) });
-            }
-        }
-        if let Some(next) = buffer.next_buffer()
-            && let Ok(next_buffer) = self.buffer(next)
-        {
-            prefetch_read_l1(std::ptr::from_ref(next_buffer).cast::<u8>());
-        }
+        prefetch_buffer_read(buffer);
+        prefetch_next_buffer_read(self, buffer);
     }
 
     #[inline]
@@ -2185,6 +2174,27 @@ impl BufferPoolInner {
         }
         self.buffer_mut(index)?.total_len_not_including_first = total;
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn prefetch_buffer_read(buffer: &Buffer) {
+    prefetch_read_l1(std::ptr::from_ref(buffer).cast::<u8>());
+    prefetch_read_l1(std::ptr::from_ref(buffer.metadata()).cast::<u8>());
+    if !buffer.current().is_empty() {
+        prefetch_read_l1(buffer.current().as_ptr());
+        if buffer.current().len() > 64 {
+            prefetch_read_l1(unsafe { buffer.current().as_ptr().add(64) });
+        }
+    }
+}
+
+#[inline(always)]
+fn prefetch_next_buffer_read(pool: &BufferPoolInner, buffer: &Buffer) {
+    if let Some(next) = buffer.next_buffer()
+        && let Ok(next_buffer) = pool.buffer(next)
+    {
+        prefetch_read_l1(std::ptr::from_ref(next_buffer).cast::<u8>());
     }
 }
 
@@ -2909,6 +2919,16 @@ pub struct BufferRef<'pool> {
 }
 
 impl BufferRef<'_> {
+    #[inline]
+    pub fn prefetch_read(&self) {
+        let buffer = self
+            .guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer");
+        prefetch_buffer_read(buffer);
+        prefetch_next_buffer_read(&self.guard, buffer);
+    }
+
     #[inline]
     pub fn buffer_ptr(&self) -> *const Buffer {
         self.guard
