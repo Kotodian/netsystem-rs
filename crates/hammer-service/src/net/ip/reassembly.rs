@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Network, Node,
-    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr, for_each_buffer_frame_index,
+    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -137,9 +137,10 @@ impl IpReassemblyNode {
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         next_frames: &mut NodeNextFrames,
+        current_next: &mut Option<NodeId>,
         index: BufferIndex,
         now: Instant,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<Option<BufferIndex>> {
         let buffer = runtime.get_buffer(index)?;
         let fragment = match parse_ip_fragment_with_chain_len(
             buffer.current(),
@@ -148,8 +149,13 @@ impl IpReassemblyNode {
             Ok(fragment) => fragment,
             Err(_) => {
                 drop(buffer);
-                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
-                return Ok(());
+                return self.emit_output(
+                    runtime,
+                    next_frames,
+                    current_next,
+                    self.next[IpReassemblyNext::Drop.slot()],
+                    index,
+                );
             }
         };
         drop(buffer);
@@ -157,20 +163,25 @@ impl IpReassemblyNode {
         let key = fragment.key;
         if self.failed_keys.contains(&key) {
             next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
-            return Ok(());
+            return Ok(None);
         }
         let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
         if let Some(handoff) = &self.handoff {
             let owner = handoff.directory.owner_or_insert(key, handoff.worker);
             if owner != handoff.worker {
                 runtime.handoff_index(owner, handoff.reassembly, index)?;
-                return Ok(());
+                return Ok(None);
             }
         }
         if !self.contexts.contains_key(&key) {
             if self.contexts.len() == self.max_reassemblies {
-                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
-                return Ok(());
+                return self.emit_output(
+                    runtime,
+                    next_frames,
+                    current_next,
+                    self.next[IpReassemblyNext::Drop.slot()],
+                    index,
+                );
             }
             self.contexts.insert(
                 key,
@@ -202,11 +213,13 @@ impl IpReassemblyNode {
             match outcome {
                 ReassemblyInsert::Pending => {}
                 ReassemblyInsert::Drop(index) => {
-                    next_frames.enqueue(
+                    return self.emit_output(
                         runtime,
+                        next_frames,
+                        current_next,
                         self.next[IpReassemblyNext::Drop.slot()],
                         index,
-                    )?;
+                    );
                 }
                 ReassemblyInsert::Reassembled(index) => reassembled = Some(index),
                 ReassemblyInsert::Failed(index) => failed = Some(index),
@@ -227,7 +240,7 @@ impl IpReassemblyNode {
             if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
-            return Ok(());
+            return Ok(None);
         }
 
         if let Some(index) = reassembled {
@@ -245,17 +258,47 @@ impl IpReassemblyNode {
                 if first_worker != handoff.worker {
                     runtime.handoff_index(first_worker, handoff.lookup, index)?;
                 } else {
-                    next_frames.enqueue(
+                    return self.emit_output(
                         runtime,
+                        next_frames,
+                        current_next,
                         self.next[IpReassemblyNext::Lookup.slot()],
                         index,
-                    )?;
+                    );
                 }
             } else {
-                next_frames.enqueue(runtime, self.next[IpReassemblyNext::Lookup.slot()], index)?;
+                return self.emit_output(
+                    runtime,
+                    next_frames,
+                    current_next,
+                    self.next[IpReassemblyNext::Lookup.slot()],
+                    index,
+                );
             }
         }
-        Ok(())
+        Ok(None)
+    }
+
+    #[inline(always)]
+    fn emit_output<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        next_frames: &mut NodeNextFrames,
+        current_next: &mut Option<NodeId>,
+        node: NodeId,
+        index: BufferIndex,
+    ) -> CoreResult<Option<BufferIndex>> {
+        match *current_next {
+            Some(current) if current == node => Ok(Some(index)),
+            Some(_) => {
+                next_frames.enqueue(runtime, node, index)?;
+                Ok(None)
+            }
+            None => {
+                *current_next = Some(node);
+                Ok(Some(index))
+            }
+        }
     }
 
     #[inline(always)]
@@ -329,14 +372,19 @@ impl<G> Node<G> for IpReassemblyNode {
     ) -> CoreResult<NodeResult> {
         let now = Instant::now();
         let mut next_frames = NodeNextFrames::default();
+        let mut current_next = None;
         self.failed_keys.clear();
-        for_each_buffer_frame_index!(runtime, frame, |index| {
-            self.process_index(runtime, &mut next_frames, index, now)?;
-            Ok(())
+        frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+            self.process_index(runtime, &mut next_frames, &mut current_next, index, now)
         })?;
-        frame.clear();
         next_frames.schedule(runtime)?;
-        Ok(NodeResult::drop())
+        if frame.has_pending()
+            && let Some(node) = current_next
+        {
+            Ok(NodeResult::next_current(node))
+        } else {
+            Ok(NodeResult::drop())
+        }
     }
 }
 

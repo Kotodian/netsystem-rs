@@ -2532,6 +2532,18 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    pub fn rewrite_indices_batched(
+        &mut self,
+        width: FrameBatchWidth,
+        mut rewrite: impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
+            FrameBatchWidth::Pair => self.rewrite_indices_pair(&mut rewrite),
+        }
+    }
+
+    #[inline(always)]
     fn retain_indices_quad(
         &mut self,
         keep: &mut impl FnMut(BufferIndex) -> CoreResult<bool>,
@@ -2633,6 +2645,54 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn rewrite_indices_quad(
+        &mut self,
+        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 4 <= len {
+            self.rewrite_one(read, &mut write, rewrite)?;
+            self.rewrite_one(read + 1, &mut write, rewrite)?;
+            self.rewrite_one(read + 2, &mut write, rewrite)?;
+            self.rewrite_one(read + 3, &mut write, rewrite)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            self.rewrite_one(read, &mut write, rewrite)?;
+            self.rewrite_one(read + 1, &mut write, rewrite)?;
+            read += 2;
+        }
+        while read < len {
+            self.rewrite_one(read, &mut write, rewrite)?;
+            read += 1;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn rewrite_indices_pair(
+        &mut self,
+        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while read + 2 <= len {
+            self.rewrite_one(read, &mut write, rewrite)?;
+            self.rewrite_one(read + 1, &mut write, rewrite)?;
+            read += 2;
+        }
+        if read < len {
+            self.rewrite_one(read, &mut write, rewrite)?;
+        }
+        self.finish_retain(write);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn retain_one(
         &mut self,
         read: usize,
@@ -2641,6 +2701,21 @@ impl BufferFrame {
     ) -> CoreResult<()> {
         let index = self.indices[read];
         if keep(index)? {
+            self.indices[*write] = index;
+            *write += 1;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn rewrite_one(
+        &mut self,
+        read: usize,
+        write: &mut usize,
+        rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
+    ) -> CoreResult<()> {
+        let index = self.indices[read];
+        if let Some(index) = rewrite(index)? {
             self.indices[*write] = index;
             *write += 1;
         }

@@ -476,6 +476,41 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
 }
 
 #[test]
+fn ipv4_reassembly_reuses_current_frame_for_complete_packet() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 1);
+    let capture = SinkCapture::new();
+    let sink = runtime.nodes().register_internal(capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
+    let input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
+    let original = ipv4_udp_packet(
+        [10, 0, 0, 22],
+        12_365,
+        [198, 51, 100, 27],
+        53,
+        b"abcdefghijklmnopqrstuvwx",
+    );
+    let fragments = ipv4_fragments(&original, 110, 16);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &fragments[1]);
+    push_packet(&runtime, frame, &fragments[0]);
+
+    assert!(runtime.schedule_frame(input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(
+        capture.packets(),
+        vec![ipv4_reassembled_packet(&original, 110)]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn ipv4_reassembly_accepts_more_than_three_fragments_by_default() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 4);
     let packets = Rc::new(RefCell::new(Vec::new()));
