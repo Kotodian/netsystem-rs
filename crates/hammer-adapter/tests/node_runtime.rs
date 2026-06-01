@@ -141,6 +141,45 @@ impl Node<TestNode> for ErrorNode {
 
 impl InternalNode<TestNode> for ErrorNode {}
 
+struct InvalidNextNode {
+    next: NodeId,
+}
+
+impl Node<TestNode> for InvalidNextNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::next_current(self.next))
+    }
+}
+
+impl InternalNode<TestNode> for InvalidNextNode {}
+
+struct ExplicitNextFrameNode {
+    next: NodeId,
+    payload: Option<&'static [u8]>,
+}
+
+impl Node<TestNode> for ExplicitNextFrameNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let split = runtime.alloc_frame_index()?;
+        if let Some(payload) = self.payload {
+            push_test_packet(runtime, split, payload);
+        }
+        Ok(NodeResult::next_frame(self.next, split))
+    }
+}
+
+impl InternalNode<TestNode> for ExplicitNextFrameNode {}
+
 struct HandoffNode {
     target_worker: DataWorkerId,
     target: NodeHandle,
@@ -248,6 +287,8 @@ enum TestNode {
     Sink(SinkNode),
     Count(CountNode),
     Error(ErrorNode),
+    InvalidNext(InvalidNextNode),
+    ExplicitNextFrame(ExplicitNextFrameNode),
     Handoff(HandoffNode),
     PointerSink(PointerSinkNode),
     SpeculativeSplit(SpeculativeSplitNode),
@@ -281,6 +322,18 @@ impl From<CountNode> for TestNode {
 impl From<ErrorNode> for TestNode {
     fn from(node: ErrorNode) -> Self {
         Self::Error(node)
+    }
+}
+
+impl From<InvalidNextNode> for TestNode {
+    fn from(node: InvalidNextNode) -> Self {
+        Self::InvalidNext(node)
+    }
+}
+
+impl From<ExplicitNextFrameNode> for TestNode {
+    fn from(node: ExplicitNextFrameNode) -> Self {
+        Self::ExplicitNextFrame(node)
     }
 }
 
@@ -321,6 +374,8 @@ impl Node<TestNode> for TestNode {
             Self::Sink(node) => node.process(runtime, frame),
             Self::Count(node) => node.process(runtime, frame),
             Self::Error(node) => node.process(runtime, frame),
+            Self::InvalidNext(node) => node.process(runtime, frame),
+            Self::ExplicitNextFrame(node) => node.process(runtime, frame),
             Self::Handoff(node) => node.process(runtime, frame),
             Self::PointerSink(node) => node.process(runtime, frame),
             Self::SpeculativeSplit(node) => node.process(runtime, frame),
@@ -530,6 +585,83 @@ fn speculative_enqueue_cleans_up_split_frame_when_validation_fails() {
         err.to_string().contains("split validation failed"),
         "unexpected error: {err}"
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_releases_current_frame_when_next_current_node_is_invalid() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 4, 4, 2);
+    let other_runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 1, 4, 1);
+    other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let invalid = other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let node = runtime
+        .nodes()
+        .register_internal(InvalidNextNode { next: invalid });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+
+    let err = runtime.run_ready_nodes().expect_err("invalid next node");
+    assert!(
+        err.to_string().contains("node id out of bounds"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_releases_current_and_next_frame_when_next_frame_node_is_invalid() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 4, 4, 3);
+    let other_runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 1, 4, 1);
+    other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let invalid = other_runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let node = runtime.nodes().register_internal(ExplicitNextFrameNode {
+        next: invalid,
+        payload: Some(b"split"),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"current");
+
+    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+
+    let err = runtime.run_ready_nodes().expect_err("invalid next node");
+    assert!(
+        err.to_string().contains("node id out of bounds"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_releases_empty_next_frame() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 4, 4, 3);
+    let count = Rc::new(Cell::new(0));
+    let sink = runtime.nodes().register_internal(CountNode {
+        count: Rc::clone(&count),
+    });
+    let node = runtime.nodes().register_internal(ExplicitNextFrameNode {
+        next: sink,
+        payload: None,
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"current");
+
+    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(count.get(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

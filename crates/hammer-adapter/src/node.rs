@@ -456,6 +456,10 @@ impl<N> NodeRuntime<N> {
                         ));
                     };
                     if frame.has_pending() {
+                        if let Err(err) = self.validate_node(node) {
+                            let _ = runtime.release_taken_frame_index(current_index, frame);
+                            return Err(err);
+                        }
                         frame.set_next_node(node);
                         runtime.return_taken_frame_index(current_index, frame)?;
                         self.schedule_frame(node, current_index, false)?;
@@ -463,12 +467,28 @@ impl<N> NodeRuntime<N> {
                         runtime.release_taken_frame_index(current_index, frame)?;
                     }
                 }
-                NextFrame::Frame { node, frame } => {
-                    if runtime.get_frame(frame)?.has_pending() {
-                        runtime.get_frame_mut(frame)?.set_next_node(node);
-                        self.schedule_frame(node, frame, false)?;
+                NextFrame::Frame { node, frame } => match runtime.schedule_frame(node, frame) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        if let Err(err) = runtime.free_frame_index(frame) {
+                            Self::release_current_frame_on_dispatch_error(
+                                runtime,
+                                current_index,
+                                &mut current_frame,
+                            );
+                            return Err(err);
+                        }
                     }
-                }
+                    Err(err) => {
+                        Self::release_next_frame_and_current_on_dispatch_error(
+                            runtime,
+                            current_index,
+                            &mut current_frame,
+                            frame,
+                        );
+                        return Err(err);
+                    }
+                },
             }
         }
 
@@ -476,6 +496,26 @@ impl<N> NodeRuntime<N> {
             runtime.release_taken_frame_index(current_index, frame)?;
         }
         Ok(())
+    }
+
+    fn release_current_frame_on_dispatch_error(
+        runtime: &DataPlaneRuntime<N>,
+        current_index: FrameIndex,
+        current_frame: &mut Option<BufferFrame>,
+    ) {
+        if let Some(frame) = current_frame.take() {
+            let _ = runtime.release_taken_frame_index(current_index, frame);
+        }
+    }
+
+    fn release_next_frame_and_current_on_dispatch_error(
+        runtime: &DataPlaneRuntime<N>,
+        current_index: FrameIndex,
+        current_frame: &mut Option<BufferFrame>,
+        next_frame: FrameIndex,
+    ) {
+        let _ = runtime.free_frame_index(next_frame);
+        Self::release_current_frame_on_dispatch_error(runtime, current_index, current_frame);
     }
 }
 
