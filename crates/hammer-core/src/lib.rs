@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod forwarding;
 pub mod lifecycle;
 pub mod log;
 pub mod metrics;
