@@ -1,72 +1,18 @@
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteDecision,
-    RouteMetadata, RouteTarget, Router, SocksAddr,
+    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteMetadata,
+    SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_service::data_plane::{RouteMatchNext, RouteMatchNode};
-use hammer_service::net::{IpInputNext, IpInputNode, RouteLookupNode};
+use hammer_core::protocol::ip::IpVersion;
+use hammer_service::net::{
+    DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+};
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
-
-struct StaticRouter {
-    decision: RouteDecision,
-    prepare_count: AtomicUsize,
-    match_count: AtomicUsize,
-}
-
-impl StaticRouter {
-    fn new(decision: RouteDecision) -> Self {
-        Self {
-            decision,
-            prepare_count: AtomicUsize::new(0),
-            match_count: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Lifecycle for StaticRouter {
-    fn name(&self) -> &str {
-        "static-router"
-    }
-
-    fn start(&self, _stage: StartStage) -> CoreResult<()> {
-        Ok(())
-    }
-
-    fn close(&self) -> CoreResult<()> {
-        Ok(())
-    }
-}
-
-impl Router for StaticRouter {
-    fn reset_network(&self) {}
-
-    fn match_route(&self, _metadata: &mut RouteMetadata) -> CoreResult<RouteDecision> {
-        self.match_count.fetch_add(1, Ordering::SeqCst);
-        Ok(self.decision.clone())
-    }
-
-    fn prepare_route_metadata(&self, metadata: &mut RouteMetadata) -> CoreResult<()> {
-        self.prepare_count.fetch_add(1, Ordering::SeqCst);
-        metadata.protocol = "prepared".to_owned();
-        Ok(())
-    }
-
-    fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<Duration> {
-        None
-    }
-
-    fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
-        false
-    }
-}
+use ipnet::Ipv4Net;
 
 struct CaptureNode {
     next: NodeId,
@@ -93,8 +39,7 @@ enum TestNode {
     TunInput(TunInputDriverNode<hammer_service::tun::MemoryTunInput>),
     IpInput(IpInputNode),
     Capture(CaptureNode),
-    RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
-    RouteLookup(RouteLookupNode),
+    IpLookup(IpLookupNode),
     TunOutputDriver(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
 }
 
@@ -116,15 +61,9 @@ impl From<CaptureNode> for TestNode {
     }
 }
 
-impl From<RouteMatchNode<Arc<StaticRouter>>> for TestNode {
-    fn from(node: RouteMatchNode<Arc<StaticRouter>>) -> Self {
-        Self::RouteMatch(node)
-    }
-}
-
-impl From<RouteLookupNode> for TestNode {
-    fn from(node: RouteLookupNode) -> Self {
-        Self::RouteLookup(node)
+impl From<IpLookupNode> for TestNode {
+    fn from(node: IpLookupNode) -> Self {
+        Self::IpLookup(node)
     }
 }
 
@@ -145,8 +84,7 @@ impl Node<TestNode> for TestNode {
             Self::TunInput(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::Capture(node) => node.process(runtime, frame),
-            Self::RouteMatch(node) => node.process(runtime, frame),
-            Self::RouteLookup(node) => node.process(runtime, frame),
+            Self::IpLookup(node) => node.process(runtime, frame),
             Self::TunOutputDriver(node) => node.process(runtime, frame),
         }
     }
@@ -222,21 +160,26 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
+    let mut builder = FibSnapshotBuilder::new(output);
+    let adjacency = builder.add_adjacency(IpVersion::V4, output);
+    let load_balance =
+        builder.add_load_balance([DpoId::adjacency(IpVersion::V4, adjacency, output)]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
+        load_balance,
+    );
     let lookup = runtime
         .nodes()
-        .register_internal(RouteLookupNode::new().with_outbound("tun-output", output));
-    let router = Arc::new(StaticRouter::new(RouteDecision::Route {
-        target: RouteTarget::Outbound("tun-output".to_owned()),
-    }));
-    let route_match = runtime.nodes().register_internal(RouteMatchNode::new(
-        Arc::clone(&router),
-        RouteMatchNext::nodes(lookup),
-    ));
-    let driver = runtime.nodes().register_driver(TunInputDriverNode::new(
-        device.input(),
-        "tun0",
-        route_match,
-    ));
+        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            output, output, output, lookup, output, output, output,
+        )));
+    let driver =
+        runtime
+            .nodes()
+            .register_driver(TunInputDriverNode::new(device.input(), "tun0", ip_input));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     runtime
@@ -246,8 +189,6 @@ fn tun_driver_routes_through_service_internal_nodes() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_eq!(device.drain_output_batch_sizes(), vec![2]);
     assert_eq!(device.drain_output(), packets);
-    assert_eq!(router.prepare_count.load(Ordering::SeqCst), 2);
-    assert_eq!(router.match_count.load(Ordering::SeqCst), 2);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -305,9 +246,22 @@ fn ipv4_udp_packet(
     packet[9] = 17;
     packet[12..16].copy_from_slice(&source);
     packet[16..20].copy_from_slice(&destination);
+    let checksum = ipv4_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
     packet[20..22].copy_from_slice(&source_port.to_be_bytes());
     packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
     packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
     packet
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks_exact(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }

@@ -19,6 +19,23 @@ pub struct RouteMetadata {
     pub udp_disable_domain_unmapping: bool,
     pub override_destination: bool,
     pub route_decision: Option<RouteDecision>,
+    pub forwarding: Option<ForwardingMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForwardingMetadata {
+    pub fib_index: u32,
+    pub load_balance_index: u32,
+    pub bucket_index: u16,
+    pub dpo_type: ForwardingDpoType,
+    pub dpo_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardingDpoType {
+    Drop,
+    Punt,
+    Adjacency,
 }
 
 /// Where a `RouteDecision::Route` points. Outbounds and endpoints live in

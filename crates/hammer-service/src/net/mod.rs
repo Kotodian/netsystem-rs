@@ -6,5 +6,9 @@ pub use ip::{
     IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory, IpReassemblyHandoff,
     IpReassemblyNext, IpReassemblyNode,
 };
-pub use lookup::RouteLookupNode;
+pub use lookup::{
+    Adjacency, AdjacencyIndex, DpoId, DpoType, FibEntry, FibLookupResult, FibSnapshot,
+    FibSnapshotBuilder, FibSnapshotHandle, IpLookupControlPlane, IpLookupNode, LoadBalance,
+    LoadBalanceIndex,
+};
 pub use route_metadata::packet_route_metadata;

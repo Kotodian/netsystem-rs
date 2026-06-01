@@ -1378,6 +1378,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "nom 8.0.0",
+ "rustc-hash",
  "rustls",
  "smoltcp",
  "tokio",
