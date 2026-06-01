@@ -9,7 +9,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet,
     DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
-    NodeNextEnqueue, NodeNextFrames, NodeResult, RouteMetadata,
+    NodeNextEnqueue, NodeNextFrames, NodeNextVectorEnqueue, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -427,6 +427,87 @@ impl Node<TestNode> for ChunkedBatchSplitNode {
 
 impl InternalNode<TestNode> for ChunkedBatchSplitNode {}
 
+struct VectorChunkedSplitNode {
+    speculative: NodeId,
+    alternate: NodeId,
+    cached_next: Rc<Cell<Option<NodeId>>>,
+    chunk_lens: Rc<RefCell<Vec<usize>>>,
+    frames_in_use_during_process: Rc<Cell<usize>>,
+}
+
+impl Node<TestNode> for VectorChunkedSplitNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let cached_next = self.cached_next.get().unwrap_or(self.speculative);
+        let (result, cached_next) = NodeNextVectorEnqueue::new(cached_next)
+            .enqueue_frame_with_buffer_batch_chunks(
+                runtime,
+                frame,
+                |batch, indices| {
+                    for index in indices.iter().copied() {
+                        batch.prefetch_read(index);
+                    }
+                },
+                |batch, indices, nexts| {
+                    self.chunk_lens.borrow_mut().push(indices.len());
+                    for (offset, index) in indices.iter().copied().enumerate() {
+                        let buffer = batch.buffer(index)?;
+                        nexts[offset] = if buffer.current() == b"alternate" {
+                            self.alternate
+                        } else {
+                            self.speculative
+                        };
+                    }
+                    Ok(())
+                },
+            )?;
+        self.cached_next.set(Some(cached_next));
+        self.frames_in_use_during_process
+            .set(runtime.frames_in_use());
+        Ok(result)
+    }
+}
+
+impl InternalNode<TestNode> for VectorChunkedSplitNode {}
+
+struct VectorErrorAfterEnqueueNode {
+    alternate: NodeId,
+}
+
+impl Node<TestNode> for VectorErrorAfterEnqueueNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let mut seen = 0usize;
+        NodeNextVectorEnqueue::new(self.alternate).enqueue_frame_with_buffer_batch_chunks(
+            runtime,
+            frame,
+            |_batch, _indices| {},
+            |_batch, indices, nexts| {
+                for offset in 0..indices.len() {
+                    seen += 1;
+                    if seen == 1 {
+                        nexts[offset] = self.alternate;
+                    } else {
+                        return Err(CoreError::internal("vector validation failed"));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        unreachable!("vector validation should fail")
+    }
+}
+
+impl InternalNode<TestNode> for VectorErrorAfterEnqueueNode {}
+
 struct SpeculativeErrorAfterSplitNode {
     speculative: NodeId,
     alternate: NodeId,
@@ -494,6 +575,8 @@ enum TestNode {
     PrecomputedSplit(PrecomputedSplitNode),
     BatchSplit(BatchSplitNode),
     ChunkedBatchSplit(ChunkedBatchSplitNode),
+    VectorChunkedSplit(VectorChunkedSplitNode),
+    VectorErrorAfterEnqueue(VectorErrorAfterEnqueueNode),
     SpeculativeErrorAfterSplit(SpeculativeErrorAfterSplitNode),
     SpeculativeErrorAfterSplitAndKeep(SpeculativeErrorAfterSplitAndKeepNode),
 }
@@ -582,6 +665,18 @@ impl From<ChunkedBatchSplitNode> for TestNode {
     }
 }
 
+impl From<VectorChunkedSplitNode> for TestNode {
+    fn from(node: VectorChunkedSplitNode) -> Self {
+        Self::VectorChunkedSplit(node)
+    }
+}
+
+impl From<VectorErrorAfterEnqueueNode> for TestNode {
+    fn from(node: VectorErrorAfterEnqueueNode) -> Self {
+        Self::VectorErrorAfterEnqueue(node)
+    }
+}
+
 impl From<SpeculativeErrorAfterSplitNode> for TestNode {
     fn from(node: SpeculativeErrorAfterSplitNode) -> Self {
         Self::SpeculativeErrorAfterSplit(node)
@@ -616,6 +711,8 @@ impl Node<TestNode> for TestNode {
             Self::PrecomputedSplit(node) => node.process(runtime, frame),
             Self::BatchSplit(node) => node.process(runtime, frame),
             Self::ChunkedBatchSplit(node) => node.process(runtime, frame),
+            Self::VectorChunkedSplit(node) => node.process(runtime, frame),
+            Self::VectorErrorAfterEnqueue(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplit(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplitAndKeep(node) => node.process(runtime, frame),
         }
@@ -921,6 +1018,152 @@ fn chunked_batch_nexts_classify_native_width_and_split_mismatches() {
         ]
     );
     assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn vector_next_enqueue_consumes_input_frame_and_schedules_owned_next_frames() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities_and_instruction_set(
+        32,
+        8,
+        8,
+        6,
+        DataPlaneInstructionSet::native(),
+    );
+    let default_payloads = Rc::new(RefCell::new(Vec::new()));
+    let alternate_payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let default = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&default_payloads),
+    });
+    let alternate = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&alternate_payloads),
+    });
+    let cached_next = Rc::new(Cell::new(None));
+    let chunk_lens = Rc::new(RefCell::new(Vec::new()));
+    let frames_seen = Rc::new(Cell::new(0));
+    let split = runtime.nodes().register_internal(VectorChunkedSplitNode {
+        speculative: default,
+        alternate,
+        cached_next: Rc::clone(&cached_next),
+        chunk_lens: Rc::clone(&chunk_lens),
+        frames_in_use_during_process: Rc::clone(&frames_seen),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"default-1");
+    push_test_packet(&runtime, frame, b"default-2");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"default-3");
+    push_test_packet(&runtime, frame, b"default-4");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(&*chunk_lens.borrow(), &[4, 1]);
+    assert_eq!(frames_seen.get(), 3);
+    assert_eq!(
+        &*default_payloads.borrow(),
+        &[
+            b"default-1".to_vec(),
+            b"default-2".to_vec(),
+            b"default-3".to_vec(),
+            b"default-4".to_vec()
+        ]
+    );
+    assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn vector_next_enqueue_caches_trailing_run_as_next_index() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities_and_instruction_set(
+        32,
+        8,
+        8,
+        8,
+        DataPlaneInstructionSet::native(),
+    );
+    let default_payloads = Rc::new(RefCell::new(Vec::new()));
+    let alternate_payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let default = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&default_payloads),
+    });
+    let alternate = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&alternate_payloads),
+    });
+    let cached_next = Rc::new(Cell::new(None));
+    let chunk_lens = Rc::new(RefCell::new(Vec::new()));
+    let frames_seen = Rc::new(Cell::new(0));
+    let split = runtime.nodes().register_internal(VectorChunkedSplitNode {
+        speculative: default,
+        alternate,
+        cached_next: Rc::clone(&cached_next),
+        chunk_lens,
+        frames_in_use_during_process: frames_seen,
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"default");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"alternate");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+    assert_eq!(runtime.run_ready_nodes().expect("run first frame"), 3);
+    assert_eq!(cached_next.get(), Some(alternate));
+
+    let frame = runtime.alloc_frame_index().expect("alloc second frame");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"alternate");
+
+    assert!(
+        runtime
+            .schedule_frame(split, frame)
+            .expect("schedule second")
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run second frame"), 2);
+    assert_eq!(cached_next.get(), Some(alternate));
+    assert_eq!(&*default_payloads.borrow(), &[b"default".to_vec()]);
+    assert_eq!(
+        &*alternate_payloads.borrow(),
+        &[
+            b"alternate".to_vec(),
+            b"alternate".to_vec(),
+            b"alternate".to_vec(),
+            b"alternate".to_vec()
+        ]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn vector_next_enqueue_cleans_output_frames_when_classification_fails() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let split = runtime
+        .nodes()
+        .register_internal(VectorErrorAfterEnqueueNode { alternate });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"default");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("vector validation failed");
+    assert!(
+        err.to_string().contains("vector validation failed"),
+        "unexpected error: {err}"
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

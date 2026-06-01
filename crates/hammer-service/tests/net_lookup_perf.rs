@@ -233,7 +233,7 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
         2048,
         1,
         1,
-        1,
+        2,
         DataPlaneInstructionSet::Scalar,
     );
     let packets = Rc::new(Cell::new(0));

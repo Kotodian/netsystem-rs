@@ -4,8 +4,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingDpoType, ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextEnqueue,
-    NodeResult, RouteMetadata,
+    ForwardingDpoType, ForwardingMetadata, InternalNode, Network, Node, NodeId,
+    NodeNextVectorEnqueue, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -105,12 +105,16 @@ impl IpLookupControlPlane {
 
 pub struct IpLookupNode {
     snapshot: FibSnapshotHandle,
+    cached_next: Option<NodeId>,
 }
 
 impl IpLookupNode {
     #[inline]
     pub fn new(snapshot: FibSnapshotHandle) -> Self {
-        Self { snapshot }
+        Self {
+            snapshot,
+            cached_next: None,
+        }
     }
 
     #[inline(always)]
@@ -232,29 +236,33 @@ impl<G> Node<G> for IpLookupNode {
             return Ok(NodeResult::drop());
         };
         let width = frame_batch_width(runtime);
-        let speculative = {
+        let first_next = {
             let mut batch = runtime.buffer_batch_mut();
             Self::prefetch_range_with_batch(&mut batch, &snapshot, indices, 0, width);
             self.process_index_with_batch(&mut batch, &snapshot, first)?
         };
+        let cached_next = self.cached_next.unwrap_or(first_next);
         let mut first_chunk = true;
-        NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
-            runtime,
-            frame,
-            |batch, indices| {
-                Self::prefetch_indices_with_batch(batch, &snapshot, indices);
-            },
-            |batch, indices, nexts| {
-                let start_offset = if first_chunk {
-                    first_chunk = false;
-                    nexts[0] = speculative;
-                    1
-                } else {
-                    0
-                };
-                self.process_indices_with_batch(batch, &snapshot, indices, nexts, start_offset)
-            },
-        )
+        let (result, cached_next) = NodeNextVectorEnqueue::new(cached_next)
+            .enqueue_frame_with_buffer_batch_chunks(
+                runtime,
+                frame,
+                |batch, indices| {
+                    Self::prefetch_indices_with_batch(batch, &snapshot, indices);
+                },
+                |batch, indices, nexts| {
+                    let start_offset = if first_chunk {
+                        first_chunk = false;
+                        nexts[0] = first_next;
+                        1
+                    } else {
+                        0
+                    };
+                    self.process_indices_with_batch(batch, &snapshot, indices, nexts, start_offset)
+                },
+            )?;
+        self.cached_next = Some(cached_next);
+        Ok(result)
     }
 }
 

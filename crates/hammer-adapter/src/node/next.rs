@@ -33,6 +33,12 @@ pub struct NodeNextEnqueue {
     split: NodeNextOwnedFrames,
 }
 
+#[derive(Debug)]
+pub struct NodeNextVectorEnqueue {
+    cached_next: NodeId,
+    frames: NodeNextOwnedFrames,
+}
+
 impl Default for NodeNextFrames {
     #[inline]
     fn default() -> Self {
@@ -343,6 +349,183 @@ impl NodeNextEnqueue {
     }
 }
 
+impl NodeNextVectorEnqueue {
+    #[inline]
+    pub fn new(cached_next: NodeId) -> Self {
+        Self {
+            cached_next,
+            frames: NodeNextOwnedFrames::default(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn enqueue_frame_with_buffer_batch_chunks<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+        mut nexts_for_indices: impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [NodeId; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<(NodeResult, NodeId)> {
+        let mut current_next = self.cached_next;
+        let width = runtime.preferred_frame_batch_width();
+        let mut batch = runtime.buffer_batch_mut();
+        let result = match width {
+            FrameBatchWidth::Quad => self.enqueue_frame_quad_chunks(
+                runtime,
+                frame,
+                &mut batch,
+                &mut current_next,
+                &mut prefetch_indices,
+                &mut nexts_for_indices,
+            ),
+            FrameBatchWidth::Pair => self.enqueue_frame_pair_chunks(
+                runtime,
+                frame,
+                &mut batch,
+                &mut current_next,
+                &mut prefetch_indices,
+                &mut nexts_for_indices,
+            ),
+        };
+        drop(batch);
+
+        if result.is_err() {
+            self.frames.free(runtime);
+        }
+        result?;
+
+        frame.clear();
+        self.frames.schedule(runtime)?;
+        Ok((NodeResult::drop(), current_next))
+    }
+
+    #[inline(always)]
+    fn enqueue_frame_quad_chunks<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &BufferFrame,
+        batch: &mut BufferBatchMut<'_>,
+        current_next: &mut NodeId,
+        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+        nexts_for_indices: &mut impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [NodeId; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let indices = frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read + 4 <= len {
+            Self::prefetch_range(batch, indices, read + 4, 4, prefetch_indices);
+            let chunk = [
+                indices[read],
+                indices[read + 1],
+                indices[read + 2],
+                indices[read + 3],
+            ];
+            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            Self::prefetch_range(batch, indices, read + 2, 2, prefetch_indices);
+            let chunk = [indices[read], indices[read + 1]];
+            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
+            read += 2;
+        }
+        while read < len {
+            let chunk = [indices[read]];
+            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
+            read += 1;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn enqueue_frame_pair_chunks<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &BufferFrame,
+        batch: &mut BufferBatchMut<'_>,
+        current_next: &mut NodeId,
+        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+        nexts_for_indices: &mut impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [NodeId; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let indices = frame.pending_indices();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read + 2 <= len {
+            Self::prefetch_range(batch, indices, read + 2, 2, prefetch_indices);
+            let chunk = [indices[read], indices[read + 1]];
+            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
+            read += 2;
+        }
+        if read < len {
+            let chunk = [indices[read]];
+            self.enqueue_chunk(runtime, &chunk, batch, current_next, nexts_for_indices)?;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn enqueue_chunk<G, const N: usize>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        indices: &[BufferIndex; N],
+        batch: &mut BufferBatchMut<'_>,
+        current_next: &mut NodeId,
+        nexts_for_indices: &mut impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [NodeId; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let mut nexts = [*current_next; 4];
+        nexts_for_indices(batch, indices, &mut nexts)?;
+
+        let first = nexts[0];
+        let all_same = (1..N).all(|offset| nexts[offset] == first);
+        if all_same {
+            self.frames
+                .enqueue_indices(runtime, first, indices.iter().copied())?;
+            *current_next = first;
+            return Ok(());
+        }
+
+        for offset in 0..N {
+            self.frames
+                .enqueue(runtime, nexts[offset], indices[offset])?;
+        }
+        if N == 1 || nexts[N - 2] == nexts[N - 1] {
+            *current_next = nexts[N - 1];
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn prefetch_range(
+        batch: &mut BufferBatchMut<'_>,
+        indices: &[BufferIndex],
+        offset: usize,
+        width: usize,
+        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+    ) {
+        if offset >= indices.len() {
+            return;
+        }
+        let end = (offset + width).min(indices.len());
+        prefetch_indices(batch, &indices[offset..end]);
+    }
+}
+
 impl NodeNextFrames {
     #[inline]
     pub fn enqueue<G>(
@@ -498,6 +681,16 @@ impl NodeNextOwnedFrames {
         index: BufferIndex,
     ) -> CoreResult<()> {
         self.frame_for_mut(runtime, node)?.push_index(index)
+    }
+
+    #[inline]
+    fn enqueue_indices<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        node: NodeId,
+        indices: impl IntoIterator<Item = BufferIndex>,
+    ) -> CoreResult<()> {
+        self.frame_for_mut(runtime, node)?.push_indices(indices)
     }
 
     #[inline]

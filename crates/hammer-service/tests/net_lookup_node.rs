@@ -193,7 +193,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
 }
 
 #[test]
-fn ip_lookup_speculative_enqueue_keeps_same_next_in_current_frame() {
+fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
@@ -233,6 +233,47 @@ fn ip_lookup_speculative_enqueue_keeps_same_next_in_current_frame() {
     );
     assert_frame_lens(&state, &[3]);
     assert_forwarding(&state, lb.get());
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 1);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let sink = register_sink(&runtime, &state);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibSnapshotBuilder::new(drop);
+    let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
+        lb,
+    );
+    let lookup = runtime
+        .nodes()
+        .register_internal(IpLookupControlPlane::new(builder.build()).node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 10_021, [203, 0, 113, 1], 53, b"one"),
+    );
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 10_022, [203, 0, 113, 2], 53, b"two"),
+    );
+
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("lookup needs an owned output frame");
+    assert!(
+        err.to_string().contains("frame pool exhausted"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(state.borrow().payloads.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
