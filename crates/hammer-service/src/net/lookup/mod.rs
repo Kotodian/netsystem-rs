@@ -283,6 +283,7 @@ fn forwarding_dpo_type(dpo: DpoId) -> ForwardingDpoType {
                 .map(CustomDpoType::get)
                 .unwrap_or_default(),
         ),
+        DpoType::LoadBalance => ForwardingDpoType::LoadBalance,
     }
 }
 

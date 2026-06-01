@@ -163,6 +163,22 @@ fn dpo_custom_carries_custom_type_index_and_next() {
 }
 
 #[test]
+fn dpo_load_balance_carries_typed_load_balance_index() {
+    let load_balance = hammer_core::forwarding::LoadBalanceIndex::new(5);
+    let dpo = Dpo::load_balance(IpVersion::V4, load_balance, NextHop::Direct);
+
+    assert_eq!(dpo.kind(), DpoType::LoadBalance);
+    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.next(), NextHop::Direct);
+    assert_eq!(dpo.load_balance_index(), Some(load_balance));
+    assert_eq!(dpo.forwarding_index(), load_balance.get());
+    assert_eq!(
+        dpo.class(),
+        DpoClass::builtin(DpoType::LoadBalance).expect("load-balance class")
+    );
+}
+
+#[test]
 fn custom_dpo_registry_allocates_unique_nonzero_types() {
     let mut registry = CustomDpoRegistry::new();
 

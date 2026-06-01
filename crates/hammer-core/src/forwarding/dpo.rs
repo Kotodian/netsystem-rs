@@ -1,5 +1,7 @@
 use crate::protocol::ip::IpVersion;
 
+use super::load_balance::LoadBalanceIndex;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdjacencyIndex(u32);
 
@@ -89,6 +91,7 @@ pub enum DpoType {
     Adjacency = 2,
     Receive = 3,
     Custom = 4,
+    LoadBalance = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +104,11 @@ impl DpoClass {
     #[inline(always)]
     pub const fn builtin(dpo_type: DpoType) -> Option<Self> {
         match dpo_type {
-            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => Some(Self {
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::LoadBalance => Some(Self {
                 dpo_type,
                 custom_type: 0,
             }),
@@ -126,7 +133,11 @@ impl DpoClass {
     pub const fn custom_type(self) -> Option<CustomDpoType> {
         match self.dpo_type {
             DpoType::Custom => CustomDpoType::new(self.custom_type),
-            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => None,
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::LoadBalance => None,
         }
     }
 }
@@ -188,6 +199,17 @@ impl<N> Dpo<N> {
         }
     }
 
+    #[inline(always)]
+    pub const fn load_balance(proto: IpVersion, load_balance: LoadBalanceIndex, next: N) -> Self {
+        Self {
+            next,
+            index: load_balance.get(),
+            custom_type: 0,
+            dpo_type: DpoType::LoadBalance,
+            proto,
+        }
+    }
+
     /// Stack a parent DPO onto a precomputed graph next.
     ///
     /// This mirrors VPP's `dpo_stack`: the DPO keeps the parent
@@ -236,9 +258,11 @@ impl<N> Dpo<N> {
             DpoType::Custom => DpoClass::custom(
                 CustomDpoType::new(self.custom_type).expect("custom DPO stores non-zero type"),
             ),
-            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => {
-                DpoClass::builtin(self.dpo_type).expect("built-in DPO class")
-            }
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::LoadBalance => DpoClass::builtin(self.dpo_type).expect("built-in DPO class"),
         }
     }
 
@@ -246,7 +270,23 @@ impl<N> Dpo<N> {
     pub fn adjacency_index(&self) -> Option<AdjacencyIndex> {
         match self.dpo_type {
             DpoType::Adjacency => Some(AdjacencyIndex::new(self.index)),
-            DpoType::Drop | DpoType::Punt | DpoType::Receive | DpoType::Custom => None,
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Receive
+            | DpoType::Custom
+            | DpoType::LoadBalance => None,
+        }
+    }
+
+    #[inline(always)]
+    pub fn load_balance_index(&self) -> Option<LoadBalanceIndex> {
+        match self.dpo_type {
+            DpoType::LoadBalance => Some(LoadBalanceIndex::new(self.index)),
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::Custom => None,
         }
     }
 
@@ -254,7 +294,11 @@ impl<N> Dpo<N> {
     pub fn custom_type(&self) -> Option<CustomDpoType> {
         match self.dpo_type {
             DpoType::Custom => CustomDpoType::new(self.custom_type),
-            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => None,
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::LoadBalance => None,
         }
     }
 
@@ -262,14 +306,18 @@ impl<N> Dpo<N> {
     pub fn custom_index(&self) -> Option<CustomDpoIndex> {
         match self.dpo_type {
             DpoType::Custom => Some(CustomDpoIndex::new(self.index)),
-            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => None,
+            DpoType::Drop
+            | DpoType::Punt
+            | DpoType::Adjacency
+            | DpoType::Receive
+            | DpoType::LoadBalance => None,
         }
     }
 
     #[inline(always)]
     pub fn forwarding_index(&self) -> u32 {
         match self.dpo_type {
-            DpoType::Adjacency | DpoType::Custom => self.index,
+            DpoType::Adjacency | DpoType::Custom | DpoType::LoadBalance => self.index,
             DpoType::Drop | DpoType::Punt | DpoType::Receive => 0,
         }
     }
