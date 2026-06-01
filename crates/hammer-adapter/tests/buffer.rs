@@ -124,6 +124,24 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
 }
 
 #[test]
+fn buffer_batch_mut_exposes_direct_buffer_refs() {
+    let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(32, 1);
+    let index = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
+        .expect("alloc buffer");
+
+    {
+        let mut batch = runtime.buffer_batch_mut();
+        assert_eq!(batch.buffer(index).expect("buffer").current(), b"alpha");
+        batch.buffer_mut(index).expect("buffer mut").current_mut()[0] = b'A';
+    }
+
+    assert_eq!(runtime.copy_current(index).expect("current"), b"Alpha");
+    runtime.free_index(index);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn buffer_header_and_packet_data_start_cacheline_aligned() {
     let pool = BufferPool::with_capacity(128, 1);
     let buffer = pool

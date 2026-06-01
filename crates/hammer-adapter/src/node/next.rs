@@ -288,6 +288,47 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
+    pub fn validate_frame_with_buffer_batch_chunks<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+        mut nexts_for_indices: impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [NodeId; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        let mut batch = runtime.buffer_batch_mut();
+        let result = frame.retain_indices_batched_with_prefetch_state_lazy_chunks(
+            width,
+            &mut batch,
+            |batch, indices| prefetch_indices(batch, indices),
+            |batch, indices, keep| {
+                let mut nexts = [speculative_node; 4];
+                nexts_for_indices(batch, indices, &mut nexts)?;
+                for offset in 0..indices.len() {
+                    let node = nexts[offset];
+                    if node == speculative_node {
+                        keep[offset] = true;
+                    } else {
+                        self.split.enqueue(runtime, node, indices[offset])?;
+                    }
+                }
+                Ok(())
+            },
+        );
+        drop(batch);
+        if result.is_err() {
+            self.split.free(runtime);
+        }
+        result?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
     fn finish<G>(
         self,
         runtime: &DataPlaneRuntime<G>,

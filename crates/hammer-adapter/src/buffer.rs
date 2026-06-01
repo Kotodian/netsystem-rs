@@ -2613,6 +2613,28 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    pub(crate) fn retain_indices_batched_with_prefetch_state_lazy_chunks<S>(
+        &mut self,
+        width: FrameBatchWidth,
+        state: &mut S,
+        mut prefetch: impl FnMut(&mut S, &[BufferIndex]),
+        mut keep_chunk: impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        match width {
+            FrameBatchWidth::Quad => self.retain_indices_quad_with_prefetch_state_lazy_chunks(
+                state,
+                &mut prefetch,
+                &mut keep_chunk,
+            ),
+            FrameBatchWidth::Pair => self.retain_indices_pair_with_prefetch_state_lazy_chunks(
+                state,
+                &mut prefetch,
+                &mut keep_chunk,
+            ),
+        }
+    }
+
+    #[inline(always)]
     pub fn rewrite_indices_batched(
         &mut self,
         width: FrameBatchWidth,
@@ -2836,6 +2858,66 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_indices_quad_with_prefetch_state_lazy_chunks<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
+        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = None;
+        while read + 4 <= len {
+            self.prefetch_indices_state_chunk(read + 4, 4, state, prefetch);
+            let chunk = [
+                self.indices[read],
+                self.indices[read + 1],
+                self.indices[read + 2],
+                self.indices[read + 3],
+            ];
+            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
+            read += 4;
+        }
+        if read + 2 <= len {
+            self.prefetch_indices_state_chunk(read + 2, 2, state, prefetch);
+            let chunk = [self.indices[read], self.indices[read + 1]];
+            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
+            read += 2;
+        }
+        while read < len {
+            let chunk = [self.indices[read]];
+            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
+            read += 1;
+        }
+        self.finish_retain_lazy(write);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn retain_indices_pair_with_prefetch_state_lazy_chunks<S>(
+        &mut self,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
+        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let len = self.indices.len();
+        let mut read = 0usize;
+        let mut write = None;
+        while read + 2 <= len {
+            self.prefetch_indices_state_chunk(read + 2, 2, state, prefetch);
+            let chunk = [self.indices[read], self.indices[read + 1]];
+            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
+            read += 2;
+        }
+        if read < len {
+            let chunk = [self.indices[read]];
+            self.retain_chunk_state_lazy(read, chunk, &mut write, state, keep_chunk)?;
+        }
+        self.finish_retain_lazy(write);
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
         rewrite: &mut impl FnMut(BufferIndex) -> CoreResult<Option<BufferIndex>>,
@@ -2935,6 +3017,31 @@ impl BufferFrame {
     }
 
     #[inline(always)]
+    fn retain_chunk_state_lazy<S, const N: usize>(
+        &mut self,
+        read: usize,
+        chunk: [BufferIndex; N],
+        write: &mut Option<usize>,
+        state: &mut S,
+        keep_chunk: &mut impl FnMut(&mut S, &[BufferIndex], &mut [bool; 4]) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        let mut keep = [false; 4];
+        keep_chunk(state, &chunk, &mut keep)?;
+        for offset in 0..N {
+            let index = chunk[offset];
+            if keep[offset] {
+                if let Some(write) = write {
+                    self.indices[*write] = index;
+                    *write += 1;
+                }
+            } else if write.is_none() {
+                *write = Some(read + offset);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
     fn rewrite_one(
         &mut self,
         read: usize,
@@ -2973,6 +3080,20 @@ impl BufferFrame {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
             prefetch(state, index);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_indices_state_chunk<S>(
+        &self,
+        offset: usize,
+        width: usize,
+        state: &mut S,
+        prefetch: &mut impl FnMut(&mut S, &[BufferIndex]),
+    ) {
+        let end = (offset + width).min(self.indices.len());
+        if offset < end {
+            prefetch(state, &self.indices[offset..end]);
         }
     }
 
@@ -3174,6 +3295,16 @@ impl BufferBatchMut<'_> {
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.guard.prefetch_read(index);
+    }
+
+    #[inline]
+    pub fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
+        self.guard.buffer(index)
+    }
+
+    #[inline]
+    pub fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
+        self.guard.buffer_mut(index)
     }
 
     #[inline]
