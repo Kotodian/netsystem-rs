@@ -255,6 +255,38 @@ impl Node<TestNode> for SpeculativeSplitNode {
 
 impl InternalNode<TestNode> for SpeculativeSplitNode {}
 
+struct PrecomputedSplitNode {
+    speculative: NodeId,
+    alternate: NodeId,
+    frames_in_use_during_process: Rc<Cell<usize>>,
+}
+
+impl Node<TestNode> for PrecomputedSplitNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let mut nexts = Vec::with_capacity(frame.pending_len());
+        for index in frame.pending_indices().iter().copied() {
+            let payload = runtime.copy_current(index)?;
+            if payload == b"alternate" {
+                nexts.push(self.alternate);
+            } else {
+                nexts.push(self.speculative);
+            }
+        }
+        let result = NodeNextEnqueue::new(self.speculative)
+            .validate_frame_with_nexts(runtime, frame, &nexts)?;
+        self.frames_in_use_during_process
+            .set(runtime.frames_in_use());
+        Ok(result)
+    }
+}
+
+impl InternalNode<TestNode> for PrecomputedSplitNode {}
+
 struct SpeculativeErrorAfterSplitNode {
     speculative: NodeId,
     alternate: NodeId,
@@ -292,6 +324,7 @@ enum TestNode {
     Handoff(HandoffNode),
     PointerSink(PointerSinkNode),
     SpeculativeSplit(SpeculativeSplitNode),
+    PrecomputedSplit(PrecomputedSplitNode),
     SpeculativeErrorAfterSplit(SpeculativeErrorAfterSplitNode),
 }
 
@@ -355,6 +388,12 @@ impl From<SpeculativeSplitNode> for TestNode {
     }
 }
 
+impl From<PrecomputedSplitNode> for TestNode {
+    fn from(node: PrecomputedSplitNode) -> Self {
+        Self::PrecomputedSplit(node)
+    }
+}
+
 impl From<SpeculativeErrorAfterSplitNode> for TestNode {
     fn from(node: SpeculativeErrorAfterSplitNode) -> Self {
         Self::SpeculativeErrorAfterSplit(node)
@@ -379,6 +418,7 @@ impl Node<TestNode> for TestNode {
             Self::Handoff(node) => node.process(runtime, frame),
             Self::PointerSink(node) => node.process(runtime, frame),
             Self::SpeculativeSplit(node) => node.process(runtime, frame),
+            Self::PrecomputedSplit(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplit(node) => node.process(runtime, frame),
         }
     }
@@ -535,6 +575,44 @@ fn speculative_enqueue_splits_mismatched_next_to_separate_frame() {
     });
     let frames_seen = Rc::new(Cell::new(0));
     let split = runtime.nodes().register_internal(SpeculativeSplitNode {
+        speculative: default,
+        alternate,
+        frames_in_use_during_process: Rc::clone(&frames_seen),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"default-1");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"default-2");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(frames_seen.get(), 2);
+    assert_eq!(
+        &*default_payloads.borrow(),
+        &[b"default-1".to_vec(), b"default-2".to_vec()]
+    );
+    assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn precomputed_nexts_split_mismatched_next_to_separate_frame() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let default_payloads = Rc::new(RefCell::new(Vec::new()));
+    let alternate_payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let default = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&default_payloads),
+    });
+    let alternate = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&alternate_payloads),
+    });
+    let frames_seen = Rc::new(Cell::new(0));
+    let split = runtime.nodes().register_internal(PrecomputedSplitNode {
         speculative: default,
         alternate,
         frames_in_use_during_process: Rc::clone(&frames_seen),

@@ -136,6 +136,48 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
+    pub fn validate_frame_with_nexts<G>(
+        mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        nexts: &[NodeId],
+    ) -> CoreResult<NodeResult> {
+        let speculative_node = self.speculative_node;
+        let width = runtime.preferred_frame_batch_width();
+        self.validate_frame_with_nexts_and_width(runtime, frame, width, nexts)?;
+        self.finish(runtime, frame, speculative_node)
+    }
+
+    #[inline(always)]
+    pub fn validate_frame_with_nexts_and_width<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        width: FrameBatchWidth,
+        nexts: &[NodeId],
+    ) -> CoreResult<()> {
+        let speculative_node = self.speculative_node;
+        if nexts.len() != frame.pending_len() {
+            return Err(CoreError::internal("node next decision count mismatch"));
+        }
+        let mut offset = 0usize;
+        let result = frame.retain_indices_batched(width, |index| {
+            let node = nexts[offset];
+            offset += 1;
+            if node == speculative_node {
+                Ok(true)
+            } else {
+                self.split.enqueue(runtime, node, index)?;
+                Ok(false)
+            }
+        });
+        if result.is_err() {
+            self.split.free(runtime);
+        }
+        result
+    }
+
+    #[inline(always)]
     pub fn validate_frame_with_width_and_prefetch<G>(
         &mut self,
         runtime: &DataPlaneRuntime<G>,
