@@ -45,6 +45,10 @@ pub enum LoadBalanceError {
         actual: IpVersion,
         bucket_index: u16,
     },
+    BucketAdjacencyMissing {
+        index: AdjacencyIndex,
+        bucket_index: u16,
+    },
 }
 
 #[repr(C, align(64))]

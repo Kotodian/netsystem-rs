@@ -3,7 +3,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
     DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
-    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceIndex,
+    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError,
+    LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -371,6 +372,20 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
 }
 
 #[test]
+fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let missing = AdjacencyIndex::new(99);
+    let err = builder
+        .try_add_ip4_route_dpo(
+            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 75), 32).expect("route"),
+            DpoId::adjacency(IpVersion::V4, missing, NextHop::Direct),
+        )
+        .expect_err("route DPO with missing adjacency should be rejected");
+
+    assert_eq!(err, FibRouteDpoError::AdjacencyMissing { index: missing });
+}
+
+#[test]
 fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance =
@@ -400,6 +415,26 @@ fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
         .expect_err("missing load-balance route should be rejected");
 
     assert_eq!(err, FibRouteDpoError::LoadBalanceMissing { index: missing });
+}
+
+#[test]
+fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let missing = AdjacencyIndex::new(99);
+    let err = builder
+        .try_add_load_balance(
+            IpVersion::V4,
+            [DpoId::adjacency(IpVersion::V4, missing, NextHop::Direct)],
+        )
+        .expect_err("load-balance bucket with missing adjacency should be rejected");
+
+    assert_eq!(
+        err,
+        LoadBalanceError::BucketAdjacencyMissing {
+            index: missing,
+            bucket_index: 0,
+        }
+    );
 }
 
 #[test]

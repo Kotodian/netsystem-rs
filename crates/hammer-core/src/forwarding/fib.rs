@@ -36,6 +36,9 @@ pub enum FibRouteDpoError {
         expected: IpVersion,
         actual: IpVersion,
     },
+    AdjacencyMissing {
+        index: AdjacencyIndex,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -281,8 +284,9 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         buckets: impl Into<Vec<DpoId<N>>>,
     ) -> Result<LoadBalanceIndex, LoadBalanceError> {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
-        self.load_balances
-            .push(LoadBalance::try_new(proto, buckets)?);
+        let load_balance = LoadBalance::try_new(proto, buckets)?;
+        self.validate_load_balance_adjacencies(&load_balance)?;
+        self.load_balances.push(load_balance);
         Ok(index)
     }
 
@@ -342,7 +346,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv4Net,
         dpo: DpoId<N>,
     ) -> Result<(), FibRouteDpoError> {
-        validate_route_dpo_proto(IpVersion::V4, dpo)?;
+        self.validate_route_dpo(IpVersion::V4, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip4_routes.push(Ip4Route { prefix, route_dpo });
         Ok(())
@@ -360,7 +364,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv6Net,
         dpo: DpoId<N>,
     ) -> Result<(), FibRouteDpoError> {
-        validate_route_dpo_proto(IpVersion::V6, dpo)?;
+        self.validate_route_dpo(IpVersion::V6, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
         Ok(())
@@ -454,6 +458,47 @@ impl<N: Copy> FibSnapshotBuilder<N> {
             Ok(())
         } else {
             Err(FibRouteDpoError::LoadBalanceProtoMismatch { expected, actual })
+        }
+    }
+
+    #[inline]
+    fn validate_load_balance_adjacencies(
+        &self,
+        load_balance: &LoadBalance<N>,
+    ) -> Result<(), LoadBalanceError> {
+        for (bucket_index, bucket) in load_balance.buckets().iter().copied().enumerate() {
+            let Some(index) = bucket.adjacency_index() else {
+                continue;
+            };
+            if self.adjacencies.get(index.slot()).is_none() {
+                return Err(LoadBalanceError::BucketAdjacencyMissing {
+                    index,
+                    bucket_index: bucket_index as u16,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_route_dpo(
+        &self,
+        expected: IpVersion,
+        dpo: DpoId<N>,
+    ) -> Result<(), FibRouteDpoError> {
+        validate_route_dpo_proto(expected, dpo)?;
+        if let Some(index) = dpo.adjacency_index() {
+            self.validate_route_dpo_adjacency(index)?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn validate_route_dpo_adjacency(&self, index: AdjacencyIndex) -> Result<(), FibRouteDpoError> {
+        if self.adjacencies.get(index.slot()).is_some() {
+            Ok(())
+        } else {
+            Err(FibRouteDpoError::AdjacencyMissing { index })
         }
     }
 }
