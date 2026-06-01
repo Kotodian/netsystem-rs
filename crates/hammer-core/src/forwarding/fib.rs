@@ -505,6 +505,9 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         if let Some(index) = dpo.adjacency_index() {
             self.validate_route_dpo_adjacency(index, dpo.proto())?;
         }
+        if let Some(index) = dpo.load_balance_index() {
+            self.validate_load_balance_proto(dpo.proto(), index)?;
+        }
         Ok(())
     }
 

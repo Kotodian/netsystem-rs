@@ -439,6 +439,38 @@ fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
 }
 
 #[test]
+fn fib_snapshot_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let load_balance =
+        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+
+    let err = builder
+        .try_add_ip4_route_dpo(
+            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 85), 32).expect("route"),
+            DpoId::load_balance(IpVersion::V4, load_balance, NextHop::Drop),
+        )
+        .expect_err("wrong-proto load-balance DPO route should be rejected");
+
+    assert_eq!(
+        err,
+        FibRouteDpoError::LoadBalanceProtoMismatch {
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
+        }
+    );
+
+    let missing = LoadBalanceIndex::new(99);
+    let err = builder
+        .try_add_ip6_route_dpo(
+            Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("route"),
+            DpoId::load_balance(IpVersion::V6, missing, NextHop::Drop),
+        )
+        .expect_err("missing load-balance DPO route should be rejected");
+
+    assert_eq!(err, FibRouteDpoError::LoadBalanceMissing { index: missing });
+}
+
+#[test]
 fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let missing = AdjacencyIndex::new(99);
