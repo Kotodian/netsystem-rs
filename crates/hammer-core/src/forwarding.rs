@@ -8,7 +8,9 @@ pub use dpo::{
     Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass,
     DpoId, DpoStackRegistry, DpoType,
 };
-pub use fib::{FibEntry, FibLookupResult, FibSnapshot, FibSnapshotBuilder, flow_hash};
+pub use fib::{
+    FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot, FibSnapshotBuilder, flow_hash,
+};
 pub use ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 pub use ip6_fib::{Ip6Fib, Ip6PrefixHashTable, Ip6PrefixKey, mask_ipv6};
 pub use load_balance::{LoadBalance, LoadBalanceIndex};

@@ -23,6 +23,14 @@ impl<N> FibEntry<N> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FibRouteDpoError {
+    ProtoMismatch {
+        expected: IpVersion,
+        actual: IpVersion,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FibRouteDpoIndex(u32);
 
@@ -278,21 +286,55 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_route_dpo(&mut self, prefix: Ipv4Net, dpo: DpoId<N>) {
+        self.try_add_ip4_route_dpo(prefix, dpo)
+            .expect("IPv4 route DPO must carry IPv4 proto");
+    }
+
+    #[inline]
+    pub fn try_add_ip4_route_dpo(
+        &mut self,
+        prefix: Ipv4Net,
+        dpo: DpoId<N>,
+    ) -> Result<(), FibRouteDpoError> {
+        validate_route_dpo_proto(IpVersion::V4, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip4_routes.push(Ip4Route { prefix, route_dpo });
+        Ok(())
     }
 
     #[inline]
     pub fn add_ip6_route_dpo(&mut self, prefix: Ipv6Net, dpo: DpoId<N>) {
+        self.try_add_ip6_route_dpo(prefix, dpo)
+            .expect("IPv6 route DPO must carry IPv6 proto");
+    }
+
+    #[inline]
+    pub fn try_add_ip6_route_dpo(
+        &mut self,
+        prefix: Ipv6Net,
+        dpo: DpoId<N>,
+    ) -> Result<(), FibRouteDpoError> {
+        validate_route_dpo_proto(IpVersion::V6, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
+        Ok(())
     }
 
     #[inline]
     pub fn add_route_dpo(&mut self, prefix: IpNet, dpo: DpoId<N>) {
+        self.try_add_route_dpo(prefix, dpo)
+            .expect("route DPO proto must match prefix IP version");
+    }
+
+    #[inline]
+    pub fn try_add_route_dpo(
+        &mut self,
+        prefix: IpNet,
+        dpo: DpoId<N>,
+    ) -> Result<(), FibRouteDpoError> {
         match prefix {
-            IpNet::V4(prefix) => self.add_ip4_route_dpo(prefix, dpo),
-            IpNet::V6(prefix) => self.add_ip6_route_dpo(prefix, dpo),
+            IpNet::V4(prefix) => self.try_add_ip4_route_dpo(prefix, dpo),
+            IpNet::V6(prefix) => self.try_add_ip6_route_dpo(prefix, dpo),
         }
     }
 
@@ -306,7 +348,13 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_entry(&mut self, entry: FibEntry<N>) {
-        self.add_route_dpo(entry.prefix, entry.dpo);
+        self.try_add_entry(entry)
+            .expect("FIB entry DPO proto must match prefix IP version");
+    }
+
+    #[inline]
+    pub fn try_add_entry(&mut self, entry: FibEntry<N>) -> Result<(), FibRouteDpoError> {
+        self.try_add_route_dpo(entry.prefix, entry.dpo)
     }
 
     #[inline]
@@ -346,6 +394,16 @@ struct Ip4Route {
 struct Ip6Route {
     prefix: Ipv6Net,
     route_dpo: FibRouteDpoIndex,
+}
+
+#[inline(always)]
+fn validate_route_dpo_proto<N>(expected: IpVersion, dpo: DpoId<N>) -> Result<(), FibRouteDpoError> {
+    let actual = dpo.proto();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(FibRouteDpoError::ProtoMismatch { expected, actual })
+    }
 }
 
 #[inline(always)]

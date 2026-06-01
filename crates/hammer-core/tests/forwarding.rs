@@ -2,8 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
-    DpoStackRegistry, DpoType, FibEntry, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute,
-    Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
+    DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
+    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -326,6 +326,40 @@ fn fib_snapshot_adds_dpo_backed_fib_entry() {
     assert_eq!(result.bucket_index(), None);
     assert_eq!(result.dpo.kind(), DpoType::Punt);
     assert_eq!(result.dpo.next(), NextHop::Direct);
+}
+
+#[test]
+fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let err = builder
+        .try_add_ip4_route_dpo(
+            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 70), 32).expect("route"),
+            DpoId::receive(IpVersion::V6, NextHop::Direct),
+        )
+        .expect_err("wrong-proto route DPO should be rejected");
+
+    assert_eq!(
+        err,
+        FibRouteDpoError::ProtoMismatch {
+            expected: IpVersion::V4,
+            actual: IpVersion::V6,
+        }
+    );
+
+    let err = builder
+        .try_add_entry(FibEntry::new(
+            IpNet::V6(Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("route")),
+            DpoId::punt(IpVersion::V4, NextHop::Direct),
+        ))
+        .expect_err("wrong-proto FIB entry should be rejected");
+
+    assert_eq!(
+        err,
+        FibRouteDpoError::ProtoMismatch {
+            expected: IpVersion::V6,
+            actual: IpVersion::V4,
+        }
+    );
 }
 
 #[test]
