@@ -9,13 +9,13 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
-    Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibLookupResult as CoreFibLookupResult,
-    FibSnapshot as CoreFibSnapshot, FibSnapshotBuilder as CoreFibSnapshotBuilder,
-    LoadBalance as CoreLoadBalance,
+    Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
+    FibLookupResult as CoreFibLookupResult, FibSnapshot as CoreFibSnapshot,
+    FibSnapshotBuilder as CoreFibSnapshotBuilder, LoadBalance as CoreLoadBalance,
 };
 pub use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoStackRegistry, DpoType,
-    FibEntry, LoadBalanceIndex,
+    LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
@@ -24,6 +24,7 @@ use hammer_runtime::ControlThreadHandle;
 
 pub type Adjacency = CoreAdjacency<NodeId>;
 pub type DpoId = CoreDpoId<NodeId>;
+pub type FibEntry = CoreFibEntry<NodeId>;
 pub type FibLookupResult = CoreFibLookupResult<NodeId>;
 pub type FibSnapshot = CoreFibSnapshot<NodeId>;
 pub type FibSnapshotBuilder = CoreFibSnapshotBuilder<NodeId>;

@@ -2,13 +2,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
-    DpoStackRegistry, DpoType, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
-    Ip6PrefixHashTable, Ip6PrefixKey,
+    DpoStackRegistry, DpoType, FibEntry, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute,
+    Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
 };
-use ipnet::{Ipv4Net, Ipv6Net};
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NextHop {
@@ -306,6 +306,25 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
     assert_eq!(result.route_dpo.proto(), IpVersion::V6);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
+}
+
+#[test]
+fn fib_snapshot_adds_dpo_backed_fib_entry() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    builder.add_entry(FibEntry::new(
+        IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 60), 32).expect("punt route")),
+        DpoId::punt(IpVersion::V4, NextHop::Direct),
+    ));
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 60), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.kind(), DpoType::Punt);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.kind(), DpoType::Punt);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 

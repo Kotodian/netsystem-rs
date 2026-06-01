@@ -10,10 +10,17 @@ use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceIndex};
 use crate::ds::prefetch::prefetch_read_l1;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FibEntry {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FibEntry<N> {
     pub prefix: IpNet,
-    pub load_balance: LoadBalanceIndex,
+    pub dpo: DpoId<N>,
+}
+
+impl<N> FibEntry<N> {
+    #[inline(always)]
+    pub const fn new(prefix: IpNet, dpo: DpoId<N>) -> Self {
+        Self { prefix, dpo }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -282,11 +289,24 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_route_dpo(&mut self, prefix: IpNet, dpo: DpoId<N>) {
+        match prefix {
+            IpNet::V4(prefix) => self.add_ip4_route_dpo(prefix, dpo),
+            IpNet::V6(prefix) => self.add_ip6_route_dpo(prefix, dpo),
+        }
+    }
+
+    #[inline]
     pub fn add_route(&mut self, prefix: IpNet, load_balance: LoadBalanceIndex) {
         match prefix {
             IpNet::V4(prefix) => self.add_ip4_route(prefix, load_balance),
             IpNet::V6(prefix) => self.add_ip6_route(prefix, load_balance),
         }
+    }
+
+    #[inline]
+    pub fn add_entry(&mut self, entry: FibEntry<N>) {
+        self.add_route_dpo(entry.prefix, entry.dpo);
     }
 
     #[inline]
