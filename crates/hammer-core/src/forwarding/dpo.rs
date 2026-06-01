@@ -91,6 +91,46 @@ pub enum DpoType {
     Custom = 4,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpoClass {
+    dpo_type: DpoType,
+    custom_type: u16,
+}
+
+impl DpoClass {
+    #[inline(always)]
+    pub const fn builtin(dpo_type: DpoType) -> Option<Self> {
+        match dpo_type {
+            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => Some(Self {
+                dpo_type,
+                custom_type: 0,
+            }),
+            DpoType::Custom => None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn custom(custom_type: CustomDpoType) -> Self {
+        Self {
+            dpo_type: DpoType::Custom,
+            custom_type: custom_type.get(),
+        }
+    }
+
+    #[inline(always)]
+    pub const fn dpo_type(self) -> DpoType {
+        self.dpo_type
+    }
+
+    #[inline(always)]
+    pub const fn custom_type(self) -> Option<CustomDpoType> {
+        match self.dpo_type {
+            DpoType::Custom => CustomDpoType::new(self.custom_type),
+            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dpo<N> {
@@ -191,6 +231,18 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
+    pub fn class(&self) -> DpoClass {
+        match self.dpo_type {
+            DpoType::Custom => DpoClass::custom(
+                CustomDpoType::new(self.custom_type).expect("custom DPO stores non-zero type"),
+            ),
+            DpoType::Drop | DpoType::Punt | DpoType::Adjacency | DpoType::Receive => {
+                DpoClass::builtin(self.dpo_type).expect("built-in DPO class")
+            }
+        }
+    }
+
+    #[inline(always)]
     pub fn adjacency_index(&self) -> Option<AdjacencyIndex> {
         match self.dpo_type {
             DpoType::Adjacency => Some(AdjacencyIndex::new(self.index)),
@@ -228,6 +280,69 @@ impl<N: Copy> Dpo<N> {
     pub fn next(&self) -> N {
         self.next
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct DpoStackRegistry<N> {
+    edges: Vec<DpoStackEdge<N>>,
+}
+
+impl<N> Default for DpoStackRegistry<N> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<N> DpoStackRegistry<N> {
+    #[inline]
+    pub const fn new() -> Self {
+        Self { edges: Vec::new() }
+    }
+
+    #[inline]
+    pub fn register(&mut self, child: DpoClass, parent: DpoClass, proto: IpVersion, next: N) {
+        let key = DpoStackKey {
+            child,
+            parent,
+            proto,
+        };
+        if let Some(edge) = self.edges.iter_mut().find(|edge| edge.key == key) {
+            edge.next = next;
+            return;
+        }
+        self.edges.push(DpoStackEdge { key, next });
+    }
+}
+
+impl<N: Copy> DpoStackRegistry<N> {
+    #[inline]
+    pub fn stack(&self, child: DpoClass, parent: Dpo<N>) -> Option<Dpo<N>> {
+        let key = DpoStackKey {
+            child,
+            parent: parent.class(),
+            proto: parent.proto(),
+        };
+        let next = self
+            .edges
+            .iter()
+            .find(|edge| edge.key == key)
+            .map(|edge| edge.next)?;
+        Some(Dpo::stack(parent, next))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DpoStackKey {
+    child: DpoClass,
+    parent: DpoClass,
+    proto: IpVersion,
+}
+
+#[derive(Debug, Clone)]
+struct DpoStackEdge<N> {
+    key: DpoStackKey,
+    next: N,
 }
 
 #[repr(C)]

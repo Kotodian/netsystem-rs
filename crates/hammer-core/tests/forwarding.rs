@@ -1,8 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoId, DpoType,
-    FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey,
+    AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
+    DpoStackRegistry, DpoType, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
+    Ip6PrefixHashTable, Ip6PrefixKey,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -186,6 +187,39 @@ fn dpo_stack_preserves_parent_identity_and_updates_next() {
     assert_eq!(stacked.custom_index(), Some(custom_index));
     assert_eq!(stacked.forwarding_index(), custom_index.get());
     assert_eq!(stacked.next(), NextHop::Direct);
+}
+
+#[test]
+fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
+    let mut custom_registry = CustomDpoRegistry::new();
+    let child_type = custom_registry.register().expect("child custom type");
+    let parent_type = custom_registry.register().expect("parent custom type");
+    let child = DpoClass::custom(child_type);
+    let parent = Dpo::custom(
+        IpVersion::V4,
+        parent_type,
+        CustomDpoIndex::new(23),
+        NextHop::Drop,
+    );
+    let mut stack_registry = DpoStackRegistry::new();
+    stack_registry.register(child, parent.class(), IpVersion::V4, NextHop::Direct);
+
+    let stacked = stack_registry
+        .stack(child, parent)
+        .expect("registered stack edge");
+
+    assert_eq!(stacked.class(), parent.class());
+    assert_eq!(stacked.custom_index(), parent.custom_index());
+    assert_eq!(stacked.next(), NextHop::Direct);
+}
+
+#[test]
+fn dpo_stack_registry_rejects_missing_stack_edge() {
+    let child = DpoClass::builtin(DpoType::Receive).expect("receive class");
+    let parent = Dpo::receive(IpVersion::V6, NextHop::Drop);
+    let stack_registry = DpoStackRegistry::<NextHop>::new();
+
+    assert_eq!(stack_registry.stack(child, parent), None);
 }
 
 #[test]
