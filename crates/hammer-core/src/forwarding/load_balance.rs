@@ -142,19 +142,13 @@ impl<N: Copy> LoadBalance<N> {
     }
 
     #[inline(always)]
-    pub fn select_hash(&self, hash: usize) -> Option<(u16, DpoId<N>)> {
-        if self.bucket_count == 0 {
-            return None;
-        }
+    pub fn select_hash(&self, hash: usize) -> (u16, DpoId<N>) {
         let bucket = self.bucket_for_hash(hash);
-        Some((bucket as u16, self.bucket_unchecked(bucket)))
+        (bucket as u16, self.bucket_unchecked(bucket))
     }
 
     #[inline(always)]
     pub fn prefetch_bucket(&self, hash: usize) {
-        if self.bucket_count == 0 {
-            return;
-        }
         let bucket = self.bucket_for_hash(hash);
         match &self.buckets {
             LoadBalanceBuckets::Inline(buckets) => prefetch_read_l1(&buckets[bucket]),
@@ -238,7 +232,8 @@ mod tests {
         assert_eq!(lb.proto(), IpVersion::V4);
         assert_eq!(lb.bucket_count(), 2);
         assert!(matches!(lb.buckets, LoadBalanceBuckets::Inline(_)));
-        assert_eq!(lb.select_hash(1).expect("bucket").1.next(), Next::B);
+        let (_bucket, dpo) = lb.select_hash(1);
+        assert_eq!(dpo.next(), Next::B);
     }
 
     #[test]
