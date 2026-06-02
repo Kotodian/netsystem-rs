@@ -3,14 +3,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ForwardingDpoType, ForwardingMetadata, InternalNode, Node,
-    NodeResult,
+    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeResult,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    CustomDpoIndex, CustomDpoType, Dpo, DpoId, DpoProto, FibSnapshotBuilder, IpInputNext,
-    IpInputNode, IpLookupControlPlane, IpLookupNode,
+    Dpo, DpoId, DpoProto, DpoType, FibSnapshotBuilder, IpInputNext, IpInputNode,
+    IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -386,9 +385,9 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"receive".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
-    assert_eq!(forwarding.route_dpo_type, ForwardingDpoType::LoadBalance);
+    assert_eq!(forwarding.route_dpo_type, DpoType::LOAD_BALANCE);
     assert_eq!(forwarding.route_dpo_index, receive_lb.get());
-    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.dpo_type, DpoType::RECEIVE);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -422,9 +421,9 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, u32::MAX);
     assert_eq!(forwarding.bucket_index, u16::MAX);
-    assert_eq!(forwarding.route_dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.route_dpo_type, DpoType::RECEIVE);
     assert_eq!(forwarding.route_dpo_index, 0);
-    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.dpo_type, DpoType::RECEIVE);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -459,7 +458,7 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"stack".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
-    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Receive);
+    assert_eq!(forwarding.dpo_type, DpoType::RECEIVE);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -471,17 +470,12 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let state = Rc::new(RefCell::new(SinkState::default()));
     let custom = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let custom_type = CustomDpoType::new(7).expect("custom type");
-    let custom_index = CustomDpoIndex::new(11);
+    let custom_type = DpoType::new(7);
+    let custom_index = 11;
     let mut builder = FibSnapshotBuilder::new(drop);
     let custom_lb = builder.add_load_balance(
         DpoProto::IP4,
-        [Dpo::custom(
-            DpoProto::IP4,
-            custom_type,
-            custom_index,
-            custom,
-        )],
+        [Dpo::new(DpoProto::IP4, custom_type, custom_index, custom)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 30), 32).expect("custom route"),
@@ -502,8 +496,8 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"custom".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
-    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Custom(7));
-    assert_eq!(forwarding.dpo_index, custom_index.get());
+    assert_eq!(forwarding.dpo_type, custom_type);
+    assert_eq!(forwarding.dpo_index, custom_index);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -737,7 +731,7 @@ fn assert_frame_lens(state: &Rc<RefCell<SinkState>>, expected_lens: &[usize]) {
 fn assert_forwarding(state: &Rc<RefCell<SinkState>>, load_balance_index: u32) {
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, load_balance_index);
-    assert_eq!(forwarding.dpo_type, ForwardingDpoType::Adjacency);
+    assert_eq!(forwarding.dpo_type, DpoType::ADJACENCY);
 }
 
 fn udp_payload(packet: &[u8]) -> &[u8] {

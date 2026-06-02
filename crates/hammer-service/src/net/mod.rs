@@ -7,9 +7,9 @@ pub use ip::{
     IpReassemblyNext, IpReassemblyNode,
 };
 pub use lookup::{
-    Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoId, DpoProto,
-    DpoStackRegistry, DpoType, FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot,
-    FibSnapshotBuilder, FibSnapshotHandle, IpLookupControlPlane, IpLookupNode, LoadBalance,
-    LoadBalanceError, LoadBalanceIndex,
+    Adjacency, AdjacencyIndex, Dpo, DpoClass, DpoId, DpoProto, DpoStackRegistry, DpoType,
+    DpoTypeRegistry, FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot, FibSnapshotBuilder,
+    FibSnapshotHandle, IpLookupControlPlane, IpLookupNode, LoadBalance, LoadBalanceError,
+    LoadBalanceIndex,
 };
 pub use route_metadata::packet_route_metadata;

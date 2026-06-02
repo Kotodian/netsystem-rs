@@ -1,10 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
-    DpoProto, DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
-    Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError,
-    LoadBalanceIndex,
+    AdjacencyIndex, Dpo, DpoId, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry,
+    FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
+    Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -148,7 +147,7 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
         .load_balance_index()
         .expect("load-balance DPO index");
 
-    assert_eq!(route_dpo.kind(), DpoType::LoadBalance);
+    assert_eq!(route_dpo.kind(), DpoType::LOAD_BALANCE);
     assert_eq!(route_dpo.proto(), DpoProto::IP4);
     assert_eq!(route_dpo.next(), NextHop::Drop);
 
@@ -169,7 +168,7 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 12), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -196,7 +195,7 @@ fn fib_snapshot_builder_adds_single_path_load_balance() {
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 13), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
-    assert_eq!(result.dpo.kind(), DpoType::Adjacency);
+    assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
     assert_eq!(result.dpo.adjacency_index(), Some(adjacency));
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
@@ -215,7 +214,7 @@ fn fib_snapshot_builder_adds_ip4_single_path_route() {
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
     assert_eq!(result.load_balance(), Some(load_balance));
-    assert_eq!(result.dpo.kind(), DpoType::Adjacency);
+    assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -232,7 +231,7 @@ fn fib_snapshot_builder_adds_ip6_single_path_route() {
     let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
     assert_eq!(result.load_balance(), Some(load_balance));
-    assert_eq!(result.dpo.kind(), DpoType::Adjacency);
+    assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -250,7 +249,7 @@ fn fib_snapshot_builder_adds_generic_single_path_route() {
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
     assert_eq!(result.load_balance(), Some(load_balance));
-    assert_eq!(result.dpo.kind(), DpoType::Adjacency);
+    assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -269,7 +268,7 @@ fn fib_snapshot_builder_adds_ip4_receive_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -287,7 +286,7 @@ fn fib_snapshot_builder_adds_ip6_receive_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
@@ -307,7 +306,7 @@ fn fib_snapshot_builder_adds_generic_receive_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -326,7 +325,7 @@ fn fib_snapshot_builder_adds_ip4_punt_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Punt);
+    assert_eq!(result.dpo.kind(), DpoType::PUNT);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -344,7 +343,7 @@ fn fib_snapshot_builder_adds_ip6_punt_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Punt);
+    assert_eq!(result.dpo.kind(), DpoType::PUNT);
     assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
@@ -364,7 +363,7 @@ fn fib_snapshot_builder_adds_generic_punt_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Punt);
+    assert_eq!(result.dpo.kind(), DpoType::PUNT);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -381,7 +380,7 @@ fn fib_snapshot_builder_adds_ip4_drop_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.kind(), DpoType::DROP);
     assert_eq!(result.dpo.next(), NextHop::Drop);
 }
 
@@ -396,7 +395,7 @@ fn fib_snapshot_builder_adds_ip6_drop_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.kind(), DpoType::DROP);
     assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Drop);
 }
@@ -415,7 +414,7 @@ fn fib_snapshot_builder_adds_generic_drop_route() {
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.kind(), DpoType::DROP);
     assert_eq!(result.dpo.next(), NextHop::Drop);
 }
 
@@ -423,7 +422,7 @@ fn fib_snapshot_builder_adds_generic_drop_route() {
 fn dpo_receive_has_no_adjacency_index() {
     let dpo = Dpo::receive(DpoProto::IP4, NextHop::Direct);
 
-    assert_eq!(dpo.kind(), DpoType::Receive);
+    assert_eq!(dpo.kind(), DpoType::RECEIVE);
     assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.adjacency_index(), None);
@@ -434,7 +433,7 @@ fn dpo_adjacency_carries_typed_adjacency_index() {
     let adjacency = AdjacencyIndex::new(7);
     let dpo = Dpo::adjacency(DpoProto::IP6, adjacency, NextHop::Direct);
 
-    assert_eq!(dpo.kind(), DpoType::Adjacency);
+    assert_eq!(dpo.kind(), DpoType::ADJACENCY);
     assert_eq!(dpo.proto(), DpoProto::IP6);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.adjacency_index(), Some(adjacency));
@@ -447,17 +446,16 @@ fn dpo_keeps_compact_hot_path_layout_for_u32_next() {
 }
 
 #[test]
-fn dpo_custom_carries_custom_type_index_and_next() {
-    let custom_type = CustomDpoType::new(42).expect("custom type");
-    let custom_index = CustomDpoIndex::new(9001);
-    let dpo = Dpo::custom(DpoProto::IP6, custom_type, custom_index, NextHop::Direct);
+fn dpo_registered_type_carries_type_index_and_next() {
+    let dpo_type = DpoType::new(42);
+    let dpo = Dpo::new(DpoProto::IP6, dpo_type, 9001, NextHop::Direct);
 
-    assert_eq!(dpo.kind(), DpoType::Custom);
+    assert_eq!(dpo.kind(), dpo_type);
     assert_eq!(dpo.proto(), DpoProto::IP6);
     assert_eq!(dpo.next(), NextHop::Direct);
-    assert_eq!(dpo.custom_type(), Some(custom_type));
-    assert_eq!(dpo.custom_index(), Some(custom_index));
-    assert_eq!(dpo.forwarding_index(), custom_index.get());
+    assert_eq!(dpo.adjacency_index(), None);
+    assert_eq!(dpo.load_balance_index(), None);
+    assert_eq!(dpo.forwarding_index(), 9001);
 }
 
 #[test]
@@ -465,56 +463,46 @@ fn dpo_load_balance_carries_typed_load_balance_index() {
     let load_balance = hammer_core::forwarding::LoadBalanceIndex::new(5);
     let dpo = Dpo::load_balance(DpoProto::IP4, load_balance, NextHop::Direct);
 
-    assert_eq!(dpo.kind(), DpoType::LoadBalance);
+    assert_eq!(dpo.kind(), DpoType::LOAD_BALANCE);
     assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.load_balance_index(), Some(load_balance));
     assert_eq!(dpo.forwarding_index(), load_balance.get());
-    assert_eq!(
-        dpo.class(),
-        DpoClass::builtin(DpoType::LoadBalance).expect("load-balance class")
-    );
+    assert_eq!(dpo.class(), DpoType::LOAD_BALANCE);
 }
 
 #[test]
-fn custom_dpo_registry_allocates_unique_nonzero_types() {
-    let mut registry = CustomDpoRegistry::new();
+fn dpo_type_registry_allocates_unique_registered_types() {
+    let mut registry = DpoTypeRegistry::new();
 
-    let first = registry.register().expect("first custom dpo type");
-    let second = registry.register().expect("second custom dpo type");
+    let first = registry.register().expect("first registered dpo type");
+    let second = registry.register().expect("second registered dpo type");
 
     assert_ne!(first, second);
-    assert_ne!(first.get(), 0);
-    assert_ne!(second.get(), 0);
+    assert!(first.get() >= DpoType::FIRST_REGISTERED);
+    assert!(second.get() >= DpoType::FIRST_REGISTERED);
+    assert!(!first.is_builtin());
+    assert!(!second.is_builtin());
 }
 
 #[test]
 fn dpo_stack_preserves_parent_identity_and_updates_next() {
-    let custom_type = CustomDpoType::new(9).expect("custom type");
-    let custom_index = CustomDpoIndex::new(17);
-    let parent = Dpo::custom(DpoProto::IP4, custom_type, custom_index, NextHop::Drop);
+    let dpo_type = DpoType::new(9);
+    let parent = Dpo::new(DpoProto::IP4, dpo_type, 17, NextHop::Drop);
     let stacked = Dpo::stack(parent, NextHop::Direct);
 
-    assert_eq!(stacked.kind(), DpoType::Custom);
+    assert_eq!(stacked.kind(), dpo_type);
     assert_eq!(stacked.proto(), DpoProto::IP4);
-    assert_eq!(stacked.custom_type(), Some(custom_type));
-    assert_eq!(stacked.custom_index(), Some(custom_index));
-    assert_eq!(stacked.forwarding_index(), custom_index.get());
+    assert_eq!(stacked.forwarding_index(), 17);
     assert_eq!(stacked.next(), NextHop::Direct);
 }
 
 #[test]
 fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
-    let mut custom_registry = CustomDpoRegistry::new();
-    let child_type = custom_registry.register().expect("child custom type");
-    let parent_type = custom_registry.register().expect("parent custom type");
-    let child = DpoClass::custom(child_type);
-    let parent = Dpo::custom(
-        DpoProto::IP4,
-        parent_type,
-        CustomDpoIndex::new(23),
-        NextHop::Drop,
-    );
+    let mut type_registry = DpoTypeRegistry::new();
+    let child = type_registry.register().expect("child registered type");
+    let parent_type = type_registry.register().expect("parent registered type");
+    let parent = Dpo::new(DpoProto::IP4, parent_type, 23, NextHop::Drop);
     let mut stack_registry = DpoStackRegistry::new();
     stack_registry.register(child, parent.class(), DpoProto::IP4, NextHop::Direct);
 
@@ -523,13 +511,13 @@ fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
         .expect("registered stack edge");
 
     assert_eq!(stacked.class(), parent.class());
-    assert_eq!(stacked.custom_index(), parent.custom_index());
+    assert_eq!(stacked.forwarding_index(), parent.forwarding_index());
     assert_eq!(stacked.next(), NextHop::Direct);
 }
 
 #[test]
 fn dpo_stack_registry_rejects_missing_stack_edge() {
-    let child = DpoClass::builtin(DpoType::Receive).expect("receive class");
+    let child = DpoType::RECEIVE;
     let parent = Dpo::receive(DpoProto::IP6, NextHop::Drop);
     let stack_registry = DpoStackRegistry::<NextHop>::new();
 
@@ -573,11 +561,11 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
     let result = snapshot
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 40), 0)
         .expect("lookup result");
-    assert_eq!(result.route_dpo.kind(), DpoType::LoadBalance);
+    assert_eq!(result.route_dpo.kind(), DpoType::LOAD_BALANCE);
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
     assert_eq!(result.load_balance(), Some(load_balance));
     assert_eq!(result.bucket_index(), Some(0));
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
 }
 
 #[test]
@@ -606,7 +594,7 @@ fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
     assert_eq!(result.route_dpo.load_balance_index(), Some(outer));
     assert_eq!(result.load_balance(), Some(inner));
     assert_eq!(result.bucket_index(), Some(1));
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -627,16 +615,16 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
     let result = snapshot
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 50), 0)
         .expect("lookup result");
-    assert_eq!(result.route_dpo.kind(), DpoType::Receive);
+    assert_eq!(result.route_dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 
     let result = snapshot
         .lookup_ip6(ip6_destination, 0)
         .expect("lookup result");
-    assert_eq!(result.route_dpo.kind(), DpoType::Receive);
+    assert_eq!(result.route_dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.route_dpo.proto(), DpoProto::IP6);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
@@ -655,10 +643,10 @@ fn fib_snapshot_adds_dpo_backed_fib_entry() {
     let result = snapshot
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 60), 0)
         .expect("lookup result");
-    assert_eq!(result.route_dpo.kind(), DpoType::Punt);
+    assert_eq!(result.route_dpo.kind(), DpoType::PUNT);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
-    assert_eq!(result.dpo.kind(), DpoType::Punt);
+    assert_eq!(result.dpo.kind(), DpoType::PUNT);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 

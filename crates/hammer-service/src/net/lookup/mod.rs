@@ -4,8 +4,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingDpoType, ForwardingMetadata, InternalNode, Network, Node, NodeId,
-    NodeNextVectorEnqueue, NodeResult, RouteMetadata,
+    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextVectorEnqueue, NodeResult,
+    RouteMetadata,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -14,8 +14,8 @@ use hammer_core::forwarding::{
     FibSnapshotBuilder as CoreFibSnapshotBuilder, LoadBalance as CoreLoadBalance,
 };
 pub use hammer_core::forwarding::{
-    AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoProto, DpoStackRegistry,
-    DpoType, FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
+    AdjacencyIndex, Dpo, DpoClass, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
+    FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
@@ -148,11 +148,11 @@ impl IpLookupNode {
             .unwrap_or_else(|| FibLookupResult::terminal(snapshot.drop_dpo(parsed.version)));
         buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
             fib_index: 0,
-            route_dpo_type: forwarding_dpo_type(result.route_dpo),
+            route_dpo_type: result.route_dpo.kind(),
             route_dpo_index: result.route_dpo.forwarding_index(),
             load_balance_index: result.forwarding_load_balance_index(),
             bucket_index: result.forwarding_bucket_index(),
-            dpo_type: forwarding_dpo_type(result.dpo),
+            dpo_type: result.dpo.kind(),
             dpo_index: result.dpo.forwarding_index(),
         });
         Ok(result.dpo.next())
@@ -268,22 +268,6 @@ impl<G> Node<G> for IpLookupNode {
 }
 
 impl<G> InternalNode<G> for IpLookupNode {}
-
-#[inline(always)]
-fn forwarding_dpo_type(dpo: DpoId) -> ForwardingDpoType {
-    match dpo.kind() {
-        DpoType::Drop => ForwardingDpoType::Drop,
-        DpoType::Punt => ForwardingDpoType::Punt,
-        DpoType::Adjacency => ForwardingDpoType::Adjacency,
-        DpoType::Receive => ForwardingDpoType::Receive,
-        DpoType::Custom => ForwardingDpoType::Custom(
-            dpo.custom_type()
-                .map(CustomDpoType::get)
-                .unwrap_or_default(),
-        ),
-        DpoType::LoadBalance => ForwardingDpoType::LoadBalance,
-    }
-}
 
 #[inline(always)]
 fn frame_batch_width<G>(runtime: &DataPlaneRuntime<G>) -> usize {

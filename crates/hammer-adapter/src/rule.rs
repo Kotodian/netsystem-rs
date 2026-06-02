@@ -3,6 +3,7 @@
 
 pub use hammer_core::SocksAddr;
 use hammer_core::config::{DomainStrategy, RuleActionKind};
+use hammer_core::forwarding::DpoType;
 
 use crate::Network;
 
@@ -33,15 +34,7 @@ pub struct ForwardingMetadata {
     pub dpo_index: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForwardingDpoType {
-    Drop,
-    Punt,
-    Adjacency,
-    Receive,
-    Custom(u16),
-    LoadBalance,
-}
+pub type ForwardingDpoType = DpoType;
 
 /// Where a `RouteDecision::Route` points. Outbounds and endpoints live in
 /// parallel namespaces with different data paths — L4 stream (`dial /
