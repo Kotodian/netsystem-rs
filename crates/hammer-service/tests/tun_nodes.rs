@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
+use std::vec::Vec as StdVec;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteMetadata,
@@ -8,19 +9,27 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
+use hammer_service::data_plane::{FeatureArcControl, FeatureArcStartNode, next_feature_frame};
 use hammer_service::net::{
-    DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane,
-    IpLookupNode,
+    DpoId, DpoProto, FibSnapshotBuilder, IpInputControlPlane, IpInputNext, IpInputNode,
+    IpLookupControlPlane, IpLookupNode, IpUnicastArc,
 };
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 use ipnet::Ipv4Net;
 
-struct CaptureNode {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FeatureVisit {
+    name: &'static str,
+    config: Option<StdVec<u8>>,
+    ingress_interface: Option<u32>,
+}
+
+struct ForwardCaptureNode {
     next: NodeId,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
 }
 
-impl Node<TestNode> for CaptureNode {
+impl Node<TestNode> for ForwardCaptureNode {
     #[inline(always)]
     fn process(
         &mut self,
@@ -34,12 +43,93 @@ impl Node<TestNode> for CaptureNode {
     }
 }
 
-impl InternalNode<TestNode> for CaptureNode {}
+impl InternalNode<TestNode> for ForwardCaptureNode {}
+
+#[hammer_component_macros::feature(arc = IpUnicastArc, name = "tun-feature")]
+struct CaptureFeatureNode {
+    metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+}
+
+impl Node<TestNode> for CaptureFeatureNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.pending_indices().iter().copied() {
+            self.metadata.borrow_mut().push(runtime.metadata(index)?);
+        }
+        next_feature_frame(runtime, frame)
+    }
+}
+
+impl InternalNode<TestNode> for CaptureFeatureNode {}
+
+#[hammer_component_macros::feature(
+    arc = IpUnicastArc,
+    name = "alpha-feature",
+    runs_before = ["beta-feature"]
+)]
+struct AlphaFeatureNode {
+    visits: Rc<RefCell<StdVec<FeatureVisit>>>,
+}
+
+impl Node<TestNode> for AlphaFeatureNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.pending_indices().iter().copied() {
+            let metadata = runtime.metadata(index)?;
+            self.visits.borrow_mut().push(FeatureVisit {
+                name: "alpha",
+                config: metadata.feature_config.clone(),
+                ingress_interface: metadata.ingress_interface,
+            });
+        }
+        next_feature_frame(runtime, frame)
+    }
+}
+
+impl InternalNode<TestNode> for AlphaFeatureNode {}
+
+#[hammer_component_macros::feature(arc = IpUnicastArc, name = "beta-feature")]
+struct BetaFeatureNode {
+    visits: Rc<RefCell<StdVec<FeatureVisit>>>,
+}
+
+impl Node<TestNode> for BetaFeatureNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.pending_indices().iter().copied() {
+            let metadata = runtime.metadata(index)?;
+            self.visits.borrow_mut().push(FeatureVisit {
+                name: "beta",
+                config: metadata.feature_config.clone(),
+                ingress_interface: metadata.ingress_interface,
+            });
+        }
+        next_feature_frame(runtime, frame)
+    }
+}
+
+impl InternalNode<TestNode> for BetaFeatureNode {}
 
 enum TestNode {
     TunInput(TunInputDriverNode<hammer_service::tun::MemoryTunInput>),
     IpInput(IpInputNode),
-    Capture(CaptureNode),
+    ForwardCapture(ForwardCaptureNode),
+    CaptureFeature(CaptureFeatureNode),
+    AlphaFeature(AlphaFeatureNode),
+    BetaFeature(BetaFeatureNode),
+    FeatureStart(FeatureArcStartNode<IpUnicastArc>),
     IpLookup(IpLookupNode),
     TunOutputDriver(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
 }
@@ -56,9 +146,33 @@ impl From<IpInputNode> for TestNode {
     }
 }
 
-impl From<CaptureNode> for TestNode {
-    fn from(node: CaptureNode) -> Self {
-        Self::Capture(node)
+impl From<ForwardCaptureNode> for TestNode {
+    fn from(node: ForwardCaptureNode) -> Self {
+        Self::ForwardCapture(node)
+    }
+}
+
+impl From<CaptureFeatureNode> for TestNode {
+    fn from(node: CaptureFeatureNode) -> Self {
+        Self::CaptureFeature(node)
+    }
+}
+
+impl From<AlphaFeatureNode> for TestNode {
+    fn from(node: AlphaFeatureNode) -> Self {
+        Self::AlphaFeature(node)
+    }
+}
+
+impl From<BetaFeatureNode> for TestNode {
+    fn from(node: BetaFeatureNode) -> Self {
+        Self::BetaFeature(node)
+    }
+}
+
+impl From<FeatureArcStartNode<IpUnicastArc>> for TestNode {
+    fn from(node: FeatureArcStartNode<IpUnicastArc>) -> Self {
+        Self::FeatureStart(node)
     }
 }
 
@@ -84,7 +198,11 @@ impl Node<TestNode> for TestNode {
         match self {
             Self::TunInput(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
-            Self::Capture(node) => node.process(runtime, frame),
+            Self::ForwardCapture(node) => node.process(runtime, frame),
+            Self::CaptureFeature(node) => node.process(runtime, frame),
+            Self::AlphaFeature(node) => node.process(runtime, frame),
+            Self::BetaFeature(node) => node.process(runtime, frame),
+            Self::FeatureStart(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
             Self::TunOutputDriver(node) => node.process(runtime, frame),
         }
@@ -108,7 +226,7 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
     let captured = Rc::new(RefCell::new(Vec::new()));
-    let capture = runtime.nodes().register_internal(CaptureNode {
+    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
         next: output,
         metadata: Rc::clone(&captured),
     });
@@ -117,10 +235,9 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         .register_internal(IpInputNode::new(IpInputNext::nodes(
             capture, capture, capture, capture, capture, capture, capture,
         )));
-    let driver =
-        runtime
-            .nodes()
-            .register_driver(TunInputDriverNode::new(device.input(), "tun0", ip_input));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(42),
+    );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     runtime
@@ -133,6 +250,7 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     assert_eq!(captured.borrow().len(), 3);
     let metadata = &captured.borrow()[0];
     assert_eq!(metadata.inbound, "tun0");
+    assert_eq!(metadata.ingress_interface, Some(42));
     assert_eq!(metadata.network, Network::Udp);
     assert_eq!(
         metadata.source,
@@ -174,24 +292,225 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let ip_input = runtime
+    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    let feature_metadata = Rc::new(RefCell::new(Vec::new()));
+    let feature = runtime.nodes().register_internal(CaptureFeatureNode {
+        metadata: Rc::clone(&feature_metadata),
+    });
+    unicast_features
+        .register_feature::<CaptureFeatureNode>(feature)
+        .expect("register feature");
+    unicast_features
+        .enable_feature::<CaptureFeatureNode>(7)
+        .expect("enable feature");
+    let feature_start = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
-            output, output, output, lookup, output, output, output,
-        )));
-    let driver =
-        runtime
-            .nodes()
-            .register_driver(TunInputDriverNode::new(device.input(), "tun0", ip_input));
+        .register_internal(FeatureArcStartNode::new(unicast_features.arc(), lookup));
+    let input_control = IpInputControlPlane::new(IpInputNext::nodes(
+        output,
+        output,
+        output,
+        feature_start,
+        output,
+        output,
+        output,
+    ));
+    let ip_input = runtime.nodes().register_internal(input_control.node());
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(7),
+    );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 
     runtime
         .schedule_driver_frame(driver, frame)
         .expect("schedule tun driver");
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
     assert_eq!(device.drain_output_batch_sizes(), vec![2]);
     assert_eq!(device.drain_output(), packets);
+    assert_eq!(feature_metadata.borrow().len(), 2);
+    assert_eq!(feature_metadata.borrow()[0].ingress_interface, Some(7));
+    assert_eq!(feature_metadata.borrow()[1].ingress_interface, Some(7));
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
+    let input_device = MemoryTunDevice::new();
+    let default_output_device = MemoryTunDevice::new();
+    let override_output_device = MemoryTunDevice::new();
+
+    let default_output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(default_output_device.output()));
+    let override_output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(override_output_device.output()));
+    let feature_metadata = Rc::new(RefCell::new(Vec::new()));
+    let feature = runtime.nodes().register_internal(CaptureFeatureNode {
+        metadata: Rc::clone(&feature_metadata),
+    });
+    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    unicast_features
+        .register_feature::<CaptureFeatureNode>(feature)
+        .expect("register feature");
+    unicast_features
+        .set_end_node_for_interface(7, override_output)
+        .expect("set end node");
+    let feature_start = runtime.nodes().register_internal(FeatureArcStartNode::new(
+        unicast_features.arc(),
+        default_output,
+    ));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            default_output,
+            default_output,
+            default_output,
+            feature_start,
+            default_output,
+            default_output,
+            default_output,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(input_device.input(), "tun0", ip_input).with_interface_index(7),
+    );
+
+    let packet_without_feature =
+        ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"off");
+    input_device
+        .inject(packet_without_feature.clone())
+        .expect("inject disabled packet");
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule disabled packet");
+    assert_eq!(runtime.run_ready_nodes().expect("run disabled packet"), 4);
+    assert!(feature_metadata.borrow().is_empty());
+    assert!(default_output_device.drain_output().is_empty());
+    assert_eq!(
+        override_output_device.drain_output(),
+        vec![packet_without_feature]
+    );
+
+    unicast_features
+        .enable_feature::<CaptureFeatureNode>(7)
+        .expect("enable feature");
+    let packet_with_feature = ipv4_udp_packet([10, 0, 0, 3], 12_346, [203, 0, 113, 10], 443, b"on");
+    input_device
+        .inject(packet_with_feature.clone())
+        .expect("inject enabled packet");
+    let frame = runtime.alloc_frame_index().expect("alloc second frame");
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule enabled packet");
+    assert_eq!(runtime.run_ready_nodes().expect("run enabled packet"), 5);
+    assert_eq!(feature_metadata.borrow().len(), 1);
+    assert_eq!(feature_metadata.borrow()[0].ingress_interface, Some(7));
+    assert!(default_output_device.drain_output().is_empty());
+    assert_eq!(
+        override_output_device.drain_output(),
+        vec![packet_with_feature]
+    );
+
+    unicast_features
+        .disable_feature::<CaptureFeatureNode>(7)
+        .expect("disable feature");
+    let packet_after_disable =
+        ipv4_udp_packet([10, 0, 0, 4], 12_347, [203, 0, 113, 11], 443, b"off-again");
+    input_device
+        .inject(packet_after_disable.clone())
+        .expect("inject re-disabled packet");
+    let frame = runtime.alloc_frame_index().expect("alloc third frame");
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule re-disabled packet");
+    assert_eq!(
+        runtime.run_ready_nodes().expect("run re-disabled packet"),
+        4
+    );
+    assert_eq!(feature_metadata.borrow().len(), 1);
+    assert!(default_output_device.drain_output().is_empty());
+    assert_eq!(
+        override_output_device.drain_output(),
+        vec![packet_after_disable]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
+    let device = MemoryTunDevice::new();
+    let packet = ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"ordered");
+    device.inject(packet.clone()).expect("inject packet");
+
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let visits = Rc::new(RefCell::new(StdVec::new()));
+    let beta = runtime.nodes().register_internal(BetaFeatureNode {
+        visits: Rc::clone(&visits),
+    });
+    let alpha = runtime.nodes().register_internal(AlphaFeatureNode {
+        visits: Rc::clone(&visits),
+    });
+    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    unicast_features
+        .register_feature::<BetaFeatureNode>(beta)
+        .expect("register beta");
+    unicast_features
+        .register_feature::<AlphaFeatureNode>(alpha)
+        .expect("register alpha");
+    unicast_features
+        .enable_feature_with_config::<BetaFeatureNode>(7, b"beta-config".to_vec())
+        .expect("enable beta");
+    unicast_features
+        .enable_feature_with_config::<AlphaFeatureNode>(7, b"alpha-config".to_vec())
+        .expect("enable alpha");
+    let feature_start = runtime
+        .nodes()
+        .register_internal(FeatureArcStartNode::new(unicast_features.arc(), output));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            output,
+            output,
+            output,
+            feature_start,
+            output,
+            output,
+            output,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(7),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tun driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
+    assert_eq!(device.drain_output(), vec![packet]);
+    assert_eq!(
+        *visits.borrow(),
+        vec![
+            FeatureVisit {
+                name: "alpha",
+                config: Some(b"alpha-config".to_vec()),
+                ingress_interface: Some(7),
+            },
+            FeatureVisit {
+                name: "beta",
+                config: Some(b"beta-config".to_vec()),
+                ingress_interface: Some(7),
+            },
+        ]
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

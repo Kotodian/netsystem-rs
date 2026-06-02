@@ -1234,6 +1234,7 @@ async fn route_tcp(
         udp_disable_domain_unmapping: false,
         override_destination: false,
         route_decision: None,
+        ..Default::default()
     };
     router.prepare_route_metadata(&mut metadata)?;
     let decision = router.match_route(&mut metadata)?;
@@ -1282,6 +1283,7 @@ fn udp_route_metadata(
         udp_disable_domain_unmapping: false,
         override_destination: false,
         route_decision: None,
+        ..Default::default()
     }
 }
 

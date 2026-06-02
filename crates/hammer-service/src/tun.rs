@@ -33,6 +33,7 @@ pub trait TunPacketSink {
 pub struct TunInputDriverNode<I> {
     input: I,
     interface_id: String,
+    interface_index: Option<u32>,
     next: NodeId,
     max_batch: usize,
 }
@@ -43,9 +44,16 @@ impl<I> TunInputDriverNode<I> {
         Self {
             input,
             interface_id: interface_id.into(),
+            interface_index: None,
             next,
             max_batch: DEFAULT_TUN_RECV_BATCH,
         }
+    }
+
+    #[inline]
+    pub fn with_interface_index(mut self, interface_index: u32) -> Self {
+        self.interface_index = Some(interface_index);
+        self
     }
 
     #[inline]
@@ -66,8 +74,17 @@ where
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let max_batch = self.max_batch.min(frame.remaining_capacity());
+        let first_new = frame.pending_len();
         self.input
             .recv_frame(runtime, frame, &self.interface_id, max_batch)?;
+        if let Some(interface_index) = self.interface_index {
+            for index in frame.pending_indices()[first_new..].iter().copied() {
+                runtime
+                    .get_buffer_mut(index)?
+                    .metadata_mut()
+                    .ingress_interface = Some(interface_index);
+            }
+        }
         if frame.has_pending() {
             Ok(NodeResult::next_current(self.next))
         } else {

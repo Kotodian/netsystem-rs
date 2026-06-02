@@ -1,4 +1,5 @@
 pub mod input;
+pub mod local;
 pub mod reassembly;
 
 pub use hammer_core::protocol::ip::{
@@ -6,7 +7,11 @@ pub use hammer_core::protocol::ip::{
     ParsedIpPacket, parse_ip_fragment, parse_ip_fragment_with_chain_len, parse_ip_packet,
     parse_ip_packet_with_chain_len,
 };
-pub use input::{IpInputNext, IpInputNode};
+pub use input::{IpInputControlPlane, IpInputNext, IpInputNode, IpUnicastArc};
+pub use local::{
+    IpLocalArc, IpLocalControlPlane, IpLocalEndOfArcNode, IpLocalError, IpLocalNext, IpLocalNode,
+    IpLocalSourceCheck,
+};
 pub use reassembly::{
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
 };

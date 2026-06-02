@@ -3,8 +3,8 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Error, ExprPath, Fields, Ident, Item, ItemEnum, LitStr, Result, Token, Type, parenthesized,
-    parse_macro_input, spanned::Spanned,
+    Error, ExprPath, Fields, Ident, Item, ItemEnum, LitStr, Result, Token, Type, bracketed,
+    parenthesized, parse_macro_input, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -92,6 +92,103 @@ struct ComponentArgs {
     dependencies: Option<Ident>,
     metrics: Option<(LitStr, LitStr)>,
     runtime: Option<Type>,
+}
+
+struct FeatureArcArgs {
+    name: LitStr,
+}
+
+impl Parse for FeatureArcArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let key: Ident = input.parse()?;
+        input.parse::<Token![=]>()?;
+        if key != "name" {
+            return Err(Error::new(key.span(), "expected `name` argument"));
+        }
+        let name = input.parse()?;
+        if input.parse::<Option<Token![,]>>()?.is_some() && !input.is_empty() {
+            return Err(Error::new(input.span(), "unexpected feature arc argument"));
+        }
+        Ok(Self { name })
+    }
+}
+
+struct FeatureArgs {
+    arc: Type,
+    name: LitStr,
+    runs_before: Vec<LitStr>,
+    runs_after: Vec<LitStr>,
+}
+
+impl Parse for FeatureArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut arc = None;
+        let mut name = None;
+        let mut runs_before = Vec::new();
+        let mut runs_after = Vec::new();
+
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "arc" => {
+                    if arc.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `arc` argument"));
+                    }
+                    arc = Some(input.parse()?);
+                }
+                "name" => {
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    name = Some(input.parse()?);
+                }
+                "runs_before" => {
+                    if !runs_before.is_empty() {
+                        return Err(Error::new(key.span(), "duplicate `runs_before` argument"));
+                    }
+                    runs_before = parse_lit_str_array(input)?;
+                }
+                "runs_after" => {
+                    if !runs_after.is_empty() {
+                        return Err(Error::new(key.span(), "duplicate `runs_after` argument"));
+                    }
+                    runs_after = parse_lit_str_array(input)?;
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown argument `{other}`; expected `arc`, `name`, `runs_before`, or `runs_after`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+
+        Ok(Self {
+            arc: arc.ok_or_else(|| Error::new(Span::call_site(), "missing `arc` argument"))?,
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?,
+            runs_before,
+            runs_after,
+        })
+    }
+}
+
+fn parse_lit_str_array(input: ParseStream<'_>) -> Result<Vec<LitStr>> {
+    let content;
+    bracketed!(content in input);
+    let mut values = Vec::new();
+    while !content.is_empty() {
+        values.push(content.parse()?);
+        if content.parse::<Option<Token![,]>>()?.is_none() {
+            break;
+        }
+    }
+    Ok(values)
 }
 
 impl Parse for ComponentArgs {
@@ -420,6 +517,121 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
         }
 
         #declaration_impl
+    }
+    .into()
+}
+
+/// Marks a dataplane feature arc marker type.
+///
+/// Example:
+///
+/// ```ignore
+/// #[hammer_component_macros::feature_arc(name = "ip-unicast")]
+/// pub struct IpUnicastArc;
+/// ```
+#[proc_macro_attribute]
+pub fn feature_arc(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as FeatureArcArgs);
+    let item = parse_macro_input!(input as Item);
+
+    let ident = match &item {
+        Item::Struct(item) => &item.ident,
+        Item::Enum(item) => &item.ident,
+        _ => {
+            return Error::new(
+                item.span(),
+                "`feature_arc` can only be attached to a struct or enum",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let generics = match &item {
+        Item::Struct(item) => &item.generics,
+        Item::Enum(item) => &item.generics,
+        _ => unreachable!(),
+    };
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let name = args.name;
+
+    quote! {
+        #item
+
+        impl #impl_generics ::hammer_service::data_plane::FeatureArcSpec
+            for #ident #ty_generics #where_clause
+        {
+            const NAME: &'static str = #name;
+        }
+    }
+    .into()
+}
+
+/// Marks a dataplane node type as a feature in a specific feature arc.
+///
+/// Example:
+///
+/// ```ignore
+/// #[hammer_component_macros::feature(arc = IpUnicastArc, name = "acl-input")]
+/// pub struct AclInputNode { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as FeatureArgs);
+    let item = parse_macro_input!(input as Item);
+
+    let ident = match &item {
+        Item::Struct(item) => &item.ident,
+        Item::Enum(item) => &item.ident,
+        _ => {
+            return Error::new(
+                item.span(),
+                "`feature` can only be attached to a struct or enum",
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+    let generics = match &item {
+        Item::Struct(item) => &item.generics,
+        Item::Enum(item) => &item.generics,
+        _ => unreachable!(),
+    };
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let arc = args.arc;
+    let name = args.name;
+    let runs_before = args.runs_before;
+    let runs_after = args.runs_after;
+    let before_order = if runs_before.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            let order = order.with_runs_before([#(#runs_before),*]);
+        }
+    };
+    let after_order = if runs_after.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            let order = order.with_runs_after([#(#runs_after),*]);
+        }
+    };
+
+    quote! {
+        #item
+
+        impl #impl_generics ::hammer_service::data_plane::Feature<#arc>
+            for #ident #ty_generics #where_clause
+        {
+            const NAME: &'static str = #name;
+
+            #[inline]
+            fn order() -> ::hammer_service::data_plane::FeatureArcOrder {
+                let order = ::hammer_service::data_plane::FeatureArcOrder::new();
+                #before_order
+                #after_order
+                order
+            }
+        }
     }
     .into()
 }

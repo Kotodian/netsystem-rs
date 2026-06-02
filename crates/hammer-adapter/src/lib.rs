@@ -62,7 +62,7 @@ pub use platform::{
 pub use probe::{ProbeProtocol, ProbeProtocolComponent, ProbeReport};
 pub use router::Router;
 pub use rule::{
-    ForwardingDpoType, ForwardingMetadata, HeadlessRule, RouteDecision, RouteMetadata, RouteTarget,
-    Rule, SocksAddr,
+    FeaturePathEntry, ForwardingDpoType, ForwardingMetadata, HeadlessRule, RouteDecision,
+    RouteMetadata, RouteTarget, Rule, SocksAddr,
 };
 pub use service::ServiceManager;

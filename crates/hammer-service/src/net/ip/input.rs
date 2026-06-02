@@ -6,6 +6,9 @@ use hammer_core::error::CoreResult;
 
 use crate::net::ip::{IpInputError, IpInputTarget, IpProtocol, parse_ip_packet_with_chain_len};
 
+#[hammer_component_macros::feature_arc(name = "ip-unicast")]
+pub struct IpUnicastArc;
+
 #[hammer_component_macros::node_next]
 pub enum IpInputNext {
     Drop,
@@ -15,6 +18,22 @@ pub enum IpInputNext {
     LookupMulticast,
     IcmpError,
     Reassembly,
+}
+
+pub struct IpInputControlPlane {
+    next: [NodeId; IpInputNext::COUNT],
+}
+
+impl IpInputControlPlane {
+    #[inline]
+    pub fn new(next: [NodeId; IpInputNext::COUNT]) -> Self {
+        Self { next }
+    }
+
+    #[inline]
+    pub fn node(&self) -> IpInputNode {
+        IpInputNode::new(self.next)
+    }
 }
 
 pub struct IpInputNode {
@@ -38,9 +57,10 @@ impl<G> Node<G> for IpInputNode {
         let Some(first) = frame.pending_indices().first().copied() else {
             return Ok(NodeResult::drop());
         };
+        let next = self.next;
         let speculative = {
             let mut batch = runtime.buffer_batch_mut();
-            next_node_for_index_with_batch(runtime, &mut batch, first, self.next)?
+            next_node_for_index_with_batch(runtime, &mut batch, first, next)?
         };
         let mut first_chunk = true;
         NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
@@ -65,7 +85,7 @@ impl<G> Node<G> for IpInputNode {
                     indices,
                     nexts,
                     start_offset,
-                    self.next,
+                    next,
                 )
             },
         )

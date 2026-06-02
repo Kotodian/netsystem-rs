@@ -5,11 +5,55 @@ pub use hammer_core::SocksAddr;
 use hammer_core::config::{DomainStrategy, RuleActionKind};
 use hammer_core::forwarding::DpoType;
 
-use crate::Network;
+use crate::{Network, NodeId};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeaturePathEntry {
+    node: NodeId,
+    config: Option<Vec<u8>>,
+}
+
+impl FeaturePathEntry {
+    #[inline]
+    pub fn new(node: NodeId, config: Option<Vec<u8>>) -> Self {
+        Self { node, config }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeaturePathMetadata {
+    next_entries: Vec<FeaturePathEntry>,
+    cursor: usize,
+}
+
+impl FeaturePathMetadata {
+    #[inline]
+    pub fn new(next_entries: Vec<FeaturePathEntry>) -> Self {
+        Self {
+            next_entries,
+            cursor: 0,
+        }
+    }
+
+    #[inline]
+    pub fn pop_next(&mut self) -> Option<FeaturePathEntry> {
+        let next = self.next_entries.get(self.cursor).cloned()?;
+        self.cursor += 1;
+        Some(next)
+    }
+
+    #[inline]
+    pub fn is_exhausted(&self) -> bool {
+        self.cursor >= self.next_entries.len()
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouteMetadata {
     pub inbound: String,
+    pub ingress_interface: Option<u32>,
+    pub feature_path: Option<FeaturePathMetadata>,
+    pub feature_config: Option<Vec<u8>>,
     pub network: Network,
     pub protocol: String,
     pub source: Option<SocksAddr>,
@@ -21,6 +65,37 @@ pub struct RouteMetadata {
     pub override_destination: bool,
     pub route_decision: Option<RouteDecision>,
     pub forwarding: Option<ForwardingMetadata>,
+}
+
+impl RouteMetadata {
+    #[inline]
+    pub fn set_current_feature_config(&mut self, config: Option<Vec<u8>>) {
+        self.feature_config = config;
+    }
+
+    #[inline]
+    pub fn set_feature_path(&mut self, next_entries: Vec<FeaturePathEntry>) {
+        self.feature_path = Some(FeaturePathMetadata::new(next_entries));
+    }
+
+    #[inline]
+    pub fn clear_feature_path(&mut self) {
+        self.feature_path = None;
+        self.feature_config = None;
+    }
+
+    #[inline]
+    pub fn pop_feature_next(&mut self) -> Option<NodeId> {
+        let path = self.feature_path.as_mut()?;
+        let next = path.pop_next();
+        if path.is_exhausted() {
+            self.feature_path = None;
+        }
+        next.map(|entry| {
+            self.feature_config = entry.config;
+            entry.node
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

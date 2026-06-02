@@ -1,3 +1,5 @@
+extern crate self as hammer_service;
+
 mod component_registry;
 pub mod data_plane;
 pub mod dns;
