@@ -335,6 +335,28 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_ip4_single_path_route(&mut self, prefix: Ipv4Net, next: N) -> LoadBalanceIndex {
+        let load_balance = self.add_single_path_load_balance(IpVersion::V4, next);
+        self.add_ip4_route(prefix, load_balance);
+        load_balance
+    }
+
+    #[inline]
+    pub fn add_ip6_single_path_route(&mut self, prefix: Ipv6Net, next: N) -> LoadBalanceIndex {
+        let load_balance = self.add_single_path_load_balance(IpVersion::V6, next);
+        self.add_ip6_route(prefix, load_balance);
+        load_balance
+    }
+
+    #[inline]
+    pub fn add_single_path_route(&mut self, prefix: IpNet, next: N) -> LoadBalanceIndex {
+        match prefix {
+            IpNet::V4(prefix) => self.add_ip4_single_path_route(prefix, next),
+            IpNet::V6(prefix) => self.add_ip6_single_path_route(prefix, next),
+        }
+    }
+
+    #[inline]
     pub fn add_load_balance_dpo(
         &mut self,
         proto: IpVersion,
