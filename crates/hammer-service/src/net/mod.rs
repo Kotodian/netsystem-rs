@@ -3,9 +3,9 @@ mod lookup;
 mod route_metadata;
 
 pub use ip::{
-    IpInputControlPlane, IpInputError, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane,
-    IpLocalEndOfArcNode, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode, IpUnicastArc,
+    IpInputError, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane, IpLocalError,
+    IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpReassemblyDirectory, IpReassemblyHandoff,
+    IpReassemblyNext, IpReassemblyNode, IpReceiveNode, IpUnicastArc,
 };
 pub use lookup::{
     Adjacency, AdjacencyIndex, Dpo, DpoClass, DpoId, DpoProto, DpoStackRegistry, DpoType,

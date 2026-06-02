@@ -11,8 +11,8 @@ use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 use hammer_service::data_plane::{FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
-    DpoId, DpoProto, FibSnapshotBuilder, IpInputControlPlane, IpInputNext, IpInputNode,
-    IpLookupControlPlane, IpLookupNode, IpUnicastArc,
+    DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane,
+    IpLookupNode,
 };
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 use ipnet::Ipv4Net;
@@ -22,6 +22,14 @@ struct FeatureVisit {
     name: &'static str,
     config: Option<StdVec<u8>>,
     ingress_interface: Option<u32>,
+}
+
+#[hammer_component_macros::feature_arc]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TestIpUnicastArc {
+    TunFeature,
+    AlphaFeature,
+    BetaFeature,
 }
 
 struct ForwardCaptureNode {
@@ -45,7 +53,7 @@ impl Node<TestNode> for ForwardCaptureNode {
 
 impl InternalNode<TestNode> for ForwardCaptureNode {}
 
-#[hammer_component_macros::feature(arc = IpUnicastArc, id = TunFeature)]
+#[hammer_component_macros::feature(arc = TestIpUnicastArc, id = TunFeature)]
 struct CaptureFeatureNode {
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
 }
@@ -67,9 +75,9 @@ impl Node<TestNode> for CaptureFeatureNode {
 impl InternalNode<TestNode> for CaptureFeatureNode {}
 
 #[hammer_component_macros::feature(
-    arc = IpUnicastArc,
+    arc = TestIpUnicastArc,
     id = AlphaFeature,
-    after = [BetaFeature]
+    runs_before = [BetaFeature]
 )]
 struct AlphaFeatureNode {
     visits: Rc<RefCell<StdVec<FeatureVisit>>>,
@@ -97,9 +105,9 @@ impl Node<TestNode> for AlphaFeatureNode {
 impl InternalNode<TestNode> for AlphaFeatureNode {}
 
 #[hammer_component_macros::feature(
-    arc = IpUnicastArc,
+    arc = TestIpUnicastArc,
     id = BetaFeature,
-    before = [AlphaFeature]
+    runs_after = [AlphaFeature]
 )]
 struct BetaFeatureNode {
     visits: Rc<RefCell<StdVec<FeatureVisit>>>,
@@ -128,7 +136,7 @@ impl InternalNode<TestNode> for BetaFeatureNode {}
 
 enum TestNode {
     TunInput(TunInputDriverNode<hammer_service::tun::MemoryTunInput>),
-    IpInput(IpInputNode),
+    IpInput(IpInputNode<TestIpUnicastArc>),
     ForwardCapture(ForwardCaptureNode),
     CaptureFeature(CaptureFeatureNode),
     AlphaFeature(AlphaFeatureNode),
@@ -143,8 +151,8 @@ impl From<TunInputDriverNode<hammer_service::tun::MemoryTunInput>> for TestNode 
     }
 }
 
-impl From<IpInputNode> for TestNode {
-    fn from(node: IpInputNode) -> Self {
+impl From<IpInputNode<TestIpUnicastArc>> for TestNode {
+    fn from(node: IpInputNode<TestIpUnicastArc>) -> Self {
         Self::IpInput(node)
     }
 }
@@ -288,7 +296,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
     let feature_metadata = Rc::new(RefCell::new(Vec::new()));
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),
@@ -299,11 +307,11 @@ fn tun_driver_routes_through_service_internal_nodes() {
     unicast_features
         .enable_feature::<CaptureFeatureNode>(7)
         .expect("enable feature");
-    let mut input_control = IpInputControlPlane::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
         output, output, output, lookup, output, output, output,
     ));
-    input_control.set_feature_arc(unicast_features.arc());
-    let ip_input = runtime.nodes().register_internal(input_control.node());
+    unicast_features.attach_start(&mut ip_input_node);
+    let ip_input = runtime.nodes().register_internal(ip_input_node);
     let driver = runtime.nodes().register_driver(
         TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(7),
     );
@@ -340,14 +348,14 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),
     });
-    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
     unicast_features
         .register_feature::<CaptureFeatureNode>(feature)
         .expect("register feature");
     unicast_features
         .set_end_node_for_interface(7, override_output)
         .expect("set end node");
-    let mut input_control = IpInputControlPlane::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
         default_output,
         default_output,
         default_output,
@@ -356,8 +364,8 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
         default_output,
         default_output,
     ));
-    input_control.set_feature_arc(unicast_features.arc());
-    let ip_input = runtime.nodes().register_internal(input_control.node());
+    unicast_features.attach_start(&mut ip_input_node);
+    let ip_input = runtime.nodes().register_internal(ip_input_node);
     let driver = runtime.nodes().register_driver(
         TunInputDriverNode::new(input_device.input(), "tun0", ip_input).with_interface_index(7),
     );
@@ -442,7 +450,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     let alpha = runtime.nodes().register_internal(AlphaFeatureNode {
         visits: Rc::clone(&visits),
     });
-    let mut unicast_features = FeatureArcControl::<IpUnicastArc>::new();
+    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
     unicast_features
         .register_feature::<BetaFeatureNode>(beta)
         .expect("register beta");
@@ -455,11 +463,11 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     unicast_features
         .enable_feature_with_config::<AlphaFeatureNode>(7, b"alpha-config".to_vec())
         .expect("enable alpha");
-    let mut input_control = IpInputControlPlane::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
         output, output, output, output, output, output, output,
     ));
-    input_control.set_feature_arc(unicast_features.arc());
-    let ip_input = runtime.nodes().register_internal(input_control.node());
+    unicast_features.attach_start(&mut ip_input_node);
+    let ip_input = runtime.nodes().register_internal(ip_input_node);
     let driver = runtime.nodes().register_driver(
         TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(7),
     );

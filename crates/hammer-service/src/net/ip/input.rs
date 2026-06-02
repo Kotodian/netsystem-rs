@@ -1,19 +1,17 @@
 use hammer_adapter::{
-    Buffer, BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    InternalNode, Network, Node, NodeId, NodeNextEnqueue, NodeResult, SocksAddr,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode,
+    Node, NodeId, NodeNextEnqueue, NodeResult, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 
-use crate::data_plane::FeatureArc;
-use crate::net::ip::{IpInputError, IpInputTarget, IpProtocol, parse_ip_packet_with_chain_len};
+use crate::data_plane::{FeatureArc, FeatureArcSpec, set_buffer_node_error_code};
+use crate::net::ip::{
+    IpInputError, IpInputTarget, network_for_protocol, parse_ip_packet_with_chain_len,
+};
 
 #[hammer_component_macros::feature_arc]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IpUnicastArc {
-    TunFeature,
-    AlphaFeature,
-    BetaFeature,
-}
+pub enum IpUnicastArc {}
 
 #[hammer_component_macros::node_next]
 pub enum IpInputNext {
@@ -26,54 +24,13 @@ pub enum IpInputNext {
     Reassembly,
 }
 
-pub struct IpInputControlPlane {
-    next: [NodeId; IpInputNext::COUNT],
-    feature_arc: Option<FeatureArc<IpUnicastArc>>,
-}
+#[hammer_component_macros::node(next = IpInputNext, start_arc = A)]
+pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc>;
 
-impl IpInputControlPlane {
-    #[inline]
-    pub fn new(next: [NodeId; IpInputNext::COUNT]) -> Self {
-        Self {
-            next,
-            feature_arc: None,
-        }
-    }
-
-    #[inline]
-    pub fn set_feature_arc(&mut self, arc: FeatureArc<IpUnicastArc>) {
-        self.feature_arc = Some(arc);
-    }
-
-    #[inline]
-    pub fn clear_feature_arc(&mut self) {
-        self.feature_arc = None;
-    }
-
-    #[inline]
-    pub fn node(&self) -> IpInputNode {
-        let mut node = IpInputNode::new(self.next);
-        node.feature_arc = self.feature_arc.clone();
-        node
-    }
-}
-
-pub struct IpInputNode {
-    next: [NodeId; IpInputNext::COUNT],
-    feature_arc: Option<FeatureArc<IpUnicastArc>>,
-}
-
-impl IpInputNode {
-    #[inline]
-    pub fn new(next: [NodeId; IpInputNext::COUNT]) -> Self {
-        Self {
-            next,
-            feature_arc: None,
-        }
-    }
-}
-
-impl<G> Node<G> for IpInputNode {
+impl<A, G> Node<G> for IpInputNode<A>
+where
+    A: FeatureArcSpec,
+{
     #[inline(always)]
     fn process(
         &mut self,
@@ -85,8 +42,11 @@ impl<G> Node<G> for IpInputNode {
         };
         let next = self.next;
         let feature_arc = self.feature_arc.as_ref();
+        let indices = frame.pending_indices();
+        let width = frame_batch_width(runtime);
         let speculative = {
             let mut batch = runtime.buffer_batch_mut();
+            prefetch_range_with_batch(&mut batch, indices, 0, width);
             next_node_for_index_with_batch(runtime, &mut batch, first, next, feature_arc)?
         };
         let mut first_chunk = true;
@@ -94,9 +54,7 @@ impl<G> Node<G> for IpInputNode {
             runtime,
             frame,
             |batch, indices| {
-                for index in indices.iter().copied() {
-                    batch.prefetch_read(index);
-                }
+                prefetch_indices_with_batch(batch, indices);
             },
             |batch, indices, nexts| {
                 let start_offset = if first_chunk {
@@ -120,16 +78,55 @@ impl<G> Node<G> for IpInputNode {
     }
 }
 
-impl<G> InternalNode<G> for IpInputNode {}
+impl<A, G> InternalNode<G> for IpInputNode<A> where A: FeatureArcSpec {}
 
 #[inline(always)]
-fn next_node_for_index_with_batch<G>(
+fn prefetch_index_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {
+    batch.prefetch_read(index);
+}
+
+#[inline(always)]
+fn prefetch_range_with_batch(
+    batch: &mut BufferBatchMut<'_>,
+    indices: &[BufferIndex],
+    offset: usize,
+    width: usize,
+) {
+    if offset >= indices.len() {
+        return;
+    }
+    let end = (offset + width).min(indices.len());
+    for index in indices[offset..end].iter().copied() {
+        prefetch_index_with_batch(batch, index);
+    }
+}
+
+#[inline(always)]
+fn prefetch_indices_with_batch(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+    for index in indices.iter().copied() {
+        prefetch_index_with_batch(batch, index);
+    }
+}
+
+#[inline(always)]
+fn frame_batch_width<G>(runtime: &DataPlaneRuntime<G>) -> usize {
+    match runtime.preferred_frame_batch_width() {
+        hammer_adapter::FrameBatchWidth::Quad => 4,
+        hammer_adapter::FrameBatchWidth::Pair => 2,
+    }
+}
+
+#[inline(always)]
+fn next_node_for_index_with_batch<A, G>(
     runtime: &DataPlaneRuntime<G>,
     batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
     next: [NodeId; IpInputNext::COUNT],
-    feature_arc: Option<&FeatureArc<IpUnicastArc>>,
-) -> CoreResult<NodeId> {
+    feature_arc: Option<&FeatureArc<A>>,
+) -> CoreResult<NodeId>
+where
+    A: FeatureArcSpec,
+{
     let buffer = batch.buffer_mut(index)?;
     let parsed = match parse_ip_packet_with_chain_len(
         buffer.current(),
@@ -137,14 +134,14 @@ fn next_node_for_index_with_batch<G>(
     ) {
         Ok(parsed) => parsed,
         Err(_) => {
-            set_node_error(runtime, buffer, IpInputError::BadLength)?;
+            set_buffer_node_error_code(runtime, buffer, IpInputError::BadLength.code())?;
             return Ok(next[IpInputNext::Drop.slot()]);
         }
     };
     if parsed.input_error == IpInputError::None {
         buffer.clear_node_error();
     } else {
-        set_node_error(runtime, buffer, parsed.input_error)?;
+        set_buffer_node_error_code(runtime, buffer, parsed.input_error.code())?;
     }
     let network = network_for_protocol(parsed.protocol);
     let cursor = if network.is_some() {
@@ -179,38 +176,20 @@ fn next_node_for_index_with_batch<G>(
 }
 
 #[inline(always)]
-fn next_nodes_for_indices_with_batch<G>(
+fn next_nodes_for_indices_with_batch<A, G>(
     runtime: &DataPlaneRuntime<G>,
     batch: &mut BufferBatchMut<'_>,
     indices: &[BufferIndex],
     nexts: &mut [NodeId; 4],
     start_offset: usize,
     next: [NodeId; IpInputNext::COUNT],
-    feature_arc: Option<&FeatureArc<IpUnicastArc>>,
-) -> CoreResult<()> {
+    feature_arc: Option<&FeatureArc<A>>,
+) -> CoreResult<()>
+where
+    A: FeatureArcSpec,
+{
     for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
         nexts[offset] = next_node_for_index_with_batch(runtime, batch, index, next, feature_arc)?;
     }
-    Ok(())
-}
-
-#[inline(always)]
-fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
-    match protocol {
-        IpProtocol::Tcp => Some(Network::Tcp),
-        IpProtocol::Udp => Some(Network::Udp),
-        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => Some(Network::Icmp),
-        IpProtocol::Other(_) => None,
-    }
-}
-
-#[inline(always)]
-fn set_node_error<G>(
-    runtime: &DataPlaneRuntime<G>,
-    buffer: &mut Buffer,
-    error: IpInputError,
-) -> CoreResult<()> {
-    let error = runtime.record_current_node_error(error.code())?;
-    buffer.set_node_error(error);
     Ok(())
 }

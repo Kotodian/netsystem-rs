@@ -10,8 +10,8 @@ use hammer_core::error::CoreResult;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
     DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane,
-    IpLocalEndOfArcNode, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
-    IpLookupControlPlane, IpLookupNode,
+    IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLookupControlPlane, IpLookupNode,
+    IpReceiveNode,
 };
 use ipnet::Ipv4Net;
 
@@ -87,7 +87,7 @@ enum TestNode {
     IpInput(IpInputNode),
     IpLookup(IpLookupNode),
     IpLocal(IpLocalNode),
-    IpLocalEnd(IpLocalEndOfArcNode),
+    IpReceive(IpReceiveNode),
 }
 
 impl From<DropNode> for TestNode {
@@ -126,9 +126,9 @@ impl From<IpLocalNode> for TestNode {
     }
 }
 
-impl From<IpLocalEndOfArcNode> for TestNode {
-    fn from(node: IpLocalEndOfArcNode) -> Self {
-        Self::IpLocalEnd(node)
+impl From<IpReceiveNode> for TestNode {
+    fn from(node: IpReceiveNode) -> Self {
+        Self::IpReceive(node)
     }
 }
 
@@ -146,7 +146,7 @@ impl Node<TestNode> for TestNode {
             Self::IpInput(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
             Self::IpLocal(node) => node.process(runtime, frame),
-            Self::IpLocalEnd(node) => node.process(runtime, frame),
+            Self::IpReceive(node) => node.process(runtime, frame),
         }
     }
 }
@@ -510,7 +510,6 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
-    let end = runtime.nodes().register_internal(control.end_of_arc_node());
     let mut features = FeatureArcControl::<IpLocalArc>::new();
     let feature_state = Rc::new(RefCell::new(CaptureState::default()));
     let feature = runtime.nodes().register_internal(ForwardNode {
@@ -522,8 +521,9 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
     features
         .enable_feature::<ForwardNode>(9)
         .expect("enable local feature");
-    control.set_feature_arc(features.arc(), end);
-    let local = runtime.nodes().register_internal(control.node());
+    let mut local_node = control.node();
+    features.attach_start(&mut local_node);
+    let local = runtime.nodes().register_internal(local_node);
 
     let good = ipv4_udp_packet(
         Ipv4Addr::new(10, 0, 0, 8),
@@ -544,7 +544,7 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
             .expect("schedule head")
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run head"), 5);
+    assert_eq!(runtime.run_ready_nodes().expect("run head"), 4);
     assert_eq!(feature_state.borrow().metadata.len(), 1);
     assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
     assert_eq!(
@@ -554,16 +554,6 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
         1
     );
 
-    let end_frame = runtime.alloc_frame_index().expect("alloc end frame");
-    push_packet(&runtime, end_frame, &bad);
-    assert!(
-        runtime
-            .schedule_frame(end, end_frame)
-            .expect("schedule end")
-    );
-
-    assert_eq!(runtime.run_ready_nodes().expect("run end"), 2);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 2);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -573,11 +563,13 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let local_control = IpLocalControlPlane::new(graph.nexts());
-    let local = runtime.nodes().register_internal(local_control.node());
+    let receive = runtime
+        .nodes()
+        .register_internal(local_control.receive_node());
     let mut builder = FibSnapshotBuilder::new(graph.drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 9), 32).expect("receive route"),
-        DpoId::receive(DpoProto::IP4, local),
+        DpoId::receive(DpoProto::IP4, receive),
     );
     let lookup = runtime
         .nodes()

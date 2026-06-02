@@ -8,20 +8,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node, NodeId,
-    NodeNextEnqueue, NodeResult, RouteMetadata, Router,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
+    NodeId, NodeNextEnqueue, NodeResult, RouteMetadata, Router,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
+#[hammer_component_macros::node]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
-
-impl DropNode {
-    #[inline(always)]
-    pub const fn new() -> Self {
-        Self
-    }
-}
 
 impl<G> Node<G> for DropNode {
     #[inline(always)]
@@ -44,11 +38,21 @@ pub struct FeatureArc<A: FeatureArcSpec> {
     _arc: PhantomData<fn() -> A>,
 }
 
+pub struct FeatureArcStartSlot<A: FeatureArcSpec> {
+    arc: Option<FeatureArc<A>>,
+}
+
 pub struct FeatureArcControl<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
     state: FeatureArcSnapshot<A>,
     _arc: PhantomData<fn() -> A>,
     _control_thread_only: PhantomData<Rc<()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureArcStart {
+    pub node: NodeId,
+    pub started: bool,
 }
 
 #[derive(Debug)]
@@ -62,14 +66,20 @@ pub trait Feature<A: FeatureArcSpec>: 'static {
     fn id() -> A;
 
     #[inline]
-    fn before() -> Vec<A> {
+    fn runs_before() -> Vec<A> {
         Vec::new()
     }
 
     #[inline]
-    fn after() -> Vec<A> {
+    fn runs_after() -> Vec<A> {
         Vec::new()
     }
+}
+
+pub trait FeatureArcStartNode<A: FeatureArcSpec>: 'static {
+    fn set_feature_arc(&mut self, arc: FeatureArc<A>);
+
+    fn clear_feature_arc(&mut self);
 }
 
 impl<A: FeatureArcSpec> Clone for FeatureArc<A> {
@@ -82,6 +92,35 @@ impl<A: FeatureArcSpec> Clone for FeatureArc<A> {
     }
 }
 
+impl<A: FeatureArcSpec> Default for FeatureArcStartSlot<A> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<A: FeatureArcSpec> FeatureArcStartSlot<A> {
+    #[inline]
+    pub fn new() -> Self {
+        Self { arc: None }
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> Option<&FeatureArc<A>> {
+        self.arc.as_ref()
+    }
+
+    #[inline]
+    pub fn set(&mut self, arc: FeatureArc<A>) {
+        self.arc = Some(arc);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.arc = None;
+    }
+}
+
 impl<A: FeatureArcSpec> fmt::Debug for FeatureArc<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("FeatureArc").finish_non_exhaustive()
@@ -91,8 +130,8 @@ impl<A: FeatureArcSpec> fmt::Debug for FeatureArc<A> {
 #[derive(Debug, Clone)]
 struct FeatureArcRegistration<A: FeatureArcSpec> {
     node: NodeId,
-    before: Vec<A>,
-    after: Vec<A>,
+    runs_before: Vec<A>,
+    runs_after: Vec<A>,
     ordinal: usize,
 }
 
@@ -152,11 +191,25 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
 
     #[inline]
     pub fn start_or(&self, metadata: &mut RouteMetadata, default_next: NodeId) -> NodeId {
+        self.start_or_with_end(metadata, default_next, default_next)
+            .node
+    }
+
+    #[inline]
+    pub fn start_or_with_end(
+        &self,
+        metadata: &mut RouteMetadata,
+        default_next: NodeId,
+        end_next: NodeId,
+    ) -> FeatureArcStart {
         metadata.clear_feature_path();
         let Some(interface_index) = metadata.ingress_interface else {
-            return default_next;
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
         };
-        self.start_for_interface_or(interface_index, metadata, default_next)
+        self.start_for_interface_or_with_end(interface_index, metadata, default_next, end_next)
     }
 
     #[inline]
@@ -166,17 +219,33 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
         metadata: &mut RouteMetadata,
         default_next: NodeId,
     ) -> NodeId {
+        self.start_for_interface_or_with_end(interface_index, metadata, default_next, default_next)
+            .node
+    }
+
+    #[inline]
+    pub fn start_for_interface_or_with_end(
+        &self,
+        interface_index: u32,
+        metadata: &mut RouteMetadata,
+        default_next: NodeId,
+        end_next: NodeId,
+    ) -> FeatureArcStart {
         let snapshot = self.inner.snapshot.load();
-        let default_next = snapshot
-            .end_nodes
-            .get(&interface_index)
-            .copied()
-            .unwrap_or(default_next);
+        let override_end = snapshot.end_nodes.get(&interface_index).copied();
+        let default_next = override_end.unwrap_or(default_next);
+        let end_next = override_end.unwrap_or(end_next);
         let Some(chain) = snapshot.chains.get(&interface_index) else {
-            return default_next;
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
         };
         let Some(first) = chain.steps.first() else {
-            return default_next;
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
         };
         let mut next_entries = chain
             .steps
@@ -184,10 +253,13 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
             .skip(1)
             .map(|step| FeaturePathEntry::new(step.node, step.config.clone()))
             .collect::<Vec<_>>();
-        next_entries.push(FeaturePathEntry::new(default_next, None));
+        next_entries.push(FeaturePathEntry::new(end_next, None));
         metadata.set_current_feature_config(first.config.clone());
         metadata.set_feature_path(next_entries);
-        first.node
+        FeatureArcStart {
+            node: first.node,
+            started: true,
+        }
     }
 }
 
@@ -216,6 +288,29 @@ pub fn next_feature_frame<G>(
         speculative,
         |index| next_feature_node_for_index(runtime, index),
     )
+}
+
+#[inline(always)]
+pub fn set_buffer_node_error_code<G>(
+    runtime: &DataPlaneRuntime<G>,
+    buffer: &mut Buffer,
+    code: u16,
+) -> CoreResult<()> {
+    let error = runtime.record_current_node_error(code)?;
+    buffer.set_node_error(error);
+    Ok(())
+}
+
+#[inline(always)]
+pub fn set_index_node_error_code<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    code: u16,
+) -> CoreResult<()> {
+    let error = runtime.record_current_node_error(code)?;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    buffer.set_node_error(error);
+    Ok(())
 }
 
 impl<A: FeatureArcSpec> Default for FeatureArcControl<A> {
@@ -260,13 +355,23 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             id,
             FeatureArcRegistration {
                 node,
-                before: F::before(),
-                after: F::after(),
+                runs_before: F::runs_before(),
+                runs_after: F::runs_after(),
                 ordinal,
             },
         );
         self.publish()?;
         Ok(())
+    }
+
+    #[inline]
+    pub fn attach_start<S: FeatureArcStartNode<A>>(&self, start: &mut S) {
+        start.set_feature_arc(self.arc());
+    }
+
+    #[inline]
+    pub fn detach_start<S: FeatureArcStartNode<A>>(&self, start: &mut S) {
+        start.clear_feature_arc();
     }
 
     pub fn enable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> CoreResult<()> {
@@ -404,14 +509,26 @@ impl<A: FeatureArcSpec> FeatureArcSnapshot<A> {
         let mut seen_edges = HashSet::<(A, A)>::new();
 
         for (id, registration) in &self.registered {
-            for before in &registration.before {
-                if self.registered.contains_key(before) {
-                    add_feature_order_edge(&mut edges, &mut indegree, &mut seen_edges, before, id);
+            for runs_before in &registration.runs_before {
+                if self.registered.contains_key(runs_before) {
+                    add_feature_order_edge(
+                        &mut edges,
+                        &mut indegree,
+                        &mut seen_edges,
+                        id,
+                        runs_before,
+                    );
                 }
             }
-            for after in &registration.after {
-                if self.registered.contains_key(after) {
-                    add_feature_order_edge(&mut edges, &mut indegree, &mut seen_edges, id, after);
+            for runs_after in &registration.runs_after {
+                if self.registered.contains_key(runs_after) {
+                    add_feature_order_edge(
+                        &mut edges,
+                        &mut indegree,
+                        &mut seen_edges,
+                        runs_after,
+                        id,
+                    );
                 }
             }
         }
@@ -472,15 +589,9 @@ pub enum RouteMatchNext {
     Lookup,
 }
 
+#[hammer_component_macros::node(next = RouteMatchNext)]
 pub struct RouteMatchNode<R> {
     router: R,
-    next: [NodeId; RouteMatchNext::COUNT],
-}
-
-impl<R> RouteMatchNode<R> {
-    pub fn new(router: R, next: [NodeId; RouteMatchNext::COUNT]) -> Self {
-        Self { router, next }
-    }
 }
 
 impl<R, T, G> Node<G> for RouteMatchNode<R>

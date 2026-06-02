@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
-    NodeId, NodeNextFrames, NodeResult, SocksAddr,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeNextFrames, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::data_plane::FeatureArc;
+use crate::data_plane::{FeatureArc, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibSnapshotHandle};
 
-use super::parse_ip_packet_with_chain_len;
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
+use super::{network_for_protocol, parse_ip_packet_with_chain_len};
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_TCP: u8 = 6;
@@ -91,8 +91,8 @@ impl IpLocalControlPlane {
     }
 
     #[inline]
-    pub fn end_of_arc_node(&self) -> IpLocalEndOfArcNode {
-        IpLocalEndOfArcNode::new(IpLocalSnapshotHandle::new(Arc::clone(&self.inner)))
+    pub fn receive_node(&self) -> IpReceiveNode {
+        IpReceiveNode::new(IpLocalSnapshotHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
@@ -116,27 +116,6 @@ impl IpLocalControlPlane {
     }
 
     #[inline]
-    pub fn set_feature_arc(&self, arc: FeatureArc<IpLocalArc>, end_of_arc: NodeId) {
-        self.inner.rcu(|current| {
-            let mut next = IpLocalSnapshot::clone(current);
-            next.feature_arc = Some(IpLocalFeatureArc {
-                arc: arc.clone(),
-                end_of_arc,
-            });
-            next
-        });
-    }
-
-    #[inline]
-    pub fn clear_feature_arc(&self) {
-        self.inner.rcu(|current| {
-            let mut next = IpLocalSnapshot::clone(current);
-            next.feature_arc = None;
-            next
-        });
-    }
-
-    #[inline]
     pub fn publish_source_check(&self, source_check: IpLocalSourceCheck) {
         self.inner.rcu(|current| {
             let mut next = IpLocalSnapshot::clone(current);
@@ -150,14 +129,7 @@ impl IpLocalControlPlane {
 struct IpLocalSnapshot {
     next: [NodeId; IpLocalNext::COUNT],
     protocol_nexts: Box<[NodeId; 256]>,
-    feature_arc: Option<IpLocalFeatureArc>,
     source_check: IpLocalSourceCheck,
-}
-
-#[derive(Debug, Clone)]
-struct IpLocalFeatureArc {
-    arc: FeatureArc<IpLocalArc>,
-    end_of_arc: NodeId,
 }
 
 impl IpLocalSnapshot {
@@ -172,7 +144,6 @@ impl IpLocalSnapshot {
         Self {
             next,
             protocol_nexts,
-            feature_arc: None,
             source_check: IpLocalSourceCheck::Disabled,
         }
     }
@@ -215,26 +186,14 @@ impl IpLocalSnapshotHandle {
     }
 }
 
+#[hammer_component_macros::node(start_arc = IpLocalArc)]
 pub struct IpLocalNode {
     snapshot: IpLocalSnapshotHandle,
 }
 
-impl IpLocalNode {
-    #[inline]
-    fn new(snapshot: IpLocalSnapshotHandle) -> Self {
-        Self { snapshot }
-    }
-}
-
-pub struct IpLocalEndOfArcNode {
+#[hammer_component_macros::node(start_arc = IpLocalArc)]
+pub struct IpReceiveNode {
     snapshot: IpLocalSnapshotHandle,
-}
-
-impl IpLocalEndOfArcNode {
-    #[inline]
-    fn new(snapshot: IpLocalSnapshotHandle) -> Self {
-        Self { snapshot }
-    }
 }
 
 impl<G> Node<G> for IpLocalNode {
@@ -245,13 +204,19 @@ impl<G> Node<G> for IpLocalNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
-        process_frame(runtime, frame, &snapshot, LocalStage::Head)
+        process_frame(
+            runtime,
+            frame,
+            &snapshot,
+            LocalStage::Head,
+            self.feature_arc.as_ref(),
+        )
     }
 }
 
 impl<G> InternalNode<G> for IpLocalNode {}
 
-impl<G> Node<G> for IpLocalEndOfArcNode {
+impl<G> Node<G> for IpReceiveNode {
     #[inline(always)]
     fn process(
         &mut self,
@@ -259,16 +224,29 @@ impl<G> Node<G> for IpLocalEndOfArcNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
-        process_frame(runtime, frame, &snapshot, LocalStage::EndOfArc)
+        process_frame(
+            runtime,
+            frame,
+            &snapshot,
+            LocalStage::Receive,
+            self.feature_arc.as_ref(),
+        )
     }
 }
 
-impl<G> InternalNode<G> for IpLocalEndOfArcNode {}
+impl<G> InternalNode<G> for IpReceiveNode {}
 
 #[derive(Debug, Clone, Copy)]
 enum LocalStage {
     Head,
-    EndOfArc,
+    Receive,
+}
+
+impl LocalStage {
+    #[inline(always)]
+    fn is_head_of_feature_arc(self) -> bool {
+        matches!(self, Self::Head | Self::Receive)
+    }
 }
 
 #[inline(always)]
@@ -277,11 +255,12 @@ fn process_frame<G>(
     frame: &mut BufferFrame,
     snapshot: &IpLocalSnapshot,
     stage: LocalStage,
+    feature_arc: Option<&FeatureArc<IpLocalArc>>,
 ) -> CoreResult<NodeResult> {
     let mut next_frames = NodeNextFrames::default();
     let mut current_next = None;
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        let next = process_index(runtime, index, snapshot, stage)?;
+        let next = process_index(runtime, index, snapshot, stage, feature_arc)?;
         emit_output(runtime, &mut next_frames, &mut current_next, next, index)
     })?;
     next_frames.schedule(runtime)?;
@@ -300,18 +279,19 @@ fn process_index<G>(
     index: BufferIndex,
     snapshot: &IpLocalSnapshot,
     stage: LocalStage,
+    feature_arc: Option<&FeatureArc<IpLocalArc>>,
 ) -> CoreResult<NodeId> {
     let packet = packet_bytes(runtime, index)?;
     let parsed = match parse_ip_packet_with_chain_len(&packet, 0) {
         Ok(parsed) => parsed,
         Err(_) => {
-            set_index_error(runtime, index, IpLocalError::BadLength)?;
+            set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             return Ok(snapshot.drop_next());
         }
     };
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
-            set_index_error(runtime, index, error_for_input(parsed.input_error))?;
+            set_index_node_error_code(runtime, index, error_for_input(parsed.input_error).code())?;
             return Ok(snapshot.drop_next());
         }
         IpInputTarget::Reassembly => {
@@ -327,7 +307,7 @@ fn process_index<G>(
     let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
         Some(transport) => transport,
         None => {
-            set_index_error(runtime, index, IpLocalError::BadLength)?;
+            set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             return Ok(snapshot.drop_next());
         }
     };
@@ -335,27 +315,27 @@ fn process_index<G>(
     let transport_len = match validate_transport(packet, transport, &parsed, stage) {
         Ok(transport_len) => transport_len,
         Err(error) => {
-            set_index_error(runtime, index, error)?;
+            set_index_node_error_code(runtime, index, error.code())?;
             return Ok(snapshot.drop_next());
         }
     };
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
-    if matches!(stage, LocalStage::Head) {
+    if stage.is_head_of_feature_arc() {
         if !source_check_passes(snapshot, &parsed) {
-            set_index_error(runtime, index, IpLocalError::SourceCheckFailed)?;
+            set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
             return Ok(snapshot.drop_next());
         }
-        if let Some(feature_arc) = &snapshot.feature_arc {
-            return runtime.with_metadata_mut(index, |metadata| {
-                feature_arc.arc.start_or(metadata, feature_arc.end_of_arc)
-            });
+        if let Some(feature_arc) = feature_arc {
+            let next = snapshot.protocol_next(parsed.protocol);
+            return runtime
+                .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next));
         }
     }
 
     let next = snapshot.protocol_next(parsed.protocol);
     if next == snapshot.punt_next() && matches!(parsed.protocol, IpProtocol::Other(_)) {
-        set_index_error(runtime, index, IpLocalError::UnknownProtocol)?;
+        set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
     }
     Ok(next)
 }
@@ -403,7 +383,7 @@ fn validate_transport(
     match parsed.protocol {
         IpProtocol::Tcp => {
             let header_len = tcp_header_len(transport)?;
-            if matches!(stage, LocalStage::Head)
+            if stage.is_head_of_feature_arc()
                 && l4_checksum(packet, parsed, IP_PROTOCOL_TCP, transport) != 0
             {
                 return Err(IpLocalError::BadChecksum);
@@ -413,7 +393,7 @@ fn validate_transport(
         IpProtocol::Udp => {
             let datagram_len = udp_datagram_len(transport)?;
             let datagram = &transport[..datagram_len];
-            if matches!(stage, LocalStage::Head) {
+            if stage.is_head_of_feature_arc() {
                 let checksum = u16::from_be_bytes([transport[6], transport[7]]);
                 match parsed.version {
                     IpVersion::V4 if checksum == 0 => {}
@@ -512,18 +492,6 @@ fn refresh_basic_metadata<G>(
 }
 
 #[inline(always)]
-fn set_index_error<G>(
-    runtime: &DataPlaneRuntime<G>,
-    index: BufferIndex,
-    error: IpLocalError,
-) -> CoreResult<()> {
-    let error = runtime.record_current_node_error(error.code())?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.set_node_error(error);
-    Ok(())
-}
-
-#[inline(always)]
 fn source_check_passes(snapshot: &IpLocalSnapshot, parsed: &ParsedIpPacket) -> bool {
     let IpLocalSourceCheck::ReverseFib(handle) = &snapshot.source_check else {
         return true;
@@ -542,16 +510,6 @@ fn source_lookup_result_is_usable(result: FibLookupResult) -> bool {
         result.dpo.kind(),
         DpoType::DROP | DpoType::PUNT | DpoType::RECEIVE
     )
-}
-
-#[inline(always)]
-fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
-    match protocol {
-        IpProtocol::Tcp => Some(Network::Tcp),
-        IpProtocol::Udp => Some(Network::Udp),
-        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => Some(Network::Icmp),
-        IpProtocol::Other(_) => None,
-    }
 }
 
 #[inline(always)]

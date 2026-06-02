@@ -104,20 +104,14 @@ impl IpLookupControlPlane {
     }
 }
 
+#[hammer_component_macros::node]
 pub struct IpLookupNode {
     snapshot: FibSnapshotHandle,
+    #[node(default)]
     cached_next: Option<NodeId>,
 }
 
 impl IpLookupNode {
-    #[inline]
-    pub fn new(snapshot: FibSnapshotHandle) -> Self {
-        Self {
-            snapshot,
-            cached_next: None,
-        }
-    }
-
     #[inline(always)]
     fn process_index_with_batch(
         &self,

@@ -822,8 +822,7 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
         .nodes()
         .register_internal_with_handle(
             REASSEMBLY_HANDLE,
-            IpReassemblyNode::with_handoff(
-                ip_reassembly_nexts(first_sink, first_sink),
+            IpReassemblyNode::new(ip_reassembly_nexts(first_sink, first_sink)).with_handoff(
                 IpReassemblyHandoff::new(
                     REASSEMBLY_HANDLE,
                     SINK_HANDLE,
@@ -856,8 +855,7 @@ fn ipv4_reassembly_handoffs_fragments_to_owner_worker_without_copying_payload_st
         .nodes()
         .register_internal_with_handle(
             REASSEMBLY_HANDLE,
-            IpReassemblyNode::with_handoff(
-                ip_reassembly_nexts(second_sink, second_sink),
+            IpReassemblyNode::new(ip_reassembly_nexts(second_sink, second_sink)).with_handoff(
                 IpReassemblyHandoff::new(
                     REASSEMBLY_HANDLE,
                     SINK_HANDLE,

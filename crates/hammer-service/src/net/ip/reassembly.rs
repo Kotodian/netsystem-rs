@@ -5,15 +5,15 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Network, Node,
-    NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeHandle,
+    NodeId, NodeNextFrames, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
 use crate::net::ip::{
-    IpFragmentKey, IpVersion, ParsedIpFragment, parse_ip_fragment_with_chain_len,
-    parse_ip_packet_with_chain_len,
+    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, network_for_protocol,
+    parse_ip_fragment_with_chain_len, parse_ip_packet_with_chain_len,
 };
 
 const IPV4_HEADER_MIN_LEN: usize = 20;
@@ -34,13 +34,19 @@ pub enum IpReassemblyNext {
     Drop,
 }
 
+#[hammer_component_macros::node(next = IpReassemblyNext)]
 pub struct IpReassemblyNode {
-    next: [NodeId; IpReassemblyNext::COUNT],
+    #[node(default)]
     handoff: Option<IpReassemblyHandoff>,
+    #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
     timeout: Duration,
+    #[node(default = DEFAULT_MAX_REASSEMBLIES)]
     max_reassemblies: usize,
+    #[node(default = DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY)]
     max_fragments_per_reassembly: usize,
+    #[node(default)]
     contexts: HashMap<IpFragmentKey, ReassemblyContext>,
+    #[node(default)]
     failed_keys: Vec<IpFragmentKey>,
 }
 
@@ -76,26 +82,9 @@ impl IpReassemblyHandoff {
 
 impl IpReassemblyNode {
     #[inline]
-    pub fn new(next: [NodeId; IpReassemblyNext::COUNT]) -> Self {
-        Self {
-            next,
-            handoff: None,
-            timeout: DEFAULT_REASSEMBLY_TIMEOUT,
-            max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
-            max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
-            contexts: HashMap::new(),
-            failed_keys: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn with_handoff(
-        next: [NodeId; IpReassemblyNext::COUNT],
-        handoff: IpReassemblyHandoff,
-    ) -> Self {
-        let mut node = Self::new(next);
-        node.handoff = Some(handoff);
-        node
+    pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
+        self.handoff = Some(handoff);
+        self
     }
 
     #[inline]
@@ -636,11 +625,15 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
     let parsed =
         parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())?;
     drop(buffer);
-    let network = match parsed.protocol {
-        crate::net::ip::IpProtocol::Tcp => Network::Tcp,
-        crate::net::ip::IpProtocol::Udp => Network::Udp,
-        crate::net::ip::IpProtocol::Icmpv4 | crate::net::ip::IpProtocol::Icmpv6 => Network::Icmp,
-        crate::net::ip::IpProtocol::Other(protocol) => {
+    let network = match network_for_protocol(parsed.protocol) {
+        Some(network) => network,
+        None => {
+            let IpProtocol::Other(protocol) = parsed.protocol else {
+                return Err(CoreError::internal(format!(
+                    "unsupported reassembled transport protocol: {:?}",
+                    parsed.protocol
+                )));
+            };
             return Err(CoreError::internal(format!(
                 "unsupported reassembled transport protocol: {protocol}"
             )));

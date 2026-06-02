@@ -3,8 +3,9 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Error, ExprPath, Fields, Ident, Item, ItemEnum, LitStr, Path, Result, Token, Type, bracketed,
-    parenthesized, parse_macro_input, spanned::Spanned,
+    Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, Ident, Item, ItemEnum,
+    ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized, parse_macro_input,
+    parse_quote, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -97,16 +98,29 @@ struct ComponentArgs {
 struct FeatureArgs {
     arc: Path,
     id: Ident,
-    before: Vec<Ident>,
-    after: Vec<Ident>,
+    runs_before: Vec<Ident>,
+    runs_after: Vec<Ident>,
+}
+
+#[derive(Default)]
+struct NodeArgs {
+    next: Option<Path>,
+    next_node: bool,
+    start_arc: Option<Path>,
+}
+
+#[derive(Default)]
+struct NodeFieldArgs {
+    default: Option<Expr>,
+    into: bool,
 }
 
 impl Parse for FeatureArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut arc = None;
         let mut id = None;
-        let mut before = Vec::new();
-        let mut after = Vec::new();
+        let mut runs_before = Vec::new();
+        let mut runs_after = Vec::new();
 
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -124,23 +138,23 @@ impl Parse for FeatureArgs {
                     }
                     id = Some(input.parse()?);
                 }
-                "before" => {
-                    if !before.is_empty() {
-                        return Err(Error::new(key.span(), "duplicate `before` argument"));
+                "runs_before" => {
+                    if !runs_before.is_empty() {
+                        return Err(Error::new(key.span(), "duplicate `runs_before` argument"));
                     }
-                    before = parse_ident_array(input)?;
+                    runs_before = parse_ident_array(input)?;
                 }
-                "after" => {
-                    if !after.is_empty() {
-                        return Err(Error::new(key.span(), "duplicate `after` argument"));
+                "runs_after" => {
+                    if !runs_after.is_empty() {
+                        return Err(Error::new(key.span(), "duplicate `runs_after` argument"));
                     }
-                    after = parse_ident_array(input)?;
+                    runs_after = parse_ident_array(input)?;
                 }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `arc`, `id`, `before`, or `after`"
+                            "unknown argument `{other}`; expected `arc`, `id`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -153,9 +167,95 @@ impl Parse for FeatureArgs {
         Ok(Self {
             arc: arc.ok_or_else(|| Error::new(Span::call_site(), "missing `arc` argument"))?,
             id: id.ok_or_else(|| Error::new(Span::call_site(), "missing `id` argument"))?,
-            before,
-            after,
+            runs_before,
+            runs_after,
         })
+    }
+}
+
+impl Parse for NodeArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut args = Self::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "next" => {
+                    if args.next.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `next` argument"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    args.next = Some(input.parse()?);
+                }
+                "next_node" => {
+                    if args.next_node {
+                        return Err(Error::new(key.span(), "duplicate `next_node` argument"));
+                    }
+                    args.next_node = true;
+                }
+                "start_arc" => {
+                    if args.start_arc.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `start_arc` argument"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    args.start_arc = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown argument `{other}`; expected `next`, `next_node`, or `start_arc`"
+                        ),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        if args.next.is_some() && args.next_node {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next` and `next_node` are mutually exclusive",
+            ));
+        }
+        Ok(args)
+    }
+}
+
+impl Parse for NodeFieldArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut args = Self::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "default" => {
+                    if args.default.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `default` argument"));
+                    }
+                    args.default = if input.parse::<Option<Token![=]>>()?.is_some() {
+                        Some(input.parse()?)
+                    } else {
+                        Some(parse_quote!(::std::default::Default::default()))
+                    };
+                }
+                "into" => {
+                    if args.into {
+                        return Err(Error::new(key.span(), "duplicate `into` argument"));
+                    }
+                    args.into = true;
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown field argument `{other}`; expected `default` or `into`"),
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(args)
     }
 }
 
@@ -502,6 +602,28 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Defines a dataplane node struct, its next-node storage, and its constructor.
+///
+/// Examples:
+///
+/// ```ignore
+/// #[hammer_component_macros::node(next = IpInputNext, start_arc = A)]
+/// pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc>;
+///
+/// #[hammer_component_macros::node(next = RouteMatchNext)]
+/// pub struct RouteMatchNode<R> {
+///     router: R,
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn node(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as NodeArgs);
+    let item = parse_macro_input!(input as ItemStruct);
+    expand_node(args, item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
 /// Marks a dataplane feature arc enum.
 ///
 /// Example:
@@ -568,35 +690,35 @@ pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
     let arc = args.arc;
     let id = args.id;
-    let before = args.before;
-    let after = args.after;
-    let before_fn = if before.is_empty() {
+    let runs_before = args.runs_before;
+    let runs_after = args.runs_after;
+    let runs_before_fn = if runs_before.is_empty() {
         quote! {
             #[inline]
-            fn before() -> ::std::vec::Vec<#arc> {
+            fn runs_before() -> ::std::vec::Vec<#arc> {
                 ::std::vec::Vec::new()
             }
         }
     } else {
         quote! {
             #[inline]
-            fn before() -> ::std::vec::Vec<#arc> {
-                ::std::vec![#(#arc::#before),*]
+            fn runs_before() -> ::std::vec::Vec<#arc> {
+                ::std::vec![#(#arc::#runs_before),*]
             }
         }
     };
-    let after_fn = if after.is_empty() {
+    let runs_after_fn = if runs_after.is_empty() {
         quote! {
             #[inline]
-            fn after() -> ::std::vec::Vec<#arc> {
+            fn runs_after() -> ::std::vec::Vec<#arc> {
                 ::std::vec::Vec::new()
             }
         }
     } else {
         quote! {
             #[inline]
-            fn after() -> ::std::vec::Vec<#arc> {
-                ::std::vec![#(#arc::#after),*]
+            fn runs_after() -> ::std::vec::Vec<#arc> {
+                ::std::vec![#(#arc::#runs_after),*]
             }
         }
     };
@@ -612,8 +734,8 @@ pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
                 #arc::#id
             }
 
-            #before_fn
-            #after_fn
+            #runs_before_fn
+            #runs_after_fn
         }
     }
     .into()
@@ -641,6 +763,176 @@ pub fn node_next(args: TokenStream, input: TokenStream) -> TokenStream {
     expand_node_next(item)
         .unwrap_or_else(Error::into_compile_error)
         .into()
+}
+
+fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
+    let attrs = item.attrs;
+    let vis = item.vis;
+    let ident = item.ident;
+    let generics = item.generics;
+    let fields = item.fields;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    let mut output_fields = Vec::<Field>::new();
+    let mut constructor_params = Vec::<TokenStream2>::new();
+    let mut constructor_inits = Vec::<TokenStream2>::new();
+
+    match fields {
+        Fields::Named(fields) => {
+            for field in fields.named {
+                let mut field = field;
+                let field_args = parse_node_field_attrs(&mut field.attrs)?;
+                let ident = field
+                    .ident
+                    .clone()
+                    .ok_or_else(|| Error::new(field.span(), "`node` fields must be named"))?;
+                let ty = field.ty.clone();
+                if field_args.default.is_some() && field_args.into {
+                    return Err(Error::new(
+                        ident.span(),
+                        "`default` and `into` cannot be combined on a node field",
+                    ));
+                }
+                if let Some(default) = field_args.default {
+                    constructor_inits.push(quote!(#ident: #default));
+                } else if field_args.into {
+                    constructor_params.push(quote!(#ident: impl ::std::convert::Into<#ty>));
+                    constructor_inits.push(quote!(#ident: #ident.into()));
+                } else {
+                    constructor_params.push(quote!(#ident: #ty));
+                    constructor_inits.push(quote!(#ident));
+                }
+                output_fields.push(field);
+            }
+        }
+        Fields::Unit => {}
+        Fields::Unnamed(fields) => {
+            return Err(Error::new(
+                fields.span(),
+                "`node` only supports unit structs or structs with named fields",
+            ));
+        }
+    }
+
+    if args.next.is_some() && has_field(&output_fields, "next") {
+        return Err(Error::new(
+            Span::call_site(),
+            "`node(next = ...)` injects a `next` field; remove the field from the struct",
+        ));
+    }
+    if args.next_node && has_field(&output_fields, "next") {
+        return Err(Error::new(
+            Span::call_site(),
+            "`node(next_node)` injects a `next` field; remove the field from the struct",
+        ));
+    }
+    if args.start_arc.is_some() && has_field(&output_fields, "feature_arc") {
+        return Err(Error::new(
+            Span::call_site(),
+            "`node(start_arc = ...)` injects a `feature_arc` field; remove the field from the struct",
+        ));
+    }
+
+    if let Some(next) = &args.next {
+        let field: Field = parse_quote! {
+            next: [::hammer_adapter::node::NodeId; #next::COUNT]
+        };
+        output_fields.push(field);
+        constructor_params.push(quote!(next: [::hammer_adapter::node::NodeId; #next::COUNT]));
+        constructor_inits.push(quote!(next));
+    }
+
+    if args.next_node {
+        let field: Field = parse_quote! {
+            next: ::hammer_adapter::node::NodeId
+        };
+        output_fields.push(field);
+        constructor_params.push(quote!(next: ::hammer_adapter::node::NodeId));
+        constructor_inits.push(quote!(next));
+    }
+
+    let start_impl = if let Some(start_arc) = &args.start_arc {
+        let field: Field = parse_quote! {
+            feature_arc: ::hammer_service::data_plane::FeatureArcStartSlot<#start_arc>
+        };
+        output_fields.push(field);
+        constructor_inits.push(quote!(
+            feature_arc: ::hammer_service::data_plane::FeatureArcStartSlot::new()
+        ));
+        quote! {
+            impl #impl_generics ::hammer_service::data_plane::FeatureArcStartNode<#start_arc>
+                for #ident #ty_generics #where_clause
+            {
+                #[inline]
+                fn set_feature_arc(
+                    &mut self,
+                    arc: ::hammer_service::data_plane::FeatureArc<#start_arc>,
+                ) {
+                    self.feature_arc.set(arc);
+                }
+
+                #[inline]
+                fn clear_feature_arc(&mut self) {
+                    self.feature_arc.clear();
+                }
+            }
+        }
+    } else {
+        quote!()
+    };
+
+    let fields_named: FieldsNamed = parse_quote!({
+        #(#output_fields),*
+    });
+
+    Ok(quote! {
+        #(#attrs)*
+        #vis struct #ident #generics #fields_named
+
+        impl #impl_generics #ident #ty_generics #where_clause {
+            #[inline]
+            pub fn new(#(#constructor_params),*) -> Self {
+                Self {
+                    #(#constructor_inits),*
+                }
+            }
+        }
+
+        #start_impl
+    })
+}
+
+fn has_field(fields: &[Field], name: &str) -> bool {
+    fields
+        .iter()
+        .any(|field| field.ident.as_ref().is_some_and(|ident| ident == name))
+}
+
+fn parse_node_field_attrs(attrs: &mut Vec<Attribute>) -> Result<NodeFieldArgs> {
+    let mut node_args = NodeFieldArgs::default();
+    let mut retained = Vec::with_capacity(attrs.len());
+    for attr in attrs.drain(..) {
+        if !attr.path().is_ident("node") {
+            retained.push(attr);
+            continue;
+        }
+        let args = attr.parse_args::<NodeFieldArgs>()?;
+        if node_args.default.is_some() && args.default.is_some() {
+            return Err(Error::new(
+                attr.span(),
+                "duplicate `default` field argument",
+            ));
+        }
+        if node_args.into && args.into {
+            return Err(Error::new(attr.span(), "duplicate `into` field argument"));
+        }
+        if args.default.is_some() {
+            node_args.default = args.default;
+        }
+        node_args.into |= args.into;
+    }
+    *attrs = retained;
+    Ok(node_args)
 }
 
 fn expand_node_next(item: ItemEnum) -> Result<TokenStream2> {

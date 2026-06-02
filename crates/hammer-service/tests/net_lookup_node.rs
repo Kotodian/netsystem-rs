@@ -9,7 +9,7 @@ use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     Dpo, DpoId, DpoProto, DpoType, FibSnapshotBuilder, IpInputNext, IpInputNode,
-    IpLookupControlPlane, IpLookupNode,
+    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -71,6 +71,7 @@ enum TestNode {
     Drop(DropNode),
     IpInput(IpInputNode),
     IpLookup(IpLookupNode),
+    IpReceive(IpReceiveNode),
     Corrupt(CorruptCurrentHeaderNode),
 }
 
@@ -98,6 +99,12 @@ impl From<IpLookupNode> for TestNode {
     }
 }
 
+impl From<IpReceiveNode> for TestNode {
+    fn from(node: IpReceiveNode) -> Self {
+        Self::IpReceive(node)
+    }
+}
+
 impl From<CorruptCurrentHeaderNode> for TestNode {
     fn from(node: CorruptCurrentHeaderNode) -> Self {
         Self::Corrupt(node)
@@ -116,6 +123,7 @@ impl Node<TestNode> for TestNode {
             Self::Drop(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
+            Self::IpReceive(node) => node.process(runtime, frame),
             Self::Corrupt(node) => node.process(runtime, frame),
         }
     }
@@ -361,8 +369,13 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
 fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
-    let receive = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let udp = register_sink(&runtime, &state);
+    let local_control =
+        IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
+    let receive = runtime
+        .nodes()
+        .register_internal(local_control.receive_node());
     let mut builder = FibSnapshotBuilder::new(drop);
     let receive_lb =
         builder.add_load_balance(DpoProto::IP4, [DpoId::receive(DpoProto::IP4, receive)]);
@@ -382,7 +395,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
 
     assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"receive".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.route_dpo_type, DpoType::LOAD_BALANCE);
@@ -397,8 +410,13 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
 fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
-    let receive = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let udp = register_sink(&runtime, &state);
+    let local_control =
+        IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
+    let receive = runtime
+        .nodes()
+        .register_internal(local_control.receive_node());
     let mut builder = FibSnapshotBuilder::new(drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 11), 32).expect("direct receive route"),
@@ -416,7 +434,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
 
     assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"direct".as_slice()]);
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, u32::MAX);
