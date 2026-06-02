@@ -5,7 +5,7 @@ mod ip6_fib;
 mod load_balance;
 
 pub use dpo::{
-    Adjacency, AdjacencyIndex, Dpo, DpoClass, DpoId, DpoProto, DpoStackRegistry, DpoType,
+    Adjacency, AdjacencyIndex, Dpo, DpoClass, DpoId, DpoKind, DpoProto, DpoStackRegistry, DpoType,
     DpoTypeRegistry,
 };
 pub use fib::{

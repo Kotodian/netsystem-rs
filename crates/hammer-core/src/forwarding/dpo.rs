@@ -136,6 +136,13 @@ impl DpoType {
     pub const FIRST_REGISTERED: u16 = 5;
 }
 
+pub trait DpoKind: Copy {
+    type Index: Copy;
+
+    fn dpo_type(self) -> DpoType;
+    fn encode_index(index: Self::Index) -> u32;
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Dpo<N> {
@@ -206,6 +213,11 @@ impl<N> Dpo<N> {
             dpo_type,
             proto,
         }
+    }
+
+    #[inline(always)]
+    pub fn typed<K: DpoKind>(proto: DpoProto, kind: K, index: K::Index, next: N) -> Self {
+        Self::new(proto, kind.dpo_type(), K::encode_index(index), next)
     }
 
     /// Stack a parent DPO onto a precomputed graph next.

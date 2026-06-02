@@ -1,8 +1,8 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    AdjacencyIndex, Dpo, DpoId, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry,
-    FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
+    AdjacencyIndex, Dpo, DpoId, DpoKind, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
+    FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
     Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
@@ -14,6 +14,28 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 enum NextHop {
     Drop,
     Direct,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TestRegisteredDpoKind {
+    dpo_type: DpoType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TestRegisteredDpoIndex(u32);
+
+impl DpoKind for TestRegisteredDpoKind {
+    type Index = TestRegisteredDpoIndex;
+
+    #[inline(always)]
+    fn dpo_type(self) -> DpoType {
+        self.dpo_type
+    }
+
+    #[inline(always)]
+    fn encode_index(index: Self::Index) -> u32 {
+        index.0
+    }
 }
 
 impl Ip4MtrieValue for NextHop {
@@ -456,6 +478,20 @@ fn dpo_registered_type_carries_type_index_and_next() {
     assert_eq!(dpo.adjacency_index(), None);
     assert_eq!(dpo.load_balance_index(), None);
     assert_eq!(dpo.forwarding_index(), 9001);
+}
+
+#[test]
+fn dpo_kind_trait_builds_registered_dpo_with_typed_index() {
+    let mut registry = DpoTypeRegistry::new();
+    let dpo_type = registry.register().expect("registered dpo type");
+    let kind = TestRegisteredDpoKind { dpo_type };
+    let index = TestRegisteredDpoIndex(33);
+    let dpo = Dpo::typed(DpoProto::IP4, kind, index, NextHop::Direct);
+
+    assert_eq!(dpo.kind(), dpo_type);
+    assert_eq!(dpo.proto(), DpoProto::IP4);
+    assert_eq!(dpo.next(), NextHop::Direct);
+    assert_eq!(dpo.forwarding_index(), index.0);
 }
 
 #[test]
