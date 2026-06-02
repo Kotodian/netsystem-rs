@@ -401,6 +401,28 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_ip4_drop_route(&mut self, prefix: Ipv4Net) -> DpoId<N> {
+        let dpo = DpoId::drop(IpVersion::V4, self.drop_next);
+        self.add_ip4_route_dpo(prefix, dpo);
+        dpo
+    }
+
+    #[inline]
+    pub fn add_ip6_drop_route(&mut self, prefix: Ipv6Net) -> DpoId<N> {
+        let dpo = DpoId::drop(IpVersion::V6, self.drop_next);
+        self.add_ip6_route_dpo(prefix, dpo);
+        dpo
+    }
+
+    #[inline]
+    pub fn add_drop_route(&mut self, prefix: IpNet) -> DpoId<N> {
+        match prefix {
+            IpNet::V4(prefix) => self.add_ip4_drop_route(prefix),
+            IpNet::V6(prefix) => self.add_ip6_drop_route(prefix),
+        }
+    }
+
+    #[inline]
     pub fn add_load_balance_dpo(
         &mut self,
         proto: IpVersion,

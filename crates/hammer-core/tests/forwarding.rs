@@ -369,6 +369,57 @@ fn fib_snapshot_builder_adds_generic_punt_route() {
 }
 
 #[test]
+fn fib_snapshot_builder_adds_ip4_drop_route() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let route_dpo =
+        builder.add_ip4_drop_route(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("route"));
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 20), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo, route_dpo);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.next(), NextHop::Drop);
+}
+
+#[test]
+fn fib_snapshot_builder_adds_ip6_drop_route() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0020);
+    let route_dpo = builder.add_ip6_drop_route(Ipv6Net::new(destination, 128).expect("route"));
+    let snapshot = builder.build();
+
+    let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
+    assert_eq!(result.route_dpo, route_dpo);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.proto(), IpVersion::V6);
+    assert_eq!(result.dpo.next(), NextHop::Drop);
+}
+
+#[test]
+fn fib_snapshot_builder_adds_generic_drop_route() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let route_dpo = builder.add_drop_route(IpNet::V4(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 21), 32).expect("route"),
+    ));
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 21), 0)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo, route_dpo);
+    assert_eq!(result.load_balance(), None);
+    assert_eq!(result.bucket_index(), None);
+    assert_eq!(result.dpo.kind(), DpoType::Drop);
+    assert_eq!(result.dpo.next(), NextHop::Drop);
+}
+
+#[test]
 fn dpo_receive_has_no_adjacency_index() {
     let dpo = Dpo::receive(IpVersion::V4, NextHop::Direct);
 
