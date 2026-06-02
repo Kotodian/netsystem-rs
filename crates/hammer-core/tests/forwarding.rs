@@ -537,18 +537,32 @@ fn dpo_stack_preserves_parent_identity_and_updates_next() {
 fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
     let mut type_registry = DpoTypeRegistry::new();
     let child = type_registry.register().expect("child registered type");
+    let child_proto = DpoProto::IP6;
     let parent_type = type_registry.register().expect("parent registered type");
     let parent = Dpo::new(DpoProto::IP4, parent_type, 23, NextHop::Drop);
     let mut stack_registry = DpoStackRegistry::new();
-    stack_registry.register(child, parent.class(), DpoProto::IP4, NextHop::Direct);
+    stack_registry.register(
+        child,
+        child_proto,
+        parent.class(),
+        parent.proto(),
+        NextHop::Direct,
+    );
 
     let stacked = stack_registry
-        .stack(child, parent)
+        .stack(child, child_proto, parent)
         .expect("registered stack edge");
 
     assert_eq!(stacked.class(), parent.class());
     assert_eq!(stacked.forwarding_index(), parent.forwarding_index());
     assert_eq!(stacked.next(), NextHop::Direct);
+
+    assert_eq!(stack_registry.stack(child, DpoProto::IP4, parent), None);
+    let wrong_parent_proto = Dpo::new(DpoProto::IP6, parent_type, 23, NextHop::Drop);
+    assert_eq!(
+        stack_registry.stack(child, child_proto, wrong_parent_proto),
+        None
+    );
 }
 
 #[test]
@@ -557,7 +571,7 @@ fn dpo_stack_registry_rejects_missing_stack_edge() {
     let parent = Dpo::receive(DpoProto::IP6, NextHop::Drop);
     let stack_registry = DpoStackRegistry::<NextHop>::new();
 
-    assert_eq!(stack_registry.stack(child, parent), None);
+    assert_eq!(stack_registry.stack(child, DpoProto::IP6, parent), None);
 }
 
 #[test]

@@ -304,11 +304,19 @@ impl<N> DpoStackRegistry<N> {
     }
 
     #[inline]
-    pub fn register(&mut self, child: DpoClass, parent: DpoClass, proto: DpoProto, next: N) {
+    pub fn register(
+        &mut self,
+        child: DpoClass,
+        child_proto: DpoProto,
+        parent: DpoClass,
+        parent_proto: DpoProto,
+        next: N,
+    ) {
         let key = DpoStackKey {
             child,
+            child_proto,
             parent,
-            proto,
+            parent_proto,
         };
         if let Some(edge) = self.edges.iter_mut().find(|edge| edge.key == key) {
             edge.next = next;
@@ -320,11 +328,12 @@ impl<N> DpoStackRegistry<N> {
 
 impl<N: Copy> DpoStackRegistry<N> {
     #[inline]
-    pub fn stack(&self, child: DpoClass, parent: Dpo<N>) -> Option<Dpo<N>> {
+    pub fn stack(&self, child: DpoClass, child_proto: DpoProto, parent: Dpo<N>) -> Option<Dpo<N>> {
         let key = DpoStackKey {
             child,
+            child_proto,
             parent: parent.class(),
-            proto: parent.proto(),
+            parent_proto: parent.proto(),
         };
         let next = self
             .edges
@@ -338,8 +347,9 @@ impl<N: Copy> DpoStackRegistry<N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DpoStackKey {
     child: DpoClass,
+    child_proto: DpoProto,
     parent: DpoClass,
-    proto: DpoProto,
+    parent_proto: DpoProto,
 }
 
 #[derive(Debug, Clone)]
