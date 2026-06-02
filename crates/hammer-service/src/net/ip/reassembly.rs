@@ -9,6 +9,7 @@ use hammer_adapter::{
     NodeHandle, NodeId, NodeNextFrames, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::vec::Vec;
 
 use crate::net::ip::{
     IpFragmentKey, IpVersion, ParsedIpFragment, parse_ip_fragment_with_chain_len,
