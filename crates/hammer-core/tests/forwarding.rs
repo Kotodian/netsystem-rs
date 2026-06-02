@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
     AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass, DpoId,
-    DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
+    DpoProto, DpoStackRegistry, DpoType, FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie,
     Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError,
     LoadBalanceIndex,
 };
@@ -106,8 +106,8 @@ fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
 #[test]
 fn fib_snapshot_is_generic_over_next_target() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
-    let load_balance = builder.add_load_balance(IpVersion::V4, [adjacency]);
+    let adjacency = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
+    let load_balance = builder.add_load_balance(DpoProto::IP4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,
@@ -124,15 +124,15 @@ fn fib_snapshot_is_generic_over_next_target() {
 #[test]
 fn fib_snapshot_builder_adds_adjacency_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let dpo = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
+    let dpo = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
     let adjacency = dpo.adjacency_index().expect("adjacency DPO index");
 
-    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
 
     let snapshot = builder.build();
     let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency entry");
-    assert_eq!(adjacency_entry.proto, IpVersion::V4);
+    assert_eq!(adjacency_entry.proto, DpoProto::IP4);
     assert_eq!(adjacency_entry.next, NextHop::Direct);
 }
 
@@ -140,8 +140,8 @@ fn fib_snapshot_builder_adds_adjacency_dpo() {
 fn fib_snapshot_builder_adds_load_balance_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_load_balance_dpo(
-        IpVersion::V4,
-        [DpoId::receive(IpVersion::V4, NextHop::Direct)],
+        DpoProto::IP4,
+        [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
         NextHop::Drop,
     );
     let load_balance = route_dpo
@@ -149,7 +149,7 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
         .expect("load-balance DPO index");
 
     assert_eq!(route_dpo.kind(), DpoType::LoadBalance);
-    assert_eq!(route_dpo.proto(), IpVersion::V4);
+    assert_eq!(route_dpo.proto(), DpoProto::IP4);
     assert_eq!(route_dpo.next(), NextHop::Drop);
 
     builder.add_ip4_route_dpo(
@@ -176,7 +176,7 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
 #[test]
 fn fib_snapshot_builder_adds_single_path_load_balance() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let load_balance = builder.add_single_path_load_balance(IpVersion::V4, NextHop::Direct);
+    let load_balance = builder.add_single_path_load_balance(DpoProto::IP4, NextHop::Direct);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 13), 32).expect("route"),
         load_balance,
@@ -189,7 +189,7 @@ fn fib_snapshot_builder_adds_single_path_load_balance() {
         .adjacency_index()
         .expect("adjacency bucket");
     let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency");
-    assert_eq!(adjacency_entry.proto, IpVersion::V4);
+    assert_eq!(adjacency_entry.proto, DpoProto::IP4);
     assert_eq!(adjacency_entry.next, NextHop::Direct);
 
     let result = snapshot
@@ -288,7 +288,7 @@ fn fib_snapshot_builder_adds_ip6_receive_route() {
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
     assert_eq!(result.dpo.kind(), DpoType::Receive);
-    assert_eq!(result.dpo.proto(), IpVersion::V6);
+    assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -345,7 +345,7 @@ fn fib_snapshot_builder_adds_ip6_punt_route() {
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
     assert_eq!(result.dpo.kind(), DpoType::Punt);
-    assert_eq!(result.dpo.proto(), IpVersion::V6);
+    assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }
 
@@ -397,7 +397,7 @@ fn fib_snapshot_builder_adds_ip6_drop_route() {
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
     assert_eq!(result.dpo.kind(), DpoType::Drop);
-    assert_eq!(result.dpo.proto(), IpVersion::V6);
+    assert_eq!(result.dpo.proto(), DpoProto::IP6);
     assert_eq!(result.dpo.next(), NextHop::Drop);
 }
 
@@ -421,10 +421,10 @@ fn fib_snapshot_builder_adds_generic_drop_route() {
 
 #[test]
 fn dpo_receive_has_no_adjacency_index() {
-    let dpo = Dpo::receive(IpVersion::V4, NextHop::Direct);
+    let dpo = Dpo::receive(DpoProto::IP4, NextHop::Direct);
 
     assert_eq!(dpo.kind(), DpoType::Receive);
-    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.adjacency_index(), None);
 }
@@ -432,10 +432,10 @@ fn dpo_receive_has_no_adjacency_index() {
 #[test]
 fn dpo_adjacency_carries_typed_adjacency_index() {
     let adjacency = AdjacencyIndex::new(7);
-    let dpo = Dpo::adjacency(IpVersion::V6, adjacency, NextHop::Direct);
+    let dpo = Dpo::adjacency(DpoProto::IP6, adjacency, NextHop::Direct);
 
     assert_eq!(dpo.kind(), DpoType::Adjacency);
-    assert_eq!(dpo.proto(), IpVersion::V6);
+    assert_eq!(dpo.proto(), DpoProto::IP6);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.adjacency_index(), Some(adjacency));
     assert_eq!(dpo.forwarding_index(), adjacency.get());
@@ -450,10 +450,10 @@ fn dpo_keeps_compact_hot_path_layout_for_u32_next() {
 fn dpo_custom_carries_custom_type_index_and_next() {
     let custom_type = CustomDpoType::new(42).expect("custom type");
     let custom_index = CustomDpoIndex::new(9001);
-    let dpo = Dpo::custom(IpVersion::V6, custom_type, custom_index, NextHop::Direct);
+    let dpo = Dpo::custom(DpoProto::IP6, custom_type, custom_index, NextHop::Direct);
 
     assert_eq!(dpo.kind(), DpoType::Custom);
-    assert_eq!(dpo.proto(), IpVersion::V6);
+    assert_eq!(dpo.proto(), DpoProto::IP6);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.custom_type(), Some(custom_type));
     assert_eq!(dpo.custom_index(), Some(custom_index));
@@ -463,10 +463,10 @@ fn dpo_custom_carries_custom_type_index_and_next() {
 #[test]
 fn dpo_load_balance_carries_typed_load_balance_index() {
     let load_balance = hammer_core::forwarding::LoadBalanceIndex::new(5);
-    let dpo = Dpo::load_balance(IpVersion::V4, load_balance, NextHop::Direct);
+    let dpo = Dpo::load_balance(DpoProto::IP4, load_balance, NextHop::Direct);
 
     assert_eq!(dpo.kind(), DpoType::LoadBalance);
-    assert_eq!(dpo.proto(), IpVersion::V4);
+    assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
     assert_eq!(dpo.load_balance_index(), Some(load_balance));
     assert_eq!(dpo.forwarding_index(), load_balance.get());
@@ -492,11 +492,11 @@ fn custom_dpo_registry_allocates_unique_nonzero_types() {
 fn dpo_stack_preserves_parent_identity_and_updates_next() {
     let custom_type = CustomDpoType::new(9).expect("custom type");
     let custom_index = CustomDpoIndex::new(17);
-    let parent = Dpo::custom(IpVersion::V4, custom_type, custom_index, NextHop::Drop);
+    let parent = Dpo::custom(DpoProto::IP4, custom_type, custom_index, NextHop::Drop);
     let stacked = Dpo::stack(parent, NextHop::Direct);
 
     assert_eq!(stacked.kind(), DpoType::Custom);
-    assert_eq!(stacked.proto(), IpVersion::V4);
+    assert_eq!(stacked.proto(), DpoProto::IP4);
     assert_eq!(stacked.custom_type(), Some(custom_type));
     assert_eq!(stacked.custom_index(), Some(custom_index));
     assert_eq!(stacked.forwarding_index(), custom_index.get());
@@ -510,13 +510,13 @@ fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
     let parent_type = custom_registry.register().expect("parent custom type");
     let child = DpoClass::custom(child_type);
     let parent = Dpo::custom(
-        IpVersion::V4,
+        DpoProto::IP4,
         parent_type,
         CustomDpoIndex::new(23),
         NextHop::Drop,
     );
     let mut stack_registry = DpoStackRegistry::new();
-    stack_registry.register(child, parent.class(), IpVersion::V4, NextHop::Direct);
+    stack_registry.register(child, parent.class(), DpoProto::IP4, NextHop::Direct);
 
     let stacked = stack_registry
         .stack(child, parent)
@@ -530,7 +530,7 @@ fn dpo_stack_registry_stacks_parent_from_child_parent_proto_edge() {
 #[test]
 fn dpo_stack_registry_rejects_missing_stack_edge() {
     let child = DpoClass::builtin(DpoType::Receive).expect("receive class");
-    let parent = Dpo::receive(IpVersion::V6, NextHop::Drop);
+    let parent = Dpo::receive(DpoProto::IP6, NextHop::Drop);
     let stack_registry = DpoStackRegistry::<NextHop>::new();
 
     assert_eq!(stack_registry.stack(child, parent), None);
@@ -540,8 +540,8 @@ fn dpo_stack_registry_rejects_missing_stack_edge() {
 fn fib_snapshot_can_route_to_receive_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::receive(IpVersion::V4, NextHop::Direct)],
+        DpoProto::IP4,
+        [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive host route"),
@@ -553,7 +553,7 @@ fn fib_snapshot_can_route_to_receive_dpo() {
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 10), 0)
         .expect("lookup result");
     assert_eq!(result.dpo.next(), NextHop::Direct);
-    assert_eq!(result.dpo.proto(), IpVersion::V4);
+    assert_eq!(result.dpo.proto(), DpoProto::IP4);
     assert_eq!(result.dpo.adjacency_index(), None);
 }
 
@@ -561,8 +561,8 @@ fn fib_snapshot_can_route_to_receive_dpo() {
 fn fib_snapshot_exposes_route_load_balance_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::receive(IpVersion::V4, NextHop::Direct)],
+        DpoProto::IP4,
+        [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 40), 32).expect("load-balance route"),
@@ -584,15 +584,15 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
 fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let inner = builder.add_load_balance(
-        IpVersion::V4,
+        DpoProto::IP4,
         [
-            DpoId::drop(IpVersion::V4, NextHop::Drop),
-            DpoId::receive(IpVersion::V4, NextHop::Direct),
+            DpoId::drop(DpoProto::IP4, NextHop::Drop),
+            DpoId::receive(DpoProto::IP4, NextHop::Direct),
         ],
     );
     let outer = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::load_balance(IpVersion::V4, inner, NextHop::Drop)],
+        DpoProto::IP4,
+        [DpoId::load_balance(DpoProto::IP4, inner, NextHop::Drop)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 41), 32).expect("nested load-balance route"),
@@ -615,12 +615,12 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 50), 32).expect("receive route"),
-        DpoId::receive(IpVersion::V4, NextHop::Direct),
+        DpoId::receive(DpoProto::IP4, NextHop::Direct),
     );
     let ip6_destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0050);
     builder.add_ip6_route_dpo(
         Ipv6Net::new(ip6_destination, 128).expect("receive route"),
-        DpoId::receive(IpVersion::V6, NextHop::Direct),
+        DpoId::receive(DpoProto::IP6, NextHop::Direct),
     );
     let snapshot = builder.build();
 
@@ -637,7 +637,7 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
         .lookup_ip6(ip6_destination, 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::Receive);
-    assert_eq!(result.route_dpo.proto(), IpVersion::V6);
+    assert_eq!(result.route_dpo.proto(), DpoProto::IP6);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
     assert_eq!(result.dpo.next(), NextHop::Direct);
@@ -648,7 +648,7 @@ fn fib_snapshot_adds_dpo_backed_fib_entry() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     builder.add_entry(FibEntry::new(
         IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 60), 32).expect("punt route")),
-        DpoId::punt(IpVersion::V4, NextHop::Direct),
+        DpoId::punt(DpoProto::IP4, NextHop::Direct),
     ));
     let snapshot = builder.build();
 
@@ -668,30 +668,30 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
     let err = builder
         .try_add_ip4_route_dpo(
             Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 70), 32).expect("route"),
-            DpoId::receive(IpVersion::V6, NextHop::Direct),
+            DpoId::receive(DpoProto::IP6, NextHop::Direct),
         )
         .expect_err("wrong-proto route DPO should be rejected");
 
     assert_eq!(
         err,
         FibRouteDpoError::ProtoMismatch {
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
         }
     );
 
     let err = builder
         .try_add_entry(FibEntry::new(
             IpNet::V6(Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("route")),
-            DpoId::punt(IpVersion::V4, NextHop::Direct),
+            DpoId::punt(DpoProto::IP4, NextHop::Direct),
         ))
         .expect_err("wrong-proto FIB entry should be rejected");
 
     assert_eq!(
         err,
         FibRouteDpoError::ProtoMismatch {
-            expected: IpVersion::V6,
-            actual: IpVersion::V4,
+            expected: DpoProto::IP6,
+            actual: DpoProto::IP4,
         }
     );
 }
@@ -703,7 +703,7 @@ fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
     let err = builder
         .try_add_ip4_route_dpo(
             Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 75), 32).expect("route"),
-            DpoId::adjacency(IpVersion::V4, missing, NextHop::Direct),
+            DpoId::adjacency(DpoProto::IP4, missing, NextHop::Direct),
         )
         .expect_err("route DPO with missing adjacency should be rejected");
 
@@ -713,11 +713,11 @@ fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
 #[test]
 fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency(IpVersion::V6, NextHop::Direct);
+    let adjacency = builder.add_adjacency(DpoProto::IP6, NextHop::Direct);
     let err = builder
         .try_add_ip4_route_dpo(
             Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 76), 32).expect("route"),
-            DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct),
+            DpoId::adjacency(DpoProto::IP4, adjacency, NextHop::Direct),
         )
         .expect_err("route DPO with wrong-proto adjacency should be rejected");
 
@@ -725,8 +725,8 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
         err,
         FibRouteDpoError::AdjacencyProtoMismatch {
             index: adjacency,
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
         }
     );
 }
@@ -735,7 +735,7 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
 fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance =
-        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+        builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
 
     let err = builder
         .try_add_ip4_route(
@@ -747,8 +747,8 @@ fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
     assert_eq!(
         err,
         FibRouteDpoError::LoadBalanceProtoMismatch {
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
         }
     );
 
@@ -767,20 +767,20 @@ fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
 fn fib_snapshot_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let load_balance =
-        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+        builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
 
     let err = builder
         .try_add_ip4_route_dpo(
             Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 85), 32).expect("route"),
-            DpoId::load_balance(IpVersion::V4, load_balance, NextHop::Drop),
+            DpoId::load_balance(DpoProto::IP4, load_balance, NextHop::Drop),
         )
         .expect_err("wrong-proto load-balance DPO route should be rejected");
 
     assert_eq!(
         err,
         FibRouteDpoError::LoadBalanceProtoMismatch {
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
         }
     );
 
@@ -788,7 +788,7 @@ fn fib_snapshot_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
     let err = builder
         .try_add_ip6_route_dpo(
             Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).expect("route"),
-            DpoId::load_balance(IpVersion::V6, missing, NextHop::Drop),
+            DpoId::load_balance(DpoProto::IP6, missing, NextHop::Drop),
         )
         .expect_err("missing load-balance DPO route should be rejected");
 
@@ -801,8 +801,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
     let missing = AdjacencyIndex::new(99);
     let err = builder
         .try_add_load_balance(
-            IpVersion::V4,
-            [DpoId::adjacency(IpVersion::V4, missing, NextHop::Direct)],
+            DpoProto::IP4,
+            [DpoId::adjacency(DpoProto::IP4, missing, NextHop::Direct)],
         )
         .expect_err("load-balance bucket with missing adjacency should be rejected");
 
@@ -818,11 +818,11 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
 #[test]
 fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency(IpVersion::V6, NextHop::Direct);
+    let adjacency = builder.add_adjacency(DpoProto::IP6, NextHop::Direct);
     let err = builder
         .try_add_load_balance(
-            IpVersion::V4,
-            [DpoId::adjacency(IpVersion::V4, adjacency, NextHop::Direct)],
+            DpoProto::IP4,
+            [DpoId::adjacency(DpoProto::IP4, adjacency, NextHop::Direct)],
         )
         .expect_err("load-balance bucket with wrong-proto adjacency should be rejected");
 
@@ -830,8 +830,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
         err,
         LoadBalanceError::BucketAdjacencyProtoMismatch {
             index: adjacency,
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
             bucket_index: 0,
         }
     );
@@ -843,8 +843,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_load_balance() {
     let missing = LoadBalanceIndex::new(99);
     let err = builder
         .try_add_load_balance(
-            IpVersion::V4,
-            [DpoId::load_balance(IpVersion::V4, missing, NextHop::Direct)],
+            DpoProto::IP4,
+            [DpoId::load_balance(DpoProto::IP4, missing, NextHop::Direct)],
         )
         .expect_err("load-balance bucket with missing load-balance should be rejected");
 
@@ -861,11 +861,11 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_load_balance() {
 fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     let inner =
-        builder.add_load_balance(IpVersion::V6, [DpoId::drop(IpVersion::V6, NextHop::Drop)]);
+        builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
     let err = builder
         .try_add_load_balance(
-            IpVersion::V4,
-            [DpoId::load_balance(IpVersion::V4, inner, NextHop::Direct)],
+            DpoProto::IP4,
+            [DpoId::load_balance(DpoProto::IP4, inner, NextHop::Direct)],
         )
         .expect_err("load-balance bucket with wrong-proto load-balance should be rejected");
 
@@ -873,8 +873,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
         err,
         LoadBalanceError::BucketLoadBalanceProtoMismatch {
             index: inner,
-            expected: IpVersion::V4,
-            actual: IpVersion::V6,
+            expected: DpoProto::IP4,
+            actual: DpoProto::IP6,
             bucket_index: 0,
         }
     );
@@ -883,8 +883,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
 #[test]
 fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
-    let adjacency = builder.add_adjacency_dpo(IpVersion::V4, NextHop::Direct);
-    let load_balance = builder.add_load_balance(IpVersion::V4, [adjacency]);
+    let adjacency = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
+    let load_balance = builder.add_load_balance(DpoProto::IP4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,

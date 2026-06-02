@@ -7,11 +7,10 @@ use hammer_adapter::{
     NodeResult,
 };
 use hammer_core::error::CoreResult;
-use hammer_core::protocol::ip::IpVersion;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    CustomDpoIndex, CustomDpoType, Dpo, DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode,
-    IpLookupControlPlane, IpLookupNode,
+    CustomDpoIndex, CustomDpoType, Dpo, DpoId, DpoProto, FibSnapshotBuilder, IpInputNext,
+    IpInputNode, IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -142,9 +141,9 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let drop = runtime.nodes().register_internal(DropNode::new());
 
     let mut builder = FibSnapshotBuilder::new(drop);
-    let default_lb = add_single_path(&mut builder, IpVersion::V4, default);
-    let specific_lb = add_single_path(&mut builder, IpVersion::V4, specific);
-    let host_lb = add_single_path(&mut builder, IpVersion::V4, host);
+    let default_lb = add_single_path(&mut builder, DpoProto::IP4, default);
+    let specific_lb = add_single_path(&mut builder, DpoProto::IP4, specific);
+    let host_lb = add_single_path(&mut builder, DpoProto::IP4, host);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         default_lb,
@@ -200,7 +199,7 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         lb,
@@ -245,7 +244,7 @@ fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
         lb,
@@ -291,9 +290,9 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
     let drop = runtime.nodes().register_internal(DropNode::new());
 
     let mut builder = FibSnapshotBuilder::new(drop);
-    let default_lb = add_single_path(&mut builder, IpVersion::V6, default);
-    let subnet_lb = add_single_path(&mut builder, IpVersion::V6, subnet);
-    let host_lb = add_single_path(&mut builder, IpVersion::V6, host);
+    let default_lb = add_single_path(&mut builder, DpoProto::IP6, default);
+    let subnet_lb = add_single_path(&mut builder, DpoProto::IP6, subnet);
+    let host_lb = add_single_path(&mut builder, DpoProto::IP6, host);
     builder.add_ip6_route(
         Ipv6Net::new(Ipv6Addr::UNSPECIFIED, 0).expect("default route"),
         default_lb,
@@ -367,7 +366,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
     let receive_lb =
-        builder.add_load_balance(IpVersion::V4, [DpoId::receive(IpVersion::V4, receive)]);
+        builder.add_load_balance(DpoProto::IP4, [DpoId::receive(DpoProto::IP4, receive)]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive route"),
         receive_lb,
@@ -404,7 +403,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let mut builder = FibSnapshotBuilder::new(drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 11), 32).expect("direct receive route"),
-        DpoId::receive(IpVersion::V4, receive),
+        DpoId::receive(DpoProto::IP4, receive),
     );
     let lookup = runtime
         .nodes()
@@ -438,9 +437,9 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let receive = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let parent = Dpo::receive(IpVersion::V4, drop);
+    let parent = Dpo::receive(DpoProto::IP4, drop);
     let stacked = Dpo::stack(parent, receive);
-    let stack_lb = builder.add_load_balance(IpVersion::V4, [stacked]);
+    let stack_lb = builder.add_load_balance(DpoProto::IP4, [stacked]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("stack route"),
         stack_lb,
@@ -476,9 +475,9 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let custom_index = CustomDpoIndex::new(11);
     let mut builder = FibSnapshotBuilder::new(drop);
     let custom_lb = builder.add_load_balance(
-        IpVersion::V4,
+        DpoProto::IP4,
         [Dpo::custom(
-            IpVersion::V4,
+            DpoProto::IP4,
             custom_type,
             custom_index,
             custom,
@@ -519,7 +518,7 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
     let drop = runtime.nodes().register_internal(DropNode::new());
 
     let mut first_builder = FibSnapshotBuilder::new(drop);
-    let first_lb = add_single_path(&mut first_builder, IpVersion::V4, first);
+    let first_lb = add_single_path(&mut first_builder, DpoProto::IP4, first);
     first_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("first default"),
         first_lb,
@@ -542,7 +541,7 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
     assert_payloads(&first_state, &[b"first".as_slice()]);
 
     let mut second_builder = FibSnapshotBuilder::new(drop);
-    let second_lb = add_single_path(&mut second_builder, IpVersion::V4, second);
+    let second_lb = add_single_path(&mut second_builder, DpoProto::IP4, second);
     second_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("second default"),
         second_lb,
@@ -573,7 +572,7 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         lb,
@@ -649,7 +648,7 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibSnapshotBuilder::new(drop);
-    let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+    let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         lb,
@@ -696,10 +695,10 @@ fn register_sink(
 
 fn add_single_path(
     builder: &mut FibSnapshotBuilder,
-    version: IpVersion,
+    proto: DpoProto,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
-    builder.add_single_path_load_balance(version, node)
+    builder.add_single_path_load_balance(proto, node)
 }
 
 fn push_packet(

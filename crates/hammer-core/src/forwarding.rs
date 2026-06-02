@@ -6,7 +6,7 @@ mod load_balance;
 
 pub use dpo::{
     Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoRegistry, CustomDpoType, Dpo, DpoClass,
-    DpoId, DpoStackRegistry, DpoType,
+    DpoId, DpoProto, DpoStackRegistry, DpoType,
 };
 pub use fib::{
     FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot, FibSnapshotBuilder, flow_hash,

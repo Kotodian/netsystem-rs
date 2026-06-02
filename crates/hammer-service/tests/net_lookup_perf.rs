@@ -10,10 +10,9 @@ use hammer_adapter::{
     RouteMetadata,
 };
 use hammer_core::error::CoreResult;
-use hammer_core::protocol::ip::IpVersion;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -356,7 +355,7 @@ fn build_lookup(
     match scenario {
         Scenario::Ipv4SameNext => {
             let sink = register_sink(runtime, packets, checksum);
-            let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+            let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
             builder.add_ip4_route(
                 Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
                 lb,
@@ -365,7 +364,7 @@ fn build_lookup(
         Scenario::Ipv4MixedNext => {
             for route in 1..=4 {
                 let sink = register_sink(runtime, packets, checksum);
-                let lb = add_single_path(&mut builder, IpVersion::V4, sink);
+                let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
                 builder.add_ip4_route(
                     Ipv4Net::new(Ipv4Addr::new(198, 51, route, 0), 24).expect("mixed route"),
                     lb,
@@ -374,7 +373,7 @@ fn build_lookup(
         }
         Scenario::Ipv6SameNext => {
             let sink = register_sink(runtime, packets, checksum);
-            let lb = add_single_path(&mut builder, IpVersion::V6, sink);
+            let lb = add_single_path(&mut builder, DpoProto::IP6, sink);
             builder.add_ip6_route(
                 Ipv6Net::new(Ipv6Addr::new(0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 0), 64)
                     .expect("ipv6 route"),
@@ -415,10 +414,10 @@ fn register_sink(
 
 fn add_single_path(
     builder: &mut FibSnapshotBuilder,
-    version: IpVersion,
+    proto: DpoProto,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {
-    builder.add_single_path_load_balance(version, node)
+    builder.add_single_path_load_balance(proto, node)
 }
 
 fn build_packets(scenario: Scenario) -> Vec<Vec<u8>> {

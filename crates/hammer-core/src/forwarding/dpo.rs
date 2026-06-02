@@ -2,6 +2,54 @@ use crate::protocol::ip::IpVersion;
 
 use super::load_balance::LoadBalanceIndex;
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DpoProto(u8);
+
+impl DpoProto {
+    #[inline(always)]
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    #[inline(always)]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    pub const IP4: Self = Self(0);
+    pub const IP6: Self = Self(1);
+    pub const MPLS: Self = Self(2);
+    pub const ETHERNET: Self = Self(3);
+    pub const BIER: Self = Self(4);
+    pub const NSH: Self = Self(5);
+
+    #[inline(always)]
+    pub const fn from_ip_version(version: IpVersion) -> Self {
+        match version {
+            IpVersion::V4 => Self::IP4,
+            IpVersion::V6 => Self::IP6,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn ip_version(self) -> Option<IpVersion> {
+        match self {
+            Self::IP4 => Some(IpVersion::V4),
+            Self::IP6 => Some(IpVersion::V6),
+            Self::MPLS | Self::ETHERNET | Self::BIER | Self::NSH => None,
+            _ => None,
+        }
+    }
+}
+
+impl From<IpVersion> for DpoProto {
+    #[inline(always)]
+    fn from(value: IpVersion) -> Self {
+        Self::from_ip_version(value)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdjacencyIndex(u32);
 
@@ -149,14 +197,14 @@ pub struct Dpo<N> {
     index: u32,
     custom_type: u16,
     dpo_type: DpoType,
-    proto: IpVersion,
+    proto: DpoProto,
 }
 
 pub type DpoId<N> = Dpo<N>;
 
 impl<N> Dpo<N> {
     #[inline(always)]
-    pub const fn drop(proto: IpVersion, next: N) -> Self {
+    pub const fn drop(proto: DpoProto, next: N) -> Self {
         Self {
             next,
             index: 0,
@@ -167,7 +215,7 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
-    pub const fn punt(proto: IpVersion, next: N) -> Self {
+    pub const fn punt(proto: DpoProto, next: N) -> Self {
         Self {
             next,
             index: 0,
@@ -178,7 +226,7 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
-    pub const fn receive(proto: IpVersion, next: N) -> Self {
+    pub const fn receive(proto: DpoProto, next: N) -> Self {
         Self {
             next,
             index: 0,
@@ -189,7 +237,7 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
-    pub const fn adjacency(proto: IpVersion, adjacency: AdjacencyIndex, next: N) -> Self {
+    pub const fn adjacency(proto: DpoProto, adjacency: AdjacencyIndex, next: N) -> Self {
         Self {
             next,
             index: adjacency.get(),
@@ -200,7 +248,7 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
-    pub const fn load_balance(proto: IpVersion, load_balance: LoadBalanceIndex, next: N) -> Self {
+    pub const fn load_balance(proto: DpoProto, load_balance: LoadBalanceIndex, next: N) -> Self {
         Self {
             next,
             index: load_balance.get(),
@@ -228,7 +276,7 @@ impl<N> Dpo<N> {
 
     #[inline(always)]
     pub const fn custom(
-        proto: IpVersion,
+        proto: DpoProto,
         custom_type: CustomDpoType,
         custom_index: CustomDpoIndex,
         next: N,
@@ -243,7 +291,7 @@ impl<N> Dpo<N> {
     }
 
     #[inline(always)]
-    pub const fn proto(&self) -> IpVersion {
+    pub const fn proto(&self) -> DpoProto {
         self.proto
     }
 
@@ -349,7 +397,7 @@ impl<N> DpoStackRegistry<N> {
     }
 
     #[inline]
-    pub fn register(&mut self, child: DpoClass, parent: DpoClass, proto: IpVersion, next: N) {
+    pub fn register(&mut self, child: DpoClass, parent: DpoClass, proto: DpoProto, next: N) {
         let key = DpoStackKey {
             child,
             parent,
@@ -384,7 +432,7 @@ impl<N: Copy> DpoStackRegistry<N> {
 struct DpoStackKey {
     child: DpoClass,
     parent: DpoClass,
-    proto: IpVersion,
+    proto: DpoProto,
 }
 
 #[derive(Debug, Clone)]
@@ -397,5 +445,5 @@ struct DpoStackEdge<N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Adjacency<N> {
     pub next: N,
-    pub proto: IpVersion,
+    pub proto: DpoProto,
 }

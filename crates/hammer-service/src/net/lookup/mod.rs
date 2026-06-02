@@ -14,8 +14,8 @@ use hammer_core::forwarding::{
     FibSnapshotBuilder as CoreFibSnapshotBuilder, LoadBalance as CoreLoadBalance,
 };
 pub use hammer_core::forwarding::{
-    AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoStackRegistry, DpoType,
-    FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
+    AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoProto, DpoStackRegistry,
+    DpoType, FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,

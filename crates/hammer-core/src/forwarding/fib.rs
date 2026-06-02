@@ -4,7 +4,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
-use super::dpo::{Adjacency, AdjacencyIndex, DpoId};
+use super::dpo::{Adjacency, AdjacencyIndex, DpoId, DpoProto};
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
@@ -26,23 +26,23 @@ impl<N> FibEntry<N> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FibRouteDpoError {
     ProtoMismatch {
-        expected: IpVersion,
-        actual: IpVersion,
+        expected: DpoProto,
+        actual: DpoProto,
     },
     LoadBalanceMissing {
         index: LoadBalanceIndex,
     },
     LoadBalanceProtoMismatch {
-        expected: IpVersion,
-        actual: IpVersion,
+        expected: DpoProto,
+        actual: DpoProto,
     },
     AdjacencyMissing {
         index: AdjacencyIndex,
     },
     AdjacencyProtoMismatch {
         index: AdjacencyIndex,
-        expected: IpVersion,
-        actual: IpVersion,
+        expected: DpoProto,
+        actual: DpoProto,
     },
 }
 
@@ -286,14 +286,14 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
-    pub fn add_adjacency(&mut self, proto: IpVersion, next: N) -> AdjacencyIndex {
+    pub fn add_adjacency(&mut self, proto: DpoProto, next: N) -> AdjacencyIndex {
         let index = AdjacencyIndex::new(self.adjacencies.len() as u32);
         self.adjacencies.push(Adjacency { next, proto });
         index
     }
 
     #[inline]
-    pub fn add_adjacency_dpo(&mut self, proto: IpVersion, next: N) -> DpoId<N> {
+    pub fn add_adjacency_dpo(&mut self, proto: DpoProto, next: N) -> DpoId<N> {
         let adjacency = self.add_adjacency(proto, next);
         DpoId::adjacency(proto, adjacency, next)
     }
@@ -308,7 +308,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     #[inline]
     pub fn add_load_balance(
         &mut self,
-        proto: IpVersion,
+        proto: DpoProto,
         buckets: impl Into<Vec<DpoId<N>>>,
     ) -> LoadBalanceIndex {
         self.try_add_load_balance(proto, buckets)
@@ -318,7 +318,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     #[inline]
     pub fn try_add_load_balance(
         &mut self,
-        proto: IpVersion,
+        proto: DpoProto,
         buckets: impl Into<Vec<DpoId<N>>>,
     ) -> Result<LoadBalanceIndex, LoadBalanceError> {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
@@ -329,21 +329,21 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
-    pub fn add_single_path_load_balance(&mut self, proto: IpVersion, next: N) -> LoadBalanceIndex {
+    pub fn add_single_path_load_balance(&mut self, proto: DpoProto, next: N) -> LoadBalanceIndex {
         let adjacency = self.add_adjacency_dpo(proto, next);
         self.add_load_balance(proto, [adjacency])
     }
 
     #[inline]
     pub fn add_ip4_single_path_route(&mut self, prefix: Ipv4Net, next: N) -> LoadBalanceIndex {
-        let load_balance = self.add_single_path_load_balance(IpVersion::V4, next);
+        let load_balance = self.add_single_path_load_balance(DpoProto::IP4, next);
         self.add_ip4_route(prefix, load_balance);
         load_balance
     }
 
     #[inline]
     pub fn add_ip6_single_path_route(&mut self, prefix: Ipv6Net, next: N) -> LoadBalanceIndex {
-        let load_balance = self.add_single_path_load_balance(IpVersion::V6, next);
+        let load_balance = self.add_single_path_load_balance(DpoProto::IP6, next);
         self.add_ip6_route(prefix, load_balance);
         load_balance
     }
@@ -358,14 +358,14 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_receive_route(&mut self, prefix: Ipv4Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::receive(IpVersion::V4, next);
+        let dpo = DpoId::receive(DpoProto::IP4, next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
     pub fn add_ip6_receive_route(&mut self, prefix: Ipv6Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::receive(IpVersion::V6, next);
+        let dpo = DpoId::receive(DpoProto::IP6, next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
@@ -380,14 +380,14 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_punt_route(&mut self, prefix: Ipv4Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::punt(IpVersion::V4, next);
+        let dpo = DpoId::punt(DpoProto::IP4, next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
     pub fn add_ip6_punt_route(&mut self, prefix: Ipv6Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::punt(IpVersion::V6, next);
+        let dpo = DpoId::punt(DpoProto::IP6, next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
@@ -402,14 +402,14 @@ impl<N: Copy> FibSnapshotBuilder<N> {
 
     #[inline]
     pub fn add_ip4_drop_route(&mut self, prefix: Ipv4Net) -> DpoId<N> {
-        let dpo = DpoId::drop(IpVersion::V4, self.drop_next);
+        let dpo = DpoId::drop(DpoProto::IP4, self.drop_next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
     pub fn add_ip6_drop_route(&mut self, prefix: Ipv6Net) -> DpoId<N> {
-        let dpo = DpoId::drop(IpVersion::V6, self.drop_next);
+        let dpo = DpoId::drop(DpoProto::IP6, self.drop_next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
@@ -425,7 +425,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     #[inline]
     pub fn add_load_balance_dpo(
         &mut self,
-        proto: IpVersion,
+        proto: DpoProto,
         buckets: impl Into<Vec<DpoId<N>>>,
         next: N,
     ) -> DpoId<N> {
@@ -437,7 +437,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     #[inline]
     pub fn try_add_load_balance_dpo(
         &mut self,
-        proto: IpVersion,
+        proto: DpoProto,
         buckets: impl Into<Vec<DpoId<N>>>,
         next: N,
     ) -> Result<DpoId<N>, LoadBalanceError> {
@@ -457,9 +457,9 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv4Net,
         load_balance: LoadBalanceIndex,
     ) -> Result<(), FibRouteDpoError> {
-        self.validate_load_balance_proto(IpVersion::V4, load_balance)?;
+        self.validate_load_balance_proto(DpoProto::IP4, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
-            IpVersion::V4,
+            DpoProto::IP4,
             load_balance,
             self.drop_next,
         ));
@@ -479,9 +479,9 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv6Net,
         load_balance: LoadBalanceIndex,
     ) -> Result<(), FibRouteDpoError> {
-        self.validate_load_balance_proto(IpVersion::V6, load_balance)?;
+        self.validate_load_balance_proto(DpoProto::IP6, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
-            IpVersion::V6,
+            DpoProto::IP6,
             load_balance,
             self.drop_next,
         ));
@@ -501,7 +501,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv4Net,
         dpo: DpoId<N>,
     ) -> Result<(), FibRouteDpoError> {
-        self.validate_route_dpo(IpVersion::V4, dpo)?;
+        self.validate_route_dpo(DpoProto::IP4, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip4_routes.push(Ip4Route { prefix, route_dpo });
         Ok(())
@@ -519,7 +519,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         prefix: Ipv6Net,
         dpo: DpoId<N>,
     ) -> Result<(), FibRouteDpoError> {
-        self.validate_route_dpo(IpVersion::V6, dpo)?;
+        self.validate_route_dpo(DpoProto::IP6, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
         Ok(())
@@ -593,15 +593,15 @@ impl<N: Copy> FibSnapshotBuilder<N> {
             },
             adjacencies: self.adjacencies.into_boxed_slice(),
             drop_next: self.drop_next,
-            ip4_drop: DpoId::drop(IpVersion::V4, self.drop_next),
-            ip6_drop: DpoId::drop(IpVersion::V6, self.drop_next),
+            ip4_drop: DpoId::drop(DpoProto::IP4, self.drop_next),
+            ip6_drop: DpoId::drop(DpoProto::IP6, self.drop_next),
         }
     }
 
     #[inline]
     fn validate_load_balance_proto(
         &self,
-        expected: IpVersion,
+        expected: DpoProto,
         index: LoadBalanceIndex,
     ) -> Result<(), FibRouteDpoError> {
         let load_balance = self
@@ -656,7 +656,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     fn validate_load_balance_bucket_load_balance(
         &self,
         index: LoadBalanceIndex,
-        expected: IpVersion,
+        expected: DpoProto,
         bucket_index: u16,
     ) -> Result<(), LoadBalanceError> {
         let Some(load_balance) = self.load_balances.get(index.slot()) else {
@@ -680,7 +680,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     #[inline]
     fn validate_route_dpo(
         &self,
-        expected: IpVersion,
+        expected: DpoProto,
         dpo: DpoId<N>,
     ) -> Result<(), FibRouteDpoError> {
         validate_route_dpo_proto(expected, dpo)?;
@@ -697,7 +697,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     fn validate_route_dpo_adjacency(
         &self,
         index: AdjacencyIndex,
-        expected: IpVersion,
+        expected: DpoProto,
     ) -> Result<(), FibRouteDpoError> {
         let Some(adjacency) = self.adjacencies.get(index.slot()) else {
             return Err(FibRouteDpoError::AdjacencyMissing { index });
@@ -727,7 +727,7 @@ struct Ip6Route {
 }
 
 #[inline(always)]
-fn validate_route_dpo_proto<N>(expected: IpVersion, dpo: DpoId<N>) -> Result<(), FibRouteDpoError> {
+fn validate_route_dpo_proto<N>(expected: DpoProto, dpo: DpoId<N>) -> Result<(), FibRouteDpoError> {
     let actual = dpo.proto();
     if actual == expected {
         Ok(())

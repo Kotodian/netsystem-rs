@@ -7,7 +7,7 @@ pub use ip::{
     IpReassemblyNext, IpReassemblyNode,
 };
 pub use lookup::{
-    Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoId,
+    Adjacency, AdjacencyIndex, CustomDpoIndex, CustomDpoType, Dpo, DpoClass, DpoId, DpoProto,
     DpoStackRegistry, DpoType, FibEntry, FibLookupResult, FibRouteDpoError, FibSnapshot,
     FibSnapshotBuilder, FibSnapshotHandle, IpLookupControlPlane, IpLookupNode, LoadBalance,
     LoadBalanceError, LoadBalanceIndex,
