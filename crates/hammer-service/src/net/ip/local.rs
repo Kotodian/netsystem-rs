@@ -8,6 +8,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
+use crate::data_plane::FeatureArc;
 use crate::net::{DpoType, FibLookupResult, FibSnapshotHandle};
 
 use super::parse_ip_packet_with_chain_len;
@@ -21,8 +22,11 @@ const TCP_HEADER_MIN_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
 const ICMP_HEADER_MIN_LEN: usize = 4;
 
-#[hammer_component_macros::feature_arc(name = "ip-local")]
-pub struct IpLocalArc;
+#[hammer_component_macros::feature_arc]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpLocalArc {
+    LocalForward,
+}
 
 #[hammer_component_macros::node_next]
 pub enum IpLocalNext {
@@ -32,7 +36,6 @@ pub enum IpLocalNext {
     Udp,
     Icmp,
     Reassembly,
-    Feature,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,11 +116,22 @@ impl IpLocalControlPlane {
     }
 
     #[inline]
-    pub fn set_feature_start_node(&self, node: NodeId) {
+    pub fn set_feature_arc(&self, arc: FeatureArc<IpLocalArc>, end_of_arc: NodeId) {
         self.inner.rcu(|current| {
             let mut next = IpLocalSnapshot::clone(current);
-            next.next[IpLocalNext::Feature.slot()] = node;
-            next.feature_start_enabled = true;
+            next.feature_arc = Some(IpLocalFeatureArc {
+                arc: arc.clone(),
+                end_of_arc,
+            });
+            next
+        });
+    }
+
+    #[inline]
+    pub fn clear_feature_arc(&self) {
+        self.inner.rcu(|current| {
+            let mut next = IpLocalSnapshot::clone(current);
+            next.feature_arc = None;
             next
         });
     }
@@ -136,8 +150,14 @@ impl IpLocalControlPlane {
 struct IpLocalSnapshot {
     next: [NodeId; IpLocalNext::COUNT],
     protocol_nexts: Box<[NodeId; 256]>,
-    feature_start_enabled: bool,
+    feature_arc: Option<IpLocalFeatureArc>,
     source_check: IpLocalSourceCheck,
+}
+
+#[derive(Debug, Clone)]
+struct IpLocalFeatureArc {
+    arc: FeatureArc<IpLocalArc>,
+    end_of_arc: NodeId,
 }
 
 impl IpLocalSnapshot {
@@ -152,7 +172,7 @@ impl IpLocalSnapshot {
         Self {
             next,
             protocol_nexts,
-            feature_start_enabled: false,
+            feature_arc: None,
             source_check: IpLocalSourceCheck::Disabled,
         }
     }
@@ -175,11 +195,6 @@ impl IpLocalSnapshot {
     #[inline(always)]
     fn reassembly_next(&self) -> NodeId {
         self.next[IpLocalNext::Reassembly.slot()]
-    }
-
-    #[inline(always)]
-    fn feature_next(&self) -> NodeId {
-        self.next[IpLocalNext::Feature.slot()]
     }
 }
 
@@ -331,8 +346,10 @@ fn process_index<G>(
             set_index_error(runtime, index, IpLocalError::SourceCheckFailed)?;
             return Ok(snapshot.drop_next());
         }
-        if snapshot.feature_start_enabled {
-            return Ok(snapshot.feature_next());
+        if let Some(feature_arc) = &snapshot.feature_arc {
+            return runtime.with_metadata_mut(index, |metadata| {
+                feature_arc.arc.start_or(metadata, feature_arc.end_of_arc)
+            });
         }
     }
 

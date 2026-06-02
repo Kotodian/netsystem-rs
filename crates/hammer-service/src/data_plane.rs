@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::rc::Rc;
@@ -39,32 +40,35 @@ impl<G> Node<G> for DropNode {
 impl<G> InternalNode<G> for DropNode {}
 
 pub struct FeatureArc<A: FeatureArcSpec> {
-    inner: Arc<FeatureArcInner>,
+    inner: Arc<FeatureArcInner<A>>,
     _arc: PhantomData<fn() -> A>,
 }
 
 pub struct FeatureArcControl<A: FeatureArcSpec> {
-    inner: Arc<FeatureArcInner>,
-    state: FeatureArcSnapshot,
+    inner: Arc<FeatureArcInner<A>>,
+    state: FeatureArcSnapshot<A>,
     _arc: PhantomData<fn() -> A>,
     _control_thread_only: PhantomData<Rc<()>>,
 }
 
 #[derive(Debug)]
-struct FeatureArcInner {
-    snapshot: ArcSwap<FeatureArcSnapshot>,
+struct FeatureArcInner<A: FeatureArcSpec> {
+    snapshot: ArcSwap<FeatureArcSnapshot<A>>,
 }
 
-pub trait FeatureArcSpec {
-    const NAME: &'static str;
-}
+pub trait FeatureArcSpec: Copy + Eq + Hash + fmt::Debug + 'static {}
 
-pub trait Feature<A: FeatureArcSpec> {
-    const NAME: &'static str;
+pub trait Feature<A: FeatureArcSpec>: 'static {
+    fn id() -> A;
 
     #[inline]
-    fn order() -> FeatureArcOrder {
-        FeatureArcOrder::default()
+    fn before() -> Vec<A> {
+        Vec::new()
+    }
+
+    #[inline]
+    fn after() -> Vec<A> {
+        Vec::new()
     }
 }
 
@@ -80,33 +84,37 @@ impl<A: FeatureArcSpec> Clone for FeatureArc<A> {
 
 impl<A: FeatureArcSpec> fmt::Debug for FeatureArc<A> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FeatureArc")
-            .field("name", &A::NAME)
-            .finish_non_exhaustive()
+        formatter.debug_struct("FeatureArc").finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FeatureArcOrder {
-    before: Vec<String>,
-    after: Vec<String>,
-}
-
 #[derive(Debug, Clone)]
-struct FeatureArcRegistration {
+struct FeatureArcRegistration<A: FeatureArcSpec> {
     node: NodeId,
-    order: FeatureArcOrder,
+    before: Vec<A>,
+    after: Vec<A>,
     ordinal: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct FeatureArcSnapshot {
-    registered: HashMap<String, FeatureArcRegistration>,
-    feature_order: Vec<String>,
-    enabled: HashMap<u32, Vec<FeatureArcEnabled>>,
+#[derive(Debug, Clone)]
+struct FeatureArcSnapshot<A: FeatureArcSpec> {
+    registered: HashMap<A, FeatureArcRegistration<A>>,
+    feature_order: Vec<A>,
+    enabled: HashMap<u32, Vec<FeatureArcEnabled<A>>>,
     end_nodes: HashMap<u32, NodeId>,
     chains: HashMap<u32, FeatureArcChain>,
+}
+
+impl<A: FeatureArcSpec> Default for FeatureArcSnapshot<A> {
+    fn default() -> Self {
+        Self {
+            registered: HashMap::new(),
+            feature_order: Vec::new(),
+            enabled: HashMap::new(),
+            end_nodes: HashMap::new(),
+            chains: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,8 +123,8 @@ struct FeatureArcChain {
 }
 
 #[derive(Debug, Clone)]
-struct FeatureArcEnabled {
-    name: String,
+struct FeatureArcEnabled<A: FeatureArcSpec> {
+    id: A,
     config: Option<Vec<u8>>,
 }
 
@@ -124,57 +132,6 @@ struct FeatureArcEnabled {
 struct FeatureArcStep {
     node: NodeId,
     config: Option<Vec<u8>>,
-}
-
-impl FeatureArcOrder {
-    #[inline]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline]
-    pub fn runs_before<I, S>(names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            before: names.into_iter().map(Into::into).collect(),
-            after: Vec::new(),
-        }
-    }
-
-    #[inline]
-    pub fn runs_after<I, S>(names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        Self {
-            before: Vec::new(),
-            after: names.into_iter().map(Into::into).collect(),
-        }
-    }
-
-    #[inline]
-    pub fn with_runs_before<I, S>(mut self, names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.before.extend(names.into_iter().map(Into::into));
-        self
-    }
-
-    #[inline]
-    pub fn with_runs_after<I, S>(mut self, names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.after.extend(names.into_iter().map(Into::into));
-        self
-    }
 }
 
 impl<A: FeatureArcSpec> Default for FeatureArc<A> {
@@ -203,7 +160,7 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
     }
 
     #[inline]
-    fn start_for_interface_or(
+    pub fn start_for_interface_or(
         &self,
         interface_index: u32,
         metadata: &mut RouteMetadata,
@@ -232,58 +189,6 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
         metadata.set_feature_path(next_entries);
         first.node
     }
-}
-
-pub struct FeatureArcStartNode<A: FeatureArcSpec> {
-    arc: FeatureArc<A>,
-    default_next: NodeId,
-}
-
-impl<A: FeatureArcSpec> FeatureArcStartNode<A> {
-    #[inline]
-    pub fn new(arc: FeatureArc<A>, default_next: NodeId) -> Self {
-        Self { arc, default_next }
-    }
-}
-
-impl<A, G> Node<G> for FeatureArcStartNode<A>
-where
-    A: FeatureArcSpec,
-{
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let Some(first) = frame.pending_indices().first().copied() else {
-            return Ok(NodeResult::drop());
-        };
-        let speculative =
-            feature_arc_start_for_index(runtime, first, &self.arc, self.default_next)?;
-        NodeNextEnqueue::new(speculative).validate_frame_with_first_next(
-            runtime,
-            frame,
-            first,
-            speculative,
-            |index| feature_arc_start_for_index(runtime, index, &self.arc, self.default_next),
-        )
-    }
-}
-
-impl<A, G> InternalNode<G> for FeatureArcStartNode<A> where A: FeatureArcSpec {}
-
-#[inline(always)]
-fn feature_arc_start_for_index<A, G>(
-    runtime: &DataPlaneRuntime<G>,
-    index: BufferIndex,
-    arc: &FeatureArc<A>,
-    default_next: NodeId,
-) -> CoreResult<NodeId>
-where
-    A: FeatureArcSpec,
-{
-    runtime.with_metadata_mut(index, |metadata| arc.start_or(metadata, default_next))
 }
 
 #[inline(always)]
@@ -341,24 +246,22 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
     }
 
     pub fn register_feature<F: Feature<A>>(&mut self, node: NodeId) -> CoreResult<()> {
-        let name = F::NAME;
-        if name.is_empty() {
-            return Err(CoreError::internal("feature name must not be empty"));
-        }
+        let id = F::id();
         let ordinal = self
             .state
             .registered
-            .get(name)
+            .get(&id)
             .map(|registration| registration.ordinal)
             .unwrap_or(self.state.feature_order.len());
-        if !self.state.registered.contains_key(name) {
-            self.state.feature_order.push(name.to_owned());
+        if !self.state.registered.contains_key(&id) {
+            self.state.feature_order.push(id);
         }
         self.state.registered.insert(
-            name.to_owned(),
+            id,
             FeatureArcRegistration {
                 node,
-                order: F::order(),
+                before: F::before(),
+                after: F::after(),
                 ordinal,
             },
         );
@@ -383,34 +286,33 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         interface_index: u32,
         config: Option<Vec<u8>>,
     ) -> CoreResult<()> {
-        if !self.state.registered.contains_key(F::NAME) {
+        let id = F::id();
+        if !self.state.registered.contains_key(&id) {
             return Err(CoreError::internal(format!(
-                "feature is not registered: {}",
-                F::NAME
+                "feature is not registered: {:?}",
+                id
             )));
         }
         let enabled = self.state.enabled.entry(interface_index).or_default();
-        if let Some(enabled) = enabled.iter_mut().find(|enabled| enabled.name == F::NAME) {
+        if let Some(enabled) = enabled.iter_mut().find(|enabled| enabled.id == id) {
             enabled.config = config;
         } else {
-            enabled.push(FeatureArcEnabled {
-                name: F::NAME.to_owned(),
-                config,
-            });
+            enabled.push(FeatureArcEnabled { id, config });
         }
         self.publish()?;
         Ok(())
     }
 
     pub fn disable_feature<F: Feature<A>>(&mut self, interface_index: u32) -> CoreResult<()> {
-        if !self.state.registered.contains_key(F::NAME) {
+        let id = F::id();
+        if !self.state.registered.contains_key(&id) {
             return Err(CoreError::internal(format!(
-                "feature is not registered: {}",
-                F::NAME
+                "feature is not registered: {:?}",
+                id
             )));
         }
         if let Some(enabled) = self.state.enabled.get_mut(&interface_index) {
-            enabled.retain(|enabled| enabled.name != F::NAME);
+            enabled.retain(|enabled| enabled.id != id);
             if enabled.is_empty() {
                 self.state.enabled.remove(&interface_index);
             }
@@ -421,10 +323,11 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
 
     #[inline]
     pub fn is_feature_enabled<F: Feature<A>>(&self, interface_index: u32) -> bool {
+        let id = F::id();
         self.state
             .enabled
             .get(&interface_index)
-            .is_some_and(|enabled| enabled.iter().any(|enabled| enabled.name == F::NAME))
+            .is_some_and(|enabled| enabled.iter().any(|enabled| enabled.id == id))
     }
 
     pub fn set_end_node_for_interface(
@@ -449,16 +352,16 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
     }
 }
 
-impl FeatureArcInner {
+impl<A: FeatureArcSpec> FeatureArcInner<A> {
     #[inline]
     fn new() -> Self {
         Self {
-            snapshot: ArcSwap::from_pointee(FeatureArcSnapshot::default()),
+            snapshot: ArcSwap::from_pointee(FeatureArcSnapshot::<A>::default()),
         }
     }
 }
 
-impl FeatureArcSnapshot {
+impl<A: FeatureArcSpec> FeatureArcSnapshot<A> {
     fn rebuild(&mut self) -> CoreResult<()> {
         self.feature_order = self.sorted_feature_order()?;
         let feature_order = self.feature_order.clone();
@@ -466,21 +369,17 @@ impl FeatureArcSnapshot {
         for (interface_index, enabled) in &self.enabled {
             let enabled = enabled
                 .iter()
-                .map(|enabled| (enabled.name.as_str(), enabled.config.clone()))
+                .map(|enabled| (enabled.id, enabled.config.clone()))
                 .collect::<HashMap<_, _>>();
             let chain_features = feature_order
                 .iter()
-                .filter_map(|name| {
-                    enabled
-                        .get(name.as_str())
-                        .map(|config| (name.clone(), config.clone()))
-                })
+                .filter_map(|id| enabled.get(id).map(|config| (*id, config.clone())))
                 .collect::<Vec<_>>();
             let mut steps = Vec::with_capacity(chain_features.len());
-            for (name, config) in chain_features {
+            for (id, config) in chain_features {
                 let node = self
                     .registered
-                    .get(&name)
+                    .get(&id)
                     .ok_or_else(|| CoreError::internal("feature chain references missing node"))?
                     .node;
                 steps.push(FeatureArcStep { node, config });
@@ -491,62 +390,56 @@ impl FeatureArcSnapshot {
         Ok(())
     }
 
-    fn sorted_feature_order(&self) -> CoreResult<Vec<String>> {
+    fn sorted_feature_order(&self) -> CoreResult<Vec<A>> {
         let mut edges = self
             .registered
             .keys()
-            .map(|name| (name.clone(), Vec::<String>::new()))
+            .map(|id| (*id, Vec::<A>::new()))
             .collect::<HashMap<_, _>>();
         let mut indegree = self
             .registered
             .keys()
-            .map(|name| (name.clone(), 0usize))
+            .map(|id| (*id, 0usize))
             .collect::<HashMap<_, _>>();
-        let mut seen_edges = HashSet::<(String, String)>::new();
+        let mut seen_edges = HashSet::<(A, A)>::new();
 
-        for (name, registration) in &self.registered {
-            for before in &registration.order.before {
+        for (id, registration) in &self.registered {
+            for before in &registration.before {
                 if self.registered.contains_key(before) {
-                    add_feature_order_edge(
-                        &mut edges,
-                        &mut indegree,
-                        &mut seen_edges,
-                        name,
-                        before,
-                    );
+                    add_feature_order_edge(&mut edges, &mut indegree, &mut seen_edges, before, id);
                 }
             }
-            for after in &registration.order.after {
+            for after in &registration.after {
                 if self.registered.contains_key(after) {
-                    add_feature_order_edge(&mut edges, &mut indegree, &mut seen_edges, after, name);
+                    add_feature_order_edge(&mut edges, &mut indegree, &mut seen_edges, id, after);
                 }
             }
         }
 
-        let mut selected = HashSet::<String>::new();
+        let mut selected = HashSet::<A>::new();
         let mut sorted = Vec::with_capacity(self.registered.len());
         while sorted.len() < self.registered.len() {
             let Some(next) = self
                 .feature_order
                 .iter()
-                .filter(|name| self.registered.contains_key(*name))
-                .filter(|name| !selected.contains(*name))
-                .filter(|name| indegree.get(*name).copied().unwrap_or_default() == 0)
-                .min_by_key(|name| {
+                .copied()
+                .filter(|id| self.registered.contains_key(id))
+                .filter(|id| !selected.contains(id))
+                .filter(|id| indegree.get(id).copied().unwrap_or_default() == 0)
+                .min_by_key(|id| {
                     self.registered
-                        .get(*name)
+                        .get(id)
                         .map(|registration| registration.ordinal)
                         .unwrap_or(usize::MAX)
                 })
-                .cloned()
             else {
                 return Err(CoreError::internal(
                     "feature order constraints contain a cycle",
                 ));
             };
 
-            selected.insert(next.clone());
-            sorted.push(next.clone());
+            selected.insert(next);
+            sorted.push(next);
             if let Some(targets) = edges.get(&next) {
                 for target in targets {
                     if let Some(count) = indegree.get_mut(target) {
@@ -560,21 +453,18 @@ impl FeatureArcSnapshot {
     }
 }
 
-fn add_feature_order_edge(
-    edges: &mut HashMap<String, Vec<String>>,
-    indegree: &mut HashMap<String, usize>,
-    seen_edges: &mut HashSet<(String, String)>,
-    from: &str,
-    to: &str,
+fn add_feature_order_edge<A: FeatureArcSpec>(
+    edges: &mut HashMap<A, Vec<A>>,
+    indegree: &mut HashMap<A, usize>,
+    seen_edges: &mut HashSet<(A, A)>,
+    from: &A,
+    to: &A,
 ) {
-    if from == to || !seen_edges.insert((from.to_owned(), to.to_owned())) {
+    if from == to || !seen_edges.insert((*from, *to)) {
         return;
     }
-    edges
-        .entry(from.to_owned())
-        .or_default()
-        .push(to.to_owned());
-    *indegree.entry(to.to_owned()).or_default() += 1;
+    edges.entry(*from).or_default().push(*to);
+    *indegree.entry(*to).or_default() += 1;
 }
 
 #[hammer_component_macros::node_next]

@@ -7,9 +7,7 @@ use hammer_adapter::{
     NodeResult, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_service::data_plane::{
-    DropNode, FeatureArcControl, FeatureArcStartNode, next_feature_frame,
-};
+use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
     DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane,
     IpLocalEndOfArcNode, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
@@ -56,7 +54,7 @@ impl Node<TestNode> for CaptureNode {
 
 impl InternalNode<TestNode> for CaptureNode {}
 
-#[hammer_component_macros::feature(arc = IpLocalArc, name = "local-forward")]
+#[hammer_component_macros::feature(arc = IpLocalArc, id = LocalForward)]
 struct ForwardNode {
     state: Rc<RefCell<CaptureState>>,
 }
@@ -90,7 +88,6 @@ enum TestNode {
     IpLookup(IpLookupNode),
     IpLocal(IpLocalNode),
     IpLocalEnd(IpLocalEndOfArcNode),
-    FeatureStart(FeatureArcStartNode<IpLocalArc>),
 }
 
 impl From<DropNode> for TestNode {
@@ -135,12 +132,6 @@ impl From<IpLocalEndOfArcNode> for TestNode {
     }
 }
 
-impl From<FeatureArcStartNode<IpLocalArc>> for TestNode {
-    fn from(node: FeatureArcStartNode<IpLocalArc>) -> Self {
-        Self::FeatureStart(node)
-    }
-}
-
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -156,7 +147,6 @@ impl Node<TestNode> for TestNode {
             Self::IpLookup(node) => node.process(runtime, frame),
             Self::IpLocal(node) => node.process(runtime, frame),
             Self::IpLocalEnd(node) => node.process(runtime, frame),
-            Self::FeatureStart(node) => node.process(runtime, frame),
         }
     }
 }
@@ -532,10 +522,7 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
     features
         .enable_feature::<ForwardNode>(9)
         .expect("enable local feature");
-    let feature_start = runtime
-        .nodes()
-        .register_internal(FeatureArcStartNode::new(features.arc(), end));
-    control.set_feature_start_node(feature_start);
+    control.set_feature_arc(features.arc(), end);
     let local = runtime.nodes().register_internal(control.node());
 
     let good = ipv4_udp_packet(
@@ -557,7 +544,7 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
             .expect("schedule head")
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run head"), 6);
+    assert_eq!(runtime.run_ready_nodes().expect("run head"), 5);
     assert_eq!(feature_state.borrow().metadata.len(), 1);
     assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
     assert_eq!(
@@ -643,7 +630,6 @@ struct LocalGraph {
     udp: NodeId,
     icmp: NodeId,
     reassembly: NodeId,
-    feature: NodeId,
     punt_state: Rc<RefCell<CaptureState>>,
     tcp_state: Rc<RefCell<CaptureState>>,
     udp_state: Rc<RefCell<CaptureState>>,
@@ -658,7 +644,6 @@ impl LocalGraph {
         let udp_state = Rc::new(RefCell::new(CaptureState::default()));
         let icmp_state = Rc::new(RefCell::new(CaptureState::default()));
         let reassembly_state = Rc::new(RefCell::new(CaptureState::default()));
-        let feature_state = Rc::new(RefCell::new(CaptureState::default()));
         let drop = runtime.nodes().register_internal(DropNode::new());
         let punt = runtime
             .nodes()
@@ -675,9 +660,6 @@ impl LocalGraph {
         let reassembly = runtime
             .nodes()
             .register_internal(CaptureNode::new(Rc::clone(&reassembly_state)));
-        let feature = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&feature_state)));
         Self {
             drop,
             punt,
@@ -685,7 +667,6 @@ impl LocalGraph {
             udp,
             icmp,
             reassembly,
-            feature,
             punt_state,
             tcp_state,
             udp_state,
@@ -702,7 +683,6 @@ impl LocalGraph {
             self.udp,
             self.icmp,
             self.reassembly,
-            self.feature,
         )
     }
 }

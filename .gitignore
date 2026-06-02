@@ -2,3 +2,4 @@ target/
 /dist
 /ios-demo
 /.worktrees
+.DS_Store

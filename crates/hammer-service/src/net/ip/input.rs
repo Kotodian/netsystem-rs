@@ -4,10 +4,16 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 
+use crate::data_plane::FeatureArc;
 use crate::net::ip::{IpInputError, IpInputTarget, IpProtocol, parse_ip_packet_with_chain_len};
 
-#[hammer_component_macros::feature_arc(name = "ip-unicast")]
-pub struct IpUnicastArc;
+#[hammer_component_macros::feature_arc]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IpUnicastArc {
+    TunFeature,
+    AlphaFeature,
+    BetaFeature,
+}
 
 #[hammer_component_macros::node_next]
 pub enum IpInputNext {
@@ -22,28 +28,48 @@ pub enum IpInputNext {
 
 pub struct IpInputControlPlane {
     next: [NodeId; IpInputNext::COUNT],
+    feature_arc: Option<FeatureArc<IpUnicastArc>>,
 }
 
 impl IpInputControlPlane {
     #[inline]
     pub fn new(next: [NodeId; IpInputNext::COUNT]) -> Self {
-        Self { next }
+        Self {
+            next,
+            feature_arc: None,
+        }
+    }
+
+    #[inline]
+    pub fn set_feature_arc(&mut self, arc: FeatureArc<IpUnicastArc>) {
+        self.feature_arc = Some(arc);
+    }
+
+    #[inline]
+    pub fn clear_feature_arc(&mut self) {
+        self.feature_arc = None;
     }
 
     #[inline]
     pub fn node(&self) -> IpInputNode {
-        IpInputNode::new(self.next)
+        let mut node = IpInputNode::new(self.next);
+        node.feature_arc = self.feature_arc.clone();
+        node
     }
 }
 
 pub struct IpInputNode {
     next: [NodeId; IpInputNext::COUNT],
+    feature_arc: Option<FeatureArc<IpUnicastArc>>,
 }
 
 impl IpInputNode {
     #[inline]
     pub fn new(next: [NodeId; IpInputNext::COUNT]) -> Self {
-        Self { next }
+        Self {
+            next,
+            feature_arc: None,
+        }
     }
 }
 
@@ -58,9 +84,10 @@ impl<G> Node<G> for IpInputNode {
             return Ok(NodeResult::drop());
         };
         let next = self.next;
+        let feature_arc = self.feature_arc.as_ref();
         let speculative = {
             let mut batch = runtime.buffer_batch_mut();
-            next_node_for_index_with_batch(runtime, &mut batch, first, next)?
+            next_node_for_index_with_batch(runtime, &mut batch, first, next, feature_arc)?
         };
         let mut first_chunk = true;
         NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
@@ -86,6 +113,7 @@ impl<G> Node<G> for IpInputNode {
                     nexts,
                     start_offset,
                     next,
+                    feature_arc,
                 )
             },
         )
@@ -100,6 +128,7 @@ fn next_node_for_index_with_batch<G>(
     batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
     next: [NodeId; IpInputNext::COUNT],
+    feature_arc: Option<&FeatureArc<IpUnicastArc>>,
 ) -> CoreResult<NodeId> {
     let buffer = batch.buffer_mut(index)?;
     let parsed = match parse_ip_packet_with_chain_len(
@@ -140,7 +169,9 @@ fn next_node_for_index_with_batch<G>(
         IpInputTarget::Drop => Ok(next[IpInputNext::Drop.slot()]),
         IpInputTarget::Punt => Ok(next[IpInputNext::Punt.slot()]),
         IpInputTarget::Options => Ok(next[IpInputNext::Options.slot()]),
-        IpInputTarget::Lookup => Ok(next[IpInputNext::Lookup.slot()]),
+        IpInputTarget::Lookup => Ok(feature_arc.map_or(next[IpInputNext::Lookup.slot()], |arc| {
+            arc.start_or(metadata, next[IpInputNext::Lookup.slot()])
+        })),
         IpInputTarget::LookupMulticast => Ok(next[IpInputNext::LookupMulticast.slot()]),
         IpInputTarget::IcmpError => Ok(next[IpInputNext::IcmpError.slot()]),
         IpInputTarget::Reassembly => Ok(next[IpInputNext::Reassembly.slot()]),
@@ -155,9 +186,10 @@ fn next_nodes_for_indices_with_batch<G>(
     nexts: &mut [NodeId; 4],
     start_offset: usize,
     next: [NodeId; IpInputNext::COUNT],
+    feature_arc: Option<&FeatureArc<IpUnicastArc>>,
 ) -> CoreResult<()> {
     for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-        nexts[offset] = next_node_for_index_with_batch(runtime, batch, index, next)?;
+        nexts[offset] = next_node_for_index_with_batch(runtime, batch, index, next, feature_arc)?;
     }
     Ok(())
 }
