@@ -6,6 +6,7 @@ use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::vec::Vec;
 
 pub use crate::net::packet_route_metadata;
 

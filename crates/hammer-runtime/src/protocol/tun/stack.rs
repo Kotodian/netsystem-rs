@@ -2196,7 +2196,7 @@ where
                 runtime.release_pooled_frame(response)?;
                 Ok(TunDispatch::RoutedResponse {
                     metadata: tun_packet.metadata,
-                    payload: Bytes::from(payload),
+                    payload: Bytes::copy_from_slice(&payload),
                 })
             }
             Network::Icmp => {

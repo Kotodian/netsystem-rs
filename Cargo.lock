@@ -1240,6 +1240,7 @@ dependencies = [
  "bytes",
  "crossbeam-queue",
  "hammer-core",
+ "hammer-infra",
  "hickory-proto",
  "ipnet",
  "tokio",
@@ -1273,6 +1274,7 @@ dependencies = [
  "blake2",
  "boringtun",
  "bytes",
+ "hammer-infra",
  "hickory-proto",
  "http",
  "humantime-serde",
@@ -1309,6 +1311,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-infra"
+version = "0.1.0"
+
+[[package]]
 name = "hammer-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1331,6 +1337,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-control",
  "hammer-core",
+ "hammer-infra",
  "hickory-proto",
  "hickory-resolver",
  "http",
@@ -1370,6 +1377,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-control",
  "hammer-core",
+ "hammer-infra",
  "hammer-runtime",
  "hickory-proto",
  "http",

@@ -238,7 +238,7 @@ async fn udp_exchange_via_with_timeout(
         }
     };
     let payload = match runtime.copy_current_chain(index) {
-        Ok(payload) => Bytes::from(payload),
+        Ok(payload) => Bytes::copy_from_slice(&payload),
         Err(err) => {
             runtime.free_index(index);
             let _ = runtime.release_pooled_frame(response);

@@ -154,6 +154,7 @@ mod tests {
     use crate::RouteMetadata;
     use crate::buffer::DataPlaneRuntime;
     use crate::node::NoopNode;
+    use hammer_infra::vec::Vec;
 
     struct CapturePacketConn {
         last: Option<Vec<u8>>,
@@ -203,7 +204,10 @@ mod tests {
         conn.send(&runtime, &mut frame).await.expect("send frame");
 
         assert!(frame.is_empty());
-        assert_eq!(conn.last, Some(b"borrowed udp payload".to_vec()));
+        assert_eq!(
+            conn.last,
+            Some(b"borrowed udp payload".iter().copied().collect::<Vec<_>>())
+        );
         assert_eq!(runtime.in_use_buffers(), 0);
         runtime
             .release_pooled_frame(frame)

@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
-use super::prefetch::prefetch_read_l1;
+use crate::prefetch::prefetch_read_l1;
+use crate::vec::Vec;
 
 const MTRIE_ROOT_BITS: u8 = 16;
 const MTRIE_PLY_BITS: u8 = 8;

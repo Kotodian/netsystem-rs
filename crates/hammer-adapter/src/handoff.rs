@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use crossbeam_queue::ArrayQueue;
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::vec::Vec;
 
 use crate::{BufferIndex, BufferPoolArena, NodeHandle};
 

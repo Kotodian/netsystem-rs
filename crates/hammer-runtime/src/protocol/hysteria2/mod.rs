@@ -445,7 +445,8 @@ impl ProxyPacketConn for Hysteria2PacketConn {
                     let destination = metadata.destination.ok_or_else(|| {
                         HammerError::internal("hysteria2 UDP frame missing destination")
                     })?;
-                    let payload = Bytes::from(runtime.copy_current_chain(index)?);
+                    let payload_bytes = runtime.copy_current_chain(index)?;
+                    let payload = Bytes::copy_from_slice(&payload_bytes);
                     if payload.len() > protocol::MAX_UDP_SIZE {
                         return Err(HammerError::internal("UDP packet too large"));
                     }

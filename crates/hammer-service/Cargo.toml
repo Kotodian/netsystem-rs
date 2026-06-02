@@ -62,6 +62,7 @@ bytes = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
 hammer-control = { path = "../hammer-control" }
 hammer-adapter = { path = "../hammer-adapter" }
+hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 hickory-proto = { workspace = true }

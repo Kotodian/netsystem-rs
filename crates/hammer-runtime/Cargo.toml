@@ -82,6 +82,7 @@ endpoint-amneziawg = [
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }
+hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 async-trait = { workspace = true }
 boringtun = { workspace = true, optional = true }

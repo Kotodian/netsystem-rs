@@ -7,9 +7,10 @@ use hammer_adapter::{
     SocksAddr,
 };
 use hammer_core::error::CoreResult;
-use hammer_core::protocol::ip::IpVersion;
+use hammer_infra::vec::Vec;
 use hammer_service::net::{
-    DpoId, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane,
+    IpLookupNode,
 };
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 use ipnet::Ipv4Net;
@@ -161,10 +162,10 @@ fn tun_driver_routes_through_service_internal_nodes() {
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
     let mut builder = FibSnapshotBuilder::new(output);
-    let adjacency = builder.add_adjacency(IpVersion::V4, output);
+    let adjacency = builder.add_adjacency(DpoProto::IP4, output);
     let load_balance = builder.add_load_balance(
-        IpVersion::V4,
-        [DpoId::adjacency(IpVersion::V4, adjacency, output)],
+        DpoProto::IP4,
+        [DpoId::adjacency(DpoProto::IP4, adjacency, output)],
     );
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -254,7 +255,7 @@ fn ipv4_udp_packet(
     packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
     packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
-    packet
+    packet.into()
 }
 
 fn ipv4_checksum(header: &[u8]) -> u16 {

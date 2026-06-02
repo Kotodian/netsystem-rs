@@ -12,6 +12,7 @@ use hammer_adapter::{
     NodeNextEnqueue, NodeNextFrames, NodeNextVectorEnqueue, NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::vec::Vec;
 
 #[derive(Default)]
 struct WakeCounter {
@@ -1906,7 +1907,7 @@ fn node_runtime_schedules_empty_driver_frame() {
     });
     let driver = runtime.nodes().register_driver(SourceDriverNode {
         next: sink,
-        payload: b"packet".to_vec(),
+        payload: b"packet".to_vec().into(),
     });
     let frame = runtime.alloc_frame_index().expect("alloc frame");
 

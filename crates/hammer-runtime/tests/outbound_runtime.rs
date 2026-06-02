@@ -38,7 +38,7 @@ fn packet_runtime() -> DataPlaneRuntime {
 
 struct TestPacket {
     destination: SocksAddr,
-    payload: Vec<u8>,
+    payload: hammer_infra::vec::Vec<u8>,
 }
 
 async fn send_packet(

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::{boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
 
 use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
@@ -183,61 +184,6 @@ impl BufferNodeError {
     }
 }
 
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-struct CacheLine([u8; BUFFER_CACHE_LINE_SIZE]);
-
-impl Default for CacheLine {
-    fn default() -> Self {
-        Self([0; BUFFER_CACHE_LINE_SIZE])
-    }
-}
-
-struct CacheAlignedStorage {
-    lines: Box<[CacheLine]>,
-    len: usize,
-}
-
-impl fmt::Debug for CacheAlignedStorage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CacheAlignedStorage")
-            .field("len", &self.len)
-            .finish()
-    }
-}
-
-impl CacheAlignedStorage {
-    #[inline]
-    fn with_len(len: usize) -> Self {
-        let line_count = len.div_ceil(BUFFER_CACHE_LINE_SIZE).max(1);
-        Self {
-            lines: vec![CacheLine::default(); line_count].into_boxed_slice(),
-            len,
-        }
-    }
-
-    #[inline]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline]
-    fn as_slice(&self) -> &[u8] {
-        let ptr = self.lines.as_ptr().cast::<u8>();
-        // SAFETY: CacheLine is a repr(C, align(64)) wrapper around contiguous
-        // bytes. `len` never exceeds the allocated line byte capacity.
-        unsafe { std::slice::from_raw_parts(ptr, self.len) }
-    }
-
-    #[inline]
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        let ptr = self.lines.as_mut_ptr().cast::<u8>();
-        // SAFETY: Same layout guarantee as `as_slice`, with unique access via
-        // `&mut self`.
-        unsafe { std::slice::from_raw_parts_mut(ptr, self.len) }
-    }
-}
-
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct Buffer {
@@ -251,7 +197,7 @@ pub struct Buffer {
     data_len: usize,
     next_buffer: Option<BufferIndex>,
     total_len_not_including_first: usize,
-    storage: CacheAlignedStorage,
+    storage: Slice<u8>,
 }
 
 impl Buffer {
@@ -268,7 +214,7 @@ impl Buffer {
             data_len: 0,
             next_buffer: None,
             total_len_not_including_first: 0,
-            storage: CacheAlignedStorage::with_len(slot_capacity),
+            storage: Slice::from_elem(slot_capacity, 0),
         }
     }
 
@@ -532,38 +478,6 @@ fn next_buffer_pool_id() -> u64 {
 fn next_frame_pool_id() -> u64 {
     NEXT_FRAME_POOL_ID.fetch_add(1, Ordering::Relaxed)
 }
-
-#[cfg(target_arch = "x86")]
-#[inline]
-fn prefetch_read_l1(ptr: *const u8) {
-    unsafe {
-        core::arch::x86::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86::_MM_HINT_T0);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn prefetch_read_l1(ptr: *const u8) {
-    unsafe {
-        core::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn prefetch_read_l1(ptr: *const u8) {
-    unsafe {
-        core::arch::asm!(
-            "prfm pldl1keep, [{ptr}]",
-            ptr = in(reg) ptr,
-            options(nostack, preserves_flags, readonly)
-        );
-    }
-}
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-#[inline]
-fn prefetch_read_l1(_ptr: *const u8) {}
 
 impl DataPlaneBuffers {
     #[inline]
@@ -1620,7 +1534,15 @@ impl BufferPool {
 
     #[inline]
     pub fn current(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
-        Ok(self.arena.inner.borrow().buffer(index)?.current().to_vec())
+        Ok(self
+            .arena
+            .inner
+            .borrow()
+            .buffer(index)?
+            .current()
+            .iter()
+            .copied()
+            .collect())
     }
 
     #[inline]
@@ -1644,7 +1566,7 @@ impl BufferPool {
         let inner = self.arena.inner.borrow();
         let buffer = inner.buffer(index)?;
         if buffer.next_buffer().is_none() {
-            return Ok(buffer.current().to_vec());
+            return Ok(buffer.current().iter().copied().collect());
         }
         inner.copy_current_chain(index)
     }
@@ -2091,7 +2013,7 @@ impl BufferPoolInner {
         let mut next = Some(index);
         while let Some(index) = next {
             let buffer = self.buffer(index)?;
-            bytes.extend_from_slice(buffer.current());
+            bytes.extend_from_copy_slice(buffer.current());
             next = buffer.next_buffer;
         }
         Ok(bytes)
@@ -2563,13 +2485,13 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn drain_indices(&mut self) -> std::vec::Drain<'_, BufferIndex> {
+    pub fn drain_indices(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
     }
 
     #[inline]
-    pub fn drain_pending(&mut self) -> std::vec::Drain<'_, BufferIndex> {
+    pub fn drain_pending(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
     }

@@ -15,7 +15,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 
 #[derive(Default)]
 struct SinkState {
-    payloads: Vec<Vec<u8>>,
+    payloads: Vec<hammer_infra::vec::Vec<u8>>,
     forwarding: Vec<Option<ForwardingMetadata>>,
     frame_lens: Vec<usize>,
 }

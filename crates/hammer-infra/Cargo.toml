@@ -1,0 +1,10 @@
+[package]
+name = "hammer-infra"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_infra"
+
+[dependencies]

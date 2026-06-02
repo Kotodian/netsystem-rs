@@ -1,4 +1,6 @@
-use super::prefetch::prefetch_read_l1;
+use crate::boxed::Slice;
+use crate::prefetch::prefetch_read_l1;
+use crate::vec::Vec;
 
 pub trait FlatHashKey: Copy + Eq {
     fn hash_key(self) -> usize;
@@ -27,19 +29,33 @@ impl FlatHashKey for u32 {
 
 #[derive(Debug, Clone)]
 pub struct FlatHashTable<K: FlatHashKey, V: Copy> {
-    buckets: Box<[FlatHashBucket<K, V>]>,
+    buckets: Slice<FlatHashBucket<K, V>>,
     len: usize,
 }
 
 impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     #[inline]
-    pub fn empty() -> Self {
+    pub fn new() -> Self {
         Self::with_capacity(1)
     }
 
     #[inline]
+    pub fn empty() -> Self {
+        Self::new()
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(1);
+        Self {
+            buckets: Slice::from_elem(capacity, FlatHashBucket::empty()),
+            len: 0,
+        }
+    }
+
+    #[inline]
     pub fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let mut table = Self::empty();
+        let mut table = Self::new();
         for (key, value) in entries {
             table.insert(key, value);
         }
@@ -55,16 +71,21 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 
     #[inline(always)]
-    pub fn lookup(&self, key: &K) -> Option<V> {
+    pub fn get(&self, key: &K) -> Option<&V> {
         let mut slot = self.slot(*key);
         loop {
             let bucket = &self.buckets[slot];
-            match bucket.entry {
-                Some(entry) if entry.key == *key => return Some(entry.value),
+            match bucket.entry.as_ref() {
+                Some(entry) if entry.key == *key => return Some(&entry.value),
                 Some(_) => slot = self.next_slot(slot),
                 None => return None,
             }
         }
+    }
+
+    #[inline(always)]
+    pub fn lookup(&self, key: &K) -> Option<V> {
+        self.get(key).copied()
     }
 
     #[inline(always)]
@@ -78,6 +99,11 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 
     #[inline(always)]
+    pub fn bucket_ptr(&self) -> *const u8 {
+        self.buckets.as_ptr().cast::<u8>()
+    }
+
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
@@ -88,20 +114,11 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 
     #[inline]
-    fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.next_power_of_two().max(1);
-        Self {
-            buckets: vec![FlatHashBucket::empty(); capacity].into_boxed_slice(),
-            len: 0,
-        }
-    }
-
-    #[inline]
     fn grow(&mut self) {
         let next_capacity = self.buckets.len() * 2;
         let old_buckets = std::mem::replace(
             &mut self.buckets,
-            vec![FlatHashBucket::empty(); next_capacity].into_boxed_slice(),
+            Slice::from_elem(next_capacity, FlatHashBucket::empty()),
         );
         self.len = 0;
         for bucket in old_buckets.iter().copied() {
@@ -142,6 +159,13 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 }
 
+impl<K: FlatHashKey, V: Copy> Default for FlatHashTable<K, V> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 struct FlatHashBucket<K: FlatHashKey, V: Copy> {
@@ -164,14 +188,14 @@ struct FlatHashEntry<K: FlatHashKey, V: Copy> {
 
 #[derive(Debug, Clone)]
 pub struct PrefixLengthSearchOrder {
-    prefix_lengths: Box<[u8]>,
+    prefix_lengths: Slice<u8>,
 }
 
 impl PrefixLengthSearchOrder {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            prefix_lengths: Box::new([]),
+            prefix_lengths: Slice::new(),
         }
     }
 
@@ -180,7 +204,7 @@ impl PrefixLengthSearchOrder {
         if self.prefix_lengths.contains(&prefix_len) {
             return;
         }
-        let mut prefix_lengths = self.prefix_lengths.to_vec();
+        let mut prefix_lengths = self.prefix_lengths.iter().copied().collect::<Vec<_>>();
         prefix_lengths.push(prefix_len);
         prefix_lengths.sort_by(|a, b| b.cmp(a));
         self.prefix_lengths = prefix_lengths.into_boxed_slice();

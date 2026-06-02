@@ -9,6 +9,7 @@ name = "hammer_adapter"
 
 [dependencies]
 hammer-core = { path = "../hammer-core" }
+hammer-infra = { path = "../hammer-infra" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 crossbeam-queue = { workspace = true }

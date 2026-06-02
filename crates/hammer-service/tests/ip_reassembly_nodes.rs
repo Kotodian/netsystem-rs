@@ -14,8 +14,10 @@ use hammer_service::net::{
     IpReassemblyNext, IpReassemblyNode,
 };
 
+type PacketVec = hammer_infra::vec::Vec<u8>;
+
 struct SinkNode {
-    packets: Rc<RefCell<Vec<Vec<u8>>>>,
+    packets: Rc<RefCell<Vec<PacketVec>>>,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
     node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
     buffer_indices: Rc<RefCell<Vec<hammer_adapter::BufferIndex>>>,
@@ -49,7 +51,7 @@ impl InternalNode<TestNode> for SinkNode {}
 
 #[derive(Clone)]
 struct SinkCapture {
-    packets: Rc<RefCell<Vec<Vec<u8>>>>,
+    packets: Rc<RefCell<Vec<PacketVec>>>,
     metadata: Rc<RefCell<Vec<RouteMetadata>>>,
     node_errors: Rc<RefCell<Vec<Option<BufferNodeError>>>>,
     buffer_indices: Rc<RefCell<Vec<hammer_adapter::BufferIndex>>>,
@@ -81,7 +83,7 @@ impl SinkCapture {
         self.packets.borrow().len()
     }
 
-    fn packets(&self) -> Vec<Vec<u8>> {
+    fn packets(&self) -> Vec<PacketVec> {
         self.packets.borrow().clone()
     }
 
