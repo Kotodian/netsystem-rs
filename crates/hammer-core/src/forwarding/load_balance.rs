@@ -40,6 +40,9 @@ impl Ip4MtrieValue for LoadBalanceIndex {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadBalanceError {
+    BucketCountTooLarge {
+        bucket_count: usize,
+    },
     BucketProtoMismatch {
         expected: IpVersion,
         actual: IpVersion,
@@ -86,7 +89,8 @@ enum LoadBalanceBuckets<N: Copy> {
 impl<N: Copy> LoadBalance<N> {
     #[inline]
     pub fn new(proto: IpVersion, buckets: impl Into<Vec<DpoId<N>>>) -> Self {
-        Self::try_new(proto, buckets).expect("load-balance buckets must match proto")
+        Self::try_new(proto, buckets)
+            .expect("load-balance buckets must fit hot-path index and match proto")
     }
 
     #[inline]
@@ -95,8 +99,9 @@ impl<N: Copy> LoadBalance<N> {
         buckets: impl Into<Vec<DpoId<N>>>,
     ) -> Result<Self, LoadBalanceError> {
         let buckets = buckets.into();
-        validate_bucket_protos(proto, &buckets)?;
         let bucket_count = buckets.len();
+        validate_bucket_count(bucket_count)?;
+        validate_bucket_protos(proto, &buckets)?;
         let power_of_two_mask = bucket_count
             .is_power_of_two()
             .then_some(bucket_count.saturating_sub(1) as u16)
@@ -180,6 +185,14 @@ impl<N: Copy> LoadBalance<N> {
 }
 
 #[inline(always)]
+fn validate_bucket_count(bucket_count: usize) -> Result<(), LoadBalanceError> {
+    if bucket_count > u16::MAX as usize {
+        return Err(LoadBalanceError::BucketCountTooLarge { bucket_count });
+    }
+    Ok(())
+}
+
+#[inline(always)]
 fn validate_bucket_protos<N: Copy>(
     expected: IpVersion,
     buckets: &[DpoId<N>],
@@ -240,6 +253,20 @@ mod tests {
                 expected: IpVersion::V4,
                 actual: IpVersion::V6,
                 bucket_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn load_balance_rejects_bucket_count_that_exceeds_hot_path_index() {
+        let buckets = vec![DpoId::drop(IpVersion::V4, Next::A); u16::MAX as usize + 1];
+        let err = LoadBalance::try_new(IpVersion::V4, buckets)
+            .expect_err("oversized load-balance should be rejected");
+
+        assert_eq!(
+            err,
+            LoadBalanceError::BucketCountTooLarge {
+                bucket_count: u16::MAX as usize + 1,
             }
         );
     }
