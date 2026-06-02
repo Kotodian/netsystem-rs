@@ -379,6 +379,28 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
+    pub fn add_ip4_punt_route(&mut self, prefix: Ipv4Net, next: N) -> DpoId<N> {
+        let dpo = DpoId::punt(IpVersion::V4, next);
+        self.add_ip4_route_dpo(prefix, dpo);
+        dpo
+    }
+
+    #[inline]
+    pub fn add_ip6_punt_route(&mut self, prefix: Ipv6Net, next: N) -> DpoId<N> {
+        let dpo = DpoId::punt(IpVersion::V6, next);
+        self.add_ip6_route_dpo(prefix, dpo);
+        dpo
+    }
+
+    #[inline]
+    pub fn add_punt_route(&mut self, prefix: IpNet, next: N) -> DpoId<N> {
+        match prefix {
+            IpNet::V4(prefix) => self.add_ip4_punt_route(prefix, next),
+            IpNet::V6(prefix) => self.add_ip6_punt_route(prefix, next),
+        }
+    }
+
+    #[inline]
     pub fn add_load_balance_dpo(
         &mut self,
         proto: IpVersion,
