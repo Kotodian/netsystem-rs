@@ -6,10 +6,13 @@ use std::ptr::{self, NonNull};
 
 use crate::align::{self, CACHE_LINE};
 use crate::boxed::{self, Slice};
+use crate::prefetch::prefetch_read_l1;
 
 pub type Vec<T> = RawVec<T, CACHE_LINE>;
 pub type Drain<'a, T> = RawDrain<'a, T, CACHE_LINE>;
 pub type IntoIter<T> = RawIntoIter<T, CACHE_LINE>;
+
+const COPY_PREFETCH_LINES: usize = 4;
 
 pub struct RawVec<T, const ALIGN: usize = CACHE_LINE> {
     ptr: NonNull<T>,
@@ -98,10 +101,10 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         self.grow_to(required.max(doubled));
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn push(&mut self, value: T) {
         if self.len == self.cap {
-            self.reserve(1);
+            self.grow_for_push();
         }
         unsafe { self.ptr.as_ptr().add(self.len).write(value) };
         self.len += 1;
@@ -139,11 +142,21 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
     #[inline]
     pub fn extend_from_slice(&mut self, other: &[T])
     where
+        T: Copy,
+    {
+        self.extend_from_copy_slice(other);
+    }
+
+    #[inline]
+    pub fn extend_from_cloned_slice(&mut self, other: &[T])
+    where
         T: Clone,
     {
         self.reserve(other.len());
-        for value in other {
-            self.push(value.clone());
+        let start = self.len;
+        for (offset, value) in other.iter().enumerate() {
+            unsafe { self.ptr.as_ptr().add(start + offset).write(value.clone()) };
+            self.len += 1;
         }
     }
 
@@ -157,6 +170,7 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
             return;
         }
         self.reserve(count);
+        prefetch_slice_prefix(other);
         unsafe {
             ptr::copy_nonoverlapping(other.as_ptr(), self.ptr.as_ptr().add(self.len), count);
         }
@@ -219,6 +233,25 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         unsafe { boxed::deallocate::<T, ALIGN>(self.ptr, self.cap) };
         self.ptr = next_ptr;
         self.cap = next_capacity;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_for_push(&mut self) {
+        self.reserve(1);
+    }
+}
+
+#[inline]
+fn prefetch_slice_prefix<T>(slice: &[T]) {
+    let byte_len = mem::size_of_val(slice);
+    if byte_len == 0 {
+        return;
+    }
+    let lines = byte_len.div_ceil(CACHE_LINE).min(COPY_PREFETCH_LINES);
+    let ptr = slice.as_ptr().cast::<u8>();
+    for line in 0..lines {
+        unsafe { prefetch_read_l1(ptr.add(line * CACHE_LINE)) };
     }
 }
 

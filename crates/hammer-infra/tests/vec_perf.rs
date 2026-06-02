@@ -12,16 +12,16 @@ fn vec_vs_std_perf_probe() {
     let std_push = measure_samples(|| {
         let mut values = std::vec::Vec::with_capacity(ITEM_COUNT);
         for value in 0..ITEM_COUNT {
-            values.push(value as u64);
+            values.push(black_box(value as u64));
         }
-        black_box(values.len() as u64 ^ values[ITEM_COUNT - 1])
+        sum_slice(&values)
     });
     let aligned_push = measure_samples(|| {
         let mut values = Vec::with_capacity(ITEM_COUNT);
         for value in 0..ITEM_COUNT {
-            values.push(value as u64);
+            values.push(black_box(value as u64));
         }
-        black_box(values.len() as u64 ^ values[ITEM_COUNT - 1])
+        sum_slice(&values)
     });
 
     let std_values = (0..ITEM_COUNT as u64).collect::<std::vec::Vec<_>>();
@@ -33,17 +33,17 @@ fn vec_vs_std_perf_probe() {
     let std_extend = measure_samples(|| {
         let mut values = std::vec::Vec::with_capacity(ITEM_COUNT);
         values.extend_from_slice(&std_values);
-        black_box(values.len() as u64 ^ values[ITEM_COUNT - 1])
+        sum_slice(&values)
     });
     let aligned_extend = measure_samples(|| {
         let mut values = Vec::with_capacity(ITEM_COUNT);
         values.extend_from_slice(&std_values);
-        black_box(values.len() as u64 ^ values[ITEM_COUNT - 1])
+        sum_slice(&values)
     });
     let aligned_copy_extend = measure_samples(|| {
         let mut values = Vec::with_capacity(ITEM_COUNT);
         values.extend_from_copy_slice(&std_values);
-        black_box(values.len() as u64 ^ values[ITEM_COUNT - 1])
+        sum_slice(&values)
     });
 
     assert_eq!(sum_slice(&std_values), sum_slice(&aligned_values));
