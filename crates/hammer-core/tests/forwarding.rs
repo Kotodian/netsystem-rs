@@ -363,6 +363,36 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
 }
 
 #[test]
+fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
+    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+    let inner = builder.add_load_balance(
+        IpVersion::V4,
+        [
+            DpoId::drop(IpVersion::V4, NextHop::Drop),
+            DpoId::receive(IpVersion::V4, NextHop::Direct),
+        ],
+    );
+    let outer = builder.add_load_balance(
+        IpVersion::V4,
+        [DpoId::load_balance(IpVersion::V4, inner, NextHop::Drop)],
+    );
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 41), 32).expect("nested load-balance route"),
+        outer,
+    );
+    let snapshot = builder.build();
+
+    let result = snapshot
+        .lookup_ip4(Ipv4Addr::new(192, 0, 2, 41), 1)
+        .expect("lookup result");
+    assert_eq!(result.route_dpo.load_balance_index(), Some(outer));
+    assert_eq!(result.load_balance(), Some(inner));
+    assert_eq!(result.bucket_index(), Some(1));
+    assert_eq!(result.dpo.kind(), DpoType::Receive);
+    assert_eq!(result.dpo.next(), NextHop::Direct);
+}
+
+#[test]
 fn fib_snapshot_can_route_directly_to_terminal_dpo() {
     let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
     builder.add_ip4_route_dpo(

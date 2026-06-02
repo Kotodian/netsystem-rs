@@ -168,12 +168,39 @@ impl<N: Copy> FibSnapshot<N> {
         prefetch_read_l1(load_balance_ref);
         load_balance_ref.prefetch_bucket(hash);
         let (bucket_index, dpo) = load_balance_ref.select_hash(hash)?;
-        Some(FibLookupResult::from_load_balance(
-            route_dpo,
-            load_balance,
-            bucket_index,
-            dpo,
-        ))
+        let Some(nested_load_balance) = dpo.load_balance_index() else {
+            return Some(FibLookupResult::from_load_balance(
+                route_dpo,
+                load_balance,
+                bucket_index,
+                dpo,
+            ));
+        };
+        self.select_nested_load_balance_dpo(route_dpo, nested_load_balance, hash)
+    }
+
+    #[inline(always)]
+    fn select_nested_load_balance_dpo(
+        &self,
+        route_dpo: DpoId<N>,
+        mut load_balance: LoadBalanceIndex,
+        hash: usize,
+    ) -> Option<FibLookupResult<N>> {
+        loop {
+            let load_balance_ref = self.load_balance(load_balance)?;
+            prefetch_read_l1(load_balance_ref);
+            load_balance_ref.prefetch_bucket(hash);
+            let (bucket_index, dpo) = load_balance_ref.select_hash(hash)?;
+            let Some(nested_load_balance) = dpo.load_balance_index() else {
+                return Some(FibLookupResult::from_load_balance(
+                    route_dpo,
+                    load_balance,
+                    bucket_index,
+                    dpo,
+                ));
+            };
+            load_balance = nested_load_balance;
+        }
     }
 }
 
