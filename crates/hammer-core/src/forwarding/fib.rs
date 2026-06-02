@@ -285,7 +285,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         buckets: impl Into<Vec<DpoId<N>>>,
     ) -> LoadBalanceIndex {
         self.try_add_load_balance(proto, buckets)
-            .expect("load-balance buckets must fit hot-path index and match proto")
+            .expect("load-balance buckets must be non-empty, fit hot-path index, and match proto")
     }
 
     #[inline]
@@ -315,7 +315,7 @@ impl<N: Copy> FibSnapshotBuilder<N> {
         next: N,
     ) -> DpoId<N> {
         self.try_add_load_balance_dpo(proto, buckets, next).expect(
-            "load-balance DPO buckets must fit hot-path index, match proto, and have valid backing",
+            "load-balance DPO buckets must be non-empty, fit hot-path index, match proto, and have valid backing",
         )
     }
 

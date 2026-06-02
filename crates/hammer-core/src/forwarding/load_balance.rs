@@ -40,6 +40,7 @@ impl Ip4MtrieValue for LoadBalanceIndex {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadBalanceError {
+    BucketCountZero,
     BucketCountTooLarge {
         bucket_count: usize,
     },
@@ -81,7 +82,6 @@ pub struct LoadBalance<N: Copy> {
 
 #[derive(Debug, Clone)]
 enum LoadBalanceBuckets<N: Copy> {
-    Empty,
     Inline([DpoId<N>; LOAD_BALANCE_INLINE_BUCKETS]),
     Heap(Box<[DpoId<N>]>),
 }
@@ -90,7 +90,7 @@ impl<N: Copy> LoadBalance<N> {
     #[inline]
     pub fn new(proto: IpVersion, buckets: impl Into<Vec<DpoId<N>>>) -> Self {
         Self::try_new(proto, buckets)
-            .expect("load-balance buckets must fit hot-path index and match proto")
+            .expect("load-balance buckets must be non-empty, fit hot-path index, and match proto")
     }
 
     #[inline]
@@ -107,7 +107,6 @@ impl<N: Copy> LoadBalance<N> {
             .then_some(bucket_count.saturating_sub(1) as u16)
             .unwrap_or(0);
         let buckets = match bucket_count {
-            0 => LoadBalanceBuckets::Empty,
             1..=LOAD_BALANCE_INLINE_BUCKETS => {
                 let first = buckets[0];
                 let mut inline = [first; LOAD_BALANCE_INLINE_BUCKETS];
@@ -137,7 +136,6 @@ impl<N: Copy> LoadBalance<N> {
     #[inline(always)]
     pub fn buckets(&self) -> &[DpoId<N>] {
         match &self.buckets {
-            LoadBalanceBuckets::Empty => &[],
             LoadBalanceBuckets::Inline(buckets) => &buckets[..self.bucket_count()],
             LoadBalanceBuckets::Heap(buckets) => buckets,
         }
@@ -159,7 +157,6 @@ impl<N: Copy> LoadBalance<N> {
         }
         let bucket = self.bucket_for_hash(hash);
         match &self.buckets {
-            LoadBalanceBuckets::Empty => {}
             LoadBalanceBuckets::Inline(buckets) => prefetch_read_l1(&buckets[bucket]),
             LoadBalanceBuckets::Heap(buckets) => prefetch_read_l1(&buckets[bucket]),
         }
@@ -177,7 +174,6 @@ impl<N: Copy> LoadBalance<N> {
     #[inline(always)]
     fn bucket_unchecked(&self, bucket: usize) -> DpoId<N> {
         match &self.buckets {
-            LoadBalanceBuckets::Empty => unreachable!(),
             LoadBalanceBuckets::Inline(buckets) => buckets[bucket],
             LoadBalanceBuckets::Heap(buckets) => buckets[bucket],
         }
@@ -186,6 +182,9 @@ impl<N: Copy> LoadBalance<N> {
 
 #[inline(always)]
 fn validate_bucket_count(bucket_count: usize) -> Result<(), LoadBalanceError> {
+    if bucket_count == 0 {
+        return Err(LoadBalanceError::BucketCountZero);
+    }
     if bucket_count > u16::MAX as usize {
         return Err(LoadBalanceError::BucketCountTooLarge { bucket_count });
     }
@@ -255,6 +254,14 @@ mod tests {
                 bucket_index: 0,
             }
         );
+    }
+
+    #[test]
+    fn load_balance_rejects_empty_bucket_set() {
+        let err = LoadBalance::try_new(IpVersion::V4, Vec::<DpoId<Next>>::new())
+            .expect_err("empty load-balance should be rejected");
+
+        assert_eq!(err, LoadBalanceError::BucketCountZero);
     }
 
     #[test]
