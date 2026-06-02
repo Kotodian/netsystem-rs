@@ -1,3 +1,4 @@
+pub mod icmp;
 pub mod input;
 pub mod local;
 pub mod reassembly;
@@ -8,6 +9,7 @@ pub use hammer_core::protocol::ip::{
     ParsedIpPacket, parse_ip_fragment, parse_ip_fragment_with_chain_len, parse_ip_packet,
     parse_ip_packet_with_chain_len,
 };
+pub use icmp::{IcmpInputControlPlane, IcmpInputError, IcmpInputNode};
 pub use input::{IpInputNext, IpInputNode, IpUnicastArc};
 pub use local::{
     IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,

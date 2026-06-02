@@ -9,9 +9,9 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
-    DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane,
-    IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLookupControlPlane, IpLookupNode,
-    IpReceiveNode,
+    DpoId, DpoProto, FibSnapshotBuilder, IcmpInputControlPlane, IcmpInputNode, IpInputNext,
+    IpInputNode, IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode,
+    IpLocalSourceCheck, IpLookupControlPlane, IpLookupNode, IpReceiveNode, IpVersion,
 };
 use ipnet::Ipv4Net;
 
@@ -86,6 +86,7 @@ enum TestNode {
     Forward(ForwardNode),
     IpInput(IpInputNode),
     IpLookup(IpLookupNode),
+    IcmpInput(IcmpInputNode),
     IpLocal(IpLocalNode),
     IpReceive(IpReceiveNode),
 }
@@ -120,6 +121,12 @@ impl From<IpLookupNode> for TestNode {
     }
 }
 
+impl From<IcmpInputNode> for TestNode {
+    fn from(node: IcmpInputNode) -> Self {
+        Self::IcmpInput(node)
+    }
+}
+
 impl From<IpLocalNode> for TestNode {
     fn from(node: IpLocalNode) -> Self {
         Self::IpLocal(node)
@@ -145,6 +152,7 @@ impl Node<TestNode> for TestNode {
             Self::Forward(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
+            Self::IcmpInput(node) => node.process(runtime, frame),
             Self::IpLocal(node) => node.process(runtime, frame),
             Self::IpReceive(node) => node.process(runtime, frame),
         }
@@ -212,7 +220,7 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
 
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
     assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
     assert_eq!(graph.tcp_state.borrow().metadata.len(), 1);
     assert_eq!(graph.icmp_state.borrow().metadata.len(), 2);
@@ -620,7 +628,7 @@ struct LocalGraph {
     punt: NodeId,
     tcp: NodeId,
     udp: NodeId,
-    icmp: NodeId,
+    icmp_input: NodeId,
     reassembly: NodeId,
     punt_state: Rc<RefCell<CaptureState>>,
     tcp_state: Rc<RefCell<CaptureState>>,
@@ -652,12 +660,20 @@ impl LocalGraph {
         let reassembly = runtime
             .nodes()
             .register_internal(CaptureNode::new(Rc::clone(&reassembly_state)));
+        let icmp_control = IcmpInputControlPlane::new(punt);
+        icmp_control
+            .register_type(IpVersion::V4, 8, icmp)
+            .expect("register IPv4 echo request");
+        icmp_control
+            .register_type(IpVersion::V6, 128, icmp)
+            .expect("register IPv6 echo request");
+        let icmp_input = runtime.nodes().register_internal(icmp_control.node());
         Self {
             drop,
             punt,
             tcp,
             udp,
-            icmp,
+            icmp_input,
             reassembly,
             punt_state,
             tcp_state,
@@ -673,7 +689,7 @@ impl LocalGraph {
             self.punt,
             self.tcp,
             self.udp,
-            self.icmp,
+            self.icmp_input,
             self.reassembly,
         )
     }
