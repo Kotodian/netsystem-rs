@@ -2,7 +2,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
     AdjacencyIndex, Dpo, DpoId, DpoKind, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
-    FibEntry, FibRouteDpoError, FibSnapshotBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
+    FibEntry, FibRouteDpoError, FibTableBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
     Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError, LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
@@ -125,41 +125,41 @@ fn ip6_prefix_hash_table_exposes_explicit_prefetch_for_flat_buckets() {
 }
 
 #[test]
-fn fib_snapshot_is_generic_over_next_target() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_is_generic_over_next_target() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
     let load_balance = builder.add_load_balance(DpoProto::IP4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(198, 51, 100, 42), 0)
         .expect("lookup result");
     assert_eq!(result.dpo.next(), NextHop::Direct);
-    assert_eq!(snapshot.drop_next(), NextHop::Drop);
+    assert_eq!(table.drop_next(), NextHop::Drop);
 }
 
 #[test]
-fn fib_snapshot_builder_adds_adjacency_dpo() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_adjacency_dpo() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let dpo = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
     let adjacency = dpo.adjacency_index().expect("adjacency DPO index");
 
     assert_eq!(dpo.proto(), DpoProto::IP4);
     assert_eq!(dpo.next(), NextHop::Direct);
 
-    let snapshot = builder.build();
-    let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency entry");
+    let table = builder.build();
+    let adjacency_entry = table.adjacency(adjacency).expect("adjacency entry");
     assert_eq!(adjacency_entry.proto, DpoProto::IP4);
     assert_eq!(adjacency_entry.next, NextHop::Direct);
 }
 
 #[test]
-fn fib_snapshot_builder_adds_load_balance_dpo() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_load_balance_dpo() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_load_balance_dpo(
         DpoProto::IP4,
         [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
@@ -177,16 +177,16 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 12), 32).expect("route"),
         route_dpo,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
     assert_eq!(
-        snapshot
+        table
             .load_balance(load_balance)
             .expect("load-balance")
             .bucket_count(),
         1
     );
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 12), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
@@ -195,25 +195,25 @@ fn fib_snapshot_builder_adds_load_balance_dpo() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_single_path_load_balance() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_single_path_load_balance() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance = builder.add_single_path_load_balance(DpoProto::IP4, NextHop::Direct);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 13), 32).expect("route"),
         load_balance,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let load_balance_entry = snapshot.load_balance(load_balance).expect("load-balance");
+    let load_balance_entry = table.load_balance(load_balance).expect("load-balance");
     assert_eq!(load_balance_entry.bucket_count(), 1);
     let adjacency = load_balance_entry.buckets()[0]
         .adjacency_index()
         .expect("adjacency bucket");
-    let adjacency_entry = snapshot.adjacency(adjacency).expect("adjacency");
+    let adjacency_entry = table.adjacency(adjacency).expect("adjacency");
     assert_eq!(adjacency_entry.proto, DpoProto::IP4);
     assert_eq!(adjacency_entry.next, NextHop::Direct);
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 13), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
@@ -223,15 +223,15 @@ fn fib_snapshot_builder_adds_single_path_load_balance() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip4_single_path_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip4_single_path_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance = builder.add_ip4_single_path_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 14), 32).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 14), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
@@ -241,16 +241,16 @@ fn fib_snapshot_builder_adds_ip4_single_path_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip6_single_path_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip6_single_path_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0014);
     let load_balance = builder.add_ip6_single_path_route(
         Ipv6Net::new(destination, 128).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
+    let result = table.lookup_ip6(destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
     assert_eq!(result.load_balance(), Some(load_balance));
     assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
@@ -258,15 +258,15 @@ fn fib_snapshot_builder_adds_ip6_single_path_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_generic_single_path_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_generic_single_path_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance = builder.add_single_path_route(
         IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 15), 32).expect("route")),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 15), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(load_balance));
@@ -276,15 +276,15 @@ fn fib_snapshot_builder_adds_generic_single_path_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip4_receive_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip4_receive_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_ip4_receive_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 16), 32).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 16), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -295,16 +295,16 @@ fn fib_snapshot_builder_adds_ip4_receive_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip6_receive_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip6_receive_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0016);
     let route_dpo = builder.add_ip6_receive_route(
         Ipv6Net::new(destination, 128).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
+    let result = table.lookup_ip6(destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
@@ -314,15 +314,15 @@ fn fib_snapshot_builder_adds_ip6_receive_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_generic_receive_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_generic_receive_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_receive_route(
         IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 17), 32).expect("route")),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 17), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -333,15 +333,15 @@ fn fib_snapshot_builder_adds_generic_receive_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip4_punt_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip4_punt_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_ip4_punt_route(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 18), 32).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 18), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -352,16 +352,16 @@ fn fib_snapshot_builder_adds_ip4_punt_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip6_punt_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip6_punt_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0018);
     let route_dpo = builder.add_ip6_punt_route(
         Ipv6Net::new(destination, 128).expect("route"),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
+    let result = table.lookup_ip6(destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
@@ -371,15 +371,15 @@ fn fib_snapshot_builder_adds_ip6_punt_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_generic_punt_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_generic_punt_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_punt_route(
         IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 19), 32).expect("route")),
         NextHop::Direct,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 19), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -390,13 +390,13 @@ fn fib_snapshot_builder_adds_generic_punt_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip4_drop_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip4_drop_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo =
         builder.add_ip4_drop_route(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 20), 32).expect("route"));
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 20), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -407,13 +407,13 @@ fn fib_snapshot_builder_adds_ip4_drop_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_ip6_drop_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_ip6_drop_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let destination = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0x0020);
     let route_dpo = builder.add_ip6_drop_route(Ipv6Net::new(destination, 128).expect("route"));
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot.lookup_ip6(destination, 0).expect("lookup result");
+    let result = table.lookup_ip6(destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
     assert_eq!(result.load_balance(), None);
     assert_eq!(result.bucket_index(), None);
@@ -423,14 +423,14 @@ fn fib_snapshot_builder_adds_ip6_drop_route() {
 }
 
 #[test]
-fn fib_snapshot_builder_adds_generic_drop_route() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_builder_adds_generic_drop_route() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let route_dpo = builder.add_drop_route(IpNet::V4(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 21), 32).expect("route"),
     ));
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 21), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo, route_dpo);
@@ -575,8 +575,8 @@ fn dpo_stack_registry_rejects_missing_stack_edge() {
 }
 
 #[test]
-fn fib_snapshot_can_route_to_receive_dpo() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_can_route_to_receive_dpo() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance = builder.add_load_balance(
         DpoProto::IP4,
         [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
@@ -585,9 +585,9 @@ fn fib_snapshot_can_route_to_receive_dpo() {
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 10), 32).expect("receive host route"),
         load_balance,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 10), 0)
         .expect("lookup result");
     assert_eq!(result.dpo.next(), NextHop::Direct);
@@ -596,8 +596,8 @@ fn fib_snapshot_can_route_to_receive_dpo() {
 }
 
 #[test]
-fn fib_snapshot_exposes_route_load_balance_dpo() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_exposes_route_load_balance_dpo() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance = builder.add_load_balance(
         DpoProto::IP4,
         [DpoId::receive(DpoProto::IP4, NextHop::Direct)],
@@ -606,9 +606,9 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 40), 32).expect("load-balance route"),
         load_balance,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 40), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::LOAD_BALANCE);
@@ -619,8 +619,8 @@ fn fib_snapshot_exposes_route_load_balance_dpo() {
 }
 
 #[test]
-fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_resolves_nested_load_balance_dpo_bucket() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let inner = builder.add_load_balance(
         DpoProto::IP4,
         [
@@ -636,9 +636,9 @@ fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 41), 32).expect("nested load-balance route"),
         outer,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 41), 1)
         .expect("lookup result");
     assert_eq!(result.route_dpo.load_balance_index(), Some(outer));
@@ -649,8 +649,8 @@ fn fib_snapshot_resolves_nested_load_balance_dpo_bucket() {
 }
 
 #[test]
-fn fib_snapshot_can_route_directly_to_terminal_dpo() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_can_route_directly_to_terminal_dpo() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 50), 32).expect("receive route"),
         DpoId::receive(DpoProto::IP4, NextHop::Direct),
@@ -660,9 +660,9 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
         Ipv6Net::new(ip6_destination, 128).expect("receive route"),
         DpoId::receive(DpoProto::IP6, NextHop::Direct),
     );
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 50), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::RECEIVE);
@@ -671,9 +671,7 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
     assert_eq!(result.dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.dpo.next(), NextHop::Direct);
 
-    let result = snapshot
-        .lookup_ip6(ip6_destination, 0)
-        .expect("lookup result");
+    let result = table.lookup_ip6(ip6_destination, 0).expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::RECEIVE);
     assert_eq!(result.route_dpo.proto(), DpoProto::IP6);
     assert_eq!(result.load_balance(), None);
@@ -682,15 +680,15 @@ fn fib_snapshot_can_route_directly_to_terminal_dpo() {
 }
 
 #[test]
-fn fib_snapshot_adds_dpo_backed_fib_entry() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_adds_dpo_backed_fib_entry() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     builder.add_entry(FibEntry::new(
         IpNet::V4(Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 60), 32).expect("punt route")),
         DpoId::punt(DpoProto::IP4, NextHop::Direct),
     ));
-    let snapshot = builder.build();
+    let table = builder.build();
 
-    let result = snapshot
+    let result = table
         .lookup_ip4(Ipv4Addr::new(192, 0, 2, 60), 0)
         .expect("lookup result");
     assert_eq!(result.route_dpo.kind(), DpoType::PUNT);
@@ -701,8 +699,8 @@ fn fib_snapshot_adds_dpo_backed_fib_entry() {
 }
 
 #[test]
-fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_route_dpo_with_wrong_ip_proto() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let err = builder
         .try_add_ip4_route_dpo(
             Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 70), 32).expect("route"),
@@ -735,8 +733,8 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_ip_proto() {
 }
 
 #[test]
-fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_route_dpo_with_missing_adjacency() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let missing = AdjacencyIndex::new(99);
     let err = builder
         .try_add_ip4_route_dpo(
@@ -749,8 +747,8 @@ fn fib_snapshot_rejects_route_dpo_with_missing_adjacency() {
 }
 
 #[test]
-fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_route_dpo_with_wrong_adjacency_proto() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency(DpoProto::IP6, NextHop::Direct);
     let err = builder
         .try_add_ip4_route_dpo(
@@ -770,8 +768,8 @@ fn fib_snapshot_rejects_route_dpo_with_wrong_adjacency_proto() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_route_with_wrong_proto_or_index() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance =
         builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
 
@@ -802,8 +800,8 @@ fn fib_snapshot_rejects_load_balance_route_with_wrong_proto_or_index() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let load_balance =
         builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
 
@@ -834,8 +832,8 @@ fn fib_snapshot_rejects_load_balance_dpo_route_with_wrong_proto_or_index() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_bucket_with_missing_adjacency() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let missing = AdjacencyIndex::new(99);
     let err = builder
         .try_add_load_balance(
@@ -854,8 +852,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_adjacency() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency(DpoProto::IP6, NextHop::Direct);
     let err = builder
         .try_add_load_balance(
@@ -876,8 +874,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_adjacency_proto() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_bucket_with_missing_load_balance() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_bucket_with_missing_load_balance() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let missing = LoadBalanceIndex::new(99);
     let err = builder
         .try_add_load_balance(
@@ -896,8 +894,8 @@ fn fib_snapshot_rejects_load_balance_bucket_with_missing_load_balance() {
 }
 
 #[test]
-fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let inner =
         builder.add_load_balance(DpoProto::IP6, [DpoId::drop(DpoProto::IP6, NextHop::Drop)]);
     let err = builder
@@ -919,15 +917,15 @@ fn fib_snapshot_rejects_load_balance_bucket_with_wrong_load_balance_proto() {
 }
 
 #[test]
-fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
-    let mut builder = FibSnapshotBuilder::new(NextHop::Drop);
+fn fib_table_exposes_packet_prefetch_before_lookup() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
     let adjacency = builder.add_adjacency_dpo(DpoProto::IP4, NextHop::Direct);
     let load_balance = builder.add_load_balance(DpoProto::IP4, [adjacency]);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
         load_balance,
     );
-    let snapshot = builder.build();
+    let table = builder.build();
     let packet = ParsedIpPacket {
         version: IpVersion::V4,
         protocol: IpProtocol::Udp,
@@ -942,8 +940,8 @@ fn fib_snapshot_exposes_packet_prefetch_before_lookup() {
         transport_header_len: 8,
     };
 
-    snapshot.prefetch_packet(&packet);
+    table.prefetch_packet(&packet);
 
-    let result = snapshot.lookup_packet(&packet).expect("lookup result");
+    let result = table.lookup_packet(&packet).expect("lookup result");
     assert_eq!(result.dpo.next(), NextHop::Direct);
 }

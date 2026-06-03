@@ -91,3 +91,4 @@ pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs
 #[cfg(feature = "inbound-tun")]
 pub use protocol::tun::TunInbound;
 pub use socket_protector::{RuntimePlatform, SocketProtector};
+pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle};

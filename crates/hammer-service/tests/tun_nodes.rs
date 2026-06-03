@@ -10,9 +10,9 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_infra::vec::Vec;
 use hammer_service::data_plane::{FeatureArcControl, next_feature_frame};
+use hammer_service::interface::{InterfaceControlPlane, InterfaceMtu};
 use hammer_service::net::{
-    DpoId, DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane,
-    IpLookupNode,
+    DpoId, DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
 };
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 use ipnet::Ipv4Net;
@@ -269,6 +269,103 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
 }
 
 #[test]
+fn tun_driver_sets_ingress_interface_from_interface_control_handle() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
+    device.inject(packet).expect("inject packet");
+
+    let interface_control = InterfaceControlPlane::new();
+    let tun0 = interface_control
+        .register_interface("tun0")
+        .expect("register tun0");
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let captured = Rc::new(RefCell::new(Vec::new()));
+    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
+        next: output,
+        metadata: Rc::clone(&captured),
+    });
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            capture, capture, capture, capture, capture, capture, capture,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", ip_input)
+            .with_interface_control(interface_control.handle()),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tun driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(captured.borrow().len(), 1);
+    assert_eq!(captured.borrow()[0].ingress_interface, Some(tun0));
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tun_driver_interface_control_handle_exposes_configured_mtu() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
+    device.inject(packet).expect("inject packet");
+
+    let interface_control = InterfaceControlPlane::new();
+    let mtu = InterfaceMtu::new(9000, 1500, 1280, 0);
+    let tun0 = interface_control
+        .register_interface_with_mtu("tun0", mtu)
+        .expect("register tun0");
+    let handle = interface_control.handle();
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", output)
+            .with_interface_control(handle.clone()),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tun driver");
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(handle.interface_mtu(tun0), Some(mtu));
+}
+
+#[test]
+fn tun_driver_errors_when_interface_control_cannot_resolve_interface() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
+    device.inject(packet).expect("inject packet");
+
+    let interface_control = InterfaceControlPlane::new();
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", output)
+            .with_interface_control(interface_control.handle()),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tun driver");
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("missing interface should fail");
+
+    assert!(err.to_string().contains("interface tun0 is not registered"));
+}
+
+#[test]
 fn tun_driver_routes_through_service_internal_nodes() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
@@ -283,7 +380,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
-    let mut builder = FibSnapshotBuilder::new(output);
+    let mut builder = FibTableBuilder::new(output);
     let adjacency = builder.add_adjacency(DpoProto::IP4, output);
     let load_balance = builder.add_load_balance(
         DpoProto::IP4,

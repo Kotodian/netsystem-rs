@@ -9,7 +9,7 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
-    DpoId, DpoProto, FibSnapshotBuilder, IcmpInputControlPlane, IcmpInputNode, IpInputNext,
+    DpoId, DpoProto, FibTableBuilder, IcmpInputControlPlane, IcmpInputNode, IpInputNext,
     IpInputNode, IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode,
     IpLocalSourceCheck, IpLookupControlPlane, IpLookupNode, IpReceiveNode, IpVersion,
 };
@@ -448,7 +448,7 @@ fn ip_local_accepts_ipv4_udp_zero_checksum_and_rejects_ipv6_udp_zero_checksum() 
 fn ip_local_reverse_fib_source_check_rejects_unusable_source_routes() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
-    let mut source_builder = FibSnapshotBuilder::new(graph.drop);
+    let mut source_builder = FibTableBuilder::new(graph.drop);
     let usable_source_lb = source_builder.add_single_path_load_balance(DpoProto::IP4, graph.udp);
     source_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("usable source route"),
@@ -465,7 +465,7 @@ fn ip_local_reverse_fib_source_check_rejects_unusable_source_routes() {
         Ipv4Net::new(Ipv4Addr::new(203, 0, 113, 3), 32).expect("punt source route"),
         graph.punt,
     );
-    let source_handle = IpLookupControlPlane::new(source_builder.build()).snapshot_handle();
+    let source_handle = IpLookupControlPlane::new(source_builder.build()).table_handle();
     let control = IpLocalControlPlane::new(graph.nexts())
         .with_source_check(IpLocalSourceCheck::ReverseFib(source_handle));
     let local = runtime.nodes().register_internal(control.node());
@@ -574,7 +574,7 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let mut builder = FibSnapshotBuilder::new(graph.drop);
+    let mut builder = FibTableBuilder::new(graph.drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 9), 32).expect("receive route"),
         DpoId::receive(DpoProto::IP4, receive),

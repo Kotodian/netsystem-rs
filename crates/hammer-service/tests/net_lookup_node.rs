@@ -1,15 +1,17 @@
 use std::cell::RefCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
+use std::time::Duration;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeResult,
 };
 use hammer_core::error::CoreResult;
+use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    Dpo, DpoId, DpoProto, DpoType, FibSnapshotBuilder, IpInputNext, IpInputNode,
-    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
+    Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, IpInputNext, IpInputNode, IpLocalControlPlane,
+    IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -147,7 +149,7 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let host = register_sink(&runtime, &host_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let default_lb = add_single_path(&mut builder, DpoProto::IP4, default);
     let specific_lb = add_single_path(&mut builder, DpoProto::IP4, specific);
     let host_lb = add_single_path(&mut builder, DpoProto::IP4, host);
@@ -205,7 +207,7 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -250,7 +252,7 @@ fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -296,7 +298,7 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
     let host = register_sink(&runtime, &host_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let default_lb = add_single_path(&mut builder, DpoProto::IP6, default);
     let subnet_lb = add_single_path(&mut builder, DpoProto::IP6, subnet);
     let host_lb = add_single_path(&mut builder, DpoProto::IP6, host);
@@ -350,7 +352,7 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime
         .nodes()
-        .register_internal(IpLookupControlPlane::new(FibSnapshotBuilder::new(drop).build()).node());
+        .register_internal(IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node());
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(
         &runtime,
@@ -376,7 +378,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let receive_lb =
         builder.add_load_balance(DpoProto::IP4, [DpoId::receive(DpoProto::IP4, receive)]);
     builder.add_ip4_route(
@@ -417,7 +419,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     builder.add_ip4_route_dpo(
         Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 11), 32).expect("direct receive route"),
         DpoId::receive(DpoProto::IP4, receive),
@@ -453,7 +455,7 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let state = Rc::new(RefCell::new(SinkState::default()));
     let receive = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let parent = Dpo::receive(DpoProto::IP4, drop);
     let stacked = Dpo::stack(parent, receive);
     let stack_lb = builder.add_load_balance(DpoProto::IP4, [stacked]);
@@ -490,7 +492,7 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let custom_type = DpoType::new(7);
     let custom_index = 11;
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let custom_lb = builder.add_load_balance(
         DpoProto::IP4,
         [Dpo::new(DpoProto::IP4, custom_type, custom_index, custom)],
@@ -521,7 +523,7 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
 }
 
 #[test]
-fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
+fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let first_state = Rc::new(RefCell::new(SinkState::default()));
     let second_state = Rc::new(RefCell::new(SinkState::default()));
@@ -529,7 +531,7 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
     let second = register_sink(&runtime, &second_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
 
-    let mut first_builder = FibSnapshotBuilder::new(drop);
+    let mut first_builder = FibTableBuilder::new(drop);
     let first_lb = add_single_path(&mut first_builder, DpoProto::IP4, first);
     first_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("first default"),
@@ -552,7 +554,7 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
     assert_eq!(runtime.run_ready_nodes().expect("run first"), 2);
     assert_payloads(&first_state, &[b"first".as_slice()]);
 
-    let mut second_builder = FibSnapshotBuilder::new(drop);
+    let mut second_builder = FibTableBuilder::new(drop);
     let second_lb = add_single_path(&mut second_builder, DpoProto::IP4, second);
     second_builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("second default"),
@@ -578,12 +580,30 @@ fn ip_lookup_control_plane_publish_replaces_forwarding_snapshot() {
 }
 
 #[test]
+fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
+    let data_runtime =
+        DataRuntime::new(1, "ip-lookup-barrier-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let control =
+        IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).with_barrier(barrier.clone());
+
+    control
+        .publish(FibTableBuilder::new(drop).build())
+        .expect("publish");
+
+    assert_eq!(barrier.sync_count(), 1);
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
 fn ip_input_to_lookup_graph_routes_packet_by_fib() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
@@ -659,7 +679,7 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("route"),
@@ -706,7 +726,7 @@ fn register_sink(
 }
 
 fn add_single_path(
-    builder: &mut FibSnapshotBuilder,
+    builder: &mut FibTableBuilder,
     proto: DpoProto,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {

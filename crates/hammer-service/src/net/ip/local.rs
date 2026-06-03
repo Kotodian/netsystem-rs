@@ -9,7 +9,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::data_plane::{FeatureArc, set_index_node_error_code};
-use crate::net::{DpoType, FibLookupResult, FibSnapshotHandle};
+use crate::net::{DpoType, FibLookupResult, FibTableHandle};
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
 use super::{network_for_protocol, parse_ip_packet_with_chain_len};
@@ -57,7 +57,7 @@ impl IpLocalError {
 #[derive(Debug, Clone)]
 pub enum IpLocalSourceCheck {
     Disabled,
-    ReverseFib(FibSnapshotHandle),
+    ReverseFib(FibTableHandle),
 }
 
 impl Default for IpLocalSourceCheck {
@@ -513,7 +513,7 @@ fn source_check_passes(snapshot: &IpLocalSnapshot, parsed: &ParsedIpPacket) -> b
     let IpLocalSourceCheck::ReverseFib(handle) = &snapshot.source_check else {
         return true;
     };
-    let fib = handle.load();
+    let fib = handle.table();
     let result = match parsed.source {
         IpAddr::V4(source) => fib.lookup_ip4(source, 0),
         IpAddr::V6(source) => fib.lookup_ip6(source, 0),

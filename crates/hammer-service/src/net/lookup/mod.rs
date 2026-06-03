@@ -1,7 +1,8 @@
+use std::cell::UnsafeCell;
+use std::fmt;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
     ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextVectorEnqueue, NodeResult,
@@ -10,8 +11,8 @@ use hammer_adapter::{
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
-    FibLookupResult as CoreFibLookupResult, FibSnapshot as CoreFibSnapshot,
-    FibSnapshotBuilder as CoreFibSnapshotBuilder, LoadBalance as CoreLoadBalance,
+    FibLookupResult as CoreFibLookupResult, FibTable as CoreFibTable,
+    FibTableBuilder as CoreFibTableBuilder, LoadBalance as CoreLoadBalance,
 };
 pub use hammer_core::forwarding::{
     AdjacencyIndex, Dpo, DpoClass, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
@@ -20,59 +21,102 @@ pub use hammer_core::forwarding::{
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
 };
-use hammer_runtime::ControlThreadHandle;
+use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
 
 pub type Adjacency = CoreAdjacency<NodeId>;
 pub type DpoId = CoreDpoId<NodeId>;
 pub type FibEntry = CoreFibEntry<NodeId>;
 pub type FibLookupResult = CoreFibLookupResult<NodeId>;
-pub type FibSnapshot = CoreFibSnapshot<NodeId>;
-pub type FibSnapshotBuilder = CoreFibSnapshotBuilder<NodeId>;
+pub type FibTable = CoreFibTable<NodeId>;
+pub type FibTableBuilder = CoreFibTableBuilder<NodeId>;
 pub type LoadBalance = CoreLoadBalance<NodeId>;
 
-#[derive(Debug, Clone)]
-pub struct FibSnapshotHandle {
-    inner: Arc<ArcSwap<FibSnapshot>>,
+#[derive(Clone)]
+pub struct FibTableHandle {
+    inner: Arc<FibTableSlot>,
 }
 
-impl FibSnapshotHandle {
+struct FibTableSlot {
+    table: UnsafeCell<FibTable>,
+}
+
+impl FibTableHandle {
     #[inline]
-    pub fn new(snapshot: FibSnapshot) -> Self {
+    pub fn new(table: FibTable) -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(snapshot)),
+            inner: Arc::new(FibTableSlot::new(table)),
         }
     }
 
     #[inline]
-    pub fn load(&self) -> arc_swap::Guard<Arc<FibSnapshot>> {
-        self.inner.load()
+    pub fn table(&self) -> &FibTable {
+        self.inner.table()
     }
 
     #[inline]
-    fn store(&self, snapshot: FibSnapshot) {
-        self.inner.store(Arc::new(snapshot));
+    fn replace_after_barrier(&self, table: FibTable) {
+        self.inner.replace_after_barrier(table);
     }
 }
 
+impl fmt::Debug for FibTableHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FibTableHandle").finish_non_exhaustive()
+    }
+}
+
+impl FibTableSlot {
+    #[inline]
+    fn new(table: FibTable) -> Self {
+        Self {
+            table: UnsafeCell::new(table),
+        }
+    }
+
+    #[inline]
+    fn table(&self) -> &FibTable {
+        // SAFETY: FIB table writes are serialized by the runtime data-plane
+        // barrier before publication. Data-plane nodes only take immutable
+        // references while workers are running.
+        unsafe { &*self.table.get() }
+    }
+
+    #[inline]
+    fn replace_after_barrier(&self, table: FibTable) {
+        // SAFETY: callers replace the table either while the runtime
+        // data-plane barrier is held, or during single-threaded graph setup in
+        // tests before packets are processed.
+        unsafe {
+            *self.table.get() = table;
+        }
+    }
+}
+
+unsafe impl Send for FibTableSlot {}
+unsafe impl Sync for FibTableSlot {}
+
 pub struct IpLookupControlPlane {
-    snapshot: FibSnapshotHandle,
+    table: FibTableHandle,
     control_handle: Option<Arc<ControlThreadHandle>>,
+    barrier: Option<DataPlaneBarrierHandle>,
 }
 
 impl IpLookupControlPlane {
     #[inline]
-    pub fn new(snapshot: FibSnapshot) -> Self {
+    pub fn new(table: FibTable) -> Self {
         Self {
-            snapshot: FibSnapshotHandle::new(snapshot),
+            table: FibTableHandle::new(table),
             control_handle: None,
+            barrier: None,
         }
     }
 
     #[inline]
-    pub fn from_handle(snapshot: FibSnapshotHandle) -> Self {
+    pub fn from_handle(table: FibTableHandle) -> Self {
         Self {
-            snapshot,
+            table,
             control_handle: None,
+            barrier: None,
         }
     }
 
@@ -83,22 +127,40 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn snapshot_handle(&self) -> FibSnapshotHandle {
-        self.snapshot.clone()
+    pub fn with_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+        self.barrier = Some(barrier);
+        self
+    }
+
+    #[inline]
+    pub fn table_handle(&self) -> FibTableHandle {
+        self.table.clone()
     }
 
     #[inline]
     pub fn node(&self) -> IpLookupNode {
-        IpLookupNode::new(self.snapshot_handle())
+        IpLookupNode::new(self.table_handle())
     }
 
     #[inline]
-    pub fn publish(&self, snapshot: FibSnapshot) -> HammerResult<()> {
-        let snapshot_handle = self.snapshot.clone();
+    pub fn publish(&self, table: FibTable) -> HammerResult<()> {
+        let table_handle = self.table.clone();
+        let barrier = self.barrier.clone();
+        let publish = move || {
+            if let Some(barrier) = barrier {
+                barrier.synchronize(|| {
+                    table_handle.replace_after_barrier(table);
+                    Ok(())
+                })
+            } else {
+                table_handle.replace_after_barrier(table);
+                Ok(())
+            }
+        };
         if let Some(control_handle) = &self.control_handle {
-            control_handle.call(move || snapshot_handle.store(snapshot))?;
+            control_handle.call(publish)??;
         } else {
-            snapshot_handle.store(snapshot);
+            publish()?;
         }
         Ok(())
     }
@@ -106,7 +168,7 @@ impl IpLookupControlPlane {
 
 #[hammer_component_macros::node]
 pub struct IpLookupNode {
-    snapshot: FibSnapshotHandle,
+    table: FibTableHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
@@ -116,7 +178,7 @@ impl IpLookupNode {
     fn process_index_with_batch(
         &self,
         batch: &mut BufferBatchMut<'_>,
-        snapshot: &FibSnapshot,
+        table: &FibTable,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
         let buffer = batch.buffer_mut(index)?;
@@ -134,12 +196,12 @@ impl IpLookupNode {
             Some(parsed) => parsed,
             None => {
                 buffer.metadata_mut().forwarding = None;
-                return Ok(snapshot.drop_next());
+                return Ok(table.drop_next());
             }
         };
-        let result = snapshot
+        let result = table
             .lookup_packet(&parsed)
-            .unwrap_or_else(|| FibLookupResult::terminal(snapshot.drop_dpo(parsed.version)));
+            .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
         buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
             fib_index: 0,
             route_dpo_type: result.route_dpo.kind(),
@@ -155,7 +217,7 @@ impl IpLookupNode {
     #[inline(always)]
     fn prefetch_index_with_batch(
         batch: &mut BufferBatchMut<'_>,
-        snapshot: &FibSnapshot,
+        table: &FibTable,
         index: BufferIndex,
     ) {
         batch.prefetch_read(index);
@@ -171,13 +233,13 @@ impl IpLookupNode {
         ) else {
             return;
         };
-        snapshot.prefetch_packet(&parsed);
+        table.prefetch_packet(&parsed);
     }
 
     #[inline(always)]
     fn prefetch_range_with_batch(
         batch: &mut BufferBatchMut<'_>,
-        snapshot: &FibSnapshot,
+        table: &FibTable,
         indices: &[BufferIndex],
         offset: usize,
         width: usize,
@@ -187,18 +249,18 @@ impl IpLookupNode {
         }
         let end = (offset + width).min(indices.len());
         for index in indices[offset..end].iter().copied() {
-            Self::prefetch_index_with_batch(batch, snapshot, index);
+            Self::prefetch_index_with_batch(batch, table, index);
         }
     }
 
     #[inline(always)]
     fn prefetch_indices_with_batch(
         batch: &mut BufferBatchMut<'_>,
-        snapshot: &FibSnapshot,
+        table: &FibTable,
         indices: &[BufferIndex],
     ) {
         for index in indices.iter().copied() {
-            Self::prefetch_index_with_batch(batch, snapshot, index);
+            Self::prefetch_index_with_batch(batch, table, index);
         }
     }
 
@@ -206,13 +268,13 @@ impl IpLookupNode {
     fn process_indices_with_batch(
         &self,
         batch: &mut BufferBatchMut<'_>,
-        snapshot: &FibSnapshot,
+        table: &FibTable,
         indices: &[BufferIndex],
         nexts: &mut [NodeId; 4],
         start_offset: usize,
     ) -> CoreResult<()> {
         for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-            nexts[offset] = self.process_index_with_batch(batch, snapshot, index)?;
+            nexts[offset] = self.process_index_with_batch(batch, table, index)?;
         }
         Ok(())
     }
@@ -225,7 +287,7 @@ impl<G> Node<G> for IpLookupNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let snapshot = self.snapshot.load();
+        let table = self.table.table();
         let indices = frame.pending_indices();
         let Some(first) = indices.first().copied() else {
             return Ok(NodeResult::drop());
@@ -233,8 +295,8 @@ impl<G> Node<G> for IpLookupNode {
         let width = frame_batch_width(runtime);
         let first_next = {
             let mut batch = runtime.buffer_batch_mut();
-            Self::prefetch_range_with_batch(&mut batch, &snapshot, indices, 0, width);
-            self.process_index_with_batch(&mut batch, &snapshot, first)?
+            Self::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
+            self.process_index_with_batch(&mut batch, &table, first)?
         };
         let cached_next = self.cached_next.unwrap_or(first_next);
         let mut first_chunk = true;
@@ -243,7 +305,7 @@ impl<G> Node<G> for IpLookupNode {
                 runtime,
                 frame,
                 |batch, indices| {
-                    Self::prefetch_indices_with_batch(batch, &snapshot, indices);
+                    Self::prefetch_indices_with_batch(batch, &table, indices);
                 },
                 |batch, indices, nexts| {
                     let start_offset = if first_chunk {
@@ -253,7 +315,7 @@ impl<G> Node<G> for IpLookupNode {
                     } else {
                         0
                     };
-                    self.process_indices_with_batch(batch, &snapshot, indices, nexts, start_offset)
+                    self.process_indices_with_batch(batch, &table, indices, nexts, start_offset)
                 },
             )?;
         self.cached_next = Some(cached_next);

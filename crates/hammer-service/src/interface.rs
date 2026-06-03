@@ -1,0 +1,477 @@
+use std::cell::UnsafeCell;
+use std::fmt;
+use std::sync::Arc;
+
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::map::{FlatHashKey, FlatHashTable};
+use hammer_infra::vec::Vec;
+use hammer_runtime::DataPlaneBarrierHandle;
+use ipnet::IpNet;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterfaceMtu {
+    values: [u32; InterfaceMtuKind::COUNT],
+}
+
+impl InterfaceMtu {
+    #[inline]
+    pub const fn new(l3: u32, ip4: u32, ip6: u32, mpls: u32) -> Self {
+        Self {
+            values: [l3, ip4, ip6, mpls],
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, kind: InterfaceMtuKind) -> u32 {
+        self.values[kind.slot()]
+    }
+
+    #[inline]
+    pub fn set(&mut self, kind: InterfaceMtuKind, value: u32) {
+        self.values[kind.slot()] = value;
+    }
+
+    #[inline]
+    pub fn l3(&self) -> u32 {
+        self.get(InterfaceMtuKind::L3)
+    }
+
+    #[inline]
+    pub fn ip4(&self) -> u32 {
+        self.get(InterfaceMtuKind::Ip4)
+    }
+
+    #[inline]
+    pub fn ip6(&self) -> u32 {
+        self.get(InterfaceMtuKind::Ip6)
+    }
+
+    #[inline]
+    pub fn mpls(&self) -> u32 {
+        self.get(InterfaceMtuKind::Mpls)
+    }
+}
+
+impl Default for InterfaceMtu {
+    #[inline]
+    fn default() -> Self {
+        Self::new(0, 0, 0, 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceMtuKind {
+    L3,
+    Ip4,
+    Ip6,
+    Mpls,
+}
+
+impl InterfaceMtuKind {
+    const COUNT: usize = 4;
+
+    #[inline]
+    const fn slot(self) -> usize {
+        match self {
+            Self::L3 => 0,
+            Self::Ip4 => 1,
+            Self::Ip6 => 2,
+            Self::Mpls => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceControlHandle {
+    inner: Arc<InterfaceStateSlot>,
+}
+
+impl InterfaceControlHandle {
+    #[inline]
+    fn new(inner: Arc<InterfaceStateSlot>) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn interface_index(&self, name: &str) -> Option<u32> {
+        self.inner.state().interface_index(name)
+    }
+
+    #[inline]
+    pub fn interface_name(&self, index: u32) -> Option<String> {
+        self.inner
+            .state()
+            .interface_name(index)
+            .map(ToOwned::to_owned)
+    }
+
+    #[inline]
+    pub fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
+        self.inner.state().interface_addresses(index)
+    }
+
+    #[inline]
+    pub fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
+        self.inner.state().interface_mtu(index)
+    }
+
+    #[inline]
+    pub fn interface_address_index(&self, interface_index: u32, address: IpNet) -> Option<u32> {
+        self.inner
+            .state()
+            .interface_address_index(interface_index, address)
+    }
+}
+
+pub struct InterfaceControlPlane {
+    inner: Arc<InterfaceStateSlot>,
+    barrier: Option<DataPlaneBarrierHandle>,
+}
+
+impl Default for InterfaceControlPlane {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InterfaceControlPlane {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(InterfaceStateSlot::new(InterfaceState::default())),
+            barrier: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+        self.barrier = Some(barrier);
+        self
+    }
+
+    #[inline]
+    pub fn handle(&self) -> InterfaceControlHandle {
+        InterfaceControlHandle::new(Arc::clone(&self.inner))
+    }
+
+    pub fn register_interface(&self, name: impl Into<String>) -> CoreResult<u32> {
+        self.register_interface_with_mtu(name, InterfaceMtu::default())
+    }
+
+    pub fn register_interface_with_mtu(
+        &self,
+        name: impl Into<String>,
+        mtu: InterfaceMtu,
+    ) -> CoreResult<u32> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(CoreError::internal("interface name is empty"));
+        }
+        let mut index = None;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            if let Some(current_index) = current.interface_index(&name) {
+                index = Some(current_index);
+                return Ok(());
+            }
+            let mut next = InterfaceState::clone(&current);
+            let next_index = next.interfaces.len() as u32;
+            next.interfaces.push(InterfaceRecord {
+                name: name.clone(),
+                addresses: Vec::new(),
+                mtu,
+            });
+            index = Some(next_index);
+            self.publish(next);
+            Ok(())
+        })?;
+        index.ok_or_else(|| CoreError::internal("interface registration did not publish an index"))
+    }
+
+    pub fn set_mtu(&self, interface_index: u32, mtu: InterfaceMtu) -> CoreResult<()> {
+        self.ensure_interface(interface_index)?;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            let mut next = InterfaceState::clone(current);
+            let interface = next.interface_mut(interface_index).ok_or_else(|| {
+                CoreError::internal(format!("interface {interface_index} is not registered"))
+            })?;
+            interface.mtu = mtu;
+            self.publish(next);
+            Ok(())
+        })
+    }
+
+    pub fn set_protocol_mtu(
+        &self,
+        interface_index: u32,
+        kind: InterfaceMtuKind,
+        value: u32,
+    ) -> CoreResult<()> {
+        self.ensure_interface(interface_index)?;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            let mut next = InterfaceState::clone(current);
+            let interface = next.interface_mut(interface_index).ok_or_else(|| {
+                CoreError::internal(format!("interface {interface_index} is not registered"))
+            })?;
+            interface.mtu.set(kind, value);
+            self.publish(next);
+            Ok(())
+        })
+    }
+
+    pub fn add_address(&self, interface_index: u32, address: IpNet) -> CoreResult<u32> {
+        self.ensure_interface(interface_index)?;
+        let mut address_index = None;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            if let Some(current_index) = current.interface_address_index(interface_index, address) {
+                address_index = Some(current_index);
+                return Ok(());
+            }
+            let mut next = InterfaceState::clone(&current);
+            let index = next.addresses.len() as u32;
+            next.address_to_index
+                .insert(InterfaceAddressKey::new(interface_index, address), index);
+            next.addresses.push(InterfaceAddressRecord {
+                interface_index,
+                address,
+                removed: false,
+            });
+            next.interfaces[interface_index as usize]
+                .addresses
+                .push(index);
+            address_index = Some(index);
+            self.publish(next);
+            Ok(())
+        })?;
+        address_index
+            .ok_or_else(|| CoreError::internal("interface address did not publish an index"))
+    }
+
+    pub fn remove_address(&self, interface_index: u32, address: IpNet) -> CoreResult<bool> {
+        self.ensure_interface(interface_index)?;
+        let mut removed = false;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            let Some(address_index) = current.interface_address_index(interface_index, address)
+            else {
+                return Ok(());
+            };
+            let mut next = InterfaceState::clone(&current);
+            if let Some(address) = next.addresses.get_mut(address_index as usize) {
+                address.removed = true;
+            }
+            if let Some(interface) = next.interfaces.get_mut(interface_index as usize) {
+                let addresses = interface
+                    .addresses
+                    .iter()
+                    .copied()
+                    .filter(|index| *index != address_index)
+                    .collect::<Vec<_>>();
+                interface.addresses = addresses;
+            }
+            next.rebuild_address_index();
+            removed = true;
+            self.publish(next);
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    #[inline]
+    fn ensure_interface(&self, interface_index: u32) -> CoreResult<()> {
+        if self.inner.state().interface(interface_index).is_some() {
+            Ok(())
+        } else {
+            Err(CoreError::internal(format!(
+                "interface {interface_index} is not registered"
+            )))
+        }
+    }
+
+    #[inline]
+    fn synchronize<R>(&self, operation: impl FnOnce() -> CoreResult<R>) -> CoreResult<R> {
+        if let Some(barrier) = &self.barrier {
+            barrier.synchronize(operation)
+        } else {
+            operation()
+        }
+    }
+
+    #[inline]
+    fn publish(&self, state: InterfaceState) {
+        self.inner.replace_after_barrier(state);
+    }
+}
+
+struct InterfaceStateSlot {
+    state: UnsafeCell<InterfaceState>,
+}
+
+impl InterfaceStateSlot {
+    #[inline]
+    fn new(state: InterfaceState) -> Self {
+        Self {
+            state: UnsafeCell::new(state),
+        }
+    }
+
+    #[inline]
+    fn state(&self) -> &InterfaceState {
+        // SAFETY: Interface state writes are serialized by the runtime
+        // data-plane barrier before publication. Driver/data-plane reads use
+        // immutable references while workers are running.
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline]
+    fn replace_after_barrier(&self, state: InterfaceState) {
+        // SAFETY: callers replace state either while the runtime data-plane
+        // barrier is held, or during single-threaded setup in tests.
+        unsafe {
+            *self.state.get() = state;
+        }
+    }
+}
+
+impl fmt::Debug for InterfaceStateSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InterfaceStateSlot").finish_non_exhaustive()
+    }
+}
+
+unsafe impl Send for InterfaceStateSlot {}
+unsafe impl Sync for InterfaceStateSlot {}
+
+#[derive(Debug, Clone, Default)]
+struct InterfaceState {
+    interfaces: Vec<InterfaceRecord>,
+    addresses: Vec<InterfaceAddressRecord>,
+    address_to_index: FlatHashTable<InterfaceAddressKey, u32>,
+}
+
+impl InterfaceState {
+    #[inline]
+    fn interface(&self, index: u32) -> Option<&InterfaceRecord> {
+        self.interfaces.get(index as usize)
+    }
+
+    #[inline]
+    fn interface_mut(&mut self, index: u32) -> Option<&mut InterfaceRecord> {
+        self.interfaces.get_mut(index as usize)
+    }
+
+    #[inline]
+    fn interface_index(&self, name: &str) -> Option<u32> {
+        self.interfaces
+            .iter()
+            .position(|interface| interface.name == name)
+            .and_then(|index| u32::try_from(index).ok())
+    }
+
+    #[inline]
+    fn interface_name(&self, index: u32) -> Option<&str> {
+        self.interface(index)
+            .map(|interface| interface.name.as_str())
+    }
+
+    #[inline]
+    fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
+        self.interface(index).map(|interface| interface.mtu)
+    }
+
+    fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
+        let Some(interface) = self.interface(index) else {
+            return Vec::new();
+        };
+        interface
+            .addresses
+            .iter()
+            .filter_map(|address_index| self.addresses.get(*address_index as usize))
+            .filter(|record| !record.removed)
+            .map(|record| record.address)
+            .collect()
+    }
+
+    #[inline]
+    fn interface_address_index(&self, interface_index: u32, address: IpNet) -> Option<u32> {
+        self.address_to_index
+            .lookup(&InterfaceAddressKey::new(interface_index, address))
+    }
+
+    fn rebuild_address_index(&mut self) {
+        let mut address_to_index = FlatHashTable::with_capacity(self.addresses.len().max(1));
+        for (index, address) in self.addresses.iter().enumerate() {
+            if address.removed {
+                continue;
+            }
+            let index = u32::try_from(index).expect("interface address index fits u32");
+            address_to_index.insert(
+                InterfaceAddressKey::new(address.interface_index, address.address),
+                index,
+            );
+        }
+        self.address_to_index = address_to_index;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InterfaceRecord {
+    name: String,
+    addresses: Vec<u32>,
+    mtu: InterfaceMtu,
+}
+
+#[derive(Debug, Clone)]
+struct InterfaceAddressRecord {
+    interface_index: u32,
+    address: IpNet,
+    removed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InterfaceAddressKey {
+    interface_index: u32,
+    address_family: u8,
+    prefix_len: u8,
+    address_hi: u64,
+    address_lo: u64,
+}
+
+impl InterfaceAddressKey {
+    #[inline]
+    fn new(interface_index: u32, address: IpNet) -> Self {
+        let (address_family, prefix_len, address_hi, address_lo) = match address {
+            IpNet::V4(address) => {
+                let value = u32::from(address.addr());
+                (4, address.prefix_len(), 0, u64::from(value))
+            }
+            IpNet::V6(address) => {
+                let value = u128::from(address.addr());
+                (6, address.prefix_len(), (value >> 64) as u64, value as u64)
+            }
+        };
+        Self {
+            interface_index,
+            address_family,
+            prefix_len,
+            address_hi,
+            address_lo,
+        }
+    }
+}
+
+impl FlatHashKey for InterfaceAddressKey {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        let mut value = u128::from(self.interface_index);
+        value ^= u128::from(self.address_family) << 32;
+        value ^= u128::from(self.prefix_len) << 40;
+        value ^= u128::from(self.address_hi) << 64;
+        value ^= u128::from(self.address_lo);
+        value.hash_key()
+    }
+}

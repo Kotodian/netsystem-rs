@@ -12,7 +12,7 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    DpoProto, FibSnapshotBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -351,7 +351,7 @@ fn build_lookup(
     checksum: &Rc<Cell<u64>>,
 ) -> hammer_adapter::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibSnapshotBuilder::new(drop);
+    let mut builder = FibTableBuilder::new(drop);
     match scenario {
         Scenario::Ipv4SameNext => {
             let sink = register_sink(runtime, packets, checksum);
@@ -413,7 +413,7 @@ fn register_sink(
 }
 
 fn add_single_path(
-    builder: &mut FibSnapshotBuilder,
+    builder: &mut FibTableBuilder,
     proto: DpoProto,
     node: hammer_adapter::NodeId,
 ) -> hammer_service::net::LoadBalanceIndex {

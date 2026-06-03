@@ -10,6 +10,8 @@ use hammer_infra::vec::Vec;
 
 pub use crate::net::packet_route_metadata;
 
+use crate::interface::InterfaceControlHandle;
+
 const DEFAULT_TUN_RECV_BATCH: usize = 256;
 
 pub trait TunPacketSource {
@@ -34,6 +36,7 @@ pub struct TunInputDriverNode<I> {
     input: I,
     interface_id: String,
     interface_index: Option<u32>,
+    interface_control: Option<InterfaceControlHandle>,
     next: NodeId,
     max_batch: usize,
 }
@@ -45,6 +48,7 @@ impl<I> TunInputDriverNode<I> {
             input,
             interface_id: interface_id.into(),
             interface_index: None,
+            interface_control: None,
             next,
             max_batch: DEFAULT_TUN_RECV_BATCH,
         }
@@ -57,9 +61,31 @@ impl<I> TunInputDriverNode<I> {
     }
 
     #[inline]
+    pub fn with_interface_control(mut self, interface_control: InterfaceControlHandle) -> Self {
+        self.interface_control = Some(interface_control);
+        self
+    }
+
+    #[inline]
     pub fn with_max_batch(mut self, max_batch: usize) -> Self {
         self.max_batch = max_batch;
         self
+    }
+
+    #[inline]
+    fn ingress_interface_index(&self) -> CoreResult<Option<u32>> {
+        if let Some(interface_control) = &self.interface_control {
+            return interface_control
+                .interface_index(&self.interface_id)
+                .map(Some)
+                .ok_or_else(|| {
+                    CoreError::internal(format!(
+                        "interface {} is not registered",
+                        self.interface_id
+                    ))
+                });
+        }
+        Ok(self.interface_index)
     }
 }
 
@@ -77,7 +103,7 @@ where
         let first_new = frame.pending_len();
         self.input
             .recv_frame(runtime, frame, &self.interface_id, max_batch)?;
-        if let Some(interface_index) = self.interface_index {
+        if let Some(interface_index) = self.ingress_interface_index()? {
             for index in frame.pending_indices()[first_new..].iter().copied() {
                 runtime
                     .get_buffer_mut(index)?

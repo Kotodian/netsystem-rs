@@ -74,7 +74,7 @@ impl Ip4MtrieValue for FibRouteDpoIndex {
 }
 
 #[derive(Debug, Clone)]
-pub struct FibSnapshot<N: Copy> {
+pub struct FibTable<N: Copy> {
     lookup: FibLookupTables<N>,
     adjacencies: Box<[Adjacency<N>]>,
     drop_next: N,
@@ -91,7 +91,7 @@ struct FibLookupTables<N: Copy> {
     load_balances: Box<[LoadBalance<N>]>,
 }
 
-impl<N: Copy> FibSnapshot<N> {
+impl<N: Copy> FibTable<N> {
     #[inline(always)]
     pub fn lookup_packet(&self, packet: &ParsedIpPacket) -> Option<FibLookupResult<N>> {
         let hash = flow_hash(packet);
@@ -263,7 +263,7 @@ impl<N: Copy> FibLookupResult<N> {
     }
 }
 
-pub struct FibSnapshotBuilder<N: Copy> {
+pub struct FibTableBuilder<N: Copy> {
     drop_next: N,
     load_balances: Vec<LoadBalance<N>>,
     route_dpos: Vec<DpoId<N>>,
@@ -272,7 +272,7 @@ pub struct FibSnapshotBuilder<N: Copy> {
     ip6_routes: Vec<Ip6Route>,
 }
 
-impl<N: Copy> FibSnapshotBuilder<N> {
+impl<N: Copy> FibTableBuilder<N> {
     #[inline]
     pub fn new(drop_next: N) -> Self {
         Self {
@@ -573,10 +573,10 @@ impl<N: Copy> FibSnapshotBuilder<N> {
     }
 
     #[inline]
-    pub fn build(mut self) -> FibSnapshot<N> {
+    pub fn build(mut self) -> FibTable<N> {
         self.ip4_routes
             .sort_by_key(|route| route.prefix.prefix_len());
-        FibSnapshot {
+        FibTable {
             lookup: FibLookupTables {
                 ip4: Ip4Mtrie::from_routes(
                     self.ip4_routes
