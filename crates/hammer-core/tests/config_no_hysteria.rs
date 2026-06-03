@@ -27,10 +27,32 @@ fn parse_config_defaults_to_direct_without_hysteria2_feature() {
 }
 
 #[test]
-fn parse_config_passes_through_tun_tap_true_without_hysteria2_feature() {
+fn parse_config_rejects_tun_tap_true_with_system_stack_without_hysteria2_feature() {
     let cfg = indoc! {r#"
         [tun]
         tap = true
+        address = ["172.19.0.1/30"]
+        route_address = ["0.0.0.0/0"]
+
+        [dns]
+        server = "local"
+    "#};
+
+    let err = config::parse_config(cfg).expect_err("system stack must not accept TAP frames");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("tun.tap requires stack = \"disabled\""),
+        "error = {msg:?}"
+    );
+}
+
+#[test]
+fn parse_config_passes_through_tun_tap_true_with_disabled_stack_without_hysteria2_feature() {
+    let cfg = indoc! {r#"
+        [tun]
+        tap = true
+        stack = "disabled"
         address = ["172.19.0.1/30"]
         route_address = ["0.0.0.0/0"]
 

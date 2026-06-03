@@ -343,6 +343,12 @@ fn build_users(raw: &[RawInboundUser]) -> Result<Vec<InboundUser>, HammerError> 
 fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerError> {
     let mtu = raw.mtu.unwrap_or(C::DEFAULT_TUN_MTU);
     let stack = raw.stack.unwrap_or_default();
+    let tap = raw.tap.unwrap_or(false);
+    if tap && matches!(stack, TunStack::System) {
+        return Err(HammerError::config_validation(
+            "tun.tap requires stack = \"disabled\" because the legacy system stack only accepts L3 IP packets",
+        ));
+    }
     let address = raw.address.clone();
     if address.is_empty() {
         return Err(HammerError::config_validation("tun.address is required"));
@@ -359,7 +365,7 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         auto_route,
         strict_route: raw.strict_route.unwrap_or(false),
         stack,
-        tap: raw.tap.unwrap_or(false),
+        tap,
         udp_timeout: raw.udp_timeout,
     })
 }

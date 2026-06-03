@@ -149,6 +149,25 @@ fn service_start_passes_tap_true_to_platform_open_tun() {
 }
 
 #[test]
+fn service_rejects_tap_true_with_system_stack() {
+    let platform = Arc::new(CapturePlatform::default());
+    let config = min_toml()
+        .replacen("stack = \"disabled\"\n", "stack = \"system\"\n", 1)
+        .replacen("[tun]\n", "[tun]\ntap = true\n", 1);
+
+    let err = match HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>) {
+        Ok(_) => panic!("HammerService::new must reject TAP on the legacy system stack"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("tun.tap requires stack = \"disabled\""),
+        "error = {err:?}"
+    );
+}
+
+#[test]
 fn service_walks_all_stages_and_managers() {
     let (platform, svc) = make_service();
     svc.start().expect("start should succeed");

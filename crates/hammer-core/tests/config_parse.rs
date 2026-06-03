@@ -147,8 +147,25 @@ fn parse_config_defaults_tun_tap_to_false() {
 }
 
 #[test]
-fn parse_config_passes_through_tun_tap_true() {
+fn parse_config_rejects_tun_tap_true_with_system_stack() {
     let cfg = MINIMAL_CONFIG.replacen("[tun]\n", "[tun]\ntap = true\n", 1);
+
+    let err = config::parse_config(&cfg).expect_err("system stack must not accept TAP frames");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("tun.tap requires stack = \"disabled\""),
+        "error = {msg:?}"
+    );
+}
+
+#[test]
+fn parse_config_passes_through_tun_tap_true_with_disabled_stack() {
+    let cfg = MINIMAL_CONFIG.replacen(
+        "stack = \"system\"\n",
+        "stack = \"disabled\"\ntap = true\n",
+        1,
+    );
     let options = config::parse_config(&cfg).expect("parse");
     let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
         panic!("inbound[0] not tun");
