@@ -11,9 +11,9 @@ pub use ip::{
     IpVersion,
 };
 pub use lookup::{
-    Adjacency, AdjacencyIndex, Dpo, DpoClass, DpoId, DpoProto, DpoStackRegistry, DpoType,
-    DpoTypeRegistry, FibEntry, FibLookupResult, FibRouteDpoError, FibTable, FibTableBuilder,
-    FibTableHandle, IpLookupControlPlane, IpLookupNode, LoadBalance, LoadBalanceError,
-    LoadBalanceIndex,
+    Adjacency, AdjacencyIndex, AdjacencyRewriteNode, AdjacencyRewriteNodeError, Dpo, DpoClass,
+    DpoId, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry, FibLookupResult,
+    FibRouteDpoError, FibTable, FibTableBuilder, FibTableHandle, IpLookupControlPlane,
+    IpLookupNode, LoadBalance, LoadBalanceError, LoadBalanceIndex,
 };
 pub use route_metadata::packet_route_metadata;

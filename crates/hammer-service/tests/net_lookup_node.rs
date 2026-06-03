@@ -7,11 +7,12 @@ use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeResult,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, IpInputNext, IpInputNode, IpLocalControlPlane,
-    IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
+    AdjacencyRewriteNode, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, IpInputNext, IpInputNode,
+    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -19,6 +20,7 @@ use ipnet::{Ipv4Net, Ipv6Net};
 struct SinkState {
     payloads: Vec<hammer_infra::vec::Vec<u8>>,
     forwarding: Vec<Option<ForwardingMetadata>>,
+    egress_interfaces: Vec<Option<u32>>,
     frame_lens: Vec<usize>,
 }
 
@@ -40,6 +42,7 @@ impl Node<TestNode> for SinkNode {
             runtime.free_index(buffer);
             let mut state = self.state.borrow_mut();
             state.forwarding.push(metadata.forwarding);
+            state.egress_interfaces.push(metadata.egress_interface);
             state.payloads.push(payload);
         }
         Ok(NodeResult::drop())
@@ -73,6 +76,7 @@ enum TestNode {
     Drop(DropNode),
     IpInput(IpInputNode),
     IpLookup(IpLookupNode),
+    AdjacencyRewrite(AdjacencyRewriteNode),
     IpReceive(IpReceiveNode),
     Corrupt(CorruptCurrentHeaderNode),
 }
@@ -101,6 +105,12 @@ impl From<IpLookupNode> for TestNode {
     }
 }
 
+impl From<AdjacencyRewriteNode> for TestNode {
+    fn from(node: AdjacencyRewriteNode) -> Self {
+        Self::AdjacencyRewrite(node)
+    }
+}
+
 impl From<IpReceiveNode> for TestNode {
     fn from(node: IpReceiveNode) -> Self {
         Self::IpReceive(node)
@@ -125,6 +135,7 @@ impl Node<TestNode> for TestNode {
             Self::Drop(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
+            Self::AdjacencyRewrite(node) => node.process(runtime, frame),
             Self::IpReceive(node) => node.process(runtime, frame),
             Self::Corrupt(node) => node.process(runtime, frame),
         }
@@ -206,8 +217,8 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
-    let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibTableBuilder::new(drop_node);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -251,8 +262,8 @@ fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 1);
     let state = Rc::new(RefCell::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
-    let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibTableBuilder::new(drop_node);
     let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
     builder.add_ip4_route(
         Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -454,9 +465,9 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let state = Rc::new(RefCell::new(SinkState::default()));
     let receive = register_sink(&runtime, &state);
-    let drop = runtime.nodes().register_internal(DropNode::new());
-    let mut builder = FibTableBuilder::new(drop);
-    let parent = Dpo::receive(DpoProto::IP4, drop);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibTableBuilder::new(drop_node);
+    let parent = Dpo::receive(DpoProto::IP4, drop_node);
     let stacked = Dpo::stack(parent, receive);
     let stack_lb = builder.add_load_balance(DpoProto::IP4, [stacked]);
     builder.add_ip4_route(
@@ -518,6 +529,125 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
     let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.dpo_type, custom_type);
     assert_eq!(forwarding.dpo_index, custom_index);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let state = Rc::new(RefCell::new(SinkState::default()));
+    let sink = register_sink(&runtime, &state);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibTableBuilder::new(drop_node);
+    let rewrite = [0xaa, 0xbb, 0xcc, 0xdd];
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        12,
+        AdjacencyRewrite::try_new(&rewrite).expect("rewrite fits"),
+        drop_node,
+        sink,
+    );
+    let adjacency = dpo.adjacency_index().expect("adjacency index");
+    let control = IpLookupControlPlane::new(builder.build());
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, b"rewrite");
+    let index = runtime
+        .alloc_index_with_bytes(Default::default(), &packet)
+        .expect("alloc packet");
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+        buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            route_dpo_type: DpoType::ADJACENCY,
+            route_dpo_index: adjacency.get(),
+            load_balance_index: u32::MAX,
+            bucket_index: u16::MAX,
+            dpo_type: DpoType::ADJACENCY,
+            dpo_index: adjacency.get(),
+        });
+        buffer.set_packet_cursor(
+            hammer_adapter::BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, 20)
+                .with_transport_header(20, 8)
+                .with_transport_payload_offset(28),
+        );
+    }
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(rewrite_node, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    let state_ref = state.borrow();
+    assert_eq!(state_ref.payloads.len(), 1);
+    assert_eq!(&state_ref.payloads[0][..rewrite.len()], &rewrite);
+    assert_eq!(&state_ref.payloads[0][rewrite.len()..], packet.as_slice());
+    let metadata = state_ref.forwarding[0].expect("forwarding metadata");
+    assert_eq!(metadata.dpo_type, DpoType::ADJACENCY);
+    assert_eq!(metadata.dpo_index, adjacency.get());
+    assert_eq!(state_ref.egress_interfaces[0], Some(12));
+    std::mem::drop(state_ref);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(
+        &runtime,
+        frame,
+        &ipv4_udp_packet([10, 0, 0, 1], 30_015, [192, 0, 2, 31], 53, b"missing-meta"),
+    );
+    let missing_adjacency = runtime
+        .alloc_index_with_bytes(
+            {
+                let mut metadata = hammer_adapter::RouteMetadata::default();
+                metadata.forwarding = Some(ForwardingMetadata {
+                    fib_index: 0,
+                    route_dpo_type: DpoType::ADJACENCY,
+                    route_dpo_index: 99,
+                    load_balance_index: u32::MAX,
+                    bucket_index: u16::MAX,
+                    dpo_type: DpoType::ADJACENCY,
+                    dpo_index: 99,
+                });
+                metadata
+            },
+            &ipv4_udp_packet([10, 0, 0, 1], 30_016, [192, 0, 2, 32], 53, b"missing-adj"),
+        )
+        .expect("alloc missing adjacency");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(missing_adjacency)
+        .expect("push missing adjacency");
+
+    assert!(
+        runtime
+            .schedule_frame(rewrite_node, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

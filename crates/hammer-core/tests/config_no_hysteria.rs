@@ -1,6 +1,6 @@
 #![cfg(not(feature = "hysteria2"))]
 
-use hammer_core::config::{self, OutboundKind};
+use hammer_core::config::{self, InboundKind, OutboundKind};
 use indoc::indoc;
 
 #[test]
@@ -20,6 +20,30 @@ fn parse_config_defaults_to_direct_without_hysteria2_feature() {
     assert_eq!(options.outbounds[0].id, "direct");
     assert!(matches!(options.outbounds[0].kind, OutboundKind::Direct(_)));
     assert_eq!(options.route.final_, "direct");
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
+    assert!(!tun.tap);
+}
+
+#[test]
+fn parse_config_passes_through_tun_tap_true_without_hysteria2_feature() {
+    let cfg = indoc! {r#"
+        [tun]
+        tap = true
+        address = ["172.19.0.1/30"]
+        route_address = ["0.0.0.0/0"]
+
+        [dns]
+        server = "local"
+    "#};
+
+    let options = config::parse_config(cfg).expect("parse tap config");
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
+
+    assert!(tun.tap);
 }
 
 #[test]

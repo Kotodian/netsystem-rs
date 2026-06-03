@@ -27,6 +27,8 @@ raw_struct_with_default_check! {
         pub mtu: Option<u32> => "Option::is_none",
         /// Packet stack mode, for example `system` or `disabled`.
         pub stack: Option<TunStack> => "Option::is_none",
+        /// Whether this interface is TAP (Ethernet frames) instead of L3 TUN.
+        pub tap: Option<bool> => "Option::is_none",
         /// Local interface addresses in CIDR form.
         pub address: Vec<IpNet> => "Vec::is_empty",
         /// Routes included through the tunnel.
@@ -170,6 +172,7 @@ pub struct TunInboundOptions {
     pub auto_route: bool,
     pub strict_route: bool,
     pub stack: TunStack,
+    pub tap: bool,
     pub udp_timeout: Option<Duration>,
 }
 
@@ -356,6 +359,7 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         auto_route,
         strict_route: raw.strict_route.unwrap_or(false),
         stack,
+        tap: raw.tap.unwrap_or(false),
         udp_timeout: raw.udp_timeout,
     })
 }

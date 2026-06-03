@@ -46,6 +46,7 @@ dictionary HammerTunOptions {
   sequence<string> route_exclude;
   boolean auto_route;
   boolean strict_route;
+  boolean tap;
 };
 
 dictionary HammerNetworkInterface {

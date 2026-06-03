@@ -25,6 +25,7 @@ pub struct HammerTunOptions {
     pub route_exclude: Vec<String>,
     pub auto_route: bool,
     pub strict_route: bool,
+    pub tap: bool,
 }
 
 #[derive(Debug, Clone)]

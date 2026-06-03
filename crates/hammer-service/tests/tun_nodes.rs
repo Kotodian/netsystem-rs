@@ -8,11 +8,15 @@ use hammer_adapter::{
     SocksAddr,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::vec::Vec;
 use hammer_service::data_plane::{FeatureArcControl, next_feature_frame};
-use hammer_service::interface::{InterfaceControlPlane, InterfaceMtu};
+use hammer_service::interface::{
+    InterfaceControlPlane, InterfaceMtu, InterfaceOutputControlPlane, InterfaceOutputNode,
+};
 use hammer_service::net::{
-    DpoId, DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    AdjacencyRewriteNode, DpoId, DpoProto, FibTableBuilder, IpInputNext, IpInputNode,
+    IpLookupControlPlane, IpLookupNode,
 };
 use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
 use ipnet::Ipv4Net;
@@ -142,6 +146,8 @@ enum TestNode {
     AlphaFeature(AlphaFeatureNode),
     BetaFeature(BetaFeatureNode),
     IpLookup(IpLookupNode),
+    AdjacencyRewrite(AdjacencyRewriteNode),
+    InterfaceOutput(InterfaceOutputNode),
     TunOutputDriver(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
 }
 
@@ -187,6 +193,18 @@ impl From<IpLookupNode> for TestNode {
     }
 }
 
+impl From<AdjacencyRewriteNode> for TestNode {
+    fn from(node: AdjacencyRewriteNode) -> Self {
+        Self::AdjacencyRewrite(node)
+    }
+}
+
+impl From<InterfaceOutputNode> for TestNode {
+    fn from(node: InterfaceOutputNode) -> Self {
+        Self::InterfaceOutput(node)
+    }
+}
+
 impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
     fn from(node: TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>) -> Self {
         Self::TunOutputDriver(node)
@@ -208,6 +226,8 @@ impl Node<TestNode> for TestNode {
             Self::AlphaFeature(node) => node.process(runtime, frame),
             Self::BetaFeature(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
+            Self::AdjacencyRewrite(node) => node.process(runtime, frame),
+            Self::InterfaceOutput(node) => node.process(runtime, frame),
             Self::TunOutputDriver(node) => node.process(runtime, frame),
         }
     }
@@ -264,6 +284,137 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
         metadata.destination,
         Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 0))
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tap_input_strips_ethernet_header_before_ip_pipeline() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"tap");
+    let frame = ethernet_frame(
+        [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
+        [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x02],
+        0x0800,
+        &ip_packet,
+    );
+    device.inject(frame).expect("inject tap frame");
+
+    let captured = Rc::new(RefCell::new(Vec::new()));
+    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
+        next: runtime
+            .nodes()
+            .register_driver(TunOutputDriverNode::new(device.output())),
+        metadata: Rc::clone(&captured),
+    });
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            capture, capture, capture, capture, capture, capture, capture,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tap0", ip_input)
+            .with_interface_index(7)
+            .with_tap(true),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tap driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(device.drain_output(), vec![ip_packet]);
+    let metadata = &captured.borrow()[0];
+    assert_eq!(metadata.ingress_interface, Some(7));
+    assert_eq!(metadata.egress_interface, None);
+    assert_eq!(metadata.network, Network::Udp);
+    assert_eq!(
+        metadata.source,
+        Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 0))
+    );
+    assert_eq!(
+        metadata.destination,
+        Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 0))
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tap_input_drops_truncated_and_unsupported_ethernet_frames() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    device
+        .inject(StdVec::from([0u8; 13]).into())
+        .expect("inject truncated");
+    device
+        .inject(ethernet_frame(
+            [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
+            [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x02],
+            0x0806,
+            b"arp-is-out-of-scope",
+        ))
+        .expect("inject unsupported");
+
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()).with_tap(true));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tap0", output)
+            .with_interface_index(7)
+            .with_tap(true),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tap driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert!(device.drain_output().is_empty());
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tap_output_emits_ethernet_frame_from_tap_metadata() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let input_device = MemoryTunDevice::new();
+    let output_device = MemoryTunDevice::new();
+    let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"tap-out");
+    let input_frame = ethernet_frame(
+        [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
+        [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x02],
+        0x0800,
+        &ip_packet,
+    );
+    input_device
+        .inject(input_frame.clone())
+        .expect("inject tap frame");
+
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(output_device.output()).with_tap(true));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            output, output, output, output, output, output, output,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(input_device.input(), "tap0", ip_input)
+            .with_interface_index(7)
+            .with_tap(true),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tap driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(output_device.drain_output(), vec![input_frame]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -424,6 +575,90 @@ fn tun_driver_routes_through_service_internal_nodes() {
     assert_eq!(feature_metadata.borrow().len(), 2);
     assert_eq!(feature_metadata.borrow()[0].ingress_interface, Some(7));
     assert_eq!(feature_metadata.borrow()[1].ingress_interface, Some(7));
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tap_graph_routes_through_adjacency_rewrite_interface_output_and_tap_output() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let input_device = MemoryTunDevice::new();
+    let output_device = MemoryTunDevice::new();
+    let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"graph-tap");
+    let input_frame = ethernet_frame(
+        [0x02, 0xaa, 0xaa, 0xaa, 0xaa, 0x01],
+        [0x02, 0xbb, 0xbb, 0xbb, 0xbb, 0x02],
+        0x0800,
+        &ip_packet,
+    );
+    input_device.inject(input_frame).expect("inject tap frame");
+    let rewrite = ethernet_header(
+        [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x03],
+        [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x04],
+        0x0800,
+    );
+    let expected = ethernet_frame(
+        [0x02, 0xcc, 0xcc, 0xcc, 0xcc, 0x03],
+        [0x02, 0xdd, 0xdd, 0xdd, 0xdd, 0x04],
+        0x0800,
+        &ip_packet,
+    );
+
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(output_device.output()).with_tap(true));
+    let interface_output_control = InterfaceOutputControlPlane::new();
+    interface_output_control
+        .register_tx(7, output)
+        .expect("register tap output");
+    let interface_output = runtime
+        .nodes()
+        .register_internal(interface_output_control.node());
+    let lookup_control = IpLookupControlPlane::new(FibTableBuilder::new(interface_output).build());
+    let adjacency_rewrite = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(lookup_control.table_handle()));
+    let mut builder = FibTableBuilder::new(interface_output);
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        7,
+        AdjacencyRewrite::try_new(&rewrite).expect("rewrite fits"),
+        adjacency_rewrite,
+        interface_output,
+    );
+    let lb = builder.add_load_balance(DpoProto::IP4, [dpo]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
+        lb,
+    );
+    lookup_control
+        .publish(builder.build())
+        .expect("publish fib");
+    let lookup = runtime.nodes().register_internal(lookup_control.node());
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            interface_output,
+            interface_output,
+            interface_output,
+            lookup,
+            interface_output,
+            interface_output,
+            interface_output,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(input_device.input(), "tap0", ip_input)
+            .with_interface_index(7)
+            .with_tap(true),
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tap graph");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
+    assert_eq!(output_device.drain_output(), vec![expected]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -655,6 +890,25 @@ fn ipv4_udp_packet(
     packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     packet[28..].copy_from_slice(payload);
     packet.into()
+}
+
+fn ethernet_header(destination: [u8; 6], source: [u8; 6], ethertype: u16) -> Vec<u8> {
+    let mut header = Vec::with_capacity(14);
+    header.extend_from_slice(&destination);
+    header.extend_from_slice(&source);
+    header.extend_from_slice(&ethertype.to_be_bytes());
+    header
+}
+
+fn ethernet_frame(
+    destination: [u8; 6],
+    source: [u8; 6],
+    ethertype: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = ethernet_header(destination, source, ethertype);
+    frame.extend_from_slice(payload);
+    frame
 }
 
 fn ipv4_checksum(header: &[u8]) -> u16 {

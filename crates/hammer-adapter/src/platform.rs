@@ -30,6 +30,7 @@ pub struct TunOptions {
     pub route_exclude: Vec<String>,
     pub auto_route: bool,
     pub strict_route: bool,
+    pub tap: bool,
 }
 
 pub trait DefaultInterfaceUpdateListener: Send + Sync + 'static {

@@ -130,6 +130,22 @@ fn service_start_opens_tun_with_configured_options() {
     assert_eq!(options.route_exclude, vec!["10.0.0.0/8"]);
     assert!(!options.auto_route);
     assert!(options.strict_route);
+    assert!(!options.tap);
+}
+
+#[test]
+fn service_start_passes_tap_true_to_platform_open_tun() {
+    let platform = Arc::new(CapturePlatform::default());
+    let config = min_toml().replacen("[tun]\n", "[tun]\ntap = true\n", 1);
+    let svc = HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("HammerService::new should accept tap config");
+
+    svc.start().expect("start should open TUN");
+    svc.close().expect("close should succeed");
+
+    let calls = platform.open_tun_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "open_tun calls = {calls:?}");
+    assert!(calls[0].tap);
 }
 
 #[test]
