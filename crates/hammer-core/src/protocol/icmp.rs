@@ -195,7 +195,7 @@ pub fn build_icmp_error_packet(
     let original = original
         .get(..parsed.packet_len)
         .ok_or(IcmpBuildError::BadLength)?;
-    if should_suppress_icmp_error(original, parsed.protocol, parsed.transport_header_offset) {
+    if should_suppress_icmp_error(original, &parsed) {
         return Err(IcmpBuildError::Suppressed);
     }
     match (
@@ -282,19 +282,45 @@ fn build_ipv6_icmp_error(
     })
 }
 
-fn should_suppress_icmp_error(
-    original: &[u8],
-    protocol: IpProtocol,
-    transport_header_offset: usize,
-) -> bool {
-    let Some(icmp_type) = original.get(transport_header_offset).copied() else {
+fn should_suppress_icmp_error(original: &[u8], parsed: &super::ip::ParsedIpPacket) -> bool {
+    match (parsed.source, parsed.destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            source.is_unspecified()
+                || source.is_broadcast()
+                || source.is_multicast()
+                || destination.is_broadcast()
+                || destination.is_multicast()
+                || ipv4_fragment_offset(original) > 0
+                || icmp_error_type_should_suppress(original, parsed)
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            source.is_unspecified()
+                || source.is_multicast()
+                || destination.is_multicast()
+                || icmp_error_type_should_suppress(original, parsed)
+        }
+        _ => true,
+    }
+}
+
+#[inline(always)]
+fn icmp_error_type_should_suppress(original: &[u8], parsed: &super::ip::ParsedIpPacket) -> bool {
+    let Some(icmp_type) = original.get(parsed.transport_header_offset).copied() else {
         return true;
     };
-    match protocol {
+    match parsed.protocol {
         IpProtocol::Icmpv4 => matches!(icmp_type, 3 | 4 | 5 | 11 | 12),
         IpProtocol::Icmpv6 => icmp_type < 128,
         _ => false,
     }
+}
+
+#[inline(always)]
+fn ipv4_fragment_offset(packet: &[u8]) -> u16 {
+    let Some(fragment) = packet.get(6..8) else {
+        return 0;
+    };
+    u16::from_be_bytes([fragment[0], fragment[1]]) & 0x1fff
 }
 
 #[inline(always)]
@@ -448,6 +474,62 @@ mod tests {
             Ipv4Addr::new(192, 0, 2, 1),
             3,
             1,
+        );
+
+        assert_eq!(
+            build_icmp_error_packet(
+                &original,
+                IcmpErrorMetadata::ipv4_time_exceeded(),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+            ),
+            Err(IcmpBuildError::Suppressed)
+        );
+    }
+
+    #[test]
+    fn build_icmp_error_packet_suppresses_icmpv6_errors() {
+        let source = "2001:db8::1".parse().expect("source");
+        let destination = "2001:db8::2".parse().expect("destination");
+        let original = ipv6_packet(source, destination, 58, &[3, 0, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(
+            build_icmp_error_packet(
+                &original,
+                IcmpErrorMetadata::ipv6_time_exceeded(),
+                IpAddr::V6("2001:db8::ff".parse().unwrap())
+            ),
+            Err(IcmpBuildError::Suppressed)
+        );
+    }
+
+    #[test]
+    fn build_icmp_error_packet_suppresses_ipv4_non_initial_fragments() {
+        let mut original = ipv4_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            17,
+            8,
+        );
+        original[6..8].copy_from_slice(&2u16.to_be_bytes());
+        update_ipv4_header_checksum(&mut original);
+
+        assert_eq!(
+            build_icmp_error_packet(
+                &original,
+                IcmpErrorMetadata::ipv4_time_exceeded(),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+            ),
+            Err(IcmpBuildError::Suppressed)
+        );
+    }
+
+    #[test]
+    fn build_icmp_error_packet_suppresses_multicast_destinations() {
+        let original = ipv4_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 1),
+            17,
+            8,
         );
 
         assert_eq!(

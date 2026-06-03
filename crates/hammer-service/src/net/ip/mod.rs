@@ -10,8 +10,9 @@ pub use hammer_core::protocol::ip::{
     parse_ip_packet_with_chain_len,
 };
 pub use icmp::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNode, IcmpNodeError,
+    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable,
+    IcmpErrorSourceTableHandle, IcmpInputControlPlane, IcmpInputError, IcmpInputNode,
+    IcmpNodeError,
 };
 pub use input::{IpInputNext, IpInputNode, IpUnicastArc};
 pub use local::{

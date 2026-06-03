@@ -10,8 +10,8 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    IcmpErrorNext, IcmpErrorNode, IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory,
-    IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+    IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable, IpInputError, IpInputNext, IpInputNode,
+    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
 };
 
 type PacketVec = hammer_infra::vec::Vec<u8>;
@@ -206,6 +206,8 @@ fn ip_input_routes_ipv4_options_to_options_next() {
 #[test]
 fn ip_input_matches_vpp_ipv4_validation_nexts() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 32, 8, 16);
+    let ingress_interface = 7;
+    let local_source = [198, 51, 100, 1];
     let lookup_capture = SinkCapture::new();
     let mcast_capture = SinkCapture::new();
     let icmp_capture = SinkCapture::new();
@@ -214,9 +216,14 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
     let icmp_lookup = runtime.nodes().register_internal(icmp_capture.node());
-    let icmp = runtime
-        .nodes()
-        .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup)));
+    let error_sources = IcmpErrorSourceTable::from_sources([(
+        ingress_interface,
+        IpAddr::V4(Ipv4Addr::from(local_source)),
+    )]);
+    let icmp = runtime.nodes().register_internal(
+        IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup))
+            .with_source_table(error_sources.handle()),
+    );
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
     let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -258,19 +265,22 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
         true,
     );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &unknown_protocol);
-    push_packet(&runtime, frame, &multicast);
-    push_packet(&runtime, frame, &ttl_expired);
-    push_packet(&runtime, frame, &bad_checksum);
-    push_packet(&runtime, frame, &fragment_offset_one);
-    push_packet(&runtime, frame, &fragmented);
+    push_packet_on_interface(&runtime, frame, &unknown_protocol, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &multicast, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &ttl_expired, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &bad_checksum, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &fragment_offset_one, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &fragmented, ingress_interface);
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 7);
     assert_eq!(lookup_capture.packets(), vec![unknown_protocol]);
     assert_eq!(mcast_capture.packets(), vec![multicast]);
-    assert!(icmp_capture.packets().is_empty());
+    let icmp_packets = icmp_capture.packets();
+    assert_eq!(icmp_packets.len(), 1);
+    assert_ipv4_time_exceeded(&icmp_packets[0], &ttl_expired, local_source);
+    assert_eq!(icmp_capture.node_errors(), vec![None]);
     assert_eq!(
         runtime
             .node_error_count(input, IpInputError::TimeExpired.code())
@@ -303,6 +313,8 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
 #[test]
 fn ip_input_matches_vpp_ipv6_validation_nexts() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 16);
+    let ingress_interface = 9;
+    let local_source = Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 5);
     let lookup_capture = SinkCapture::new();
     let mcast_capture = SinkCapture::new();
     let icmp_capture = SinkCapture::new();
@@ -311,9 +323,12 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
     let icmp_lookup = runtime.nodes().register_internal(icmp_capture.node());
-    let icmp = runtime
-        .nodes()
-        .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup)));
+    let error_sources =
+        IcmpErrorSourceTable::from_sources([(ingress_interface, IpAddr::V6(local_source))]);
+    let icmp = runtime.nodes().register_internal(
+        IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup))
+            .with_source_table(error_sources.handle()),
+    );
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
     let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -350,17 +365,20 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
     );
     let too_short = vec![0x60, 0, 0, 0, 0, 0, 17, 64];
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &lookup_packet);
-    push_packet(&runtime, frame, &multicast);
-    push_packet(&runtime, frame, &hop_expired);
-    push_packet(&runtime, frame, &too_short);
+    push_packet_on_interface(&runtime, frame, &lookup_packet, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &multicast, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &hop_expired, ingress_interface);
+    push_packet_on_interface(&runtime, frame, &too_short, ingress_interface);
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
     assert_eq!(lookup_capture.packets(), vec![lookup_packet]);
     assert_eq!(mcast_capture.packets(), vec![multicast]);
-    assert!(icmp_capture.packets().is_empty());
+    let icmp_packets = icmp_capture.packets();
+    assert_eq!(icmp_packets.len(), 1);
+    assert_ipv6_time_exceeded(&icmp_packets[0], &hop_expired, local_source);
+    assert_eq!(icmp_capture.node_errors(), vec![None]);
     assert_eq!(
         runtime
             .node_error_count(input, IpInputError::TimeExpired.code())
@@ -945,6 +963,29 @@ fn push_packet(
     index
 }
 
+fn push_packet_on_interface(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    packet: &[u8],
+    interface_index: u32,
+) -> hammer_adapter::BufferIndex {
+    let index = runtime
+        .alloc_index_with_bytes(
+            RouteMetadata {
+                ingress_interface: Some(interface_index),
+                ..RouteMetadata::default()
+            },
+            packet,
+        )
+        .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+    index
+}
+
 fn ip_input_nexts(
     default: hammer_adapter::NodeId,
     reassembly: hammer_adapter::NodeId,
@@ -959,6 +1000,37 @@ fn ip_reassembly_nexts(
     drop: hammer_adapter::NodeId,
 ) -> [hammer_adapter::NodeId; IpReassemblyNext::COUNT] {
     IpReassemblyNext::nodes(lookup, drop)
+}
+
+fn assert_ipv4_time_exceeded(packet: &[u8], original: &[u8], local_source: [u8; 4]) {
+    assert_eq!(packet[0], 0x45);
+    assert_eq!(packet[8], 64);
+    assert_eq!(packet[9], 1);
+    assert_eq!(&packet[12..16], &local_source);
+    assert_eq!(&packet[16..20], &original[12..16]);
+    assert_eq!(packet[20], 11);
+    assert_eq!(packet[21], 0);
+    assert_eq!(&packet[24..28], &[0, 0, 0, 0]);
+    assert_eq!(&packet[28..], original);
+    assert_eq!(internet_checksum(&packet[..20]), 0);
+    assert_eq!(internet_checksum(&packet[20..]), 0);
+}
+
+fn assert_ipv6_time_exceeded(packet: &[u8], original: &[u8], local_source: Ipv6Addr) {
+    assert_eq!(packet[0], 0x60);
+    assert_eq!(packet[6], 58);
+    assert_eq!(packet[7], 64);
+    assert_eq!(&packet[8..24], &local_source.octets());
+    assert_eq!(&packet[24..40], &original[8..24]);
+    assert_eq!(packet[40], 3);
+    assert_eq!(packet[41], 0);
+    assert_eq!(&packet[44..48], &[0, 0, 0, 0]);
+    assert_eq!(&packet[48..], original);
+    let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("destination"));
+    assert_eq!(
+        ipv6_l4_checksum(local_source, destination, 58, &packet[40..]),
+        0
+    );
 }
 
 fn ipv4_options_packet() -> Vec<u8> {
@@ -1194,4 +1266,14 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
         }
     }
     !(sum as u16)
+}
+
+fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&source.octets());
+    pseudo.extend_from_slice(&destination.octets());
+    pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, protocol]);
+    pseudo.extend_from_slice(segment);
+    internet_checksum(&pseudo)
 }

@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -8,7 +9,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::{
-    IcmpBuildError, IcmpGeneratedPacket, build_echo_reply, build_icmp_error_packet,
+    IcmpBuildError, IcmpErrorFamily, IcmpGeneratedPacket, build_echo_reply, build_icmp_error_packet,
 };
 
 use crate::data_plane::set_index_node_error_code;
@@ -48,6 +49,7 @@ pub enum IcmpNodeError {
     BadChecksum,
     Suppressed,
     MissingMetadata,
+    MissingIngressInterface,
     MissingSource,
     UnsupportedFamily,
 }
@@ -71,6 +73,125 @@ impl From<IcmpBuildError> for IcmpNodeError {
             IcmpBuildError::Suppressed => Self::Suppressed,
             IcmpBuildError::UnsupportedFamily => Self::UnsupportedFamily,
         }
+    }
+}
+
+pub struct IcmpErrorSourceTable {
+    inner: Arc<ArcSwap<IcmpErrorSourceSnapshot>>,
+}
+
+impl IcmpErrorSourceTable {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(IcmpErrorSourceSnapshot::new())),
+        }
+    }
+
+    #[inline]
+    pub fn from_sources(sources: impl IntoIterator<Item = (u32, IpAddr)>) -> Self {
+        let mut snapshot = IcmpErrorSourceSnapshot::new();
+        for (interface_index, source) in sources {
+            snapshot.insert(interface_index, source);
+        }
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(snapshot)),
+        }
+    }
+
+    #[inline]
+    pub fn handle(&self) -> IcmpErrorSourceTableHandle {
+        IcmpErrorSourceTableHandle {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    #[inline]
+    pub fn publish(&self, sources: impl IntoIterator<Item = (u32, IpAddr)>) {
+        let mut snapshot = IcmpErrorSourceSnapshot::new();
+        for (interface_index, source) in sources {
+            snapshot.insert(interface_index, source);
+        }
+        self.inner.store(Arc::new(snapshot));
+    }
+}
+
+impl Default for IcmpErrorSourceTable {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
+pub struct IcmpErrorSourceTableHandle {
+    inner: Arc<ArcSwap<IcmpErrorSourceSnapshot>>,
+}
+
+impl IcmpErrorSourceTableHandle {
+    #[inline]
+    fn load(&self) -> arc_swap::Guard<Arc<IcmpErrorSourceSnapshot>> {
+        self.inner.load()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IcmpErrorSourceSnapshot {
+    sources: hammer_infra::vec::Vec<IcmpErrorSourceEntry>,
+}
+
+impl IcmpErrorSourceSnapshot {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            sources: hammer_infra::vec::Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, interface_index: u32, source: IpAddr) {
+        if self
+            .lookup(interface_index, version_for_addr(source))
+            .is_some()
+        {
+            return;
+        }
+        self.sources.push(IcmpErrorSourceEntry {
+            interface_index,
+            source,
+        });
+    }
+
+    #[inline(always)]
+    fn lookup(&self, interface_index: u32, version: IpVersion) -> Option<IpAddr> {
+        self.sources
+            .iter()
+            .find(|entry| {
+                entry.interface_index == interface_index
+                    && version_for_addr(entry.source) == version
+            })
+            .map(|entry| entry.source)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IcmpErrorSourceEntry {
+    interface_index: u32,
+    source: IpAddr,
+}
+
+#[inline(always)]
+fn version_for_addr(addr: IpAddr) -> IpVersion {
+    match addr {
+        IpAddr::V4(_) => IpVersion::V4,
+        IpAddr::V6(_) => IpVersion::V6,
+    }
+}
+
+#[inline(always)]
+fn version_for_family(family: IcmpErrorFamily) -> IpVersion {
+    match family {
+        IcmpErrorFamily::Ipv4 => IpVersion::V4,
+        IcmpErrorFamily::Ipv6 => IpVersion::V6,
     }
 }
 
@@ -399,11 +520,14 @@ pub enum IcmpErrorNext {
 #[hammer_component_macros::node(next = IcmpErrorNext)]
 pub struct IcmpErrorNode {
     #[node(default)]
+    source_table: Option<IcmpErrorSourceTableHandle>,
+    #[node(default)]
     cached_next: Option<NodeId>,
 }
 
 struct IcmpErrorNextResolver {
     next: [NodeId; IcmpErrorNext::COUNT],
+    source_table: Option<arc_swap::Guard<Arc<IcmpErrorSourceSnapshot>>>,
 }
 
 impl<G> PacketNextResolver<G> for IcmpErrorNextResolver {
@@ -413,7 +537,19 @@ impl<G> PacketNextResolver<G> for IcmpErrorNextResolver {
         runtime: &DataPlaneRuntime<G>,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
-        next_node_for_icmp_error_index(runtime, index, self.next)
+        let source_table = self
+            .source_table
+            .as_ref()
+            .map(|source_table| source_table.as_ref());
+        next_node_for_icmp_error_index(runtime, index, self.next, source_table)
+    }
+}
+
+impl IcmpErrorNode {
+    #[inline]
+    pub fn with_source_table(mut self, source_table: IcmpErrorSourceTableHandle) -> Self {
+        self.source_table = Some(source_table);
+        self
     }
 }
 
@@ -424,7 +560,13 @@ impl<G> Node<G> for IcmpErrorNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = IcmpErrorNextResolver { next: self.next };
+        let resolver = IcmpErrorNextResolver {
+            next: self.next,
+            source_table: self
+                .source_table
+                .as_ref()
+                .map(IcmpErrorSourceTableHandle::load),
+        };
         process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
     }
 }
@@ -518,13 +660,25 @@ fn next_node_for_icmp_error_index<G>(
     runtime: &DataPlaneRuntime<G>,
     index: BufferIndex,
     next: [NodeId; IcmpErrorNext::COUNT],
+    source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeId> {
     let Some(metadata) = runtime.with_metadata(index, |metadata| metadata.icmp_error)? else {
         set_index_node_error_code(runtime, index, IcmpNodeError::MissingMetadata.code())?;
         return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
     };
-    let Some(local_source) = runtime.with_metadata(index, |metadata| metadata.icmp_error_source)?
+    let Some(interface_index) =
+        runtime.with_metadata(index, |metadata| metadata.ingress_interface)?
     else {
+        set_index_node_error_code(
+            runtime,
+            index,
+            IcmpNodeError::MissingIngressInterface.code(),
+        )?;
+        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+    };
+    let Some(local_source) = source_table.and_then(|source_table| {
+        source_table.lookup(interface_index, version_for_family(metadata.family()))
+    }) else {
         set_index_node_error_code(runtime, index, IcmpNodeError::MissingSource.code())?;
         return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
     };
@@ -575,7 +729,6 @@ fn refresh_generated_icmp_metadata<G>(
     metadata.source = Some(SocksAddr::ip(generated.source, 0));
     metadata.destination = Some(SocksAddr::ip(generated.destination, 0));
     metadata.icmp_error = None;
-    metadata.icmp_error_source = None;
     Ok(())
 }
 
