@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeHandle,
-    NodeId, NodeNextFrames, NodeResult, SocksAddr,
+    NodeId, NodeNextFrames, NodeNextStorage, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -143,7 +143,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    self.next[IpReassemblyNext::Drop.slot()],
+                    NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
                     index,
                 );
             }
@@ -152,7 +152,11 @@ impl IpReassemblyNode {
 
         let key = fragment.key;
         if self.failed_keys.contains(&key) {
-            next_frames.enqueue(runtime, self.next[IpReassemblyNext::Drop.slot()], index)?;
+            next_frames.enqueue(
+                runtime,
+                NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
+                index,
+            )?;
             return Ok(None);
         }
         let fragment_first_worker = self.fragment_first_worker(runtime, index, fragment)?;
@@ -169,7 +173,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    self.next[IpReassemblyNext::Drop.slot()],
+                    NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
                     index,
                 );
             }
@@ -207,7 +211,7 @@ impl IpReassemblyNode {
                         runtime,
                         next_frames,
                         current_next,
-                        self.next[IpReassemblyNext::Drop.slot()],
+                        NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
                         index,
                     );
                 }
@@ -217,7 +221,7 @@ impl IpReassemblyNode {
         }
 
         if let Some(failed_index) = failed {
-            let drop_node = self.next[IpReassemblyNext::Drop.slot()];
+            let drop_node = NodeNextStorage::next(&self.next, IpReassemblyNext::Drop);
             if let Some(context) = self.contexts.remove(&key) {
                 for fragment in context.fragments {
                     next_frames.enqueue(runtime, drop_node, fragment.index)?;
@@ -252,7 +256,7 @@ impl IpReassemblyNode {
                         runtime,
                         next_frames,
                         current_next,
-                        self.next[IpReassemblyNext::Lookup.slot()],
+                        NodeNextStorage::next(&self.next, IpReassemblyNext::Lookup),
                         index,
                     );
                 }
@@ -261,7 +265,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    self.next[IpReassemblyNext::Lookup.slot()],
+                    NodeNextStorage::next(&self.next, IpReassemblyNext::Lookup),
                     index,
                 );
             }

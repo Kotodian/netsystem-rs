@@ -9,7 +9,9 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet,
     DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
-    NodeNextEnqueue, NodeNextFrames, NodeNextVectorEnqueue, NodeResult, RouteMetadata,
+    NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue, NodeResult,
+    PacketNextResolver, RouteMetadata, process_cached_rewrite_next,
+    process_cached_speculative_next,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -428,6 +430,104 @@ impl Node<TestNode> for ChunkedBatchSplitNode {
 
 impl InternalNode<TestNode> for ChunkedBatchSplitNode {}
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestNext {
+    Default,
+    Alternate,
+}
+
+impl NodeNext for TestNext {
+    const COUNT: usize = 2;
+
+    #[inline(always)]
+    fn slot(self) -> usize {
+        match self {
+            Self::Default => 0,
+            Self::Alternate => 1,
+        }
+    }
+}
+
+struct PayloadNextResolver {
+    default: NodeId,
+    alternate: NodeId,
+}
+
+impl PacketNextResolver<TestNode> for PayloadNextResolver {
+    #[inline(always)]
+    fn next_for_index(
+        &self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        index: hammer_adapter::BufferIndex,
+    ) -> CoreResult<NodeId> {
+        let payload = runtime.copy_current(index)?;
+        if payload == b"alternate" {
+            Ok(self.alternate)
+        } else {
+            Ok(self.default)
+        }
+    }
+}
+
+struct CachedSpeculativeSplitNode {
+    default: NodeId,
+    alternate: NodeId,
+    cached_next: Option<NodeId>,
+    cached_after_process: Rc<Cell<Option<NodeId>>>,
+    frames_in_use_during_process: Rc<Cell<usize>>,
+}
+
+impl Node<TestNode> for CachedSpeculativeSplitNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let resolver = PayloadNextResolver {
+            default: self.default,
+            alternate: self.alternate,
+        };
+        let result =
+            process_cached_speculative_next(runtime, frame, &mut self.cached_next, &resolver)?;
+        self.cached_after_process.set(self.cached_next);
+        self.frames_in_use_during_process
+            .set(runtime.frames_in_use());
+        Ok(result)
+    }
+}
+
+impl InternalNode<TestNode> for CachedSpeculativeSplitNode {}
+
+struct CachedRewriteSplitNode {
+    default: NodeId,
+    alternate: NodeId,
+    cached_next: Option<NodeId>,
+    cached_after_process: Rc<Cell<Option<NodeId>>>,
+    frames_in_use_during_process: Rc<Cell<usize>>,
+}
+
+impl Node<TestNode> for CachedRewriteSplitNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let resolver = PayloadNextResolver {
+            default: self.default,
+            alternate: self.alternate,
+        };
+        let result = process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)?;
+        self.cached_after_process.set(self.cached_next);
+        self.frames_in_use_during_process
+            .set(runtime.frames_in_use());
+        Ok(result)
+    }
+}
+
+impl InternalNode<TestNode> for CachedRewriteSplitNode {}
+
 struct VectorChunkedSplitNode {
     speculative: NodeId,
     alternate: NodeId,
@@ -576,6 +676,8 @@ enum TestNode {
     PrecomputedSplit(PrecomputedSplitNode),
     BatchSplit(BatchSplitNode),
     ChunkedBatchSplit(ChunkedBatchSplitNode),
+    CachedSpeculativeSplit(CachedSpeculativeSplitNode),
+    CachedRewriteSplit(CachedRewriteSplitNode),
     VectorChunkedSplit(VectorChunkedSplitNode),
     VectorErrorAfterEnqueue(VectorErrorAfterEnqueueNode),
     SpeculativeErrorAfterSplit(SpeculativeErrorAfterSplitNode),
@@ -666,6 +768,18 @@ impl From<ChunkedBatchSplitNode> for TestNode {
     }
 }
 
+impl From<CachedSpeculativeSplitNode> for TestNode {
+    fn from(node: CachedSpeculativeSplitNode) -> Self {
+        Self::CachedSpeculativeSplit(node)
+    }
+}
+
+impl From<CachedRewriteSplitNode> for TestNode {
+    fn from(node: CachedRewriteSplitNode) -> Self {
+        Self::CachedRewriteSplit(node)
+    }
+}
+
 impl From<VectorChunkedSplitNode> for TestNode {
     fn from(node: VectorChunkedSplitNode) -> Self {
         Self::VectorChunkedSplit(node)
@@ -712,6 +826,8 @@ impl Node<TestNode> for TestNode {
             Self::PrecomputedSplit(node) => node.process(runtime, frame),
             Self::BatchSplit(node) => node.process(runtime, frame),
             Self::ChunkedBatchSplit(node) => node.process(runtime, frame),
+            Self::CachedSpeculativeSplit(node) => node.process(runtime, frame),
+            Self::CachedRewriteSplit(node) => node.process(runtime, frame),
             Self::VectorChunkedSplit(node) => node.process(runtime, frame),
             Self::VectorErrorAfterEnqueue(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplit(node) => node.process(runtime, frame),
@@ -814,6 +930,31 @@ fn node_runtime_registers_internal_role_node() {
 }
 
 #[test]
+fn node_next_storage_reads_static_array_by_key() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let default = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let next = [default, alternate];
+
+    assert_eq!(NodeNextStorage::next(&next, TestNext::Default), default);
+    assert_eq!(NodeNextStorage::next(&next, TestNext::Alternate), alternate);
+}
+
+#[test]
+fn node_next_storage_reads_single_next_for_unit_key() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let next = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+
+    assert_eq!(NodeNextStorage::next(&next, ()), next);
+}
+
+#[test]
 fn speculative_enqueue_keeps_matching_next_in_current_frame() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
     let default_payloads = Rc::new(RefCell::new(Vec::new()));
@@ -889,6 +1030,91 @@ fn speculative_enqueue_splits_mismatched_next_to_separate_frame() {
         &[b"default-1".to_vec(), b"default-2".to_vec()]
     );
     assert_eq!(&*alternate_payloads.borrow(), &[b"alternate".to_vec()]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn cached_speculative_next_updates_cache_to_trailing_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let default_payloads = Rc::new(RefCell::new(Vec::new()));
+    let alternate_payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let default = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&default_payloads),
+    });
+    let alternate = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&alternate_payloads),
+    });
+    let cached_after_process = Rc::new(Cell::new(None));
+    let frames_seen = Rc::new(Cell::new(0));
+    let split = runtime
+        .nodes()
+        .register_internal(CachedSpeculativeSplitNode {
+            default,
+            alternate,
+            cached_next: None,
+            cached_after_process: Rc::clone(&cached_after_process),
+            frames_in_use_during_process: Rc::clone(&frames_seen),
+        });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"default-1");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"alternate");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(cached_after_process.get(), Some(alternate));
+    assert_eq!(frames_seen.get(), 2);
+    assert_eq!(&*default_payloads.borrow(), &[b"default-1".to_vec()]);
+    assert_eq!(
+        &*alternate_payloads.borrow(),
+        &[b"alternate".to_vec(), b"alternate".to_vec()]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn cached_rewrite_next_updates_cache_to_trailing_next() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let default_payloads = Rc::new(RefCell::new(Vec::new()));
+    let alternate_payloads = Rc::new(RefCell::new(Vec::new()));
+    let trace = Rc::new(RefCell::new(Vec::new()));
+    let default = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&default_payloads),
+    });
+    let alternate = runtime.nodes().register_driver(SinkNode {
+        trace: Rc::clone(&trace),
+        payloads: Rc::clone(&alternate_payloads),
+    });
+    let cached_after_process = Rc::new(Cell::new(None));
+    let frames_seen = Rc::new(Cell::new(0));
+    let split = runtime.nodes().register_internal(CachedRewriteSplitNode {
+        default,
+        alternate,
+        cached_next: Some(default),
+        cached_after_process: Rc::clone(&cached_after_process),
+        frames_in_use_during_process: Rc::clone(&frames_seen),
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"alternate");
+    push_test_packet(&runtime, frame, b"alternate");
+
+    assert!(runtime.schedule_frame(split, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(cached_after_process.get(), Some(alternate));
+    assert_eq!(frames_seen.get(), 2);
+    assert!(default_payloads.borrow().is_empty());
+    assert_eq!(
+        &*alternate_payloads.borrow(),
+        &[b"alternate".to_vec(), b"alternate".to_vec()]
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

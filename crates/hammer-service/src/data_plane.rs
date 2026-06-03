@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
-    NodeId, NodeNextEnqueue, NodeResult, RouteMetadata, Router,
+    NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, RouteMetadata, Router,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -617,9 +617,10 @@ where
                 metadata.route_decision = Some(decision);
             }
         }
-        Ok(NodeResult::next_current(
-            self.next[RouteMatchNext::Lookup.slot()],
-        ))
+        Ok(NodeResult::next_current(NodeNextStorage::next(
+            &self.next,
+            RouteMatchNext::Lookup,
+        )))
     }
 }
 

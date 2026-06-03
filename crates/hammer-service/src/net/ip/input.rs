@@ -1,6 +1,6 @@
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode,
-    Node, NodeId, NodeNextEnqueue, NodeResult, SocksAddr,
+    Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 
@@ -25,7 +25,10 @@ pub enum IpInputNext {
 }
 
 #[hammer_component_macros::node(next = IpInputNext, start_arc = A)]
-pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc>;
+pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
 
 impl<A, G> Node<G> for IpInputNode<A>
 where
@@ -44,13 +47,20 @@ where
         let feature_arc = self.feature_arc.as_ref();
         let indices = frame.pending_indices();
         let width = frame_batch_width(runtime);
-        let speculative = {
+        let mut last_next = None;
+        let cached_next = self.cached_next;
+        let speculative = if let Some(cached_next) = cached_next {
+            cached_next
+        } else {
             let mut batch = runtime.buffer_batch_mut();
             prefetch_range_with_batch(&mut batch, indices, 0, width);
-            next_node_for_index_with_batch(runtime, &mut batch, first, next, feature_arc)?
+            let first_next =
+                next_node_for_index_with_batch(runtime, &mut batch, first, next, feature_arc)?;
+            last_next = Some(first_next);
+            first_next
         };
         let mut first_chunk = true;
-        NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
+        let result = NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
             runtime,
             frame,
             |batch, indices| {
@@ -59,8 +69,12 @@ where
             |batch, indices, nexts| {
                 let start_offset = if first_chunk {
                     first_chunk = false;
-                    nexts[0] = speculative;
-                    1
+                    if cached_next.is_none() {
+                        nexts[0] = speculative;
+                        1
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -72,9 +86,14 @@ where
                     start_offset,
                     next,
                     feature_arc,
+                    &mut last_next,
                 )
             },
-        )
+        )?;
+        if let Some(node) = last_next {
+            self.cached_next = Some(node);
+        }
+        Ok(result)
     }
 }
 
@@ -135,7 +154,7 @@ where
         Ok(parsed) => parsed,
         Err(_) => {
             set_buffer_node_error_code(runtime, buffer, IpInputError::BadLength.code())?;
-            return Ok(next[IpInputNext::Drop.slot()]);
+            return Ok(NodeNextStorage::next(&next, IpInputNext::Drop));
         }
     };
     if parsed.input_error == IpInputError::None {
@@ -163,15 +182,18 @@ where
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));
     metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
     match parsed.input_target {
-        IpInputTarget::Drop => Ok(next[IpInputNext::Drop.slot()]),
-        IpInputTarget::Punt => Ok(next[IpInputNext::Punt.slot()]),
-        IpInputTarget::Options => Ok(next[IpInputNext::Options.slot()]),
-        IpInputTarget::Lookup => Ok(feature_arc.map_or(next[IpInputNext::Lookup.slot()], |arc| {
-            arc.start_or(metadata, next[IpInputNext::Lookup.slot()])
-        })),
-        IpInputTarget::LookupMulticast => Ok(next[IpInputNext::LookupMulticast.slot()]),
-        IpInputTarget::IcmpError => Ok(next[IpInputNext::IcmpError.slot()]),
-        IpInputTarget::Reassembly => Ok(next[IpInputNext::Reassembly.slot()]),
+        IpInputTarget::Drop => Ok(NodeNextStorage::next(&next, IpInputNext::Drop)),
+        IpInputTarget::Punt => Ok(NodeNextStorage::next(&next, IpInputNext::Punt)),
+        IpInputTarget::Options => Ok(NodeNextStorage::next(&next, IpInputNext::Options)),
+        IpInputTarget::Lookup => Ok(feature_arc
+            .map_or(NodeNextStorage::next(&next, IpInputNext::Lookup), |arc| {
+                arc.start_or(metadata, NodeNextStorage::next(&next, IpInputNext::Lookup))
+            })),
+        IpInputTarget::LookupMulticast => {
+            Ok(NodeNextStorage::next(&next, IpInputNext::LookupMulticast))
+        }
+        IpInputTarget::IcmpError => Ok(NodeNextStorage::next(&next, IpInputNext::IcmpError)),
+        IpInputTarget::Reassembly => Ok(NodeNextStorage::next(&next, IpInputNext::Reassembly)),
     }
 }
 
@@ -184,12 +206,15 @@ fn next_nodes_for_indices_with_batch<A, G>(
     start_offset: usize,
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArc<A>>,
+    last_next: &mut Option<NodeId>,
 ) -> CoreResult<()>
 where
     A: FeatureArcSpec,
 {
     for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-        nexts[offset] = next_node_for_index_with_batch(runtime, batch, index, next, feature_arc)?;
+        let node = next_node_for_index_with_batch(runtime, batch, index, next, feature_arc)?;
+        nexts[offset] = node;
+        *last_next = Some(node);
     }
     Ok(())
 }

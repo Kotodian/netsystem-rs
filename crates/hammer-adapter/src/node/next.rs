@@ -13,6 +13,127 @@ pub trait NodeNext: Copy + Eq {
     fn slot(self) -> usize;
 }
 
+pub trait NodeNextStorage<K> {
+    fn next(&self, key: K) -> NodeId;
+}
+
+impl<K, const N: usize> NodeNextStorage<K> for [NodeId; N]
+where
+    K: NodeNext,
+{
+    #[inline(always)]
+    fn next(&self, key: K) -> NodeId {
+        self[key.slot()]
+    }
+}
+
+impl NodeNextStorage<()> for NodeId {
+    #[inline(always)]
+    fn next(&self, _key: ()) -> NodeId {
+        *self
+    }
+}
+
+pub trait PacketNextResolver<G> {
+    fn next_for_index(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<NodeId>;
+}
+
+#[inline(always)]
+pub fn process_cached_speculative_next<G, R>(
+    runtime: &DataPlaneRuntime<G>,
+    frame: &mut BufferFrame,
+    cached_next: &mut Option<NodeId>,
+    resolver: &R,
+) -> CoreResult<NodeResult>
+where
+    R: PacketNextResolver<G> + ?Sized,
+{
+    let Some(first_index) = frame.pending_indices().first().copied() else {
+        return Ok(NodeResult::drop());
+    };
+    let mut last_next = None;
+    let result = match *cached_next {
+        Some(speculative) => {
+            NodeNextEnqueue::new(speculative).validate_frame(runtime, frame, |index| {
+                let node = resolver.next_for_index(runtime, index)?;
+                last_next = Some(node);
+                Ok(node)
+            })
+        }
+        None => {
+            let first_next = resolver.next_for_index(runtime, first_index)?;
+            last_next = Some(first_next);
+            NodeNextEnqueue::new(first_next).validate_frame_with_first_next(
+                runtime,
+                frame,
+                first_index,
+                first_next,
+                |index| {
+                    let node = resolver.next_for_index(runtime, index)?;
+                    last_next = Some(node);
+                    Ok(node)
+                },
+            )
+        }
+    };
+    if result.is_ok()
+        && let Some(node) = last_next
+    {
+        *cached_next = Some(node);
+    }
+    result
+}
+
+#[inline(always)]
+pub fn process_cached_rewrite_next<G, R>(
+    runtime: &DataPlaneRuntime<G>,
+    frame: &mut BufferFrame,
+    cached_next: &mut Option<NodeId>,
+    resolver: &R,
+) -> CoreResult<NodeResult>
+where
+    R: PacketNextResolver<G> + ?Sized,
+{
+    let mut next_frames = NodeNextFrames::default();
+    let mut current_next = *cached_next;
+    let mut last_next = None;
+    let result = frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+        let node = resolver.next_for_index(runtime, index)?;
+        last_next = Some(node);
+        match current_next {
+            Some(current) if current == node => Ok(Some(index)),
+            Some(_) => {
+                next_frames.enqueue(runtime, node, index)?;
+                Ok(None)
+            }
+            None => {
+                current_next = Some(node);
+                Ok(Some(index))
+            }
+        }
+    });
+    if let Err(err) = result {
+        next_frames.free(runtime);
+        return Err(err);
+    }
+
+    next_frames.schedule(runtime)?;
+    if let Some(node) = last_next {
+        *cached_next = Some(node);
+    }
+    if frame.has_pending()
+        && let Some(node) = current_next
+    {
+        Ok(NodeResult::next_current(node))
+    } else {
+        Ok(NodeResult::drop())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NodeNextFrames {
     nodes: [Option<NodeId>; MAX_NODE_NEXT_FRAMES],

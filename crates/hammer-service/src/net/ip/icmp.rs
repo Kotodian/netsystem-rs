@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextEnqueue,
-    NodeResult,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextStorage,
+    NodeResult, PacketNextResolver, process_cached_speculative_next,
 };
 use hammer_core::error::CoreResult;
 
@@ -143,6 +143,20 @@ impl IcmpInputSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IcmpInputKey {
+    version: IpVersion,
+    icmp_type: u8,
+}
+
+impl NodeNextStorage<IcmpInputKey> for IcmpInputSnapshot {
+    #[inline(always)]
+    fn next(&self, key: IcmpInputKey) -> NodeId {
+        self.next_for_type(key.version, key.icmp_type)
+            .unwrap_or_else(|| self.default_next(key.version))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct IcmpInputTable {
     default_next: NodeId,
@@ -261,6 +275,23 @@ impl IcmpInputSnapshotHandle {
 #[hammer_component_macros::node]
 pub struct IcmpInputNode {
     snapshot: IcmpInputSnapshotHandle,
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
+
+struct IcmpInputNextResolver {
+    snapshot: arc_swap::Guard<Arc<IcmpInputSnapshot>>,
+}
+
+impl<G> PacketNextResolver<G> for IcmpInputNextResolver {
+    #[inline(always)]
+    fn next_for_index(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<NodeId> {
+        next_node_for_index(runtime, index, &self.snapshot)
+    }
 }
 
 impl<G> Node<G> for IcmpInputNode {
@@ -270,18 +301,10 @@ impl<G> Node<G> for IcmpInputNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let Some(first) = frame.pending_indices().first().copied() else {
-            return Ok(NodeResult::drop());
+        let resolver = IcmpInputNextResolver {
+            snapshot: self.snapshot.load(),
         };
-        let snapshot = self.snapshot.load();
-        let first_next = next_node_for_index(runtime, first, &snapshot)?;
-        NodeNextEnqueue::new(first_next).validate_frame_with_first_next(
-            runtime,
-            frame,
-            first,
-            first_next,
-            |index| next_node_for_index(runtime, index, &snapshot),
-        )
+        process_cached_speculative_next(runtime, frame, &mut self.cached_next, &resolver)
     }
 }
 
@@ -322,10 +345,11 @@ fn next_node_for_index<G>(
 
     let icmp_type = icmp[0];
     let code = icmp[1];
-    let Some(next) = snapshot.next_for_type(version, icmp_type) else {
+    let key = IcmpInputKey { version, icmp_type };
+    if snapshot.next_for_type(version, icmp_type).is_none() {
         set_index_node_error_code(runtime, index, IcmpInputError::UnknownType.code())?;
-        return Ok(default_next);
-    };
+        return Ok(NodeNextStorage::next(snapshot, key));
+    }
     let spec = snapshot.spec(version, icmp_type);
     if code > spec.max_code {
         set_index_node_error_code(runtime, index, IcmpInputError::BadCode.code())?;
@@ -345,5 +369,44 @@ fn next_node_for_index<G>(
     }
 
     runtime.get_buffer_mut(index)?.clear_node_error();
-    Ok(next)
+    Ok(NodeNextStorage::next(snapshot, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use hammer_adapter::{DataPlaneRuntime, NodeNextStorage};
+
+    use super::*;
+    use crate::data_plane::DropNode;
+
+    #[test]
+    fn icmp_snapshot_storage_returns_registered_or_default_next() {
+        let runtime = DataPlaneRuntime::<DropNode>::with_capacities(8, 2, 1, 1);
+        let default = runtime.nodes().register_internal(DropNode::new());
+        let echo = runtime.nodes().register_internal(DropNode::new());
+        let mut snapshot = IcmpInputSnapshot::new(default, default);
+
+        snapshot.register_type(IpVersion::V4, ICMP4_ECHO_REQUEST, echo);
+
+        assert_eq!(
+            NodeNextStorage::next(
+                &snapshot,
+                IcmpInputKey {
+                    version: IpVersion::V4,
+                    icmp_type: ICMP4_ECHO_REQUEST,
+                },
+            ),
+            echo
+        );
+        assert_eq!(
+            NodeNextStorage::next(
+                &snapshot,
+                IcmpInputKey {
+                    version: IpVersion::V4,
+                    icmp_type: 13,
+                },
+            ),
+            default
+        );
+    }
 }
