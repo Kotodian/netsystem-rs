@@ -64,17 +64,7 @@ impl IcmpInputControlPlane {
     pub fn register_type(&self, version: IpVersion, icmp_type: u8, node: NodeId) -> CoreResult<()> {
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
-            let index = icmp_type as usize;
-            match version {
-                IpVersion::V4 => {
-                    next.ip4_type_nexts[index] = node;
-                    next.ip4_registered[index] = true;
-                }
-                IpVersion::V6 => {
-                    next.ip6_type_nexts[index] = node;
-                    next.ip6_registered[index] = true;
-                }
-            }
+            next.register_type(version, icmp_type, node);
             next
         });
         Ok(())
@@ -84,17 +74,7 @@ impl IcmpInputControlPlane {
     pub fn unregister_type(&self, version: IpVersion, icmp_type: u8) -> CoreResult<()> {
         self.inner.rcu(|current| {
             let mut next = IcmpInputSnapshot::clone(current);
-            let index = icmp_type as usize;
-            match version {
-                IpVersion::V4 => {
-                    next.ip4_type_nexts[index] = next.ip4_default_next;
-                    next.ip4_registered[index] = false;
-                }
-                IpVersion::V6 => {
-                    next.ip6_type_nexts[index] = next.ip6_default_next;
-                    next.ip6_registered[index] = false;
-                }
-            }
+            next.unregister_type(version, icmp_type);
             next
         });
         Ok(())
@@ -103,63 +83,131 @@ impl IcmpInputControlPlane {
 
 #[derive(Debug, Clone)]
 struct IcmpInputSnapshot {
-    ip4_default_next: NodeId,
-    ip6_default_next: NodeId,
-    ip4_type_nexts: Box<[NodeId; 256]>,
-    ip6_type_nexts: Box<[NodeId; 256]>,
-    ip4_registered: Box<[bool; 256]>,
-    ip6_registered: Box<[bool; 256]>,
-    ip4_specs: Box<[IcmpTypeSpec; 256]>,
-    ip6_specs: Box<[IcmpTypeSpec; 256]>,
+    ip4: IcmpInputTable,
+    ip6: IcmpInputTable,
 }
 
 impl IcmpInputSnapshot {
     #[inline]
     fn new(ip4_default_next: NodeId, ip6_default_next: NodeId) -> Self {
-        let mut ip4_specs = Box::new([IcmpTypeSpec::default(); 256]);
-        ip4_specs[ICMP4_ECHO_REPLY as usize] = IcmpTypeSpec::echo();
-        ip4_specs[ICMP4_ECHO_REQUEST as usize] = IcmpTypeSpec::echo();
+        let mut ip4 = IcmpInputTable::new(ip4_default_next);
+        ip4.set_spec(ICMP4_ECHO_REPLY, IcmpTypeSpec::echo());
+        ip4.set_spec(ICMP4_ECHO_REQUEST, IcmpTypeSpec::echo());
 
-        let mut ip6_specs = Box::new([IcmpTypeSpec::default(); 256]);
-        ip6_specs[ICMP6_ECHO_REQUEST as usize] = IcmpTypeSpec::echo();
-        ip6_specs[ICMP6_ECHO_REPLY as usize] = IcmpTypeSpec::echo();
+        let mut ip6 = IcmpInputTable::new(ip6_default_next);
+        ip6.set_spec(ICMP6_ECHO_REQUEST, IcmpTypeSpec::echo());
+        ip6.set_spec(ICMP6_ECHO_REPLY, IcmpTypeSpec::echo());
 
-        Self {
-            ip4_default_next,
-            ip6_default_next,
-            ip4_type_nexts: Box::new([ip4_default_next; 256]),
-            ip6_type_nexts: Box::new([ip6_default_next; 256]),
-            ip4_registered: Box::new([false; 256]),
-            ip6_registered: Box::new([false; 256]),
-            ip4_specs,
-            ip6_specs,
-        }
+        Self { ip4, ip6 }
     }
 
     #[inline(always)]
     fn default_next(&self, version: IpVersion) -> NodeId {
-        match version {
-            IpVersion::V4 => self.ip4_default_next,
-            IpVersion::V6 => self.ip6_default_next,
-        }
+        self.table(version).default_next()
     }
 
     #[inline(always)]
     fn next_for_type(&self, version: IpVersion, icmp_type: u8) -> Option<NodeId> {
-        let index = icmp_type as usize;
-        match version {
-            IpVersion::V4 if self.ip4_registered[index] => Some(self.ip4_type_nexts[index]),
-            IpVersion::V6 if self.ip6_registered[index] => Some(self.ip6_type_nexts[index]),
-            _ => None,
-        }
+        self.table(version).next_for_type(icmp_type)
     }
 
     #[inline(always)]
     fn spec(&self, version: IpVersion, icmp_type: u8) -> IcmpTypeSpec {
-        let index = icmp_type as usize;
+        self.table(version).spec(icmp_type)
+    }
+
+    #[inline(always)]
+    fn register_type(&mut self, version: IpVersion, icmp_type: u8, node: NodeId) {
+        self.table_mut(version).register_type(icmp_type, node);
+    }
+
+    #[inline(always)]
+    fn unregister_type(&mut self, version: IpVersion, icmp_type: u8) {
+        self.table_mut(version).unregister_type(icmp_type);
+    }
+
+    #[inline(always)]
+    fn table(&self, version: IpVersion) -> &IcmpInputTable {
         match version {
-            IpVersion::V4 => self.ip4_specs[index],
-            IpVersion::V6 => self.ip6_specs[index],
+            IpVersion::V4 => &self.ip4,
+            IpVersion::V6 => &self.ip6,
+        }
+    }
+
+    #[inline(always)]
+    fn table_mut(&mut self, version: IpVersion) -> &mut IcmpInputTable {
+        match version {
+            IpVersion::V4 => &mut self.ip4,
+            IpVersion::V6 => &mut self.ip6,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IcmpInputTable {
+    default_next: NodeId,
+    entries: [IcmpInputEntry; 256],
+}
+
+impl IcmpInputTable {
+    #[inline]
+    fn new(default_next: NodeId) -> Self {
+        Self {
+            default_next,
+            entries: [IcmpInputEntry::new(default_next); 256],
+        }
+    }
+
+    #[inline(always)]
+    fn default_next(&self) -> NodeId {
+        self.default_next
+    }
+
+    #[inline(always)]
+    fn set_spec(&mut self, icmp_type: u8, spec: IcmpTypeSpec) {
+        self.entries[icmp_type as usize].spec = spec;
+    }
+
+    #[inline(always)]
+    fn register_type(&mut self, icmp_type: u8, node: NodeId) {
+        let entry = &mut self.entries[icmp_type as usize];
+        entry.next = node;
+        entry.registered = true;
+    }
+
+    #[inline(always)]
+    fn unregister_type(&mut self, icmp_type: u8) {
+        let entry = &mut self.entries[icmp_type as usize];
+        entry.next = self.default_next;
+        entry.registered = false;
+    }
+
+    #[inline(always)]
+    fn next_for_type(&self, icmp_type: u8) -> Option<NodeId> {
+        let entry = self.entries[icmp_type as usize];
+        entry.registered.then_some(entry.next)
+    }
+
+    #[inline(always)]
+    fn spec(&self, icmp_type: u8) -> IcmpTypeSpec {
+        self.entries[icmp_type as usize].spec
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IcmpInputEntry {
+    next: NodeId,
+    spec: IcmpTypeSpec,
+    registered: bool,
+}
+
+impl IcmpInputEntry {
+    #[inline]
+    fn new(default_next: NodeId) -> Self {
+        Self {
+            next: default_next,
+            spec: IcmpTypeSpec::default(),
+            registered: false,
         }
     }
 }
@@ -251,7 +299,7 @@ fn next_node_for_index<G>(
         Ok(parsed) => parsed,
         Err(_) => {
             set_index_node_error_code(runtime, index, IcmpInputError::BadLength.code())?;
-            return Ok(snapshot.ip4_default_next);
+            return Ok(snapshot.default_next(IpVersion::V4));
         }
     };
     let version = parsed.version;
