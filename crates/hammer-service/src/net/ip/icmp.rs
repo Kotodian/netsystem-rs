@@ -45,7 +45,10 @@ pub enum IcmpNodeError {
     WrongProtocol,
     WrongType,
     BadCode,
+    BadChecksum,
+    Suppressed,
     MissingMetadata,
+    MissingSource,
     UnsupportedFamily,
 }
 
@@ -64,6 +67,8 @@ impl From<IcmpBuildError> for IcmpNodeError {
             IcmpBuildError::WrongProtocol => Self::WrongProtocol,
             IcmpBuildError::WrongType => Self::WrongType,
             IcmpBuildError::BadCode => Self::BadCode,
+            IcmpBuildError::BadChecksum => Self::BadChecksum,
+            IcmpBuildError::Suppressed => Self::Suppressed,
             IcmpBuildError::UnsupportedFamily => Self::UnsupportedFamily,
         }
     }
@@ -518,8 +523,13 @@ fn next_node_for_icmp_error_index<G>(
         set_index_node_error_code(runtime, index, IcmpNodeError::MissingMetadata.code())?;
         return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
     };
+    let Some(local_source) = runtime.with_metadata(index, |metadata| metadata.icmp_error_source)?
+    else {
+        set_index_node_error_code(runtime, index, IcmpNodeError::MissingSource.code())?;
+        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+    };
     let original = runtime.copy_current_chain(index)?;
-    match build_icmp_error_packet(original.as_ref(), metadata) {
+    match build_icmp_error_packet(original.as_ref(), metadata, local_source) {
         Ok(generated) => {
             replace_current_chain(runtime, index, &generated.packet)?;
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
@@ -565,6 +575,7 @@ fn refresh_generated_icmp_metadata<G>(
     metadata.source = Some(SocksAddr::ip(generated.source, 0));
     metadata.destination = Some(SocksAddr::ip(generated.destination, 0));
     metadata.icmp_error = None;
+    metadata.icmp_error_source = None;
     Ok(())
 }
 

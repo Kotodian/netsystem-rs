@@ -223,6 +223,47 @@ fn icmp_echo_request_sends_wrong_type_to_drop_with_node_error() {
 }
 
 #[test]
+fn icmp_echo_request_sends_bad_checksum_to_drop_with_node_error() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
+    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let lookup = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+    let drop = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+    let echo =
+        runtime
+            .nodes()
+            .register_internal(IcmpEchoRequestNode::new(IcmpEchoRequestNext::nodes(
+                lookup, drop,
+            )));
+    let mut packet = ipv4_icmp_echo_packet(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 0, 2, 1),
+        8,
+        b"bad-checksum",
+    );
+    packet[22] ^= 0xff;
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &packet, RouteMetadata::default());
+
+    assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert!(lookup_state.borrow().packets.is_empty());
+    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert_eq!(
+        drop_state.borrow().node_errors,
+        vec![Some(BufferNodeError::new(
+            echo,
+            IcmpNodeError::BadChecksum.code()
+        ))]
+    );
+}
+
+#[test]
 fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
     let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
@@ -242,7 +283,8 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
         b"expired-hop",
     );
     let metadata = RouteMetadata {
-        icmp_error: Some(IcmpErrorMetadata::new(11, 0, 0)),
+        icmp_error: Some(IcmpErrorMetadata::ipv4_time_exceeded()),
+        icmp_error_source: Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))),
         ..RouteMetadata::default()
     };
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -258,7 +300,7 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
     let reply = &lookup_state.packets[0];
     assert_eq!(reply[8], LOCAL_ORIGINATED_TTL);
     assert_eq!(reply[9], 1);
-    assert_eq!(&reply[12..16], &[198, 51, 100, 1]);
+    assert_eq!(&reply[12..16], &[203, 0, 113, 9]);
     assert_eq!(&reply[16..20], &[10, 0, 0, 10]);
     assert_eq!(reply[20], 11);
     assert_eq!(reply[21], 0);
@@ -285,8 +327,10 @@ fn icmp_error_node_synthesizes_ipv6_packet_too_big_to_lookup() {
     let source = "2001:db8::10".parse().expect("source");
     let destination = "2001:db8::20".parse().expect("destination");
     let original = ipv6_udp_packet(source, destination, b"too-big");
+    let local_source = "2001:db8::ff".parse().expect("local source");
     let metadata = RouteMetadata {
-        icmp_error: Some(IcmpErrorMetadata::new(2, 0, 1280)),
+        icmp_error: Some(IcmpErrorMetadata::ipv6_packet_too_big(1280)),
+        icmp_error_source: Some(IpAddr::V6(local_source)),
         ..RouteMetadata::default()
     };
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -302,13 +346,13 @@ fn icmp_error_node_synthesizes_ipv6_packet_too_big_to_lookup() {
     let reply = &lookup_state.packets[0];
     assert_eq!(reply[6], 58);
     assert_eq!(reply[7], LOCAL_ORIGINATED_TTL);
-    assert_eq!(&reply[8..24], &destination.octets());
+    assert_eq!(&reply[8..24], &local_source.octets());
     assert_eq!(&reply[24..40], &source.octets());
     assert_eq!(reply[40], 2);
     assert_eq!(reply[41], 0);
     assert_eq!(&reply[44..48], &1280u32.to_be_bytes());
     assert_eq!(&reply[48..], &original[..]);
-    assert_eq!(ipv6_l4_checksum(destination, source, 58, &reply[40..]), 0);
+    assert_eq!(ipv6_l4_checksum(local_source, source, 58, &reply[40..]), 0);
 }
 
 #[test]
@@ -343,6 +387,46 @@ fn icmp_error_node_drops_when_metadata_is_missing() {
         vec![Some(BufferNodeError::new(
             error,
             IcmpNodeError::MissingMetadata.code()
+        ))]
+    );
+}
+
+#[test]
+fn icmp_error_node_drops_when_local_source_is_missing() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
+    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let lookup = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+    let drop = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+    let error = runtime
+        .nodes()
+        .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, lookup)));
+    let packet = ipv4_udp_packet(
+        Ipv4Addr::new(10, 0, 0, 10),
+        Ipv4Addr::new(198, 51, 100, 1),
+        b"no-source",
+    );
+    let metadata = RouteMetadata {
+        icmp_error: Some(IcmpErrorMetadata::ipv4_time_exceeded()),
+        ..RouteMetadata::default()
+    };
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &packet, metadata);
+
+    assert!(runtime.schedule_frame(error, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert!(lookup_state.borrow().packets.is_empty());
+    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert_eq!(
+        drop_state.borrow().node_errors,
+        vec![Some(BufferNodeError::new(
+            error,
+            IcmpNodeError::MissingSource.code()
         ))]
     );
 }

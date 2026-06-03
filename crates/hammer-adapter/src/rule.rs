@@ -1,6 +1,8 @@
 // Rule / RuleSet surface for the minimal M4 route engine. Full sing-box rule
 // sets land later; M4 only consumes the default rules generated from tun.*.
 
+use std::net::IpAddr;
+
 pub use hammer_core::SocksAddr;
 use hammer_core::config::{DomainStrategy, RuleActionKind};
 use hammer_core::forwarding::DpoType;
@@ -67,6 +69,7 @@ pub struct RouteMetadata {
     pub route_decision: Option<RouteDecision>,
     pub forwarding: Option<ForwardingMetadata>,
     pub icmp_error: Option<IcmpErrorMetadata>,
+    pub icmp_error_source: Option<IpAddr>,
 }
 
 impl RouteMetadata {

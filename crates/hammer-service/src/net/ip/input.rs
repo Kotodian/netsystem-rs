@@ -206,8 +206,8 @@ fn icmp_error_metadata_for_input(parsed: &ParsedIpPacket) -> Option<IcmpErrorMet
         return None;
     }
     match (parsed.version, parsed.input_error) {
-        (IpVersion::V4, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::new(11, 0, 0)),
-        (IpVersion::V6, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::new(3, 0, 0)),
+        (IpVersion::V4, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::ipv4_time_exceeded()),
+        (IpVersion::V6, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::ipv6_time_exceeded()),
         _ => None,
     }
 }

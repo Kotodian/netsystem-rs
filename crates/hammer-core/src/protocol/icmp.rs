@@ -31,7 +31,15 @@ pub enum IcmpBuildError {
     WrongProtocol,
     WrongType,
     BadCode,
+    BadChecksum,
+    Suppressed,
     UnsupportedFamily,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpErrorFamily {
+    Ipv4,
+    Ipv6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +48,46 @@ pub struct IcmpErrorMetadata(NonZeroU64);
 
 impl IcmpErrorMetadata {
     #[inline]
-    pub fn new(icmp_type: u8, code: u8, data: u32) -> Self {
-        let packed =
-            (1u64 << 63) | ((icmp_type as u64) << 40) | ((code as u64) << 32) | data as u64;
+    fn new(family: IcmpErrorFamily, icmp_type: u8, code: u8, data: u32) -> Self {
+        let family = match family {
+            IcmpErrorFamily::Ipv4 => 4u64,
+            IcmpErrorFamily::Ipv6 => 6u64,
+        };
+        let packed = (1u64 << 63)
+            | (family << 48)
+            | ((icmp_type as u64) << 40)
+            | ((code as u64) << 32)
+            | data as u64;
         Self(NonZeroU64::new(packed).expect("ICMP error metadata is presence-tagged"))
+    }
+
+    #[inline]
+    pub fn ipv4_time_exceeded() -> Self {
+        Self::new(IcmpErrorFamily::Ipv4, 11, 0, 0)
+    }
+
+    #[inline]
+    pub fn ipv4_destination_unreachable(code: u8, data: u32) -> Self {
+        Self::new(IcmpErrorFamily::Ipv4, 3, code, data)
+    }
+
+    #[inline]
+    pub fn ipv6_time_exceeded() -> Self {
+        Self::new(IcmpErrorFamily::Ipv6, 3, 0, 0)
+    }
+
+    #[inline]
+    pub fn ipv6_packet_too_big(mtu: u32) -> Self {
+        Self::new(IcmpErrorFamily::Ipv6, 2, 0, mtu)
+    }
+
+    #[inline]
+    pub const fn family(self) -> IcmpErrorFamily {
+        match (self.0.get() >> 48) & 0xff {
+            4 => IcmpErrorFamily::Ipv4,
+            6 => IcmpErrorFamily::Ipv6,
+            _ => unreachable!(),
+        }
     }
 
     #[inline]
@@ -77,13 +121,12 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
     let packet = packet
         .get(..parsed.packet_len)
         .ok_or(IcmpBuildError::BadLength)?;
-    let mut reply = packet.to_vec();
     let icmp_offset = parsed.transport_header_offset;
     let icmp_len = parsed.packet_len.saturating_sub(icmp_offset);
     if icmp_len < ICMP_ECHO_HEADER_LEN || icmp_offset > parsed.packet_len {
         return Err(IcmpBuildError::BadLength);
     }
-    let icmp = &mut reply[icmp_offset..parsed.packet_len];
+    let icmp = &packet[icmp_offset..parsed.packet_len];
     match (parsed.version, parsed.protocol) {
         (IpVersion::V4, IpProtocol::Icmpv4) => {
             if icmp[0] != ICMP4_ECHO_REQUEST {
@@ -92,6 +135,11 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             if icmp[1] != 0 {
                 return Err(IcmpBuildError::BadCode);
             }
+            if internet_checksum(icmp) != 0 {
+                return Err(IcmpBuildError::BadChecksum);
+            }
+            let mut reply = packet.to_vec();
+            let icmp = &mut reply[icmp_offset..parsed.packet_len];
             icmp[0] = ICMP4_ECHO_REPLY;
             zero_checksum(icmp);
             let checksum = internet_checksum(icmp);
@@ -114,6 +162,11 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
             if icmp[1] != 0 {
                 return Err(IcmpBuildError::BadCode);
             }
+            if icmpv6_checksum(packet, icmp_offset, parsed.packet_len)? != 0 {
+                return Err(IcmpBuildError::BadChecksum);
+            }
+            let mut reply = packet.to_vec();
+            let icmp = &mut reply[icmp_offset..parsed.packet_len];
             icmp[0] = ICMP6_ECHO_REPLY;
             zero_checksum(icmp);
             swap_ranges::<16>(&mut reply, IPV6_SOURCE_OFFSET, IPV6_DESTINATION_OFFSET);
@@ -135,18 +188,27 @@ pub fn build_echo_reply(packet: &[u8]) -> Result<IcmpGeneratedPacket, IcmpBuildE
 pub fn build_icmp_error_packet(
     original: &[u8],
     metadata: IcmpErrorMetadata,
+    local_source: IpAddr,
 ) -> Result<IcmpGeneratedPacket, IcmpBuildError> {
     let parsed =
         parse_ip_packet_with_chain_len(original, 0).map_err(|_| IcmpBuildError::BadLength)?;
     let original = original
         .get(..parsed.packet_len)
         .ok_or(IcmpBuildError::BadLength)?;
-    match (parsed.version, parsed.source, parsed.destination) {
-        (IpVersion::V4, IpAddr::V4(source), IpAddr::V4(destination)) => {
-            build_ipv4_icmp_error(original, source, destination, metadata)
+    if should_suppress_icmp_error(original, parsed.protocol, parsed.transport_header_offset) {
+        return Err(IcmpBuildError::Suppressed);
+    }
+    match (
+        metadata.family(),
+        parsed.version,
+        parsed.source,
+        local_source,
+    ) {
+        (IcmpErrorFamily::Ipv4, IpVersion::V4, IpAddr::V4(source), IpAddr::V4(local_source)) => {
+            build_ipv4_icmp_error(original, source, local_source, metadata)
         }
-        (IpVersion::V6, IpAddr::V6(source), IpAddr::V6(destination)) => {
-            build_ipv6_icmp_error(original, source, destination, metadata)
+        (IcmpErrorFamily::Ipv6, IpVersion::V6, IpAddr::V6(source), IpAddr::V6(local_source)) => {
+            build_ipv6_icmp_error(original, source, local_source, metadata)
         }
         _ => Err(IcmpBuildError::UnsupportedFamily),
     }
@@ -155,7 +217,7 @@ pub fn build_icmp_error_packet(
 fn build_ipv4_icmp_error(
     original: &[u8],
     source: Ipv4Addr,
-    destination: Ipv4Addr,
+    local_source: Ipv4Addr,
     metadata: IcmpErrorMetadata,
 ) -> Result<IcmpGeneratedPacket, IcmpBuildError> {
     let quote_len = original
@@ -167,7 +229,7 @@ fn build_ipv4_icmp_error(
     packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     packet[IPV4_TTL_OFFSET] = LOCAL_ORIGINATED_TTL;
     packet[IPV4_PROTOCOL_OFFSET] = ICMP_PROTOCOL_V4;
-    packet[IPV4_SOURCE_OFFSET..IPV4_SOURCE_OFFSET + 4].copy_from_slice(&destination.octets());
+    packet[IPV4_SOURCE_OFFSET..IPV4_SOURCE_OFFSET + 4].copy_from_slice(&local_source.octets());
     packet[IPV4_DESTINATION_OFFSET..IPV4_DESTINATION_OFFSET + 4].copy_from_slice(&source.octets());
     let icmp_offset = IPV4_HEADER_MIN_LEN;
     packet[icmp_offset] = metadata.icmp_type();
@@ -179,7 +241,7 @@ fn build_ipv4_icmp_error(
     packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&checksum.to_be_bytes());
     Ok(IcmpGeneratedPacket {
         packet,
-        source: IpAddr::V4(destination),
+        source: IpAddr::V4(local_source),
         destination: IpAddr::V4(source),
         network_header_len: IPV4_HEADER_MIN_LEN,
         transport_header_offset: icmp_offset,
@@ -189,7 +251,7 @@ fn build_ipv4_icmp_error(
 fn build_ipv6_icmp_error(
     original: &[u8],
     source: Ipv6Addr,
-    destination: Ipv6Addr,
+    local_source: Ipv6Addr,
     metadata: IcmpErrorMetadata,
 ) -> Result<IcmpGeneratedPacket, IcmpBuildError> {
     let quote_len = original
@@ -202,7 +264,7 @@ fn build_ipv6_icmp_error(
     packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
     packet[IPV6_NEXT_HEADER_OFFSET] = ICMP_PROTOCOL_V6;
     packet[IPV6_HOP_LIMIT_OFFSET] = LOCAL_ORIGINATED_TTL;
-    packet[IPV6_SOURCE_OFFSET..IPV6_SOURCE_OFFSET + 16].copy_from_slice(&destination.octets());
+    packet[IPV6_SOURCE_OFFSET..IPV6_SOURCE_OFFSET + 16].copy_from_slice(&local_source.octets());
     packet[IPV6_DESTINATION_OFFSET..IPV6_DESTINATION_OFFSET + 16].copy_from_slice(&source.octets());
     let icmp_offset = IPV6_HEADER_LEN;
     packet[icmp_offset] = metadata.icmp_type();
@@ -213,11 +275,26 @@ fn build_ipv6_icmp_error(
     packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&checksum.to_be_bytes());
     Ok(IcmpGeneratedPacket {
         packet,
-        source: IpAddr::V6(destination),
+        source: IpAddr::V6(local_source),
         destination: IpAddr::V6(source),
         network_header_len: IPV6_HEADER_LEN,
         transport_header_offset: icmp_offset,
     })
+}
+
+fn should_suppress_icmp_error(
+    original: &[u8],
+    protocol: IpProtocol,
+    transport_header_offset: usize,
+) -> bool {
+    let Some(icmp_type) = original.get(transport_header_offset).copied() else {
+        return true;
+    };
+    match protocol {
+        IpProtocol::Icmpv4 => matches!(icmp_type, 3 | 4 | 5 | 11 | 12),
+        IpProtocol::Icmpv6 => icmp_type < 128,
+        _ => false,
+    }
 }
 
 #[inline(always)]
@@ -286,9 +363,9 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-    use super::{IcmpErrorMetadata, build_echo_reply, build_icmp_error_packet};
+    use super::{IcmpBuildError, IcmpErrorMetadata, build_echo_reply, build_icmp_error_packet};
 
     #[test]
     fn build_echo_reply_rewrites_ipv4_echo_request() {
@@ -314,17 +391,72 @@ mod tests {
         let destination = "2001:db8::2".parse().expect("destination");
         let original = ipv6_packet(source, destination, 17, b"expired");
 
-        let error =
-            build_icmp_error_packet(&original, IcmpErrorMetadata::new(3, 0, 0)).expect("error");
+        let local_source = "2001:db8::ff".parse().expect("local source");
+        let error = build_icmp_error_packet(
+            &original,
+            IcmpErrorMetadata::ipv6_time_exceeded(),
+            IpAddr::V6(local_source),
+        )
+        .expect("error");
 
-        assert_eq!(&error.packet[8..24], &destination.octets());
+        assert_eq!(&error.packet[8..24], &local_source.octets());
         assert_eq!(&error.packet[24..40], &source.octets());
         assert_eq!(error.packet[40], 3);
         assert_eq!(error.packet[41], 0);
         assert_eq!(&error.packet[48..], &original[..]);
         assert_eq!(
-            ipv6_l4_checksum(destination, source, 58, &error.packet[40..]),
+            ipv6_l4_checksum(local_source, source, 58, &error.packet[40..]),
             0
+        );
+    }
+
+    #[test]
+    fn build_echo_reply_rejects_bad_ipv4_icmp_checksum() {
+        let mut request = ipv4_icmp_echo_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            b"echo4",
+        );
+        request[22] ^= 0xff;
+
+        assert_eq!(build_echo_reply(&request), Err(IcmpBuildError::BadChecksum));
+    }
+
+    #[test]
+    fn ipv6_metadata_does_not_apply_to_ipv4_errors() {
+        let original = ipv4_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            17,
+            8,
+        );
+
+        assert_eq!(
+            build_icmp_error_packet(
+                &original,
+                IcmpErrorMetadata::ipv6_packet_too_big(1280),
+                IpAddr::V6("2001:db8::ff".parse().unwrap())
+            ),
+            Err(IcmpBuildError::UnsupportedFamily)
+        );
+    }
+
+    #[test]
+    fn build_icmp_error_packet_suppresses_icmpv4_errors() {
+        let original = ipv4_icmp_error_packet(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 0, 2, 1),
+            3,
+            1,
+        );
+
+        assert_eq!(
+            build_icmp_error_packet(
+                &original,
+                IcmpErrorMetadata::ipv4_time_exceeded(),
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))
+            ),
+            Err(IcmpBuildError::Suppressed)
         );
     }
 
@@ -335,6 +467,22 @@ mod tests {
         packet[icmp + 4..icmp + 6].copy_from_slice(&0x1234u16.to_be_bytes());
         packet[icmp + 6..icmp + 8].copy_from_slice(&1u16.to_be_bytes());
         packet[icmp + 8..].copy_from_slice(payload);
+        let checksum = internet_checksum(&packet[icmp..]);
+        packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
+        update_ipv4_header_checksum(&mut packet);
+        packet
+    }
+
+    fn ipv4_icmp_error_packet(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        icmp_type: u8,
+        code: u8,
+    ) -> Vec<u8> {
+        let mut packet = ipv4_packet(source, destination, 1, 8);
+        let icmp = 20;
+        packet[icmp] = icmp_type;
+        packet[icmp + 1] = code;
         let checksum = internet_checksum(&packet[icmp..]);
         packet[icmp + 2..icmp + 4].copy_from_slice(&checksum.to_be_bytes());
         update_ipv4_header_checksum(&mut packet);
