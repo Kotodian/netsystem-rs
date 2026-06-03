@@ -2,10 +2,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextStorage,
-    NodeResult, PacketNextResolver, process_cached_speculative_next,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
+    NodeId, NodeNextStorage, NodeResult, PacketNextResolver, SocksAddr,
+    process_cached_rewrite_next, process_cached_speculative_next,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::icmp::{
+    IcmpBuildError, IcmpGeneratedPacket, build_echo_reply, build_icmp_error_packet,
+};
 
 use crate::data_plane::set_index_node_error_code;
 
@@ -32,6 +36,36 @@ impl IcmpInputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpNodeError {
+    BadLength,
+    WrongProtocol,
+    WrongType,
+    BadCode,
+    MissingMetadata,
+    UnsupportedFamily,
+}
+
+impl IcmpNodeError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+impl From<IcmpBuildError> for IcmpNodeError {
+    #[inline(always)]
+    fn from(error: IcmpBuildError) -> Self {
+        match error {
+            IcmpBuildError::BadLength => Self::BadLength,
+            IcmpBuildError::WrongProtocol => Self::WrongProtocol,
+            IcmpBuildError::WrongType => Self::WrongType,
+            IcmpBuildError::BadCode => Self::BadCode,
+            IcmpBuildError::UnsupportedFamily => Self::UnsupportedFamily,
+        }
     }
 }
 
@@ -310,6 +344,88 @@ impl<G> Node<G> for IcmpInputNode {
 
 impl<G> InternalNode<G> for IcmpInputNode {}
 
+#[hammer_component_macros::node_next]
+pub enum IcmpEchoRequestNext {
+    Lookup,
+    Drop,
+}
+
+#[hammer_component_macros::node(next = IcmpEchoRequestNext)]
+pub struct IcmpEchoRequestNode {
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
+
+struct IcmpEchoRequestNextResolver {
+    next: [NodeId; IcmpEchoRequestNext::COUNT],
+}
+
+impl<G> PacketNextResolver<G> for IcmpEchoRequestNextResolver {
+    #[inline(always)]
+    fn next_for_index(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<NodeId> {
+        next_node_for_echo_request_index(runtime, index, self.next)
+    }
+}
+
+impl<G> Node<G> for IcmpEchoRequestNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let resolver = IcmpEchoRequestNextResolver { next: self.next };
+        process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+    }
+}
+
+impl<G> InternalNode<G> for IcmpEchoRequestNode {}
+
+#[hammer_component_macros::node_next]
+pub enum IcmpErrorNext {
+    Drop,
+    Lookup,
+}
+
+#[hammer_component_macros::node(next = IcmpErrorNext)]
+pub struct IcmpErrorNode {
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
+
+struct IcmpErrorNextResolver {
+    next: [NodeId; IcmpErrorNext::COUNT],
+}
+
+impl<G> PacketNextResolver<G> for IcmpErrorNextResolver {
+    #[inline(always)]
+    fn next_for_index(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<NodeId> {
+        next_node_for_icmp_error_index(runtime, index, self.next)
+    }
+}
+
+impl<G> Node<G> for IcmpErrorNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let resolver = IcmpErrorNextResolver { next: self.next };
+        process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+    }
+}
+
+impl<G> InternalNode<G> for IcmpErrorNode {}
+
 #[inline(always)]
 fn next_node_for_index<G>(
     runtime: &DataPlaneRuntime<G>,
@@ -370,6 +486,86 @@ fn next_node_for_index<G>(
 
     runtime.get_buffer_mut(index)?.clear_node_error();
     Ok(NodeNextStorage::next(snapshot, key))
+}
+
+#[inline(always)]
+fn next_node_for_echo_request_index<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    next: [NodeId; IcmpEchoRequestNext::COUNT],
+) -> CoreResult<NodeId> {
+    let packet = runtime.copy_current_chain(index)?;
+    match build_echo_reply(packet.as_ref()) {
+        Ok(generated) => {
+            replace_current_chain(runtime, index, &generated.packet)?;
+            refresh_generated_icmp_metadata(runtime, index, &generated)?;
+            Ok(NodeNextStorage::next(&next, IcmpEchoRequestNext::Lookup))
+        }
+        Err(error) => {
+            set_index_node_error_code(runtime, index, IcmpNodeError::from(error).code())?;
+            Ok(NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop))
+        }
+    }
+}
+
+#[inline(always)]
+fn next_node_for_icmp_error_index<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    next: [NodeId; IcmpErrorNext::COUNT],
+) -> CoreResult<NodeId> {
+    let Some(metadata) = runtime.with_metadata(index, |metadata| metadata.icmp_error)? else {
+        set_index_node_error_code(runtime, index, IcmpNodeError::MissingMetadata.code())?;
+        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+    };
+    let original = runtime.copy_current_chain(index)?;
+    match build_icmp_error_packet(original.as_ref(), metadata) {
+        Ok(generated) => {
+            replace_current_chain(runtime, index, &generated.packet)?;
+            refresh_generated_icmp_metadata(runtime, index, &generated)?;
+            Ok(NodeNextStorage::next(&next, IcmpErrorNext::Lookup))
+        }
+        Err(error) => {
+            set_index_node_error_code(runtime, index, IcmpNodeError::from(error).code())?;
+            Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop))
+        }
+    }
+}
+
+#[inline(always)]
+fn replace_current_chain<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    packet: &[u8],
+) -> CoreResult<()> {
+    runtime.truncate_chain(index, 0)?;
+    runtime.append(index, packet)
+}
+
+#[inline(always)]
+fn refresh_generated_icmp_metadata<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    generated: &IcmpGeneratedPacket,
+) -> CoreResult<()> {
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    let packet_len = generated.packet.len();
+    buffer.clear_node_error();
+    buffer.set_packet_cursor(
+        BufferPacketCursor::new()
+            .with_packet_len(packet_len)
+            .with_network_header(0, generated.network_header_len)
+            .with_transport_header(generated.transport_header_offset, ICMP_ECHO_HEADER_LEN)
+            .with_transport_payload_offset(
+                generated.transport_header_offset + ICMP_ECHO_HEADER_LEN,
+            ),
+    );
+    let metadata = buffer.metadata_mut();
+    metadata.network = Network::Icmp;
+    metadata.source = Some(SocksAddr::ip(generated.source, 0));
+    metadata.destination = Some(SocksAddr::ip(generated.destination, 0));
+    metadata.icmp_error = None;
+    Ok(())
 }
 
 #[cfg(test)]

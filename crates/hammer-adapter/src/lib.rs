@@ -29,6 +29,7 @@ pub use buffer::{
 pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
+pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 

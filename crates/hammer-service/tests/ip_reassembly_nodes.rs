@@ -10,8 +10,8 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory, IpReassemblyHandoff,
-    IpReassemblyNext, IpReassemblyNode,
+    IcmpErrorNext, IcmpErrorNode, IpInputError, IpInputNext, IpInputNode, IpReassemblyDirectory,
+    IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
 };
 
 type PacketVec = hammer_infra::vec::Vec<u8>;
@@ -94,6 +94,7 @@ impl SinkCapture {
 
 enum TestNode {
     Drop(DropNode),
+    IcmpError(IcmpErrorNode),
     IpInput(IpInputNode),
     Reassembly(IpReassemblyNode),
     Sink(SinkNode),
@@ -102,6 +103,12 @@ enum TestNode {
 impl From<DropNode> for TestNode {
     fn from(node: DropNode) -> Self {
         Self::Drop(node)
+    }
+}
+
+impl From<IcmpErrorNode> for TestNode {
+    fn from(node: IcmpErrorNode) -> Self {
+        Self::IcmpError(node)
     }
 }
 
@@ -132,6 +139,7 @@ impl Node<TestNode> for TestNode {
     ) -> CoreResult<NodeResult> {
         match self {
             Self::Drop(node) => node.process(runtime, frame),
+            Self::IcmpError(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
             Self::Reassembly(node) => node.process(runtime, frame),
             Self::Sink(node) => node.process(runtime, frame),
@@ -205,7 +213,10 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
-    let icmp = runtime.nodes().register_internal(icmp_capture.node());
+    let icmp_lookup = runtime.nodes().register_internal(icmp_capture.node());
+    let icmp = runtime
+        .nodes()
+        .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup)));
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
     let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -256,17 +267,13 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 7);
     assert_eq!(lookup_capture.packets(), vec![unknown_protocol]);
     assert_eq!(mcast_capture.packets(), vec![multicast]);
-    assert_eq!(icmp_capture.packets(), vec![ttl_expired]);
-    assert_eq!(
-        icmp_capture.node_errors(),
-        vec![Some(BufferNodeError::new(
-            input,
-            IpInputError::TimeExpired.code()
-        ))]
-    );
+    let icmp_packets = icmp_capture.packets();
+    assert_eq!(icmp_packets.len(), 1);
+    assert_ipv4_time_exceeded(&icmp_packets[0], &ttl_expired);
+    assert_eq!(icmp_capture.node_errors(), vec![None]);
     assert_eq!(
         runtime
             .node_error_count(input, IpInputError::TimeExpired.code())
@@ -306,7 +313,10 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
     let mcast = runtime.nodes().register_internal(mcast_capture.node());
-    let icmp = runtime.nodes().register_internal(icmp_capture.node());
+    let icmp_lookup = runtime.nodes().register_internal(icmp_capture.node());
+    let icmp = runtime
+        .nodes()
+        .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, icmp_lookup)));
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
     let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
@@ -350,17 +360,13 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
     assert_eq!(lookup_capture.packets(), vec![lookup_packet]);
     assert_eq!(mcast_capture.packets(), vec![multicast]);
-    assert_eq!(icmp_capture.packets(), vec![hop_expired]);
-    assert_eq!(
-        icmp_capture.node_errors(),
-        vec![Some(BufferNodeError::new(
-            input,
-            IpInputError::TimeExpired.code()
-        ))]
-    );
+    let icmp_packets = icmp_capture.packets();
+    assert_eq!(icmp_packets.len(), 1);
+    assert_ipv6_time_exceeded(&icmp_packets[0], &hop_expired);
+    assert_eq!(icmp_capture.node_errors(), vec![None]);
     assert_eq!(
         runtime
             .node_error_count(input, IpInputError::TimeExpired.code())
@@ -961,6 +967,35 @@ fn ip_reassembly_nexts(
     IpReassemblyNext::nodes(lookup, drop)
 }
 
+fn assert_ipv4_time_exceeded(packet: &[u8], original: &[u8]) {
+    assert_eq!(packet[0], 0x45);
+    assert_eq!(packet[8], 64);
+    assert_eq!(packet[9], 1);
+    assert_eq!(&packet[12..16], &original[16..20]);
+    assert_eq!(&packet[16..20], &original[12..16]);
+    assert_eq!(packet[20], 11);
+    assert_eq!(packet[21], 0);
+    assert_eq!(&packet[24..28], &[0, 0, 0, 0]);
+    assert_eq!(&packet[28..], original);
+    assert_eq!(internet_checksum(&packet[..20]), 0);
+    assert_eq!(internet_checksum(&packet[20..]), 0);
+}
+
+fn assert_ipv6_time_exceeded(packet: &[u8], original: &[u8]) {
+    assert_eq!(packet[0], 0x60);
+    assert_eq!(packet[6], 58);
+    assert_eq!(packet[7], 64);
+    assert_eq!(&packet[8..24], &original[24..40]);
+    assert_eq!(&packet[24..40], &original[8..24]);
+    assert_eq!(packet[40], 3);
+    assert_eq!(packet[41], 0);
+    assert_eq!(&packet[44..48], &[0, 0, 0, 0]);
+    assert_eq!(&packet[48..], original);
+    let source = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("source"));
+    let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("destination"));
+    assert_eq!(ipv6_l4_checksum(source, destination, 58, &packet[40..]), 0);
+}
+
 fn ipv4_options_packet() -> Vec<u8> {
     let payload = b"option";
     let total_len = 24 + payload.len();
@@ -1194,4 +1229,14 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
         }
     }
     !(sum as u16)
+}
+
+fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&source.octets());
+    pseudo.extend_from_slice(&destination.octets());
+    pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, protocol]);
+    pseudo.extend_from_slice(segment);
+    internet_checksum(&pseudo)
 }

@@ -3,7 +3,8 @@ mod lookup;
 mod route_metadata;
 
 pub use ip::{
-    IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IpInputError, IpInputNext, IpInputNode,
+    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpInputControlPlane,
+    IcmpInputError, IcmpInputNode, IcmpNodeError, IpInputError, IpInputNext, IpInputNode,
     IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode, IpReceiveNode,
     IpUnicastArc, IpVersion,

@@ -3,10 +3,12 @@ use hammer_adapter::{
     Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, SocksAddr,
 };
 use hammer_core::error::CoreResult;
+use hammer_core::protocol::icmp::IcmpErrorMetadata;
 
 use crate::data_plane::{FeatureArc, FeatureArcSpec, set_buffer_node_error_code};
 use crate::net::ip::{
-    IpInputError, IpInputTarget, network_for_protocol, parse_ip_packet_with_chain_len,
+    IpInputError, IpInputTarget, IpVersion, ParsedIpPacket, network_for_protocol,
+    parse_ip_packet_with_chain_len,
 };
 
 #[hammer_component_macros::feature_arc]
@@ -181,6 +183,7 @@ where
     }
     metadata.source = Some(SocksAddr::ip(parsed.source, 0));
     metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
+    metadata.icmp_error = icmp_error_metadata_for_input(&parsed);
     match parsed.input_target {
         IpInputTarget::Drop => Ok(NodeNextStorage::next(&next, IpInputNext::Drop)),
         IpInputTarget::Punt => Ok(NodeNextStorage::next(&next, IpInputNext::Punt)),
@@ -194,6 +197,18 @@ where
         }
         IpInputTarget::IcmpError => Ok(NodeNextStorage::next(&next, IpInputNext::IcmpError)),
         IpInputTarget::Reassembly => Ok(NodeNextStorage::next(&next, IpInputNext::Reassembly)),
+    }
+}
+
+#[inline(always)]
+fn icmp_error_metadata_for_input(parsed: &ParsedIpPacket) -> Option<IcmpErrorMetadata> {
+    if parsed.input_target != IpInputTarget::IcmpError {
+        return None;
+    }
+    match (parsed.version, parsed.input_error) {
+        (IpVersion::V4, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::new(11, 0, 0)),
+        (IpVersion::V6, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::new(3, 0, 0)),
+        _ => None,
     }
 }
 

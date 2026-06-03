@@ -4,6 +4,7 @@
 pub use hammer_core::SocksAddr;
 use hammer_core::config::{DomainStrategy, RuleActionKind};
 use hammer_core::forwarding::DpoType;
+use hammer_core::protocol::icmp::IcmpErrorMetadata;
 
 use crate::{Network, NodeId};
 
@@ -65,6 +66,7 @@ pub struct RouteMetadata {
     pub override_destination: bool,
     pub route_decision: Option<RouteDecision>,
     pub forwarding: Option<ForwardingMetadata>,
+    pub icmp_error: Option<IcmpErrorMetadata>,
 }
 
 impl RouteMetadata {
@@ -147,4 +149,16 @@ pub trait Rule: HeadlessRule {
     fn type_name(&self) -> &str;
     fn matches(&self, metadata: &RouteMetadata) -> bool;
     fn action(&self) -> &RuleActionKind;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::IcmpErrorMetadata;
+
+    #[test]
+    fn icmp_error_metadata_option_stays_word_sized() {
+        assert_eq!(size_of::<Option<IcmpErrorMetadata>>(), size_of::<u64>());
+    }
 }

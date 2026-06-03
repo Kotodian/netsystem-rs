@@ -9,9 +9,10 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
-    DpoId, DpoProto, FibTableBuilder, IcmpInputControlPlane, IcmpInputNode, IpInputNext,
-    IpInputNode, IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode,
-    IpLocalSourceCheck, IpLookupControlPlane, IpLookupNode, IpReceiveNode, IpVersion,
+    DpoId, DpoProto, FibTableBuilder, IcmpEchoRequestNext, IcmpEchoRequestNode,
+    IcmpInputControlPlane, IcmpInputNode, IpInputNext, IpInputNode, IpLocalArc,
+    IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
+    IpLookupControlPlane, IpLookupNode, IpReceiveNode, IpVersion,
 };
 use ipnet::Ipv4Net;
 
@@ -87,6 +88,7 @@ enum TestNode {
     IpInput(IpInputNode),
     IpLookup(IpLookupNode),
     IcmpInput(IcmpInputNode),
+    IcmpEchoRequest(IcmpEchoRequestNode),
     IpLocal(IpLocalNode),
     IpReceive(IpReceiveNode),
 }
@@ -127,6 +129,12 @@ impl From<IcmpInputNode> for TestNode {
     }
 }
 
+impl From<IcmpEchoRequestNode> for TestNode {
+    fn from(node: IcmpEchoRequestNode) -> Self {
+        Self::IcmpEchoRequest(node)
+    }
+}
+
 impl From<IpLocalNode> for TestNode {
     fn from(node: IpLocalNode) -> Self {
         Self::IpLocal(node)
@@ -153,6 +161,7 @@ impl Node<TestNode> for TestNode {
             Self::IpInput(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
             Self::IcmpInput(node) => node.process(runtime, frame),
+            Self::IcmpEchoRequest(node) => node.process(runtime, frame),
             Self::IpLocal(node) => node.process(runtime, frame),
             Self::IpReceive(node) => node.process(runtime, frame),
         }
@@ -220,7 +229,7 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
 
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
     assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
     assert_eq!(graph.tcp_state.borrow().metadata.len(), 1);
     assert_eq!(graph.icmp_state.borrow().metadata.len(), 2);
@@ -244,17 +253,17 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
     assert_metadata(
         &graph.icmp_state.borrow().metadata[0],
         Network::Icmp,
-        Ipv4Addr::new(10, 0, 0, 3).into(),
-        0,
         Ipv4Addr::new(192, 0, 2, 3).into(),
+        0,
+        Ipv4Addr::new(10, 0, 0, 3).into(),
         0,
     );
     assert_metadata(
         &graph.icmp_state.borrow().metadata[1],
         Network::Icmp,
-        "2001:db8::3".parse().expect("source"),
+        "2001:db8::4".parse().expect("source"),
         0,
-        "2001:db8::4".parse().expect("destination"),
+        "2001:db8::3".parse().expect("destination"),
         0,
     );
     assert_eq!(runtime.frames_in_use(), 0);
@@ -654,18 +663,21 @@ impl LocalGraph {
         let udp = runtime
             .nodes()
             .register_internal(CaptureNode::new(Rc::clone(&udp_state)));
-        let icmp = runtime
+        let icmp_lookup = runtime
             .nodes()
             .register_internal(CaptureNode::new(Rc::clone(&icmp_state)));
+        let icmp_echo_request = runtime.nodes().register_internal(IcmpEchoRequestNode::new(
+            IcmpEchoRequestNext::nodes(icmp_lookup, drop),
+        ));
         let reassembly = runtime
             .nodes()
             .register_internal(CaptureNode::new(Rc::clone(&reassembly_state)));
         let icmp_control = IcmpInputControlPlane::new(punt);
         icmp_control
-            .register_type(IpVersion::V4, 8, icmp)
+            .register_type(IpVersion::V4, 8, icmp_echo_request)
             .expect("register IPv4 echo request");
         icmp_control
-            .register_type(IpVersion::V6, 128, icmp)
+            .register_type(IpVersion::V6, 128, icmp_echo_request)
             .expect("register IPv6 echo request");
         let icmp_input = runtime.nodes().register_internal(icmp_control.node());
         Self {
