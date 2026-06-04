@@ -61,6 +61,7 @@ fn parse_config_builds_hysteria_tun_options() {
         panic!("inbound[0] not tun");
     };
     assert_eq!(tun.stack, TunStack::System);
+    assert!(!tun.tap);
 
     assert_eq!(options.route.rules.len(), 5, "expected 5 tun rules");
     assert_rule_action(&options.route.rules[0].default_options.action, "sniff");
@@ -133,6 +134,44 @@ fn parse_config_builds_hysteria_tun_options() {
         _ => panic!("dns server is not Https"),
     };
     assert_eq!(https.via, "direct");
+}
+
+#[test]
+fn parse_config_defaults_tun_tap_to_false() {
+    let options = config::parse_config(MINIMAL_CONFIG).expect("parse");
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
+
+    assert!(!tun.tap);
+}
+
+#[test]
+fn parse_config_rejects_tun_tap_true_with_system_stack() {
+    let cfg = MINIMAL_CONFIG.replacen("[tun]\n", "[tun]\ntap = true\n", 1);
+
+    let err = config::parse_config(&cfg).expect_err("system stack must not accept TAP frames");
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("tun.tap requires stack = \"disabled\""),
+        "error = {msg:?}"
+    );
+}
+
+#[test]
+fn parse_config_passes_through_tun_tap_true_with_disabled_stack() {
+    let cfg = MINIMAL_CONFIG.replacen(
+        "stack = \"system\"\n",
+        "stack = \"disabled\"\ntap = true\n",
+        1,
+    );
+    let options = config::parse_config(&cfg).expect("parse");
+    let InboundKind::Tun(tun) = &options.inbounds[0].kind else {
+        panic!("inbound[0] not tun");
+    };
+
+    assert!(tun.tap);
 }
 
 #[test]

@@ -1,9 +1,46 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
+use hammer_adapter::{BufferFrame, DataPlaneRuntime, Node, NodeResult};
+use hammer_core::error::CoreResult;
 use hammer_runtime::spawn::DataRuntime;
-use hammer_service::interface::{InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind};
+use hammer_service::interface::{
+    InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputControlPlane,
+    InterfaceOutputNode,
+};
+use hammer_service::tun::{MemoryTunDevice, TunOutputDriverNode};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+
+enum TestNode {
+    InterfaceOutput(InterfaceOutputNode),
+    TunOutput(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
+}
+
+impl From<InterfaceOutputNode> for TestNode {
+    fn from(node: InterfaceOutputNode) -> Self {
+        Self::InterfaceOutput(node)
+    }
+}
+
+impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
+    fn from(node: TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>) -> Self {
+        Self::TunOutput(node)
+    }
+}
+
+impl Node<TestNode> for TestNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        match self {
+            Self::InterfaceOutput(node) => node.process(runtime, frame),
+            Self::TunOutput(node) => node.process(runtime, frame),
+        }
+    }
+}
 
 #[test]
 fn control_plane_publishes_interfaces_and_addresses_through_handle() {
@@ -126,4 +163,136 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
 
     assert_eq!(barrier.sync_count(), 3);
     data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn interface_output_dispatches_to_registered_tx_node() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let output_device = MemoryTunDevice::new();
+    let tx = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(output_device.output()));
+    let output_control = InterfaceOutputControlPlane::new();
+    output_control.register_tx(7, tx).expect("register tx node");
+    let output_node = runtime.nodes().register_internal(output_control.node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], b"interface-output");
+    let index = runtime
+        .alloc_index_with_bytes(
+            {
+                let mut metadata = hammer_adapter::RouteMetadata::default();
+                metadata.egress_interface = Some(7);
+                metadata
+            },
+            &packet,
+        )
+        .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(output_node, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(output_device.drain_output(), vec![packet]);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn interface_output_drops_missing_egress_or_tx_mapping() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let output_device = MemoryTunDevice::new();
+    let output_control = InterfaceOutputControlPlane::new();
+    let output_node = runtime.nodes().register_internal(output_control.node());
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet_with_egress(&runtime, frame, None, b"no-egress");
+    push_packet_with_egress(&runtime, frame, Some(99), b"no-tx");
+
+    assert!(
+        runtime
+            .schedule_frame(output_node, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert!(output_device.drain_output().is_empty());
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier() {
+    let data_runtime =
+        DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let tx = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let output_control =
+        InterfaceOutputControlPlane::new().with_data_plane_barrier(barrier.clone());
+
+    output_control.register_tx(7, tx).expect("register tx");
+    output_control.unregister_tx(7).expect("unregister tx");
+
+    assert_eq!(barrier.sync_count(), 2);
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+fn push_packet_with_egress(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    egress_interface: Option<u32>,
+    payload: &[u8],
+) {
+    let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], payload);
+    let index = runtime
+        .alloc_index_with_bytes(
+            {
+                let mut metadata = hammer_adapter::RouteMetadata::default();
+                metadata.egress_interface = egress_interface;
+                metadata
+            },
+            &packet,
+        )
+        .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+}
+
+fn ipv4_packet(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {
+    let total_len = 20 + payload.len();
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 59;
+    packet[12..16].copy_from_slice(&source);
+    packet[16..20].copy_from_slice(&destination);
+    let checksum = ipv4_checksum(&packet[..20]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet[20..].copy_from_slice(payload);
+    packet
+}
+
+fn ipv4_checksum(header: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in header.chunks_exact(2) {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }

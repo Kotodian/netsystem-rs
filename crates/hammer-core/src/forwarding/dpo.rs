@@ -358,9 +358,71 @@ struct DpoStackEdge<N> {
     next: N,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjacencyRewriteError {
+    TooLarge { len: usize, max: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdjacencyRewrite {
+    len: u8,
+    bytes: [u8; Self::MAX_LEN],
+}
+
+impl AdjacencyRewrite {
+    pub const MAX_LEN: usize = 64;
+
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self {
+            len: 0,
+            bytes: [0; Self::MAX_LEN],
+        }
+    }
+
+    #[inline]
+    pub fn try_new(bytes: &[u8]) -> Result<Self, AdjacencyRewriteError> {
+        if bytes.len() > Self::MAX_LEN {
+            return Err(AdjacencyRewriteError::TooLarge {
+                len: bytes.len(),
+                max: Self::MAX_LEN,
+            });
+        }
+
+        let mut rewrite = Self::empty();
+        rewrite.bytes[..bytes.len()].copy_from_slice(bytes);
+        rewrite.len = bytes.len() as u8;
+        Ok(rewrite)
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+
+    #[inline(always)]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline(always)]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for AdjacencyRewrite {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Adjacency<N> {
     pub next: N,
     pub proto: DpoProto,
+    pub egress_interface: Option<u32>,
+    pub rewrite: AdjacencyRewrite,
 }

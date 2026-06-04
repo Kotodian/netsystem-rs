@@ -4,7 +4,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
-use super::dpo::{Adjacency, AdjacencyIndex, DpoId, DpoProto};
+use super::dpo::{Adjacency, AdjacencyIndex, AdjacencyRewrite, DpoId, DpoProto};
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
@@ -287,15 +287,74 @@ impl<N: Copy> FibTableBuilder<N> {
 
     #[inline]
     pub fn add_adjacency(&mut self, proto: DpoProto, next: N) -> AdjacencyIndex {
-        let index = AdjacencyIndex::new(self.adjacencies.len() as u32);
-        self.adjacencies.push(Adjacency { next, proto });
-        index
+        self.add_interface_adjacency(proto, None, AdjacencyRewrite::empty(), next)
     }
 
     #[inline]
     pub fn add_adjacency_dpo(&mut self, proto: DpoProto, next: N) -> DpoId<N> {
         let adjacency = self.add_adjacency(proto, next);
         DpoId::adjacency(proto, adjacency, next)
+    }
+
+    #[inline]
+    pub fn add_interface_adjacency(
+        &mut self,
+        proto: DpoProto,
+        egress_interface: impl Into<Option<u32>>,
+        rewrite: AdjacencyRewrite,
+        post_rewrite_next: N,
+    ) -> AdjacencyIndex {
+        let index = AdjacencyIndex::new(self.adjacencies.len() as u32);
+        self.adjacencies.push(Adjacency {
+            next: post_rewrite_next,
+            proto,
+            egress_interface: egress_interface.into(),
+            rewrite,
+        });
+        index
+    }
+
+    #[inline]
+    pub fn try_add_interface_adjacency(
+        &mut self,
+        proto: DpoProto,
+        egress_interface: impl Into<Option<u32>>,
+        rewrite: AdjacencyRewrite,
+        post_rewrite_next: N,
+    ) -> Result<AdjacencyIndex, core::convert::Infallible> {
+        Ok(self.add_interface_adjacency(proto, egress_interface, rewrite, post_rewrite_next))
+    }
+
+    #[inline]
+    pub fn add_interface_adjacency_dpo(
+        &mut self,
+        proto: DpoProto,
+        egress_interface: impl Into<Option<u32>>,
+        rewrite: AdjacencyRewrite,
+        rewrite_next: N,
+        post_rewrite_next: N,
+    ) -> DpoId<N> {
+        let adjacency =
+            self.add_interface_adjacency(proto, egress_interface, rewrite, post_rewrite_next);
+        DpoId::adjacency(proto, adjacency, rewrite_next)
+    }
+
+    #[inline]
+    pub fn try_add_interface_adjacency_dpo(
+        &mut self,
+        proto: DpoProto,
+        egress_interface: impl Into<Option<u32>>,
+        rewrite: AdjacencyRewrite,
+        rewrite_next: N,
+        post_rewrite_next: N,
+    ) -> Result<DpoId<N>, core::convert::Infallible> {
+        Ok(self.add_interface_adjacency_dpo(
+            proto,
+            egress_interface,
+            rewrite,
+            rewrite_next,
+            post_rewrite_next,
+        ))
     }
 
     #[inline]

@@ -53,6 +53,8 @@ impl FeaturePathMetadata {
 pub struct RouteMetadata {
     pub inbound: String,
     pub ingress_interface: Option<u32>,
+    pub egress_interface: Option<u32>,
+    pub tap_ethernet: Option<TapEthernetMetadata>,
     pub feature_path: Option<FeaturePathMetadata>,
     pub feature_config: Option<Vec<u8>>,
     pub network: Network,
@@ -67,6 +69,45 @@ pub struct RouteMetadata {
     pub route_decision: Option<RouteDecision>,
     pub forwarding: Option<ForwardingMetadata>,
     pub icmp_error: Option<IcmpErrorMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TapEthernetMetadata {
+    pub destination: [u8; 6],
+    pub source: [u8; 6],
+    pub ethertype: u16,
+    pub header_present: bool,
+}
+
+impl TapEthernetMetadata {
+    #[inline]
+    pub const fn new(destination: [u8; 6], source: [u8; 6], ethertype: u16) -> Self {
+        Self {
+            destination,
+            source,
+            ethertype,
+            header_present: false,
+        }
+    }
+
+    #[inline]
+    pub const fn header_present(destination: [u8; 6], source: [u8; 6], ethertype: u16) -> Self {
+        Self {
+            destination,
+            source,
+            ethertype,
+            header_present: true,
+        }
+    }
+
+    #[inline]
+    pub fn header(self) -> [u8; 14] {
+        let mut header = [0u8; 14];
+        header[..6].copy_from_slice(&self.destination);
+        header[6..12].copy_from_slice(&self.source);
+        header[12..14].copy_from_slice(&self.ethertype.to_be_bytes());
+        header
+    }
 }
 
 impl RouteMetadata {

@@ -2,11 +2,17 @@ use std::cell::UnsafeCell;
 use std::fmt;
 use std::sync::Arc;
 
+use hammer_adapter::{
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
+    NodeResult,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneBarrierHandle;
 use ipnet::IpNet;
+
+use crate::data_plane::set_index_node_error_code;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceMtu {
@@ -475,3 +481,266 @@ impl FlatHashKey for InterfaceAddressKey {
         value.hash_key()
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct InterfaceOutputHandle {
+    inner: Arc<InterfaceOutputStateSlot>,
+}
+
+impl InterfaceOutputHandle {
+    #[inline]
+    fn new(inner: Arc<InterfaceOutputStateSlot>) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn tx_node(&self, interface_index: u32) -> Option<NodeId> {
+        self.inner.state().tx_node(interface_index)
+    }
+}
+
+pub struct InterfaceOutputControlPlane {
+    inner: Arc<InterfaceOutputStateSlot>,
+    barrier: Option<DataPlaneBarrierHandle>,
+}
+
+impl Default for InterfaceOutputControlPlane {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InterfaceOutputControlPlane {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(InterfaceOutputStateSlot::new(
+                InterfaceOutputState::default(),
+            )),
+            barrier: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+        self.barrier = Some(barrier);
+        self
+    }
+
+    #[inline]
+    pub fn handle(&self) -> InterfaceOutputHandle {
+        InterfaceOutputHandle::new(Arc::clone(&self.inner))
+    }
+
+    #[inline]
+    pub fn node(&self) -> InterfaceOutputNode {
+        InterfaceOutputNode::new(self.handle())
+    }
+
+    pub fn register_tx(&self, interface_index: u32, node: NodeId) -> CoreResult<()> {
+        self.synchronize(|| {
+            let current = self.inner.state();
+            let mut next = InterfaceOutputState::clone(current);
+            next.set_tx_node(interface_index, Some(node));
+            self.publish(next);
+            Ok(())
+        })
+    }
+
+    pub fn unregister_tx(&self, interface_index: u32) -> CoreResult<bool> {
+        let mut removed = false;
+        self.synchronize(|| {
+            let current = self.inner.state();
+            removed = current.tx_node(interface_index).is_some();
+            if !removed {
+                return Ok(());
+            }
+            let mut next = InterfaceOutputState::clone(current);
+            next.set_tx_node(interface_index, None);
+            self.publish(next);
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    #[inline]
+    fn synchronize<R>(&self, operation: impl FnOnce() -> CoreResult<R>) -> CoreResult<R> {
+        if let Some(barrier) = &self.barrier {
+            barrier.synchronize(operation)
+        } else {
+            operation()
+        }
+    }
+
+    #[inline]
+    fn publish(&self, state: InterfaceOutputState) {
+        self.inner.replace_after_barrier(state);
+    }
+}
+
+struct InterfaceOutputStateSlot {
+    state: UnsafeCell<InterfaceOutputState>,
+}
+
+impl InterfaceOutputStateSlot {
+    #[inline]
+    fn new(state: InterfaceOutputState) -> Self {
+        Self {
+            state: UnsafeCell::new(state),
+        }
+    }
+
+    #[inline]
+    fn state(&self) -> &InterfaceOutputState {
+        // SAFETY: Interface output map writes are serialized by the runtime
+        // data-plane barrier before publication. Data-plane nodes only read an
+        // immutable snapshot while workers are running.
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline]
+    fn replace_after_barrier(&self, state: InterfaceOutputState) {
+        // SAFETY: callers replace state either under the runtime barrier or
+        // during single-threaded graph setup in tests.
+        unsafe {
+            *self.state.get() = state;
+        }
+    }
+}
+
+impl fmt::Debug for InterfaceOutputStateSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("InterfaceOutputStateSlot")
+            .finish_non_exhaustive()
+    }
+}
+
+unsafe impl Send for InterfaceOutputStateSlot {}
+unsafe impl Sync for InterfaceOutputStateSlot {}
+
+#[derive(Debug, Clone, Default)]
+struct InterfaceOutputState {
+    tx_nodes: Vec<Option<NodeId>>,
+}
+
+impl InterfaceOutputState {
+    #[inline]
+    fn tx_node(&self, interface_index: u32) -> Option<NodeId> {
+        self.tx_nodes
+            .get(interface_index as usize)
+            .copied()
+            .flatten()
+    }
+
+    #[inline]
+    fn set_tx_node(&mut self, interface_index: u32, node: Option<NodeId>) {
+        let slot = interface_index as usize;
+        while self.tx_nodes.len() <= slot {
+            self.tx_nodes.push(None);
+        }
+        self.tx_nodes[slot] = node;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceOutputNodeError {
+    MissingEgressInterface,
+    MissingTxNode,
+}
+
+impl InterfaceOutputNodeError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::MissingEgressInterface => 1,
+            Self::MissingTxNode => 2,
+        }
+    }
+}
+
+#[hammer_component_macros::node]
+pub struct InterfaceOutputNode {
+    output: InterfaceOutputHandle,
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
+
+impl InterfaceOutputNode {
+    #[inline(always)]
+    fn tx_for_index<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<Option<NodeId>> {
+        let metadata = runtime.metadata(index)?;
+        let Some(interface_index) = metadata.egress_interface else {
+            set_index_node_error_code(
+                runtime,
+                index,
+                InterfaceOutputNodeError::MissingEgressInterface.code(),
+            )?;
+            runtime.free_index(index);
+            return Ok(None);
+        };
+        let Some(tx) = self.output.tx_node(interface_index) else {
+            set_index_node_error_code(
+                runtime,
+                index,
+                InterfaceOutputNodeError::MissingTxNode.code(),
+            )?;
+            runtime.free_index(index);
+            return Ok(None);
+        };
+        Ok(Some(tx))
+    }
+}
+
+impl<G> Node<G> for InterfaceOutputNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let mut next_frames = NodeNextFrames::default();
+        let mut current_next = self.cached_next;
+        let mut last_next = None;
+        let result =
+            frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+                let Some(node) = self.tx_for_index(runtime, index)? else {
+                    return Ok(None);
+                };
+                last_next = Some(node);
+                match current_next {
+                    Some(current) if current == node => Ok(Some(index)),
+                    Some(_) => {
+                        next_frames.enqueue(runtime, node, index)?;
+                        Ok(None)
+                    }
+                    None => {
+                        current_next = Some(node);
+                        Ok(Some(index))
+                    }
+                }
+            });
+        if let Err(err) = result {
+            next_frames.free(runtime);
+            return Err(err);
+        }
+
+        next_frames.schedule(runtime)?;
+        if let Some(node) = last_next {
+            self.cached_next = Some(node);
+        }
+        if frame.has_pending()
+            && let Some(node) = current_next
+        {
+            Ok(NodeResult::next_current(node))
+        } else {
+            Ok(NodeResult::drop())
+        }
+    }
+}
+
+impl<G> InternalNode<G> for InterfaceOutputNode {}

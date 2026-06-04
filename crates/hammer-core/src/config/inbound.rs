@@ -27,6 +27,8 @@ raw_struct_with_default_check! {
         pub mtu: Option<u32> => "Option::is_none",
         /// Packet stack mode, for example `system` or `disabled`.
         pub stack: Option<TunStack> => "Option::is_none",
+        /// Whether this interface is TAP (Ethernet frames) instead of L3 TUN.
+        pub tap: Option<bool> => "Option::is_none",
         /// Local interface addresses in CIDR form.
         pub address: Vec<IpNet> => "Vec::is_empty",
         /// Routes included through the tunnel.
@@ -170,6 +172,7 @@ pub struct TunInboundOptions {
     pub auto_route: bool,
     pub strict_route: bool,
     pub stack: TunStack,
+    pub tap: bool,
     pub udp_timeout: Option<Duration>,
 }
 
@@ -340,6 +343,12 @@ fn build_users(raw: &[RawInboundUser]) -> Result<Vec<InboundUser>, HammerError> 
 fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerError> {
     let mtu = raw.mtu.unwrap_or(C::DEFAULT_TUN_MTU);
     let stack = raw.stack.unwrap_or_default();
+    let tap = raw.tap.unwrap_or(false);
+    if tap && matches!(stack, TunStack::System) {
+        return Err(HammerError::config_validation(
+            "tun.tap requires stack = \"disabled\" because the legacy system stack only accepts L3 IP packets",
+        ));
+    }
     let address = raw.address.clone();
     if address.is_empty() {
         return Err(HammerError::config_validation("tun.address is required"));
@@ -356,6 +365,7 @@ fn build_tun_options(raw: &RawTunConfig) -> Result<TunInboundOptions, HammerErro
         auto_route,
         strict_route: raw.strict_route.unwrap_or(false),
         stack,
+        tap,
         udp_timeout: raw.udp_timeout,
     })
 }

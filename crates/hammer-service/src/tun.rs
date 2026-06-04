@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeResult, RouteMetadata,
+    TapEthernetMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -13,6 +14,9 @@ pub use crate::net::packet_route_metadata;
 use crate::interface::InterfaceControlHandle;
 
 const DEFAULT_TUN_RECV_BATCH: usize = 256;
+const ETHERNET_HEADER_LEN: usize = 14;
+const ETHERTYPE_IP4: u16 = 0x0800;
+const ETHERTYPE_IP6: u16 = 0x86dd;
 
 pub trait TunPacketSource {
     fn recv_frame<G>(
@@ -20,6 +24,7 @@ pub trait TunPacketSource {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
         interface_id: &str,
+        mode: TunDriverMode,
         max: usize,
     ) -> CoreResult<usize>;
 }
@@ -29,7 +34,26 @@ pub trait TunPacketSink {
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
+        mode: TunDriverMode,
     ) -> CoreResult<usize>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunDriverMode {
+    Tun,
+    Tap,
+}
+
+impl TunDriverMode {
+    #[inline(always)]
+    pub const fn from_tap(tap: bool) -> Self {
+        if tap { Self::Tap } else { Self::Tun }
+    }
+
+    #[inline(always)]
+    pub const fn is_tap(self) -> bool {
+        matches!(self, Self::Tap)
+    }
 }
 
 pub struct TunInputDriverNode<I> {
@@ -39,6 +63,7 @@ pub struct TunInputDriverNode<I> {
     interface_control: Option<InterfaceControlHandle>,
     next: NodeId,
     max_batch: usize,
+    mode: TunDriverMode,
 }
 
 impl<I> TunInputDriverNode<I> {
@@ -51,6 +76,7 @@ impl<I> TunInputDriverNode<I> {
             interface_control: None,
             next,
             max_batch: DEFAULT_TUN_RECV_BATCH,
+            mode: TunDriverMode::Tun,
         }
     }
 
@@ -69,6 +95,18 @@ impl<I> TunInputDriverNode<I> {
     #[inline]
     pub fn with_max_batch(mut self, max_batch: usize) -> Self {
         self.max_batch = max_batch;
+        self
+    }
+
+    #[inline]
+    pub fn with_tap(mut self, tap: bool) -> Self {
+        self.mode = TunDriverMode::from_tap(tap);
+        self
+    }
+
+    #[inline]
+    pub fn with_mode(mut self, mode: TunDriverMode) -> Self {
+        self.mode = mode;
         self
     }
 
@@ -102,7 +140,7 @@ where
         let max_batch = self.max_batch.min(frame.remaining_capacity());
         let first_new = frame.pending_len();
         self.input
-            .recv_frame(runtime, frame, &self.interface_id, max_batch)?;
+            .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)?;
         if let Some(interface_index) = self.ingress_interface_index()? {
             for index in frame.pending_indices()[first_new..].iter().copied() {
                 runtime
@@ -123,12 +161,28 @@ impl<I, G> DriverNode<G> for TunInputDriverNode<I> where I: TunPacketSource {}
 
 pub struct TunOutputDriverNode<O> {
     output: O,
+    mode: TunDriverMode,
 }
 
 impl<O> TunOutputDriverNode<O> {
     #[inline]
     pub fn new(output: O) -> Self {
-        Self { output }
+        Self {
+            output,
+            mode: TunDriverMode::Tun,
+        }
+    }
+
+    #[inline]
+    pub fn with_tap(mut self, tap: bool) -> Self {
+        self.mode = TunDriverMode::from_tap(tap);
+        self
+    }
+
+    #[inline]
+    pub fn with_mode(mut self, mode: TunDriverMode) -> Self {
+        self.mode = mode;
+        self
     }
 }
 
@@ -142,7 +196,7 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        self.output.send_frame(runtime, frame)?;
+        self.output.send_frame(runtime, frame, self.mode)?;
         Ok(NodeResult::drop())
     }
 }
@@ -229,21 +283,25 @@ impl TunPacketSource for MemoryTunInput {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
         interface_id: &str,
+        mode: TunDriverMode,
         max: usize,
     ) -> CoreResult<usize> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
             return Err(CoreError::internal("memory TUN is closed"));
         }
-        let mut received = 0usize;
-        while received < max {
+        let mut attempts = 0usize;
+        let mut accepted = 0usize;
+        while attempts < max {
             let Some(packet) = inner.input.pop_front() else {
                 break;
             };
-            push_packet_to_frame(runtime, frame, interface_id, &packet)?;
-            received += 1;
+            attempts += 1;
+            if push_packet_to_frame(runtime, frame, interface_id, mode, &packet)? {
+                accepted += 1;
+            }
         }
-        Ok(received)
+        Ok(accepted)
     }
 }
 
@@ -253,6 +311,7 @@ impl TunPacketSink for MemoryTunOutput {
         &mut self,
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
+        mode: TunDriverMode,
     ) -> CoreResult<usize> {
         let mut inner = self.inner.borrow_mut();
         if inner.closed {
@@ -270,7 +329,7 @@ impl TunPacketSink for MemoryTunOutput {
             'send: while let Some(batch) = cursor.next() {
                 cursor.prefetch_next(runtime);
                 for index in batch.indices() {
-                    let packet = runtime.copy_current_chain(index);
+                    let packet = tun_output_packet(runtime, index, mode);
                     runtime.free_index(index);
                     processed += 1;
                     match packet {
@@ -300,16 +359,70 @@ fn push_packet_to_frame<G>(
     runtime: &DataPlaneRuntime<G>,
     frame: &mut BufferFrame,
     interface_id: &str,
+    mode: TunDriverMode,
     packet: &[u8],
-) -> CoreResult<()> {
-    let metadata = packet_route_metadata(interface_id, packet).unwrap_or_else(|_| RouteMetadata {
-        inbound: interface_id.to_owned(),
-        ..Default::default()
-    });
+) -> CoreResult<bool> {
+    let Some((packet, tap_ethernet)) = packet_for_mode(mode, packet) else {
+        return Ok(false);
+    };
+    let mut metadata =
+        packet_route_metadata(interface_id, packet).unwrap_or_else(|_| RouteMetadata {
+            inbound: interface_id.to_owned(),
+            ..Default::default()
+        });
+    metadata.tap_ethernet = tap_ethernet;
     let index = runtime.alloc_index_with_bytes(metadata, packet)?;
     if let Err(err) = frame.push_index(index) {
         runtime.free_index(index);
         return Err(err);
     }
-    Ok(())
+    Ok(true)
+}
+
+#[inline]
+fn packet_for_mode(
+    mode: TunDriverMode,
+    packet: &[u8],
+) -> Option<(&[u8], Option<TapEthernetMetadata>)> {
+    if !mode.is_tap() {
+        return Some((packet, None));
+    }
+    if packet.len() < ETHERNET_HEADER_LEN {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([packet[12], packet[13]]);
+    if ethertype != ETHERTYPE_IP4 && ethertype != ETHERTYPE_IP6 {
+        return None;
+    }
+    let mut destination = [0u8; 6];
+    destination.copy_from_slice(&packet[..6]);
+    let mut source = [0u8; 6];
+    source.copy_from_slice(&packet[6..12]);
+    Some((
+        &packet[ETHERNET_HEADER_LEN..],
+        Some(TapEthernetMetadata::new(destination, source, ethertype)),
+    ))
+}
+
+#[inline]
+fn tun_output_packet<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: hammer_adapter::BufferIndex,
+    mode: TunDriverMode,
+) -> CoreResult<Vec<u8>> {
+    let packet = runtime.copy_current_chain(index)?;
+    if !mode.is_tap() {
+        return Ok(packet);
+    }
+    let metadata = runtime.metadata(index)?;
+    let Some(tap) = metadata.tap_ethernet else {
+        return Ok(packet);
+    };
+    if tap.header_present {
+        return Ok(packet);
+    }
+    let mut frame = Vec::with_capacity(ETHERNET_HEADER_LEN + packet.len());
+    frame.extend_from_slice(&tap.header());
+    frame.extend_from_slice(&packet);
+    Ok(frame)
 }

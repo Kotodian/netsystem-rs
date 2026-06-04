@@ -306,6 +306,7 @@ where
                 .collect(),
             auto_route: self.options.auto_route,
             strict_route: self.options.strict_route,
+            tap: self.options.tap,
         })
     }
 }

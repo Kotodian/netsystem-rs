@@ -1,9 +1,10 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_core::forwarding::{
-    AdjacencyIndex, Dpo, DpoId, DpoKind, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
-    FibEntry, FibRouteDpoError, FibTableBuilder, Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue,
-    Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError, LoadBalanceIndex,
+    AdjacencyIndex, AdjacencyRewrite, AdjacencyRewriteError, Dpo, DpoId, DpoKind, DpoProto,
+    DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry, FibRouteDpoError, FibTableBuilder,
+    Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue, Ip6PrefixHashTable, Ip6PrefixKey, LoadBalanceError,
+    LoadBalanceIndex,
 };
 use hammer_core::protocol::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket,
@@ -14,6 +15,7 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 enum NextHop {
     Drop,
     Direct,
+    Rewrite,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +46,7 @@ impl Ip4MtrieValue for NextHop {
         match self {
             Self::Drop => 0,
             Self::Direct => 1,
+            Self::Rewrite => 2,
         }
     }
 
@@ -52,6 +55,7 @@ impl Ip4MtrieValue for NextHop {
         match value {
             0 => Self::Drop,
             1 => Self::Direct,
+            2 => Self::Rewrite,
             other => panic!("unexpected next hop value: {other}"),
         }
     }
@@ -155,6 +159,104 @@ fn fib_table_builder_adds_adjacency_dpo() {
     let adjacency_entry = table.adjacency(adjacency).expect("adjacency entry");
     assert_eq!(adjacency_entry.proto, DpoProto::IP4);
     assert_eq!(adjacency_entry.next, NextHop::Direct);
+    assert_eq!(adjacency_entry.egress_interface, None);
+    assert!(adjacency_entry.rewrite.as_slice().is_empty());
+}
+
+#[test]
+fn fib_table_builder_adds_interface_adjacency_with_rewrite() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
+    let rewrite =
+        AdjacencyRewrite::try_new(&[0xaa, 0xbb, 0x08, 0x00]).expect("rewrite fits inline storage");
+
+    let adjacency = builder.add_interface_adjacency(DpoProto::IP4, 7, rewrite, NextHop::Direct);
+    let table = builder.build();
+
+    let adjacency_entry = table.adjacency(adjacency).expect("adjacency entry");
+    assert_eq!(adjacency_entry.proto, DpoProto::IP4);
+    assert_eq!(adjacency_entry.egress_interface, Some(7));
+    assert_eq!(
+        adjacency_entry.rewrite.as_slice(),
+        &[0xaa, 0xbb, 0x08, 0x00]
+    );
+    assert_eq!(adjacency_entry.next, NextHop::Direct);
+}
+
+#[test]
+fn fib_table_builder_interface_adjacency_dpo_keeps_rewrite_next_separate() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
+    let rewrite =
+        AdjacencyRewrite::try_new(&[0xaa, 0xbb, 0x08, 0x00]).expect("rewrite fits inline storage");
+
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        9,
+        rewrite,
+        NextHop::Rewrite,
+        NextHop::Direct,
+    );
+    let adjacency = dpo.adjacency_index().expect("adjacency DPO index");
+
+    assert_eq!(dpo.kind(), DpoType::ADJACENCY);
+    assert_eq!(dpo.next(), NextHop::Rewrite);
+
+    let table = builder.build();
+    let adjacency_entry = table.adjacency(adjacency).expect("adjacency entry");
+    assert_eq!(adjacency_entry.next, NextHop::Direct);
+    assert_eq!(adjacency_entry.egress_interface, Some(9));
+    assert_eq!(
+        adjacency_entry.rewrite.as_slice(),
+        &[0xaa, 0xbb, 0x08, 0x00]
+    );
+}
+
+#[test]
+fn adjacency_rewrite_rejects_oversized_bytes() {
+    let bytes = [0u8; 65];
+    let err = AdjacencyRewrite::try_new(&bytes).expect_err("rewrite must fit inline storage");
+
+    assert_eq!(
+        err,
+        AdjacencyRewriteError::TooLarge {
+            len: 65,
+            max: AdjacencyRewrite::MAX_LEN,
+        }
+    );
+}
+
+#[test]
+fn fib_table_selects_interface_adjacency_from_load_balance() {
+    let mut builder = FibTableBuilder::new(NextHop::Drop);
+    let rewrite =
+        AdjacencyRewrite::try_new(&[0xde, 0xad, 0xbe, 0xef]).expect("rewrite fits inline storage");
+    let adjacency = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        11,
+        rewrite,
+        NextHop::Rewrite,
+        NextHop::Direct,
+    );
+    let load_balance = builder.add_load_balance(DpoProto::IP4, [adjacency]);
+    builder.add_ip4_route(
+        Ipv4Net::new(Ipv4Addr::new(203, 0, 113, 0), 24).expect("route"),
+        load_balance,
+    );
+    let table = builder.build();
+
+    let result = table
+        .lookup_ip4(Ipv4Addr::new(203, 0, 113, 7), 0)
+        .expect("lookup result");
+    let adjacency = result.dpo.adjacency_index().expect("adjacency index");
+    let adjacency_entry = table.adjacency(adjacency).expect("adjacency entry");
+
+    assert_eq!(result.dpo.kind(), DpoType::ADJACENCY);
+    assert_eq!(result.dpo.next(), NextHop::Rewrite);
+    assert_eq!(adjacency_entry.egress_interface, Some(11));
+    assert_eq!(adjacency_entry.next, NextHop::Direct);
+    assert_eq!(
+        adjacency_entry.rewrite.as_slice(),
+        &[0xde, 0xad, 0xbe, 0xef]
+    );
 }
 
 #[test]

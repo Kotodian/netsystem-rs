@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextVectorEnqueue, NodeResult,
-    RouteMetadata,
+    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextFrames, NodeNextVectorEnqueue,
+    NodeResult, RouteMetadata,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -22,6 +22,8 @@ use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
 };
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
+
+use crate::data_plane::set_index_node_error_code;
 
 pub type Adjacency = CoreAdjacency<NodeId>;
 pub type DpoId = CoreDpoId<NodeId>;
@@ -324,6 +326,169 @@ impl<G> Node<G> for IpLookupNode {
 }
 
 impl<G> InternalNode<G> for IpLookupNode {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjacencyRewriteNodeError {
+    MissingForwarding,
+    WrongDpo,
+    MissingAdjacency,
+}
+
+impl AdjacencyRewriteNodeError {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        match self {
+            Self::MissingForwarding => 1,
+            Self::WrongDpo => 2,
+            Self::MissingAdjacency => 3,
+        }
+    }
+}
+
+#[hammer_component_macros::node]
+pub struct AdjacencyRewriteNode {
+    table: FibTableHandle,
+    #[node(default)]
+    cached_next: Option<NodeId>,
+}
+
+impl AdjacencyRewriteNode {
+    #[inline(always)]
+    fn next_for_index<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: BufferIndex,
+    ) -> CoreResult<Option<NodeId>> {
+        let metadata = runtime.metadata(index)?;
+        let Some(forwarding) = metadata.forwarding else {
+            set_index_node_error_code(
+                runtime,
+                index,
+                AdjacencyRewriteNodeError::MissingForwarding.code(),
+            )?;
+            runtime.free_index(index);
+            return Ok(None);
+        };
+        if forwarding.dpo_type != DpoType::ADJACENCY {
+            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
+            runtime.free_index(index);
+            return Ok(None);
+        }
+        let Some(adjacency) = self
+            .table
+            .table()
+            .adjacency(AdjacencyIndex::new(forwarding.dpo_index))
+        else {
+            set_index_node_error_code(
+                runtime,
+                index,
+                AdjacencyRewriteNodeError::MissingAdjacency.code(),
+            )?;
+            runtime.free_index(index);
+            return Ok(None);
+        };
+        apply_adjacency_rewrite(runtime, index, adjacency)?;
+        Ok(Some(adjacency.next))
+    }
+}
+
+impl<G> Node<G> for AdjacencyRewriteNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let mut next_frames = NodeNextFrames::default();
+        let mut current_next = self.cached_next;
+        let mut last_next = None;
+        let result =
+            frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+                let Some(node) = self.next_for_index(runtime, index)? else {
+                    return Ok(None);
+                };
+                last_next = Some(node);
+                match current_next {
+                    Some(current) if current == node => Ok(Some(index)),
+                    Some(_) => {
+                        next_frames.enqueue(runtime, node, index)?;
+                        Ok(None)
+                    }
+                    None => {
+                        current_next = Some(node);
+                        Ok(Some(index))
+                    }
+                }
+            });
+        if let Err(err) = result {
+            next_frames.free(runtime);
+            return Err(err);
+        }
+
+        next_frames.schedule(runtime)?;
+        if let Some(node) = last_next {
+            self.cached_next = Some(node);
+        }
+        if frame.has_pending()
+            && let Some(node) = current_next
+        {
+            Ok(NodeResult::next_current(node))
+        } else {
+            Ok(NodeResult::drop())
+        }
+    }
+}
+
+impl<G> InternalNode<G> for AdjacencyRewriteNode {}
+
+#[inline(always)]
+fn apply_adjacency_rewrite<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: BufferIndex,
+    adjacency: Adjacency,
+) -> CoreResult<()> {
+    let rewrite = adjacency.rewrite.as_slice();
+    if !rewrite.is_empty() {
+        if runtime.current_data(index)? >= rewrite.len() {
+            runtime.prepend(index, rewrite)?;
+        } else {
+            let packet = runtime.copy_current_chain(index)?;
+            runtime.truncate_chain(index, 0)?;
+            runtime.append(index, rewrite)?;
+            runtime.append(index, &packet)?;
+        }
+    }
+
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    if !rewrite.is_empty() {
+        let cursor = buffer.packet_cursor();
+        buffer.set_packet_cursor(shift_packet_cursor(cursor, rewrite.len()));
+    }
+    let metadata = buffer.metadata_mut();
+    metadata.egress_interface = adjacency.egress_interface;
+    if !rewrite.is_empty() {
+        metadata.tap_ethernet = None;
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn shift_packet_cursor(cursor: BufferPacketCursor, delta: usize) -> BufferPacketCursor {
+    if cursor.packet_len() == 0 {
+        return cursor;
+    }
+    BufferPacketCursor::new()
+        .with_packet_len(cursor.packet_len() + delta)
+        .with_network_header(
+            cursor.network_header_offset() + delta,
+            cursor.network_header_len(),
+        )
+        .with_transport_header(
+            cursor.transport_header_offset() + delta,
+            cursor.transport_header_len(),
+        )
+        .with_transport_payload_offset(cursor.transport_payload_offset() + delta)
+}
 
 #[inline(always)]
 fn frame_batch_width<G>(runtime: &DataPlaneRuntime<G>) -> usize {

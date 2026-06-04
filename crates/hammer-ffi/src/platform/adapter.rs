@@ -116,6 +116,7 @@ impl From<AdapterTunOptions> for HammerTunOptions {
             route_exclude: value.route_exclude,
             auto_route: value.auto_route,
             strict_route: value.strict_route,
+            tap: value.tap,
         }
     }
 }
