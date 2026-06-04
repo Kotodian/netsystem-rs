@@ -12,6 +12,7 @@ pub mod instruction_set;
 pub mod network;
 pub mod node;
 pub mod outbound;
+pub mod packet_buffer;
 pub mod platform;
 pub mod probe;
 pub mod router;
@@ -57,6 +58,12 @@ pub use node::{
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,
     ProxyStream,
+};
+pub use packet_buffer::{
+    NetworkOpaque, NetworkOpaquePayload, NetworkPayloadOpaque, PACKET_BUFFER_INVALID_INDEX,
+    PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PacketBufferFlags, PacketBufferHeader,
+    PacketBufferHeaderExt, PrimaryOpaque, PrimaryOpaquePayload, SecondaryOpaque,
+    SecondaryOpaquePayload,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
