@@ -774,8 +774,10 @@ fn reassembly_expire_frees_incomplete_fragments() {
         buffer_indices: Rc::new(RefCell::new(Vec::new())),
         chained: Rc::new(RefCell::new(Vec::new())),
     }));
-    let mut reassembly = IpReassemblyNode::new(ip_reassembly_nexts(sink, sink))
-        .with_timeout(Duration::from_millis(100));
+    let reassembly = runtime.nodes().register_internal(
+        IpReassemblyNode::new(ip_reassembly_nexts(sink, sink))
+            .with_timeout(Duration::from_millis(100)),
+    );
     let packet = ipv4_udp_packet(
         [10, 0, 0, 5],
         12_348,
@@ -784,23 +786,35 @@ fn reassembly_expire_frees_incomplete_fragments() {
         b"abcdefghijklmnopqrstuvwx",
     );
     let fragments = ipv4_fragments(&packet, 103, 16);
-    let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), &fragments[0])
         .expect("alloc packet");
-    frame.push_index(index).expect("push packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
 
     let started = Instant::now();
-    reassembly
-        .process(&runtime, &mut frame)
-        .expect("process fragment");
-    runtime.release_pooled_frame(frame).expect("release frame");
+    assert!(
+        runtime
+            .schedule_frame(reassembly, frame)
+            .expect("schedule fragment")
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("process fragment"), 1);
 
     assert_eq!(runtime.in_use_buffers(), 1);
-    assert_eq!(
-        reassembly.expire(&runtime, started + Duration::from_secs(1)),
-        1
-    );
+    let expired = runtime
+        .nodes()
+        .with_node_mut(reassembly, |node| match node {
+            TestNode::Reassembly(reassembly) => {
+                Ok(reassembly.expire(&runtime, started + Duration::from_secs(1)))
+            }
+            _ => unreachable!("registered node is reassembly"),
+        })
+        .expect("expire");
+    assert_eq!(expired, 1);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 

@@ -5,12 +5,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeResult, RouteDecision,
+    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteDecision,
     RouteMetadata, RouteTarget, Router,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
-use hammer_service::data_plane::{DropNode, RouteMatchNext, RouteMatchNode};
+use hammer_runtime::spawn::DataRuntime;
+use hammer_service::data_plane::{
+    DropNode, Feature, FeatureArcControl, FeatureArcSpec, RouteMatchNext, RouteMatchNode,
+};
 
 struct StaticRouter {
     decision: RouteDecision,
@@ -69,6 +72,35 @@ struct DecisionSinkNode {
     decisions: Rc<RefCell<Vec<RouteDecision>>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TestFeatureArc {
+    Probe,
+}
+
+impl FeatureArcSpec for TestFeatureArc {}
+
+struct ProbeFeatureNode;
+
+impl Feature<TestFeatureArc> for ProbeFeatureNode {
+    #[inline]
+    fn id() -> TestFeatureArc {
+        TestFeatureArc::Probe
+    }
+}
+
+impl Node<TestNode> for ProbeFeatureNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for ProbeFeatureNode {}
+
 impl Node<TestNode> for DecisionSinkNode {
     #[inline(always)]
     fn process(
@@ -91,6 +123,7 @@ impl Node<TestNode> for DecisionSinkNode {
 enum TestNode {
     DecisionSink(DecisionSinkNode),
     Drop(DropNode),
+    ProbeFeature(ProbeFeatureNode),
     RouteMatch(RouteMatchNode<Arc<StaticRouter>>),
 }
 
@@ -106,6 +139,12 @@ impl From<RouteMatchNode<Arc<StaticRouter>>> for TestNode {
     }
 }
 
+impl From<ProbeFeatureNode> for TestNode {
+    fn from(node: ProbeFeatureNode) -> Self {
+        Self::ProbeFeature(node)
+    }
+}
+
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -116,6 +155,7 @@ impl Node<TestNode> for TestNode {
         match self {
             Self::DecisionSink(node) => node.process(runtime, frame),
             Self::Drop(node) => node.process(runtime, frame),
+            Self::ProbeFeature(node) => node.process(runtime, frame),
             Self::RouteMatch(node) => node.process(runtime, frame),
         }
     }
@@ -207,4 +247,44 @@ fn drop_node_frees_frame_buffers() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn feature_arc_updates_run_through_configured_runtime_data_plane_barrier() {
+    let data_runtime =
+        DataRuntime::new(1, "feature-arc-barrier-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 1, 2);
+    let feature: NodeId = runtime.nodes().register_internal(ProbeFeatureNode);
+    let mut control =
+        FeatureArcControl::<TestFeatureArc>::new().with_data_plane_barrier(barrier.clone());
+
+    control
+        .register_feature::<ProbeFeatureNode>(feature)
+        .expect("register feature");
+    control
+        .enable_feature::<ProbeFeatureNode>(7)
+        .expect("enable feature");
+    control
+        .disable_feature::<ProbeFeatureNode>(7)
+        .expect("disable feature");
+
+    assert_eq!(barrier.sync_count(), 3);
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn feature_arc_publish_requires_configured_runtime_data_plane_barrier() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 1, 2);
+    let feature: NodeId = runtime.nodes().register_internal(ProbeFeatureNode);
+    let mut control = FeatureArcControl::<TestFeatureArc>::new();
+
+    let err = control
+        .register_feature::<ProbeFeatureNode>(feature)
+        .expect_err("feature arc publish should require barrier");
+
+    assert!(
+        err.to_string()
+            .contains("feature arc publish requires data-plane barrier")
+    );
 }

@@ -51,14 +51,73 @@ pub trait Node<G = Self> {
 /// Driver nodes are responsible for bringing packets into the data plane from
 /// the operating system or protocol I/O. They are runtime roles, not business
 /// protocol roles.
-pub trait DriverNode<G = Self>: Node<G> {}
+pub trait DriverNode<G = Self>: Node<G> {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::Plain
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &[]
+    }
+}
 
 /// Packet graph node that performs dataplane-internal work.
 ///
 /// Internal nodes are not external I/O drivers. They transform frame metadata,
 /// split frames, or select the next graph edge while keeping packet ownership on
 /// the current data worker.
-pub trait InternalNode<G = Self>: Node<G> {}
+pub trait InternalNode<G = Self>: Node<G> {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::Plain
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &[]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRegistration {
+    Plain,
+    Next {
+        name: &'static str,
+        next_count: usize,
+    },
+    Sibling {
+        name: &'static str,
+        sibling_of: &'static str,
+    },
+}
+
+impl NodeRegistration {
+    #[inline]
+    pub fn next(name: &'static str, next_count: usize) -> Self {
+        Self::Next { name, next_count }
+    }
+
+    #[inline]
+    pub fn sibling_of(name: &'static str, sibling_of: &'static str) -> Self {
+        Self::Sibling { name, sibling_of }
+    }
+
+    #[inline]
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Next { name, .. } | Self::Sibling { name, .. } => Some(name),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
@@ -218,6 +277,9 @@ struct NodeRuntimeInner<N> {
     error_counters: Vec<NodeErrorCounters>,
     queue: VecDeque<ScheduledFrame>,
     handles: HashMap<NodeHandle, NodeId>,
+    declared_nodes: HashMap<&'static str, NodeId>,
+    next_nodes: Vec<Vec<Option<NodeId>>>,
+    siblings: Vec<Vec<NodeId>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -248,6 +310,123 @@ struct ScheduledFrame {
     allow_empty: bool,
 }
 
+impl<N> NodeRuntimeInner<N> {
+    fn push_node(&mut self, node: N) -> NodeId {
+        let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
+        self.nodes.push(Some(node));
+        self.error_counters.push(NodeErrorCounters::default());
+        self.next_nodes.push(Vec::new());
+        self.siblings.push(Vec::new());
+        id
+    }
+
+    fn register_declared(
+        &mut self,
+        node: N,
+        registration: NodeRegistration,
+        initial_nexts: &[NodeId],
+        _handle: Option<NodeHandle>,
+    ) -> CoreResult<NodeId> {
+        if initial_nexts.len() > MAX_NODE_NEXT_FRAMES {
+            return Err(CoreError::internal("node next frame capacity exceeded"));
+        }
+        for next in initial_nexts.iter().copied() {
+            self.validate_node(next)?;
+        }
+        if matches!(registration, NodeRegistration::Plain) && !initial_nexts.is_empty() {
+            return Err(CoreError::internal(
+                "plain node cannot declare initial next nodes",
+            ));
+        }
+        if matches!(registration, NodeRegistration::Sibling { .. }) && !initial_nexts.is_empty() {
+            return Err(CoreError::internal(
+                "node sibling cannot declare initial next nodes",
+            ));
+        }
+        if let NodeRegistration::Next { next_count, .. } = registration
+            && next_count != initial_nexts.len()
+        {
+            return Err(CoreError::internal("node initial next count mismatch"));
+        }
+        if let Some(name) = registration.name()
+            && self.declared_nodes.contains_key(name)
+        {
+            return Err(CoreError::internal("node name is already registered"));
+        }
+
+        match registration {
+            NodeRegistration::Plain => Ok(self.push_node(node)),
+            NodeRegistration::Next { name, next_count } => {
+                let id = self.push_node(node);
+                self.next_nodes[id.0 as usize] = initial_nexts
+                    .iter()
+                    .copied()
+                    .map(Some)
+                    .take(next_count)
+                    .collect();
+                self.declared_nodes.insert(name, id);
+                Ok(id)
+            }
+            NodeRegistration::Sibling { name, sibling_of } => {
+                let owner = self
+                    .declared_nodes
+                    .get(sibling_of)
+                    .copied()
+                    .ok_or_else(|| CoreError::internal("node sibling owner is not registered"))?;
+                let owner_nexts = self
+                    .next_nodes
+                    .get(owner.0 as usize)
+                    .cloned()
+                    .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+                let id = self.push_node(node);
+                self.next_nodes[id.0 as usize] = owner_nexts;
+                let mut group = self.siblings[owner.0 as usize].clone();
+                group.push(owner);
+                for sibling in group.iter().copied() {
+                    self.siblings[sibling.0 as usize].push(id);
+                    self.siblings[id.0 as usize].push(sibling);
+                }
+                self.declared_nodes.insert(name, id);
+                Ok(id)
+            }
+        }
+    }
+
+    fn validate_node(&self, node: NodeId) -> CoreResult<()> {
+        if self.nodes.get(node.0 as usize).is_none() {
+            return Err(CoreError::internal("node id out of bounds"));
+        }
+        Ok(())
+    }
+
+    fn node_next_slot(&self, node: NodeId, slot: usize) -> CoreResult<NodeId> {
+        self.validate_node(node)?;
+        self.next_nodes
+            .get(node.0 as usize)
+            .and_then(|nexts| nexts.get(slot))
+            .copied()
+            .flatten()
+            .ok_or_else(|| CoreError::internal("node next slot is not registered"))
+    }
+
+    fn set_node_next_slot(&mut self, node: NodeId, slot: usize, next: NodeId) -> CoreResult<()> {
+        let next_count = self
+            .next_nodes
+            .get(node.0 as usize)
+            .map(Vec::len)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+        if slot >= next_count {
+            return Err(CoreError::internal("node next slot out of range"));
+        }
+        let mut group = self.siblings[node.0 as usize].clone();
+        group.push(node);
+        for sibling in group {
+            self.next_nodes[sibling.0 as usize][slot] = Some(next);
+        }
+        Ok(())
+    }
+}
+
 impl<N> Default for NodeRuntime<N> {
     fn default() -> Self {
         Self {
@@ -256,6 +435,9 @@ impl<N> Default for NodeRuntime<N> {
                 error_counters: Vec::new(),
                 queue: VecDeque::new(),
                 handles: HashMap::new(),
+                declared_nodes: HashMap::new(),
+                next_nodes: Vec::new(),
+                siblings: Vec::new(),
             })),
             readiness: Rc::new(NodeReadiness::default()),
         }
@@ -265,24 +447,41 @@ impl<N> Default for NodeRuntime<N> {
 impl<N> NodeRuntime<N> {
     pub fn register(&self, node: N) -> NodeId {
         let mut inner = self.inner.borrow_mut();
-        let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
-        inner.nodes.push(Some(node));
-        inner.error_counters.push(NodeErrorCounters::default());
-        id
+        inner.push_node(node)
     }
 
     pub fn register_driver<I>(&self, node: I) -> NodeId
     where
-        I: DriverNode<N> + Into<N>,
+        I: DriverNode<N> + Into<N> + 'static,
     {
-        self.register(node.into())
+        self.try_register_driver(node)
+            .expect("driver node registration")
+    }
+
+    pub fn try_register_driver<I>(&self, node: I) -> CoreResult<NodeId>
+    where
+        I: DriverNode<N> + Into<N> + 'static,
+    {
+        let registration = DriverNode::<N>::node_registration(&node);
+        let initial_nexts = DriverNode::<N>::node_initial_nexts(&node).to_vec();
+        self.register_declared(node.into(), registration, &initial_nexts)
     }
 
     pub fn register_internal<I>(&self, node: I) -> NodeId
     where
-        I: InternalNode<N> + Into<N>,
+        I: InternalNode<N> + Into<N> + 'static,
     {
-        self.register(node.into())
+        self.try_register_internal(node)
+            .expect("internal node registration")
+    }
+
+    pub fn try_register_internal<I>(&self, node: I) -> CoreResult<NodeId>
+    where
+        I: InternalNode<N> + Into<N> + 'static,
+    {
+        let registration = InternalNode::<N>::node_registration(&node);
+        let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
+        self.register_declared(node.into(), registration, &initial_nexts)
     }
 
     pub fn register_internal_with_handle<I>(
@@ -291,19 +490,39 @@ impl<N> NodeRuntime<N> {
         node: I,
     ) -> CoreResult<NodeId>
     where
-        I: InternalNode<N> + Into<N>,
+        I: InternalNode<N> + Into<N> + 'static,
     {
-        self.register_with_handle(handle, node.into())
+        let registration = InternalNode::<N>::node_registration(&node);
+        let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
+        self.register_declared_with_handle(handle, node.into(), registration, &initial_nexts)
     }
 
     pub fn register_with_handle(&self, handle: NodeHandle, node: N) -> CoreResult<NodeId> {
+        self.register_declared_with_handle(handle, node, NodeRegistration::Plain, &[])
+    }
+
+    fn register_declared(
+        &self,
+        node: N,
+        registration: NodeRegistration,
+        initial_nexts: &[NodeId],
+    ) -> CoreResult<NodeId> {
+        let mut inner = self.inner.borrow_mut();
+        inner.register_declared(node, registration, initial_nexts, None)
+    }
+
+    fn register_declared_with_handle(
+        &self,
+        handle: NodeHandle,
+        node: N,
+        registration: NodeRegistration,
+        initial_nexts: &[NodeId],
+    ) -> CoreResult<NodeId> {
         let mut inner = self.inner.borrow_mut();
         if inner.handles.contains_key(&handle) {
             return Err(CoreError::internal("node handle already registered"));
         }
-        let id = NodeId(u32::try_from(inner.nodes.len()).expect("node index fits u32"));
-        inner.nodes.push(Some(node));
-        inner.error_counters.push(NodeErrorCounters::default());
+        let id = inner.register_declared(node, registration, initial_nexts, Some(handle))?;
         inner.handles.insert(handle, id);
         Ok(id)
     }
@@ -352,6 +571,55 @@ impl<N> NodeRuntime<N> {
             .get(node.0 as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?
             .get(code))
+    }
+
+    #[inline]
+    pub fn node_next<K: NodeNext>(&self, node: NodeId, key: K) -> CoreResult<NodeId> {
+        self.node_next_slot(node, key.slot())
+    }
+
+    pub fn node_nexts<const COUNT: usize>(&self, node: NodeId) -> CoreResult<[NodeId; COUNT]> {
+        let mut nexts = [NodeId(0); COUNT];
+        let inner = self.inner.borrow();
+        let node_nexts = inner
+            .next_nodes
+            .get(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+        if node_nexts.len() != COUNT {
+            return Err(CoreError::internal("node next count mismatch"));
+        }
+        for (slot, next) in node_nexts.iter().enumerate() {
+            nexts[slot] =
+                next.ok_or_else(|| CoreError::internal("node next slot is not registered"))?;
+        }
+        Ok(nexts)
+    }
+
+    pub fn node_next_slot(&self, node: NodeId, slot: usize) -> CoreResult<NodeId> {
+        let inner = self.inner.borrow();
+        inner.node_next_slot(node, slot)
+    }
+
+    #[inline]
+    pub fn set_node_next<K: NodeNext>(&self, node: NodeId, key: K, next: NodeId) -> CoreResult<()> {
+        self.set_node_next_slot(node, key.slot(), next)
+    }
+
+    pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.validate_node(next)?;
+        inner.set_node_next_slot(node, slot, next)
+    }
+
+    pub fn node_siblings(&self, node: NodeId) -> CoreResult<Vec<NodeId>> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        inner
+            .siblings
+            .get(node.0 as usize)
+            .cloned()
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))
     }
 
     pub(crate) fn schedule_frame(
@@ -404,10 +672,7 @@ impl<N> NodeRuntime<N> {
     }
 
     fn validate_node(&self, node: NodeId) -> CoreResult<()> {
-        if self.inner.borrow().nodes.get(node.0 as usize).is_none() {
-            return Err(CoreError::internal("node id out of bounds"));
-        }
-        Ok(())
+        self.inner.borrow().validate_node(node)
     }
 
     fn take_node(&self, node: NodeId) -> CoreResult<N> {
@@ -431,6 +696,18 @@ impl<N> NodeRuntime<N> {
         }
         *slot = Some(value);
         Ok(())
+    }
+
+    pub fn with_node_mut<R>(
+        &self,
+        node: NodeId,
+        operation: impl FnOnce(&mut N) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        self.validate_node(node)?;
+        let mut node_value = self.take_node(node)?;
+        let result = operation(&mut node_value);
+        self.return_node(node, node_value)?;
+        result
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {

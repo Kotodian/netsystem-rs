@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Node, NodeId,
-    NodeNextStorage, NodeResult, PacketNextResolver, SocksAddr, process_cached_rewrite_next,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
+    NodeResult, PacketNextResolver, SocksAddr, process_cached_rewrite_next,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -68,14 +68,16 @@ impl Default for IpLocalSourceCheck {
 }
 
 pub struct IpLocalControlPlane {
-    inner: Arc<ArcSwap<IpLocalSnapshot>>,
+    inner: Arc<ArcSwap<IpLocalState>>,
+    next: [NodeId; IpLocalNext::COUNT],
 }
 
 impl IpLocalControlPlane {
     #[inline]
     pub fn new(next: [NodeId; IpLocalNext::COUNT]) -> Self {
         Self {
-            inner: Arc::new(ArcSwap::from_pointee(IpLocalSnapshot::new(next))),
+            inner: Arc::new(ArcSwap::from_pointee(IpLocalState::new())),
+            next,
         }
     }
 
@@ -87,19 +89,19 @@ impl IpLocalControlPlane {
 
     #[inline]
     pub fn node(&self) -> IpLocalNode {
-        IpLocalNode::new(IpLocalSnapshotHandle::new(Arc::clone(&self.inner)))
+        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)), self.next)
     }
 
     #[inline]
     pub fn receive_node(&self) -> IpReceiveNode {
-        IpReceiveNode::new(IpLocalSnapshotHandle::new(Arc::clone(&self.inner)))
+        IpReceiveNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
     }
 
     #[inline]
     pub fn register_protocol(&self, protocol: u8, node: NodeId) -> CoreResult<()> {
         self.inner.rcu(|current| {
-            let mut next = IpLocalSnapshot::clone(current);
-            next.protocol_nexts[protocol as usize] = node;
+            let mut next = IpLocalState::clone(current);
+            next.protocol_nexts[protocol as usize] = Some(node);
             next
         });
         Ok(())
@@ -108,8 +110,8 @@ impl IpLocalControlPlane {
     #[inline]
     pub fn unregister_protocol(&self, protocol: u8) -> CoreResult<()> {
         self.inner.rcu(|current| {
-            let mut next = IpLocalSnapshot::clone(current);
-            next.protocol_nexts[protocol as usize] = next.next[IpLocalNext::Punt.slot()];
+            let mut next = IpLocalState::clone(current);
+            next.protocol_nexts[protocol as usize] = None;
             next
         });
         Ok(())
@@ -118,7 +120,7 @@ impl IpLocalControlPlane {
     #[inline]
     pub fn publish_source_check(&self, source_check: IpLocalSourceCheck) {
         self.inner.rcu(|current| {
-            let mut next = IpLocalSnapshot::clone(current);
+            let mut next = IpLocalState::clone(current);
             next.source_check = source_check.clone();
             next
         });
@@ -126,98 +128,93 @@ impl IpLocalControlPlane {
 }
 
 #[derive(Debug, Clone)]
-struct IpLocalSnapshot {
-    next: [NodeId; IpLocalNext::COUNT],
-    protocol_nexts: Box<[NodeId; 256]>,
+struct IpLocalState {
+    protocol_nexts: Box<[Option<NodeId>; 256]>,
     source_check: IpLocalSourceCheck,
 }
 
-impl IpLocalSnapshot {
+impl IpLocalState {
     #[inline]
-    fn new(next: [NodeId; IpLocalNext::COUNT]) -> Self {
-        let punt = next[IpLocalNext::Punt.slot()];
-        let mut protocol_nexts = Box::new([punt; 256]);
-        protocol_nexts[IP_PROTOCOL_TCP as usize] = next[IpLocalNext::Tcp.slot()];
-        protocol_nexts[IP_PROTOCOL_UDP as usize] = next[IpLocalNext::Udp.slot()];
-        protocol_nexts[IP_PROTOCOL_ICMP as usize] = next[IpLocalNext::Icmp.slot()];
-        protocol_nexts[IP_PROTOCOL_ICMP6 as usize] = next[IpLocalNext::Icmp.slot()];
+    fn new() -> Self {
         Self {
-            next,
-            protocol_nexts,
+            protocol_nexts: Box::new([None; 256]),
             source_check: IpLocalSourceCheck::Disabled,
         }
     }
 
     #[inline(always)]
-    fn protocol_next(&self, protocol: IpProtocol) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Protocol(protocol))
+    fn protocol_next(&self, next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtocol) -> NodeId {
+        NodeNextStorage::next(self, IpLocalNextKey::Protocol { next, protocol })
     }
 
     #[inline(always)]
-    fn punt_next(&self) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Punt)
+    fn punt_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
+        NodeNextStorage::next(self, IpLocalNextKey::Punt(next))
     }
 
     #[inline(always)]
-    fn drop_next(&self) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Drop)
+    fn drop_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
+        NodeNextStorage::next(self, IpLocalNextKey::Drop(next))
     }
 
     #[inline(always)]
-    fn reassembly_next(&self) -> NodeId {
-        NodeNextStorage::next(self, IpLocalNextKey::Reassembly)
+    fn reassembly_next(&self, next: &[NodeId; IpLocalNext::COUNT]) -> NodeId {
+        NodeNextStorage::next(self, IpLocalNextKey::Reassembly(next))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-enum IpLocalNextKey {
-    Drop,
-    Punt,
-    Reassembly,
-    Protocol(IpProtocol),
+enum IpLocalNextKey<'a> {
+    Drop(&'a [NodeId; IpLocalNext::COUNT]),
+    Punt(&'a [NodeId; IpLocalNext::COUNT]),
+    Reassembly(&'a [NodeId; IpLocalNext::COUNT]),
+    Protocol {
+        next: &'a [NodeId; IpLocalNext::COUNT],
+        protocol: IpProtocol,
+    },
 }
 
-impl NodeNextStorage<IpLocalNextKey> for IpLocalSnapshot {
+impl NodeNextStorage<IpLocalNextKey<'_>> for IpLocalState {
     #[inline(always)]
-    fn next(&self, key: IpLocalNextKey) -> NodeId {
+    fn next(&self, key: IpLocalNextKey<'_>) -> NodeId {
         match key {
-            IpLocalNextKey::Drop => self.next[IpLocalNext::Drop.slot()],
-            IpLocalNextKey::Punt => self.next[IpLocalNext::Punt.slot()],
-            IpLocalNextKey::Reassembly => self.next[IpLocalNext::Reassembly.slot()],
-            IpLocalNextKey::Protocol(protocol) => {
-                self.protocol_nexts[ip_protocol_number(protocol) as usize]
-            }
+            IpLocalNextKey::Drop(next) => next[IpLocalNext::Drop.slot()],
+            IpLocalNextKey::Punt(next) => next[IpLocalNext::Punt.slot()],
+            IpLocalNextKey::Reassembly(next) => next[IpLocalNext::Reassembly.slot()],
+            IpLocalNextKey::Protocol { next, protocol } => self.protocol_nexts
+                [ip_protocol_number(protocol) as usize]
+                .unwrap_or_else(|| default_protocol_next(next, protocol)),
         }
     }
 }
 
 #[derive(Clone)]
-struct IpLocalSnapshotHandle {
-    inner: Arc<ArcSwap<IpLocalSnapshot>>,
+struct IpLocalStateHandle {
+    inner: Arc<ArcSwap<IpLocalState>>,
 }
 
-impl IpLocalSnapshotHandle {
+impl IpLocalStateHandle {
     #[inline]
-    fn new(inner: Arc<ArcSwap<IpLocalSnapshot>>) -> Self {
+    fn new(inner: Arc<ArcSwap<IpLocalState>>) -> Self {
         Self { inner }
     }
 
     #[inline]
-    fn load(&self) -> arc_swap::Guard<Arc<IpLocalSnapshot>> {
+    fn load(&self) -> arc_swap::Guard<Arc<IpLocalState>> {
         self.inner.load()
     }
 }
 
-#[hammer_component_macros::node(start_arc = IpLocalArc)]
+#[hammer_component_macros::node(role = internal, next = IpLocalNext, start_arc = IpLocalArc)]
 pub struct IpLocalNode {
-    snapshot: IpLocalSnapshotHandle,
+    state: IpLocalStateHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
 
-#[hammer_component_macros::node(start_arc = IpLocalArc)]
+#[hammer_component_macros::node(role = internal, sibling_of = IpLocalNode, start_arc = IpLocalArc)]
 pub struct IpReceiveNode {
-    snapshot: IpLocalSnapshotHandle,
+    state: IpLocalStateHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
@@ -229,19 +226,19 @@ impl<G> Node<G> for IpLocalNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let snapshot = self.snapshot.load();
+        let state = self.state.load();
+        let next = Self::runtime_nexts(runtime)?;
         process_frame(
             runtime,
             frame,
-            &snapshot,
+            &state,
+            next,
             LocalStage::Head,
             self.feature_arc.as_ref(),
             &mut self.cached_next,
         )
     }
 }
-
-impl<G> InternalNode<G> for IpLocalNode {}
 
 impl<G> Node<G> for IpReceiveNode {
     #[inline(always)]
@@ -250,19 +247,19 @@ impl<G> Node<G> for IpReceiveNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let snapshot = self.snapshot.load();
+        let state = self.state.load();
+        let next = Self::runtime_nexts(runtime)?;
         process_frame(
             runtime,
             frame,
-            &snapshot,
+            &state,
+            next,
             LocalStage::Receive,
             self.feature_arc.as_ref(),
             &mut self.cached_next,
         )
     }
 }
-
-impl<G> InternalNode<G> for IpReceiveNode {}
 
 #[derive(Debug, Clone, Copy)]
 enum LocalStage {
@@ -281,13 +278,15 @@ impl LocalStage {
 fn process_frame<G>(
     runtime: &DataPlaneRuntime<G>,
     frame: &mut BufferFrame,
-    snapshot: &IpLocalSnapshot,
+    state: &IpLocalState,
+    next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArc<IpLocalArc>>,
     cached_next: &mut Option<NodeId>,
 ) -> CoreResult<NodeResult> {
     let resolver = IpLocalNextResolver {
-        snapshot,
+        state,
+        next,
         stage,
         feature_arc,
     };
@@ -295,7 +294,8 @@ fn process_frame<G>(
 }
 
 struct IpLocalNextResolver<'a> {
-    snapshot: &'a IpLocalSnapshot,
+    state: &'a IpLocalState,
+    next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&'a FeatureArc<IpLocalArc>>,
 }
@@ -307,7 +307,14 @@ impl<G> PacketNextResolver<G> for IpLocalNextResolver<'_> {
         runtime: &DataPlaneRuntime<G>,
         index: BufferIndex,
     ) -> CoreResult<NodeId> {
-        process_index(runtime, index, self.snapshot, self.stage, self.feature_arc)
+        process_index(
+            runtime,
+            index,
+            self.state,
+            &self.next,
+            self.stage,
+            self.feature_arc,
+        )
     }
 }
 
@@ -315,7 +322,8 @@ impl<G> PacketNextResolver<G> for IpLocalNextResolver<'_> {
 fn process_index<G>(
     runtime: &DataPlaneRuntime<G>,
     index: BufferIndex,
-    snapshot: &IpLocalSnapshot,
+    state: &IpLocalState,
+    next: &[NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
     feature_arc: Option<&FeatureArc<IpLocalArc>>,
 ) -> CoreResult<NodeId> {
@@ -324,17 +332,17 @@ fn process_index<G>(
         Ok(parsed) => parsed,
         Err(_) => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            return Ok(snapshot.drop_next());
+            return Ok(state.drop_next(next));
         }
     };
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
             set_index_node_error_code(runtime, index, error_for_input(parsed.input_error).code())?;
-            return Ok(snapshot.drop_next());
+            return Ok(state.drop_next(next));
         }
         IpInputTarget::Reassembly => {
             refresh_basic_metadata(runtime, index, &parsed, None)?;
-            return Ok(snapshot.reassembly_next());
+            return Ok(state.reassembly_next(next));
         }
         IpInputTarget::Punt | IpInputTarget::Lookup | IpInputTarget::LookupMulticast => {}
     }
@@ -346,7 +354,7 @@ fn process_index<G>(
         Some(transport) => transport,
         None => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            return Ok(snapshot.drop_next());
+            return Ok(state.drop_next(next));
         }
     };
 
@@ -354,28 +362,28 @@ fn process_index<G>(
         Ok(transport_len) => transport_len,
         Err(error) => {
             set_index_node_error_code(runtime, index, error.code())?;
-            return Ok(snapshot.drop_next());
+            return Ok(state.drop_next(next));
         }
     };
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
-        if !source_check_passes(snapshot, &parsed) {
+        if !source_check_passes(state, &parsed) {
             set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
-            return Ok(snapshot.drop_next());
+            return Ok(state.drop_next(next));
         }
         if let Some(feature_arc) = feature_arc {
-            let next = snapshot.protocol_next(parsed.protocol);
+            let next = state.protocol_next(next, parsed.protocol);
             return runtime
                 .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next));
         }
     }
 
-    let next = snapshot.protocol_next(parsed.protocol);
-    if next == snapshot.punt_next() && matches!(parsed.protocol, IpProtocol::Other(_)) {
+    let resolved = state.protocol_next(next, parsed.protocol);
+    if resolved == state.punt_next(next) && matches!(parsed.protocol, IpProtocol::Other(_)) {
         set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
     }
-    Ok(next)
+    Ok(resolved)
 }
 
 #[inline(always)]
@@ -509,8 +517,8 @@ fn refresh_basic_metadata<G>(
 }
 
 #[inline(always)]
-fn source_check_passes(snapshot: &IpLocalSnapshot, parsed: &ParsedIpPacket) -> bool {
-    let IpLocalSourceCheck::ReverseFib(handle) = &snapshot.source_check else {
+fn source_check_passes(state: &IpLocalState, parsed: &ParsedIpPacket) -> bool {
+    let IpLocalSourceCheck::ReverseFib(handle) = &state.source_check else {
         return true;
     };
     let fib = handle.table();
@@ -545,6 +553,16 @@ fn ip_protocol_number(protocol: IpProtocol) -> u8 {
         IpProtocol::Udp => IP_PROTOCOL_UDP,
         IpProtocol::Icmpv6 => IP_PROTOCOL_ICMP6,
         IpProtocol::Other(value) => value,
+    }
+}
+
+#[inline(always)]
+fn default_protocol_next(next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtocol) -> NodeId {
+    match protocol {
+        IpProtocol::Tcp => next[IpLocalNext::Tcp.slot()],
+        IpProtocol::Udp => next[IpLocalNext::Udp.slot()],
+        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => next[IpLocalNext::Icmp.slot()],
+        IpProtocol::Other(_) => next[IpLocalNext::Punt.slot()],
     }
 }
 
@@ -608,7 +626,7 @@ mod tests {
     use crate::data_plane::DropNode;
 
     #[test]
-    fn ip_local_snapshot_storage_returns_protocol_or_control_next() {
+    fn ip_local_state_returns_protocol_or_control_next() {
         let runtime = DataPlaneRuntime::<DropNode>::with_capacities(8, 8, 1, 1);
         let drop = runtime.nodes().register_internal(DropNode::new());
         let punt = runtime.nodes().register_internal(DropNode::new());
@@ -616,20 +634,35 @@ mod tests {
         let udp = runtime.nodes().register_internal(DropNode::new());
         let icmp = runtime.nodes().register_internal(DropNode::new());
         let reassembly = runtime.nodes().register_internal(DropNode::new());
-        let snapshot =
-            IpLocalSnapshot::new(IpLocalNext::nodes(drop, punt, tcp, udp, icmp, reassembly));
+        let next = IpLocalNext::nodes(drop, punt, tcp, udp, icmp, reassembly);
+        let state = IpLocalState::new();
 
         assert_eq!(
-            NodeNextStorage::next(&snapshot, IpLocalNextKey::Protocol(IpProtocol::Tcp)),
+            NodeNextStorage::next(
+                &state,
+                IpLocalNextKey::Protocol {
+                    next: &next,
+                    protocol: IpProtocol::Tcp
+                }
+            ),
             tcp
         );
         assert_eq!(
-            NodeNextStorage::next(&snapshot, IpLocalNextKey::Protocol(IpProtocol::Other(99))),
+            NodeNextStorage::next(
+                &state,
+                IpLocalNextKey::Protocol {
+                    next: &next,
+                    protocol: IpProtocol::Other(99)
+                }
+            ),
             punt
         );
-        assert_eq!(NodeNextStorage::next(&snapshot, IpLocalNextKey::Drop), drop);
         assert_eq!(
-            NodeNextStorage::next(&snapshot, IpLocalNextKey::Reassembly),
+            NodeNextStorage::next(&state, IpLocalNextKey::Drop(&next)),
+            drop
+        );
+        assert_eq!(
+            NodeNextStorage::next(&state, IpLocalNextKey::Reassembly(&next)),
             reassembly
         );
     }

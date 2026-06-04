@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
@@ -6,12 +7,12 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
     NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, RouteMetadata, Router,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_runtime::DataPlaneBarrierHandle;
 
 #[hammer_component_macros::node]
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,7 +45,8 @@ pub struct FeatureArcStartSlot<A: FeatureArcSpec> {
 
 pub struct FeatureArcControl<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
-    state: FeatureArcSnapshot<A>,
+    state: FeatureArcState<A>,
+    barrier: Option<DataPlaneBarrierHandle>,
     _arc: PhantomData<fn() -> A>,
     _control_thread_only: PhantomData<Rc<()>>,
 }
@@ -57,7 +59,7 @@ pub struct FeatureArcStart {
 
 #[derive(Debug)]
 struct FeatureArcInner<A: FeatureArcSpec> {
-    snapshot: ArcSwap<FeatureArcSnapshot<A>>,
+    state: UnsafeCell<FeatureArcState<A>>,
 }
 
 pub trait FeatureArcSpec: Copy + Eq + Hash + fmt::Debug + 'static {}
@@ -136,7 +138,7 @@ struct FeatureArcRegistration<A: FeatureArcSpec> {
 }
 
 #[derive(Debug, Clone)]
-struct FeatureArcSnapshot<A: FeatureArcSpec> {
+struct FeatureArcState<A: FeatureArcSpec> {
     registered: HashMap<A, FeatureArcRegistration<A>>,
     feature_order: Vec<A>,
     enabled: HashMap<u32, Vec<FeatureArcEnabled<A>>>,
@@ -144,7 +146,7 @@ struct FeatureArcSnapshot<A: FeatureArcSpec> {
     chains: HashMap<u32, FeatureArcChain>,
 }
 
-impl<A: FeatureArcSpec> Default for FeatureArcSnapshot<A> {
+impl<A: FeatureArcSpec> Default for FeatureArcState<A> {
     fn default() -> Self {
         Self {
             registered: HashMap::new(),
@@ -231,11 +233,11 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
         default_next: NodeId,
         end_next: NodeId,
     ) -> FeatureArcStart {
-        let snapshot = self.inner.snapshot.load();
-        let override_end = snapshot.end_nodes.get(&interface_index).copied();
+        let state = self.inner.state();
+        let override_end = state.end_nodes.get(&interface_index).copied();
         let default_next = override_end.unwrap_or(default_next);
         let end_next = override_end.unwrap_or(end_next);
-        let Some(chain) = snapshot.chains.get(&interface_index) else {
+        let Some(chain) = state.chains.get(&interface_index) else {
             return FeatureArcStart {
                 node: default_next,
                 started: false,
@@ -326,10 +328,17 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         let inner = Arc::new(FeatureArcInner::new());
         Self {
             inner,
-            state: FeatureArcSnapshot::default(),
+            state: FeatureArcState::default(),
+            barrier: None,
             _arc: PhantomData,
             _control_thread_only: PhantomData,
         }
+    }
+
+    #[inline]
+    pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
+        self.barrier = Some(barrier);
+        self
     }
 
     #[inline]
@@ -451,8 +460,16 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
 
     #[inline]
     fn publish(&mut self) -> CoreResult<()> {
-        self.state.rebuild()?;
-        self.inner.snapshot.store(Arc::new(self.state.clone()));
+        let inner = Arc::clone(&self.inner);
+        let mut state = self.state.clone();
+        let barrier = self.barrier.as_ref().ok_or_else(|| {
+            CoreError::internal("feature arc publish requires data-plane barrier")
+        })?;
+        barrier.synchronize(|| {
+            state.rebuild()?;
+            inner.replace_after_barrier(state);
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -461,12 +478,29 @@ impl<A: FeatureArcSpec> FeatureArcInner<A> {
     #[inline]
     fn new() -> Self {
         Self {
-            snapshot: ArcSwap::from_pointee(FeatureArcSnapshot::<A>::default()),
+            state: UnsafeCell::new(FeatureArcState::<A>::default()),
+        }
+    }
+
+    #[inline]
+    fn state(&self) -> &FeatureArcState<A> {
+        // SAFETY: Feature arc writes are serialized by the runtime data-plane
+        // barrier before publication. Data-plane nodes only read immutable
+        // state while workers are running.
+        unsafe { &*self.state.get() }
+    }
+
+    #[inline]
+    fn replace_after_barrier(&self, state: FeatureArcState<A>) {
+        // SAFETY: callers replace state either while the runtime data-plane
+        // barrier is held, or during single-threaded graph setup in tests.
+        unsafe {
+            *self.state.get() = state;
         }
     }
 }
 
-impl<A: FeatureArcSpec> FeatureArcSnapshot<A> {
+impl<A: FeatureArcSpec> FeatureArcState<A> {
     fn rebuild(&mut self) -> CoreResult<()> {
         self.feature_order = self.sorted_feature_order()?;
         let feature_order = self.feature_order.clone();
@@ -589,7 +623,7 @@ pub enum RouteMatchNext {
     Lookup,
 }
 
-#[hammer_component_macros::node(next = RouteMatchNext)]
+#[hammer_component_macros::node(role = internal, next = RouteMatchNext)]
 pub struct RouteMatchNode<R> {
     router: R,
 }
@@ -617,16 +651,10 @@ where
                 metadata.route_decision = Some(decision);
             }
         }
+        let next = Self::runtime_nexts(runtime)?;
         Ok(NodeResult::next_current(NodeNextStorage::next(
-            &self.next,
+            &next,
             RouteMatchNext::Lookup,
         )))
     }
-}
-
-impl<R, T, G> InternalNode<G> for RouteMatchNode<R>
-where
-    R: Deref<Target = T>,
-    T: Router + ?Sized,
-{
 }
