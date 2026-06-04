@@ -7,7 +7,7 @@ use hammer_control::{
     CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
     ServiceManager,
 };
-use hammer_core::config::{self, Options};
+use hammer_core::config::{self, Options, TraceOptions};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
@@ -18,7 +18,7 @@ use hammer_runtime::EndpointManager;
 use hammer_runtime::adapter::ProbeProtocolComponent;
 use hammer_runtime::adapter::{
     DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, OutboundManager as _,
-    PlatformInterface, ProbeReport,
+    PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
@@ -30,8 +30,8 @@ use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
-    ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, EventSubscriberBuilder,
-    InboundManager, MetricSample, MetricsRegistry, OutboundManager,
+    ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, ControlTimerHandle,
+    EventSubscriberBuilder, InboundManager, MetricSample, MetricsRegistry, OutboundManager,
 };
 use std::time::Duration;
 
@@ -52,6 +52,7 @@ const DATA_WORKER_THREADS: usize = 2;
 const DATA_WORKER_STACK_SIZE: usize = 512 * 1024;
 const DATA_MAX_BLOCKING_THREADS: usize = 4;
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const TRACE_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// Time budget for the control thread to drain queued logs and emit a
 /// final metrics dump on shutdown. 500ms was too tight when the log queue
 /// (4096 entries) is full and each iOS write costs tens of milliseconds;
@@ -105,8 +106,10 @@ struct ServiceInner {
     log_factory: Arc<Factory>,
     control_handle: Option<Arc<ControlThreadHandle>>,
     control_thread: Option<JoinHandle<()>>,
+    trace_drain_timer: Option<ControlTimerHandle>,
     event_subscriptions: Vec<ControlEventSubscriptionHandle>,
     metrics: Arc<MetricsRegistry>,
+    _trace: TraceControlPlane,
     _platform: Arc<dyn PlatformInterface>,
     _registry: Arc<RuntimeRegistry>,
     lifecycles: Vec<Arc<dyn Lifecycle>>,
@@ -151,7 +154,9 @@ impl RuntimeService {
         hammer_runtime::install_default_crypto_provider();
 
         let options = config::parse_config(config_content)?;
+        validate_trace_options_for_service(&options.trace)?;
         let metrics = MetricsRegistry::new();
+        let trace = TraceControlPlane::new(options.trace.record_capacity);
         let base_time = Instant::now();
         // Data-plane runtime: multiple fixed data threads, each with its own
         // current-thread reactor and thread-local packet buffer pool. Futures
@@ -188,6 +193,15 @@ impl RuntimeService {
         };
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
+        trace.publish_options(&options.trace, |_name| None)?;
+        data_context
+            .set_trace_control_on_workers(Some(trace.handle()), options.trace.packet_capacity)?;
+        let trace_drain_timer = schedule_trace_drain(
+            Arc::clone(&control_handle),
+            data_context.clone(),
+            trace.sink(),
+            new_logger(&log_factory, "trace-control"),
+        )?;
         let event_subscriptions = build_event_subscribers(
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
@@ -366,8 +380,10 @@ impl RuntimeService {
                 log_factory,
                 control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
+                trace_drain_timer: Some(trace_drain_timer),
                 event_subscriptions,
                 metrics,
+                _trace: trace,
                 _platform: platform,
                 _registry: registry,
                 lifecycles,
@@ -629,6 +645,38 @@ fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
 }
 
+fn validate_trace_options_for_service(options: &TraceOptions) -> HammerResult<()> {
+    if options.enabled
+        && let Some(input) = options.inputs.first()
+    {
+        return Err(HammerError::config_validation(format!(
+            "trace.inputs node is not a declared packet node: {}",
+            input.node
+        )));
+    }
+    Ok(())
+}
+
+fn schedule_trace_drain(
+    control_handle: Arc<ControlThreadHandle>,
+    data_context: DataRuntimeContext,
+    sink: TraceRecordSink,
+    logger: Logger,
+) -> HammerResult<ControlTimerHandle> {
+    control_handle.schedule_interval(TRACE_DRAIN_INTERVAL, TRACE_DRAIN_INTERVAL, move || {
+        let data_context = data_context.clone();
+        let sink = sink.clone();
+        let logger = logger.clone();
+        async move {
+            if let Err(err) =
+                data_context.drain_trace_records_on_workers_with_logger(sink, logger.clone())
+            {
+                logger.warn(format!("drain packet trace records: {err}"));
+            }
+        }
+    })
+}
+
 /// Wraps every declared `Endpoint` in an `EndpointOutboundAdapter` and
 /// registers it into the `OutboundManager` under the endpoint's id. This
 /// is what lets `[[dns.servers]] via = "<endpoint-id>"` resolve through
@@ -725,6 +773,16 @@ fn finish_close(
         subscription.cancel();
     }
     drop(event_subscriptions);
+    let trace_drain_timer = {
+        inner
+            .lock()
+            .expect("service mutex poisoned")
+            .trace_drain_timer
+            .take()
+    };
+    if let Some(timer) = trace_drain_timer {
+        timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
+    }
     let control_handle = {
         inner
             .lock()

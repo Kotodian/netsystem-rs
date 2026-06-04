@@ -1458,6 +1458,43 @@ fn trace_completed_queue_overflow_drops_records_without_blocking() {
 }
 
 #[test]
+fn trace_publish_updates_completed_queue_capacity() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 8, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(1);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 3,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 3,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 8);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"first");
+    push_test_packet(&runtime, frame, b"second");
+    push_test_packet(&runtime, frame, b"third");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 3);
+    assert_eq!(control.dropped_completed(), 0);
+    let records = control.take_records();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+    assert_eq!(records[1].entries[0].payload_bytes, b"second");
+    assert_eq!(records[2].entries[0].payload_bytes, b"third");
+}
+
+#[test]
 fn trace_record_sink_prints_completed_records_through_control_logger() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let payloads = Rc::new(RefCell::new(Vec::new()));
@@ -1549,6 +1586,21 @@ fn trace_control_publish_options_resolves_declared_node_names() {
             .contains("trace.inputs node is not a declared packet node: missing"),
         "unexpected error: {err}"
     );
+    let epoch = control
+        .publish_options(
+            &TraceOptions {
+                enabled: false,
+                record_capacity: 4,
+                packet_capacity: 2,
+                inputs: vec![TraceInputOptions {
+                    node: "missing".to_owned(),
+                    count: 1,
+                }],
+            },
+            |_name| panic!("disabled trace inputs should not resolve packet graph nodes"),
+        )
+        .expect("disabled trace options should publish without input resolution");
+    assert_eq!(epoch, 2);
 }
 
 #[test]

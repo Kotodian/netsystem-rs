@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crossbeam_queue::ArrayQueue;
+use crossbeam_queue::SegQueue;
 use hammer_core::config::TraceOptions;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
@@ -121,7 +121,9 @@ pub struct TraceRecordSink {
 #[derive(Debug)]
 struct TraceControlInner {
     state: Mutex<TraceControlState>,
-    completed: ArrayQueue<TraceRecord>,
+    completed: SegQueue<TraceRecord>,
+    completed_len: AtomicUsize,
+    completed_capacity: AtomicUsize,
     dropped_completed: AtomicUsize,
     next_epoch: AtomicU64,
 }
@@ -145,7 +147,9 @@ impl TraceControlPlane {
                     quotas: FlatHashTable::new(),
                     ring: VecDeque::with_capacity(record_capacity),
                 }),
-                completed: ArrayQueue::new(record_capacity),
+                completed: SegQueue::new(),
+                completed_len: AtomicUsize::new(0),
+                completed_capacity: AtomicUsize::new(record_capacity),
                 dropped_completed: AtomicUsize::new(0),
                 next_epoch: AtomicU64::new(1),
             }),
@@ -182,8 +186,14 @@ impl TraceControlPlane {
         } else {
             FlatHashTable::new()
         };
-        if state.ring.capacity() != policy.record_capacity {
-            state.ring = VecDeque::with_capacity(policy.record_capacity.max(1));
+        let record_capacity = policy.record_capacity.max(1);
+        self.inner
+            .completed_capacity
+            .store(record_capacity, Ordering::Release);
+        trim_completed_queue(&self.inner, record_capacity);
+        resize_bounded_queue(&mut state.ring, record_capacity);
+        if state.ring.capacity() != record_capacity {
+            state.ring = VecDeque::with_capacity(record_capacity);
         }
         state.policy = policy;
         epoch
@@ -195,17 +205,19 @@ impl TraceControlPlane {
         resolve_node: impl Fn(&str) -> Option<NodeId>,
     ) -> CoreResult<u64> {
         let mut inputs = Vec::with_capacity(options.inputs.len());
-        for input in &options.inputs {
-            let node = resolve_node(&input.node).ok_or_else(|| {
-                CoreError::config_validation(format!(
-                    "trace.inputs node is not a declared packet node: {}",
-                    input.node
-                ))
-            })?;
-            inputs.push(TraceInputPolicy {
-                node,
-                count: input.count,
-            });
+        if options.enabled {
+            for input in &options.inputs {
+                let node = resolve_node(&input.node).ok_or_else(|| {
+                    CoreError::config_validation(format!(
+                        "trace.inputs node is not a declared packet node: {}",
+                        input.node
+                    ))
+                })?;
+                inputs.push(TraceInputPolicy {
+                    node,
+                    count: input.count,
+                });
+            }
         }
         Ok(self.publish(TracePolicy {
             enabled: options.enabled,
@@ -398,27 +410,48 @@ impl TraceControlHandle {
     }
 
     pub fn push_completed_record(&self, record: TraceRecord) {
-        if self.inner.completed.push(record).is_err() {
-            self.inner.dropped_completed.fetch_add(1, Ordering::Relaxed);
+        loop {
+            let capacity = self.inner.completed_capacity.load(Ordering::Acquire).max(1);
+            let current = self.inner.completed_len.load(Ordering::Acquire);
+            if current >= capacity {
+                self.inner.dropped_completed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if self
+                .inner
+                .completed_len
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                self.inner.completed.push(record);
+                return;
+            }
         }
     }
 }
 
 impl TraceRecordSink {
     pub fn drain_completed(&self) -> usize {
-        let mut drained = 0usize;
-        while let Some(record) = self.inner.completed.pop() {
-            self.push_ring(record);
-            drained += 1;
-        }
-        drained
+        self.drain_completed_inner(None)
     }
 
     pub fn drain_completed_with_logger(&self, logger: &Logger) -> usize {
+        self.drain_completed_inner(Some(logger))
+    }
+
+    fn drain_completed_inner(&self, logger: Option<&Logger>) -> usize {
         let mut drained = 0usize;
         while let Some(record) = self.inner.completed.pop() {
-            logger.debug(format_trace_record(&record));
-            self.push_ring(record);
+            self.inner.completed_len.fetch_sub(1, Ordering::AcqRel);
+            if let Some(logger) = logger {
+                logger.debug(format_trace_record(&record));
+            }
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("trace control lock poisoned");
+            push_ring(&mut state, record);
             drained += 1;
         }
         drained
@@ -436,18 +469,29 @@ impl TraceRecordSink {
     pub fn dropped_completed(&self) -> usize {
         self.inner.dropped_completed.load(Ordering::Acquire)
     }
+}
 
-    fn push_ring(&self, record: TraceRecord) {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        let capacity = state.policy.record_capacity.max(1);
-        while state.ring.len() >= capacity {
-            state.ring.pop_front();
-        }
-        state.ring.push_back(record);
+fn push_ring(state: &mut TraceControlState, record: TraceRecord) {
+    let capacity = state.policy.record_capacity.max(1);
+    while state.ring.len() >= capacity {
+        state.ring.pop_front();
+    }
+    state.ring.push_back(record);
+}
+
+fn resize_bounded_queue(queue: &mut VecDeque<TraceRecord>, capacity: usize) {
+    while queue.len() > capacity {
+        queue.pop_front();
+    }
+}
+
+fn trim_completed_queue(inner: &TraceControlInner, capacity: usize) {
+    while inner.completed_len.load(Ordering::Acquire) > capacity {
+        let Some(_) = inner.completed.pop() else {
+            return;
+        };
+        inner.completed_len.fetch_sub(1, Ordering::AcqRel);
+        inner.dropped_completed.fetch_add(1, Ordering::Relaxed);
     }
 }
 
