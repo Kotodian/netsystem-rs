@@ -12,7 +12,8 @@ use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     AdjacencyRewriteNode, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, IpInputNext, IpInputNode,
-    IpLocalControlPlane, IpLocalNext, IpLookupControlPlane, IpLookupNode, IpReceiveNode,
+    IpLocalControlPlane, IpLocalNext, IpLocalNode, IpLookupControlPlane, IpLookupNode,
+    IpReceiveNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -75,6 +76,7 @@ enum TestNode {
     Sink(SinkNode),
     Drop(DropNode),
     IpInput(IpInputNode),
+    IpLocal(IpLocalNode),
     IpLookup(IpLookupNode),
     AdjacencyRewrite(AdjacencyRewriteNode),
     IpReceive(IpReceiveNode),
@@ -102,6 +104,12 @@ impl From<IpInputNode> for TestNode {
 impl From<IpLookupNode> for TestNode {
     fn from(node: IpLookupNode) -> Self {
         Self::IpLookup(node)
+    }
+}
+
+impl From<IpLocalNode> for TestNode {
+    fn from(node: IpLocalNode) -> Self {
+        Self::IpLocal(node)
     }
 }
 
@@ -134,6 +142,7 @@ impl Node<TestNode> for TestNode {
             Self::Sink(node) => node.process(runtime, frame),
             Self::Drop(node) => node.process(runtime, frame),
             Self::IpInput(node) => node.process(runtime, frame),
+            Self::IpLocal(node) => node.process(runtime, frame),
             Self::IpLookup(node) => node.process(runtime, frame),
             Self::AdjacencyRewrite(node) => node.process(runtime, frame),
             Self::IpReceive(node) => node.process(runtime, frame),
@@ -386,6 +395,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
     let udp = register_sink(&runtime, &state);
     let local_control =
         IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
+    runtime.nodes().register_internal(local_control.node());
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
@@ -427,6 +437,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
     let udp = register_sink(&runtime, &state);
     let local_control =
         IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, udp, drop, drop));
+    runtime.nodes().register_internal(local_control.node());
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());

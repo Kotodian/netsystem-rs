@@ -7,6 +7,7 @@ use hammer_adapter::{
     NodeResult, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
+use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
     DpoId, DpoProto, FibTableBuilder, IcmpEchoRequestNext, IcmpEchoRequestNode,
@@ -524,10 +525,13 @@ fn ip_local_reverse_fib_source_check_rejects_unusable_source_routes() {
 
 #[test]
 fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
+    let data_runtime =
+        DataRuntime::new(1, "ip-local-feature-arc-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
-    let mut features = FeatureArcControl::<IpLocalArc>::new();
+    let mut features = FeatureArcControl::<IpLocalArc>::new().with_data_plane_barrier(barrier);
     let feature_state = Rc::new(RefCell::new(CaptureState::default()));
     let feature = runtime.nodes().register_internal(ForwardNode {
         state: Rc::clone(&feature_state),
@@ -573,6 +577,7 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+    data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[test]
@@ -580,6 +585,7 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let local_control = IpLocalControlPlane::new(graph.nexts());
+    runtime.nodes().register_internal(local_control.node());
     let receive = runtime
         .nodes()
         .register_internal(local_control.receive_node());
@@ -630,6 +636,79 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ip_receive_sibling_shares_runtime_next_slots_with_feature_arc_start() {
+    let data_runtime =
+        DataRuntime::new(1, "ip-receive-feature-arc-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
+    let graph = LocalGraph::new(&runtime);
+    let alternate_udp_state = Rc::new(RefCell::new(CaptureState::default()));
+    let alternate_udp = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Rc::clone(&alternate_udp_state)));
+    let mut features = FeatureArcControl::<IpLocalArc>::new().with_data_plane_barrier(barrier);
+    let feature_state = Rc::new(RefCell::new(CaptureState::default()));
+    let feature = runtime.nodes().register_internal(ForwardNode {
+        state: Rc::clone(&feature_state),
+    });
+    features
+        .register_feature::<ForwardNode>(feature)
+        .expect("register receive feature");
+    features
+        .enable_feature::<ForwardNode>(9)
+        .expect("enable receive feature");
+    let local_control = IpLocalControlPlane::new(graph.nexts());
+    let owner = runtime.nodes().register_internal(local_control.node());
+    let mut receive_node = local_control.receive_node();
+    features.attach_start(&mut receive_node);
+    let receive = runtime.nodes().register_internal(receive_node);
+    runtime
+        .nodes()
+        .set_node_next(owner, IpLocalNext::Udp, alternate_udp)
+        .expect("update owner UDP slot");
+
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet_on_interface(
+        &runtime,
+        frame,
+        &ipv4_udp_packet(
+            Ipv4Addr::new(10, 0, 0, 10),
+            10_010,
+            Ipv4Addr::new(192, 0, 2, 10),
+            53,
+            b"receive-sibling-feature",
+            true,
+        ),
+        9,
+    );
+
+    assert!(runtime.schedule_frame(receive, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(feature_state.borrow().metadata.len(), 1);
+    assert_eq!(graph.udp_state.borrow().metadata.len(), 0);
+    assert_eq!(alternate_udp_state.borrow().metadata.len(), 1);
+    assert_metadata(
+        &alternate_udp_state.borrow().metadata[0],
+        Network::Udp,
+        Ipv4Addr::new(10, 0, 0, 10).into(),
+        10_010,
+        Ipv4Addr::new(192, 0, 2, 10).into(),
+        53,
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(receive, IpLocalNext::Udp)
+            .unwrap(),
+        alternate_udp
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+    data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 struct LocalGraph {

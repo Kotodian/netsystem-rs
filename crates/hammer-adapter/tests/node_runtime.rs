@@ -9,8 +9,8 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet,
     DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
-    NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue, NodeResult,
-    PacketNextResolver, RouteMetadata, process_cached_rewrite_next,
+    NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,
+    NodeRegistration, NodeResult, PacketNextResolver, RouteMetadata, process_cached_rewrite_next,
     process_cached_speculative_next,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -233,6 +233,146 @@ impl Node<TestNode> for HandoffNode {
 
 impl InternalNode<TestNode> for HandoffNode {}
 
+struct DeclaredNextOwnerNode {
+    name: &'static str,
+    next: [NodeId; TestNext::COUNT],
+}
+
+impl DeclaredNextOwnerNode {
+    fn new(next: [NodeId; TestNext::COUNT]) -> Self {
+        Self {
+            name: "declared-next-owner",
+            next,
+        }
+    }
+
+    fn with_name(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
+    }
+}
+
+impl Node<TestNode> for DeclaredNextOwnerNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let next = runtime.current_node_next(TestNext::Default)?;
+        Ok(NodeResult::next_current(next))
+    }
+}
+
+impl InternalNode<TestNode> for DeclaredNextOwnerNode {
+    #[inline(always)]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next(self.name, TestNext::COUNT)
+    }
+
+    #[inline(always)]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
+}
+
+struct DeclaredNextSiblingNode;
+
+impl Node<TestNode> for DeclaredNextSiblingNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let next = runtime.current_node_next(TestNext::Default)?;
+        Ok(NodeResult::next_current(next))
+    }
+}
+
+impl InternalNode<TestNode> for DeclaredNextSiblingNode {
+    #[inline(always)]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::sibling_of("declared-next-sibling", "declared-next-owner")
+    }
+}
+
+struct IllegalSiblingWithNextNode {
+    next: [NodeId; TestNext::COUNT],
+}
+
+impl Node<TestNode> for IllegalSiblingWithNextNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for IllegalSiblingWithNextNode {
+    #[inline(always)]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::sibling_of("illegal-sibling-with-next", "declared-next-owner")
+    }
+
+    #[inline(always)]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
+}
+
+struct IllegalPlainWithNextNode {
+    next: [NodeId; TestNext::COUNT],
+}
+
+impl Node<TestNode> for IllegalPlainWithNextNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for IllegalPlainWithNextNode {
+    #[inline(always)]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
+}
+
+struct IllegalNextCountNode {
+    next: [NodeId; TestNext::COUNT],
+}
+
+impl Node<TestNode> for IllegalNextCountNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime<TestNode>,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::drop())
+    }
+}
+
+impl InternalNode<TestNode> for IllegalNextCountNode {
+    #[inline(always)]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("illegal-next-count", TestNext::COUNT + 1)
+    }
+
+    #[inline(always)]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &self.next
+    }
+}
+
 struct PointerSinkNode {
     payloads: Rc<RefCell<Vec<Vec<u8>>>>,
     current_ptrs: Rc<RefCell<Vec<usize>>>,
@@ -434,6 +574,13 @@ impl InternalNode<TestNode> for ChunkedBatchSplitNode {}
 enum TestNext {
     Default,
     Alternate,
+}
+
+impl TestNext {
+    #[inline(always)]
+    fn nodes(default_node: NodeId, alternate_node: NodeId) -> [NodeId; Self::COUNT] {
+        [default_node, alternate_node]
+    }
 }
 
 impl NodeNext for TestNext {
@@ -671,6 +818,11 @@ enum TestNode {
     ExplicitNextFrame(ExplicitNextFrameNode),
     MultipleNextFrame(MultipleNextFrameNode),
     Handoff(HandoffNode),
+    DeclaredNextOwner(DeclaredNextOwnerNode),
+    DeclaredNextSibling(DeclaredNextSiblingNode),
+    IllegalSiblingWithNext(IllegalSiblingWithNextNode),
+    IllegalPlainWithNext(IllegalPlainWithNextNode),
+    IllegalNextCount(IllegalNextCountNode),
     PointerSink(PointerSinkNode),
     SpeculativeSplit(SpeculativeSplitNode),
     PrecomputedSplit(PrecomputedSplitNode),
@@ -735,6 +887,36 @@ impl From<MultipleNextFrameNode> for TestNode {
 impl From<HandoffNode> for TestNode {
     fn from(node: HandoffNode) -> Self {
         Self::Handoff(node)
+    }
+}
+
+impl From<DeclaredNextOwnerNode> for TestNode {
+    fn from(node: DeclaredNextOwnerNode) -> Self {
+        Self::DeclaredNextOwner(node)
+    }
+}
+
+impl From<DeclaredNextSiblingNode> for TestNode {
+    fn from(node: DeclaredNextSiblingNode) -> Self {
+        Self::DeclaredNextSibling(node)
+    }
+}
+
+impl From<IllegalSiblingWithNextNode> for TestNode {
+    fn from(node: IllegalSiblingWithNextNode) -> Self {
+        Self::IllegalSiblingWithNext(node)
+    }
+}
+
+impl From<IllegalPlainWithNextNode> for TestNode {
+    fn from(node: IllegalPlainWithNextNode) -> Self {
+        Self::IllegalPlainWithNext(node)
+    }
+}
+
+impl From<IllegalNextCountNode> for TestNode {
+    fn from(node: IllegalNextCountNode) -> Self {
+        Self::IllegalNextCount(node)
     }
 }
 
@@ -821,6 +1003,11 @@ impl Node<TestNode> for TestNode {
             Self::ExplicitNextFrame(node) => node.process(runtime, frame),
             Self::MultipleNextFrame(node) => node.process(runtime, frame),
             Self::Handoff(node) => node.process(runtime, frame),
+            Self::DeclaredNextOwner(node) => node.process(runtime, frame),
+            Self::DeclaredNextSibling(node) => node.process(runtime, frame),
+            Self::IllegalSiblingWithNext(node) => node.process(runtime, frame),
+            Self::IllegalPlainWithNext(node) => node.process(runtime, frame),
+            Self::IllegalNextCount(node) => node.process(runtime, frame),
             Self::PointerSink(node) => node.process(runtime, frame),
             Self::SpeculativeSplit(node) => node.process(runtime, frame),
             Self::PrecomputedSplit(node) => node.process(runtime, frame),
@@ -1639,6 +1826,276 @@ fn node_runtime_releases_empty_next_frame() {
     assert_eq!(count.get(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_registers_declared_sibling_with_inherited_next_slots() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let default = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+
+    let owner = runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(
+            default, alternate,
+        )));
+    let sibling = runtime.nodes().register_internal(DeclaredNextSiblingNode);
+
+    assert_eq!(
+        runtime.nodes().node_next(owner, TestNext::Default).unwrap(),
+        default
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(sibling, TestNext::Default)
+            .unwrap(),
+        default
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(sibling, TestNext::Alternate)
+            .unwrap(),
+        alternate
+    );
+    assert_eq!(runtime.nodes().node_siblings(owner).unwrap(), vec![sibling]);
+    assert_eq!(runtime.nodes().node_siblings(sibling).unwrap(), vec![owner]);
+}
+
+#[test]
+fn node_runtime_allows_multiple_declared_next_nodes_with_distinct_names() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let second = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+
+    let owner_a = runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(first, second)));
+    let owner_b = runtime.nodes().register_internal(
+        DeclaredNextOwnerNode::new(TestNext::nodes(second, first))
+            .with_name("declared-next-owner-b"),
+    );
+
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(owner_a, TestNext::Default)
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(owner_b, TestNext::Default)
+            .unwrap(),
+        second
+    );
+}
+
+#[test]
+fn node_runtime_propagates_next_slot_updates_across_declared_siblings() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let second = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let replacement = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let owner = runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(first, second)));
+    let sibling = runtime.nodes().register_internal(DeclaredNextSiblingNode);
+
+    runtime
+        .nodes()
+        .set_node_next(sibling, TestNext::Default, replacement)
+        .expect("update sibling next");
+
+    assert_eq!(
+        runtime.nodes().node_next(owner, TestNext::Default).unwrap(),
+        replacement
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(sibling, TestNext::Default)
+            .unwrap(),
+        replacement
+    );
+    assert_eq!(
+        runtime
+            .nodes()
+            .node_next(owner, TestNext::Alternate)
+            .unwrap(),
+        second
+    );
+}
+
+#[test]
+fn current_node_next_resolves_declared_sibling_slot_during_processing() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first_count = Rc::new(Cell::new(0));
+    let replacement_count = Rc::new(Cell::new(0));
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::clone(&first_count),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let replacement = runtime.nodes().register_internal(CountNode {
+        count: Rc::clone(&replacement_count),
+    });
+    runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(
+            first, alternate,
+        )));
+    let sibling = runtime.nodes().register_internal(DeclaredNextSiblingNode);
+    runtime
+        .nodes()
+        .set_node_next(sibling, TestNext::Default, replacement)
+        .expect("update sibling next");
+
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+    assert!(runtime.schedule_frame(sibling, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(first_count.get(), 0);
+    assert_eq!(replacement_count.get(), 1);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn node_runtime_rejects_declared_sibling_before_owner_registration() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+
+    let err = runtime
+        .nodes()
+        .try_register_internal(DeclaredNextSiblingNode)
+        .expect_err("sibling owner missing");
+
+    assert!(
+        err.to_string()
+            .contains("node sibling owner is not registered"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn node_runtime_rejects_declared_sibling_with_initial_next_nodes() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(
+            first, alternate,
+        )));
+
+    let err = runtime
+        .nodes()
+        .try_register_internal(IllegalSiblingWithNextNode {
+            next: TestNext::nodes(first, alternate),
+        })
+        .expect_err("sibling initial nexts rejected");
+
+    assert!(
+        err.to_string()
+            .contains("node sibling cannot declare initial next nodes"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn node_runtime_rejects_plain_node_with_initial_next_nodes() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+
+    let err = runtime
+        .nodes()
+        .try_register_internal(IllegalPlainWithNextNode {
+            next: TestNext::nodes(first, alternate),
+        })
+        .expect_err("plain initial nexts rejected");
+
+    assert!(
+        err.to_string()
+            .contains("plain node cannot declare initial next nodes"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn node_runtime_rejects_declared_next_count_mismatch() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+
+    let err = runtime
+        .nodes()
+        .try_register_internal(IllegalNextCountNode {
+            next: TestNext::nodes(first, alternate),
+        })
+        .expect_err("next count mismatch rejected");
+
+    assert!(
+        err.to_string().contains("node initial next count mismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn node_runtime_rejects_out_of_range_sibling_next_slot_update() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(32, 8, 8, 4);
+    let first = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let alternate = runtime.nodes().register_internal(CountNode {
+        count: Rc::new(Cell::new(0)),
+    });
+    let owner = runtime
+        .nodes()
+        .register_internal(DeclaredNextOwnerNode::new(TestNext::nodes(
+            first, alternate,
+        )));
+    runtime.nodes().register_internal(DeclaredNextSiblingNode);
+
+    let err = runtime
+        .nodes()
+        .set_node_next_slot(owner, TestNext::COUNT, first)
+        .expect_err("slot out of range");
+
+    assert!(
+        err.to_string().contains("node next slot out of range"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]

@@ -3,9 +3,9 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
-    Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, Ident, Item, ItemEnum,
-    ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized, parse_macro_input,
-    parse_quote, spanned::Spanned,
+    Attribute, Error, Expr, ExprPath, Field, Fields, FieldsNamed, GenericParam, Generics, Ident,
+    Item, ItemEnum, ItemStruct, LitStr, Path, Result, Token, Type, bracketed, parenthesized,
+    parse_macro_input, parse_quote, spanned::Spanned,
 };
 
 #[derive(Clone, Copy)]
@@ -106,7 +106,15 @@ struct FeatureArgs {
 struct NodeArgs {
     next: Option<Path>,
     next_node: bool,
+    sibling_of: Option<Path>,
+    role: Option<NodeRole>,
     start_arc: Option<Path>,
+}
+
+#[derive(Clone, Copy)]
+enum NodeRole {
+    Internal,
+    Driver,
 }
 
 #[derive(Default)]
@@ -179,6 +187,25 @@ impl Parse for NodeArgs {
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             match key.to_string().as_str() {
+                "role" => {
+                    if args.role.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `role` argument"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    let role: Ident = input.parse()?;
+                    args.role = Some(match role.to_string().as_str() {
+                        "internal" => NodeRole::Internal,
+                        "driver" => NodeRole::Driver,
+                        other => {
+                            return Err(Error::new(
+                                role.span(),
+                                format!(
+                                    "unknown node role `{other}`; expected `internal` or `driver`"
+                                ),
+                            ));
+                        }
+                    });
+                }
                 "next" => {
                     if args.next.is_some() {
                         return Err(Error::new(key.span(), "duplicate `next` argument"));
@@ -192,6 +219,13 @@ impl Parse for NodeArgs {
                     }
                     args.next_node = true;
                 }
+                "sibling_of" => {
+                    if args.sibling_of.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `sibling_of` argument"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    args.sibling_of = Some(input.parse()?);
+                }
                 "start_arc" => {
                     if args.start_arc.is_some() {
                         return Err(Error::new(key.span(), "duplicate `start_arc` argument"));
@@ -203,7 +237,7 @@ impl Parse for NodeArgs {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `next`, `next_node`, or `start_arc`"
+                            "unknown argument `{other}`; expected `role`, `next`, `next_node`, `sibling_of`, or `start_arc`"
                         ),
                     ));
                 }
@@ -216,6 +250,18 @@ impl Parse for NodeArgs {
             return Err(Error::new(
                 Span::call_site(),
                 "`next` and `next_node` are mutually exclusive",
+            ));
+        }
+        if args.next.is_some() && args.sibling_of.is_some() {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next` and `sibling_of` are mutually exclusive",
+            ));
+        }
+        if args.next_node && args.sibling_of.is_some() {
+            return Err(Error::new(
+                Span::call_site(),
+                "`next_node` and `sibling_of` are mutually exclusive",
             ));
         }
         Ok(args)
@@ -769,9 +815,21 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
     let attrs = item.attrs;
     let vis = item.vis;
     let ident = item.ident;
+    let node_name = LitStr::new(
+        &to_snake_case(&ident.to_string()).replace('_', "-"),
+        ident.span(),
+    );
     let generics = item.generics;
     let fields = item.fields;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let mut role_generics = node_role_generics(&generics);
+    role_generics
+        .make_where_clause()
+        .predicates
+        .push(parse_quote!(
+            #ident #ty_generics: ::hammer_adapter::node::Node<G>
+        ));
+    let (role_impl_generics, _, role_where_clause) = role_generics.split_for_impl();
 
     let mut output_fields = Vec::<Field>::new();
     let mut constructor_params = Vec::<TokenStream2>::new();
@@ -832,14 +890,56 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             "`node(start_arc = ...)` injects a `feature_arc` field; remove the field from the struct",
         ));
     }
+    if (args.next.is_some() || args.sibling_of.is_some()) && has_field(&output_fields, "node_name")
+    {
+        return Err(Error::new(
+            Span::call_site(),
+            "`node(next = ...)` and `node(sibling_of = ...)` inject a `node_name` field; remove the field from the struct",
+        ));
+    }
 
+    let declared_node = args.next.is_some() || args.sibling_of.is_some();
+    let mut next_impl = quote!();
     if let Some(next) = &args.next {
+        let name_field: Field = parse_quote! {
+            node_name: &'static str
+        };
+        output_fields.push(name_field);
+        constructor_inits.push(quote!(node_name: Self::NODE_NAME));
         let field: Field = parse_quote! {
             next: [::hammer_adapter::node::NodeId; #next::COUNT]
         };
         output_fields.push(field);
         constructor_params.push(quote!(next: [::hammer_adapter::node::NodeId; #next::COUNT]));
         constructor_inits.push(quote!(next));
+        next_impl = quote! {
+            pub const NODE_NEXT_COUNT: usize = #next::COUNT;
+
+            #[inline]
+            pub fn runtime_nexts<G>(
+                runtime: &::hammer_adapter::DataPlaneRuntime<G>,
+            ) -> ::hammer_core::error::CoreResult<[::hammer_adapter::node::NodeId; #next::COUNT]> {
+                runtime.current_node_nexts::<{ #next::COUNT }>()
+            }
+        };
+    } else if let Some(sibling_of) = &args.sibling_of {
+        let name_field: Field = parse_quote! {
+            node_name: &'static str
+        };
+        output_fields.push(name_field);
+        constructor_inits.push(quote!(node_name: Self::NODE_NAME));
+        next_impl = quote! {
+            pub const NODE_NEXT_COUNT: usize = #sibling_of::NODE_NEXT_COUNT;
+
+            #[inline]
+            pub fn runtime_nexts<G>(
+                runtime: &::hammer_adapter::DataPlaneRuntime<G>,
+            ) -> ::hammer_core::error::CoreResult<
+                [::hammer_adapter::node::NodeId; #sibling_of::NODE_NEXT_COUNT]
+            > {
+                runtime.current_node_nexts::<{ #sibling_of::NODE_NEXT_COUNT }>()
+            }
+        };
     }
 
     if args.next_node {
@@ -881,25 +981,128 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         quote!()
     };
 
+    let declared_name_impl = if declared_node {
+        quote! {
+            #[inline]
+            pub fn with_node_name(mut self, node_name: &'static str) -> Self {
+                self.node_name = node_name;
+                self
+            }
+        }
+    } else {
+        quote!()
+    };
+
     let fields_named: FieldsNamed = parse_quote!({
         #(#output_fields),*
     });
+
+    let role_impl = match args.role {
+        Some(NodeRole::Internal) => {
+            let registration = node_registration_tokens(&ident, &args.next, &args.sibling_of);
+            let initial_nexts = if args.next.is_some() {
+                quote! {
+                    #[inline]
+                    fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                        &self.next
+                    }
+                }
+            } else {
+                quote!()
+            };
+            quote! {
+                impl #role_impl_generics ::hammer_adapter::node::InternalNode<G>
+                    for #ident #ty_generics #role_where_clause
+                {
+                    #[inline]
+                    fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+                        #registration
+                    }
+
+                    #initial_nexts
+                }
+            }
+        }
+        Some(NodeRole::Driver) => {
+            let registration = node_registration_tokens(&ident, &args.next, &args.sibling_of);
+            let initial_nexts = if args.next.is_some() {
+                quote! {
+                    #[inline]
+                    fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                        &self.next
+                    }
+                }
+            } else {
+                quote!()
+            };
+            quote! {
+                impl #role_impl_generics ::hammer_adapter::node::DriverNode<G>
+                    for #ident #ty_generics #role_where_clause
+                {
+                    #[inline]
+                    fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+                        #registration
+                    }
+
+                    #initial_nexts
+                }
+            }
+        }
+        None => quote!(),
+    };
 
     Ok(quote! {
         #(#attrs)*
         #vis struct #ident #generics #fields_named
 
         impl #impl_generics #ident #ty_generics #where_clause {
+            pub const NODE_NAME: &'static str = #node_name;
+
             #[inline]
             pub fn new(#(#constructor_params),*) -> Self {
                 Self {
                     #(#constructor_inits),*
                 }
             }
+
+            #declared_name_impl
+            #next_impl
         }
 
         #start_impl
+        #role_impl
     })
+}
+
+fn node_registration_tokens(
+    ident: &Ident,
+    next: &Option<Path>,
+    sibling_of: &Option<Path>,
+) -> TokenStream2 {
+    if let Some(next) = next {
+        quote!(::hammer_adapter::node::NodeRegistration::next(self.node_name, #next::COUNT))
+    } else if let Some(sibling_of) = sibling_of {
+        quote!(::hammer_adapter::node::NodeRegistration::sibling_of(
+            self.node_name,
+            #sibling_of::NODE_NAME
+        ))
+    } else {
+        let _ = ident;
+        quote!(::hammer_adapter::node::NodeRegistration::Plain)
+    }
+}
+
+fn node_role_generics(generics: &Generics) -> Generics {
+    let mut generics = generics.clone();
+    for param in generics.params.iter_mut() {
+        match param {
+            GenericParam::Type(param) => param.default = None,
+            GenericParam::Const(param) => param.default = None,
+            GenericParam::Lifetime(_) => {}
+        }
+    }
+    generics.params.push(parse_quote!(G));
+    generics
 }
 
 fn has_field(fields: &[Field], name: &str) -> bool {
@@ -1040,4 +1243,75 @@ fn to_snake_case(input: &str) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_args_rejects_next_with_sibling_of() {
+        let err = match syn::parse_str::<NodeArgs>(
+            "role = internal, next = OwnerNext, sibling_of = OwnerNode",
+        ) {
+            Ok(_) => panic!("next and sibling_of should be mutually exclusive"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("`next` and `sibling_of` are mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn node_args_accepts_sibling_of_type() {
+        let args = syn::parse_str::<NodeArgs>("role = internal, sibling_of = OwnerNode")
+            .expect("parse sibling_of");
+
+        assert!(args.next.is_none());
+        assert!(matches!(args.role, Some(NodeRole::Internal)));
+        assert_eq!(
+            args.sibling_of
+                .as_ref()
+                .and_then(|path| path.segments.last())
+                .map(|segment| segment.ident.to_string())
+                .as_deref(),
+            Some("OwnerNode")
+        );
+    }
+
+    #[test]
+    fn declared_node_expansion_supports_instance_node_name_override() {
+        let args =
+            syn::parse_str::<NodeArgs>("role = internal, next = OwnerNext").expect("parse next");
+        let item = syn::parse_str::<ItemStruct>("pub struct OwnerNode;").expect("parse item");
+        let expanded = expand_node(args, item).expect("expand node").to_string();
+
+        assert!(
+            expanded.contains("with_node_name"),
+            "declared node should expose node name override: {expanded}"
+        );
+        assert!(
+            expanded.contains("node_name"),
+            "declared node should store instance node name: {expanded}"
+        );
+    }
+
+    #[test]
+    fn plain_node_expansion_does_not_inject_node_name_override() {
+        let args = syn::parse_str::<NodeArgs>("").expect("parse plain");
+        let item = syn::parse_str::<ItemStruct>("pub struct PlainNode;").expect("parse item");
+        let expanded = expand_node(args, item).expect("expand node").to_string();
+
+        assert!(
+            !expanded.contains("with_node_name"),
+            "plain node should not expose node name override: {expanded}"
+        );
+        assert!(
+            !expanded.contains("node_name"),
+            "plain node should not store instance node name: {expanded}"
+        );
+    }
 }

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeHandle,
-    NodeId, NodeNextFrames, NodeNextStorage, NodeResult, SocksAddr,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
+    NodeNextFrames, NodeNextStorage, NodeResult, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -34,7 +34,7 @@ pub enum IpReassemblyNext {
     Drop,
 }
 
-#[hammer_component_macros::node(next = IpReassemblyNext)]
+#[hammer_component_macros::node(role = internal, next = IpReassemblyNext)]
 pub struct IpReassemblyNode {
     #[node(default)]
     handoff: Option<IpReassemblyHandoff>,
@@ -128,6 +128,7 @@ impl IpReassemblyNode {
         runtime: &DataPlaneRuntime<G>,
         next_frames: &mut NodeNextFrames,
         current_next: &mut Option<NodeId>,
+        next: [NodeId; IpReassemblyNext::COUNT],
         index: BufferIndex,
         now: Instant,
     ) -> CoreResult<Option<BufferIndex>> {
@@ -143,7 +144,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
+                    NodeNextStorage::next(&next, IpReassemblyNext::Drop),
                     index,
                 );
             }
@@ -154,7 +155,7 @@ impl IpReassemblyNode {
         if self.failed_keys.contains(&key) {
             next_frames.enqueue(
                 runtime,
-                NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
+                NodeNextStorage::next(&next, IpReassemblyNext::Drop),
                 index,
             )?;
             return Ok(None);
@@ -173,7 +174,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
+                    NodeNextStorage::next(&next, IpReassemblyNext::Drop),
                     index,
                 );
             }
@@ -211,7 +212,7 @@ impl IpReassemblyNode {
                         runtime,
                         next_frames,
                         current_next,
-                        NodeNextStorage::next(&self.next, IpReassemblyNext::Drop),
+                        NodeNextStorage::next(&next, IpReassemblyNext::Drop),
                         index,
                     );
                 }
@@ -221,7 +222,7 @@ impl IpReassemblyNode {
         }
 
         if let Some(failed_index) = failed {
-            let drop_node = NodeNextStorage::next(&self.next, IpReassemblyNext::Drop);
+            let drop_node = NodeNextStorage::next(&next, IpReassemblyNext::Drop);
             if let Some(context) = self.contexts.remove(&key) {
                 for fragment in context.fragments {
                     next_frames.enqueue(runtime, drop_node, fragment.index)?;
@@ -256,7 +257,7 @@ impl IpReassemblyNode {
                         runtime,
                         next_frames,
                         current_next,
-                        NodeNextStorage::next(&self.next, IpReassemblyNext::Lookup),
+                        NodeNextStorage::next(&next, IpReassemblyNext::Lookup),
                         index,
                     );
                 }
@@ -265,7 +266,7 @@ impl IpReassemblyNode {
                     runtime,
                     next_frames,
                     current_next,
-                    NodeNextStorage::next(&self.next, IpReassemblyNext::Lookup),
+                    NodeNextStorage::next(&next, IpReassemblyNext::Lookup),
                     index,
                 );
             }
@@ -365,11 +366,19 @@ impl<G> Node<G> for IpReassemblyNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let now = Instant::now();
+        let next = Self::runtime_nexts(runtime)?;
         let mut next_frames = NodeNextFrames::default();
         let mut current_next = None;
         self.failed_keys.clear();
         frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-            self.process_index(runtime, &mut next_frames, &mut current_next, index, now)
+            self.process_index(
+                runtime,
+                &mut next_frames,
+                &mut current_next,
+                next,
+                index,
+                now,
+            )
         })?;
         next_frames.schedule(runtime)?;
         if frame.has_pending()
@@ -381,8 +390,6 @@ impl<G> Node<G> for IpReassemblyNode {
         }
     }
 }
-
-impl<G> InternalNode<G> for IpReassemblyNode {}
 
 struct ReassemblyContext {
     version: IpVersion,

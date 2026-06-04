@@ -476,7 +476,7 @@ pub enum IcmpEchoRequestNext {
     Drop,
 }
 
-#[hammer_component_macros::node(next = IcmpEchoRequestNext)]
+#[hammer_component_macros::node(role = internal, next = IcmpEchoRequestNext)]
 pub struct IcmpEchoRequestNode {
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -504,12 +504,12 @@ impl<G> Node<G> for IcmpEchoRequestNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = IcmpEchoRequestNextResolver { next: self.next };
+        let resolver = IcmpEchoRequestNextResolver {
+            next: Self::runtime_nexts(runtime)?,
+        };
         process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
     }
 }
-
-impl<G> InternalNode<G> for IcmpEchoRequestNode {}
 
 #[hammer_component_macros::node_next]
 pub enum IcmpErrorNext {
@@ -517,7 +517,7 @@ pub enum IcmpErrorNext {
     Lookup,
 }
 
-#[hammer_component_macros::node(next = IcmpErrorNext)]
+#[hammer_component_macros::node(role = internal, next = IcmpErrorNext)]
 pub struct IcmpErrorNode {
     #[node(default)]
     source_table: Option<IcmpErrorSourceTableHandle>,
@@ -561,7 +561,7 @@ impl<G> Node<G> for IcmpErrorNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let resolver = IcmpErrorNextResolver {
-            next: self.next,
+            next: Self::runtime_nexts(runtime)?,
             source_table: self
                 .source_table
                 .as_ref()
@@ -570,8 +570,6 @@ impl<G> Node<G> for IcmpErrorNode {
         process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
     }
 }
-
-impl<G> InternalNode<G> for IcmpErrorNode {}
 
 #[inline(always)]
 fn next_node_for_index<G>(

@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode,
-    Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, SocksAddr,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
+    NodeNextEnqueue, NodeNextStorage, NodeResult, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -26,7 +26,7 @@ pub enum IpInputNext {
     Reassembly,
 }
 
-#[hammer_component_macros::node(next = IpInputNext, start_arc = A)]
+#[hammer_component_macros::node(role = internal, next = IpInputNext, start_arc = A)]
 pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -45,7 +45,7 @@ where
         let Some(first) = frame.pending_indices().first().copied() else {
             return Ok(NodeResult::drop());
         };
-        let next = self.next;
+        let next = Self::runtime_nexts(runtime)?;
         let feature_arc = self.feature_arc.as_ref();
         let indices = frame.pending_indices();
         let width = frame_batch_width(runtime);
@@ -98,8 +98,6 @@ where
         Ok(result)
     }
 }
-
-impl<A, G> InternalNode<G> for IpInputNode<A> where A: FeatureArcSpec {}
 
 #[inline(always)]
 fn prefetch_index_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {

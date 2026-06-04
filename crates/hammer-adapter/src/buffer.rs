@@ -13,7 +13,7 @@ use hammer_infra::{boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
 use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{Node, NodeHandle, NodeId, NodeRuntime, NoopNode};
+use crate::node::{Node, NodeHandle, NodeId, NodeNext, NodeRuntime, NoopNode};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -997,6 +997,22 @@ impl<N> DataPlaneRuntime<N> {
     #[inline]
     pub fn current_node(&self) -> Option<NodeId> {
         self.current_node.get()
+    }
+
+    #[inline]
+    pub fn current_node_next<K: NodeNext>(&self, key: K) -> CoreResult<NodeId> {
+        let node = self
+            .current_node()
+            .ok_or_else(|| CoreError::internal("node next read outside node processing"))?;
+        self.nodes.node_next(node, key)
+    }
+
+    #[inline]
+    pub fn current_node_nexts<const COUNT: usize>(&self) -> CoreResult<[NodeId; COUNT]> {
+        let node = self
+            .current_node()
+            .ok_or_else(|| CoreError::internal("node next read outside node processing"))?;
+        self.nodes.node_nexts(node)
     }
 
     #[inline]

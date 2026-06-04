@@ -10,6 +10,7 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::vec::Vec;
+use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::{FeatureArcControl, next_feature_frame};
 use hammer_service::interface::{
     InterfaceControlPlane, InterfaceMtu, InterfaceOutputControlPlane, InterfaceOutputNode,
@@ -518,6 +519,9 @@ fn tun_driver_errors_when_interface_control_cannot_resolve_interface() {
 
 #[test]
 fn tun_driver_routes_through_service_internal_nodes() {
+    let data_runtime =
+        DataRuntime::new(1, "tun-feature-arc-route-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packets = vec![
@@ -544,7 +548,8 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let lookup = runtime
         .nodes()
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
-    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
+    let mut unicast_features =
+        FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
     let feature_metadata = Rc::new(RefCell::new(Vec::new()));
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),
@@ -577,6 +582,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
     assert_eq!(feature_metadata.borrow()[1].ingress_interface, Some(7));
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+    data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[test]
@@ -665,6 +671,9 @@ fn tap_graph_routes_through_adjacency_rewrite_interface_output_and_tap_output() 
 
 #[test]
 fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
+    let data_runtime =
+        DataRuntime::new(1, "tun-feature-arc-toggle-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let input_device = MemoryTunDevice::new();
     let default_output_device = MemoryTunDevice::new();
@@ -680,7 +689,8 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),
     });
-    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
+    let mut unicast_features =
+        FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
     unicast_features
         .register_feature::<CaptureFeatureNode>(feature)
         .expect("register feature");
@@ -763,10 +773,14 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+    data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[test]
 fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
+    let data_runtime =
+        DataRuntime::new(1, "tun-feature-arc-order-test", 512 * 1024, 2).expect("data runtime");
+    let barrier = data_runtime.data_plane_barrier();
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"ordered");
@@ -782,7 +796,8 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     let alpha = runtime.nodes().register_internal(AlphaFeatureNode {
         visits: Rc::clone(&visits),
     });
-    let mut unicast_features = FeatureArcControl::<TestIpUnicastArc>::new();
+    let mut unicast_features =
+        FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
     unicast_features
         .register_feature::<BetaFeatureNode>(beta)
         .expect("register beta");
@@ -828,6 +843,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+    data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
 }
 
 #[test]
