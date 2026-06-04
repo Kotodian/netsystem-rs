@@ -10,17 +10,18 @@ pub use hammer_core::protocol::ip::{
     parse_ip_packet_with_chain_len,
 };
 pub use icmp::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable,
-    IcmpErrorSourceTableHandle, IcmpInputControlPlane, IcmpInputError, IcmpInputNode,
-    IcmpNodeError,
+    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
+    IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
+    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError,
 };
-pub use input::{IpInputNext, IpInputNode, IpUnicastArc};
+pub use input::{IpInputNext, IpInputNode, IpInputTrace, IpUnicastArc};
 pub use local::{
     IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
-    IpReceiveNode,
+    IpLocalTrace, IpLocalTraceStage, IpReceiveNode,
 };
 pub use reassembly::{
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+    IpReassemblyTrace, IpReassemblyTraceAction,
 };
 
 #[inline(always)]

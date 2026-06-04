@@ -5,15 +5,16 @@ use std::time::Duration;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeResult,
+    TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    AdjacencyRewriteNode, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder, IpInputNext, IpInputNode,
-    IpLocalControlPlane, IpLocalNext, IpLocalNode, IpLookupControlPlane, IpLookupNode,
-    IpReceiveNode,
+    AdjacencyRewriteNode, AdjacencyRewriteTrace, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder,
+    IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext, IpLocalNode, IpLookupControlPlane,
+    IpLookupNode, IpLookupTrace, IpReceiveNode,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -189,6 +190,17 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     let lookup = control.node();
     assert_internal_node(&lookup);
     let lookup = runtime.nodes().register_internal(lookup);
+    let trace = TraceControlPlane::new(8);
+    trace.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: lookup,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace.handle()), 4);
 
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(
@@ -217,6 +229,26 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     assert_frame_lens(&specific_state, &[1]);
     assert_frame_lens(&host_state, &[1]);
     assert_forwarding(&host_state, host_lb.get());
+    let default_forwarding = default_state.borrow().forwarding[0].expect("default forwarding");
+    assert_eq!(trace.drain_completed(), 1);
+    let records = trace.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, lookup);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].node_name, Some("ip-lookup-node"));
+    assert_eq!(
+        IpLookupTrace::decode(&records[0].entries[0].payload_bytes).expect("ip lookup trace"),
+        IpLookupTrace {
+            fib_index: 0,
+            route_dpo_type: Some(default_forwarding.route_dpo_type),
+            route_dpo_index: Some(default_forwarding.route_dpo_index),
+            load_balance_index: Some(default_forwarding.load_balance_index),
+            bucket_index: Some(default_forwarding.bucket_index),
+            dpo_type: Some(default_forwarding.dpo_type),
+            dpo_index: Some(default_forwarding.dpo_index),
+            next: default,
+        }
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -564,6 +596,17 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let rewrite_node = runtime
         .nodes()
         .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let trace = TraceControlPlane::new(8);
+    trace.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: rewrite_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, b"rewrite");
     let index = runtime
@@ -610,6 +653,26 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     assert_eq!(metadata.dpo_index, adjacency.get());
     assert_eq!(state_ref.egress_interfaces[0], Some(12));
     std::mem::drop(state_ref);
+    assert_eq!(trace.drain_completed(), 1);
+    let records = trace.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, rewrite_node);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(
+        records[0].entries[0].node_name,
+        Some("adjacency-rewrite-node")
+    );
+    assert_eq!(
+        AdjacencyRewriteTrace::decode(&records[0].entries[0].payload_bytes)
+            .expect("adjacency rewrite trace"),
+        AdjacencyRewriteTrace {
+            dpo_index: Some(adjacency.get()),
+            egress_interface: Some(12),
+            rewrite_len: rewrite.len(),
+            error: None,
+            next: Some(sink),
+        }
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

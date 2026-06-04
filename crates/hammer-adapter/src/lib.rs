@@ -18,6 +18,7 @@ pub mod probe;
 pub mod router;
 pub mod rule;
 pub mod service;
+pub mod trace;
 
 pub use buffer::{
     BUFFER_CACHE_LINE_SIZE, Buffer, BufferBatchMut, BufferFlags, BufferFrame, BufferFrameBatch,
@@ -75,3 +76,7 @@ pub use rule::{
     RouteMetadata, RouteTarget, Rule, SocksAddr, TapEthernetMetadata,
 };
 pub use service::ServiceManager;
+pub use trace::{
+    PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
+    TraceInputPolicy, TraceMark, TracePolicy, TraceRecord, TraceRecordSink, unlikely,
+};

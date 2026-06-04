@@ -8,6 +8,7 @@ mod inbound;
 mod log;
 mod outbound;
 mod route;
+mod trace;
 mod util;
 
 pub use dns::*;
@@ -17,6 +18,7 @@ pub use inbound::*;
 pub use log::*;
 pub use outbound::*;
 pub use route::*;
+pub use trace::*;
 pub use util::*;
 
 use std::collections::{HashMap, HashSet};
@@ -168,6 +170,9 @@ pub struct RawConfig {
     /// Optional route section.
     #[serde(default, skip_serializing_if = "route::RawRouteConfig::is_default")]
     pub route: route::RawRouteConfig,
+    /// Optional node packet trace section.
+    #[serde(default, skip_serializing_if = "trace::RawTraceConfig::is_default")]
+    pub trace: trace::RawTraceConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +184,7 @@ pub struct Options {
     #[cfg(feature = "wireguard")]
     pub endpoints: Vec<endpoint::Endpoint>,
     pub route: route::RouteOptions,
+    pub trace: trace::TraceOptions,
 }
 
 pub fn check_config(content: &str) -> Result<(), HammerError> {
@@ -259,6 +265,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         endpoints: raw_endpoints,
         dns: raw_dns,
         route: raw_route,
+        trace: raw_trace,
     } = raw;
     #[cfg(not(feature = "wireguard"))]
     let RawConfig {
@@ -270,6 +277,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         outbounds: raw_outbounds,
         dns: raw_dns,
         route: raw_route,
+        trace: raw_trace,
     } = raw;
 
     let (inbounds, mut rules) = if raw_inbounds.is_empty() {
@@ -440,6 +448,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         #[cfg(feature = "wireguard")]
         endpoints,
         route: route_options,
+        trace: trace::build_trace_options(raw_trace)?,
     })
 }
 

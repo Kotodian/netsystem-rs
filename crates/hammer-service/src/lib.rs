@@ -10,6 +10,7 @@ pub mod net;
 mod probe;
 pub mod route;
 mod service;
+mod trace;
 pub mod tun;
 
 pub mod adapter {

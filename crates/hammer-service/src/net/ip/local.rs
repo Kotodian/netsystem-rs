@@ -4,7 +4,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeResult, PacketNextResolver, SocksAddr, process_cached_rewrite_next,
+    NodeResult, PacketNextResolver, PacketTrace, SocksAddr, TraceFormatter,
+    process_cached_rewrite_next, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -13,6 +14,10 @@ use crate::net::{DpoType, FibLookupResult, FibTableHandle};
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
 use super::{network_for_protocol, parse_ip_packet_with_chain_len};
+use crate::trace::codec::{
+    TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
+    put_u8, put_usize,
+};
 
 const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_TCP: u8 = 6;
@@ -45,6 +50,66 @@ pub enum IpLocalError {
     BadChecksum,
     SourceCheckFailed,
     UnknownProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpLocalTraceStage {
+    Head,
+    Receive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpLocalTrace {
+    pub stage: IpLocalTraceStage,
+    pub version: Option<IpVersion>,
+    pub protocol: Option<IpProtocol>,
+    pub transport_header_len: usize,
+    pub error: Option<u16>,
+    pub next: NodeId,
+}
+
+impl IpLocalTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let stage = match cursor.read_u8()? {
+            0 => IpLocalTraceStage::Head,
+            1 => IpLocalTraceStage::Receive,
+            _ => return None,
+        };
+        let trace = Self {
+            stage,
+            version: cursor.read_option_ip_version()?,
+            protocol: cursor.read_option_ip_protocol()?,
+            transport_header_len: cursor.read_usize()?,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for IpLocalTrace {
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_u8(
+            out,
+            match self.stage {
+                IpLocalTraceStage::Head => 0,
+                IpLocalTraceStage::Receive => 1,
+            },
+        );
+        put_option_ip_version(out, self.version);
+        put_option_ip_protocol(out, self.protocol);
+        put_usize(out, self.transport_header_len);
+        put_option_u16(out, self.error);
+        put_node(out, self.next);
+    }
+}
+
+fn format_ip_local_trace(bytes: &[u8]) -> String {
+    match IpLocalTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("IpLocalTrace invalid={bytes:?}"),
+    }
 }
 
 impl IpLocalError {
@@ -238,6 +303,11 @@ impl<G> Node<G> for IpLocalNode {
             &mut self.cached_next,
         )
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip_local_trace)
+    }
 }
 
 impl<G> Node<G> for IpReceiveNode {
@@ -259,6 +329,11 @@ impl<G> Node<G> for IpReceiveNode {
             &mut self.cached_next,
         )
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip_local_trace)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,6 +346,14 @@ impl LocalStage {
     #[inline(always)]
     fn is_head_of_feature_arc(self) -> bool {
         matches!(self, Self::Head | Self::Receive)
+    }
+
+    #[inline(always)]
+    fn trace_stage(self) -> IpLocalTraceStage {
+        match self {
+            Self::Head => IpLocalTraceStage::Head,
+            Self::Receive => IpLocalTraceStage::Receive,
+        }
     }
 }
 
@@ -327,22 +410,64 @@ fn process_index<G>(
     stage: LocalStage,
     feature_arc: Option<&FeatureArc<IpLocalArc>>,
 ) -> CoreResult<NodeId> {
+    let traced = runtime.should_trace_packet(index)?;
     let packet = packet_bytes(runtime, index)?;
+    let add_local_trace = |version, protocol, transport_header_len, error, next| {
+        if unlikely(traced) {
+            runtime.add_trace(
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version,
+                    protocol,
+                    transport_header_len,
+                    error,
+                    next,
+                },
+            )?;
+        }
+        Ok(())
+    };
     let parsed = match parse_ip_packet_with_chain_len(&packet, 0) {
         Ok(parsed) => parsed,
         Err(_) => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            return Ok(state.drop_next(next));
+            let resolved = state.drop_next(next);
+            add_local_trace(
+                None,
+                None,
+                0,
+                Some(IpLocalError::BadLength.code()),
+                resolved,
+            )?;
+            return Ok(resolved);
         }
     };
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
-            set_index_node_error_code(runtime, index, error_for_input(parsed.input_error).code())?;
-            return Ok(state.drop_next(next));
+            let error = error_for_input(parsed.input_error).code();
+            set_index_node_error_code(runtime, index, error)?;
+            let resolved = state.drop_next(next);
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                parsed.transport_header_len,
+                Some(error),
+                resolved,
+            )?;
+            return Ok(resolved);
         }
         IpInputTarget::Reassembly => {
             refresh_basic_metadata(runtime, index, &parsed, None)?;
-            return Ok(state.reassembly_next(next));
+            let resolved = state.reassembly_next(next);
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                parsed.transport_header_len,
+                None,
+                resolved,
+            )?;
+            return Ok(resolved);
         }
         IpInputTarget::Punt | IpInputTarget::Lookup | IpInputTarget::LookupMulticast => {}
     }
@@ -354,7 +479,15 @@ fn process_index<G>(
         Some(transport) => transport,
         None => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
-            return Ok(state.drop_next(next));
+            let resolved = state.drop_next(next);
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                0,
+                Some(IpLocalError::BadLength.code()),
+                resolved,
+            )?;
+            return Ok(resolved);
         }
     };
 
@@ -362,7 +495,15 @@ fn process_index<G>(
         Ok(transport_len) => transport_len,
         Err(error) => {
             set_index_node_error_code(runtime, index, error.code())?;
-            return Ok(state.drop_next(next));
+            let resolved = state.drop_next(next);
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                0,
+                Some(error.code()),
+                resolved,
+            )?;
+            return Ok(resolved);
         }
     };
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
@@ -370,12 +511,28 @@ fn process_index<G>(
     if stage.is_head_of_feature_arc() {
         if !source_check_passes(state, &parsed) {
             set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
-            return Ok(state.drop_next(next));
+            let resolved = state.drop_next(next);
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                transport_len.unwrap_or_default(),
+                Some(IpLocalError::SourceCheckFailed.code()),
+                resolved,
+            )?;
+            return Ok(resolved);
         }
         if let Some(feature_arc) = feature_arc {
             let next = state.protocol_next(next, parsed.protocol);
-            return runtime
-                .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next));
+            let resolved = runtime
+                .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next))?;
+            add_local_trace(
+                Some(parsed.version),
+                Some(parsed.protocol),
+                transport_len.unwrap_or_default(),
+                None,
+                resolved,
+            )?;
+            return Ok(resolved);
         }
     }
 
@@ -383,6 +540,19 @@ fn process_index<G>(
     if resolved == state.punt_next(next) && matches!(parsed.protocol, IpProtocol::Other(_)) {
         set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
     }
+    let error =
+        if resolved == state.punt_next(next) && matches!(parsed.protocol, IpProtocol::Other(_)) {
+            Some(IpLocalError::UnknownProtocol.code())
+        } else {
+            None
+        };
+    add_local_trace(
+        Some(parsed.version),
+        Some(parsed.protocol),
+        transport_len.unwrap_or_default(),
+        error,
+        resolved,
+    )?;
     Ok(resolved)
 }
 

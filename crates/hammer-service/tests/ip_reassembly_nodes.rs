@@ -5,13 +5,15 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, InternalNode,
-    Network, Node, NodeHandle, NodeResult, RouteMetadata, SocksAddr,
+    Network, Node, NodeHandle, NodeResult, RouteMetadata, SocksAddr, TraceControlPlane,
+    TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable, IpInputError, IpInputNext, IpInputNode,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+    IpInputTarget, IpInputTrace, IpProtocol, IpReassemblyDirectory, IpReassemblyHandoff,
+    IpReassemblyNext, IpReassemblyNode, IpReassemblyTrace, IpReassemblyTraceAction,
 };
 
 type PacketVec = hammer_infra::vec::Vec<u8>;
@@ -170,6 +172,17 @@ fn ip_input_routes_ipv4_options_to_options_next() {
     ));
     assert_internal_node(&input);
     let input = runtime.nodes().register_internal(input);
+    let control = TraceControlPlane::new(4);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: input,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 2);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_options_packet();
     let buffer = runtime
@@ -198,6 +211,14 @@ fn ip_input_routes_ipv4_options_to_options_next() {
             .expect("options counter"),
         1
     );
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    let trace = IpInputTrace::decode(&records[0].entries[0].payload_bytes).expect("ip input trace");
+    assert_eq!(trace.version, Some(hammer_service::net::IpVersion::V4));
+    assert_eq!(trace.protocol, Some(IpProtocol::Udp));
+    assert_eq!(trace.input_target, Some(IpInputTarget::Options));
+    assert_eq!(trace.input_error, Some(IpInputError::Options));
+    assert_eq!(trace.next, options);
     assert_eq!(lookup_capture.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
@@ -457,6 +478,17 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
+    let trace = TraceControlPlane::new(8);
+    trace.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: reassembly,
+            count: 2,
+        }],
+    });
+    runtime.set_trace_control(Some(trace.handle()), 4);
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(ip_input_nexts(sink, reassembly)));
@@ -491,6 +523,36 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     );
     assert_eq!(&*buffer_indices.borrow(), &[first_fragment]);
     assert_eq!(&*chained.borrow(), &[true]);
+    assert_eq!(trace.drain_completed(), 2);
+    let records = trace.take_records();
+    assert_eq!(records.len(), 2);
+    let traces = records
+        .iter()
+        .flat_map(|record| record.entries.iter())
+        .filter(|entry| entry.node_name == Some("ip-reassembly-node"))
+        .map(|entry| IpReassemblyTrace::decode(&entry.payload_bytes).expect("ip reassembly trace"))
+        .collect::<Vec<_>>();
+    assert_eq!(traces.len(), 2);
+    let key = traces[0].key.expect("trace key");
+    assert!(traces.iter().all(|trace| trace.key == Some(key)));
+    assert!(
+        traces
+            .iter()
+            .all(|trace| trace.current_worker == DataWorkerId::new(0))
+    );
+    assert!(
+        traces
+            .iter()
+            .all(|trace| trace.owner_worker == Some(DataWorkerId::new(0)))
+    );
+    assert!(
+        traces.iter().any(|trace| {
+            trace.action == IpReassemblyTraceAction::Pending && trace.next.is_none()
+        })
+    );
+    assert!(traces.iter().any(|trace| {
+        trace.action == IpReassemblyTraceAction::Reassembled && trace.next == Some(sink)
+    }));
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

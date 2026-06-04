@@ -1,14 +1,17 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use hammer_adapter::{BufferFrame, DataPlaneRuntime, Node, NodeResult};
+use hammer_adapter::{
+    BufferFrame, DataPlaneRuntime, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
+    TracePolicy,
+};
 use hammer_core::error::CoreResult;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::interface::{
     InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputControlPlane,
-    InterfaceOutputNode,
+    InterfaceOutputNode, InterfaceOutputTrace,
 };
-use hammer_service::tun::{MemoryTunDevice, TunOutputDriverNode};
+use hammer_service::tun::{MemoryTunDevice, TunOutputDriverNode, TunOutputTrace};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 enum TestNode {
@@ -175,6 +178,17 @@ fn interface_output_dispatches_to_registered_tx_node() {
     let output_control = InterfaceOutputControlPlane::new();
     output_control.register_tx(7, tx).expect("register tx node");
     let output_node = runtime.nodes().register_internal(output_control.node());
+    let trace = TraceControlPlane::new(8);
+    trace.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: output_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], b"interface-output");
     let index = runtime
@@ -201,6 +215,36 @@ fn interface_output_dispatches_to_registered_tx_node() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(output_device.drain_output(), vec![packet]);
+    assert_eq!(trace.drain_completed(), 1);
+    let records = trace.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, output_node);
+    assert_eq!(records[0].entries.len(), 2);
+    assert_eq!(
+        records[0].entries[0].node_name,
+        Some("interface-output-node")
+    );
+    assert_eq!(
+        InterfaceOutputTrace::decode(&records[0].entries[0].payload_bytes)
+            .expect("interface output trace"),
+        InterfaceOutputTrace {
+            egress_interface: Some(7),
+            tx_node: Some(tx),
+            error: None,
+            next: Some(tx),
+        }
+    );
+    assert_eq!(
+        records[0].entries[1].node_name,
+        Some("tun-output-driver-node")
+    );
+    assert_eq!(
+        TunOutputTrace::decode(&records[0].entries[1].payload_bytes).expect("tun output trace"),
+        TunOutputTrace {
+            mode: hammer_service::tun::TunDriverMode::Tun,
+            pending: 1,
+        }
+    );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

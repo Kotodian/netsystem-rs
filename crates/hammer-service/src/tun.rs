@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeResult, RouteMetadata,
-    TapEthernetMetadata,
+    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeRegistration, NodeResult,
+    PacketTrace, RouteMetadata, TapEthernetMetadata, TraceFormatter,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -53,6 +53,103 @@ impl TunDriverMode {
     #[inline(always)]
     pub const fn is_tap(self) -> bool {
         matches!(self, Self::Tap)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunInputTrace {
+    pub interface_index: Option<u32>,
+    pub mode: TunDriverMode,
+    pub received: usize,
+}
+
+impl TunInputTrace {
+    pub const ENCODED_LEN: usize = 14;
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let interface_index = match bytes[0] {
+            0 => None,
+            1 => Some(u32::from_le_bytes(bytes[1..5].try_into().ok()?)),
+            _ => return None,
+        };
+        let mode = decode_tun_driver_mode(bytes[5])?;
+        let received = usize::try_from(u64::from_le_bytes(bytes[6..14].try_into().ok()?)).ok()?;
+        Some(Self {
+            interface_index,
+            mode,
+            received,
+        })
+    }
+}
+
+impl PacketTrace for TunInputTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        out.push(u8::from(self.interface_index.is_some()));
+        out.extend_from_slice(&self.interface_index.unwrap_or_default().to_le_bytes());
+        out.push(encode_tun_driver_mode(self.mode));
+        out.extend_from_slice(&(self.received as u64).to_le_bytes());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunOutputTrace {
+    pub mode: TunDriverMode,
+    pub pending: usize,
+}
+
+impl TunOutputTrace {
+    pub const ENCODED_LEN: usize = 9;
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        let mode = decode_tun_driver_mode(bytes[0])?;
+        let pending = usize::try_from(u64::from_le_bytes(bytes[1..9].try_into().ok()?)).ok()?;
+        Some(Self { mode, pending })
+    }
+}
+
+impl PacketTrace for TunOutputTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        out.push(encode_tun_driver_mode(self.mode));
+        out.extend_from_slice(&(self.pending as u64).to_le_bytes());
+    }
+}
+
+fn format_tun_input_trace(bytes: &[u8]) -> String {
+    match TunInputTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("TunInputTrace invalid={bytes:?}"),
+    }
+}
+
+fn format_tun_output_trace(bytes: &[u8]) -> String {
+    match TunOutputTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("TunOutputTrace invalid={bytes:?}"),
+    }
+}
+
+#[inline]
+fn encode_tun_driver_mode(mode: TunDriverMode) -> u8 {
+    match mode {
+        TunDriverMode::Tun => 0,
+        TunDriverMode::Tap => 1,
+    }
+}
+
+#[inline]
+fn decode_tun_driver_mode(value: u8) -> Option<TunDriverMode> {
+    match value {
+        0 => Some(TunDriverMode::Tun),
+        1 => Some(TunDriverMode::Tap),
+        _ => None,
     }
 }
 
@@ -139,9 +236,11 @@ where
     ) -> CoreResult<NodeResult> {
         let max_batch = self.max_batch.min(frame.remaining_capacity());
         let first_new = frame.pending_len();
-        self.input
-            .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)?;
-        if let Some(interface_index) = self.ingress_interface_index()? {
+        let received =
+            self.input
+                .recv_frame(runtime, frame, &self.interface_id, self.mode, max_batch)?;
+        let interface_index = self.ingress_interface_index()?;
+        if let Some(interface_index) = interface_index {
             for index in frame.pending_indices()[first_new..].iter().copied() {
                 runtime
                     .get_buffer_mut(index)?
@@ -149,15 +248,51 @@ where
                     .ingress_interface = Some(interface_index);
             }
         }
+        let Some(current_node) = runtime.current_node() else {
+            return Err(CoreError::internal(
+                "tun input trace outside node processing",
+            ));
+        };
+        for index in frame.pending_indices()[first_new..].iter().copied() {
+            runtime.try_mark_trace(current_node, index)?;
+            runtime.add_trace_with(index, || {
+                Ok(TunInputTrace {
+                    interface_index,
+                    mode: self.mode,
+                    received,
+                })
+            })?;
+        }
         if frame.has_pending() {
             Ok(NodeResult::next_current(self.next))
         } else {
             Ok(NodeResult::drop())
         }
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tun_input_trace)
+    }
 }
 
-impl<I, G> DriverNode<G> for TunInputDriverNode<I> where I: TunPacketSource {}
+impl<I, G> DriverNode<G> for TunInputDriverNode<I>
+where
+    I: TunPacketSource,
+{
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("tun-input-driver-node", 1)
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.next)
+    }
+}
 
 pub struct TunOutputDriverNode<O> {
     output: O,
@@ -196,12 +331,37 @@ where
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
+        let pending = frame.pending_len();
+        for index in frame.pending_indices().iter().copied() {
+            runtime.add_trace_with(index, || {
+                Ok(TunOutputTrace {
+                    mode: self.mode,
+                    pending,
+                })
+            })?;
+        }
         self.output.send_frame(runtime, frame, self.mode)?;
         Ok(NodeResult::drop())
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_tun_output_trace)
+    }
 }
 
-impl<O, G> DriverNode<G> for TunOutputDriverNode<O> where O: TunPacketSink {}
+impl<O, G> DriverNode<G> for TunOutputDriverNode<O>
+where
+    O: TunPacketSink,
+{
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("tun-output-driver-node", 0)
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct MemoryTunDevice {

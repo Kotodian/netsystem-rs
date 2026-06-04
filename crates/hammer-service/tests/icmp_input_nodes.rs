@@ -4,10 +4,13 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeResult, RouteMetadata,
+    TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
-use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IpVersion};
+use hammer_service::net::{
+    IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IcmpInputTrace, IpVersion,
+};
 
 #[derive(Default)]
 struct CaptureState {
@@ -103,6 +106,17 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
         .register_type(IpVersion::V4, 8, echo)
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
+    let trace_control = TraceControlPlane::new(4);
+    trace_control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: icmp_input,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_packet(8, 0, b"echo4");
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_packet(&runtime, frame, &packet);
@@ -113,6 +127,15 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     assert_eq!(echo_state.borrow().packets, vec![packet]);
     assert!(echo_state.borrow().node_errors[0].is_none());
     assert!(punt_state.borrow().packets.is_empty());
+    assert_eq!(trace_control.drain_completed(), 1);
+    let records = trace_control.take_records();
+    let trace =
+        IcmpInputTrace::decode(&records[0].entries[0].payload_bytes).expect("icmp input trace");
+    assert_eq!(trace.version, Some(IpVersion::V4));
+    assert_eq!(trace.icmp_type, Some(8));
+    assert_eq!(trace.code, Some(0));
+    assert_eq!(trace.error, None);
+    assert_eq!(trace.next, echo);
 }
 
 #[test]

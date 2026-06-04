@@ -8,6 +8,7 @@ use std::task::{Context, Poll, Waker};
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::buffer::{BufferFrame, DataPlaneRuntime, FrameIndex};
+use crate::trace::TraceFormatter;
 
 pub mod next;
 
@@ -22,6 +23,11 @@ pub use next::{
 pub struct NodeId(u32);
 
 impl NodeId {
+    #[inline(always)]
+    pub const fn new(slot: u32) -> Self {
+        Self(slot)
+    }
+
     #[inline]
     pub fn slot(self) -> u32 {
         self.0
@@ -44,6 +50,11 @@ pub trait Node<G = Self> {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult>;
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        None
+    }
 }
 
 /// Packet graph node that drives an external input boundary.
@@ -278,6 +289,8 @@ struct NodeRuntimeInner<N> {
     queue: VecDeque<ScheduledFrame>,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
+    node_names: Vec<Option<&'static str>>,
+    node_trace_formatters: Vec<Option<TraceFormatter>>,
     next_nodes: Vec<Vec<Option<NodeId>>>,
     siblings: Vec<Vec<NodeId>>,
 }
@@ -315,6 +328,8 @@ impl<N> NodeRuntimeInner<N> {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
         self.nodes.push(Some(node));
         self.error_counters.push(NodeErrorCounters::default());
+        self.node_names.push(None);
+        self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
         self.siblings.push(Vec::new());
         id
@@ -325,6 +340,7 @@ impl<N> NodeRuntimeInner<N> {
         node: N,
         registration: NodeRegistration,
         initial_nexts: &[NodeId],
+        trace_formatter: Option<TraceFormatter>,
         _handle: Option<NodeHandle>,
     ) -> CoreResult<NodeId> {
         if initial_nexts.len() > MAX_NODE_NEXT_FRAMES {
@@ -355,9 +371,15 @@ impl<N> NodeRuntimeInner<N> {
         }
 
         match registration {
-            NodeRegistration::Plain => Ok(self.push_node(node)),
+            NodeRegistration::Plain => {
+                let id = self.push_node(node);
+                self.node_trace_formatters[id.0 as usize] = trace_formatter;
+                Ok(id)
+            }
             NodeRegistration::Next { name, next_count } => {
                 let id = self.push_node(node);
+                self.node_names[id.0 as usize] = Some(name);
+                self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 self.next_nodes[id.0 as usize] = initial_nexts
                     .iter()
                     .copied()
@@ -379,6 +401,8 @@ impl<N> NodeRuntimeInner<N> {
                     .cloned()
                     .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
                 let id = self.push_node(node);
+                self.node_names[id.0 as usize] = Some(name);
+                self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 self.next_nodes[id.0 as usize] = owner_nexts;
                 let mut group = self.siblings[owner.0 as usize].clone();
                 group.push(owner);
@@ -436,6 +460,8 @@ impl<N> Default for NodeRuntime<N> {
                 queue: VecDeque::new(),
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
+                node_names: Vec::new(),
+                node_trace_formatters: Vec::new(),
                 next_nodes: Vec::new(),
                 siblings: Vec::new(),
             })),
@@ -464,7 +490,8 @@ impl<N> NodeRuntime<N> {
     {
         let registration = DriverNode::<N>::node_registration(&node);
         let initial_nexts = DriverNode::<N>::node_initial_nexts(&node).to_vec();
-        self.register_declared(node.into(), registration, &initial_nexts)
+        let trace_formatter = Node::<N>::node_trace_formatter(&node);
+        self.register_declared(node.into(), registration, &initial_nexts, trace_formatter)
     }
 
     pub fn register_internal<I>(&self, node: I) -> NodeId
@@ -481,7 +508,8 @@ impl<N> NodeRuntime<N> {
     {
         let registration = InternalNode::<N>::node_registration(&node);
         let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
-        self.register_declared(node.into(), registration, &initial_nexts)
+        let trace_formatter = Node::<N>::node_trace_formatter(&node);
+        self.register_declared(node.into(), registration, &initial_nexts, trace_formatter)
     }
 
     pub fn register_internal_with_handle<I>(
@@ -494,11 +522,18 @@ impl<N> NodeRuntime<N> {
     {
         let registration = InternalNode::<N>::node_registration(&node);
         let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
-        self.register_declared_with_handle(handle, node.into(), registration, &initial_nexts)
+        let trace_formatter = Node::<N>::node_trace_formatter(&node);
+        self.register_declared_with_handle(
+            handle,
+            node.into(),
+            registration,
+            &initial_nexts,
+            trace_formatter,
+        )
     }
 
     pub fn register_with_handle(&self, handle: NodeHandle, node: N) -> CoreResult<NodeId> {
-        self.register_declared_with_handle(handle, node, NodeRegistration::Plain, &[])
+        self.register_declared_with_handle(handle, node, NodeRegistration::Plain, &[], None)
     }
 
     fn register_declared(
@@ -506,9 +541,10 @@ impl<N> NodeRuntime<N> {
         node: N,
         registration: NodeRegistration,
         initial_nexts: &[NodeId],
+        trace_formatter: Option<TraceFormatter>,
     ) -> CoreResult<NodeId> {
         let mut inner = self.inner.borrow_mut();
-        inner.register_declared(node, registration, initial_nexts, None)
+        inner.register_declared(node, registration, initial_nexts, trace_formatter, None)
     }
 
     fn register_declared_with_handle(
@@ -517,12 +553,19 @@ impl<N> NodeRuntime<N> {
         node: N,
         registration: NodeRegistration,
         initial_nexts: &[NodeId],
+        trace_formatter: Option<TraceFormatter>,
     ) -> CoreResult<NodeId> {
         let mut inner = self.inner.borrow_mut();
         if inner.handles.contains_key(&handle) {
             return Err(CoreError::internal("node handle already registered"));
         }
-        let id = inner.register_declared(node, registration, initial_nexts, Some(handle))?;
+        let id = inner.register_declared(
+            node,
+            registration,
+            initial_nexts,
+            trace_formatter,
+            Some(handle),
+        )?;
         inner.handles.insert(handle, id);
         Ok(id)
     }
@@ -539,6 +582,29 @@ impl<N> NodeRuntime<N> {
 
     pub fn pending_len(&self) -> usize {
         self.inner.borrow().queue.len()
+    }
+
+    #[inline]
+    pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
+        self.inner.borrow().declared_nodes.get(name).copied()
+    }
+
+    #[inline]
+    pub fn node_name(&self, node: NodeId) -> CoreResult<Option<&'static str>> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.node_names.get(node.0 as usize).copied().flatten())
+    }
+
+    #[inline]
+    pub fn node_trace_formatter(&self, node: NodeId) -> CoreResult<Option<TraceFormatter>> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner
+            .node_trace_formatters
+            .get(node.0 as usize)
+            .copied()
+            .flatten())
     }
 
     pub fn has_pending(&self) -> bool {
@@ -653,6 +719,13 @@ impl<N> NodeRuntime<N> {
             }
 
             frame.clear_next_node();
+            for index in frame.pending_indices().iter().copied() {
+                if let Err(err) = runtime.try_mark_trace(scheduled.node, index) {
+                    self.return_node(scheduled.node, node)?;
+                    let _ = runtime.release_taken_frame_index(scheduled.frame, frame);
+                    return Err(err);
+                }
+            }
             runtime.set_current_node(Some(scheduled.node));
             let result = node.process(runtime, &mut frame);
             runtime.set_current_node(None);

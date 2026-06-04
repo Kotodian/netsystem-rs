@@ -37,7 +37,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::DataPlaneBuffers;
+use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use hammer_core::error::{HammerError, HammerResult};
@@ -365,6 +365,24 @@ impl DataRuntimeContext {
                 })
             })
             .collect()
+    }
+
+    pub fn set_trace_control_on_workers(
+        &self,
+        control: Option<TraceControlHandle>,
+        packet_capacity: usize,
+    ) -> HammerResult<()> {
+        self.for_each_worker(move |_| {
+            DATA_PLANE_RUNTIME.with(|runtime| {
+                runtime.set_trace_control(control.clone(), packet_capacity);
+            });
+        })
+        .map(|_| ())
+    }
+
+    pub fn drain_trace_records_on_workers(&self, sink: TraceRecordSink) -> HammerResult<usize> {
+        self.for_each_worker(move |_| sink.drain_completed())
+            .map(|counts| counts.into_iter().sum())
     }
 
     fn first_handle(&self) -> &Handle {
@@ -893,6 +911,7 @@ fn next_data_runtime_context_id() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_adapter::{NodeId, TraceControlPlane, TraceInputPolicy, TracePolicy};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::thread;
     use std::time::Duration;
@@ -1020,6 +1039,51 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(during, 1);
         assert_eq!(after, 0);
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_context_sets_trace_control_on_each_worker_runtime() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-trace", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let control = TraceControlPlane::new(8);
+        control.publish(TracePolicy {
+            enabled: false,
+            record_capacity: 8,
+            packet_capacity: 2,
+            inputs: vec![TraceInputPolicy {
+                node: NodeId::new(0),
+                count: 2,
+            }],
+        });
+
+        context
+            .set_trace_control_on_workers(Some(control.handle()), 2)
+            .expect("set trace control");
+        let marks = context
+            .for_each_worker(|_| {
+                DATA_PLANE_RUNTIME.with(|runtime| {
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .expect("alloc packet");
+                    runtime
+                        .try_mark_trace(NodeId::new(0), index)
+                        .expect("disabled trace mark is no-op");
+                    let marked = runtime
+                        .get_buffer(index)
+                        .expect("buffer")
+                        .trace_mark()
+                        .is_some();
+                    runtime.free_index(index);
+                    marked
+                })
+            })
+            .expect("inspect workers");
+
+        assert_eq!(marks, vec![false, false]);
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
