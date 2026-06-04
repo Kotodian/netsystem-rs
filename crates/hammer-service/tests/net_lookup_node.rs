@@ -203,9 +203,10 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     runtime.set_trace_control(Some(trace.handle()), 4);
 
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(
+    push_marked_packet(
         &runtime,
         frame,
+        lookup,
         &ipv4_udp_packet([10, 0, 0, 1], 10_001, [203, 0, 113, 7], 53, b"default"),
     );
     push_packet(
@@ -612,6 +613,9 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let index = runtime
         .alloc_index_with_bytes(Default::default(), &packet)
         .expect("alloc packet");
+    runtime
+        .try_mark_trace(rewrite_node, index)
+        .expect("mark packet");
     {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
         buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
@@ -945,6 +949,25 @@ fn push_packet(
     let index = runtime
         .alloc_index_with_bytes(Default::default(), packet)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+) {
+    let index = runtime
+        .alloc_index_with_bytes(Default::default(), packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, index)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

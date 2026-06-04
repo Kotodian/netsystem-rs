@@ -719,13 +719,6 @@ impl<N> NodeRuntime<N> {
             }
 
             frame.clear_next_node();
-            for index in frame.pending_indices().iter().copied() {
-                if let Err(err) = runtime.try_mark_trace(scheduled.node, index) {
-                    self.return_node(scheduled.node, node)?;
-                    let _ = runtime.release_taken_frame_index(scheduled.frame, frame);
-                    return Err(err);
-                }
-            }
             runtime.set_current_node(Some(scheduled.node));
             let result = node.process(runtime, &mut frame);
             runtime.set_current_node(None);

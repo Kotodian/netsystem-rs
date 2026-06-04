@@ -271,6 +271,7 @@ fn drop_node_adds_trace_payload_before_freeing_packet() {
     let packet = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"drop")
         .expect("alloc packet");
+    runtime.try_mark_trace(drop, packet).expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -335,6 +336,9 @@ fn route_match_node_adds_trace_payload_for_route_decision() {
     let packet = runtime
         .alloc_index_with_bytes(metadata, b"route")
         .expect("alloc packet");
+    runtime
+        .try_mark_trace(route_match, packet)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

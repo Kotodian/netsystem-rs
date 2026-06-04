@@ -188,6 +188,7 @@ fn ip_input_routes_ipv4_options_to_options_next() {
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), &packet)
         .expect("alloc packet");
+    runtime.try_mark_trace(input, buffer).expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -246,12 +247,11 @@ fn ip_input_matches_vpp_ipv4_validation_nexts() {
             .with_source_table(error_sources.handle()),
     );
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
-    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
             reassembly_sink,
-            reassembly_drop,
+            drop,
         )));
     let input = runtime
         .nodes()
@@ -351,12 +351,11 @@ fn ip_input_matches_vpp_ipv6_validation_nexts() {
             .with_source_table(error_sources.handle()),
     );
     let reassembly_sink = runtime.nodes().register_internal(reassembly_capture.node());
-    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
         .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
             reassembly_sink,
-            reassembly_drop,
+            drop,
         )));
     let input = runtime
         .nodes()
@@ -423,13 +422,9 @@ fn ip_input_validates_chain_length_like_vpp_current_chain() {
     let lookup_capture = SinkCapture::new();
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime.nodes().register_internal(lookup_capture.node());
-    let reassembly_drop = runtime.nodes().register_internal(DropNode::new());
     let reassembly = runtime
         .nodes()
-        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(
-            lookup,
-            reassembly_drop,
-        )));
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(lookup, drop)));
     let input = runtime
         .nodes()
         .register_internal(IpInputNode::new(IpInputNext::nodes(
@@ -501,8 +496,8 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
     );
     let fragments = ipv4_fragments(&original, 100, 16);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &fragments[1]);
-    let first_fragment = push_packet(&runtime, frame, &fragments[0]);
+    push_marked_packet(&runtime, frame, reassembly, &fragments[1]);
+    let first_fragment = push_marked_packet(&runtime, frame, reassembly, &fragments[0]);
 
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
@@ -1031,6 +1026,26 @@ fn push_packet(
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), packet)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+    index
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+) -> hammer_adapter::BufferIndex {
+    let index = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, index)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

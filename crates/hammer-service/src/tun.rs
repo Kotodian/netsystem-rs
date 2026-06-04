@@ -154,6 +154,7 @@ fn decode_tun_driver_mode(value: u8) -> Option<TunDriverMode> {
 }
 
 pub struct TunInputDriverNode<I> {
+    node_name: &'static str,
     input: I,
     interface_id: String,
     interface_index: Option<u32>,
@@ -167,6 +168,7 @@ impl<I> TunInputDriverNode<I> {
     #[inline]
     pub fn new(input: I, interface_id: impl Into<String>, next: NodeId) -> Self {
         Self {
+            node_name: "tun-input-driver-node",
             input,
             interface_id: interface_id.into(),
             interface_index: None,
@@ -204,6 +206,12 @@ impl<I> TunInputDriverNode<I> {
     #[inline]
     pub fn with_mode(mut self, mode: TunDriverMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    #[inline]
+    pub fn with_node_name(mut self, node_name: &'static str) -> Self {
+        self.node_name = node_name;
         self
     }
 
@@ -285,7 +293,7 @@ where
     where
         Self: Sized,
     {
-        NodeRegistration::next("tun-input-driver-node", 1)
+        NodeRegistration::next(self.node_name, 1)
     }
 
     #[inline]
@@ -295,6 +303,7 @@ where
 }
 
 pub struct TunOutputDriverNode<O> {
+    node_name: &'static str,
     output: O,
     mode: TunDriverMode,
 }
@@ -303,6 +312,7 @@ impl<O> TunOutputDriverNode<O> {
     #[inline]
     pub fn new(output: O) -> Self {
         Self {
+            node_name: "tun-output-driver-node",
             output,
             mode: TunDriverMode::Tun,
         }
@@ -317,6 +327,12 @@ impl<O> TunOutputDriverNode<O> {
     #[inline]
     pub fn with_mode(mut self, mode: TunDriverMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    #[inline]
+    pub fn with_node_name(mut self, node_name: &'static str) -> Self {
+        self.node_name = node_name;
         self
     }
 }
@@ -359,7 +375,7 @@ where
     where
         Self: Sized,
     {
-        NodeRegistration::next("tun-output-driver-node", 0)
+        NodeRegistration::next(self.node_name, 0)
     }
 }
 

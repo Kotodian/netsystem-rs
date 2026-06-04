@@ -1195,6 +1195,9 @@ fn trace_control_records_marked_packet_entries_when_buffer_is_freed() {
         .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
         .expect("alloc packet");
     runtime
+        .try_mark_trace(trace_node, buffer)
+        .expect("mark packet");
+    runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
         .push_index(buffer)
@@ -1244,6 +1247,9 @@ fn trace_control_honors_input_quota() {
         let buffer = runtime
             .alloc_index_with_bytes(RouteMetadata::default(), payload)
             .expect("alloc packet");
+        runtime
+            .try_mark_trace(trace_node, buffer)
+            .expect("mark packet");
         runtime
             .get_frame_mut(frame)
             .expect("mutate frame")
@@ -1379,6 +1385,92 @@ fn trace_control_replacement_epoch_stops_old_policy_new_quota() {
 }
 
 #[test]
+fn trace_marked_old_epoch_packets_keep_recording_after_policy_replacement() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    let first_epoch = control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"oldpkt")
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_node, buffer)
+        .expect("mark packet");
+    let mark = runtime
+        .get_buffer(buffer)
+        .expect("buffer")
+        .trace_mark()
+        .expect("packet marked");
+    assert_eq!(mark.epoch, first_epoch);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: std::vec::Vec::new(),
+    });
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].epoch, first_epoch);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].payload_bytes, b"oldpkt");
+}
+
+#[test]
+fn scheduled_internal_nodes_do_not_start_packet_traces() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 0);
+    assert!(control.take_records().is_empty());
+}
+
+#[test]
 fn trace_add_trace_noops_for_unmarked_packets() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let payloads = Rc::new(RefCell::new(Vec::new()));
@@ -1444,8 +1536,8 @@ fn trace_completed_queue_overflow_drops_records_without_blocking() {
     });
     runtime.set_trace_control(Some(control.handle()), 8);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_test_packet(&runtime, frame, b"first");
-    push_test_packet(&runtime, frame, b"second");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
 
     assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
 
@@ -1478,9 +1570,9 @@ fn trace_publish_updates_completed_queue_capacity() {
     });
     runtime.set_trace_control(Some(control.handle()), 8);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_test_packet(&runtime, frame, b"first");
-    push_test_packet(&runtime, frame, b"second");
-    push_test_packet(&runtime, frame, b"third");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
+    push_marked_test_packet(&runtime, frame, trace_node, b"third");
 
     assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
 
@@ -1515,7 +1607,7 @@ fn trace_record_sink_prints_completed_records_through_control_logger() {
     });
     runtime.set_trace_control(Some(control.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_test_packet(&runtime, frame, b"packet");
+    push_marked_test_packet(&runtime, frame, trace_node, b"packet");
     assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
@@ -2669,6 +2761,25 @@ fn push_test_packet(
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), payload)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+}
+
+fn push_marked_test_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: NodeId,
+    payload: &[u8],
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), payload)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

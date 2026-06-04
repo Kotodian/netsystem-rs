@@ -298,13 +298,6 @@ impl DataPlaneTrace {
         formatter: Option<TraceFormatter>,
         payload_bytes: Vec<u8>,
     ) {
-        let control = self.inner.borrow().control.clone();
-        let Some(control) = control else {
-            return;
-        };
-        if !control.is_epoch_writable(mark.epoch) {
-            return;
-        }
         let slot = match mark.handle.checked_sub(1) {
             Some(slot) => slot as usize,
             None => return,

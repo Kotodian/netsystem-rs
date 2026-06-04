@@ -132,7 +132,7 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
         b"echo4-payload",
     );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet, RouteMetadata::default());
+    push_marked_packet(&runtime, frame, echo, &packet, RouteMetadata::default());
 
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
@@ -321,7 +321,7 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
         ..RouteMetadata::default()
     };
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &original, metadata);
+    push_marked_packet(&runtime, frame, error, &original, metadata);
 
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
@@ -532,6 +532,26 @@ fn push_packet(
     let buffer = runtime
         .alloc_index_with_bytes(metadata, packet)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+    metadata: RouteMetadata,
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(metadata, packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

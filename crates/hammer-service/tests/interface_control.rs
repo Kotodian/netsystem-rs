@@ -202,6 +202,9 @@ fn interface_output_dispatches_to_registered_tx_node() {
         )
         .expect("alloc packet");
     runtime
+        .try_mark_trace(output_node, index)
+        .expect("mark packet");
+    runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
         .push_index(index)

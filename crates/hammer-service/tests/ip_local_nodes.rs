@@ -197,9 +197,10 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
     runtime.set_trace_control(Some(trace_control.handle()), 4);
 
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(
+    push_marked_packet(
         &runtime,
         frame,
+        local,
         &ipv4_udp_packet(
             Ipv4Addr::new(10, 0, 0, 1),
             10_001,
@@ -812,6 +813,25 @@ fn push_packet(
     packet: &[u8],
 ) {
     push_packet_with_metadata(runtime, frame, RouteMetadata::default(), packet);
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
 }
 
 fn push_packet_on_interface(

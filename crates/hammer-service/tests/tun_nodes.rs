@@ -760,12 +760,14 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     let default_output_device = MemoryTunDevice::new();
     let override_output_device = MemoryTunDevice::new();
 
-    let default_output = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new(default_output_device.output()));
-    let override_output = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new(override_output_device.output()));
+    let default_output = runtime.nodes().register_driver(
+        TunOutputDriverNode::new(default_output_device.output())
+            .with_node_name("default-tun-output-driver-node"),
+    );
+    let override_output = runtime.nodes().register_driver(
+        TunOutputDriverNode::new(override_output_device.output())
+            .with_node_name("override-tun-output-driver-node"),
+    );
     let feature_metadata = Rc::new(RefCell::new(Vec::new()));
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),
