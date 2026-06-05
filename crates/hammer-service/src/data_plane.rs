@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Network,
     Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeRegistration, NodeResult, PacketTrace,
-    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter,
+    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -72,7 +72,7 @@ impl<G> Node<G> for DropNode {
     ) -> CoreResult<NodeResult> {
         let dropped = frame.pending_len();
         for index in frame.drain_pending() {
-            runtime.add_trace_with(index, || Ok(DropTrace { dropped }))?;
+            add_packet_trace!(runtime, index, DropTrace { dropped })?;
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
@@ -792,16 +792,20 @@ where
                 let metadata = buffer.metadata_mut();
                 self.router.prepare_route_metadata(metadata)?;
                 let decision = self.router.match_route(metadata)?;
-                let trace = traced.then(|| RouteMatchTrace {
-                    network: metadata.network,
-                    source: metadata.source.clone(),
-                    destination: metadata.destination.clone(),
-                    decision_kind: RouteDecisionKind::from(&decision),
-                });
+                let trace = if unlikely(traced) {
+                    Some(RouteMatchTrace {
+                        network: metadata.network,
+                        source: metadata.source.clone(),
+                        destination: metadata.destination.clone(),
+                        decision_kind: RouteDecisionKind::from(&decision),
+                    })
+                } else {
+                    None
+                };
                 metadata.route_decision = Some(decision);
                 drop(buffer);
                 if let Some(trace) = trace {
-                    runtime.add_trace(index, trace)?;
+                    add_packet_trace!(runtime, index, trace)?;
                 }
             }
         }

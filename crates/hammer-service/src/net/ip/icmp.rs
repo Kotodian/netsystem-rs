@@ -5,7 +5,7 @@ use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
     NodeId, NodeNextStorage, NodeResult, PacketNextResolver, PacketTrace, SocksAddr,
-    TraceFormatter, process_cached_rewrite_next, process_cached_speculative_next, unlikely,
+    TraceFormatter, add_packet_trace, process_cached_rewrite_next, process_cached_speculative_next,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::{
@@ -736,22 +736,6 @@ fn next_node_for_index<G>(
     index: BufferIndex,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeId> {
-    let traced = runtime.should_trace_packet(index)?;
-    let add_input_trace = |version, icmp_type, code, error, next| {
-        if unlikely(traced) {
-            runtime.add_trace(
-                index,
-                IcmpInputTrace {
-                    version,
-                    icmp_type,
-                    code,
-                    error,
-                    next,
-                },
-            )?;
-        }
-        Ok(())
-    };
     let packet = runtime.copy_current_chain(index)?;
     let packet = packet.as_ref();
     let parsed = match parse_ip_packet_with_chain_len(packet, 0) {
@@ -760,7 +744,17 @@ fn next_node_for_index<G>(
             let error = IcmpInputError::BadLength.code();
             set_index_node_error_code(runtime, index, error)?;
             let next = snapshot.default_next(IpVersion::V4);
-            add_input_trace(None, None, None, Some(error), next)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpInputTrace {
+                    version: None,
+                    icmp_type: None,
+                    code: None,
+                    error: Some(error),
+                    next,
+                },
+            )?;
             return Ok(next);
         }
     };
@@ -771,20 +765,50 @@ fn next_node_for_index<G>(
         IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
             let error = IcmpInputError::WrongProtocol.code();
             set_index_node_error_code(runtime, index, error)?;
-            add_input_trace(Some(version), None, None, Some(error), default_next)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpInputTrace {
+                    version: Some(version),
+                    icmp_type: None,
+                    code: None,
+                    error: Some(error),
+                    next: default_next,
+                },
+            )?;
             return Ok(default_next);
         }
     }
     let Some(icmp) = packet.get(parsed.transport_header_offset..parsed.packet_len) else {
         let error = IcmpInputError::BadLength.code();
         set_index_node_error_code(runtime, index, error)?;
-        add_input_trace(Some(version), None, None, Some(error), default_next)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: None,
+                code: None,
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     };
     if icmp.len() < ICMP_HEADER_MIN_LEN {
         let error = IcmpInputError::BadLength.code();
         set_index_node_error_code(runtime, index, error)?;
-        add_input_trace(Some(version), None, None, Some(error), default_next)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: None,
+                code: None,
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     }
 
@@ -795,12 +819,16 @@ fn next_node_for_index<G>(
         let error = IcmpInputError::UnknownType.code();
         set_index_node_error_code(runtime, index, error)?;
         let next = NodeNextStorage::next(snapshot, key);
-        add_input_trace(
-            Some(version),
-            Some(icmp_type),
-            Some(code),
-            Some(error),
-            next,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next,
+            },
         )?;
         return Ok(next);
     }
@@ -808,24 +836,32 @@ fn next_node_for_index<G>(
     if code > spec.max_code {
         let error = IcmpInputError::BadCode.code();
         set_index_node_error_code(runtime, index, error)?;
-        add_input_trace(
-            Some(version),
-            Some(icmp_type),
-            Some(code),
-            Some(error),
-            default_next,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
         )?;
         return Ok(default_next);
     }
     if icmp.len() < spec.min_len {
         let error = IcmpInputError::TooShort.code();
         set_index_node_error_code(runtime, index, error)?;
-        add_input_trace(
-            Some(version),
-            Some(icmp_type),
-            Some(code),
-            Some(error),
-            default_next,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
         )?;
         return Ok(default_next);
     }
@@ -836,19 +872,33 @@ fn next_node_for_index<G>(
     {
         let error = IcmpInputError::HopLimit.code();
         set_index_node_error_code(runtime, index, error)?;
-        add_input_trace(
-            Some(version),
-            Some(icmp_type),
-            Some(code),
-            Some(error),
-            default_next,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
         )?;
         return Ok(default_next);
     }
 
     runtime.get_buffer_mut(index)?.clear_node_error();
     let next = NodeNextStorage::next(snapshot, key);
-    add_input_trace(Some(version), Some(icmp_type), Some(code), None, next)?;
+    add_packet_trace!(
+        runtime,
+        index,
+        IcmpInputTrace {
+            version: Some(version),
+            icmp_type: Some(icmp_type),
+            code: Some(code),
+            error: None,
+            next,
+        },
+    )?;
     Ok(next)
 }
 
@@ -858,20 +908,6 @@ fn next_node_for_echo_request_index<G>(
     index: BufferIndex,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeId> {
-    let traced = runtime.should_trace_packet(index)?;
-    let add_echo_trace = |generated_len, error, next| {
-        if unlikely(traced) {
-            runtime.add_trace(
-                index,
-                IcmpEchoRequestTrace {
-                    generated_len,
-                    error,
-                    next,
-                },
-            )?;
-        }
-        Ok(())
-    };
     let packet = runtime.copy_current_chain(index)?;
     match build_echo_reply(packet.as_ref()) {
         Ok(generated) => {
@@ -879,14 +915,30 @@ fn next_node_for_echo_request_index<G>(
             replace_current_chain(runtime, index, &generated.packet)?;
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
             let resolved = NodeNextStorage::next(&next, IcmpEchoRequestNext::Lookup);
-            add_echo_trace(Some(generated_len), None, resolved)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpEchoRequestTrace {
+                    generated_len: Some(generated_len),
+                    error: None,
+                    next: resolved,
+                },
+            )?;
             Ok(resolved)
         }
         Err(error) => {
             let error = IcmpNodeError::from(error).code();
             set_index_node_error_code(runtime, index, error)?;
             let resolved = NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop);
-            add_echo_trace(None, Some(error), resolved)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpEchoRequestTrace {
+                    generated_len: None,
+                    error: Some(error),
+                    next: resolved,
+                },
+            )?;
             Ok(resolved)
         }
     }
@@ -899,29 +951,22 @@ fn next_node_for_icmp_error_index<G>(
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeId> {
-    let traced = runtime.should_trace_packet(index)?;
-    let add_error_trace =
-        |family, ingress_interface, local_source_present, generated_len, error, next| {
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    IcmpErrorTrace {
-                        family,
-                        ingress_interface,
-                        local_source_present,
-                        generated_len,
-                        error,
-                        next,
-                    },
-                )?;
-            }
-            Ok(())
-        };
     let Some(metadata) = runtime.with_metadata(index, |metadata| metadata.icmp_error)? else {
         let error = IcmpNodeError::MissingMetadata.code();
         set_index_node_error_code(runtime, index, error)?;
         let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
-        add_error_trace(None, None, false, None, Some(error), resolved)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpErrorTrace {
+                family: None,
+                ingress_interface: None,
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
+        )?;
         return Ok(resolved);
     };
     let Some(interface_index) =
@@ -930,13 +975,17 @@ fn next_node_for_icmp_error_index<G>(
         let error = IcmpNodeError::MissingIngressInterface.code();
         set_index_node_error_code(runtime, index, error)?;
         let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
-        add_error_trace(
-            Some(metadata.family()),
-            None,
-            false,
-            None,
-            Some(error),
-            resolved,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpErrorTrace {
+                family: Some(metadata.family()),
+                ingress_interface: None,
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
         )?;
         return Ok(resolved);
     };
@@ -946,13 +995,17 @@ fn next_node_for_icmp_error_index<G>(
         let error = IcmpNodeError::MissingSource.code();
         set_index_node_error_code(runtime, index, error)?;
         let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
-        add_error_trace(
-            Some(metadata.family()),
-            Some(interface_index),
-            false,
-            None,
-            Some(error),
-            resolved,
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpErrorTrace {
+                family: Some(metadata.family()),
+                ingress_interface: Some(interface_index),
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
         )?;
         return Ok(resolved);
     };
@@ -963,13 +1016,17 @@ fn next_node_for_icmp_error_index<G>(
             replace_current_chain(runtime, index, &generated.packet)?;
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
             let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Lookup);
-            add_error_trace(
-                Some(metadata.family()),
-                Some(interface_index),
-                true,
-                Some(generated_len),
-                None,
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpErrorTrace {
+                    family: Some(metadata.family()),
+                    ingress_interface: Some(interface_index),
+                    local_source_present: true,
+                    generated_len: Some(generated_len),
+                    error: None,
+                    next: resolved,
+                },
             )?;
             Ok(resolved)
         }
@@ -977,13 +1034,17 @@ fn next_node_for_icmp_error_index<G>(
             let error = IcmpNodeError::from(error).code();
             set_index_node_error_code(runtime, index, error)?;
             let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
-            add_error_trace(
-                Some(metadata.family()),
-                Some(interface_index),
-                true,
-                None,
-                Some(error),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpErrorTrace {
+                    family: Some(metadata.family()),
+                    ingress_interface: Some(interface_index),
+                    local_source_present: true,
+                    generated_len: None,
+                    error: Some(error),
+                    next: resolved,
+                },
             )?;
             Ok(resolved)
         }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, unlikely,
+    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
@@ -713,24 +713,22 @@ impl InterfaceOutputNode {
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
         let metadata = runtime.metadata(index)?;
-        let traced = runtime.get_buffer(index)?.trace_mark().is_some();
         let Some(interface_index) = metadata.egress_interface else {
             set_index_node_error_code(
                 runtime,
                 index,
                 InterfaceOutputNodeError::MissingEgressInterface.code(),
             )?;
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    InterfaceOutputTrace {
-                        egress_interface: None,
-                        tx_node: None,
-                        error: Some(InterfaceOutputNodeError::MissingEgressInterface.code()),
-                        next: None,
-                    },
-                )?;
-            }
+            add_packet_trace!(
+                runtime,
+                index,
+                InterfaceOutputTrace {
+                    egress_interface: None,
+                    tx_node: None,
+                    error: Some(InterfaceOutputNodeError::MissingEgressInterface.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
@@ -740,31 +738,29 @@ impl InterfaceOutputNode {
                 index,
                 InterfaceOutputNodeError::MissingTxNode.code(),
             )?;
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    InterfaceOutputTrace {
-                        egress_interface: Some(interface_index),
-                        tx_node: None,
-                        error: Some(InterfaceOutputNodeError::MissingTxNode.code()),
-                        next: None,
-                    },
-                )?;
-            }
-            runtime.free_index(index);
-            return Ok(None);
-        };
-        if unlikely(traced) {
-            runtime.add_trace(
+            add_packet_trace!(
+                runtime,
                 index,
                 InterfaceOutputTrace {
                     egress_interface: Some(interface_index),
-                    tx_node: Some(tx),
-                    error: None,
-                    next: Some(tx),
+                    tx_node: None,
+                    error: Some(InterfaceOutputNodeError::MissingTxNode.code()),
+                    next: None,
                 },
             )?;
-        }
+            runtime.free_index(index);
+            return Ok(None);
+        };
+        add_packet_trace!(
+            runtime,
+            index,
+            InterfaceOutputTrace {
+                egress_interface: Some(interface_index),
+                tx_node: Some(tx),
+                error: None,
+                next: Some(tx),
+            },
+        )?;
         Ok(Some(tx))
     }
 }

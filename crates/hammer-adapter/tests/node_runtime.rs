@@ -11,8 +11,8 @@ use hammer_adapter::{
     DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
     NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,
     NodeRegistration, NodeResult, PacketNextResolver, PacketTrace, RouteMetadata,
-    TraceControlPlane, TraceFormatter, TraceInputPolicy, TracePolicy, process_cached_rewrite_next,
-    process_cached_speculative_next,
+    TraceControlPlane, TraceFormatter, TraceInputPolicy, TracePolicy, add_packet_trace,
+    process_cached_rewrite_next, process_cached_speculative_next,
 };
 use hammer_core::config::{TraceInputOptions, TraceOptions};
 use hammer_core::error::{CoreError, CoreResult};
@@ -853,11 +853,13 @@ impl Node<TestNode> for TraceNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         for index in frame.pending_indices().iter().copied() {
-            runtime.add_trace_with(index, || {
-                Ok(TestPacketTrace {
+            add_packet_trace!(
+                runtime,
+                index,
+                TestPacketTrace {
                     bytes: runtime.copy_current(index)?.to_vec(),
-                })
-            })?;
+                },
+            )?;
         }
         Ok(NodeResult::next_current(self.next))
     }
@@ -1267,6 +1269,70 @@ fn trace_control_honors_input_quota() {
 }
 
 #[test]
+fn trace_control_publish_updates_packet_capacity_for_new_marks() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 1,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 2,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 1);
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first packet");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second packet");
+    runtime
+        .try_mark_trace(trace_node, first)
+        .expect("mark first packet");
+    runtime
+        .try_mark_trace(trace_node, second)
+        .expect("packet capacity rejects second mark");
+    assert!(
+        runtime
+            .get_buffer(second)
+            .expect("second buffer")
+            .trace_mark()
+            .is_none()
+    );
+
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime
+        .try_mark_trace(trace_node, second)
+        .expect("new packet capacity allows second mark");
+
+    assert!(
+        runtime
+            .get_buffer(second)
+            .expect("second buffer")
+            .trace_mark()
+            .is_some()
+    );
+    runtime.free_index(first);
+    runtime.free_index(second);
+}
+
+#[test]
 fn trace_control_disabled_policy_does_not_mark_packets() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let payloads = Rc::new(RefCell::new(Vec::new()));
@@ -1489,7 +1555,7 @@ fn trace_add_trace_noops_for_unmarked_packets() {
 }
 
 #[test]
-fn trace_add_trace_with_does_not_build_for_unmarked_packets() {
+fn trace_macro_does_not_build_for_unmarked_packets() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let payloads = Rc::new(RefCell::new(Vec::new()));
     let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
@@ -1502,14 +1568,13 @@ fn trace_add_trace_with_does_not_build_for_unmarked_packets() {
         .expect("alloc packet");
     let built = Cell::new(false);
 
-    runtime
-        .add_trace_with(index, || {
-            built.set(true);
-            Ok(TestPacketTrace {
-                bytes: b"should-not-build".to_vec(),
-            })
-        })
-        .expect("unmarked add_trace_with noops");
+    add_packet_trace!(runtime, index, {
+        built.set(true);
+        TestPacketTrace {
+            bytes: b"should-not-build".to_vec(),
+        }
+    },)
+    .expect("unmarked trace macro noops");
 
     assert!(!built.get(), "trace payload builder must stay cold");
     runtime.free_index(index);
@@ -2858,6 +2923,94 @@ fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storag
     assert_eq!(&*current_ptrs.borrow(), &[original_ptr]);
     assert_eq!(first_runtime.in_use_buffers(), 0);
     assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn traced_packet_handoff_records_entries_on_target_worker() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(3);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = second_runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    assert_eq!(sink, NodeId::new(0));
+    let target_trace = second_runtime
+        .nodes()
+        .register_internal_with_handle(SINK_HANDLE, TraceNode { next: sink })
+        .expect("register target trace node");
+    let source_sink = first_runtime.nodes().register(TestNode::Count(CountNode {
+        count: Rc::new(Cell::new(0)),
+    }));
+    let source_trace = first_runtime
+        .nodes()
+        .register_internal(TraceNode { next: source_sink });
+    let handoff_node = first_runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: source_trace,
+            count: 1,
+        }],
+    });
+    let trace_handle = control.handle();
+    first_runtime.set_trace_control(Some(trace_handle.clone()), 2);
+    second_runtime.set_trace_control(Some(trace_handle), 2);
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    first_runtime
+        .try_mark_trace(source_trace, buffer)
+        .expect("mark packet on source worker");
+    first_runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(
+        first_runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run source"), 1);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run target"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, source_trace);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].node, target_trace);
+    assert_eq!(records[0].entries[0].node_name, Some("trace-input"));
+    assert_eq!(records[0].entries[0].payload_bytes, b"packet");
 }
 
 #[test]

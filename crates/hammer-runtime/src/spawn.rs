@@ -373,9 +373,10 @@ impl DataRuntimeContext {
         control: Option<TraceControlHandle>,
         packet_capacity: usize,
     ) -> HammerResult<()> {
+        let _ = packet_capacity;
         self.for_each_worker(move |_| {
             DATA_PLANE_RUNTIME.with(|runtime| {
-                runtime.set_trace_control(control.clone(), packet_capacity);
+                runtime.set_trace_control(control.clone(), 0);
             });
         })
         .map(|_| ())

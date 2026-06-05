@@ -1060,6 +1060,11 @@ impl<N> DataPlaneRuntime<N> {
     }
 
     #[inline]
+    pub fn may_mark_trace(&self, node: NodeId) -> bool {
+        self.buffers.trace.may_mark(node)
+    }
+
+    #[inline]
     pub fn try_mark_trace(&self, node: NodeId, index: BufferIndex) -> CoreResult<()> {
         if !self.buffers.trace.may_mark(node) {
             return Ok(());
@@ -1097,19 +1102,6 @@ impl<N> DataPlaneRuntime<N> {
         Ok(crate::trace::unlikely(
             self.get_buffer(index)?.trace_mark().is_some(),
         ))
-    }
-
-    #[inline(always)]
-    pub fn add_trace_with<T, F>(&self, index: BufferIndex, build: F) -> CoreResult<()>
-    where
-        T: PacketTrace,
-        F: FnOnce() -> CoreResult<T>,
-    {
-        if !self.should_trace_packet(index)? {
-            return Ok(());
-        }
-        let trace = build()?;
-        self.add_trace(index, trace)
     }
 
     #[inline]

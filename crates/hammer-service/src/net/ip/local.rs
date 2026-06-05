@@ -4,8 +4,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeResult, PacketNextResolver, PacketTrace, SocksAddr, TraceFormatter,
-    process_cached_rewrite_next, unlikely,
+    NodeResult, PacketNextResolver, PacketTrace, SocksAddr, TraceFormatter, add_packet_trace,
+    process_cached_rewrite_next,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -410,35 +410,23 @@ fn process_index<G>(
     stage: LocalStage,
     feature_arc: Option<&FeatureArc<IpLocalArc>>,
 ) -> CoreResult<NodeId> {
-    let traced = runtime.should_trace_packet(index)?;
     let packet = packet_bytes(runtime, index)?;
-    let add_local_trace = |version, protocol, transport_header_len, error, next| {
-        if unlikely(traced) {
-            runtime.add_trace(
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version,
-                    protocol,
-                    transport_header_len,
-                    error,
-                    next,
-                },
-            )?;
-        }
-        Ok(())
-    };
     let parsed = match parse_ip_packet_with_chain_len(&packet, 0) {
         Ok(parsed) => parsed,
         Err(_) => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
-            add_local_trace(
-                None,
-                None,
-                0,
-                Some(IpLocalError::BadLength.code()),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: None,
+                    protocol: None,
+                    transport_header_len: 0,
+                    error: Some(IpLocalError::BadLength.code()),
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -448,24 +436,34 @@ fn process_index<G>(
             let error = error_for_input(parsed.input_error).code();
             set_index_node_error_code(runtime, index, error)?;
             let resolved = state.drop_next(next);
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                parsed.transport_header_len,
-                Some(error),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: parsed.transport_header_len,
+                    error: Some(error),
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
         IpInputTarget::Reassembly => {
             refresh_basic_metadata(runtime, index, &parsed, None)?;
             let resolved = state.reassembly_next(next);
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                parsed.transport_header_len,
-                None,
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: parsed.transport_header_len,
+                    error: None,
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -480,12 +478,17 @@ fn process_index<G>(
         None => {
             set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
             let resolved = state.drop_next(next);
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                0,
-                Some(IpLocalError::BadLength.code()),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: 0,
+                    error: Some(IpLocalError::BadLength.code()),
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -496,12 +499,17 @@ fn process_index<G>(
         Err(error) => {
             set_index_node_error_code(runtime, index, error.code())?;
             let resolved = state.drop_next(next);
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                0,
-                Some(error.code()),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: 0,
+                    error: Some(error.code()),
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -512,12 +520,17 @@ fn process_index<G>(
         if !source_check_passes(state, &parsed) {
             set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
             let resolved = state.drop_next(next);
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                transport_len.unwrap_or_default(),
-                Some(IpLocalError::SourceCheckFailed.code()),
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: transport_len.unwrap_or_default(),
+                    error: Some(IpLocalError::SourceCheckFailed.code()),
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -525,12 +538,17 @@ fn process_index<G>(
             let next = state.protocol_next(next, parsed.protocol);
             let resolved = runtime
                 .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next))?;
-            add_local_trace(
-                Some(parsed.version),
-                Some(parsed.protocol),
-                transport_len.unwrap_or_default(),
-                None,
-                resolved,
+            add_packet_trace!(
+                runtime,
+                index,
+                IpLocalTrace {
+                    stage: stage.trace_stage(),
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    transport_header_len: transport_len.unwrap_or_default(),
+                    error: None,
+                    next: resolved,
+                },
             )?;
             return Ok(resolved);
         }
@@ -546,12 +564,17 @@ fn process_index<G>(
         } else {
             None
         };
-    add_local_trace(
-        Some(parsed.version),
-        Some(parsed.protocol),
-        transport_len.unwrap_or_default(),
-        error,
-        resolved,
+    add_packet_trace!(
+        runtime,
+        index,
+        IpLocalTrace {
+            stage: stage.trace_stage(),
+            version: Some(parsed.version),
+            protocol: Some(parsed.protocol),
+            transport_header_len: transport_len.unwrap_or_default(),
+            error,
+            next: resolved,
+        },
     )?;
     Ok(resolved)
 }

@@ -1,6 +1,7 @@
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
-    NodeNextEnqueue, NodeNextStorage, NodeResult, PacketTrace, SocksAddr, TraceFormatter, unlikely,
+    NodeNextEnqueue, NodeNextStorage, NodeResult, PacketTrace, SocksAddr, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -148,7 +149,7 @@ where
             },
         )?;
         for (index, trace) in traces {
-            runtime.add_trace(index, trace)?;
+            add_packet_trace!(runtime, index, trace)?;
         }
         if let Some(node) = last_next {
             self.cached_next = Some(node);
@@ -221,14 +222,18 @@ where
                 set_buffer_node_error_code(runtime, buffer, IpInputError::BadLength.code())?;
                 let resolved = NodeNextStorage::next(&next, IpInputNext::Drop);
                 (
-                    unlikely(traced).then(|| IpInputTrace {
-                        version: None,
-                        protocol: None,
-                        input_target: None,
-                        input_error: Some(IpInputError::BadLength),
-                        packet_len: 0,
-                        next: resolved,
-                    }),
+                    if unlikely(traced) {
+                        Some(IpInputTrace {
+                            version: None,
+                            protocol: None,
+                            input_target: None,
+                            input_error: Some(IpInputError::BadLength),
+                            packet_len: 0,
+                            next: resolved,
+                        })
+                    } else {
+                        None
+                    },
                     resolved,
                 )
             }
@@ -288,14 +293,18 @@ where
                     }
                 };
                 (
-                    unlikely(traced).then(|| IpInputTrace {
-                        version: Some(parsed.version),
-                        protocol: Some(parsed.protocol),
-                        input_target: Some(parsed.input_target),
-                        input_error: Some(parsed.input_error),
-                        packet_len: parsed.packet_len,
-                        next: resolved,
-                    }),
+                    if unlikely(traced) {
+                        Some(IpInputTrace {
+                            version: Some(parsed.version),
+                            protocol: Some(parsed.protocol),
+                            input_target: Some(parsed.input_target),
+                            input_error: Some(parsed.input_error),
+                            packet_len: parsed.packet_len,
+                            next: resolved,
+                        })
+                    } else {
+                        None
+                    },
                     resolved,
                 )
             }

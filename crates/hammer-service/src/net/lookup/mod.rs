@@ -6,7 +6,8 @@ use std::sync::Arc;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
     ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextFrames, NodeNextVectorEnqueue,
-    NodeRegistration, NodeResult, PacketTrace, RouteMetadata, TraceFormatter, unlikely,
+    NodeRegistration, NodeResult, PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
+    unlikely,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -458,7 +459,7 @@ impl<G> Node<G> for IpLookupNode {
                 },
             )?;
         for (index, trace) in traces {
-            runtime.add_trace(index, trace)?;
+            add_packet_trace!(runtime, index, trace)?;
         }
         self.cached_next = Some(cached_next);
         Ok(result)
@@ -513,42 +514,39 @@ impl AdjacencyRewriteNode {
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
         let metadata = runtime.metadata(index)?;
-        let traced = runtime.get_buffer(index)?.trace_mark().is_some();
         let Some(forwarding) = metadata.forwarding else {
             set_index_node_error_code(
                 runtime,
                 index,
                 AdjacencyRewriteNodeError::MissingForwarding.code(),
             )?;
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    AdjacencyRewriteTrace {
-                        dpo_index: None,
-                        egress_interface: None,
-                        rewrite_len: 0,
-                        error: Some(AdjacencyRewriteNodeError::MissingForwarding.code()),
-                        next: None,
-                    },
-                )?;
-            }
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: None,
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::MissingForwarding.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
             set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    AdjacencyRewriteTrace {
-                        dpo_index: Some(forwarding.dpo_index),
-                        egress_interface: None,
-                        rewrite_len: 0,
-                        error: Some(AdjacencyRewriteNodeError::WrongDpo.code()),
-                        next: None,
-                    },
-                )?;
-            }
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: Some(forwarding.dpo_index),
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::WrongDpo.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         }
@@ -562,18 +560,17 @@ impl AdjacencyRewriteNode {
                 index,
                 AdjacencyRewriteNodeError::MissingAdjacency.code(),
             )?;
-            if unlikely(traced) {
-                runtime.add_trace(
-                    index,
-                    AdjacencyRewriteTrace {
-                        dpo_index: Some(forwarding.dpo_index),
-                        egress_interface: None,
-                        rewrite_len: 0,
-                        error: Some(AdjacencyRewriteNodeError::MissingAdjacency.code()),
-                        next: None,
-                    },
-                )?;
-            }
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: Some(forwarding.dpo_index),
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::MissingAdjacency.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
@@ -581,18 +578,17 @@ impl AdjacencyRewriteNode {
         let egress_interface = adjacency.egress_interface;
         let next = adjacency.next;
         apply_adjacency_rewrite(runtime, index, adjacency)?;
-        if unlikely(traced) {
-            runtime.add_trace(
-                index,
-                AdjacencyRewriteTrace {
-                    dpo_index: Some(forwarding.dpo_index),
-                    egress_interface,
-                    rewrite_len,
-                    error: None,
-                    next: Some(next),
-                },
-            )?;
-        }
+        add_packet_trace!(
+            runtime,
+            index,
+            AdjacencyRewriteTrace {
+                dpo_index: Some(forwarding.dpo_index),
+                egress_interface,
+                rewrite_len,
+                error: None,
+                next: Some(next),
+            },
+        )?;
         Ok(Some(next))
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,9 +78,6 @@ pub struct DataPlaneTrace {
 #[derive(Debug, Default)]
 struct DataPlaneTraceState {
     control: Option<TraceControlHandle>,
-    packets: Vec<Option<PacketTraceState>>,
-    free: Vec<u32>,
-    packet_capacity: usize,
 }
 
 #[derive(Debug)]
@@ -93,6 +90,17 @@ struct PacketTraceState {
 
 pub trait PacketTrace {
     fn encode_trace(&self, out: &mut Vec<u8>);
+}
+
+#[macro_export]
+macro_rules! add_packet_trace {
+    ($runtime:expr, $index:expr, $trace:expr $(,)?) => {{
+        match $runtime.should_trace_packet($index) {
+            Ok(traced) if $crate::trace::unlikely(traced) => $runtime.add_trace($index, $trace),
+            Ok(_) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }};
 }
 
 #[inline(always)]
@@ -126,6 +134,8 @@ struct TraceControlInner {
     completed_capacity: AtomicUsize,
     dropped_completed: AtomicUsize,
     next_epoch: AtomicU64,
+    next_handle: AtomicU64,
+    marking_inputs: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -133,6 +143,7 @@ struct TraceControlState {
     epoch: u64,
     policy: TracePolicy,
     quotas: FlatHashTable<u32, u32>,
+    active: HashMap<u32, PacketTraceState>,
     ring: VecDeque<TraceRecord>,
 }
 
@@ -145,6 +156,7 @@ impl TraceControlPlane {
                     epoch: 0,
                     policy: TracePolicy::disabled(record_capacity, 1),
                     quotas: FlatHashTable::new(),
+                    active: HashMap::new(),
                     ring: VecDeque::with_capacity(record_capacity),
                 }),
                 completed: SegQueue::new(),
@@ -152,6 +164,8 @@ impl TraceControlPlane {
                 completed_capacity: AtomicUsize::new(record_capacity),
                 dropped_completed: AtomicUsize::new(0),
                 next_epoch: AtomicU64::new(1),
+                next_handle: AtomicU64::new(1),
+                marking_inputs: AtomicUsize::new(0),
             }),
         }
     }
@@ -186,6 +200,14 @@ impl TraceControlPlane {
         } else {
             FlatHashTable::new()
         };
+        let marking_inputs = if policy.enabled {
+            policy.inputs.len()
+        } else {
+            0
+        };
+        self.inner
+            .marking_inputs
+            .store(marking_inputs, Ordering::Release);
         let record_capacity = policy.record_capacity.max(1);
         self.inner
             .completed_capacity
@@ -248,46 +270,21 @@ impl TraceControlPlane {
 impl DataPlaneTrace {
     pub fn set_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
         let mut state = self.inner.borrow_mut();
+        let _ = packet_capacity;
         state.control = control;
-        state.packet_capacity = packet_capacity;
-        if state.packets.len() > packet_capacity {
-            state.packets.truncate(packet_capacity);
-            state.free.retain(|slot| (*slot as usize) < packet_capacity);
-        }
     }
 
     pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<TraceMark> {
-        {
-            let state = self.inner.borrow();
-            state.control.as_ref()?;
-            if !state.has_packet_capacity() {
-                return None;
-            }
-        }
-
         let control = self.inner.borrow().control.clone()?;
-        let mark = control.try_mark(node)?;
-        let mut state = self.inner.borrow_mut();
-        let slot = state.alloc_packet_slot()?;
-        state.packets[slot as usize] = Some(PacketTraceState {
-            epoch: mark.epoch,
-            input_node: node,
-            input_node_name: node_name,
-            entries: Vec::new(),
-        });
-        Some(TraceMark {
-            handle: slot + 1,
-            epoch: mark.epoch,
-        })
+        control.try_mark(node, node_name)
     }
 
     pub fn may_mark(&self, node: NodeId) -> bool {
         let state = self.inner.borrow();
-        state.has_packet_capacity()
-            && state
-                .control
-                .as_ref()
-                .is_some_and(|control| control.may_mark(node))
+        state
+            .control
+            .as_ref()
+            .is_some_and(|control| control.may_mark(node))
     }
 
     pub fn add_entry(
@@ -298,12 +295,83 @@ impl DataPlaneTrace {
         formatter: Option<TraceFormatter>,
         payload_bytes: Vec<u8>,
     ) {
-        let slot = match mark.handle.checked_sub(1) {
-            Some(slot) => slot as usize,
-            None => return,
+        let Some(control) = self.inner.borrow().control.clone() else {
+            return;
         };
-        let mut state = self.inner.borrow_mut();
-        let Some(Some(packet)) = state.packets.get_mut(slot) else {
+        control.add_entry(mark, node, node_name, formatter, payload_bytes);
+    }
+
+    pub fn finalize(&self, mark: TraceMark) {
+        let Some(control) = self.inner.borrow().control.clone() else {
+            return;
+        };
+        control.finalize(mark);
+    }
+}
+
+impl TraceControlHandle {
+    pub fn may_mark(&self, node: NodeId) -> bool {
+        if self.inner.marking_inputs.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("trace control lock poisoned");
+        state.policy.enabled
+            && state.active.len() < state.policy.packet_capacity.max(1)
+            && state.quotas.lookup(&node.slot()).unwrap_or(0) > 0
+    }
+
+    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<TraceMark> {
+        if self.inner.marking_inputs.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("trace control lock poisoned");
+        if !state.policy.enabled {
+            return None;
+        }
+        if state.active.len() >= state.policy.packet_capacity.max(1) {
+            return None;
+        }
+        let epoch = state.epoch;
+        let quota = state.quotas.lookup(&node.slot())?;
+        if quota == 0 {
+            return None;
+        }
+        state.quotas.insert(node.slot(), quota - 1);
+        let handle = self.next_trace_handle(&state.active);
+        state.active.insert(
+            handle,
+            PacketTraceState {
+                epoch,
+                input_node: node,
+                input_node_name: node_name,
+                entries: Vec::new(),
+            },
+        );
+        Some(TraceMark { handle, epoch })
+    }
+
+    pub fn add_entry(
+        &self,
+        mark: TraceMark,
+        node: NodeId,
+        node_name: Option<&'static str>,
+        formatter: Option<TraceFormatter>,
+        payload_bytes: Vec<u8>,
+    ) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .expect("trace control lock poisoned");
+        let Some(packet) = state.active.get_mut(&mark.handle) else {
             return;
         };
         if packet.epoch != mark.epoch {
@@ -318,79 +386,32 @@ impl DataPlaneTrace {
     }
 
     pub fn finalize(&self, mark: TraceMark) {
-        let slot = match mark.handle.checked_sub(1) {
-            Some(slot) => slot as usize,
-            None => return,
+        let packet = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("trace control lock poisoned");
+            let Some(packet) = state.active.get(&mark.handle) else {
+                return;
+            };
+            if packet.epoch != mark.epoch {
+                return;
+            }
+            state
+                .active
+                .remove(&mark.handle)
+                .expect("active trace packet disappeared")
         };
-        let control = self.inner.borrow().control.clone();
-        let mut state = self.inner.borrow_mut();
-        let Some(packet_slot) = state.packets.get_mut(slot) else {
-            return;
-        };
-        let Some(packet) = packet_slot.take() else {
-            return;
-        };
-        state.free.push(slot as u32);
-        drop(state);
         if packet.entries.is_empty() {
             return;
         }
-        if let Some(control) = control {
-            control.push_completed_record(TraceRecord {
-                epoch: packet.epoch,
-                input_node: packet.input_node,
-                input_node_name: packet.input_node_name,
-                entries: packet.entries,
-            });
-        }
-    }
-}
-
-impl DataPlaneTraceState {
-    fn has_packet_capacity(&self) -> bool {
-        self.packet_capacity != 0
-            && (!self.free.is_empty() || self.packets.len() < self.packet_capacity)
-    }
-
-    fn alloc_packet_slot(&mut self) -> Option<u32> {
-        if let Some(slot) = self.free.pop() {
-            return Some(slot);
-        }
-        if self.packets.len() >= self.packet_capacity {
-            return None;
-        }
-        let slot = u32::try_from(self.packets.len()).ok()?;
-        self.packets.push(None);
-        Some(slot)
-    }
-}
-
-impl TraceControlHandle {
-    pub fn may_mark(&self, node: NodeId) -> bool {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.policy.enabled && state.quotas.lookup(&node.slot()).unwrap_or(0) > 0
-    }
-
-    pub fn try_mark(&self, node: NodeId) -> Option<TraceMark> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        if !state.policy.enabled {
-            return None;
-        }
-        let epoch = state.epoch;
-        let quota = state.quotas.lookup(&node.slot())?;
-        if quota == 0 {
-            return None;
-        }
-        state.quotas.insert(node.slot(), quota - 1);
-        Some(TraceMark { handle: 0, epoch })
+        self.push_completed_record(TraceRecord {
+            epoch: packet.epoch,
+            input_node: packet.input_node,
+            input_node_name: packet.input_node_name,
+            entries: packet.entries,
+        });
     }
 
     pub fn is_epoch_writable(&self, epoch: u64) -> bool {
@@ -400,6 +421,16 @@ impl TraceControlHandle {
             .lock()
             .expect("trace control lock poisoned");
         state.epoch == epoch
+    }
+
+    fn next_trace_handle(&self, active: &HashMap<u32, PacketTraceState>) -> u32 {
+        loop {
+            let value = self.inner.next_handle.fetch_add(1, Ordering::AcqRel);
+            let handle = (value as u32).max(1);
+            if !active.contains_key(&handle) {
+                return handle;
+            }
+        }
     }
 
     pub fn push_completed_record(&self, record: TraceRecord) {

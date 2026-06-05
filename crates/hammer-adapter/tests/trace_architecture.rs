@@ -24,6 +24,7 @@ fn trace_has_no_global_enable_or_enum_plumbing() {
     let runtime_spawn = include_str!("../../hammer-runtime/src/spawn.rs");
     let global_enable = concat!("set_", "trace_", "enabled");
     let enum_payload_api = concat!("add_", "trace_", "payload");
+    let closure_payload_api = concat!("add_", "trace_", "with");
 
     for source in [adapter_trace, adapter_buffer, runtime_spawn] {
         assert!(
@@ -34,7 +35,15 @@ fn trace_has_no_global_enable_or_enum_plumbing() {
             !source.contains(enum_payload_api),
             "adapter/runtime must not expose enum-payload trace plumbing"
         );
+        assert!(
+            !source.contains(closure_payload_api),
+            "trace append should use the packet trace macro, not closure payload plumbing"
+        );
     }
+    assert!(
+        adapter_trace.contains("macro_rules! add_packet_trace"),
+        "adapter trace API should expose the packet trace append macro"
+    );
 }
 
 #[test]

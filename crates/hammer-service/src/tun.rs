@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeRegistration, NodeResult,
-    PacketTrace, RouteMetadata, TapEthernetMetadata, TraceFormatter,
+    PacketTrace, RouteMetadata, TapEthernetMetadata, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -256,20 +256,21 @@ where
                     .ingress_interface = Some(interface_index);
             }
         }
-        let Some(current_node) = runtime.current_node() else {
-            return Err(CoreError::internal(
-                "tun input trace outside node processing",
-            ));
-        };
-        for index in frame.pending_indices()[first_new..].iter().copied() {
-            runtime.try_mark_trace(current_node, index)?;
-            runtime.add_trace_with(index, || {
-                Ok(TunInputTrace {
-                    interface_index,
-                    mode: self.mode,
-                    received,
-                })
-            })?;
+        if let Some(current_node) = runtime.current_node()
+            && unlikely(runtime.may_mark_trace(current_node))
+        {
+            for index in frame.pending_indices()[first_new..].iter().copied() {
+                runtime.try_mark_trace(current_node, index)?;
+                add_packet_trace!(
+                    runtime,
+                    index,
+                    TunInputTrace {
+                        interface_index,
+                        mode: self.mode,
+                        received,
+                    },
+                )?;
+            }
         }
         if frame.has_pending() {
             Ok(NodeResult::next_current(self.next))
@@ -349,12 +350,14 @@ where
     ) -> CoreResult<NodeResult> {
         let pending = frame.pending_len();
         for index in frame.pending_indices().iter().copied() {
-            runtime.add_trace_with(index, || {
-                Ok(TunOutputTrace {
+            add_packet_trace!(
+                runtime,
+                index,
+                TunOutputTrace {
                     mode: self.mode,
                     pending,
-                })
-            })?;
+                },
+            )?;
         }
         self.output.send_frame(runtime, frame, self.mode)?;
         Ok(NodeResult::drop())

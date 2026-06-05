@@ -194,8 +194,10 @@ impl RuntimeService {
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
         trace.publish_options(&options.trace, |_name| None)?;
-        data_context
-            .set_trace_control_on_workers(Some(trace.handle()), options.trace.packet_capacity)?;
+        data_context.set_trace_control_on_workers(
+            trace_worker_control(&options.trace).then(|| trace.handle()),
+            options.trace.packet_capacity,
+        )?;
         let trace_drain_timer = schedule_trace_drain(
             Arc::clone(&control_handle),
             data_context.clone(),
@@ -657,6 +659,10 @@ fn validate_trace_options_for_service(options: &TraceOptions) -> HammerResult<()
     Ok(())
 }
 
+fn trace_worker_control(options: &TraceOptions) -> bool {
+    options.enabled && !options.inputs.is_empty()
+}
+
 fn schedule_trace_drain(
     control_handle: Arc<ControlThreadHandle>,
     data_context: DataRuntimeContext,
@@ -947,5 +953,29 @@ mod tests {
             panic!("expected timeout with recoverable join handle");
         };
         handle.join().expect("thread should still be joinable");
+    }
+
+    #[test]
+    fn trace_worker_control_is_only_installed_for_enabled_inputs() {
+        let mut options = TraceOptions {
+            enabled: false,
+            record_capacity: 8,
+            packet_capacity: 4,
+            inputs: vec![config::TraceInputOptions {
+                node: "tun-input-driver-node".to_owned(),
+                count: 1,
+            }],
+        };
+        assert!(!trace_worker_control(&options));
+
+        options.enabled = true;
+        options.inputs.clear();
+        assert!(!trace_worker_control(&options));
+
+        options.inputs.push(config::TraceInputOptions {
+            node: "tun-input-driver-node".to_owned(),
+            count: 1,
+        });
+        assert!(trace_worker_control(&options));
     }
 }

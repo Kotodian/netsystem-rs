@@ -13,7 +13,7 @@ raw_struct_with_default_check! {
         pub enabled: Option<bool> => "Option::is_none",
         /// Maximum completed records kept by the control plane.
         pub record_capacity: Option<usize> => "Option::is_none",
-        /// Maximum in-flight traced packets kept by each data-plane worker.
+        /// Maximum in-flight traced packets kept by trace control.
         pub packet_capacity: Option<usize> => "Option::is_none",
         /// Input node quotas. Empty means no packets are sampled.
         pub inputs: Vec<RawTraceInputConfig> => "Vec::is_empty",

@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
-    NodeNextFrames, NodeNextStorage, NodeResult, PacketTrace, SocksAddr, TraceFormatter, unlikely,
+    NodeNextFrames, NodeNextStorage, NodeResult, PacketTrace, SocksAddr, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -212,7 +213,6 @@ impl IpReassemblyNode {
         now: Instant,
     ) -> CoreResult<Option<BufferIndex>> {
         let buffer = runtime.get_buffer(index)?;
-        let traced = buffer.trace_mark().is_some();
         let current_worker = self.current_worker();
         let fragment = match parse_ip_fragment_with_chain_len(
             buffer.current(),
@@ -225,7 +225,6 @@ impl IpReassemblyNode {
                 self.add_trace(
                     runtime,
                     index,
-                    traced,
                     None,
                     IpReassemblyTraceAction::Drop,
                     current_worker,
@@ -243,7 +242,6 @@ impl IpReassemblyNode {
             self.add_trace(
                 runtime,
                 index,
-                traced,
                 Some(key),
                 IpReassemblyTraceAction::Drop,
                 current_worker,
@@ -260,7 +258,6 @@ impl IpReassemblyNode {
                 self.add_trace(
                     runtime,
                     index,
-                    traced,
                     Some(key),
                     IpReassemblyTraceAction::Handoff,
                     current_worker,
@@ -277,7 +274,6 @@ impl IpReassemblyNode {
                 self.add_trace(
                     runtime,
                     index,
-                    traced,
                     Some(key),
                     IpReassemblyTraceAction::Drop,
                     current_worker,
@@ -331,7 +327,6 @@ impl IpReassemblyNode {
             self.add_trace(
                 runtime,
                 index,
-                traced,
                 Some(key),
                 IpReassemblyTraceAction::Pending,
                 current_worker,
@@ -345,7 +340,6 @@ impl IpReassemblyNode {
             self.add_trace(
                 runtime,
                 index,
-                traced,
                 Some(key),
                 IpReassemblyTraceAction::Drop,
                 current_worker,
@@ -362,7 +356,6 @@ impl IpReassemblyNode {
                     self.add_trace(
                         runtime,
                         fragment.index,
-                        runtime.get_buffer(fragment.index)?.trace_mark().is_some(),
                         Some(key),
                         IpReassemblyTraceAction::Failed,
                         current_worker,
@@ -375,7 +368,6 @@ impl IpReassemblyNode {
             self.add_trace(
                 runtime,
                 failed_index,
-                traced,
                 Some(key),
                 IpReassemblyTraceAction::Failed,
                 current_worker,
@@ -408,7 +400,6 @@ impl IpReassemblyNode {
                     self.add_trace(
                         runtime,
                         index,
-                        runtime.get_buffer(index)?.trace_mark().is_some(),
                         Some(key),
                         IpReassemblyTraceAction::Handoff,
                         current_worker,
@@ -421,7 +412,6 @@ impl IpReassemblyNode {
                     self.add_trace(
                         runtime,
                         index,
-                        runtime.get_buffer(index)?.trace_mark().is_some(),
                         Some(key),
                         IpReassemblyTraceAction::Reassembled,
                         current_worker,
@@ -441,7 +431,6 @@ impl IpReassemblyNode {
                 self.add_trace(
                     runtime,
                     index,
-                    runtime.get_buffer(index)?.trace_mark().is_some(),
                     Some(key),
                     IpReassemblyTraceAction::Reassembled,
                     current_worker,
@@ -459,26 +448,23 @@ impl IpReassemblyNode {
         &self,
         runtime: &DataPlaneRuntime<G>,
         index: BufferIndex,
-        traced: bool,
         key: Option<IpFragmentKey>,
         action: IpReassemblyTraceAction,
         current_worker: DataWorkerId,
         owner_worker: Option<DataWorkerId>,
         next: Option<NodeId>,
     ) -> CoreResult<()> {
-        if unlikely(traced) {
-            runtime.add_trace(
-                index,
-                IpReassemblyTrace {
-                    key,
-                    action,
-                    current_worker,
-                    owner_worker,
-                    next,
-                },
-            )?;
-        }
-        Ok(())
+        add_packet_trace!(
+            runtime,
+            index,
+            IpReassemblyTrace {
+                key,
+                action,
+                current_worker,
+                owner_worker,
+                next,
+            },
+        )
     }
 
     #[inline(always)]
