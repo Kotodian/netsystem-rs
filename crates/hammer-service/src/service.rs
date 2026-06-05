@@ -17,7 +17,7 @@ use hammer_runtime::EndpointManager;
 #[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
 use hammer_runtime::adapter::{
-    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, OutboundManager as _,
+    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeId, OutboundManager as _,
     PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
 };
 #[cfg(feature = "endpoint")]
@@ -154,7 +154,6 @@ impl RuntimeService {
         hammer_runtime::install_default_crypto_provider();
 
         let options = config::parse_config(config_content)?;
-        validate_trace_options_for_service(&options.trace)?;
         let metrics = MetricsRegistry::new();
         let trace = TraceControlPlane::new(options.trace.record_capacity);
         let base_time = Instant::now();
@@ -193,17 +192,23 @@ impl RuntimeService {
         };
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
-        trace.publish_options(&options.trace, |_name| None)?;
+        let trace_enabled_with_inputs = trace_worker_control(&options.trace);
+        let packet_graph = ServicePacketGraphDeclarations::default();
+        trace.publish_options(&options.trace, |name| packet_graph.resolve(name))?;
         data_context.set_trace_control_on_workers(
-            trace_worker_control(&options.trace).then(|| trace.handle()),
+            trace_enabled_with_inputs.then(|| trace.handle()),
             options.trace.packet_capacity,
         )?;
-        let trace_drain_timer = schedule_trace_drain(
-            Arc::clone(&control_handle),
-            data_context.clone(),
-            trace.sink(),
-            new_logger(&log_factory, "trace-control"),
-        )?;
+        let trace_drain_timer = if trace_enabled_with_inputs {
+            Some(schedule_trace_drain(
+                Arc::clone(&control_handle),
+                data_context.clone(),
+                trace.sink(),
+                new_logger(&log_factory, "trace-control"),
+            )?)
+        } else {
+            None
+        };
         let event_subscriptions = build_event_subscribers(
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
@@ -382,7 +387,7 @@ impl RuntimeService {
                 log_factory,
                 control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
-                trace_drain_timer: Some(trace_drain_timer),
+                trace_drain_timer,
                 event_subscriptions,
                 metrics,
                 _trace: trace,
@@ -647,21 +652,45 @@ fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
 }
 
-fn validate_trace_options_for_service(options: &TraceOptions) -> HammerResult<()> {
-    if options.enabled
-        && let Some(input) = options.inputs.first()
-    {
-        return Err(HammerError::config_validation(format!(
-            "trace.inputs node is not a declared packet node: {}",
-            input.node
-        )));
-    }
-    Ok(())
-}
-
 fn trace_worker_control(options: &TraceOptions) -> bool {
     options.enabled && !options.inputs.is_empty()
 }
+
+#[derive(Debug, Clone, Copy)]
+struct ServicePacketGraphDeclarations;
+
+impl Default for ServicePacketGraphDeclarations {
+    #[inline]
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl ServicePacketGraphDeclarations {
+    fn resolve(&self, name: &str) -> Option<NodeId> {
+        SERVICE_PACKET_GRAPH_NODES
+            .iter()
+            .position(|node| *node == name)
+            .and_then(|slot| u32::try_from(slot).ok())
+            .map(NodeId::new)
+    }
+}
+
+const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
+    "tun-input-driver-node",
+    "ip-input-node",
+    "route-match-node",
+    "ip-lookup-node",
+    "adjacency-rewrite-node",
+    "ip-local-node",
+    "ip-receive-node",
+    "ip-reassembly-node",
+    "icmp-echo-request-node",
+    "icmp-error-node",
+    "interface-output-node",
+    "tun-output-driver-node",
+    "drop-node",
+];
 
 fn schedule_trace_drain(
     control_handle: Arc<ControlThreadHandle>,
@@ -929,6 +958,91 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    struct NoopPlatform;
+
+    impl PlatformInterface for NoopPlatform {
+        fn open_tun(&self, _options: hammer_runtime::adapter::TunOptions) -> HammerResult<i32> {
+            Ok(42)
+        }
+
+        fn use_platform_auto_detect_interface_control(&self) -> bool {
+            false
+        }
+
+        fn auto_detect_interface_control(&self, _fd: i32) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn start_default_interface_monitor(
+            &self,
+            _listener: Arc<dyn hammer_runtime::adapter::DefaultInterfaceUpdateListener>,
+        ) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close_default_interface_monitor(
+            &self,
+            _listener: Arc<dyn hammer_runtime::adapter::DefaultInterfaceUpdateListener>,
+        ) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn get_interfaces(&self) -> HammerResult<Vec<hammer_runtime::adapter::NetworkInterface>> {
+            Ok(Vec::new())
+        }
+
+        fn read_wifi_state(&self) -> Option<hammer_runtime::adapter::WifiState> {
+            None
+        }
+    }
+
+    fn minimal_config(trace: &str) -> String {
+        format!(
+            r#"
+[log]
+level = "debug"
+
+[tun]
+interface_name = "utun"
+address = ["172.19.0.1/30"]
+route_address = ["0.0.0.0/0"]
+auto_route = false
+strict_route = true
+mtu = 1400
+stack = "disabled"
+[dns]
+server = "udp://1.1.1.1"
+
+[[outbounds]]
+type = "direct"
+id = "direct"
+
+[route]
+final = "direct"
+
+{trace}
+"#
+        )
+    }
+
+    fn new_test_service(trace: &str) -> Arc<RuntimeService> {
+        RuntimeService::new(
+            &minimal_config(trace),
+            Arc::new(NoopPlatform),
+            Arc::new(DiscardWriter),
+        )
+        .expect("test service should build")
+    }
+
+    fn has_trace_drain_timer(service: &RuntimeService) -> bool {
+        service
+            .inner
+            .lock()
+            .expect("service mutex poisoned")
+            .trace_drain_timer
+            .is_some()
+    }
+
     #[test]
     fn join_control_thread_timeout_returns_without_waiting_forever() {
         let handle = thread::spawn(|| thread::sleep(Duration::from_millis(200)));
@@ -977,5 +1091,28 @@ mod tests {
             count: 1,
         });
         assert!(trace_worker_control(&options));
+    }
+
+    #[test]
+    fn trace_drain_timer_is_only_installed_for_enabled_inputs() {
+        let disabled = new_test_service(
+            r#"[trace]
+enabled = false
+
+[[trace.inputs]]
+node = "tun-input-driver-node"
+count = 1
+"#,
+        );
+        assert!(!has_trace_drain_timer(&disabled));
+        disabled.close().expect("close disabled trace service");
+
+        let empty = new_test_service(
+            r#"[trace]
+enabled = true
+"#,
+        );
+        assert!(!has_trace_drain_timer(&empty));
+        empty.close().expect("close empty trace service");
     }
 }

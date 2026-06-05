@@ -18,6 +18,9 @@ use hammer_service::data_plane::{
     RouteMatchNext, RouteMatchNode, RouteMatchTrace,
 };
 
+const DATA_PLANE_SOURCE: &str = include_str!("../src/data_plane.rs");
+const IP_REASSEMBLY_SOURCE: &str = include_str!("../src/net/ip/reassembly.rs");
+
 struct StaticRouter {
     decision: RouteDecision,
     prepare_count: AtomicUsize,
@@ -375,6 +378,26 @@ fn route_match_node_adds_trace_payload_for_route_decision() {
         ))
     );
     assert_eq!(trace.decision_kind, RouteDecisionKind::Reject);
+}
+
+#[test]
+fn packet_trace_append_sites_use_macro_owned_trace_checks() {
+    assert!(
+        !DATA_PLANE_SOURCE.contains("let traced = runtime.should_trace_packet(index)?"),
+        "RouteMatchNode append sites should let add_packet_trace! own trace checks"
+    );
+    assert!(
+        !DATA_PLANE_SOURCE.contains("if unlikely(traced)"),
+        "RouteMatchNode should construct trace payloads lazily inside add_packet_trace!"
+    );
+    assert!(
+        !IP_REASSEMBLY_SOURCE.contains("fn add_trace"),
+        "IpReassemblyNode append sites should call add_packet_trace! directly"
+    );
+    assert!(
+        !IP_REASSEMBLY_SOURCE.contains("self.add_trace("),
+        "IpReassemblyNode should not route trace appends through a node-local wrapper"
+    );
 }
 
 #[test]

@@ -215,7 +215,9 @@ impl TraceControlPlane {
         trim_completed_queue(&self.inner, record_capacity);
         resize_bounded_queue(&mut state.ring, record_capacity);
         if state.ring.capacity() != record_capacity {
-            state.ring = VecDeque::with_capacity(record_capacity);
+            let mut ring = VecDeque::with_capacity(record_capacity);
+            ring.extend(state.ring.drain(..));
+            state.ring = ring;
         }
         state.policy = policy;
         epoch

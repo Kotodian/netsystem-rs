@@ -10,7 +10,7 @@ use std::sync::Arc;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Network,
     Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeRegistration, NodeResult, PacketTrace,
-    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter, add_packet_trace, unlikely,
+    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -787,26 +787,25 @@ where
         while let Some(batch) = cursor.next() {
             cursor.prefetch_next(runtime);
             for index in batch.indices() {
-                let traced = runtime.should_trace_packet(index)?;
                 let mut buffer = runtime.get_buffer_mut(index)?;
                 let metadata = buffer.metadata_mut();
                 self.router.prepare_route_metadata(metadata)?;
                 let decision = self.router.match_route(metadata)?;
-                let trace = if unlikely(traced) {
-                    Some(RouteMatchTrace {
-                        network: metadata.network,
-                        source: metadata.source.clone(),
-                        destination: metadata.destination.clone(),
-                        decision_kind: RouteDecisionKind::from(&decision),
-                    })
-                } else {
-                    None
-                };
                 metadata.route_decision = Some(decision);
                 drop(buffer);
-                if let Some(trace) = trace {
-                    add_packet_trace!(runtime, index, trace)?;
-                }
+                add_packet_trace!(runtime, index, {
+                    runtime.with_metadata(index, |metadata| {
+                        let decision = metadata.route_decision.as_ref().ok_or_else(|| {
+                            CoreError::internal("missing route decision for route trace")
+                        })?;
+                        Ok(RouteMatchTrace {
+                            network: metadata.network,
+                            source: metadata.source.clone(),
+                            destination: metadata.destination.clone(),
+                            decision_kind: RouteDecisionKind::from(decision),
+                        })
+                    })??
+                })?;
             }
         }
         let next = Self::runtime_nexts(runtime)?;

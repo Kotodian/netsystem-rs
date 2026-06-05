@@ -1652,6 +1652,58 @@ fn trace_publish_updates_completed_queue_capacity() {
 }
 
 #[test]
+fn trace_publish_preserves_drained_records_when_capacity_grows() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 8, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(1);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 1,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 8);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 3,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 2,
+        }],
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc second frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
+    push_marked_test_packet(&runtime, frame, trace_node, b"third");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 2);
+    let records = control.take_records();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+    assert_eq!(records[1].entries[0].payload_bytes, b"second");
+    assert_eq!(records[2].entries[0].payload_bytes, b"third");
+}
+
+#[test]
 fn trace_record_sink_prints_completed_records_through_control_logger() {
     let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
     let payloads = Rc::new(RefCell::new(Vec::new()));
