@@ -8,6 +8,7 @@ mod inbound;
 mod log;
 mod outbound;
 mod route;
+mod runtime;
 mod trace;
 mod util;
 
@@ -18,6 +19,7 @@ pub use inbound::*;
 pub use log::*;
 pub use outbound::*;
 pub use route::*;
+pub use runtime::*;
 pub use trace::*;
 pub use util::*;
 
@@ -170,6 +172,9 @@ pub struct RawConfig {
     /// Optional route section.
     #[serde(default, skip_serializing_if = "route::RawRouteConfig::is_default")]
     pub route: route::RawRouteConfig,
+    /// Optional runtime dump section.
+    #[serde(default, skip_serializing_if = "runtime::RawRuntimeConfig::is_default")]
+    pub runtime: runtime::RawRuntimeConfig,
     /// Optional node packet trace section.
     #[serde(default, skip_serializing_if = "trace::RawTraceConfig::is_default")]
     pub trace: trace::RawTraceConfig,
@@ -184,6 +189,7 @@ pub struct Options {
     #[cfg(feature = "wireguard")]
     pub endpoints: Vec<endpoint::Endpoint>,
     pub route: route::RouteOptions,
+    pub runtime: runtime::RuntimeOptions,
     pub trace: trace::TraceOptions,
 }
 
@@ -265,6 +271,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         endpoints: raw_endpoints,
         dns: raw_dns,
         route: raw_route,
+        runtime: raw_runtime,
         trace: raw_trace,
     } = raw;
     #[cfg(not(feature = "wireguard"))]
@@ -277,6 +284,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         outbounds: raw_outbounds,
         dns: raw_dns,
         route: raw_route,
+        runtime: raw_runtime,
         trace: raw_trace,
     } = raw;
 
@@ -448,6 +456,7 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
         #[cfg(feature = "wireguard")]
         endpoints,
         route: route_options,
+        runtime: runtime::build_runtime_options(raw_runtime)?,
         trace: trace::build_trace_options(raw_trace)?,
     })
 }

@@ -37,6 +37,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hammer_adapter::node::NodeRuntimeStatsRow;
 use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
 use hammer_core::log::Logger;
 
@@ -394,6 +395,63 @@ impl DataRuntimeContext {
     ) -> HammerResult<usize> {
         self.for_each_worker(move |_| sink.drain_completed_with_logger(&logger))
             .map(|counts| counts.into_iter().sum())
+    }
+
+    pub fn runtime_stats_on_workers(&self) -> HammerResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
+        self.for_each_worker(move |worker| {
+            DATA_PLANE_RUNTIME
+                .with(|runtime| (worker, runtime.nodes().node_runtime_stats_snapshot()))
+        })
+    }
+
+    pub async fn runtime_stats_on_workers_async(
+        &self,
+    ) -> HammerResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
+        let mut receivers = Vec::with_capacity(self.inner.workers.len());
+        for (index, worker) in self.inner.workers.iter().cloned().enumerate() {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let context = self.clone();
+            drop(
+                worker
+                    .handle
+                    .spawn(TASK_DATA_CONTEXT.scope(context, async move {
+                        let rows = DATA_PLANE_RUNTIME
+                            .with(|runtime| runtime.nodes().node_runtime_stats_snapshot());
+                        let _ = tx.send((index, rows));
+                    })),
+            );
+            receivers.push(rx);
+        }
+
+        let mut results = (0..self.inner.workers.len())
+            .map(|_| None)
+            .collect::<Vec<_>>();
+        for rx in receivers {
+            let (index, rows) = rx.await.map_err(|err| {
+                HammerError::internal(format!("receive data worker runtime stats: {err}"))
+            })?;
+            let slot = results.get_mut(index).ok_or_else(|| {
+                HammerError::internal(format!(
+                    "data worker runtime stats index out of range: {index}"
+                ))
+            })?;
+            if slot.is_some() {
+                return Err(HammerError::internal(format!(
+                    "duplicate data worker runtime stats: {index}"
+                )));
+            }
+            *slot = Some((index, rows));
+        }
+
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, result)| {
+                result.ok_or_else(|| {
+                    HammerError::internal(format!("missing data worker runtime stats: {index}"))
+                })
+            })
+            .collect()
     }
 
     fn first_handle(&self) -> &Handle {
@@ -1153,6 +1211,43 @@ mod tests {
                 .contains("packet trace epoch=1 input=trace-input")
         );
         assert!(lines[0].1.contains("trace-node: 0x74657374"));
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_context_collects_runtime_stats_on_workers() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-runtime-stats", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+
+        let stats = context
+            .runtime_stats_on_workers()
+            .expect("collect runtime stats");
+
+        assert_eq!(stats.len(), 2);
+        assert_eq!(stats[0].0, 0);
+        assert_eq!(stats[1].0, 1);
+        assert!(stats[0].1.is_empty());
+        assert!(stats[1].1.is_empty());
+
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build driver runtime");
+        let async_stats = driver.block_on(async {
+            context
+                .runtime_stats_on_workers_async()
+                .await
+                .expect("collect async runtime stats")
+        });
+
+        assert_eq!(async_stats.len(), 2);
+        assert_eq!(async_stats[0].0, 0);
+        assert_eq!(async_stats[1].0, 1);
+        assert!(async_stats[0].1.is_empty());
+        assert!(async_stats[1].1.is_empty());
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

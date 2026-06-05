@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -286,6 +287,7 @@ impl NodeReadiness {
 struct NodeRuntimeInner<N> {
     nodes: Vec<Option<N>>,
     error_counters: Vec<NodeErrorCounters>,
+    runtime_stats: Vec<NodeRuntimeStats>,
     queue: VecDeque<ScheduledFrame>,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
@@ -293,6 +295,26 @@ struct NodeRuntimeInner<N> {
     node_trace_formatters: Vec<Option<TraceFormatter>>,
     next_nodes: Vec<Vec<Option<NodeId>>>,
     siblings: Vec<Vec<NodeId>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct NodeRuntimeStats {
+    calls: u64,
+    vectors: u64,
+    total_elapsed_ns: u64,
+    max_elapsed_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRuntimeStatsRow {
+    pub node_id: NodeId,
+    pub node_name: Option<&'static str>,
+    pub error_counters: NodeErrorCounters,
+    pub calls: u64,
+    pub vectors: u64,
+    pub suspends: u64,
+    pub total_elapsed_ns: u64,
+    pub max_elapsed_ns: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -328,6 +350,7 @@ impl<N> NodeRuntimeInner<N> {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
         self.nodes.push(Some(node));
         self.error_counters.push(NodeErrorCounters::default());
+        self.runtime_stats.push(NodeRuntimeStats::default());
         self.node_names.push(None);
         self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
@@ -457,6 +480,7 @@ impl<N> Default for NodeRuntime<N> {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
                 nodes: Vec::new(),
                 error_counters: Vec::new(),
+                runtime_stats: Vec::new(),
                 queue: VecDeque::new(),
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
@@ -582,6 +606,28 @@ impl<N> NodeRuntime<N> {
 
     pub fn pending_len(&self) -> usize {
         self.inner.borrow().queue.len()
+    }
+
+    pub fn node_runtime_stats_snapshot(&self) -> Vec<NodeRuntimeStatsRow> {
+        let inner = self.inner.borrow();
+        inner
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(slot, _)| {
+                let stats = inner.runtime_stats.get(slot).copied().unwrap_or_default();
+                NodeRuntimeStatsRow {
+                    node_id: NodeId::new(u32::try_from(slot).expect("node index fits u32")),
+                    node_name: inner.node_names.get(slot).copied().flatten(),
+                    error_counters: inner.error_counters.get(slot).cloned().unwrap_or_default(),
+                    calls: stats.calls,
+                    vectors: stats.vectors,
+                    suspends: 0,
+                    total_elapsed_ns: stats.total_elapsed_ns,
+                    max_elapsed_ns: stats.max_elapsed_ns,
+                }
+            })
+            .collect()
     }
 
     #[inline]
@@ -720,9 +766,13 @@ impl<N> NodeRuntime<N> {
 
             frame.clear_next_node();
             runtime.set_current_node(Some(scheduled.node));
+            let vectors = frame.pending_len();
+            let start = Instant::now();
             let result = node.process(runtime, &mut frame);
+            let elapsed_ns = elapsed_ns(start);
             runtime.set_current_node(None);
             self.return_node(scheduled.node, node)?;
+            self.record_runtime_stats(scheduled.node, vectors, elapsed_ns)?;
             let result = match result {
                 Ok(result) => result,
                 Err(err) => {
@@ -735,6 +785,24 @@ impl<N> NodeRuntime<N> {
             self.dispatch_result(runtime, scheduled.frame, frame, result)?;
         }
         Ok(processed)
+    }
+
+    fn record_runtime_stats(
+        &self,
+        node: NodeId,
+        vectors: usize,
+        elapsed_ns: u64,
+    ) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        let stats = inner
+            .runtime_stats
+            .get_mut(node.0 as usize)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+        stats.calls = stats.calls.saturating_add(1);
+        stats.vectors = stats.vectors.saturating_add(vectors as u64);
+        stats.total_elapsed_ns = stats.total_elapsed_ns.saturating_add(elapsed_ns);
+        stats.max_elapsed_ns = stats.max_elapsed_ns.max(elapsed_ns);
+        Ok(())
     }
 
     fn validate_node(&self, node: NodeId) -> CoreResult<()> {
@@ -903,6 +971,10 @@ impl<N> NodeRuntime<N> {
     }
 }
 
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 pub struct NodeRuntimeReady {
     readiness: Rc<NodeReadiness>,
 }
@@ -912,5 +984,78 @@ impl Future for NodeRuntimeReady {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.readiness.poll_pending(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Default)]
+    struct StatsNode;
+
+    impl Node<StatsNode> for StatsNode {
+        fn process(
+            &mut self,
+            runtime: &DataPlaneRuntime<StatsNode>,
+            frame: &mut BufferFrame,
+        ) -> CoreResult<NodeResult> {
+            for buffer in frame.drain_pending() {
+                runtime.free_index(buffer);
+            }
+            Ok(NodeResult::drop())
+        }
+    }
+
+    impl InternalNode<StatsNode> for StatsNode {
+        fn node_registration(&self) -> NodeRegistration {
+            NodeRegistration::next("stats-node", 0)
+        }
+    }
+
+    #[test]
+    fn node_runtime_stats_snapshot_counts_named_node_frames() {
+        let runtime = DataPlaneRuntime::<StatsNode>::with_capacities(16, 8, 4, 2);
+        let node = runtime.nodes().register_internal(StatsNode);
+
+        let first = runtime.alloc_frame_index().expect("alloc first frame");
+        push_packet(&runtime, first, b"one");
+        push_packet(&runtime, first, b"two");
+        let second = runtime.alloc_frame_index().expect("alloc second frame");
+        push_packet(&runtime, second, b"three");
+
+        assert!(runtime.schedule_frame(node, first).expect("schedule first"));
+        assert!(
+            runtime
+                .schedule_frame(node, second)
+                .expect("schedule second")
+        );
+        runtime
+            .nodes()
+            .increment_node_error(node, 7)
+            .expect("increment error counter");
+        assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
+
+        let rows = runtime.nodes().node_runtime_stats_snapshot();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.node_id, node);
+        assert_eq!(row.node_name, Some("stats-node"));
+        assert_eq!(row.error_counters.get(7), 1);
+        assert_eq!(row.calls, 2);
+        assert_eq!(row.vectors, 3);
+        assert_eq!(row.suspends, 0);
+        assert!(row.total_elapsed_ns >= row.max_elapsed_ns);
+    }
+
+    fn push_packet(runtime: &DataPlaneRuntime<StatsNode>, frame: FrameIndex, payload: &[u8]) {
+        let buffer = runtime
+            .alloc_index_with_bytes(crate::RouteMetadata::default(), payload)
+            .expect("alloc packet");
+        runtime
+            .get_frame_mut(frame)
+            .expect("get frame")
+            .push_index(buffer)
+            .expect("push packet");
     }
 }
