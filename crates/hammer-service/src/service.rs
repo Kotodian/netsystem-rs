@@ -16,9 +16,10 @@ use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::EndpointManager;
 #[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
+use hammer_runtime::adapter::node::NodeRuntimeStatsRow;
 use hammer_runtime::adapter::{
-    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeId, OutboundManager as _,
-    PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
+    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeErrorCounters, NodeId,
+    OutboundManager as _, PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
@@ -107,6 +108,7 @@ struct ServiceInner {
     control_handle: Option<Arc<ControlThreadHandle>>,
     control_thread: Option<JoinHandle<()>>,
     trace_drain_timer: Option<ControlTimerHandle>,
+    runtime_dump_timer: Option<ControlTimerHandle>,
     event_subscriptions: Vec<ControlEventSubscriptionHandle>,
     metrics: Arc<MetricsRegistry>,
     _trace: TraceControlPlane,
@@ -199,16 +201,6 @@ impl RuntimeService {
             trace_enabled_with_inputs.then(|| trace.handle()),
             options.trace.packet_capacity,
         )?;
-        let trace_drain_timer = if trace_enabled_with_inputs {
-            Some(schedule_trace_drain(
-                Arc::clone(&control_handle),
-                data_context.clone(),
-                trace.sink(),
-                new_logger(&log_factory, "trace-control"),
-            )?)
-        } else {
-            None
-        };
         let event_subscriptions = build_event_subscribers(
             new_logger(&log_factory, "control-event"),
             Arc::clone(&control_handle),
@@ -381,6 +373,36 @@ impl RuntimeService {
 
         #[cfg(feature = "probe")]
         let probe = Arc::new(ProbeManager::new(Arc::clone(&outbound)));
+
+        let trace_drain_timer = if trace_enabled_with_inputs {
+            Some(schedule_trace_drain(
+                Arc::clone(&control_handle),
+                data_context.clone(),
+                trace.sink(),
+                new_logger(&log_factory, "trace-control"),
+            )?)
+        } else {
+            None
+        };
+        let runtime_dump_timer = if options.runtime.enabled {
+            match schedule_runtime_dump(
+                Arc::clone(&control_handle),
+                data_context.clone(),
+                options.runtime.interval,
+                new_logger(&log_factory, "runtime-control"),
+            ) {
+                Ok(timer) => Some(timer),
+                Err(err) => {
+                    if let Some(timer) = &trace_drain_timer {
+                        timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
+                    }
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Arc::new(Self {
             inner: Arc::new(Mutex::new(ServiceInner {
                 state: ServiceState::NotStarted,
@@ -388,6 +410,7 @@ impl RuntimeService {
                 control_handle: Some(control_handle),
                 control_thread: Some(control_thread),
                 trace_drain_timer,
+                runtime_dump_timer,
                 event_subscriptions,
                 metrics,
                 _trace: trace,
@@ -712,6 +735,87 @@ fn schedule_trace_drain(
     })
 }
 
+fn schedule_runtime_dump(
+    control_handle: Arc<ControlThreadHandle>,
+    data_context: DataRuntimeContext,
+    interval: Duration,
+    logger: Logger,
+) -> HammerResult<ControlTimerHandle> {
+    control_handle.schedule_interval(interval, interval, move || {
+        let data_context = data_context.clone();
+        let logger = logger.clone();
+        async move {
+            match data_context.runtime_stats_on_workers_async().await {
+                Ok(stats) => {
+                    for line in render_runtime_stats_lines(&stats) {
+                        logger.debug(line);
+                    }
+                }
+                Err(err) => logger.warn(format!("dump node runtime stats: {err}")),
+            }
+        }
+    })
+}
+
+fn render_runtime_stats_lines(stats: &[(usize, Vec<NodeRuntimeStatsRow>)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (worker, rows) in stats {
+        lines.push(format!(
+            "show runtime worker={worker} Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"
+        ));
+        let mut rows = rows.iter().filter(|row| row.calls > 0).collect::<Vec<_>>();
+        rows.sort_by(|a, b| compare_runtime_rows(a, b));
+        for row in rows {
+            lines.push(format_runtime_stats_row(*worker, row));
+        }
+    }
+    lines
+}
+
+fn format_runtime_stats_row(worker: usize, row: &NodeRuntimeStatsRow) -> String {
+    let avg_ns = if row.vectors > 0 {
+        row.total_elapsed_ns / row.vectors
+    } else if row.calls > 0 {
+        row.total_elapsed_ns / row.calls
+    } else {
+        0
+    };
+    let vectors_per_call = if row.calls > 0 {
+        format!("{:.2}", row.vectors as f64 / row.calls as f64)
+    } else {
+        "0.00".to_owned()
+    };
+    format!(
+        "show runtime worker={} {:<32} {:<5} {:>10} {:>10} {:>8} {:>10} {:>12} {:>10}",
+        worker,
+        runtime_row_name(row),
+        "active",
+        row.calls,
+        row.vectors,
+        row.suspends,
+        avg_ns,
+        vectors_per_call,
+        row.max_elapsed_ns,
+    )
+}
+
+fn runtime_row_name(row: &NodeRuntimeStatsRow) -> String {
+    row.node_name
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("node-{}", row.node_id.slot()))
+}
+
+fn compare_runtime_rows(a: &NodeRuntimeStatsRow, b: &NodeRuntimeStatsRow) -> std::cmp::Ordering {
+    match (a.node_name, b.node_name) {
+        (Some(a_name), Some(b_name)) => a_name
+            .cmp(b_name)
+            .then_with(|| a.node_id.slot().cmp(&b.node_id.slot())),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.node_id.slot().cmp(&b.node_id.slot()),
+    }
+}
+
 /// Wraps every declared `Endpoint` in an `EndpointOutboundAdapter` and
 /// registers it into the `OutboundManager` under the endpoint's id. This
 /// is what lets `[[dns.servers]] via = "<endpoint-id>"` resolve through
@@ -816,6 +920,16 @@ fn finish_close(
             .take()
     };
     if let Some(timer) = trace_drain_timer {
+        timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
+    }
+    let runtime_dump_timer = {
+        inner
+            .lock()
+            .expect("service mutex poisoned")
+            .runtime_dump_timer
+            .take()
+    };
+    if let Some(timer) = runtime_dump_timer {
         timer.cancel_timeout(CONTROL_SHUTDOWN_TIMEOUT);
     }
     let control_handle = {
@@ -996,7 +1110,7 @@ mod tests {
         }
     }
 
-    fn minimal_config(trace: &str) -> String {
+    fn minimal_config(extra: &str) -> String {
         format!(
             r#"
 [log]
@@ -1020,7 +1134,7 @@ id = "direct"
 [route]
 final = "direct"
 
-{trace}
+{extra}
 "#
         )
     }
@@ -1040,6 +1154,15 @@ final = "direct"
             .lock()
             .expect("service mutex poisoned")
             .trace_drain_timer
+            .is_some()
+    }
+
+    fn has_runtime_dump_timer(service: &RuntimeService) -> bool {
+        service
+            .inner
+            .lock()
+            .expect("service mutex poisoned")
+            .runtime_dump_timer
             .is_some()
     }
 
@@ -1114,5 +1237,96 @@ enabled = true
         );
         assert!(!has_trace_drain_timer(&empty));
         empty.close().expect("close empty trace service");
+    }
+
+    #[test]
+    fn runtime_dump_timer_is_only_installed_when_enabled() {
+        let disabled = new_test_service("");
+        assert!(!has_runtime_dump_timer(&disabled));
+        disabled.close().expect("close disabled runtime service");
+
+        let enabled = new_test_service(
+            r#"[runtime]
+enabled = true
+interval = "5s"
+"#,
+        );
+        assert!(has_runtime_dump_timer(&enabled));
+        enabled.close().expect("close enabled runtime service");
+        assert!(!has_runtime_dump_timer(&enabled));
+    }
+
+    #[test]
+    fn runtime_stats_rendering_filters_idle_nodes_and_formats_vpp_columns() {
+        let lines = render_runtime_stats_lines(&[
+            (
+                1,
+                vec![
+                    NodeRuntimeStatsRow {
+                        node_id: NodeId::new(0),
+                        node_name: Some("idle-node"),
+                        error_counters: NodeErrorCounters::default(),
+                        calls: 0,
+                        vectors: 0,
+                        suspends: 0,
+                        total_elapsed_ns: 0,
+                        max_elapsed_ns: 0,
+                    },
+                    NodeRuntimeStatsRow {
+                        node_id: NodeId::new(2),
+                        node_name: Some("ip-input-node"),
+                        error_counters: NodeErrorCounters::default(),
+                        calls: 2,
+                        vectors: 5,
+                        suspends: 0,
+                        total_elapsed_ns: 50,
+                        max_elapsed_ns: 30,
+                    },
+                    NodeRuntimeStatsRow {
+                        node_id: NodeId::new(10),
+                        node_name: None,
+                        error_counters: NodeErrorCounters::default(),
+                        calls: 1,
+                        vectors: 1,
+                        suspends: 0,
+                        total_elapsed_ns: 1,
+                        max_elapsed_ns: 1,
+                    },
+                    NodeRuntimeStatsRow {
+                        node_id: NodeId::new(2),
+                        node_name: None,
+                        error_counters: NodeErrorCounters::default(),
+                        calls: 1,
+                        vectors: 1,
+                        suspends: 0,
+                        total_elapsed_ns: 1,
+                        max_elapsed_ns: 1,
+                    },
+                ],
+            ),
+            (2, Vec::new()),
+        ]);
+
+        assert_eq!(lines.len(), 5);
+        assert!(
+            lines[0].contains("Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|line| line.contains("idle-node")));
+        assert!(lines[1].contains("ip-input-node"), "{lines:?}");
+        assert!(lines[1].contains("active"), "{lines:?}");
+        assert!(lines[1].contains("         2"), "{lines:?}");
+        assert!(lines[1].contains("         5"), "{lines:?}");
+        assert!(
+            lines[4].contains(
+                "show runtime worker=2 Name State Calls Vectors Suspends AvgNs Vectors/Call MaxNs"
+            ),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("        10"), "{lines:?}");
+        assert!(lines[1].contains("        2.50"), "{lines:?}");
+        assert!(lines[1].contains("        30"), "{lines:?}");
+        assert!(lines[2].contains("node-2"), "{lines:?}");
+        assert!(lines[3].contains("node-10"), "{lines:?}");
     }
 }
