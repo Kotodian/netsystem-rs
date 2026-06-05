@@ -14,6 +14,7 @@ use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{Node, NodeHandle, NodeId, NodeNext, NodeRuntime, NoopNode};
+use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle, TraceMark};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -191,6 +192,7 @@ pub struct Buffer {
     packet_cursor: BufferPacketCursor,
     node_error: Option<BufferNodeError>,
     handoff_source_worker: Option<DataWorkerId>,
+    trace_mark: Option<TraceMark>,
     flags: BufferFlags,
     current_data: usize,
     current_len: usize,
@@ -208,6 +210,7 @@ impl Buffer {
             packet_cursor: BufferPacketCursor::default(),
             node_error: None,
             handoff_source_worker: None,
+            trace_mark: None,
             flags: BufferFlags::empty(),
             current_data: 0,
             current_len: 0,
@@ -231,6 +234,7 @@ impl Buffer {
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
         self.handoff_source_worker = None;
+        self.trace_mark = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = bytes.len();
@@ -247,6 +251,7 @@ impl Buffer {
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
         self.handoff_source_worker = None;
+        self.trace_mark = None;
         self.flags = BufferFlags::empty();
         self.current_data = 0;
         self.current_len = 0;
@@ -286,8 +291,23 @@ impl Buffer {
     }
 
     #[inline]
+    pub fn trace_mark(&self) -> Option<TraceMark> {
+        self.trace_mark
+    }
+
+    #[inline]
     pub fn set_handoff_source_worker(&mut self, worker: DataWorkerId) {
         self.handoff_source_worker = Some(worker);
+    }
+
+    #[inline]
+    pub fn set_trace_mark(&mut self, mark: TraceMark) {
+        self.trace_mark = Some(mark);
+    }
+
+    #[inline]
+    pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+        self.trace_mark.take()
     }
 
     #[inline]
@@ -437,6 +457,7 @@ pub struct DataPlaneBuffers {
     buffers: BufferPool,
     frames: FramePool,
     instruction_set: DataPlaneInstructionSet,
+    trace: DataPlaneTrace,
 }
 
 #[derive(Debug)]
@@ -549,6 +570,7 @@ impl DataPlaneBuffers {
             buffers: BufferPool::with_arena(buffer_arena),
             frames: FramePool::with_capacity(frame_capacity, frame_slots),
             instruction_set,
+            trace: DataPlaneTrace::default(),
         }
     }
 
@@ -572,6 +594,11 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn instruction_set(&self) -> DataPlaneInstructionSet {
         self.instruction_set
+    }
+
+    #[inline]
+    pub fn set_trace_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
+        self.trace.set_control(control, packet_capacity);
     }
 
     #[inline]
@@ -610,6 +637,7 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
+        self.finalize_trace_chain(index);
         self.buffers.free_index(index);
     }
 
@@ -620,7 +648,9 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn free_frame(&self, frame: &mut BufferFrame) {
-        self.buffers.free_frame(frame);
+        for index in frame.drain_indices() {
+            self.free_index(index);
+        }
     }
 
     #[inline]
@@ -658,7 +688,9 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn free_frame_index(&self, index: FrameIndex) -> CoreResult<()> {
-        self.frames.free_index(&self.buffers, index)
+        let mut frame = self.frames.take_index(index)?;
+        self.free_frame(&mut frame);
+        self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
     #[inline]
@@ -676,6 +708,8 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn release_pooled_frame(&self, frame: PooledBufferFrame) -> CoreResult<()> {
         let PooledBufferFrame { index, frame } = frame;
+        let mut frame = frame;
+        self.free_frame(&mut frame);
         self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
@@ -709,6 +743,8 @@ impl DataPlaneBuffers {
         index: FrameIndex,
         frame: BufferFrame,
     ) -> CoreResult<()> {
+        let mut frame = frame;
+        self.free_frame(&mut frame);
         self.frames.free_taken_index(&self.buffers, index, frame)
     }
 
@@ -868,6 +904,20 @@ impl DataPlaneBuffers {
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_current_chain(index)
     }
+
+    fn finalize_trace_chain(&self, index: BufferIndex) {
+        let mut next = Some(index);
+        while let Some(index) = next {
+            let mut buffer = match self.get_buffer_mut(index) {
+                Ok(buffer) => buffer,
+                Err(_) => return,
+            };
+            next = buffer.next_buffer();
+            if let Some(mark) = buffer.take_trace_mark() {
+                self.trace.finalize(mark);
+            }
+        }
+    }
 }
 
 impl<N> DataPlaneRuntime<N> {
@@ -990,6 +1040,16 @@ impl<N> DataPlaneRuntime<N> {
     }
 
     #[inline]
+    pub fn set_trace_control(&self, control: Option<TraceControlHandle>, packet_capacity: usize) {
+        self.buffers.set_trace_control(control, packet_capacity);
+    }
+
+    #[inline]
+    pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
+        self.nodes.node_by_name(name)
+    }
+
+    #[inline]
     pub(crate) fn set_current_node(&self, node: Option<NodeId>) {
         self.current_node.set(node);
     }
@@ -997,6 +1057,51 @@ impl<N> DataPlaneRuntime<N> {
     #[inline]
     pub fn current_node(&self) -> Option<NodeId> {
         self.current_node.get()
+    }
+
+    #[inline]
+    pub fn may_mark_trace(&self, node: NodeId) -> bool {
+        self.buffers.trace.may_mark(node)
+    }
+
+    #[inline]
+    pub fn try_mark_trace(&self, node: NodeId, index: BufferIndex) -> CoreResult<()> {
+        if !self.buffers.trace.may_mark(node) {
+            return Ok(());
+        }
+        if self.get_buffer(index)?.trace_mark().is_some() {
+            return Ok(());
+        }
+        let node_name = self.nodes.node_name(node)?;
+        if let Some(mark) = self.buffers.trace.try_mark(node, node_name) {
+            self.get_buffer_mut(index)?.set_trace_mark(mark);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn add_trace<T: PacketTrace>(&self, index: BufferIndex, trace: T) -> CoreResult<()> {
+        let Some(node) = self.current_node() else {
+            return Ok(());
+        };
+        let Some(mark) = self.get_buffer(index)?.trace_mark() else {
+            return Ok(());
+        };
+        let node_name = self.nodes.node_name(node)?;
+        let formatter = self.nodes.node_trace_formatter(node)?;
+        let mut payload_bytes = std::vec::Vec::new();
+        trace.encode_trace(&mut payload_bytes);
+        self.buffers
+            .trace
+            .add_entry(mark, node, node_name, formatter, payload_bytes);
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn should_trace_packet(&self, index: BufferIndex) -> CoreResult<bool> {
+        Ok(crate::trace::unlikely(
+            self.get_buffer(index)?.trace_mark().is_some(),
+        ))
     }
 
     #[inline]
@@ -3413,6 +3518,14 @@ impl BufferRef<'_> {
     }
 
     #[inline]
+    pub fn trace_mark(&self) -> Option<TraceMark> {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .trace_mark()
+    }
+
+    #[inline]
     pub fn current(&self) -> &[u8] {
         self.guard
             .buffer(self.index)
@@ -3497,6 +3610,30 @@ impl BufferRefMut<'_> {
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .set_node_error(error);
+    }
+
+    #[inline]
+    pub fn next_buffer(&self) -> Option<BufferIndex> {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .next_buffer()
+    }
+
+    #[inline]
+    pub fn set_trace_mark(&mut self, mark: TraceMark) {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .set_trace_mark(mark);
+    }
+
+    #[inline]
+    pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .take_trace_mark()
     }
 
     #[inline]

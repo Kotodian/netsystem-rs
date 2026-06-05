@@ -8,15 +8,60 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
-    NodeId, NodeNextEnqueue, NodeNextStorage, NodeResult, RouteMetadata, Router,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Network,
+    Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeRegistration, NodeResult, PacketTrace,
+    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
 
-#[hammer_component_macros::node]
+use crate::trace::codec::{
+    TraceDecodeCursor, decode_network, encode_network, put_socks_addr, put_u8, put_usize,
+};
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
+
+impl DropNode {
+    pub const NODE_NAME: &'static str = "drop-node";
+
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DropTrace {
+    pub dropped: usize,
+}
+
+impl DropTrace {
+    pub const ENCODED_LEN: usize = 8;
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return None;
+        }
+        Some(Self {
+            dropped: usize::try_from(u64::from_le_bytes(bytes.try_into().ok()?)).ok()?,
+        })
+    }
+}
+
+impl PacketTrace for DropTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_usize(out, self.dropped);
+    }
+}
+
+fn format_drop_trace(bytes: &[u8]) -> String {
+    match DropTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("DropTrace invalid={bytes:?}"),
+    }
+}
 
 impl<G> Node<G> for DropNode {
     #[inline(always)]
@@ -25,14 +70,29 @@ impl<G> Node<G> for DropNode {
         runtime: &DataPlaneRuntime<G>,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
+        let dropped = frame.pending_len();
         for index in frame.drain_pending() {
+            add_packet_trace!(runtime, index, DropTrace { dropped })?;
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_drop_trace)
+    }
 }
 
-impl<G> InternalNode<G> for DropNode {}
+impl<G> InternalNode<G> for DropNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next(Self::NODE_NAME, 0)
+    }
+}
 
 pub struct FeatureArc<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
@@ -623,6 +683,89 @@ pub enum RouteMatchNext {
     Lookup,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteMatchTrace {
+    pub network: Network,
+    pub source: Option<SocksAddr>,
+    pub destination: Option<SocksAddr>,
+    pub decision_kind: RouteDecisionKind,
+}
+
+impl RouteMatchTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let network = decode_network(cursor.read_u8()?)?;
+        let source = cursor.read_socks_addr()?;
+        let destination = cursor.read_socks_addr()?;
+        let decision_kind = RouteDecisionKind::decode(cursor.read_u8()?)?;
+        if !cursor.is_empty() {
+            return None;
+        }
+        Some(Self {
+            network,
+            source,
+            destination,
+            decision_kind,
+        })
+    }
+}
+
+impl PacketTrace for RouteMatchTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_u8(out, encode_network(self.network));
+        put_socks_addr(out, self.source.as_ref());
+        put_socks_addr(out, self.destination.as_ref());
+        put_u8(out, self.decision_kind.encode());
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteDecisionKind {
+    Route,
+    HijackDns,
+    Reject,
+}
+
+impl RouteDecisionKind {
+    #[inline]
+    fn encode(self) -> u8 {
+        match self {
+            Self::Route => 0,
+            Self::HijackDns => 1,
+            Self::Reject => 2,
+        }
+    }
+
+    #[inline]
+    fn decode(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Route),
+            1 => Some(Self::HijackDns),
+            2 => Some(Self::Reject),
+            _ => None,
+        }
+    }
+}
+
+impl From<&RouteDecision> for RouteDecisionKind {
+    #[inline]
+    fn from(value: &RouteDecision) -> Self {
+        match value {
+            RouteDecision::Route { .. } => Self::Route,
+            RouteDecision::HijackDns => Self::HijackDns,
+            RouteDecision::Reject { .. } => Self::Reject,
+        }
+    }
+}
+
+fn format_route_match_trace(bytes: &[u8]) -> String {
+    match RouteMatchTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("RouteMatchTrace invalid={bytes:?}"),
+    }
+}
+
 #[hammer_component_macros::node(role = internal, next = RouteMatchNext)]
 pub struct RouteMatchNode<R> {
     router: R,
@@ -649,6 +792,20 @@ where
                 self.router.prepare_route_metadata(metadata)?;
                 let decision = self.router.match_route(metadata)?;
                 metadata.route_decision = Some(decision);
+                drop(buffer);
+                add_packet_trace!(runtime, index, {
+                    runtime.with_metadata(index, |metadata| {
+                        let decision = metadata.route_decision.as_ref().ok_or_else(|| {
+                            CoreError::internal("missing route decision for route trace")
+                        })?;
+                        Ok(RouteMatchTrace {
+                            network: metadata.network,
+                            source: metadata.source.clone(),
+                            destination: metadata.destination.clone(),
+                            decision_kind: RouteDecisionKind::from(decision),
+                        })
+                    })??
+                })?;
             }
         }
         let next = Self::runtime_nexts(runtime)?;
@@ -656,5 +813,10 @@ where
             &next,
             RouteMatchNext::Lookup,
         )))
+    }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_route_match_trace)
     }
 }

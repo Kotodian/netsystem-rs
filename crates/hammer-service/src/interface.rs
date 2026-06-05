@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeResult,
+    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
@@ -13,6 +13,7 @@ use hammer_runtime::DataPlaneBarrierHandle;
 use ipnet::IpNet;
 
 use crate::data_plane::set_index_node_error_code;
+use crate::trace::codec::{TraceDecodeCursor, put_option_node, put_option_u16, put_option_u32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InterfaceMtu {
@@ -659,6 +660,44 @@ impl InterfaceOutputNodeError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceOutputTrace {
+    pub egress_interface: Option<u32>,
+    pub tx_node: Option<NodeId>,
+    pub error: Option<u16>,
+    pub next: Option<NodeId>,
+}
+
+impl InterfaceOutputTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let trace = Self {
+            egress_interface: cursor.read_option_u32()?,
+            tx_node: cursor.read_option_node()?,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_option_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for InterfaceOutputTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_option_u32(out, self.egress_interface);
+        put_option_node(out, self.tx_node);
+        put_option_u16(out, self.error);
+        put_option_node(out, self.next);
+    }
+}
+
+fn format_interface_output_trace(bytes: &[u8]) -> String {
+    match InterfaceOutputTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("InterfaceOutputTrace invalid={bytes:?}"),
+    }
+}
+
 #[hammer_component_macros::node]
 pub struct InterfaceOutputNode {
     output: InterfaceOutputHandle,
@@ -680,6 +719,16 @@ impl InterfaceOutputNode {
                 index,
                 InterfaceOutputNodeError::MissingEgressInterface.code(),
             )?;
+            add_packet_trace!(
+                runtime,
+                index,
+                InterfaceOutputTrace {
+                    egress_interface: None,
+                    tx_node: None,
+                    error: Some(InterfaceOutputNodeError::MissingEgressInterface.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
@@ -689,9 +738,29 @@ impl InterfaceOutputNode {
                 index,
                 InterfaceOutputNodeError::MissingTxNode.code(),
             )?;
+            add_packet_trace!(
+                runtime,
+                index,
+                InterfaceOutputTrace {
+                    egress_interface: Some(interface_index),
+                    tx_node: None,
+                    error: Some(InterfaceOutputNodeError::MissingTxNode.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
+        add_packet_trace!(
+            runtime,
+            index,
+            InterfaceOutputTrace {
+                egress_interface: Some(interface_index),
+                tx_node: Some(tx),
+                error: None,
+                next: Some(tx),
+            },
+        )?;
         Ok(Some(tx))
     }
 }
@@ -741,6 +810,19 @@ impl<G> Node<G> for InterfaceOutputNode {
             Ok(NodeResult::drop())
         }
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_interface_output_trace)
+    }
 }
 
-impl<G> InternalNode<G> for InterfaceOutputNode {}
+impl<G> InternalNode<G> for InterfaceOutputNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("interface-output-node", 0)
+    }
+}

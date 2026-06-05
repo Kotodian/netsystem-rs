@@ -6,7 +6,8 @@ use std::sync::Arc;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
     ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextFrames, NodeNextVectorEnqueue,
-    NodeResult, RouteMetadata,
+    NodeRegistration, NodeResult, PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
+    unlikely,
 };
 use hammer_core::error::{CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -24,6 +25,10 @@ use hammer_core::protocol::ip::{
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
 
 use crate::data_plane::set_index_node_error_code;
+use crate::trace::codec::{
+    TraceDecodeCursor, put_node, put_option_dpo_type, put_option_node, put_option_u16,
+    put_option_u32, put_u32, put_usize,
+};
 
 pub type Adjacency = CoreAdjacency<NodeId>;
 pub type DpoId = CoreDpoId<NodeId>;
@@ -32,6 +37,97 @@ pub type FibLookupResult = CoreFibLookupResult<NodeId>;
 pub type FibTable = CoreFibTable<NodeId>;
 pub type FibTableBuilder = CoreFibTableBuilder<NodeId>;
 pub type LoadBalance = CoreLoadBalance<NodeId>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpLookupTrace {
+    pub fib_index: u32,
+    pub route_dpo_type: Option<DpoType>,
+    pub route_dpo_index: Option<u32>,
+    pub load_balance_index: Option<u32>,
+    pub bucket_index: Option<u16>,
+    pub dpo_type: Option<DpoType>,
+    pub dpo_index: Option<u32>,
+    pub next: NodeId,
+}
+
+impl IpLookupTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let trace = Self {
+            fib_index: cursor.read_u32()?,
+            route_dpo_type: cursor.read_option_dpo_type()?,
+            route_dpo_index: cursor.read_option_u32()?,
+            load_balance_index: cursor.read_option_u32()?,
+            bucket_index: cursor.read_option_u16()?,
+            dpo_type: cursor.read_option_dpo_type()?,
+            dpo_index: cursor.read_option_u32()?,
+            next: cursor.read_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for IpLookupTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_u32(out, self.fib_index);
+        put_option_dpo_type(out, self.route_dpo_type);
+        put_option_u32(out, self.route_dpo_index);
+        put_option_u32(out, self.load_balance_index);
+        put_option_u16(out, self.bucket_index);
+        put_option_dpo_type(out, self.dpo_type);
+        put_option_u32(out, self.dpo_index);
+        put_node(out, self.next);
+    }
+}
+
+fn format_ip_lookup_trace(bytes: &[u8]) -> String {
+    match IpLookupTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("IpLookupTrace invalid={bytes:?}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjacencyRewriteTrace {
+    pub dpo_index: Option<u32>,
+    pub egress_interface: Option<u32>,
+    pub rewrite_len: usize,
+    pub error: Option<u16>,
+    pub next: Option<NodeId>,
+}
+
+impl AdjacencyRewriteTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let trace = Self {
+            dpo_index: cursor.read_option_u32()?,
+            egress_interface: cursor.read_option_u32()?,
+            rewrite_len: cursor.read_usize()?,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_option_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for AdjacencyRewriteTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_option_u32(out, self.dpo_index);
+        put_option_u32(out, self.egress_interface);
+        put_usize(out, self.rewrite_len);
+        put_option_u16(out, self.error);
+        put_option_node(out, self.next);
+    }
+}
+
+fn format_adjacency_rewrite_trace(bytes: &[u8]) -> String {
+    match AdjacencyRewriteTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("AdjacencyRewriteTrace invalid={bytes:?}"),
+    }
+}
 
 #[derive(Clone)]
 pub struct FibTableHandle {
@@ -182,8 +278,10 @@ impl IpLookupNode {
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         index: BufferIndex,
+        traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
     ) -> CoreResult<NodeId> {
         let buffer = batch.buffer_mut(index)?;
+        let traced = buffer.trace_mark().is_some();
         let parsed = match packet_from_cached_metadata(
             buffer.metadata(),
             buffer.packet_cursor(),
@@ -198,7 +296,23 @@ impl IpLookupNode {
             Some(parsed) => parsed,
             None => {
                 buffer.metadata_mut().forwarding = None;
-                return Ok(table.drop_next());
+                let next = table.drop_next();
+                if unlikely(traced) {
+                    traces.push((
+                        index,
+                        IpLookupTrace {
+                            fib_index: 0,
+                            route_dpo_type: None,
+                            route_dpo_index: None,
+                            load_balance_index: None,
+                            bucket_index: None,
+                            dpo_type: None,
+                            dpo_index: None,
+                            next,
+                        },
+                    ));
+                }
+                return Ok(next);
             }
         };
         let result = table
@@ -213,6 +327,21 @@ impl IpLookupNode {
             dpo_type: result.dpo.kind(),
             dpo_index: result.dpo.forwarding_index(),
         });
+        if unlikely(traced) {
+            traces.push((
+                index,
+                IpLookupTrace {
+                    fib_index: 0,
+                    route_dpo_type: Some(result.route_dpo.kind()),
+                    route_dpo_index: Some(result.route_dpo.forwarding_index()),
+                    load_balance_index: Some(result.forwarding_load_balance_index()),
+                    bucket_index: Some(result.forwarding_bucket_index()),
+                    dpo_type: Some(result.dpo.kind()),
+                    dpo_index: Some(result.dpo.forwarding_index()),
+                    next: result.dpo.next(),
+                },
+            ));
+        }
         Ok(result.dpo.next())
     }
 
@@ -274,9 +403,10 @@ impl IpLookupNode {
         indices: &[BufferIndex],
         nexts: &mut [NodeId; 4],
         start_offset: usize,
+        traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
     ) -> CoreResult<()> {
         for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-            nexts[offset] = self.process_index_with_batch(batch, table, index)?;
+            nexts[offset] = self.process_index_with_batch(batch, table, index, traces)?;
         }
         Ok(())
     }
@@ -295,10 +425,11 @@ impl<G> Node<G> for IpLookupNode {
             return Ok(NodeResult::drop());
         };
         let width = frame_batch_width(runtime);
+        let mut traces = std::vec::Vec::new();
         let first_next = {
             let mut batch = runtime.buffer_batch_mut();
             Self::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
-            self.process_index_with_batch(&mut batch, &table, first)?
+            self.process_index_with_batch(&mut batch, &table, first, &mut traces)?
         };
         let cached_next = self.cached_next.unwrap_or(first_next);
         let mut first_chunk = true;
@@ -317,15 +448,38 @@ impl<G> Node<G> for IpLookupNode {
                     } else {
                         0
                     };
-                    self.process_indices_with_batch(batch, &table, indices, nexts, start_offset)
+                    self.process_indices_with_batch(
+                        batch,
+                        &table,
+                        indices,
+                        nexts,
+                        start_offset,
+                        &mut traces,
+                    )
                 },
             )?;
+        for (index, trace) in traces {
+            add_packet_trace!(runtime, index, trace)?;
+        }
         self.cached_next = Some(cached_next);
         Ok(result)
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_ip_lookup_trace)
+    }
 }
 
-impl<G> InternalNode<G> for IpLookupNode {}
+impl<G> InternalNode<G> for IpLookupNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("ip-lookup-node", 0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdjacencyRewriteNodeError {
@@ -366,11 +520,33 @@ impl AdjacencyRewriteNode {
                 index,
                 AdjacencyRewriteNodeError::MissingForwarding.code(),
             )?;
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: None,
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::MissingForwarding.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
             set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: Some(forwarding.dpo_index),
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::WrongDpo.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         }
@@ -384,11 +560,36 @@ impl AdjacencyRewriteNode {
                 index,
                 AdjacencyRewriteNodeError::MissingAdjacency.code(),
             )?;
+            add_packet_trace!(
+                runtime,
+                index,
+                AdjacencyRewriteTrace {
+                    dpo_index: Some(forwarding.dpo_index),
+                    egress_interface: None,
+                    rewrite_len: 0,
+                    error: Some(AdjacencyRewriteNodeError::MissingAdjacency.code()),
+                    next: None,
+                },
+            )?;
             runtime.free_index(index);
             return Ok(None);
         };
+        let rewrite_len = adjacency.rewrite.as_slice().len();
+        let egress_interface = adjacency.egress_interface;
+        let next = adjacency.next;
         apply_adjacency_rewrite(runtime, index, adjacency)?;
-        Ok(Some(adjacency.next))
+        add_packet_trace!(
+            runtime,
+            index,
+            AdjacencyRewriteTrace {
+                dpo_index: Some(forwarding.dpo_index),
+                egress_interface,
+                rewrite_len,
+                error: None,
+                next: Some(next),
+            },
+        )?;
+        Ok(Some(next))
     }
 }
 
@@ -437,9 +638,22 @@ impl<G> Node<G> for AdjacencyRewriteNode {
             Ok(NodeResult::drop())
         }
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_adjacency_rewrite_trace)
+    }
 }
 
-impl<G> InternalNode<G> for AdjacencyRewriteNode {}
+impl<G> InternalNode<G> for AdjacencyRewriteNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("adjacency-rewrite-node", 0)
+    }
+}
 
 #[inline(always)]
 fn apply_adjacency_rewrite<G>(

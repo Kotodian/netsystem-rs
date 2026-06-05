@@ -4,8 +4,8 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
-    NodeId, NodeNextStorage, NodeResult, PacketNextResolver, SocksAddr,
-    process_cached_rewrite_next, process_cached_speculative_next,
+    NodeId, NodeNextStorage, NodeResult, PacketNextResolver, PacketTrace, SocksAddr,
+    TraceFormatter, add_packet_trace, process_cached_rewrite_next, process_cached_speculative_next,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::icmp::{
@@ -13,6 +13,10 @@ use hammer_core::protocol::icmp::{
 };
 
 use crate::data_plane::set_index_node_error_code;
+use crate::trace::codec::{
+    TraceDecodeCursor, put_node, put_option_icmp_error_family, put_option_ip_version,
+    put_option_u16, put_option_u32, put_option_usize, put_u8,
+};
 
 use super::{IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 
@@ -52,6 +56,146 @@ pub enum IcmpNodeError {
     MissingIngressInterface,
     MissingSource,
     UnsupportedFamily,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcmpInputTrace {
+    pub version: Option<IpVersion>,
+    pub icmp_type: Option<u8>,
+    pub code: Option<u8>,
+    pub error: Option<u16>,
+    pub next: NodeId,
+}
+
+impl IcmpInputTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let version = cursor.read_option_ip_version()?;
+        let icmp_type = if cursor.read_bool()? {
+            Some(cursor.read_u8()?)
+        } else {
+            None
+        };
+        let code = if cursor.read_bool()? {
+            Some(cursor.read_u8()?)
+        } else {
+            None
+        };
+        let trace = Self {
+            version,
+            icmp_type,
+            code,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for IcmpInputTrace {
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_option_ip_version(out, self.version);
+        match self.icmp_type {
+            Some(value) => {
+                crate::trace::codec::put_bool(out, true);
+                put_u8(out, value);
+            }
+            None => crate::trace::codec::put_bool(out, false),
+        }
+        match self.code {
+            Some(value) => {
+                crate::trace::codec::put_bool(out, true);
+                put_u8(out, value);
+            }
+            None => crate::trace::codec::put_bool(out, false),
+        }
+        put_option_u16(out, self.error);
+        put_node(out, self.next);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcmpEchoRequestTrace {
+    pub generated_len: Option<usize>,
+    pub error: Option<u16>,
+    pub next: NodeId,
+}
+
+impl IcmpEchoRequestTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let trace = Self {
+            generated_len: cursor.read_option_usize()?,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for IcmpEchoRequestTrace {
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_option_usize(out, self.generated_len);
+        put_option_u16(out, self.error);
+        put_node(out, self.next);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcmpErrorTrace {
+    pub family: Option<IcmpErrorFamily>,
+    pub ingress_interface: Option<u32>,
+    pub local_source_present: bool,
+    pub generated_len: Option<usize>,
+    pub error: Option<u16>,
+    pub next: NodeId,
+}
+
+impl IcmpErrorTrace {
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = TraceDecodeCursor::new(bytes);
+        let trace = Self {
+            family: cursor.read_option_icmp_error_family()?,
+            ingress_interface: cursor.read_option_u32()?,
+            local_source_present: cursor.read_bool()?,
+            generated_len: cursor.read_option_usize()?,
+            error: cursor.read_option_u16()?,
+            next: cursor.read_node()?,
+        };
+        cursor.is_empty().then_some(trace)
+    }
+}
+
+impl PacketTrace for IcmpErrorTrace {
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        put_option_icmp_error_family(out, self.family);
+        put_option_u32(out, self.ingress_interface);
+        crate::trace::codec::put_bool(out, self.local_source_present);
+        put_option_usize(out, self.generated_len);
+        put_option_u16(out, self.error);
+        put_node(out, self.next);
+    }
+}
+
+fn format_icmp_input_trace(bytes: &[u8]) -> String {
+    match IcmpInputTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("IcmpInputTrace invalid={bytes:?}"),
+    }
+}
+
+fn format_icmp_echo_request_trace(bytes: &[u8]) -> String {
+    match IcmpEchoRequestTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("IcmpEchoRequestTrace invalid={bytes:?}"),
+    }
+}
+
+fn format_icmp_error_trace(bytes: &[u8]) -> String {
+    match IcmpErrorTrace::decode(bytes) {
+        Some(trace) => format!("{trace:?}"),
+        None => format!("IcmpErrorTrace invalid={bytes:?}"),
+    }
 }
 
 impl IcmpNodeError {
@@ -466,6 +610,11 @@ impl<G> Node<G> for IcmpInputNode {
         };
         process_cached_speculative_next(runtime, frame, &mut self.cached_next, &resolver)
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_icmp_input_trace)
+    }
 }
 
 impl<G> InternalNode<G> for IcmpInputNode {}
@@ -508,6 +657,11 @@ impl<G> Node<G> for IcmpEchoRequestNode {
             next: Self::runtime_nexts(runtime)?,
         };
         process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+    }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_icmp_echo_request_trace)
     }
 }
 
@@ -569,6 +723,11 @@ impl<G> Node<G> for IcmpErrorNode {
         };
         process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
     }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_icmp_error_trace)
+    }
 }
 
 #[inline(always)]
@@ -582,8 +741,21 @@ fn next_node_for_index<G>(
     let parsed = match parse_ip_packet_with_chain_len(packet, 0) {
         Ok(parsed) => parsed,
         Err(_) => {
-            set_index_node_error_code(runtime, index, IcmpInputError::BadLength.code())?;
-            return Ok(snapshot.default_next(IpVersion::V4));
+            let error = IcmpInputError::BadLength.code();
+            set_index_node_error_code(runtime, index, error)?;
+            let next = snapshot.default_next(IpVersion::V4);
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpInputTrace {
+                    version: None,
+                    icmp_type: None,
+                    code: None,
+                    error: Some(error),
+                    next,
+                },
+            )?;
+            return Ok(next);
         }
     };
     let version = parsed.version;
@@ -591,16 +763,52 @@ fn next_node_for_index<G>(
     match parsed.protocol {
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => {}
         IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
-            set_index_node_error_code(runtime, index, IcmpInputError::WrongProtocol.code())?;
+            let error = IcmpInputError::WrongProtocol.code();
+            set_index_node_error_code(runtime, index, error)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpInputTrace {
+                    version: Some(version),
+                    icmp_type: None,
+                    code: None,
+                    error: Some(error),
+                    next: default_next,
+                },
+            )?;
             return Ok(default_next);
         }
     }
     let Some(icmp) = packet.get(parsed.transport_header_offset..parsed.packet_len) else {
-        set_index_node_error_code(runtime, index, IcmpInputError::BadLength.code())?;
+        let error = IcmpInputError::BadLength.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: None,
+                code: None,
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     };
     if icmp.len() < ICMP_HEADER_MIN_LEN {
-        set_index_node_error_code(runtime, index, IcmpInputError::BadLength.code())?;
+        let error = IcmpInputError::BadLength.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: None,
+                code: None,
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     }
 
@@ -608,16 +816,53 @@ fn next_node_for_index<G>(
     let code = icmp[1];
     let key = IcmpInputKey { version, icmp_type };
     if snapshot.next_for_type(version, icmp_type).is_none() {
-        set_index_node_error_code(runtime, index, IcmpInputError::UnknownType.code())?;
-        return Ok(NodeNextStorage::next(snapshot, key));
+        let error = IcmpInputError::UnknownType.code();
+        set_index_node_error_code(runtime, index, error)?;
+        let next = NodeNextStorage::next(snapshot, key);
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next,
+            },
+        )?;
+        return Ok(next);
     }
     let spec = snapshot.spec(version, icmp_type);
     if code > spec.max_code {
-        set_index_node_error_code(runtime, index, IcmpInputError::BadCode.code())?;
+        let error = IcmpInputError::BadCode.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     }
     if icmp.len() < spec.min_len {
-        set_index_node_error_code(runtime, index, IcmpInputError::TooShort.code())?;
+        let error = IcmpInputError::TooShort.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     }
     if version == IpVersion::V6
@@ -625,12 +870,36 @@ fn next_node_for_index<G>(
             .get(7)
             .is_some_and(|hop_limit| *hop_limit < spec.min_hop_limit)
     {
-        set_index_node_error_code(runtime, index, IcmpInputError::HopLimit.code())?;
+        let error = IcmpInputError::HopLimit.code();
+        set_index_node_error_code(runtime, index, error)?;
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpInputTrace {
+                version: Some(version),
+                icmp_type: Some(icmp_type),
+                code: Some(code),
+                error: Some(error),
+                next: default_next,
+            },
+        )?;
         return Ok(default_next);
     }
 
     runtime.get_buffer_mut(index)?.clear_node_error();
-    Ok(NodeNextStorage::next(snapshot, key))
+    let next = NodeNextStorage::next(snapshot, key);
+    add_packet_trace!(
+        runtime,
+        index,
+        IcmpInputTrace {
+            version: Some(version),
+            icmp_type: Some(icmp_type),
+            code: Some(code),
+            error: None,
+            next,
+        },
+    )?;
+    Ok(next)
 }
 
 #[inline(always)]
@@ -642,13 +911,35 @@ fn next_node_for_echo_request_index<G>(
     let packet = runtime.copy_current_chain(index)?;
     match build_echo_reply(packet.as_ref()) {
         Ok(generated) => {
+            let generated_len = generated.packet.len();
             replace_current_chain(runtime, index, &generated.packet)?;
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
-            Ok(NodeNextStorage::next(&next, IcmpEchoRequestNext::Lookup))
+            let resolved = NodeNextStorage::next(&next, IcmpEchoRequestNext::Lookup);
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpEchoRequestTrace {
+                    generated_len: Some(generated_len),
+                    error: None,
+                    next: resolved,
+                },
+            )?;
+            Ok(resolved)
         }
         Err(error) => {
-            set_index_node_error_code(runtime, index, IcmpNodeError::from(error).code())?;
-            Ok(NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop))
+            let error = IcmpNodeError::from(error).code();
+            set_index_node_error_code(runtime, index, error)?;
+            let resolved = NodeNextStorage::next(&next, IcmpEchoRequestNext::Drop);
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpEchoRequestTrace {
+                    generated_len: None,
+                    error: Some(error),
+                    next: resolved,
+                },
+            )?;
+            Ok(resolved)
         }
     }
 }
@@ -661,35 +952,101 @@ fn next_node_for_icmp_error_index<G>(
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeId> {
     let Some(metadata) = runtime.with_metadata(index, |metadata| metadata.icmp_error)? else {
-        set_index_node_error_code(runtime, index, IcmpNodeError::MissingMetadata.code())?;
-        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+        let error = IcmpNodeError::MissingMetadata.code();
+        set_index_node_error_code(runtime, index, error)?;
+        let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpErrorTrace {
+                family: None,
+                ingress_interface: None,
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
+        )?;
+        return Ok(resolved);
     };
     let Some(interface_index) =
         runtime.with_metadata(index, |metadata| metadata.ingress_interface)?
     else {
-        set_index_node_error_code(
+        let error = IcmpNodeError::MissingIngressInterface.code();
+        set_index_node_error_code(runtime, index, error)?;
+        let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
+        add_packet_trace!(
             runtime,
             index,
-            IcmpNodeError::MissingIngressInterface.code(),
+            IcmpErrorTrace {
+                family: Some(metadata.family()),
+                ingress_interface: None,
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
         )?;
-        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+        return Ok(resolved);
     };
     let Some(local_source) = source_table.and_then(|source_table| {
         source_table.lookup(interface_index, version_for_family(metadata.family()))
     }) else {
-        set_index_node_error_code(runtime, index, IcmpNodeError::MissingSource.code())?;
-        return Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop));
+        let error = IcmpNodeError::MissingSource.code();
+        set_index_node_error_code(runtime, index, error)?;
+        let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
+        add_packet_trace!(
+            runtime,
+            index,
+            IcmpErrorTrace {
+                family: Some(metadata.family()),
+                ingress_interface: Some(interface_index),
+                local_source_present: false,
+                generated_len: None,
+                error: Some(error),
+                next: resolved,
+            },
+        )?;
+        return Ok(resolved);
     };
     let original = runtime.copy_current_chain(index)?;
     match build_icmp_error_packet(original.as_ref(), metadata, local_source) {
         Ok(generated) => {
+            let generated_len = generated.packet.len();
             replace_current_chain(runtime, index, &generated.packet)?;
             refresh_generated_icmp_metadata(runtime, index, &generated)?;
-            Ok(NodeNextStorage::next(&next, IcmpErrorNext::Lookup))
+            let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Lookup);
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpErrorTrace {
+                    family: Some(metadata.family()),
+                    ingress_interface: Some(interface_index),
+                    local_source_present: true,
+                    generated_len: Some(generated_len),
+                    error: None,
+                    next: resolved,
+                },
+            )?;
+            Ok(resolved)
         }
         Err(error) => {
-            set_index_node_error_code(runtime, index, IcmpNodeError::from(error).code())?;
-            Ok(NodeNextStorage::next(&next, IcmpErrorNext::Drop))
+            let error = IcmpNodeError::from(error).code();
+            set_index_node_error_code(runtime, index, error)?;
+            let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
+            add_packet_trace!(
+                runtime,
+                index,
+                IcmpErrorTrace {
+                    family: Some(metadata.family()),
+                    ingress_interface: Some(interface_index),
+                    local_source_present: true,
+                    generated_len: None,
+                    error: Some(error),
+                    next: resolved,
+                },
+            )?;
+            Ok(resolved)
         }
     }
 }

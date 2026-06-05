@@ -3,17 +3,19 @@ mod lookup;
 mod route_metadata;
 
 pub use ip::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable,
-    IcmpErrorSourceTableHandle, IcmpInputControlPlane, IcmpInputError, IcmpInputNode,
-    IcmpNodeError, IpInputError, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane,
-    IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpReassemblyDirectory,
-    IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode, IpReceiveNode, IpUnicastArc,
-    IpVersion,
+    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
+    IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
+    IcmpInputError, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IpInputError, IpInputNext,
+    IpInputNode, IpInputTarget, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError,
+    IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage, IpProtocol,
+    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
+    IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc, IpVersion,
 };
 pub use lookup::{
-    Adjacency, AdjacencyIndex, AdjacencyRewriteNode, AdjacencyRewriteNodeError, Dpo, DpoClass,
-    DpoId, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry, FibEntry, FibLookupResult,
-    FibRouteDpoError, FibTable, FibTableBuilder, FibTableHandle, IpLookupControlPlane,
-    IpLookupNode, LoadBalance, LoadBalanceError, LoadBalanceIndex,
+    Adjacency, AdjacencyIndex, AdjacencyRewriteNode, AdjacencyRewriteNodeError,
+    AdjacencyRewriteTrace, Dpo, DpoClass, DpoId, DpoProto, DpoStackRegistry, DpoType,
+    DpoTypeRegistry, FibEntry, FibLookupResult, FibRouteDpoError, FibTable, FibTableBuilder,
+    FibTableHandle, IpLookupControlPlane, IpLookupNode, IpLookupTrace, LoadBalance,
+    LoadBalanceError, LoadBalanceIndex,
 };
 pub use route_metadata::packet_route_metadata;

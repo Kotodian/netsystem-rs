@@ -2,23 +2,40 @@ use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet,
     DataPlaneRuntime, DataWorkerId, DriverNode, InternalNode, NextFrame, Node, NodeHandle, NodeId,
     NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,
-    NodeRegistration, NodeResult, PacketNextResolver, RouteMetadata, process_cached_rewrite_next,
-    process_cached_speculative_next,
+    NodeRegistration, NodeResult, PacketNextResolver, PacketTrace, RouteMetadata,
+    TraceControlPlane, TraceFormatter, TraceInputPolicy, TracePolicy, add_packet_trace,
+    process_cached_rewrite_next, process_cached_speculative_next,
 };
+use hammer_core::config::{TraceInputOptions, TraceOptions};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::log::{Factory, Level, LogWriter};
 use hammer_infra::vec::Vec;
+use std::time::Instant;
 
 #[derive(Default)]
 struct WakeCounter {
     wakes: AtomicUsize,
+}
+
+struct CaptureWriter {
+    lines: Mutex<std::vec::Vec<(Level, String)>>,
+}
+
+impl LogWriter for CaptureWriter {
+    fn write_message(&self, level: Level, message: String) {
+        self.lines
+            .lock()
+            .expect("capture writer poisoned")
+            .push((level, message));
+    }
 }
 
 impl Wake for WakeCounter {
@@ -808,6 +825,63 @@ impl Node<TestNode> for SpeculativeErrorAfterSplitAndKeepNode {
 
 impl InternalNode<TestNode> for SpeculativeErrorAfterSplitAndKeepNode {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestPacketTrace {
+    bytes: std::vec::Vec<u8>,
+}
+
+impl PacketTrace for TestPacketTrace {
+    #[inline]
+    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+        out.extend_from_slice(&self.bytes);
+    }
+}
+
+fn format_test_packet_trace(payload: &[u8]) -> String {
+    format!("TestPacketTrace bytes={payload:?}")
+}
+
+struct TraceNode {
+    next: NodeId,
+}
+
+impl Node<TestNode> for TraceNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime<TestNode>,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for index in frame.pending_indices().iter().copied() {
+            add_packet_trace!(
+                runtime,
+                index,
+                TestPacketTrace {
+                    bytes: runtime.copy_current(index)?.to_vec(),
+                },
+            )?;
+        }
+        Ok(NodeResult::next_current(self.next))
+    }
+
+    #[inline(always)]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_test_packet_trace)
+    }
+}
+
+impl InternalNode<TestNode> for TraceNode {
+    #[inline(always)]
+    fn node_registration(&self) -> NodeRegistration {
+        NodeRegistration::next("trace-input", 1)
+    }
+
+    #[inline(always)]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        std::slice::from_ref(&self.next)
+    }
+}
+
 enum TestNode {
     Forward(ForwardNode),
     SourceDriver(SourceDriverNode),
@@ -834,6 +908,7 @@ enum TestNode {
     VectorErrorAfterEnqueue(VectorErrorAfterEnqueueNode),
     SpeculativeErrorAfterSplit(SpeculativeErrorAfterSplitNode),
     SpeculativeErrorAfterSplitAndKeep(SpeculativeErrorAfterSplitAndKeepNode),
+    Trace(TraceNode),
 }
 
 impl From<ForwardNode> for TestNode {
@@ -986,6 +1061,12 @@ impl From<SpeculativeErrorAfterSplitAndKeepNode> for TestNode {
     }
 }
 
+impl From<TraceNode> for TestNode {
+    fn from(node: TraceNode) -> Self {
+        Self::Trace(node)
+    }
+}
+
 impl Node<TestNode> for TestNode {
     #[inline(always)]
     fn process(
@@ -1019,6 +1100,7 @@ impl Node<TestNode> for TestNode {
             Self::VectorErrorAfterEnqueue(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplit(node) => node.process(runtime, frame),
             Self::SpeculativeErrorAfterSplitAndKeep(node) => node.process(runtime, frame),
+            Self::Trace(node) => node.process(runtime, frame),
         }
     }
 }
@@ -1088,6 +1170,646 @@ fn node_runtime_does_not_schedule_empty_frame() {
     assert_eq!(count.get(), 0);
 
     runtime.free_frame_index(frame).expect("free empty frame");
+}
+
+#[test]
+fn trace_control_records_marked_packet_entries_when_buffer_is_freed() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_node, buffer)
+        .expect("mark packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, trace_node);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].node, trace_node);
+    assert_eq!(records[0].entries[0].node_name, Some("trace-input"));
+    assert_eq!(records[0].entries[0].payload_bytes, b"packet");
+    assert_eq!(
+        records[0].entries[0].format_payload(),
+        "TestPacketTrace bytes=[112, 97, 99, 107, 101, 116]"
+    );
+    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.frames_in_use(), 0);
+}
+
+#[test]
+fn trace_control_honors_input_quota() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let buffer = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), payload)
+            .expect("alloc packet");
+        runtime
+            .try_mark_trace(trace_node, buffer)
+            .expect("mark packet");
+        runtime
+            .get_frame_mut(frame)
+            .expect("mutate frame")
+            .push_index(buffer)
+            .expect("push packet");
+    }
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+}
+
+#[test]
+fn trace_control_publish_updates_packet_capacity_for_new_marks() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 1,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 2,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 1);
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first packet");
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .expect("alloc second packet");
+    runtime
+        .try_mark_trace(trace_node, first)
+        .expect("mark first packet");
+    runtime
+        .try_mark_trace(trace_node, second)
+        .expect("packet capacity rejects second mark");
+    assert!(
+        runtime
+            .get_buffer(second)
+            .expect("second buffer")
+            .trace_mark()
+            .is_none()
+    );
+
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime
+        .try_mark_trace(trace_node, second)
+        .expect("new packet capacity allows second mark");
+
+    assert!(
+        runtime
+            .get_buffer(second)
+            .expect("second buffer")
+            .trace_mark()
+            .is_some()
+    );
+    runtime.free_index(first);
+    runtime.free_index(second);
+}
+
+#[test]
+fn trace_control_disabled_policy_does_not_mark_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: false,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 0);
+    assert!(control.take_records().is_empty());
+}
+
+#[test]
+fn trace_control_empty_inputs_do_not_mark_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: std::vec::Vec::new(),
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 0);
+    assert!(control.take_records().is_empty());
+}
+
+#[test]
+fn trace_control_replacement_epoch_stops_old_policy_new_quota() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    let first_epoch = control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 4,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"old")
+        .expect("alloc first packet");
+    runtime
+        .try_mark_trace(trace_node, first)
+        .expect("mark first packet");
+    let first_mark = runtime
+        .get_buffer(first)
+        .expect("first buffer")
+        .trace_mark()
+        .expect("first packet marked");
+    assert_eq!(first_mark.epoch, first_epoch);
+
+    let second_epoch = control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: std::vec::Vec::new(),
+    });
+    assert_ne!(first_epoch, second_epoch);
+    let second = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"new")
+        .expect("alloc second packet");
+    runtime
+        .try_mark_trace(trace_node, second)
+        .expect("new policy must not mark without inputs");
+
+    assert!(
+        runtime
+            .get_buffer(second)
+            .expect("second buffer")
+            .trace_mark()
+            .is_none()
+    );
+
+    runtime.free_index(first);
+    runtime.free_index(second);
+    assert_eq!(control.drain_completed(), 0);
+    assert!(control.take_records().is_empty());
+}
+
+#[test]
+fn trace_marked_old_epoch_packets_keep_recording_after_policy_replacement() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 4, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    let first_epoch = control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"oldpkt")
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_node, buffer)
+        .expect("mark packet");
+    let mark = runtime
+        .get_buffer(buffer)
+        .expect("buffer")
+        .trace_mark()
+        .expect("packet marked");
+    assert_eq!(mark.epoch, first_epoch);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: std::vec::Vec::new(),
+    });
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].epoch, first_epoch);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].payload_bytes, b"oldpkt");
+}
+
+#[test]
+fn scheduled_internal_nodes_do_not_start_packet_traces() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 0);
+    assert!(control.take_records().is_empty());
+}
+
+#[test]
+fn trace_add_trace_noops_for_unmarked_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_test_packet(&runtime, frame, b"packet");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn trace_macro_does_not_build_for_unmarked_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let _trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let index = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    let built = Cell::new(false);
+
+    add_packet_trace!(runtime, index, {
+        built.set(true);
+        TestPacketTrace {
+            bytes: b"should-not-build".to_vec(),
+        }
+    },)
+    .expect("unmarked trace macro noops");
+
+    assert!(!built.get(), "trace payload builder must stay cold");
+    runtime.free_index(index);
+}
+
+#[test]
+fn trace_completed_queue_overflow_drops_records_without_blocking() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 8, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(1);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 1,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 2,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 8);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    assert_eq!(control.dropped_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+}
+
+#[test]
+fn trace_publish_updates_completed_queue_capacity() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 8, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(1);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 3,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 3,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 8);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
+    push_marked_test_packet(&runtime, frame, trace_node, b"third");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 3);
+    assert_eq!(control.dropped_completed(), 0);
+    let records = control.take_records();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+    assert_eq!(records[1].entries[0].payload_bytes, b"second");
+    assert_eq!(records[2].entries[0].payload_bytes, b"third");
+}
+
+#[test]
+fn trace_publish_preserves_drained_records_when_capacity_grows() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 8, 8, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(1);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 1,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 8);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"first");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 3,
+        packet_capacity: 8,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 2,
+        }],
+    });
+    let frame = runtime.alloc_frame_index().expect("alloc second frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"second");
+    push_marked_test_packet(&runtime, frame, trace_node, b"third");
+
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 2);
+    let records = control.take_records();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].entries[0].payload_bytes, b"first");
+    assert_eq!(records[1].entries[0].payload_bytes, b"second");
+    assert_eq!(records[2].entries[0].payload_bytes, b"third");
+}
+
+#[test]
+fn trace_record_sink_prints_completed_records_through_control_logger() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 4, 2, 2);
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: trace_node,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_marked_test_packet(&runtime, frame, trace_node, b"packet");
+    assert!(runtime.schedule_frame(trace_node, frame).expect("schedule"));
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+
+    let writer = Arc::new(CaptureWriter {
+        lines: Mutex::new(std::vec::Vec::new()),
+    });
+    let logger = Factory::new(Instant::now(), writer.clone()).new_logger("trace-control");
+
+    assert_eq!(control.sink().drain_completed_with_logger(&logger), 1);
+
+    let captured = writer.lines.lock().expect("capture writer poisoned");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].0, Level::Debug);
+    assert!(captured[0].1.contains("trace-control"));
+    assert!(
+        captured[0]
+            .1
+            .contains("packet trace epoch=1 input=trace-input")
+    );
+    assert!(
+        captured[0]
+            .1
+            .contains("trace-input: TestPacketTrace bytes=[112, 97, 99, 107, 101, 116]")
+    );
+}
+
+#[test]
+fn trace_control_publish_options_resolves_declared_node_names() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(8, 2, 1, 1);
+    let sink = runtime.nodes().register(TestNode::Count(CountNode {
+        count: Rc::new(Cell::new(0)),
+    }));
+    let trace_node = runtime.nodes().register_internal(TraceNode { next: sink });
+    let control = TraceControlPlane::new(4);
+    let epoch = control
+        .publish_options(
+            &TraceOptions {
+                enabled: true,
+                record_capacity: 4,
+                packet_capacity: 2,
+                inputs: vec![TraceInputOptions {
+                    node: "trace-input".to_owned(),
+                    count: 3,
+                }],
+            },
+            |name| runtime.node_by_name(name),
+        )
+        .expect("publish trace options");
+
+    assert_eq!(epoch, 1);
+    assert_eq!(runtime.node_by_name("trace-input"), Some(trace_node));
+    let err = control
+        .publish_options(
+            &TraceOptions {
+                enabled: true,
+                record_capacity: 4,
+                packet_capacity: 2,
+                inputs: vec![TraceInputOptions {
+                    node: "missing".to_owned(),
+                    count: 1,
+                }],
+            },
+            |name| runtime.node_by_name(name),
+        )
+        .expect_err("missing trace input node must fail");
+    assert!(
+        err.to_string()
+            .contains("trace.inputs node is not a declared packet node: missing"),
+        "unexpected error: {err}"
+    );
+    let epoch = control
+        .publish_options(
+            &TraceOptions {
+                enabled: false,
+                record_capacity: 4,
+                packet_capacity: 2,
+                inputs: vec![TraceInputOptions {
+                    node: "missing".to_owned(),
+                    count: 1,
+                }],
+            },
+            |_name| panic!("disabled trace inputs should not resolve packet graph nodes"),
+        )
+        .expect("disabled trace options should publish without input resolution");
+    assert_eq!(epoch, 2);
 }
 
 #[test]
@@ -2163,6 +2885,25 @@ fn push_test_packet(
         .expect("push packet");
 }
 
+fn push_marked_test_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: NodeId,
+    payload: &[u8],
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), payload)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+}
+
 #[test]
 fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storage() {
     const SINK_HANDLE: NodeHandle = NodeHandle::new(1);
@@ -2234,6 +2975,94 @@ fn data_plane_handoff_moves_frame_between_workers_without_copying_payload_storag
     assert_eq!(&*current_ptrs.borrow(), &[original_ptr]);
     assert_eq!(first_runtime.in_use_buffers(), 0);
     assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn traced_packet_handoff_records_entries_on_target_worker() {
+    const SINK_HANDLE: NodeHandle = NodeHandle::new(3);
+    let handoff = DataPlaneHandoff::with_buffer_arena(2, 8, BufferPoolArena::with_capacity(64, 8));
+    let first_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::<TestNode>::with_handoff(
+        DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+            handoff.buffer_arena(),
+            4,
+            4,
+            hammer_adapter::DataPlaneInstructionSet::Scalar,
+        ),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let payloads = Rc::new(RefCell::new(Vec::new()));
+    let sink = second_runtime.nodes().register(TestNode::Sink(SinkNode {
+        trace: Rc::new(RefCell::new(Vec::new())),
+        payloads,
+    }));
+    assert_eq!(sink, NodeId::new(0));
+    let target_trace = second_runtime
+        .nodes()
+        .register_internal_with_handle(SINK_HANDLE, TraceNode { next: sink })
+        .expect("register target trace node");
+    let source_sink = first_runtime.nodes().register(TestNode::Count(CountNode {
+        count: Rc::new(Cell::new(0)),
+    }));
+    let source_trace = first_runtime
+        .nodes()
+        .register_internal(TraceNode { next: source_sink });
+    let handoff_node = first_runtime.nodes().register_internal(HandoffNode {
+        target_worker: DataWorkerId::new(1),
+        target: SINK_HANDLE,
+    });
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: source_trace,
+            count: 1,
+        }],
+    });
+    let trace_handle = control.handle();
+    first_runtime.set_trace_control(Some(trace_handle.clone()), 2);
+    second_runtime.set_trace_control(Some(trace_handle), 2);
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = first_runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .expect("alloc packet");
+    first_runtime
+        .try_mark_trace(source_trace, buffer)
+        .expect("mark packet on source worker");
+    first_runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+
+    assert!(
+        first_runtime
+            .schedule_frame(handoff_node, frame)
+            .expect("schedule handoff")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run source"), 1);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run target"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, source_trace);
+    assert_eq!(records[0].entries.len(), 1);
+    assert_eq!(records[0].entries[0].node, target_trace);
+    assert_eq!(records[0].entries[0].node_name, Some("trace-input"));
+    assert_eq!(records[0].entries[0].payload_bytes, b"packet");
 }
 
 #[test]

@@ -168,6 +168,54 @@ fn service_rejects_tap_true_with_system_stack() {
 }
 
 #[test]
+fn service_accepts_trace_input_for_declared_packet_graph_node() {
+    let platform = Arc::new(CapturePlatform::default());
+    let config = format!(
+        "{}\n[trace]\nenabled = true\n\n[[trace.inputs]]\nnode = \"tun-input-driver-node\"\ncount = 1\n",
+        min_toml()
+    );
+
+    let svc = HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("declared packet graph trace input should construct");
+
+    svc.close().expect("close should succeed");
+}
+
+#[test]
+fn service_rejects_trace_input_when_packet_graph_node_is_not_declared() {
+    let platform = Arc::new(CapturePlatform::default());
+    let config = format!(
+        "{}\n[trace]\nenabled = true\n\n[[trace.inputs]]\nnode = \"not-a-packet-node\"\ncount = 1\n",
+        min_toml()
+    );
+
+    let err = match HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>) {
+        Ok(_) => panic!("unknown trace input node must be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string()
+            .contains("trace.inputs node is not a declared packet node: not-a-packet-node"),
+        "error = {err:?}"
+    );
+}
+
+#[test]
+fn service_accepts_disabled_trace_inputs_as_noop() {
+    let platform = Arc::new(CapturePlatform::default());
+    let config = format!(
+        "{}\n[trace]\nenabled = false\n\n[[trace.inputs]]\nnode = \"tun-input-driver-node\"\ncount = 1\n",
+        min_toml()
+    );
+
+    let svc = HammerService::new(&config, Arc::clone(&platform) as Arc<dyn HammerPlatform>)
+        .expect("disabled trace inputs should not resolve packet graph nodes");
+
+    svc.close().expect("close should succeed");
+}
+
+#[test]
 fn service_walks_all_stages_and_managers() {
     let (platform, svc) = make_service();
     svc.start().expect("start should succeed");

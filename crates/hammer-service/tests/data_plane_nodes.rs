@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::net::{IpAddr, Ipv4Addr};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6,14 +7,19 @@ use std::time::Duration;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteDecision,
-    RouteMetadata, RouteTarget, Router,
+    RouteMetadata, RouteTarget, Router, SocksAddr, TraceControlPlane, TraceInputPolicy,
+    TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::lifecycle::{Lifecycle, StartStage};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::{
-    DropNode, Feature, FeatureArcControl, FeatureArcSpec, RouteMatchNext, RouteMatchNode,
+    DropNode, DropTrace, Feature, FeatureArcControl, FeatureArcSpec, RouteDecisionKind,
+    RouteMatchNext, RouteMatchNode, RouteMatchTrace,
 };
+
+const DATA_PLANE_SOURCE: &str = include_str!("../src/data_plane.rs");
+const IP_REASSEMBLY_SOURCE: &str = include_str!("../src/net/ip/reassembly.rs");
 
 struct StaticRouter {
     decision: RouteDecision,
@@ -247,6 +253,151 @@ fn drop_node_frees_frame_buffers() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn drop_node_adds_trace_payload_before_freeing_packet() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(64, 4, 2, 4);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let control = TraceControlPlane::new(4);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: drop,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 2);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"drop")
+        .expect("alloc packet");
+    runtime.try_mark_trace(drop, packet).expect("mark packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(packet)
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(drop, frame).expect("schedule drop"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].entries[0].node_name, Some("drop-node"));
+    assert_eq!(
+        DropTrace::decode(&records[0].entries[0].payload_bytes).expect("drop trace"),
+        DropTrace { dropped: 1 }
+    );
+}
+
+#[test]
+fn route_match_node_adds_trace_payload_for_route_decision() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(128, 4, 2, 4);
+    let decisions = Rc::new(RefCell::new(Vec::new()));
+    let sink = runtime
+        .nodes()
+        .register(TestNode::DecisionSink(DecisionSinkNode {
+            decisions: Rc::clone(&decisions),
+        }));
+    let router = Arc::new(StaticRouter::new(RouteDecision::Reject {
+        method: "blocked".to_owned(),
+    }));
+    let route_match = runtime.nodes().register_internal(RouteMatchNode::new(
+        Arc::clone(&router),
+        RouteMatchNext::nodes(sink),
+    ));
+    let control = TraceControlPlane::new(4);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: route_match,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 2);
+    let metadata = RouteMetadata {
+        network: Network::Tcp,
+        source: Some(SocksAddr::domain(
+            "source.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            1234,
+        )),
+        destination: Some(SocksAddr::domain(
+            "dest.example",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            443,
+        )),
+        ..Default::default()
+    };
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = runtime
+        .alloc_index_with_bytes(metadata, b"route")
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(route_match, packet)
+        .expect("mark packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(packet)
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(route_match, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].entries[0].node_name, Some("route-match-node"));
+    let trace = RouteMatchTrace::decode(&records[0].entries[0].payload_bytes).expect("route trace");
+    assert_eq!(trace.network, Network::Tcp);
+    assert_eq!(
+        trace.source,
+        Some(SocksAddr::domain(
+            "source.example",
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            1234
+        ))
+    );
+    assert_eq!(
+        trace.destination,
+        Some(SocksAddr::domain(
+            "dest.example",
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            443
+        ))
+    );
+    assert_eq!(trace.decision_kind, RouteDecisionKind::Reject);
+}
+
+#[test]
+fn packet_trace_append_sites_use_macro_owned_trace_checks() {
+    assert!(
+        !DATA_PLANE_SOURCE.contains("let traced = runtime.should_trace_packet(index)?"),
+        "RouteMatchNode append sites should let add_packet_trace! own trace checks"
+    );
+    assert!(
+        !DATA_PLANE_SOURCE.contains("if unlikely(traced)"),
+        "RouteMatchNode should construct trace payloads lazily inside add_packet_trace!"
+    );
+    assert!(
+        !IP_REASSEMBLY_SOURCE.contains("fn add_trace"),
+        "IpReassemblyNode append sites should call add_packet_trace! directly"
+    );
+    assert!(
+        !IP_REASSEMBLY_SOURCE.contains("self.add_trace("),
+        "IpReassemblyNode should not route trace appends through a node-local wrapper"
+    );
 }
 
 #[test]

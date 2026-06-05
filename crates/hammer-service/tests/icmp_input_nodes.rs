@@ -4,10 +4,13 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeResult, RouteMetadata,
+    TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
-use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IpVersion};
+use hammer_service::net::{
+    IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IcmpInputTrace, IpVersion,
+};
 
 #[derive(Default)]
 struct CaptureState {
@@ -103,9 +106,20 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
         .register_type(IpVersion::V4, 8, echo)
         .expect("register echo request");
     let icmp_input = runtime.nodes().register_internal(control.node());
+    let trace_control = TraceControlPlane::new(4);
+    trace_control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: icmp_input,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_packet(8, 0, b"echo4");
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet);
+    push_marked_packet(&runtime, frame, icmp_input, &packet);
 
     assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
 
@@ -113,6 +127,15 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     assert_eq!(echo_state.borrow().packets, vec![packet]);
     assert!(echo_state.borrow().node_errors[0].is_none());
     assert!(punt_state.borrow().packets.is_empty());
+    assert_eq!(trace_control.drain_completed(), 1);
+    let records = trace_control.take_records();
+    let trace =
+        IcmpInputTrace::decode(&records[0].entries[0].payload_bytes).expect("icmp input trace");
+    assert_eq!(trace.version, Some(IpVersion::V4));
+    assert_eq!(trace.icmp_type, Some(8));
+    assert_eq!(trace.code, Some(0));
+    assert_eq!(trace.error, None);
+    assert_eq!(trace.next, echo);
 }
 
 #[test]
@@ -211,6 +234,25 @@ fn push_packet(
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), packet)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

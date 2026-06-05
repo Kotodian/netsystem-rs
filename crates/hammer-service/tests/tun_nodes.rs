@@ -5,7 +5,7 @@ use std::vec::Vec as StdVec;
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteMetadata,
-    SocksAddr,
+    SocksAddr, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_core::forwarding::AdjacencyRewrite;
@@ -17,9 +17,11 @@ use hammer_service::interface::{
 };
 use hammer_service::net::{
     AdjacencyRewriteNode, DpoId, DpoProto, FibTableBuilder, IpInputNext, IpInputNode,
-    IpLookupControlPlane, IpLookupNode,
+    IpInputTarget, IpInputTrace, IpLookupControlPlane, IpLookupNode, IpProtocol, IpVersion,
 };
-use hammer_service::tun::{MemoryTunDevice, TunInputDriverNode, TunOutputDriverNode};
+use hammer_service::tun::{
+    MemoryTunDevice, TunInputDriverNode, TunInputTrace, TunOutputDriverNode, TunOutputTrace,
+};
 use ipnet::Ipv4Net;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +289,85 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tun_driver_nodes_record_node_payloads_for_traced_packets() {
+    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let device = MemoryTunDevice::new();
+    let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
+    device.inject(packet.clone()).expect("inject packet");
+
+    let output = runtime
+        .nodes()
+        .register_driver(TunOutputDriverNode::new(device.output()));
+    let ip_input = runtime
+        .nodes()
+        .register_internal(IpInputNode::new(IpInputNext::nodes(
+            output, output, output, output, output, output, output,
+        )));
+    let driver = runtime.nodes().register_driver(
+        TunInputDriverNode::new(device.input(), "tun0", ip_input).with_interface_index(42),
+    );
+    let control = TraceControlPlane::new(8);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 8,
+        packet_capacity: 4,
+        inputs: vec![TraceInputPolicy {
+            node: driver,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 4);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+
+    runtime
+        .schedule_driver_frame(driver, frame)
+        .expect("schedule tun driver");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_eq!(control.drain_completed(), 1);
+    let records = control.take_records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].input_node, driver);
+    assert_eq!(records[0].input_node_name, Some("tun-input-driver-node"));
+    assert_eq!(records[0].entries.len(), 3);
+    assert_eq!(
+        records[0].entries[0].node_name,
+        Some("tun-input-driver-node")
+    );
+    assert_eq!(
+        TunInputTrace::decode(&records[0].entries[0].payload_bytes).expect("tun input trace"),
+        TunInputTrace {
+            interface_index: Some(42),
+            mode: hammer_service::tun::TunDriverMode::Tun,
+            received: 1,
+        }
+    );
+    assert_eq!(records[0].entries[1].node_name, Some("ip-input-node"));
+    assert_eq!(
+        IpInputTrace::decode(&records[0].entries[1].payload_bytes).expect("ip input trace"),
+        IpInputTrace {
+            version: Some(IpVersion::V4),
+            protocol: Some(IpProtocol::Udp),
+            input_target: Some(IpInputTarget::Lookup),
+            input_error: Some(hammer_service::net::IpInputError::None),
+            packet_len: packet.len(),
+            next: output,
+        }
+    );
+    assert_eq!(
+        records[0].entries[2].node_name,
+        Some("tun-output-driver-node")
+    );
+    assert_eq!(
+        TunOutputTrace::decode(&records[0].entries[2].payload_bytes).expect("tun output trace"),
+        TunOutputTrace {
+            mode: hammer_service::tun::TunDriverMode::Tun,
+            pending: 1,
+        }
+    );
 }
 
 #[test]
@@ -679,12 +760,14 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     let default_output_device = MemoryTunDevice::new();
     let override_output_device = MemoryTunDevice::new();
 
-    let default_output = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new(default_output_device.output()));
-    let override_output = runtime
-        .nodes()
-        .register_driver(TunOutputDriverNode::new(override_output_device.output()));
+    let default_output = runtime.nodes().register_driver(
+        TunOutputDriverNode::new(default_output_device.output())
+            .with_node_name("default-tun-output-driver-node"),
+    );
+    let override_output = runtime.nodes().register_driver(
+        TunOutputDriverNode::new(override_output_device.output())
+            .with_node_name("override-tun-output-driver-node"),
+    );
     let feature_metadata = Rc::new(RefCell::new(Vec::new()));
     let feature = runtime.nodes().register_internal(CaptureFeatureNode {
         metadata: Rc::clone(&feature_metadata),

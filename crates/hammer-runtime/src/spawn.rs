@@ -37,7 +37,8 @@ use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::DataPlaneBuffers;
+use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
+use hammer_core::log::Logger;
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use hammer_core::error::{HammerError, HammerResult};
@@ -365,6 +366,34 @@ impl DataRuntimeContext {
                 })
             })
             .collect()
+    }
+
+    pub fn set_trace_control_on_workers(
+        &self,
+        control: Option<TraceControlHandle>,
+        packet_capacity: usize,
+    ) -> HammerResult<()> {
+        let _ = packet_capacity;
+        self.for_each_worker(move |_| {
+            DATA_PLANE_RUNTIME.with(|runtime| {
+                runtime.set_trace_control(control.clone(), 0);
+            });
+        })
+        .map(|_| ())
+    }
+
+    pub fn drain_trace_records_on_workers(&self, sink: TraceRecordSink) -> HammerResult<usize> {
+        self.for_each_worker(move |_| sink.drain_completed())
+            .map(|counts| counts.into_iter().sum())
+    }
+
+    pub fn drain_trace_records_on_workers_with_logger(
+        &self,
+        sink: TraceRecordSink,
+        logger: Logger,
+    ) -> HammerResult<usize> {
+        self.for_each_worker(move |_| sink.drain_completed_with_logger(&logger))
+            .map(|counts| counts.into_iter().sum())
     }
 
     fn first_handle(&self) -> &Handle {
@@ -893,9 +922,14 @@ fn next_data_runtime_context_id() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_adapter::{
+        NodeId, TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
+    };
+    use hammer_core::log::{Factory, Level, LogWriter};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
     use std::thread;
     use std::time::Duration;
+    use std::time::Instant as StdInstant;
     use tokio::sync::oneshot;
 
     static TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -905,6 +939,19 @@ mod tests {
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .expect("spawn test lock poisoned")
+    }
+
+    struct CaptureWriter {
+        lines: StdMutex<std::vec::Vec<(Level, String)>>,
+    }
+
+    impl LogWriter for CaptureWriter {
+        fn write_message(&self, level: Level, message: String) {
+            self.lines
+                .lock()
+                .expect("capture writer poisoned")
+                .push((level, message));
+        }
     }
 
     #[test]
@@ -1020,6 +1067,92 @@ mod tests {
         assert_eq!(before, 0);
         assert_eq!(during, 1);
         assert_eq!(after, 0);
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_context_sets_trace_control_on_each_worker_runtime() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(2, "spawn-test-trace", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let control = TraceControlPlane::new(8);
+        control.publish(TracePolicy {
+            enabled: false,
+            record_capacity: 8,
+            packet_capacity: 2,
+            inputs: vec![TraceInputPolicy {
+                node: NodeId::new(0),
+                count: 2,
+            }],
+        });
+
+        context
+            .set_trace_control_on_workers(Some(control.handle()), 2)
+            .expect("set trace control");
+        let marks = context
+            .for_each_worker(|_| {
+                DATA_PLANE_RUNTIME.with(|runtime| {
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .expect("alloc packet");
+                    runtime
+                        .try_mark_trace(NodeId::new(0), index)
+                        .expect("disabled trace mark is no-op");
+                    let marked = runtime
+                        .get_buffer(index)
+                        .expect("buffer")
+                        .trace_mark()
+                        .is_some();
+                    runtime.free_index(index);
+                    marked
+                })
+            })
+            .expect("inspect workers");
+
+        assert_eq!(marks, vec![false, false]);
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_context_drains_trace_records_through_logger() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-trace-drain", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let control = TraceControlPlane::new(4);
+        control.handle().push_completed_record(TraceRecord {
+            epoch: 1,
+            input_node: NodeId::new(0),
+            input_node_name: Some("trace-input"),
+            entries: vec![TraceEntry {
+                node: NodeId::new(1),
+                node_name: Some("trace-node"),
+                payload_bytes: b"test".to_vec(),
+                formatter: None,
+            }],
+        });
+        let writer = Arc::new(CaptureWriter {
+            lines: StdMutex::new(std::vec::Vec::new()),
+        });
+        let logger = Factory::new(StdInstant::now(), writer.clone()).new_logger("trace-control");
+
+        let drained = context
+            .drain_trace_records_on_workers_with_logger(control.sink(), logger)
+            .expect("drain trace records");
+
+        assert_eq!(drained, 1);
+        let lines = writer.lines.lock().expect("capture writer poisoned");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].0, Level::Debug);
+        assert!(
+            lines[0]
+                .1
+                .contains("packet trace epoch=1 input=trace-input")
+        );
+        assert!(lines[0].1.contains("trace-node: 0x74657374"));
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

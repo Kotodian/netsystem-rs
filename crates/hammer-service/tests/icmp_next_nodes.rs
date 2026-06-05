@@ -4,13 +4,13 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, IcmpErrorMetadata, InternalNode, Node,
-    NodeResult, RouteMetadata,
+    NodeResult, RouteMetadata, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpErrorNext, IcmpErrorNode, IcmpErrorSourceTable,
-    IcmpNodeError,
+    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
+    IcmpErrorSourceTable, IcmpErrorTrace, IcmpNodeError,
 };
 
 const LOCAL_ORIGINATED_TTL: u8 = 64;
@@ -114,6 +114,17 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
             .register_internal(IcmpEchoRequestNode::new(IcmpEchoRequestNext::nodes(
                 lookup, drop,
             )));
+    let trace_control = TraceControlPlane::new(4);
+    trace_control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: echo,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_echo_packet(
         Ipv4Addr::new(10, 0, 0, 1),
         Ipv4Addr::new(192, 0, 2, 1),
@@ -121,7 +132,7 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
         b"echo4-payload",
     );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &packet, RouteMetadata::default());
+    push_marked_packet(&runtime, frame, echo, &packet, RouteMetadata::default());
 
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
@@ -140,6 +151,13 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
     assert_eq!(&reply[28..], &packet[28..]);
     assert_eq!(internet_checksum(&reply[..20]), 0);
     assert_eq!(internet_checksum(&reply[20..]), 0);
+    assert_eq!(trace_control.drain_completed(), 1);
+    let records = trace_control.take_records();
+    let trace = IcmpEchoRequestTrace::decode(&records[0].entries[0].payload_bytes)
+        .expect("echo request trace");
+    assert_eq!(trace.generated_len, Some(reply.len()));
+    assert_eq!(trace.error, None);
+    assert_eq!(trace.next, lookup);
 }
 
 #[test]
@@ -281,6 +299,17 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
         IcmpErrorNode::new(IcmpErrorNext::nodes(drop, lookup))
             .with_source_table(error_sources.handle()),
     );
+    let trace_control = TraceControlPlane::new(4);
+    trace_control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: error,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(trace_control.handle()), 2);
     let original = ipv4_udp_packet(
         Ipv4Addr::new(10, 0, 0, 10),
         Ipv4Addr::new(198, 51, 100, 1),
@@ -292,7 +321,7 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
         ..RouteMetadata::default()
     };
     let frame = runtime.alloc_frame_index().expect("alloc frame");
-    push_packet(&runtime, frame, &original, metadata);
+    push_marked_packet(&runtime, frame, error, &original, metadata);
 
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
@@ -312,6 +341,19 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
     assert_eq!(&reply[28..], &original[..]);
     assert_eq!(internet_checksum(&reply[..20]), 0);
     assert_eq!(internet_checksum(&reply[20..]), 0);
+    assert_eq!(trace_control.drain_completed(), 1);
+    let records = trace_control.take_records();
+    let trace =
+        IcmpErrorTrace::decode(&records[0].entries[0].payload_bytes).expect("icmp error trace");
+    assert_eq!(
+        trace.family,
+        Some(hammer_core::protocol::icmp::IcmpErrorFamily::Ipv4)
+    );
+    assert_eq!(trace.ingress_interface, Some(7));
+    assert!(trace.local_source_present);
+    assert_eq!(trace.generated_len, Some(reply.len()));
+    assert_eq!(trace.error, None);
+    assert_eq!(trace.next, lookup);
 }
 
 #[test]
@@ -490,6 +532,26 @@ fn push_packet(
     let buffer = runtime
         .alloc_index_with_bytes(metadata, packet)
         .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(buffer)
+        .expect("push packet");
+}
+
+fn push_marked_packet(
+    runtime: &DataPlaneRuntime<TestNode>,
+    frame: hammer_adapter::FrameIndex,
+    trace_input: hammer_adapter::NodeId,
+    packet: &[u8],
+    metadata: RouteMetadata,
+) {
+    let buffer = runtime
+        .alloc_index_with_bytes(metadata, packet)
+        .expect("alloc packet");
+    runtime
+        .try_mark_trace(trace_input, buffer)
+        .expect("mark packet");
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
