@@ -1,6 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use hammer_adapter::{Network, NodeId, SocksAddr};
+use hammer_adapter::NodeId;
 use hammer_core::forwarding::DpoType;
 use hammer_core::protocol::icmp::IcmpErrorFamily;
 use hammer_core::protocol::ip::{
@@ -72,55 +72,6 @@ pub(crate) fn put_option_node(out: &mut Vec<u8>, value: Option<NodeId>) {
             put_node(out, value);
         }
         None => put_bool(out, false),
-    }
-}
-
-pub(crate) fn put_socks_addr(out: &mut Vec<u8>, value: Option<&SocksAddr>) {
-    let Some(value) = value else {
-        put_bool(out, false);
-        return;
-    };
-    put_bool(out, true);
-    put_ip_addr(out, value.host);
-    put_u16(out, value.port);
-    if let Some(domain) = &value.domain {
-        put_bool(out, true);
-        let bytes = domain.as_bytes();
-        let len = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
-        put_u16(out, len);
-        out.extend_from_slice(&bytes[..usize::from(len)]);
-    } else {
-        put_bool(out, false);
-    }
-}
-
-pub(crate) fn put_ip_addr(out: &mut Vec<u8>, value: IpAddr) {
-    match value {
-        IpAddr::V4(addr) => {
-            put_u8(out, 4);
-            out.extend_from_slice(&addr.octets());
-        }
-        IpAddr::V6(addr) => {
-            put_u8(out, 6);
-            out.extend_from_slice(&addr.octets());
-        }
-    }
-}
-
-pub(crate) fn encode_network(value: Network) -> u8 {
-    match value {
-        Network::Tcp => 0,
-        Network::Udp => 1,
-        Network::Icmp => 2,
-    }
-}
-
-pub(crate) fn decode_network(value: u8) -> Option<Network> {
-    match value {
-        0 => Some(Network::Tcp),
-        1 => Some(Network::Udp),
-        2 => Some(Network::Icmp),
-        _ => None,
     }
 }
 
@@ -395,32 +346,6 @@ impl<'a> TraceDecodeCursor<'a> {
             Some(Some(self.read_node()?))
         } else {
             Some(None)
-        }
-    }
-
-    pub(crate) fn read_socks_addr(&mut self) -> Option<Option<SocksAddr>> {
-        if !self.read_bool()? {
-            return Some(None);
-        }
-        let host = self.read_ip_addr()?;
-        let port = self.read_u16()?;
-        let domain = if self.read_bool()? {
-            let len = usize::from(self.read_u16()?);
-            let end = self.position.checked_add(len)?;
-            let bytes = self.bytes.get(self.position..end)?;
-            self.position = end;
-            Some(String::from_utf8(bytes.to_vec()).ok()?)
-        } else {
-            None
-        };
-        Some(Some(SocksAddr { host, port, domain }))
-    }
-
-    pub(crate) fn read_ip_addr(&mut self) -> Option<IpAddr> {
-        match self.read_u8()? {
-            4 => Some(IpAddr::V4(Ipv4Addr::from(self.read_array::<4>()?))),
-            6 => Some(IpAddr::V6(Ipv6Addr::from(self.read_array::<16>()?))),
-            _ => None,
         }
     }
 

@@ -19,11 +19,11 @@ struct SplitNode {
     mixed_next: bool,
 }
 
-impl Node<ProbeNode> for SplitNode {
+impl Node for SplitNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<ProbeNode>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         NodeNextEnqueue::new(self.speculative).validate_frame(runtime, frame, |index| {
@@ -36,18 +36,18 @@ impl Node<ProbeNode> for SplitNode {
     }
 }
 
-impl InternalNode<ProbeNode> for SplitNode {}
+impl InternalNode for SplitNode {}
 
 struct SinkNode {
     packets: Rc<Cell<usize>>,
     checksum: Rc<Cell<u64>>,
 }
 
-impl Node<ProbeNode> for SinkNode {
+impl Node for SinkNode {
     #[inline(always)]
     fn process(
         &mut self,
-        _runtime: &DataPlaneRuntime<ProbeNode>,
+        _runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let mut packets = self.packets.get();
@@ -62,38 +62,7 @@ impl Node<ProbeNode> for SinkNode {
     }
 }
 
-impl DriverNode<ProbeNode> for SinkNode {}
-
-enum ProbeNode {
-    Split(SplitNode),
-    Sink(SinkNode),
-}
-
-impl From<SplitNode> for ProbeNode {
-    fn from(node: SplitNode) -> Self {
-        Self::Split(node)
-    }
-}
-
-impl From<SinkNode> for ProbeNode {
-    fn from(node: SinkNode) -> Self {
-        Self::Sink(node)
-    }
-}
-
-impl Node<ProbeNode> for ProbeNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<ProbeNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Split(node) => node.process(runtime, frame),
-            Self::Sink(node) => node.process(runtime, frame),
-        }
-    }
-}
+impl DriverNode for SinkNode {}
 
 #[test]
 #[ignore = "performance probe; run with `cargo test -p hammer-adapter --release --test node_next_perf -- --ignored --nocapture`"]
@@ -137,7 +106,7 @@ fn measure_enqueue_samples(
 }
 
 fn measure_enqueue(mixed_next: bool, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
-    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
         64,
         FRAME_PACKETS,
         FRAME_PACKETS,
@@ -180,7 +149,7 @@ fn measure_enqueue(mixed_next: bool, instruction_set: DataPlaneInstructionSet) -
     }
 }
 
-fn alloc_indices(runtime: &DataPlaneRuntime<ProbeNode>) -> Vec<BufferIndex> {
+fn alloc_indices(runtime: &DataPlaneRuntime) -> Vec<BufferIndex> {
     let mut indices = Vec::with_capacity(FRAME_PACKETS);
     for index in 0..FRAME_PACKETS {
         let buffer = runtime

@@ -14,12 +14,14 @@ use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::EndpointManager;
+#[cfg(test)]
+use hammer_runtime::adapter::NodeErrorCounters;
 #[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
 use hammer_runtime::adapter::node::NodeRuntimeStatsRow;
 use hammer_runtime::adapter::{
-    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeErrorCounters, NodeId,
-    OutboundManager as _, PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
+    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeId, OutboundManager as _,
+    PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
@@ -28,8 +30,6 @@ use hammer_runtime::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::inbounds::RuntimeDnsRouter;
 use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
-#[cfg(feature = "endpoint")]
-use hammer_runtime::tun::TunInbound;
 use hammer_runtime::{
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, ControlTimerHandle,
     EventSubscriberBuilder, InboundManager, MetricSample, MetricsRegistry, OutboundManager,
@@ -39,14 +39,6 @@ use std::time::Duration;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 use crate::{DnsRouter, DnsTransportManager, Router};
-
-#[cfg(feature = "endpoint")]
-type RuntimeTunInbound = TunInbound<
-    dyn hammer_runtime::adapter::Router,
-    RuntimeDnsRouter,
-    OutboundManager,
-    EndpointManager,
->;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;
@@ -300,41 +292,6 @@ impl RuntimeService {
             Arc::clone(&platform),
             Arc::clone(&metrics),
         )?);
-        // Wire the EndpointManager into every TUN inbound *before* lifecycle
-        // Start so the packet loop's L3 fast path (`L3DispatchTable`) is built
-        // with the actual endpoint set rather than running with an empty
-        // dispatcher.
-        //
-        // The endpoint API exposes inbound packets via a one-shot
-        // `ip_recv_take()` — only one consumer can drain decrypted ingress.
-        // Wiring the same `EndpointManager` into multiple TUN stacks means
-        // whichever TUN starts first wins the receiver while the others
-        // can still drive egress, splitting reply paths across interfaces.
-        // Fail fast on this misconfiguration instead of silently degrading.
-        #[cfg(feature = "endpoint")]
-        {
-            let system_tuns: Vec<_> = inbound
-                .list()
-                .into_iter()
-                .filter(|comp| {
-                    comp.runtime()
-                        .as_any()
-                        .downcast_ref::<RuntimeTunInbound>()
-                        .is_some_and(RuntimeTunInbound::uses_system_stack)
-                })
-                .collect();
-            if !endpoint.list().is_empty() && system_tuns.len() > 1 {
-                return Err(HammerError::config_validation(format!(
-                    "multiple system TUN inbounds cannot share endpoints (found {})",
-                    system_tuns.len()
-                )));
-            }
-            for comp in inbound.list() {
-                if let Some(tun) = comp.runtime().as_any().downcast_ref::<RuntimeTunInbound>() {
-                    tun.set_endpoint_manager(Arc::clone(&endpoint));
-                }
-            }
-        }
         let service_mgr = Arc::new(ServiceManager::new(new_logger(&log_factory, "service")));
 
         registry.set::<CertificateStore>(Arc::clone(&cert_store));

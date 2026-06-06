@@ -1,19 +1,19 @@
-use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Network, Node, NodeId,
-    NodeResult, RouteMetadata, SocksAddr, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    NodeProcessFn, NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr, TraceControlPlane,
+    TraceInputPolicy, TracePolicy,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::{DropNode, FeatureArcControl, next_feature_frame};
 use hammer_service::net::{
     DpoId, DpoProto, FibTableBuilder, IcmpEchoRequestNext, IcmpEchoRequestNode,
-    IcmpInputControlPlane, IcmpInputNode, IpInputNext, IpInputNode, IpLocalArc,
-    IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace,
-    IpLocalTraceStage, IpLookupControlPlane, IpLookupNode, IpProtocol, IpReceiveNode, IpVersion,
+    IcmpInputControlPlane, IpInputNext, IpInputNode, IpLocalArc, IpLocalControlPlane, IpLocalError,
+    IpLocalNext, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage, IpLookupControlPlane,
+    IpProtocol, IpUnicastArc, IpVersion,
 };
 use ipnet::Ipv4Net;
 
@@ -25,160 +25,161 @@ struct CaptureState {
 }
 
 struct CaptureNode {
-    state: Rc<RefCell<CaptureState>>,
+    runtime_data: NodeRuntimeData,
 }
 
 impl CaptureNode {
-    fn new(state: Rc<RefCell<CaptureState>>) -> Self {
-        Self { state }
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
+        }
     }
 }
 
-impl Node<TestNode> for CaptureNode {
+impl Node for CaptureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        self.state.borrow_mut().frame_lens.push(frame.pending_len());
-        for index in frame.drain_pending() {
-            let metadata = runtime.metadata(index)?;
-            let node_error = runtime.node_error(index)?;
-            let mut state = self.state.borrow_mut();
-            state.metadata.push(metadata);
-            state.node_errors.push(node_error);
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
+        Err(CoreError::internal(
+            "capture node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for CaptureNode {}
+impl InternalNode for CaptureNode {}
 
 #[hammer_component_macros::feature(arc = IpLocalArc, id = LocalForward)]
 struct ForwardNode {
-    state: Rc<RefCell<CaptureState>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for ForwardNode {
+impl ForwardNode {
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
+        }
+    }
+}
+
+impl Node for ForwardNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        self.state.borrow_mut().frame_lens.push(frame.pending_len());
-        for index in frame.pending_indices().iter().copied() {
-            let metadata = runtime.metadata(index)?;
-            let node_error = runtime.node_error(index)?;
-            let mut state = self.state.borrow_mut();
-            state.metadata.push(metadata);
-            state.node_errors.push(node_error);
-        }
-        next_feature_frame(runtime, frame)
+        Err(CoreError::internal(
+            "forward node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        forward_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for ForwardNode {}
+impl InternalNode for ForwardNode {}
 
-enum TestNode {
-    Drop(DropNode),
-    Capture(CaptureNode),
-    Forward(ForwardNode),
-    IpInput(IpInputNode),
-    IpLookup(IpLookupNode),
-    IcmpInput(IcmpInputNode),
-    IcmpEchoRequest(IcmpEchoRequestNode),
-    IpLocal(IpLocalNode),
-    IpReceive(IpReceiveNode),
+fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-impl From<DropNode> for TestNode {
-    fn from(node: DropNode) -> Self {
-        Self::Drop(node)
-    }
+fn capture_state(data: NodeRuntimeData) -> CoreResult<Arc<Mutex<CaptureState>>> {
+    let states = capture_states()
+        .lock()
+        .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
+    Ok(Arc::clone(states.get(data.usize_word(0)?).ok_or_else(
+        || CoreError::internal("capture state slot is invalid"),
+    )?))
 }
 
-impl From<CaptureNode> for TestNode {
-    fn from(node: CaptureNode) -> Self {
-        Self::Capture(node)
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = capture_state(data)?;
+    state
+        .lock()
+        .map_err(|_| CoreError::internal("capture state poisoned"))?
+        .frame_lens
+        .push(frame.pending_len());
+    for index in frame.drain_pending() {
+        let metadata = runtime.metadata(index)?;
+        let node_error = runtime.node_error(index)?;
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::internal("capture state poisoned"))?;
+        state.metadata.push(metadata);
+        state.node_errors.push(node_error);
+        runtime.free_index(index);
     }
+    Ok(NodeResult::drop())
 }
 
-impl From<ForwardNode> for TestNode {
-    fn from(node: ForwardNode) -> Self {
-        Self::Forward(node)
+fn forward_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = capture_state(data)?;
+    state
+        .lock()
+        .map_err(|_| CoreError::internal("capture state poisoned"))?
+        .frame_lens
+        .push(frame.pending_len());
+    for index in frame.pending_indices().iter().copied() {
+        let metadata = runtime.metadata(index)?;
+        let node_error = runtime.node_error(index)?;
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::internal("capture state poisoned"))?;
+        state.metadata.push(metadata);
+        state.node_errors.push(node_error);
     }
-}
-
-impl From<IpInputNode> for TestNode {
-    fn from(node: IpInputNode) -> Self {
-        Self::IpInput(node)
-    }
-}
-
-impl From<IpLookupNode> for TestNode {
-    fn from(node: IpLookupNode) -> Self {
-        Self::IpLookup(node)
-    }
-}
-
-impl From<IcmpInputNode> for TestNode {
-    fn from(node: IcmpInputNode) -> Self {
-        Self::IcmpInput(node)
-    }
-}
-
-impl From<IcmpEchoRequestNode> for TestNode {
-    fn from(node: IcmpEchoRequestNode) -> Self {
-        Self::IcmpEchoRequest(node)
-    }
-}
-
-impl From<IpLocalNode> for TestNode {
-    fn from(node: IpLocalNode) -> Self {
-        Self::IpLocal(node)
-    }
-}
-
-impl From<IpReceiveNode> for TestNode {
-    fn from(node: IpReceiveNode) -> Self {
-        Self::IpReceive(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Drop(node) => node.process(runtime, frame),
-            Self::Capture(node) => node.process(runtime, frame),
-            Self::Forward(node) => node.process(runtime, frame),
-            Self::IpInput(node) => node.process(runtime, frame),
-            Self::IpLookup(node) => node.process(runtime, frame),
-            Self::IcmpInput(node) => node.process(runtime, frame),
-            Self::IcmpEchoRequest(node) => node.process(runtime, frame),
-            Self::IpLocal(node) => node.process(runtime, frame),
-            Self::IpReceive(node) => node.process(runtime, frame),
-        }
-    }
+    next_feature_frame(runtime, frame)
 }
 
 fn assert_internal_node<I>(node: &I)
 where
-    I: InternalNode<TestNode>,
+    I: InternalNode,
 {
     let _ = node;
 }
 
 #[test]
 fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
     let local = control.node();
@@ -243,12 +244,12 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 6);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
-    assert_eq!(graph.tcp_state.borrow().metadata.len(), 1);
-    assert_eq!(graph.icmp_state.borrow().metadata.len(), 2);
-    assert_eq!(graph.punt_state.borrow().metadata.len(), 0);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(graph.tcp_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(graph.icmp_state.lock().unwrap().metadata.len(), 2);
+    assert_eq!(graph.punt_state.lock().unwrap().metadata.len(), 0);
     assert_metadata(
-        &graph.udp_state.borrow().metadata[0],
+        &graph.udp_state.lock().unwrap().metadata[0],
         Network::Udp,
         Ipv4Addr::new(10, 0, 0, 1).into(),
         10_001,
@@ -256,7 +257,7 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
         53,
     );
     assert_metadata(
-        &graph.tcp_state.borrow().metadata[0],
+        &graph.tcp_state.lock().unwrap().metadata[0],
         Network::Tcp,
         "2001:db8::1".parse().expect("source"),
         10_002,
@@ -273,7 +274,7 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
     assert_eq!(trace.error, None);
     assert_eq!(trace.next, graph.udp);
     assert_metadata(
-        &graph.icmp_state.borrow().metadata[0],
+        &graph.icmp_state.lock().unwrap().metadata[0],
         Network::Icmp,
         Ipv4Addr::new(192, 0, 2, 3).into(),
         0,
@@ -281,7 +282,7 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
         0,
     );
     assert_metadata(
-        &graph.icmp_state.borrow().metadata[1],
+        &graph.icmp_state.lock().unwrap().metadata[1],
         Network::Icmp,
         "2001:db8::4".parse().expect("source"),
         0,
@@ -294,12 +295,12 @@ fn ip_local_dispatches_ipv4_and_ipv6_known_protocols() {
 
 #[test]
 fn ip_local_protocol_table_defaults_to_punt_and_allows_registration() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
-    let custom_state = Rc::new(RefCell::new(CaptureState::default()));
+    let custom_state = Arc::new(Mutex::new(CaptureState::default()));
     let custom = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&custom_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&custom_state)));
     let control = IpLocalControlPlane::new(graph.nexts());
     let local = runtime.nodes().register_internal(control.node());
     let unknown = ipv4_protocol_packet(
@@ -313,8 +314,8 @@ fn ip_local_protocol_table_defaults_to_punt_and_allows_registration() {
     push_packet(&runtime, first, &unknown);
     assert!(runtime.schedule_frame(local, first).expect("schedule punt"));
     assert_eq!(runtime.run_ready_nodes().expect("run punt"), 2);
-    assert_eq!(graph.punt_state.borrow().metadata.len(), 1);
-    assert_eq!(custom_state.borrow().metadata.len(), 0);
+    assert_eq!(graph.punt_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(custom_state.lock().unwrap().metadata.len(), 0);
 
     control
         .register_protocol(143, custom)
@@ -327,7 +328,7 @@ fn ip_local_protocol_table_defaults_to_punt_and_allows_registration() {
             .expect("schedule custom")
     );
     assert_eq!(runtime.run_ready_nodes().expect("run custom"), 2);
-    assert_eq!(custom_state.borrow().metadata.len(), 1);
+    assert_eq!(custom_state.lock().unwrap().metadata.len(), 1);
 
     control
         .unregister_protocol(143)
@@ -336,7 +337,7 @@ fn ip_local_protocol_table_defaults_to_punt_and_allows_registration() {
     push_packet(&runtime, third, &unknown);
     assert!(runtime.schedule_frame(local, third).expect("schedule punt"));
     assert_eq!(runtime.run_ready_nodes().expect("run punt again"), 2);
-    assert_eq!(graph.punt_state.borrow().metadata.len(), 2);
+    assert_eq!(graph.punt_state.lock().unwrap().metadata.len(), 2);
     assert_eq!(
         runtime
             .node_error_count(local, IpLocalError::UnknownProtocol.code())
@@ -349,7 +350,7 @@ fn ip_local_protocol_table_defaults_to_punt_and_allows_registration() {
 
 #[test]
 fn ip_local_routes_fragments_to_reassembly_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
     let local = runtime.nodes().register_internal(control.node());
@@ -370,15 +371,15 @@ fn ip_local_routes_fragments_to_reassembly_next() {
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(graph.reassembly_state.borrow().metadata.len(), 1);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 0);
+    assert_eq!(graph.reassembly_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 #[test]
 fn ip_local_drops_bad_transport_headers_and_checksums() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
     let local = runtime.nodes().register_internal(control.node());
@@ -406,8 +407,8 @@ fn ip_local_drops_bad_transport_headers_and_checksums() {
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(graph.tcp_state.borrow().metadata.len(), 0);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 0);
+    assert_eq!(graph.tcp_state.lock().unwrap().metadata.len(), 0);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 0);
     assert_eq!(
         runtime
             .node_error_count(local, IpLocalError::BadChecksum.code())
@@ -426,7 +427,7 @@ fn ip_local_drops_bad_transport_headers_and_checksums() {
 
 #[test]
 fn ip_local_accepts_ipv4_udp_zero_checksum_and_rejects_ipv6_udp_zero_checksum() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
     let local = runtime.nodes().register_internal(control.node());
@@ -456,9 +457,9 @@ fn ip_local_accepts_ipv4_udp_zero_checksum_and_rejects_ipv6_udp_zero_checksum() 
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 1);
     assert_metadata(
-        &graph.udp_state.borrow().metadata[0],
+        &graph.udp_state.lock().unwrap().metadata[0],
         Network::Udp,
         Ipv4Addr::new(10, 0, 0, 6).into(),
         10_006,
@@ -477,7 +478,7 @@ fn ip_local_accepts_ipv4_udp_zero_checksum_and_rejects_ipv6_udp_zero_checksum() 
 
 #[test]
 fn ip_local_reverse_fib_source_check_rejects_unusable_source_routes() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let mut source_builder = FibTableBuilder::new(graph.drop);
     let usable_source_lb = source_builder.add_single_path_load_balance(DpoProto::IP4, graph.udp);
@@ -525,9 +526,9 @@ fn ip_local_reverse_fib_source_check_rejects_unusable_source_routes() {
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 1);
     assert_metadata(
-        &graph.udp_state.borrow().metadata[0],
+        &graph.udp_state.lock().unwrap().metadata[0],
         Network::Udp,
         Ipv4Addr::new(198, 51, 100, 8).into(),
         10_007,
@@ -549,14 +550,14 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
     let data_runtime =
         DataRuntime::new(1, "ip-local-feature-arc-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let control = IpLocalControlPlane::new(graph.nexts());
     let mut features = FeatureArcControl::<IpLocalArc>::new().with_data_plane_barrier(barrier);
-    let feature_state = Rc::new(RefCell::new(CaptureState::default()));
-    let feature = runtime.nodes().register_internal(ForwardNode {
-        state: Rc::clone(&feature_state),
-    });
+    let feature_state = Arc::new(Mutex::new(CaptureState::default()));
+    let feature = runtime
+        .nodes()
+        .register_internal(ForwardNode::new(Arc::clone(&feature_state)));
     features
         .register_feature::<ForwardNode>(feature)
         .expect("register local feature");
@@ -587,8 +588,8 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
     );
 
     assert_eq!(runtime.run_ready_nodes().expect("run head"), 4);
-    assert_eq!(feature_state.borrow().metadata.len(), 1);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
+    assert_eq!(feature_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 1);
     assert_eq!(
         runtime
             .node_error_count(local, IpLocalError::BadChecksum.code())
@@ -603,7 +604,7 @@ fn ip_local_feature_arc_runs_before_end_of_arc_dispatch() {
 
 #[test]
 fn ip_input_lookup_receive_route_reaches_ip_local() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let graph = LocalGraph::new(&runtime);
     let local_control = IpLocalControlPlane::new(graph.nexts());
     runtime.nodes().register_internal(local_control.node());
@@ -620,7 +621,7 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             graph.drop,
             graph.punt,
             graph.drop,
@@ -646,9 +647,9 @@ fn ip_input_lookup_receive_route_reaches_ip_local() {
     assert!(runtime.schedule_frame(input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 1);
     assert_metadata(
-        &graph.udp_state.borrow().metadata[0],
+        &graph.udp_state.lock().unwrap().metadata[0],
         Network::Udp,
         Ipv4Addr::new(10, 0, 0, 9).into(),
         10_009,
@@ -664,17 +665,17 @@ fn ip_receive_sibling_shares_runtime_next_slots_with_feature_arc_start() {
     let data_runtime =
         DataRuntime::new(1, "ip-receive-feature-arc-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 24, 8, 8);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 24, 8, 8);
     let graph = LocalGraph::new(&runtime);
-    let alternate_udp_state = Rc::new(RefCell::new(CaptureState::default()));
+    let alternate_udp_state = Arc::new(Mutex::new(CaptureState::default()));
     let alternate_udp = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&alternate_udp_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&alternate_udp_state)));
     let mut features = FeatureArcControl::<IpLocalArc>::new().with_data_plane_barrier(barrier);
-    let feature_state = Rc::new(RefCell::new(CaptureState::default()));
-    let feature = runtime.nodes().register_internal(ForwardNode {
-        state: Rc::clone(&feature_state),
-    });
+    let feature_state = Arc::new(Mutex::new(CaptureState::default()));
+    let feature = runtime
+        .nodes()
+        .register_internal(ForwardNode::new(Arc::clone(&feature_state)));
     features
         .register_feature::<ForwardNode>(feature)
         .expect("register receive feature");
@@ -709,11 +710,11 @@ fn ip_receive_sibling_shares_runtime_next_slots_with_feature_arc_start() {
     assert!(runtime.schedule_frame(receive, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
-    assert_eq!(feature_state.borrow().metadata.len(), 1);
-    assert_eq!(graph.udp_state.borrow().metadata.len(), 0);
-    assert_eq!(alternate_udp_state.borrow().metadata.len(), 1);
+    assert_eq!(feature_state.lock().unwrap().metadata.len(), 1);
+    assert_eq!(graph.udp_state.lock().unwrap().metadata.len(), 0);
+    assert_eq!(alternate_udp_state.lock().unwrap().metadata.len(), 1);
     assert_metadata(
-        &alternate_udp_state.borrow().metadata[0],
+        &alternate_udp_state.lock().unwrap().metadata[0],
         Network::Udp,
         Ipv4Addr::new(10, 0, 0, 10).into(),
         10_010,
@@ -739,39 +740,39 @@ struct LocalGraph {
     udp: NodeId,
     icmp_input: NodeId,
     reassembly: NodeId,
-    punt_state: Rc<RefCell<CaptureState>>,
-    tcp_state: Rc<RefCell<CaptureState>>,
-    udp_state: Rc<RefCell<CaptureState>>,
-    icmp_state: Rc<RefCell<CaptureState>>,
-    reassembly_state: Rc<RefCell<CaptureState>>,
+    punt_state: Arc<Mutex<CaptureState>>,
+    tcp_state: Arc<Mutex<CaptureState>>,
+    udp_state: Arc<Mutex<CaptureState>>,
+    icmp_state: Arc<Mutex<CaptureState>>,
+    reassembly_state: Arc<Mutex<CaptureState>>,
 }
 
 impl LocalGraph {
-    fn new(runtime: &DataPlaneRuntime<TestNode>) -> Self {
-        let punt_state = Rc::new(RefCell::new(CaptureState::default()));
-        let tcp_state = Rc::new(RefCell::new(CaptureState::default()));
-        let udp_state = Rc::new(RefCell::new(CaptureState::default()));
-        let icmp_state = Rc::new(RefCell::new(CaptureState::default()));
-        let reassembly_state = Rc::new(RefCell::new(CaptureState::default()));
+    fn new(runtime: &DataPlaneRuntime) -> Self {
+        let punt_state = Arc::new(Mutex::new(CaptureState::default()));
+        let tcp_state = Arc::new(Mutex::new(CaptureState::default()));
+        let udp_state = Arc::new(Mutex::new(CaptureState::default()));
+        let icmp_state = Arc::new(Mutex::new(CaptureState::default()));
+        let reassembly_state = Arc::new(Mutex::new(CaptureState::default()));
         let drop = runtime.nodes().register_internal(DropNode::new());
         let punt = runtime
             .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&punt_state)));
+            .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
         let tcp = runtime
             .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&tcp_state)));
+            .register_internal(CaptureNode::new(Arc::clone(&tcp_state)));
         let udp = runtime
             .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&udp_state)));
+            .register_internal(CaptureNode::new(Arc::clone(&udp_state)));
         let icmp_lookup = runtime
             .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&icmp_state)));
+            .register_internal(CaptureNode::new(Arc::clone(&icmp_state)));
         let icmp_echo_request = runtime.nodes().register_internal(IcmpEchoRequestNode::new(
             IcmpEchoRequestNext::nodes(icmp_lookup, drop),
         ));
         let reassembly = runtime
             .nodes()
-            .register_internal(CaptureNode::new(Rc::clone(&reassembly_state)));
+            .register_internal(CaptureNode::new(Arc::clone(&reassembly_state)));
         let icmp_control = IcmpInputControlPlane::new(punt);
         icmp_control
             .register_type(IpVersion::V4, 8, icmp_echo_request)
@@ -807,16 +808,12 @@ impl LocalGraph {
     }
 }
 
-fn push_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
-    frame: hammer_adapter::FrameIndex,
-    packet: &[u8],
-) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
     push_packet_with_metadata(runtime, frame, RouteMetadata::default(), packet);
 }
 
 fn push_marked_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],
@@ -835,7 +832,7 @@ fn push_marked_packet(
 }
 
 fn push_packet_on_interface(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     packet: &[u8],
     ingress_interface: u32,
@@ -852,7 +849,7 @@ fn push_packet_on_interface(
 }
 
 fn push_packet_with_metadata(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     metadata: RouteMetadata,
     packet: &[u8],

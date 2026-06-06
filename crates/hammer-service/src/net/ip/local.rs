@@ -1,15 +1,15 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeResult, PacketNextResolver, PacketTrace, SocksAddr, TraceFormatter, add_packet_trace,
-    process_cached_rewrite_next,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketNextResolver, PacketTrace, SocksAddr,
+    TraceFormatter, add_packet_trace, process_cached_rewrite_next,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::data_plane::{FeatureArc, set_index_node_error_code};
+use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibTableHandle};
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
@@ -272,6 +272,8 @@ impl IpLocalStateHandle {
 
 #[hammer_component_macros::node(role = internal, next = IpLocalNext, start_arc = IpLocalArc)]
 pub struct IpLocalNode {
+    #[node(default = register_ip_local_runtime(state.clone()))]
+    runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -279,19 +281,22 @@ pub struct IpLocalNode {
 
 #[hammer_component_macros::node(role = internal, sibling_of = IpLocalNode, start_arc = IpLocalArc)]
 pub struct IpReceiveNode {
+    #[node(default = register_ip_local_runtime(state.clone()))]
+    runtime_data: NodeRuntimeData,
     state: IpLocalStateHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
 
-impl<G> Node<G> for IpLocalNode {
+impl Node for IpLocalNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let state = self.state.load();
+        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         let next = Self::runtime_nexts(runtime)?;
         process_frame(
             runtime,
@@ -299,7 +304,7 @@ impl<G> Node<G> for IpLocalNode {
             &state,
             next,
             LocalStage::Head,
-            self.feature_arc.as_ref(),
+            feature_arc.as_ref(),
             &mut self.cached_next,
         )
     }
@@ -308,16 +313,31 @@ impl<G> Node<G> for IpLocalNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_ip_local_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        ip_local_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        sync_ip_local_runtime(
+            self.runtime_data,
+            self.feature_arc.as_ref().map(|arc| arc.start_handle()),
+        )?;
+        Ok(self.runtime_data)
+    }
 }
 
-impl<G> Node<G> for IpReceiveNode {
+impl Node for IpReceiveNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let state = self.state.load();
+        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         let next = Self::runtime_nexts(runtime)?;
         process_frame(
             runtime,
@@ -325,7 +345,7 @@ impl<G> Node<G> for IpReceiveNode {
             &state,
             next,
             LocalStage::Receive,
-            self.feature_arc.as_ref(),
+            feature_arc.as_ref(),
             &mut self.cached_next,
         )
     }
@@ -334,6 +354,108 @@ impl<G> Node<G> for IpReceiveNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_ip_local_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        ip_receive_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        sync_ip_local_runtime(
+            self.runtime_data,
+            self.feature_arc.as_ref().map(|arc| arc.start_handle()),
+        )?;
+        Ok(self.runtime_data)
+    }
+}
+
+#[derive(Clone)]
+struct IpLocalRuntime {
+    state: IpLocalStateHandle,
+    feature_arc: Option<FeatureArcStartHandle>,
+}
+
+fn ip_local_runtimes() -> &'static Mutex<Vec<IpLocalRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IpLocalRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_ip_local_runtime(state: IpLocalStateHandle) -> NodeRuntimeData {
+    let mut runtimes = ip_local_runtimes()
+        .lock()
+        .expect("IP local runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(IpLocalRuntime {
+        state,
+        feature_arc: None,
+    });
+    NodeRuntimeData::from_usize(slot).expect("IP local runtime slot overflow")
+}
+
+fn sync_ip_local_runtime(
+    data: NodeRuntimeData,
+    feature_arc: Option<FeatureArcStartHandle>,
+) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_local_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP local runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP local runtime slot is invalid"))?;
+    runtime.feature_arc = feature_arc;
+    Ok(())
+}
+
+fn ip_local_runtime(data: NodeRuntimeData) -> CoreResult<IpLocalRuntime> {
+    let slot = data.usize_word(0)?;
+    ip_local_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP local runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("IP local runtime slot is invalid"))
+}
+
+fn ip_local_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = ip_local_runtime(data)?;
+    let feature_arc = state.feature_arc.clone();
+    let state = state.state.load();
+    let mut cached_next = None;
+    process_frame(
+        runtime,
+        frame,
+        &state,
+        IpLocalNode::runtime_nexts(runtime)?,
+        LocalStage::Head,
+        feature_arc.as_ref(),
+        &mut cached_next,
+    )
+}
+
+fn ip_receive_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = ip_local_runtime(data)?;
+    let feature_arc = state.feature_arc.clone();
+    let state = state.state.load();
+    let mut cached_next = None;
+    process_frame(
+        runtime,
+        frame,
+        &state,
+        IpReceiveNode::runtime_nexts(runtime)?,
+        LocalStage::Receive,
+        feature_arc.as_ref(),
+        &mut cached_next,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -358,13 +480,13 @@ impl LocalStage {
 }
 
 #[inline(always)]
-fn process_frame<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn process_frame(
+    runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     state: &IpLocalState,
     next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
-    feature_arc: Option<&FeatureArc<IpLocalArc>>,
+    feature_arc: Option<&FeatureArcStartHandle>,
     cached_next: &mut Option<NodeId>,
 ) -> CoreResult<NodeResult> {
     let resolver = IpLocalNextResolver {
@@ -380,16 +502,12 @@ struct IpLocalNextResolver<'a> {
     state: &'a IpLocalState,
     next: [NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
-    feature_arc: Option<&'a FeatureArc<IpLocalArc>>,
+    feature_arc: Option<&'a FeatureArcStartHandle>,
 }
 
-impl<G> PacketNextResolver<G> for IpLocalNextResolver<'_> {
+impl PacketNextResolver for IpLocalNextResolver<'_> {
     #[inline(always)]
-    fn next_for_index(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<NodeId> {
+    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
         process_index(
             runtime,
             index,
@@ -402,13 +520,13 @@ impl<G> PacketNextResolver<G> for IpLocalNextResolver<'_> {
 }
 
 #[inline(always)]
-fn process_index<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn process_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     state: &IpLocalState,
     next: &[NodeId; IpLocalNext::COUNT],
     stage: LocalStage,
-    feature_arc: Option<&FeatureArc<IpLocalArc>>,
+    feature_arc: Option<&FeatureArcStartHandle>,
 ) -> CoreResult<NodeId> {
     let packet = packet_bytes(runtime, index)?;
     let parsed = match parse_ip_packet_with_chain_len(&packet, 0) {
@@ -580,7 +698,7 @@ fn process_index<G>(
 }
 
 #[inline(always)]
-fn packet_bytes<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> CoreResult<Vec<u8>> {
+fn packet_bytes(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<Vec<u8>> {
     let buffer = runtime.get_buffer(index)?;
     let packet_len = buffer.current_len() + buffer.total_len_not_including_first();
     drop(buffer);
@@ -673,8 +791,8 @@ fn udp_datagram_len(transport: &[u8]) -> Result<usize, IpLocalError> {
 }
 
 #[inline(always)]
-fn refresh_basic_metadata<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn refresh_basic_metadata(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     parsed: &ParsedIpPacket,
     transport_header_len: Option<usize>,
@@ -820,7 +938,7 @@ mod tests {
 
     #[test]
     fn ip_local_state_returns_protocol_or_control_next() {
-        let runtime = DataPlaneRuntime::<DropNode>::with_capacities(8, 8, 1, 1);
+        let runtime = DataPlaneRuntime::with_capacities(8, 8, 1, 1);
         let drop = runtime.nodes().register_internal(DropNode::new());
         let punt = runtime.nodes().register_internal(DropNode::new());
         let tcp = runtime.nodes().register_internal(DropNode::new());

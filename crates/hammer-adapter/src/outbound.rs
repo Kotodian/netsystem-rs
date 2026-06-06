@@ -153,7 +153,6 @@ mod tests {
     use super::*;
     use crate::RouteMetadata;
     use crate::buffer::DataPlaneRuntime;
-    use crate::node::NoopNode;
     use hammer_infra::vec::Vec;
 
     struct CapturePacketConn {
@@ -188,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn packet_conn_send_uses_borrowed_frame() {
-        let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(128, 1);
+        let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(128, 1);
         let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let mut metadata = RouteMetadata::default();
         metadata.destination = Some(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53));

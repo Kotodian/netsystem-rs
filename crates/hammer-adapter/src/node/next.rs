@@ -34,23 +34,19 @@ impl NodeNextStorage<()> for NodeId {
     }
 }
 
-pub trait PacketNextResolver<G> {
-    fn next_for_index(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<NodeId>;
+pub trait PacketNextResolver {
+    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId>;
 }
 
 #[inline(always)]
-pub fn process_cached_speculative_next<G, R>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn process_cached_speculative_next<R>(
+    runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     cached_next: &mut Option<NodeId>,
     resolver: &R,
 ) -> CoreResult<NodeResult>
 where
-    R: PacketNextResolver<G> + ?Sized,
+    R: PacketNextResolver + ?Sized,
 {
     let Some(first_index) = frame.pending_indices().first().copied() else {
         return Ok(NodeResult::drop());
@@ -89,14 +85,14 @@ where
 }
 
 #[inline(always)]
-pub fn process_cached_rewrite_next<G, R>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn process_cached_rewrite_next<R>(
+    runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     cached_next: &mut Option<NodeId>,
     resolver: &R,
 ) -> CoreResult<NodeResult>
 where
-    R: PacketNextResolver<G> + ?Sized,
+    R: PacketNextResolver + ?Sized,
 {
     let mut next_frames = NodeNextFrames::default();
     let mut current_next = *cached_next;
@@ -192,9 +188,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame<G>(
+    pub fn validate_frame(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
     ) -> CoreResult<NodeResult> {
@@ -208,9 +204,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_first_next<G>(
+    pub fn validate_frame_with_first_next(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         first_index: BufferIndex,
         first_next: NodeId,
@@ -230,9 +226,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_first_next_and_prefetch<G>(
+    pub fn validate_frame_with_first_next_and_prefetch(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         first_index: BufferIndex,
         first_next: NodeId,
@@ -259,9 +255,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_first_next_and_buffer_batch_prefetch<G>(
+    pub fn validate_frame_with_first_next_and_buffer_batch_prefetch(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         first_index: BufferIndex,
         first_next: NodeId,
@@ -288,9 +284,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_width<G>(
+    pub fn validate_frame_with_width(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         width: FrameBatchWidth,
         mut next_for_index: impl FnMut(BufferIndex) -> CoreResult<NodeId>,
@@ -312,9 +308,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_nexts<G>(
+    pub fn validate_frame_with_nexts(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         nexts: &[NodeId],
     ) -> CoreResult<NodeResult> {
@@ -325,9 +321,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_nexts_and_width<G>(
+    pub fn validate_frame_with_nexts_and_width(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         width: FrameBatchWidth,
         nexts: &[NodeId],
@@ -354,9 +350,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_width_and_prefetch<G>(
+    pub fn validate_frame_with_width_and_prefetch(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         width: FrameBatchWidth,
         mut prefetch_index: impl FnMut(BufferIndex),
@@ -383,9 +379,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_width_and_buffer_batch_prefetch<G>(
+    pub fn validate_frame_with_width_and_buffer_batch_prefetch(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         width: FrameBatchWidth,
         mut prefetch_index: impl FnMut(&mut BufferBatchMut<'_>, BufferIndex),
@@ -415,9 +411,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    pub fn validate_frame_with_buffer_batch_chunks<G>(
+    pub fn validate_frame_with_buffer_batch_chunks(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
         mut nexts_for_indices: impl FnMut(
@@ -455,9 +451,9 @@ impl NodeNextEnqueue {
     }
 
     #[inline(always)]
-    fn finish<G>(
+    fn finish(
         self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
         speculative_node: NodeId,
     ) -> CoreResult<NodeResult> {
@@ -480,9 +476,9 @@ impl NodeNextVectorEnqueue {
     }
 
     #[inline(always)]
-    pub fn enqueue_frame_with_buffer_batch_chunks<G>(
+    pub fn enqueue_frame_with_buffer_batch_chunks(
         mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         mut prefetch_indices: impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
         mut nexts_for_indices: impl FnMut(
@@ -525,9 +521,9 @@ impl NodeNextVectorEnqueue {
     }
 
     #[inline(always)]
-    fn enqueue_frame_quad_chunks<G>(
+    fn enqueue_frame_quad_chunks(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
         batch: &mut BufferBatchMut<'_>,
         current_next: &mut NodeId,
@@ -567,9 +563,9 @@ impl NodeNextVectorEnqueue {
     }
 
     #[inline(always)]
-    fn enqueue_frame_pair_chunks<G>(
+    fn enqueue_frame_pair_chunks(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
         batch: &mut BufferBatchMut<'_>,
         current_next: &mut NodeId,
@@ -597,9 +593,9 @@ impl NodeNextVectorEnqueue {
     }
 
     #[inline(always)]
-    fn enqueue_chunk<G, const N: usize>(
+    fn enqueue_chunk<const N: usize>(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         indices: &[BufferIndex; N],
         batch: &mut BufferBatchMut<'_>,
         current_next: &mut NodeId,
@@ -649,9 +645,9 @@ impl NodeNextVectorEnqueue {
 
 impl NodeNextFrames {
     #[inline]
-    pub fn enqueue<G>(
+    pub fn enqueue(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
         index: BufferIndex,
     ) -> CoreResult<()> {
@@ -664,9 +660,9 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn enqueue_indices<G>(
+    pub fn enqueue_indices(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
@@ -679,9 +675,9 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn enqueue_optional<G>(
+    pub fn enqueue_optional(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
         node: Option<NodeId>,
     ) -> CoreResult<()> {
@@ -693,7 +689,7 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn schedule<G>(mut self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+    pub fn schedule(mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
         for offset in 0..self.len {
             let node = match self.node(offset) {
                 Ok(node) => node,
@@ -726,14 +722,14 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    pub fn free<G>(&mut self, runtime: &DataPlaneRuntime<G>) {
+    pub fn free(&mut self, runtime: &DataPlaneRuntime) {
         self.free_from(runtime, 0);
     }
 
     #[inline]
-    fn frame_for_enqueue<G>(
+    fn frame_for_enqueue(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
     ) -> CoreResult<(FrameIndex, usize, bool)> {
         if let Some(offset) = self.position(node) {
@@ -782,7 +778,7 @@ impl NodeNextFrames {
     }
 
     #[inline]
-    fn free_from<G>(&mut self, runtime: &DataPlaneRuntime<G>, start: usize) {
+    fn free_from(&mut self, runtime: &DataPlaneRuntime, start: usize) {
         for offset in start..self.len {
             self.nodes[offset] = None;
             if let Some(frame) = self.frames[offset].take() {
@@ -795,9 +791,9 @@ impl NodeNextFrames {
 
 impl NodeNextOwnedFrames {
     #[inline]
-    fn enqueue<G>(
+    fn enqueue(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
         index: BufferIndex,
     ) -> CoreResult<()> {
@@ -805,9 +801,9 @@ impl NodeNextOwnedFrames {
     }
 
     #[inline]
-    fn enqueue_indices<G>(
+    fn enqueue_indices(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
         indices: impl IntoIterator<Item = BufferIndex>,
     ) -> CoreResult<()> {
@@ -815,7 +811,7 @@ impl NodeNextOwnedFrames {
     }
 
     #[inline]
-    fn schedule<G>(mut self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+    fn schedule(mut self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
         for offset in 0..self.len {
             let node = match self.node(offset) {
                 Ok(node) => node,
@@ -841,14 +837,14 @@ impl NodeNextOwnedFrames {
     }
 
     #[inline]
-    fn free<G>(&mut self, runtime: &DataPlaneRuntime<G>) {
+    fn free(&mut self, runtime: &DataPlaneRuntime) {
         self.free_from(runtime, 0);
     }
 
     #[inline]
-    fn frame_for_mut<G>(
+    fn frame_for_mut(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         node: NodeId,
     ) -> CoreResult<&mut BufferFrame> {
         if let Some(offset) = self.position(node) {
@@ -898,7 +894,7 @@ impl NodeNextOwnedFrames {
     }
 
     #[inline]
-    fn free_from<G>(&mut self, runtime: &DataPlaneRuntime<G>, start: usize) {
+    fn free_from(&mut self, runtime: &DataPlaneRuntime, start: usize) {
         for offset in start..self.len {
             self.nodes[offset] = None;
             if let Some(frame) = self.frames[offset].take() {

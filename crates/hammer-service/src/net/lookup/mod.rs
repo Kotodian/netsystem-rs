@@ -1,15 +1,15 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
     ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextFrames, NodeNextVectorEnqueue,
-    NodeRegistration, NodeResult, PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
-    unlikely,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, RouteMetadata,
+    TraceFormatter, add_packet_trace, unlikely,
 };
-use hammer_core::error::{CoreResult, HammerResult};
+use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
     FibLookupResult as CoreFibLookupResult, FibTable as CoreFibTable,
@@ -152,7 +152,7 @@ impl FibTableHandle {
     }
 
     #[inline]
-    fn replace_after_barrier(&self, table: FibTable) {
+    pub(crate) fn replace_after_barrier(&self, table: FibTable) {
         self.inner.replace_after_barrier(table);
     }
 }
@@ -266,6 +266,8 @@ impl IpLookupControlPlane {
 
 #[hammer_component_macros::node]
 pub struct IpLookupNode {
+    #[node(default = register_ip_lookup_runtime(table.clone()))]
+    runtime_data: NodeRuntimeData,
     table: FibTableHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -274,7 +276,6 @@ pub struct IpLookupNode {
 impl IpLookupNode {
     #[inline(always)]
     fn process_index_with_batch(
-        &self,
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         index: BufferIndex,
@@ -397,7 +398,6 @@ impl IpLookupNode {
 
     #[inline(always)]
     fn process_indices_with_batch(
-        &self,
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         indices: &[BufferIndex],
@@ -406,17 +406,17 @@ impl IpLookupNode {
         traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
     ) -> CoreResult<()> {
         for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-            nexts[offset] = self.process_index_with_batch(batch, table, index, traces)?;
+            nexts[offset] = Self::process_index_with_batch(batch, table, index, traces)?;
         }
         Ok(())
     }
 }
 
-impl<G> Node<G> for IpLookupNode {
+impl Node for IpLookupNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let table = self.table.table();
@@ -429,7 +429,7 @@ impl<G> Node<G> for IpLookupNode {
         let first_next = {
             let mut batch = runtime.buffer_batch_mut();
             Self::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
-            self.process_index_with_batch(&mut batch, &table, first, &mut traces)?
+            Self::process_index_with_batch(&mut batch, &table, first, &mut traces)?
         };
         let cached_next = self.cached_next.unwrap_or(first_next);
         let mut first_chunk = true;
@@ -448,7 +448,7 @@ impl<G> Node<G> for IpLookupNode {
                     } else {
                         0
                     };
-                    self.process_indices_with_batch(
+                    Self::process_indices_with_batch(
                         batch,
                         &table,
                         indices,
@@ -469,9 +469,19 @@ impl<G> Node<G> for IpLookupNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_ip_lookup_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        ip_lookup_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
 }
 
-impl<G> InternalNode<G> for IpLookupNode {
+impl InternalNode for IpLookupNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -501,6 +511,8 @@ impl AdjacencyRewriteNodeError {
 
 #[hammer_component_macros::node]
 pub struct AdjacencyRewriteNode {
+    #[node(default = register_adjacency_rewrite_runtime(table.clone()))]
+    runtime_data: NodeRuntimeData,
     table: FibTableHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -508,9 +520,9 @@ pub struct AdjacencyRewriteNode {
 
 impl AdjacencyRewriteNode {
     #[inline(always)]
-    fn next_for_index<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
+    fn next_for_index(
+        table: &FibTableHandle,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
         let metadata = runtime.metadata(index)?;
@@ -550,8 +562,7 @@ impl AdjacencyRewriteNode {
             runtime.free_index(index);
             return Ok(None);
         }
-        let Some(adjacency) = self
-            .table
+        let Some(adjacency) = table
             .table()
             .adjacency(AdjacencyIndex::new(forwarding.dpo_index))
         else {
@@ -593,11 +604,11 @@ impl AdjacencyRewriteNode {
     }
 }
 
-impl<G> Node<G> for AdjacencyRewriteNode {
+impl Node for AdjacencyRewriteNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let mut next_frames = NodeNextFrames::default();
@@ -605,7 +616,7 @@ impl<G> Node<G> for AdjacencyRewriteNode {
         let mut last_next = None;
         let result =
             frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-                let Some(node) = self.next_for_index(runtime, index)? else {
+                let Some(node) = Self::next_for_index(&self.table, runtime, index)? else {
                     return Ok(None);
                 };
                 last_next = Some(node);
@@ -643,9 +654,19 @@ impl<G> Node<G> for AdjacencyRewriteNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_adjacency_rewrite_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        adjacency_rewrite_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
 }
 
-impl<G> InternalNode<G> for AdjacencyRewriteNode {
+impl InternalNode for AdjacencyRewriteNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -655,9 +676,156 @@ impl<G> InternalNode<G> for AdjacencyRewriteNode {
     }
 }
 
+#[derive(Clone)]
+struct LookupRuntime {
+    table: FibTableHandle,
+}
+
+#[derive(Clone)]
+struct AdjacencyRewriteRuntime {
+    table: FibTableHandle,
+}
+
+fn lookup_runtimes() -> &'static Mutex<Vec<LookupRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<LookupRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn adjacency_rewrite_runtimes() -> &'static Mutex<Vec<AdjacencyRewriteRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<AdjacencyRewriteRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_ip_lookup_runtime(table: FibTableHandle) -> NodeRuntimeData {
+    let mut runtimes = lookup_runtimes()
+        .lock()
+        .expect("IP lookup runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(LookupRuntime { table });
+    NodeRuntimeData::from_usize(slot).expect("IP lookup runtime slot overflow")
+}
+
+fn register_adjacency_rewrite_runtime(table: FibTableHandle) -> NodeRuntimeData {
+    let mut runtimes = adjacency_rewrite_runtimes()
+        .lock()
+        .expect("adjacency rewrite runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(AdjacencyRewriteRuntime { table });
+    NodeRuntimeData::from_usize(slot).expect("adjacency rewrite runtime slot overflow")
+}
+
+fn ip_lookup_runtime(data: NodeRuntimeData) -> CoreResult<LookupRuntime> {
+    let slot = data.usize_word(0)?;
+    lookup_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP lookup runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("IP lookup runtime slot is invalid"))
+}
+
+fn adjacency_rewrite_runtime(data: NodeRuntimeData) -> CoreResult<AdjacencyRewriteRuntime> {
+    let slot = data.usize_word(0)?;
+    adjacency_rewrite_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("adjacency rewrite runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("adjacency rewrite runtime slot is invalid"))
+}
+
+fn ip_lookup_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = ip_lookup_runtime(data)?;
+    let table = state.table.table();
+    let indices = frame.pending_indices();
+    let Some(first) = indices.first().copied() else {
+        return Ok(NodeResult::drop());
+    };
+    let width = frame_batch_width(runtime);
+    let mut traces = std::vec::Vec::new();
+    let first_next = {
+        let mut batch = runtime.buffer_batch_mut();
+        IpLookupNode::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
+        IpLookupNode::process_index_with_batch(&mut batch, &table, first, &mut traces)?
+    };
+    let mut first_chunk = true;
+    let (result, _) = NodeNextVectorEnqueue::new(first_next)
+        .enqueue_frame_with_buffer_batch_chunks(
+            runtime,
+            frame,
+            |batch, indices| {
+                IpLookupNode::prefetch_indices_with_batch(batch, &table, indices);
+            },
+            |batch, indices, nexts| {
+                let start_offset = if first_chunk {
+                    first_chunk = false;
+                    nexts[0] = first_next;
+                    1
+                } else {
+                    0
+                };
+                IpLookupNode::process_indices_with_batch(
+                    batch,
+                    &table,
+                    indices,
+                    nexts,
+                    start_offset,
+                    &mut traces,
+                )
+            },
+        )?;
+    for (index, trace) in traces {
+        add_packet_trace!(runtime, index, trace)?;
+    }
+    Ok(result)
+}
+
+fn adjacency_rewrite_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = adjacency_rewrite_runtime(data)?;
+    let mut next_frames = NodeNextFrames::default();
+    let mut current_next = None;
+    let result = frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+        let Some(node) = AdjacencyRewriteNode::next_for_index(&state.table, runtime, index)? else {
+            return Ok(None);
+        };
+        match current_next {
+            Some(current) if current == node => Ok(Some(index)),
+            Some(_) => {
+                next_frames.enqueue(runtime, node, index)?;
+                Ok(None)
+            }
+            None => {
+                current_next = Some(node);
+                Ok(Some(index))
+            }
+        }
+    });
+    if let Err(err) = result {
+        next_frames.free(runtime);
+        return Err(err);
+    }
+
+    next_frames.schedule(runtime)?;
+    if frame.has_pending()
+        && let Some(node) = current_next
+    {
+        Ok(NodeResult::next_current(node))
+    } else {
+        Ok(NodeResult::drop())
+    }
+}
+
 #[inline(always)]
-fn apply_adjacency_rewrite<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn apply_adjacency_rewrite(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     adjacency: Adjacency,
 ) -> CoreResult<()> {
@@ -705,7 +873,7 @@ fn shift_packet_cursor(cursor: BufferPacketCursor, delta: usize) -> BufferPacket
 }
 
 #[inline(always)]
-fn frame_batch_width<G>(runtime: &DataPlaneRuntime<G>) -> usize {
+fn frame_batch_width(runtime: &DataPlaneRuntime) -> usize {
     match runtime.preferred_frame_batch_width() {
         hammer_adapter::FrameBatchWidth::Quad => 4,
         hammer_adapter::FrameBatchWidth::Pair => 2,

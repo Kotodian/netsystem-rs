@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
-    NodeNextFrames, NodeNextStorage, NodeResult, PacketTrace, SocksAddr, TraceFormatter,
-    add_packet_trace,
+    NodeNextFrames, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    SocksAddr, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -115,7 +115,10 @@ fn format_ip_reassembly_trace(bytes: &[u8]) -> String {
 }
 
 #[hammer_component_macros::node(role = internal, next = IpReassemblyNext)]
+#[derive(Clone)]
 pub struct IpReassemblyNode {
+    #[node(default = register_ip_reassembly_runtime())]
+    runtime_data: NodeRuntimeData,
     #[node(default)]
     handoff: Option<IpReassemblyHandoff>,
     #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
@@ -124,10 +127,28 @@ pub struct IpReassemblyNode {
     max_reassemblies: usize,
     #[node(default = DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY)]
     max_fragments_per_reassembly: usize,
-    #[node(default)]
+}
+
+struct IpReassemblyRuntime {
+    handoff: Option<IpReassemblyHandoff>,
+    timeout: Duration,
+    max_reassemblies: usize,
+    max_fragments_per_reassembly: usize,
     contexts: HashMap<IpFragmentKey, ReassemblyContext>,
-    #[node(default)]
     failed_keys: Vec<IpFragmentKey>,
+}
+
+impl Default for IpReassemblyRuntime {
+    fn default() -> Self {
+        Self {
+            handoff: None,
+            timeout: DEFAULT_REASSEMBLY_TIMEOUT,
+            max_reassemblies: DEFAULT_MAX_REASSEMBLIES,
+            max_fragments_per_reassembly: DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY,
+            contexts: HashMap::new(),
+            failed_keys: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,24 +184,54 @@ impl IpReassemblyHandoff {
 impl IpReassemblyNode {
     #[inline]
     pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
+        set_ip_reassembly_runtime_handoff(self.runtime_data, Some(handoff.clone()))
+            .expect("IP reassembly runtime slot");
         self.handoff = Some(handoff);
         self
     }
 
     #[inline]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        set_ip_reassembly_runtime_timeout(self.runtime_data, timeout)
+            .expect("IP reassembly runtime slot");
         self.timeout = timeout;
         self
     }
 
     #[inline]
     pub fn with_max_fragments_per_reassembly(mut self, max_fragments: usize) -> Self {
+        set_ip_reassembly_runtime_max_fragments(self.runtime_data, max_fragments)
+            .expect("IP reassembly runtime slot");
         self.max_fragments_per_reassembly = max_fragments;
         self
     }
 
     #[inline]
-    pub fn expire<G>(&mut self, runtime: &DataPlaneRuntime<G>, now: Instant) -> usize {
+    pub fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+        let Ok(expired) = expire_ip_reassembly_runtime(self.runtime_data, runtime, now) else {
+            return 0;
+        };
+        expired
+    }
+}
+
+impl IpReassemblyRuntime {
+    #[inline]
+    fn sync_config(
+        &mut self,
+        handoff: Option<IpReassemblyHandoff>,
+        timeout: Duration,
+        max_reassemblies: usize,
+        max_fragments_per_reassembly: usize,
+    ) {
+        self.handoff = handoff;
+        self.timeout = timeout;
+        self.max_reassemblies = max_reassemblies;
+        self.max_fragments_per_reassembly = max_fragments_per_reassembly;
+    }
+
+    #[inline]
+    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
         let timeout = self.timeout;
         let expired = self
             .contexts
@@ -202,10 +253,40 @@ impl IpReassemblyNode {
         expired_len
     }
 
-    #[inline]
-    fn process_index<G>(
+    fn process_frame(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        next: [NodeId; IpReassemblyNext::COUNT],
+        now: Instant,
+    ) -> CoreResult<NodeResult> {
+        let mut next_frames = NodeNextFrames::default();
+        let mut current_next = None;
+        self.failed_keys.clear();
+        frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+            self.process_index(
+                runtime,
+                &mut next_frames,
+                &mut current_next,
+                next,
+                index,
+                now,
+            )
+        })?;
+        next_frames.schedule(runtime)?;
+        if frame.has_pending()
+            && let Some(node) = current_next
+        {
+            Ok(NodeResult::next_current(node))
+        } else {
+            Ok(NodeResult::drop())
+        }
+    }
+
+    #[inline]
+    fn process_index(
+        &mut self,
+        runtime: &DataPlaneRuntime,
         next_frames: &mut NodeNextFrames,
         current_next: &mut Option<NodeId>,
         next: [NodeId; IpReassemblyNext::COUNT],
@@ -466,9 +547,9 @@ impl IpReassemblyNode {
     }
 
     #[inline(always)]
-    fn emit_output<G>(
+    fn emit_output(
         &self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         next_frames: &mut NodeNextFrames,
         current_next: &mut Option<NodeId>,
         node: NodeId,
@@ -488,9 +569,9 @@ impl IpReassemblyNode {
     }
 
     #[inline(always)]
-    fn fragment_first_worker<G>(
+    fn fragment_first_worker(
         &self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
         fragment: ParsedIpFragment,
     ) -> CoreResult<Option<DataWorkerId>> {
@@ -549,42 +630,149 @@ impl IpReassemblyDirectory {
     }
 }
 
-impl<G> Node<G> for IpReassemblyNode {
+impl Node for IpReassemblyNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let now = Instant::now();
-        let next = Self::runtime_nexts(runtime)?;
-        let mut next_frames = NodeNextFrames::default();
-        let mut current_next = None;
-        self.failed_keys.clear();
-        frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-            self.process_index(
-                runtime,
-                &mut next_frames,
-                &mut current_next,
-                next,
-                index,
-                now,
-            )
-        })?;
-        next_frames.schedule(runtime)?;
-        if frame.has_pending()
-            && let Some(node) = current_next
-        {
-            Ok(NodeResult::next_current(node))
-        } else {
-            Ok(NodeResult::drop())
-        }
+        Err(CoreError::internal(
+            "IP reassembly node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        ip_reassembly_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        sync_ip_reassembly_runtime(
+            self.runtime_data,
+            self.handoff.clone(),
+            self.timeout,
+            self.max_reassemblies,
+            self.max_fragments_per_reassembly,
+        )?;
+        Ok(self.runtime_data)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_ip_reassembly_trace)
     }
+}
+
+fn ip_reassembly_runtimes() -> &'static Mutex<Vec<IpReassemblyRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IpReassemblyRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_ip_reassembly_runtime() -> NodeRuntimeData {
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .expect("IP reassembly runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(IpReassemblyRuntime::default());
+    NodeRuntimeData::from_usize(slot).expect("IP reassembly runtime slot overflow")
+}
+
+fn set_ip_reassembly_runtime_handoff(
+    data: NodeRuntimeData,
+    handoff: Option<IpReassemblyHandoff>,
+) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    runtime.handoff = handoff;
+    Ok(())
+}
+
+fn set_ip_reassembly_runtime_timeout(data: NodeRuntimeData, timeout: Duration) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    runtime.timeout = timeout;
+    Ok(())
+}
+
+fn set_ip_reassembly_runtime_max_fragments(
+    data: NodeRuntimeData,
+    max_fragments: usize,
+) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    runtime.max_fragments_per_reassembly = max_fragments;
+    Ok(())
+}
+
+fn sync_ip_reassembly_runtime(
+    data: NodeRuntimeData,
+    handoff: Option<IpReassemblyHandoff>,
+    timeout: Duration,
+    max_reassemblies: usize,
+    max_fragments_per_reassembly: usize,
+) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    runtime.sync_config(
+        handoff,
+        timeout,
+        max_reassemblies,
+        max_fragments_per_reassembly,
+    );
+    Ok(())
+}
+
+fn expire_ip_reassembly_runtime(
+    data: NodeRuntimeData,
+    runtime: &DataPlaneRuntime,
+    now: Instant,
+) -> CoreResult<usize> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let state = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    Ok(state.expire(runtime, now))
+}
+
+fn ip_reassembly_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let slot = data.usize_word(0)?;
+    let next = IpReassemblyNode::runtime_nexts(runtime)?;
+    let mut runtimes = ip_reassembly_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("IP reassembly runtime registry poisoned"))?;
+    let state = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("IP reassembly runtime slot is invalid"))?;
+    state.process_frame(runtime, frame, next, Instant::now())
 }
 
 struct ReassemblyContext {
@@ -608,9 +796,9 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn insert_fragment<G>(
+    fn insert_fragment(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
         fragment: ParsedIpFragment,
         now: Instant,
@@ -685,9 +873,9 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn assemble<G>(
+    fn assemble(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         total_payload_len: usize,
     ) -> CoreResult<ReassemblyInsert> {
         match self.version {
@@ -697,9 +885,9 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn assemble_ipv4_chain<G>(
+    fn assemble_ipv4_chain(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         total_payload_len: usize,
     ) -> CoreResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
@@ -747,9 +935,9 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn assemble_ipv6_chain<G>(
+    fn assemble_ipv6_chain(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         total_payload_len: usize,
     ) -> CoreResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
@@ -804,7 +992,7 @@ impl ReassemblyContext {
     }
 
     #[inline]
-    fn free<G>(self, runtime: &DataPlaneRuntime<G>) {
+    fn free(self, runtime: &DataPlaneRuntime) {
         for fragment in self.fragments {
             runtime.free_index(fragment.index);
         }
@@ -827,7 +1015,7 @@ enum ReassemblyInsert {
 }
 
 #[inline(always)]
-fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> CoreResult<()> {
+fn refresh_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
     let buffer = runtime.get_buffer(index)?;
     let parsed =
         parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())?;
@@ -855,8 +1043,8 @@ fn refresh_metadata<G>(runtime: &DataPlaneRuntime<G>, index: BufferIndex) -> Cor
 }
 
 #[inline(always)]
-fn trim_fragment_payload_chain<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn trim_fragment_payload_chain(
+    runtime: &DataPlaneRuntime,
     fragment: ReassemblyFragment,
 ) -> CoreResult<()> {
     let payload_len = fragment.end - fragment.start;

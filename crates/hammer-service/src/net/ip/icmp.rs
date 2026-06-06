@@ -1,16 +1,18 @@
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
-    NodeId, NodeNextStorage, NodeResult, PacketNextResolver, PacketTrace, SocksAddr,
-    TraceFormatter, add_packet_trace, process_cached_rewrite_next, process_cached_speculative_next,
+    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketNextResolver,
+    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace, process_cached_rewrite_next,
+    process_cached_speculative_next,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
     IcmpBuildError, IcmpErrorFamily, IcmpGeneratedPacket, build_echo_reply, build_icmp_error_packet,
 };
+use hammer_infra::vec::Vec;
 
 use crate::data_plane::set_index_node_error_code;
 use crate::trace::codec::{
@@ -578,6 +580,8 @@ impl IcmpInputSnapshotHandle {
 
 #[hammer_component_macros::node]
 pub struct IcmpInputNode {
+    #[node(default = register_icmp_input_runtime(snapshot.clone()))]
+    runtime_data: NodeRuntimeData,
     snapshot: IcmpInputSnapshotHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -587,22 +591,18 @@ struct IcmpInputNextResolver {
     snapshot: arc_swap::Guard<Arc<IcmpInputSnapshot>>,
 }
 
-impl<G> PacketNextResolver<G> for IcmpInputNextResolver {
+impl PacketNextResolver for IcmpInputNextResolver {
     #[inline(always)]
-    fn next_for_index(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<NodeId> {
+    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
         next_node_for_index(runtime, index, &self.snapshot)
     }
 }
 
-impl<G> Node<G> for IcmpInputNode {
+impl Node for IcmpInputNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let resolver = IcmpInputNextResolver {
@@ -615,9 +615,19 @@ impl<G> Node<G> for IcmpInputNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_icmp_input_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        icmp_input_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
 }
 
-impl<G> InternalNode<G> for IcmpInputNode {}
+impl InternalNode for IcmpInputNode {}
 
 #[hammer_component_macros::node_next]
 pub enum IcmpEchoRequestNext {
@@ -635,22 +645,18 @@ struct IcmpEchoRequestNextResolver {
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 }
 
-impl<G> PacketNextResolver<G> for IcmpEchoRequestNextResolver {
+impl PacketNextResolver for IcmpEchoRequestNextResolver {
     #[inline(always)]
-    fn next_for_index(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<NodeId> {
+    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
         next_node_for_echo_request_index(runtime, index, self.next)
     }
 }
 
-impl<G> Node<G> for IcmpEchoRequestNode {
+impl Node for IcmpEchoRequestNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let resolver = IcmpEchoRequestNextResolver {
@@ -663,6 +669,65 @@ impl<G> Node<G> for IcmpEchoRequestNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_icmp_echo_request_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        icmp_echo_request_process
+    }
+}
+
+#[derive(Clone)]
+struct IcmpInputRuntime {
+    snapshot: IcmpInputSnapshotHandle,
+}
+
+fn icmp_input_runtimes() -> &'static Mutex<Vec<IcmpInputRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IcmpInputRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_icmp_input_runtime(snapshot: IcmpInputSnapshotHandle) -> NodeRuntimeData {
+    let mut runtimes = icmp_input_runtimes()
+        .lock()
+        .expect("ICMP input runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(IcmpInputRuntime { snapshot });
+    NodeRuntimeData::from_usize(slot).expect("ICMP input runtime slot overflow")
+}
+
+fn icmp_input_runtime(data: NodeRuntimeData) -> CoreResult<IcmpInputRuntime> {
+    let slot = data.usize_word(0)?;
+    icmp_input_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("ICMP input runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("ICMP input runtime slot is invalid"))
+}
+
+fn icmp_input_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = icmp_input_runtime(data)?;
+    let resolver = IcmpInputNextResolver {
+        snapshot: state.snapshot.load(),
+    };
+    let mut cached_next = None;
+    process_cached_speculative_next(runtime, frame, &mut cached_next, &resolver)
+}
+
+fn icmp_echo_request_process(
+    runtime: &DataPlaneRuntime,
+    _data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let resolver = IcmpEchoRequestNextResolver {
+        next: IcmpEchoRequestNode::runtime_nexts(runtime)?,
+    };
+    let mut cached_next = None;
+    process_cached_rewrite_next(runtime, frame, &mut cached_next, &resolver)
 }
 
 #[hammer_component_macros::node_next]
@@ -673,6 +738,8 @@ pub enum IcmpErrorNext {
 
 #[hammer_component_macros::node(role = internal, next = IcmpErrorNext)]
 pub struct IcmpErrorNode {
+    #[node(default = register_icmp_error_runtime(None))]
+    runtime_data: NodeRuntimeData,
     #[node(default)]
     source_table: Option<IcmpErrorSourceTableHandle>,
     #[node(default)]
@@ -684,13 +751,9 @@ struct IcmpErrorNextResolver {
     source_table: Option<arc_swap::Guard<Arc<IcmpErrorSourceSnapshot>>>,
 }
 
-impl<G> PacketNextResolver<G> for IcmpErrorNextResolver {
+impl PacketNextResolver for IcmpErrorNextResolver {
     #[inline(always)]
-    fn next_for_index(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
-        index: BufferIndex,
-    ) -> CoreResult<NodeId> {
+    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
         let source_table = self
             .source_table
             .as_ref()
@@ -702,16 +765,18 @@ impl<G> PacketNextResolver<G> for IcmpErrorNextResolver {
 impl IcmpErrorNode {
     #[inline]
     pub fn with_source_table(mut self, source_table: IcmpErrorSourceTableHandle) -> Self {
+        sync_icmp_error_runtime(self.runtime_data, Some(source_table.clone()))
+            .expect("ICMP error runtime slot");
         self.source_table = Some(source_table);
         self
     }
 }
 
-impl<G> Node<G> for IcmpErrorNode {
+impl Node for IcmpErrorNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let resolver = IcmpErrorNextResolver {
@@ -728,11 +793,85 @@ impl<G> Node<G> for IcmpErrorNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_icmp_error_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        icmp_error_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        sync_icmp_error_runtime(self.runtime_data, self.source_table.clone())?;
+        Ok(self.runtime_data)
+    }
+}
+
+#[derive(Clone)]
+struct IcmpErrorRuntime {
+    source_table: Option<IcmpErrorSourceTableHandle>,
+}
+
+fn icmp_error_runtimes() -> &'static Mutex<Vec<IcmpErrorRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<IcmpErrorRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_icmp_error_runtime(
+    source_table: Option<IcmpErrorSourceTableHandle>,
+) -> NodeRuntimeData {
+    let mut runtimes = icmp_error_runtimes()
+        .lock()
+        .expect("ICMP error runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(IcmpErrorRuntime { source_table });
+    NodeRuntimeData::from_usize(slot).expect("ICMP error runtime slot overflow")
+}
+
+fn sync_icmp_error_runtime(
+    data: NodeRuntimeData,
+    source_table: Option<IcmpErrorSourceTableHandle>,
+) -> CoreResult<()> {
+    let slot = data.usize_word(0)?;
+    let mut runtimes = icmp_error_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("ICMP error runtime registry poisoned"))?;
+    let runtime = runtimes
+        .get_mut(slot)
+        .ok_or_else(|| CoreError::internal("ICMP error runtime slot is invalid"))?;
+    runtime.source_table = source_table;
+    Ok(())
+}
+
+fn icmp_error_runtime(data: NodeRuntimeData) -> CoreResult<IcmpErrorRuntime> {
+    let slot = data.usize_word(0)?;
+    icmp_error_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("ICMP error runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("ICMP error runtime slot is invalid"))
+}
+
+fn icmp_error_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = icmp_error_runtime(data)?;
+    let resolver = IcmpErrorNextResolver {
+        next: IcmpErrorNode::runtime_nexts(runtime)?,
+        source_table: state
+            .source_table
+            .as_ref()
+            .map(IcmpErrorSourceTableHandle::load),
+    };
+    let mut cached_next = None;
+    process_cached_rewrite_next(runtime, frame, &mut cached_next, &resolver)
 }
 
 #[inline(always)]
-fn next_node_for_index<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn next_node_for_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     snapshot: &IcmpInputSnapshot,
 ) -> CoreResult<NodeId> {
@@ -903,8 +1042,8 @@ fn next_node_for_index<G>(
 }
 
 #[inline(always)]
-fn next_node_for_echo_request_index<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn next_node_for_echo_request_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     next: [NodeId; IcmpEchoRequestNext::COUNT],
 ) -> CoreResult<NodeId> {
@@ -945,8 +1084,8 @@ fn next_node_for_echo_request_index<G>(
 }
 
 #[inline(always)]
-fn next_node_for_icmp_error_index<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn next_node_for_icmp_error_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
@@ -1052,8 +1191,8 @@ fn next_node_for_icmp_error_index<G>(
 }
 
 #[inline(always)]
-fn replace_current_chain<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn replace_current_chain(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     packet: &[u8],
 ) -> CoreResult<()> {
@@ -1062,8 +1201,8 @@ fn replace_current_chain<G>(
 }
 
 #[inline(always)]
-fn refresh_generated_icmp_metadata<G>(
-    runtime: &DataPlaneRuntime<G>,
+fn refresh_generated_icmp_metadata(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     generated: &IcmpGeneratedPacket,
 ) -> CoreResult<()> {
@@ -1089,16 +1228,14 @@ fn refresh_generated_icmp_metadata<G>(
 
 #[cfg(test)]
 mod tests {
-    use hammer_adapter::{DataPlaneRuntime, NodeNextStorage};
+    use hammer_adapter::{NodeId, NodeNextStorage};
 
     use super::*;
-    use crate::data_plane::DropNode;
 
     #[test]
     fn icmp_snapshot_storage_returns_registered_or_default_next() {
-        let runtime = DataPlaneRuntime::<DropNode>::with_capacities(8, 2, 1, 1);
-        let default = runtime.nodes().register_internal(DropNode::new());
-        let echo = runtime.nodes().register_internal(DropNode::new());
+        let default = NodeId::new(1);
+        let echo = NodeId::new(2);
         let mut snapshot = IcmpInputSnapshot::new(default, default);
 
         snapshot.register_type(IpVersion::V4, ICMP4_ECHO_REQUEST, echo);

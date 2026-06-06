@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
     BufferPool, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
-    DataWorkerId, FrameBatchWidth, NoopNode, RouteMetadata,
+    DataWorkerId, FrameBatchWidth, RouteMetadata,
 };
 
 #[derive(Default)]
@@ -89,7 +89,7 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 
 #[test]
 fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(32, 2);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 2);
     let first = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
         .expect("alloc first buffer");
@@ -125,7 +125,7 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
 
 #[test]
 fn buffer_batch_mut_exposes_direct_buffer_refs() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_buffer_capacity(32, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 1);
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
         .expect("alloc buffer");
@@ -159,7 +159,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 
 #[test]
 fn buffer_exposes_vpp_style_current_pointer_and_advance() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(128, 1, 1, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(128, 1, 1, 1);
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"network-transport")
         .expect("alloc buffer");
@@ -371,7 +371,7 @@ fn instruction_set_selects_preferred_frame_batch_width() {
 
 #[test]
 fn data_plane_runtime_can_use_explicit_instruction_set() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
         8,
         4,
         2,
@@ -385,7 +385,7 @@ fn data_plane_runtime_can_use_explicit_instruction_set() {
 
 #[test]
 fn data_plane_runtime_defaults_to_native_instruction_set() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
 
     assert_eq!(runtime.instruction_set(), DataPlaneInstructionSet::native());
     assert_eq!(
@@ -420,14 +420,14 @@ fn buffer_pool_rejects_index_from_another_runtime() {
 fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     let arena = BufferPoolArena::with_capacity(8, 4);
     let handoff = DataPlaneHandoff::with_buffer_arena(2, 4, arena);
-    let first = DataPlaneRuntime::<NoopNode>::with_handoff_capacities(
+    let first: DataPlaneRuntime = DataPlaneRuntime::with_handoff_capacities(
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
         2,
         2,
         DataPlaneInstructionSet::Scalar,
     );
-    let second = DataPlaneRuntime::<NoopNode>::with_handoff_capacities(
+    let second: DataPlaneRuntime = DataPlaneRuntime::with_handoff_capacities(
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
         2,
@@ -472,12 +472,12 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
 #[test]
 fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
     let handoff = DataPlaneHandoff::new(2, 4);
-    let first = DataPlaneRuntime::<NoopNode>::with_handoff(
+    let first: DataPlaneRuntime = DataPlaneRuntime::with_handoff(
         DataPlaneRuntime::with_capacities(8, 4, 2, 2),
         DataWorkerId::new(0),
         handoff.worker(DataWorkerId::new(0)),
     );
-    let second = DataPlaneRuntime::<NoopNode>::with_handoff(
+    let second: DataPlaneRuntime = DataPlaneRuntime::with_handoff(
         DataPlaneRuntime::with_capacities(8, 4, 2, 2),
         DataWorkerId::new(1),
         handoff.worker(DataWorkerId::new(1)),
@@ -501,7 +501,7 @@ fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
 
 #[test]
 fn buffer_frame_reset_does_not_free_buffers() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -540,7 +540,7 @@ fn buffer_frame_reset_does_not_free_buffers() {
 
 #[test]
 fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -574,7 +574,7 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
 
 #[test]
 fn buffer_frame_drain_indices_preserves_order_without_freeing() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -613,7 +613,7 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
 
 #[test]
 fn buffer_frame_tracks_pending_indices_until_drained() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -650,7 +650,7 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
 
 #[test]
 fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 2, 1, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let index = pool
@@ -683,7 +683,7 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
 
 #[test]
 fn buffer_frame_push_indices_batches_one_wake() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -717,7 +717,7 @@ fn buffer_frame_push_indices_batches_one_wake() {
 
 #[test]
 fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..5)
@@ -749,7 +749,7 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
 
 #[test]
 fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..7)
@@ -781,7 +781,7 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
 
 #[test]
 fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 2, 8, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 8, 1);
     let frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
 
     assert_eq!(frame.pair_batch_cursor().next(), None);
@@ -794,7 +794,7 @@ fn buffer_frame_batch_cursors_are_empty_for_empty_frame() {
 
 #[test]
 fn buffer_frame_batch_cursor_uses_requested_width() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
 
@@ -825,14 +825,14 @@ fn buffer_frame_batch_cursor_uses_requested_width() {
 
 #[test]
 fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
-    let quad_runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+    let quad_runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
         8,
         8,
         8,
         1,
         DataPlaneInstructionSet::Avx2,
     );
-    let pair_runtime = DataPlaneRuntime::<NoopNode>::with_capacities_and_instruction_set(
+    let pair_runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities_and_instruction_set(
         8,
         8,
         8,
@@ -882,7 +882,7 @@ fn buffer_frame_batch_dispatch_uses_runtime_preferred_width() {
 
 #[test]
 fn buffer_frame_pending_future_observes_reset_before_processing() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 2, 1, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 2, 1, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -925,7 +925,7 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
 
 #[test]
 fn buffer_frame_push_index_respects_preallocated_capacity() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 1, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 1, 1);
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
@@ -949,7 +949,7 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
 
 #[test]
 fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
     let first = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"one")
@@ -999,7 +999,7 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
 
 #[test]
 fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
     let first = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), b"one")
@@ -1029,7 +1029,7 @@ fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
 
 #[test]
 fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 4, 2, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let frame_index = frame.index();
     let buffer = runtime
@@ -1061,7 +1061,7 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
 
 #[test]
 fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
-    let runtime = DataPlaneRuntime::<NoopNode>::with_capacities(8, 8, 8, 1);
+    let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 8, 8, 1);
     let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
     let indices = push_numbered_indices(&runtime, &mut frame, 5);
     let mut prefetched = 0usize;
@@ -1089,7 +1089,7 @@ fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
 }
 
 fn push_numbered_indices(
-    runtime: &DataPlaneRuntime<NoopNode>,
+    runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     count: u8,
 ) -> Vec<BufferIndex> {

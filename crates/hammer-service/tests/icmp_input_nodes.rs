@@ -1,16 +1,12 @@
-use std::cell::RefCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeResult, RouteMetadata,
-    TraceControlPlane, TraceInputPolicy, TracePolicy,
+    BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
+    NodeRuntimeData, RouteMetadata, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_core::error::CoreResult;
-use hammer_service::data_plane::DropNode;
-use hammer_service::net::{
-    IcmpInputControlPlane, IcmpInputError, IcmpInputNode, IcmpInputTrace, IpVersion,
-};
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion};
 
 #[derive(Default)]
 struct CaptureState {
@@ -20,87 +16,96 @@ struct CaptureState {
 }
 
 struct CaptureNode {
-    state: Rc<RefCell<CaptureState>>,
+    runtime_data: NodeRuntimeData,
 }
 
 impl CaptureNode {
-    fn new(state: Rc<RefCell<CaptureState>>) -> Self {
-        Self { state }
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
+        }
     }
 }
 
-impl Node<TestNode> for CaptureNode {
+impl Node for CaptureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        self.state.borrow_mut().frame_lens.push(frame.pending_len());
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
-            let node_error = runtime.node_error(index)?;
-            let mut state = self.state.borrow_mut();
-            state.packets.push(packet.into_iter().collect());
-            state.node_errors.push(node_error);
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
+        Err(CoreError::internal(
+            "capture node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for CaptureNode {}
+impl InternalNode for CaptureNode {}
 
-enum TestNode {
-    Drop(DropNode),
-    Capture(CaptureNode),
-    IcmpInput(IcmpInputNode),
+fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-impl From<DropNode> for TestNode {
-    fn from(node: DropNode) -> Self {
-        Self::Drop(node)
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = {
+        let states = capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
+        Arc::clone(
+            states
+                .get(data.usize_word(0)?)
+                .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?,
+        )
+    };
+    state
+        .lock()
+        .map_err(|_| CoreError::internal("capture state poisoned"))?
+        .frame_lens
+        .push(frame.pending_len());
+    for index in frame.drain_pending() {
+        let packet = runtime.copy_current_chain(index)?;
+        let node_error = runtime.node_error(index)?;
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::internal("capture state poisoned"))?;
+        state.packets.push(packet.into_iter().collect());
+        state.node_errors.push(node_error);
+        runtime.free_index(index);
     }
-}
-
-impl From<CaptureNode> for TestNode {
-    fn from(node: CaptureNode) -> Self {
-        Self::Capture(node)
-    }
-}
-
-impl From<IcmpInputNode> for TestNode {
-    fn from(node: IcmpInputNode) -> Self {
-        Self::IcmpInput(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Drop(node) => node.process(runtime, frame),
-            Self::Capture(node) => node.process(runtime, frame),
-            Self::IcmpInput(node) => node.process(runtime, frame),
-        }
-    }
+    Ok(NodeResult::drop())
 }
 
 #[test]
 fn icmp_input_dispatches_ipv4_echo_request_by_type() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let echo_state = Rc::new(RefCell::new(CaptureState::default()));
-    let punt_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&echo_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
     let punt = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&punt_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
     let control = IcmpInputControlPlane::new(punt);
     control
         .register_type(IpVersion::V4, 8, echo)
@@ -124,9 +129,9 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
     assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(echo_state.borrow().packets, vec![packet]);
-    assert!(echo_state.borrow().node_errors[0].is_none());
-    assert!(punt_state.borrow().packets.is_empty());
+    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
+    assert!(echo_state.lock().unwrap().node_errors[0].is_none());
+    assert!(punt_state.lock().unwrap().packets.is_empty());
     assert_eq!(trace_control.drain_completed(), 1);
     let records = trace_control.take_records();
     let trace =
@@ -140,15 +145,15 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
 
 #[test]
 fn icmp_input_dispatches_ipv6_echo_request_by_type() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let echo_state = Rc::new(RefCell::new(CaptureState::default()));
-    let punt_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&echo_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
     let punt = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&punt_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
     let control = IcmpInputControlPlane::new(punt);
     control
         .register_type(IpVersion::V6, 128, echo)
@@ -161,18 +166,18 @@ fn icmp_input_dispatches_ipv6_echo_request_by_type() {
     assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(echo_state.borrow().packets, vec![packet]);
-    assert!(echo_state.borrow().node_errors[0].is_none());
-    assert!(punt_state.borrow().packets.is_empty());
+    assert_eq!(echo_state.lock().unwrap().packets, vec![packet]);
+    assert!(echo_state.lock().unwrap().node_errors[0].is_none());
+    assert!(punt_state.lock().unwrap().packets.is_empty());
 }
 
 #[test]
 fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let punt_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let punt = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&punt_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
     let control = IcmpInputControlPlane::new(punt);
     let icmp_input = runtime.nodes().register_internal(control.node());
     let packet = ipv4_icmp_packet(13, 0, b"timestamp");
@@ -182,9 +187,9 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
     assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert_eq!(punt_state.borrow().packets, vec![packet]);
+    assert_eq!(punt_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        punt_state.borrow().node_errors,
+        punt_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             icmp_input,
             IcmpInputError::UnknownType.code()
@@ -194,15 +199,15 @@ fn icmp_input_sends_unknown_ipv4_type_to_default_next() {
 
 #[test]
 fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let echo_state = Rc::new(RefCell::new(CaptureState::default()));
-    let punt_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let echo_state = Arc::new(Mutex::new(CaptureState::default()));
+    let punt_state = Arc::new(Mutex::new(CaptureState::default()));
     let echo = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&echo_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&echo_state)));
     let punt = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&punt_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&punt_state)));
     let control = IcmpInputControlPlane::new(punt);
     control
         .register_type(IpVersion::V6, 128, echo)
@@ -215,10 +220,10 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
     assert!(runtime.schedule_frame(icmp_input, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(echo_state.borrow().packets.is_empty());
-    assert_eq!(punt_state.borrow().packets, vec![packet]);
+    assert!(echo_state.lock().unwrap().packets.is_empty());
+    assert_eq!(punt_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        punt_state.borrow().node_errors,
+        punt_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             icmp_input,
             IcmpInputError::BadCode.code()
@@ -226,11 +231,7 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
     );
 }
 
-fn push_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
-    frame: hammer_adapter::FrameIndex,
-    packet: &[u8],
-) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
     let buffer = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), packet)
         .expect("alloc packet");
@@ -242,7 +243,7 @@ fn push_packet(
 }
 
 fn push_marked_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],

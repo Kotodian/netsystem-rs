@@ -56,21 +56,10 @@ pub mod congestion {
     pub use crate::protocol::congestion::*;
 }
 
-#[cfg(feature = "inbound-tun")]
-pub mod tun {
-    pub use crate::protocol::tun::*;
-}
-
 #[cfg(feature = "endpoint-wireguard")]
 pub mod wireguard {
     pub use crate::protocol::endpoint::wireguard::*;
 }
-
-#[cfg(all(
-    feature = "inbound-tun",
-    any(target_os = "macos", target_os = "ios", target_os = "tvos")
-))]
-mod apple_utun;
 
 pub use component_registry::{
     EventSubscriberComponentDeclaration, register_event_subscriber_component,
@@ -88,7 +77,5 @@ pub use inbounds::InboundManager;
 pub use outbounds::OutboundManager;
 #[cfg(feature = "outbound-hysteria2")]
 pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
-#[cfg(feature = "inbound-tun")]
-pub use protocol::tun::TunInbound;
 pub use socket_protector::{RuntimePlatform, SocketProtector};
 pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle};

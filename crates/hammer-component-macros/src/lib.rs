@@ -827,10 +827,9 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         .make_where_clause()
         .predicates
         .push(parse_quote!(
-            #ident #ty_generics: ::hammer_adapter::node::Node<G>
+            #ident #ty_generics: ::hammer_adapter::node::Node
         ));
     let (role_impl_generics, _, role_where_clause) = role_generics.split_for_impl();
-
     let mut output_fields = Vec::<Field>::new();
     let mut constructor_params = Vec::<TokenStream2>::new();
     let mut constructor_inits = Vec::<TokenStream2>::new();
@@ -916,8 +915,8 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             pub const NODE_NEXT_COUNT: usize = #next::COUNT;
 
             #[inline]
-            pub fn runtime_nexts<G>(
-                runtime: &::hammer_adapter::DataPlaneRuntime<G>,
+            pub fn runtime_nexts(
+                runtime: &::hammer_adapter::DataPlaneRuntime,
             ) -> ::hammer_core::error::CoreResult<[::hammer_adapter::node::NodeId; #next::COUNT]> {
                 runtime.current_node_nexts::<{ #next::COUNT }>()
             }
@@ -932,8 +931,8 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             pub const NODE_NEXT_COUNT: usize = #sibling_of::NODE_NEXT_COUNT;
 
             #[inline]
-            pub fn runtime_nexts<G>(
-                runtime: &::hammer_adapter::DataPlaneRuntime<G>,
+            pub fn runtime_nexts(
+                runtime: &::hammer_adapter::DataPlaneRuntime,
             ) -> ::hammer_core::error::CoreResult<
                 [::hammer_adapter::node::NodeId; #sibling_of::NODE_NEXT_COUNT]
             > {
@@ -993,30 +992,58 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
         quote!()
     };
 
+    let registration_tokens = node_registration_tokens(&ident, &args.next, &args.sibling_of);
+    let registration_impl = if args.role.is_some() {
+        quote! {
+            #[inline]
+            pub fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
+                #registration_tokens
+            }
+        }
+    } else {
+        quote!()
+    };
+    let initial_nexts_inherent_impl = if args.role.is_some() && args.next.is_some() {
+        quote! {
+            #[inline]
+            pub fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                &self.next
+            }
+        }
+    } else if args.role.is_some() {
+        quote! {
+            #[inline]
+            pub fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
+                &[]
+            }
+        }
+    } else {
+        quote!()
+    };
+
     let fields_named: FieldsNamed = parse_quote!({
         #(#output_fields),*
     });
 
     let role_impl = match args.role {
         Some(NodeRole::Internal) => {
-            let registration = node_registration_tokens(&ident, &args.next, &args.sibling_of);
             let initial_nexts = if args.next.is_some() {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
-                        &self.next
+                        self.node_initial_nexts()
                     }
                 }
             } else {
                 quote!()
             };
             quote! {
-                impl #role_impl_generics ::hammer_adapter::node::InternalNode<G>
+                impl #role_impl_generics ::hammer_adapter::node::InternalNode
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
                     fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
-                        #registration
+                        self.node_registration()
                     }
 
                     #initial_nexts
@@ -1024,24 +1051,23 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             }
         }
         Some(NodeRole::Driver) => {
-            let registration = node_registration_tokens(&ident, &args.next, &args.sibling_of);
             let initial_nexts = if args.next.is_some() {
                 quote! {
                     #[inline]
                     fn node_initial_nexts(&self) -> &[::hammer_adapter::node::NodeId] {
-                        &self.next
+                        self.node_initial_nexts()
                     }
                 }
             } else {
                 quote!()
             };
             quote! {
-                impl #role_impl_generics ::hammer_adapter::node::DriverNode<G>
+                impl #role_impl_generics ::hammer_adapter::node::DriverNode
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
                     fn node_registration(&self) -> ::hammer_adapter::node::NodeRegistration {
-                        #registration
+                        self.node_registration()
                     }
 
                     #initial_nexts
@@ -1066,6 +1092,8 @@ fn expand_node(args: NodeArgs, item: ItemStruct) -> Result<TokenStream2> {
             }
 
             #declared_name_impl
+            #registration_impl
+            #initial_nexts_inherent_impl
             #next_impl
         }
 
@@ -1101,7 +1129,6 @@ fn node_role_generics(generics: &Generics) -> Generics {
             GenericParam::Lifetime(_) => {}
         }
     }
-    generics.params.push(parse_quote!(G));
     generics
 }
 

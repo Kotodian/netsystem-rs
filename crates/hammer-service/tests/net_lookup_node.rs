@@ -1,20 +1,19 @@
-use std::cell::RefCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeResult,
-    TraceControlPlane, TraceInputPolicy, TracePolicy,
+    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
     AdjacencyRewriteNode, AdjacencyRewriteTrace, Dpo, DpoId, DpoProto, DpoType, FibTableBuilder,
-    IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext, IpLocalNode, IpLookupControlPlane,
-    IpLookupNode, IpLookupTrace, IpReceiveNode,
+    IpInputNext, IpInputNode, IpLocalControlPlane, IpLocalNext, IpLookupControlPlane,
+    IpLookupTrace, IpUnicastArc,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -27,144 +26,147 @@ struct SinkState {
 }
 
 struct SinkNode {
-    state: Rc<RefCell<SinkState>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for SinkNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        self.state.borrow_mut().frame_lens.push(frame.pending_len());
-        for buffer in frame.drain_pending() {
-            let metadata = runtime.metadata(buffer)?;
-            let payload = runtime.copy_current_chain(buffer)?;
-            runtime.free_index(buffer);
-            let mut state = self.state.borrow_mut();
-            state.forwarding.push(metadata.forwarding);
-            state.egress_interfaces.push(metadata.egress_interface);
-            state.payloads.push(payload);
+impl SinkNode {
+    fn new(state: Arc<Mutex<SinkState>>) -> Self {
+        let mut states = sink_states().lock().expect("sink state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("sink state slot"),
         }
-        Ok(NodeResult::drop())
     }
 }
 
-impl InternalNode<TestNode> for SinkNode {}
+impl Node for SinkNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Err(CoreError::internal(
+            "sink node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        sink_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for SinkNode {}
 
 struct CorruptCurrentHeaderNode {
-    next: hammer_adapter::NodeId,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for CorruptCurrentHeaderNode {
+impl CorruptCurrentHeaderNode {
+    fn new(next: hammer_adapter::NodeId) -> Self {
+        Self {
+            runtime_data: NodeRuntimeData::from_words([u64::from(next.slot()), 0, 0, 0]),
+        }
+    }
+}
+
+impl Node for CorruptCurrentHeaderNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            runtime.get_buffer_mut(index)?.current_mut()[0] = 0;
-        }
-        Ok(NodeResult::next_current(self.next))
+        Err(CoreError::internal(
+            "corrupt current header node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        corrupt_current_header_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for CorruptCurrentHeaderNode {}
+impl InternalNode for CorruptCurrentHeaderNode {}
 
-enum TestNode {
-    Sink(SinkNode),
-    Drop(DropNode),
-    IpInput(IpInputNode),
-    IpLocal(IpLocalNode),
-    IpLookup(IpLookupNode),
-    AdjacencyRewrite(AdjacencyRewriteNode),
-    IpReceive(IpReceiveNode),
-    Corrupt(CorruptCurrentHeaderNode),
+fn sink_states() -> &'static Mutex<Vec<Arc<Mutex<SinkState>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<SinkState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-impl From<SinkNode> for TestNode {
-    fn from(node: SinkNode) -> Self {
-        Self::Sink(node)
+fn sink_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = {
+        let states = sink_states()
+            .lock()
+            .map_err(|_| CoreError::internal("sink state registry poisoned"))?;
+        Arc::clone(
+            states
+                .get(data.usize_word(0)?)
+                .ok_or_else(|| CoreError::internal("sink state slot is invalid"))?,
+        )
+    };
+    state
+        .lock()
+        .map_err(|_| CoreError::internal("sink state poisoned"))?
+        .frame_lens
+        .push(frame.pending_len());
+    for buffer in frame.drain_pending() {
+        let metadata = runtime.metadata(buffer)?;
+        let payload = runtime.copy_current_chain(buffer)?;
+        runtime.free_index(buffer);
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::internal("sink state poisoned"))?;
+        state.forwarding.push(metadata.forwarding);
+        state.egress_interfaces.push(metadata.egress_interface);
+        state.payloads.push(payload);
     }
+    Ok(NodeResult::drop())
 }
 
-impl From<DropNode> for TestNode {
-    fn from(node: DropNode) -> Self {
-        Self::Drop(node)
+fn corrupt_current_header_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    for index in frame.pending_indices().iter().copied() {
+        runtime.get_buffer_mut(index)?.current_mut()[0] = 0;
     }
-}
-
-impl From<IpInputNode> for TestNode {
-    fn from(node: IpInputNode) -> Self {
-        Self::IpInput(node)
-    }
-}
-
-impl From<IpLookupNode> for TestNode {
-    fn from(node: IpLookupNode) -> Self {
-        Self::IpLookup(node)
-    }
-}
-
-impl From<IpLocalNode> for TestNode {
-    fn from(node: IpLocalNode) -> Self {
-        Self::IpLocal(node)
-    }
-}
-
-impl From<AdjacencyRewriteNode> for TestNode {
-    fn from(node: AdjacencyRewriteNode) -> Self {
-        Self::AdjacencyRewrite(node)
-    }
-}
-
-impl From<IpReceiveNode> for TestNode {
-    fn from(node: IpReceiveNode) -> Self {
-        Self::IpReceive(node)
-    }
-}
-
-impl From<CorruptCurrentHeaderNode> for TestNode {
-    fn from(node: CorruptCurrentHeaderNode) -> Self {
-        Self::Corrupt(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Sink(node) => node.process(runtime, frame),
-            Self::Drop(node) => node.process(runtime, frame),
-            Self::IpInput(node) => node.process(runtime, frame),
-            Self::IpLocal(node) => node.process(runtime, frame),
-            Self::IpLookup(node) => node.process(runtime, frame),
-            Self::AdjacencyRewrite(node) => node.process(runtime, frame),
-            Self::IpReceive(node) => node.process(runtime, frame),
-            Self::Corrupt(node) => node.process(runtime, frame),
-        }
-    }
+    let slot = u32::try_from(data.word(0))
+        .map_err(|_| CoreError::internal("corrupt next node id overflow"))?;
+    Ok(NodeResult::next_current(hammer_adapter::NodeId::new(slot)))
 }
 
 fn assert_internal_node<I>(node: &I)
 where
-    I: InternalNode<TestNode>,
+    I: InternalNode,
 {
     let _ = node;
 }
 
 #[test]
 fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let default_state = Rc::new(RefCell::new(SinkState::default()));
-    let specific_state = Rc::new(RefCell::new(SinkState::default()));
-    let host_state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let default_state = Arc::new(Mutex::new(SinkState::default()));
+    let specific_state = Arc::new(Mutex::new(SinkState::default()));
+    let host_state = Arc::new(Mutex::new(SinkState::default()));
     let default = register_sink(&runtime, &default_state);
     let specific = register_sink(&runtime, &specific_state);
     let host = register_sink(&runtime, &host_state);
@@ -230,7 +232,8 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
     assert_frame_lens(&specific_state, &[1]);
     assert_frame_lens(&host_state, &[1]);
     assert_forwarding(&host_state, host_lb.get());
-    let default_forwarding = default_state.borrow().forwarding[0].expect("default forwarding");
+    let default_forwarding =
+        default_state.lock().unwrap().forwarding[0].expect("default forwarding");
     assert_eq!(trace.drain_completed(), 1);
     let records = trace.take_records();
     assert_eq!(records.len(), 1);
@@ -256,8 +259,8 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
 
 #[test]
 fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop_node);
@@ -301,8 +304,8 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
 
 #[test]
 fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 1);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 1);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop_node);
@@ -335,17 +338,17 @@ fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
         err.to_string().contains("frame pool exhausted"),
         "unexpected error: {err}"
     );
-    assert_eq!(state.borrow().payloads.len(), 0);
+    assert_eq!(state.lock().unwrap().payloads.len(), 0);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 #[test]
 fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let default_state = Rc::new(RefCell::new(SinkState::default()));
-    let subnet_state = Rc::new(RefCell::new(SinkState::default()));
-    let host_state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let default_state = Arc::new(Mutex::new(SinkState::default()));
+    let subnet_state = Arc::new(Mutex::new(SinkState::default()));
+    let host_state = Arc::new(Mutex::new(SinkState::default()));
     let default = register_sink(&runtime, &default_state);
     let subnet = register_sink(&runtime, &subnet_state);
     let host = register_sink(&runtime, &host_state);
@@ -401,7 +404,7 @@ fn ip_lookup_node_uses_ipv6_hash_prefix_order() {
 
 #[test]
 fn ip_lookup_node_sends_miss_to_drop_dpo() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let lookup = runtime
         .nodes()
@@ -422,8 +425,8 @@ fn ip_lookup_node_sends_miss_to_drop_dpo() {
 
 #[test]
 fn ip_lookup_node_routes_receive_dpo_to_local_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
     let local_control =
@@ -453,7 +456,7 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"receive".as_slice()]);
-    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    let forwarding = state.lock().unwrap().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.route_dpo_type, DpoType::LOAD_BALANCE);
     assert_eq!(forwarding.route_dpo_index, receive_lb.get());
     assert_eq!(forwarding.dpo_type, DpoType::RECEIVE);
@@ -464,8 +467,8 @@ fn ip_lookup_node_routes_receive_dpo_to_local_next() {
 
 #[test]
 fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let drop = runtime.nodes().register_internal(DropNode::new());
     let udp = register_sink(&runtime, &state);
     let local_control =
@@ -493,7 +496,7 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_payloads(&state, &[b"direct".as_slice()]);
-    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    let forwarding = state.lock().unwrap().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, u32::MAX);
     assert_eq!(forwarding.bucket_index, u16::MAX);
     assert_eq!(forwarding.route_dpo_type, DpoType::RECEIVE);
@@ -506,8 +509,8 @@ fn ip_lookup_node_routes_direct_receive_dpo_to_local_next() {
 
 #[test]
 fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let receive = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop_node);
@@ -532,7 +535,7 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"stack".as_slice()]);
-    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    let forwarding = state.lock().unwrap().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.dpo_type, DpoType::RECEIVE);
     assert_eq!(forwarding.dpo_index, 0);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -541,8 +544,8 @@ fn ip_lookup_node_routes_stacked_dpo_with_parent_identity() {
 
 #[test]
 fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let custom = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let custom_type = DpoType::new(7);
@@ -570,7 +573,7 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_payloads(&state, &[b"custom".as_slice()]);
-    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+    let forwarding = state.lock().unwrap().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.dpo_type, custom_type);
     assert_eq!(forwarding.dpo_index, custom_index);
     assert_eq!(runtime.frames_in_use(), 0);
@@ -579,8 +582,8 @@ fn ip_lookup_node_routes_custom_dpo_to_custom_next() {
 
 #[test]
 fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop_node = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop_node);
@@ -648,7 +651,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     );
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    let state_ref = state.borrow();
+    let state_ref = state.lock().unwrap();
     assert_eq!(state_ref.payloads.len(), 1);
     assert_eq!(&state_ref.payloads[0][..rewrite.len()], &rewrite);
     assert_eq!(&state_ref.payloads[0][rewrite.len()..], packet.as_slice());
@@ -683,7 +686,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
 
 #[test]
 fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
     let rewrite_node = runtime
@@ -732,9 +735,9 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
 
 #[test]
 fn ip_lookup_control_plane_publish_replaces_forwarding_table() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let first_state = Rc::new(RefCell::new(SinkState::default()));
-    let second_state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let first_state = Arc::new(Mutex::new(SinkState::default()));
+    let second_state = Arc::new(Mutex::new(SinkState::default()));
     let first = register_sink(&runtime, &first_state);
     let second = register_sink(&runtime, &second_state);
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -792,7 +795,7 @@ fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "ip-lookup-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let control =
         IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).with_barrier(barrier.clone());
@@ -807,8 +810,8 @@ fn ip_lookup_control_plane_publish_runs_through_runtime_data_plane_barrier() {
 
 #[test]
 fn ip_input_to_lookup_graph_routes_packet_by_fib() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop);
@@ -822,7 +825,7 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, lookup, drop, drop, drop,
         )));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -843,13 +846,13 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
 
 #[test]
 fn ip_input_keeps_lookup_packets_in_current_frame_without_allocating_next_frame() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 1);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 1);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, sink, drop, drop, drop,
         )));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -883,8 +886,8 @@ fn ip_input_keeps_lookup_packets_in_current_frame_without_allocating_next_frame(
 
 #[test]
 fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let state = Rc::new(RefCell::new(SinkState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop);
@@ -898,10 +901,10 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
     let corrupt = runtime
         .nodes()
-        .register_internal(CorruptCurrentHeaderNode { next: lookup });
+        .register_internal(CorruptCurrentHeaderNode::new(lookup));
     let input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, corrupt, drop, drop, drop,
         )));
     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -915,7 +918,7 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     {
-        let state = state.borrow();
+        let state = state.lock().unwrap();
         assert_eq!(state.payloads.len(), 1);
         assert_eq!(&state.payloads[0][28..], b"cursor");
     }
@@ -925,12 +928,12 @@ fn ip_lookup_uses_ip_input_cursor_without_reparsing_current_header() {
 }
 
 fn register_sink(
-    runtime: &DataPlaneRuntime<TestNode>,
-    state: &Rc<RefCell<SinkState>>,
+    runtime: &DataPlaneRuntime,
+    state: &Arc<Mutex<SinkState>>,
 ) -> hammer_adapter::NodeId {
-    runtime.nodes().register_internal(SinkNode {
-        state: Rc::clone(state),
-    })
+    runtime
+        .nodes()
+        .register_internal(SinkNode::new(Arc::clone(state)))
 }
 
 fn add_single_path(
@@ -941,11 +944,7 @@ fn add_single_path(
     builder.add_single_path_load_balance(proto, node)
 }
 
-fn push_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
-    frame: hammer_adapter::FrameIndex,
-    packet: &[u8],
-) {
+fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
     let index = runtime
         .alloc_index_with_bytes(Default::default(), packet)
         .expect("alloc packet");
@@ -957,7 +956,7 @@ fn push_packet(
 }
 
 fn push_marked_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],
@@ -975,9 +974,10 @@ fn push_marked_packet(
         .expect("push packet");
 }
 
-fn assert_payloads(state: &Rc<RefCell<SinkState>>, expected_payloads: &[&[u8]]) {
+fn assert_payloads(state: &Arc<Mutex<SinkState>>, expected_payloads: &[&[u8]]) {
     let payloads = state
-        .borrow()
+        .lock()
+        .unwrap()
         .payloads
         .iter()
         .map(|packet| udp_payload(packet).to_vec())
@@ -989,12 +989,12 @@ fn assert_payloads(state: &Rc<RefCell<SinkState>>, expected_payloads: &[&[u8]]) 
     assert_eq!(payloads, expected);
 }
 
-fn assert_frame_lens(state: &Rc<RefCell<SinkState>>, expected_lens: &[usize]) {
-    assert_eq!(&*state.borrow().frame_lens, expected_lens);
+fn assert_frame_lens(state: &Arc<Mutex<SinkState>>, expected_lens: &[usize]) {
+    assert_eq!(&*state.lock().unwrap().frame_lens, expected_lens);
 }
 
-fn assert_forwarding(state: &Rc<RefCell<SinkState>>, load_balance_index: u32) {
-    let forwarding = state.borrow().forwarding[0].expect("forwarding metadata");
+fn assert_forwarding(state: &Arc<Mutex<SinkState>>, load_balance_index: u32) {
+    let forwarding = state.lock().unwrap().forwarding[0].expect("forwarding metadata");
     assert_eq!(forwarding.load_balance_index, load_balance_index);
     assert_eq!(forwarding.dpo_type, DpoType::ADJACENCY);
 }

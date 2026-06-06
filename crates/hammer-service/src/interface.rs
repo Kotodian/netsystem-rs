@@ -1,18 +1,21 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 use hammer_infra::vec::Vec;
 use hammer_runtime::DataPlaneBarrierHandle;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 
 use crate::data_plane::set_index_node_error_code;
+use crate::net::{DpoId, DpoProto, FibTableBuilder, FibTableHandle};
 use crate::trace::codec::{TraceDecodeCursor, put_option_node, put_option_u16, put_option_u32};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +136,7 @@ impl InterfaceControlHandle {
 pub struct InterfaceControlPlane {
     inner: Arc<InterfaceStateSlot>,
     barrier: Option<DataPlaneBarrierHandle>,
+    connected_routes: Option<InterfaceConnectedRouteControl>,
 }
 
 impl Default for InterfaceControlPlane {
@@ -148,12 +152,19 @@ impl InterfaceControlPlane {
         Self {
             inner: Arc::new(InterfaceStateSlot::new(InterfaceState::default())),
             barrier: None,
+            connected_routes: None,
         }
     }
 
     #[inline]
     pub fn with_data_plane_barrier(mut self, barrier: DataPlaneBarrierHandle) -> Self {
         self.barrier = Some(barrier);
+        self
+    }
+
+    #[inline]
+    pub fn with_connected_routes(mut self, routes: InterfaceConnectedRouteControl) -> Self {
+        self.connected_routes = Some(routes);
         self
     }
 
@@ -190,7 +201,7 @@ impl InterfaceControlPlane {
                 mtu,
             });
             index = Some(next_index);
-            self.publish(next);
+            self.publish(next)?;
             Ok(())
         })?;
         index.ok_or_else(|| CoreError::internal("interface registration did not publish an index"))
@@ -205,7 +216,7 @@ impl InterfaceControlPlane {
                 CoreError::internal(format!("interface {interface_index} is not registered"))
             })?;
             interface.mtu = mtu;
-            self.publish(next);
+            self.publish(next)?;
             Ok(())
         })
     }
@@ -224,7 +235,7 @@ impl InterfaceControlPlane {
                 CoreError::internal(format!("interface {interface_index} is not registered"))
             })?;
             interface.mtu.set(kind, value);
-            self.publish(next);
+            self.publish(next)?;
             Ok(())
         })
     }
@@ -251,7 +262,7 @@ impl InterfaceControlPlane {
                 .addresses
                 .push(index);
             address_index = Some(index);
-            self.publish(next);
+            self.publish(next)?;
             Ok(())
         })?;
         address_index
@@ -282,7 +293,7 @@ impl InterfaceControlPlane {
             }
             next.rebuild_address_index();
             removed = true;
-            self.publish(next);
+            self.publish(next)?;
             Ok(())
         })?;
         Ok(removed)
@@ -309,9 +320,116 @@ impl InterfaceControlPlane {
     }
 
     #[inline]
-    fn publish(&self, state: InterfaceState) {
+    fn publish(&self, state: InterfaceState) -> CoreResult<()> {
+        if let Some(routes) = &self.connected_routes {
+            routes.publish_state(&state)?;
+        }
         self.inner.replace_after_barrier(state);
+        Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct InterfaceConnectedRouteControl {
+    table: FibTableHandle,
+    drop_next: NodeId,
+    receive_next: NodeId,
+    connected_nexts: Option<InterfaceConnectedNexts>,
+}
+
+impl InterfaceConnectedRouteControl {
+    #[inline]
+    pub fn new(table: FibTableHandle, drop_next: NodeId, receive_next: NodeId) -> Self {
+        Self {
+            table,
+            drop_next,
+            receive_next,
+            connected_nexts: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_connected_adjacency(
+        mut self,
+        adjacency_rewrite_next: NodeId,
+        interface_output_next: NodeId,
+    ) -> Self {
+        self.connected_nexts = Some(InterfaceConnectedNexts {
+            adjacency_rewrite_next,
+            interface_output_next,
+        });
+        self
+    }
+
+    fn publish_state(&self, state: &InterfaceState) -> CoreResult<()> {
+        let mut builder = FibTableBuilder::new(self.drop_next);
+        for record in state.addresses.iter().filter(|record| !record.removed) {
+            self.add_address_routes(&mut builder, record);
+        }
+        self.table.replace_after_barrier(builder.build());
+        Ok(())
+    }
+
+    fn add_address_routes(&self, builder: &mut FibTableBuilder, record: &InterfaceAddressRecord) {
+        match record.address {
+            IpNet::V4(address) => {
+                let receive = Ipv4Net::new(address.addr(), 32).expect("IPv4 host prefix");
+                builder
+                    .add_ip4_route_dpo(receive, DpoId::receive(DpoProto::IP4, self.receive_next));
+                if address.prefix_len() < 32 {
+                    let prefix =
+                        Ipv4Net::new(address.network(), address.prefix_len()).expect("IPv4 prefix");
+                    self.add_connected_route(
+                        builder,
+                        IpNet::V4(prefix),
+                        DpoProto::IP4,
+                        record.interface_index,
+                    );
+                }
+            }
+            IpNet::V6(address) => {
+                let receive = Ipv6Net::new(address.addr(), 128).expect("IPv6 host prefix");
+                builder
+                    .add_ip6_route_dpo(receive, DpoId::receive(DpoProto::IP6, self.receive_next));
+                if address.prefix_len() < 128 {
+                    let prefix =
+                        Ipv6Net::new(address.network(), address.prefix_len()).expect("IPv6 prefix");
+                    self.add_connected_route(
+                        builder,
+                        IpNet::V6(prefix),
+                        DpoProto::IP6,
+                        record.interface_index,
+                    );
+                }
+            }
+        }
+    }
+
+    fn add_connected_route(
+        &self,
+        builder: &mut FibTableBuilder,
+        prefix: IpNet,
+        proto: DpoProto,
+        interface_index: u32,
+    ) {
+        let Some(nexts) = self.connected_nexts else {
+            return;
+        };
+        let dpo = builder.add_interface_adjacency_dpo(
+            proto,
+            interface_index,
+            AdjacencyRewrite::empty(),
+            nexts.adjacency_rewrite_next,
+            nexts.interface_output_next,
+        );
+        builder.add_route_dpo(prefix, dpo);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InterfaceConnectedNexts {
+    adjacency_rewrite_next: NodeId,
+    interface_output_next: NodeId,
 }
 
 struct InterfaceStateSlot {
@@ -700,6 +818,8 @@ fn format_interface_output_trace(bytes: &[u8]) -> String {
 
 #[hammer_component_macros::node]
 pub struct InterfaceOutputNode {
+    #[node(default = register_interface_output_runtime(output.clone()))]
+    runtime_data: NodeRuntimeData,
     output: InterfaceOutputHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
@@ -707,9 +827,9 @@ pub struct InterfaceOutputNode {
 
 impl InterfaceOutputNode {
     #[inline(always)]
-    fn tx_for_index<G>(
-        &self,
-        runtime: &DataPlaneRuntime<G>,
+    fn tx_for_index(
+        output: &InterfaceOutputHandle,
+        runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
         let metadata = runtime.metadata(index)?;
@@ -732,7 +852,7 @@ impl InterfaceOutputNode {
             runtime.free_index(index);
             return Ok(None);
         };
-        let Some(tx) = self.output.tx_node(interface_index) else {
+        let Some(tx) = output.tx_node(interface_index) else {
             set_index_node_error_code(
                 runtime,
                 index,
@@ -765,11 +885,11 @@ impl InterfaceOutputNode {
     }
 }
 
-impl<G> Node<G> for InterfaceOutputNode {
+impl Node for InterfaceOutputNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let mut next_frames = NodeNextFrames::default();
@@ -777,7 +897,7 @@ impl<G> Node<G> for InterfaceOutputNode {
         let mut last_next = None;
         let result =
             frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-                let Some(node) = self.tx_for_index(runtime, index)? else {
+                let Some(node) = Self::tx_for_index(&self.output, runtime, index)? else {
                     return Ok(None);
                 };
                 last_next = Some(node);
@@ -815,14 +935,92 @@ impl<G> Node<G> for InterfaceOutputNode {
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_interface_output_trace)
     }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        interface_output_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
 }
 
-impl<G> InternalNode<G> for InterfaceOutputNode {
+impl InternalNode for InterfaceOutputNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
         Self: Sized,
     {
         NodeRegistration::next("interface-output-node", 0)
+    }
+}
+
+#[derive(Clone)]
+struct InterfaceOutputRuntime {
+    output: InterfaceOutputHandle,
+}
+
+fn interface_output_runtimes() -> &'static Mutex<Vec<InterfaceOutputRuntime>> {
+    static RUNTIMES: OnceLock<Mutex<Vec<InterfaceOutputRuntime>>> = OnceLock::new();
+    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn register_interface_output_runtime(output: InterfaceOutputHandle) -> NodeRuntimeData {
+    let mut runtimes = interface_output_runtimes()
+        .lock()
+        .expect("interface output runtime registry poisoned");
+    let slot = runtimes.len();
+    runtimes.push(InterfaceOutputRuntime { output });
+    NodeRuntimeData::from_usize(slot).expect("interface output runtime slot overflow")
+}
+
+fn interface_output_runtime(data: NodeRuntimeData) -> CoreResult<InterfaceOutputRuntime> {
+    let slot = data.usize_word(0)?;
+    interface_output_runtimes()
+        .lock()
+        .map_err(|_| CoreError::internal("interface output runtime registry poisoned"))?
+        .get(slot)
+        .cloned()
+        .ok_or_else(|| CoreError::internal("interface output runtime slot is invalid"))
+}
+
+fn interface_output_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = interface_output_runtime(data)?;
+    let mut next_frames = NodeNextFrames::default();
+    let mut current_next = None;
+    let result = frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
+        let Some(node) = InterfaceOutputNode::tx_for_index(&state.output, runtime, index)? else {
+            return Ok(None);
+        };
+        match current_next {
+            Some(current) if current == node => Ok(Some(index)),
+            Some(_) => {
+                next_frames.enqueue(runtime, node, index)?;
+                Ok(None)
+            }
+            None => {
+                current_next = Some(node);
+                Ok(Some(index))
+            }
+        }
+    });
+    if let Err(err) = result {
+        next_frames.free(runtime);
+        return Err(err);
+    }
+
+    next_frames.schedule(runtime)?;
+    if frame.has_pending()
+        && let Some(node) = current_next
+    {
+        Ok(NodeResult::next_current(node))
+    } else {
+        Ok(NodeResult::drop())
     }
 }

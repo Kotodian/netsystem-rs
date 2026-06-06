@@ -12,7 +12,6 @@ default = []
 # Enables runtime ICMP probe support used by hammer-service probe orchestration.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
 probe = ["dep:socket2"]
-inbound-tun = ["dep:libc", "dep:tun-rs", "dep:socket2"]
 inbound-socks = ["dep:base64"]
 inbound-http = ["dep:base64"]
 inbound-mixed = ["inbound-socks", "inbound-http"]
@@ -64,7 +63,7 @@ outbound-urltest = [
 ]
 # Enables the generic L3 endpoint domain (Endpoint trait, manager, packet-loop
 # fast path). Concrete endpoint protocols opt into this parent feature.
-endpoint = ["inbound-tun", "hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]
+endpoint = ["hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]
 # Enables the WireGuard endpoint module. Pulls in the matching config feature
 # in hammer-core. Off by default to keep the iOS xcframework slim.
 endpoint-wireguard = [
@@ -118,9 +117,7 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-derive = { workspace = true }
 socket2 = { workspace = true, optional = true }
-tun-rs = { workspace = true, optional = true }
 ipnet = { workspace = true }
-libc = { workspace = true, optional = true }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 rustls-platform-verifier = { workspace = true, optional = true }

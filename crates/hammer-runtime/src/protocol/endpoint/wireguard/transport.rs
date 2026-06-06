@@ -58,18 +58,18 @@ use crate::{ControlThreadHandle, ControlTimerHandle};
 const REKEY_KEEPALIVE_TIMER: Duration = Duration::from_millis(250);
 const SESSION_REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 
-/// Channel buffer for IP packets waiting to be encrypted. Apple utun can hand
-/// the packet loop a 256-packet batch, and the L3 fast path uses `try_send` so
-/// it never parks the TUN reader. Keep enough room for at least two full TUN
-/// batches; otherwise a single speed-test burst can fill the channel and turn
-/// the rest of that batch into drops.
+/// Channel buffer for IP packets waiting to be encrypted. Service-side packet
+/// graph code can hand this endpoint a large L3 batch, and the fast path uses
+/// `try_send` so it never parks the packet source. Keep enough room for at
+/// least two full batches; otherwise a single speed-test burst can fill the
+/// channel and turn the rest of that batch into drops.
 pub(crate) const ENCRYPT_QUEUE: usize = 512;
 pub(crate) const ENCRYPT_BATCH_QUEUE: usize = 32;
 /// Same for the decrypted-inbound side. Now that each decrypted packet is
 /// pushed as its own `Bytes` (the old `IpStackInput::Batch` enum is gone), the
 /// queue holds one packet per slot.
 /// 256 × MTU 1408 ≈ 360 KiB worst case, comfortably inside NetExt budget; the
-/// queue almost never fills because the TUN writer drains it line-rate.
+/// queue almost never fills because the L3 consumer drains it line-rate.
 const INBOUND_QUEUE: usize = 256;
 pub(crate) const INBOUND_BATCH_QUEUE: usize = 32;
 /// After one UDP readiness wake, drain a small bounded burst so we keep the
@@ -619,8 +619,8 @@ pub(crate) struct TransportHandles {
     pub(crate) encrypt_tx: mpsc::Sender<Bytes>,
     pub(crate) encrypt_batch_tx: mpsc::Sender<Vec<Bytes>>,
     /// Receive decrypted IP packets coming back from any peer. The endpoint
-    /// (now an `adapter::Endpoint`, not an `Outbound`) hands this stream
-    /// straight to the TUN packet-loop fan-in.
+    /// (now an `adapter::Endpoint`, not an `Outbound`) hands this stream to
+    /// the service-side L3 consumer.
     pub(crate) inbound_rx: mpsc::Receiver<Bytes>,
     pub(crate) inbound_batch_rx: mpsc::Receiver<Vec<Bytes>>,
     /// The address the OS bound the UDP socket to.
@@ -629,7 +629,7 @@ pub(crate) struct TransportHandles {
     /// Send `()` (or drop) to ask the actor to exit promptly.
     pub(crate) shutdown: oneshot::Sender<()>,
     /// Ask the actor to rebind/reprotect its UDP sockets while keeping the
-    /// packet channels stable for the TUN fast path.
+    /// packet channels stable for the L3 fast path.
     pub(crate) reset_tx: mpsc::Sender<()>,
     pub(crate) tunnel_control: TunnelControl,
     pub(crate) rekey_keepalive_timer: Option<ControlTimerHandle>,

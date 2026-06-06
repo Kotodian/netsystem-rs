@@ -3,21 +3,19 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Network,
-    Node, NodeId, NodeNextEnqueue, NodeNextStorage, NodeRegistration, NodeResult, PacketTrace,
-    RouteDecision, RouteMetadata, Router, SocksAddr, TraceFormatter, add_packet_trace,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
+    NodeId, NodeNextEnqueue, NodeProcessFn, NodeRegistration, NodeResult, PacketTrace,
+    RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
 
-use crate::trace::codec::{
-    TraceDecodeCursor, decode_network, encode_network, put_socks_addr, put_u8, put_usize,
-};
+use crate::trace::codec::put_usize;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
@@ -63,19 +61,21 @@ fn format_drop_trace(bytes: &[u8]) -> String {
     }
 }
 
-impl<G> Node<G> for DropNode {
+impl Node for DropNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let dropped = frame.pending_len();
-        for index in frame.drain_pending() {
-            add_packet_trace!(runtime, index, DropTrace { dropped })?;
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
+        Err(CoreError::internal(
+            "drop node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        drop_node_process
     }
 
     #[inline]
@@ -84,7 +84,20 @@ impl<G> Node<G> for DropNode {
     }
 }
 
-impl<G> InternalNode<G> for DropNode {
+fn drop_node_process(
+    runtime: &DataPlaneRuntime,
+    _data: hammer_adapter::node::NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let dropped = frame.pending_len();
+    for index in frame.drain_pending() {
+        add_packet_trace!(runtime, index, DropTrace { dropped })?;
+        runtime.free_index(index);
+    }
+    Ok(NodeResult::drop())
+}
+
+impl InternalNode for DropNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -97,6 +110,11 @@ impl<G> InternalNode<G> for DropNode {
 pub struct FeatureArc<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
     _arc: PhantomData<fn() -> A>,
+}
+
+#[derive(Clone)]
+pub struct FeatureArcStartHandle {
+    inner: Arc<ArcSwap<FeatureArcStartState>>,
 }
 
 pub struct FeatureArcStartSlot<A: FeatureArcSpec> {
@@ -120,6 +138,7 @@ pub struct FeatureArcStart {
 #[derive(Debug)]
 struct FeatureArcInner<A: FeatureArcSpec> {
     state: UnsafeCell<FeatureArcState<A>>,
+    start_state: Arc<ArcSwap<FeatureArcStartState>>,
 }
 
 pub trait FeatureArcSpec: Copy + Eq + Hash + fmt::Debug + 'static {}
@@ -206,6 +225,12 @@ struct FeatureArcState<A: FeatureArcSpec> {
     chains: HashMap<u32, FeatureArcChain>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct FeatureArcStartState {
+    end_nodes: HashMap<u32, NodeId>,
+    chains: HashMap<u32, FeatureArcChain>,
+}
+
 impl<A: FeatureArcSpec> Default for FeatureArcState<A> {
     fn default() -> Self {
         Self {
@@ -248,6 +273,13 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
         Self {
             inner: Arc::new(FeatureArcInner::new()),
             _arc: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn start_handle(&self) -> FeatureArcStartHandle {
+        FeatureArcStartHandle {
+            inner: Arc::clone(&self.inner.start_state),
         }
     }
 
@@ -325,9 +357,73 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
     }
 }
 
+impl FeatureArcStartHandle {
+    #[inline]
+    pub fn start_or(&self, metadata: &mut RouteMetadata, default_next: NodeId) -> NodeId {
+        self.start_or_with_end(metadata, default_next, default_next)
+            .node
+    }
+
+    #[inline]
+    pub fn start_or_with_end(
+        &self,
+        metadata: &mut RouteMetadata,
+        default_next: NodeId,
+        end_next: NodeId,
+    ) -> FeatureArcStart {
+        metadata.clear_feature_path();
+        let Some(interface_index) = metadata.ingress_interface else {
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
+        };
+        self.start_for_interface_or_with_end(interface_index, metadata, default_next, end_next)
+    }
+
+    #[inline]
+    pub fn start_for_interface_or_with_end(
+        &self,
+        interface_index: u32,
+        metadata: &mut RouteMetadata,
+        default_next: NodeId,
+        end_next: NodeId,
+    ) -> FeatureArcStart {
+        let state = self.inner.load();
+        let override_end = state.end_nodes.get(&interface_index).copied();
+        let default_next = override_end.unwrap_or(default_next);
+        let end_next = override_end.unwrap_or(end_next);
+        let Some(chain) = state.chains.get(&interface_index) else {
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
+        };
+        let Some(first) = chain.steps.first() else {
+            return FeatureArcStart {
+                node: default_next,
+                started: false,
+            };
+        };
+        let mut next_entries = chain
+            .steps
+            .iter()
+            .skip(1)
+            .map(|step| FeaturePathEntry::new(step.node, step.config.clone()))
+            .collect::<Vec<_>>();
+        next_entries.push(FeaturePathEntry::new(end_next, None));
+        metadata.set_current_feature_config(first.config.clone());
+        metadata.set_feature_path(next_entries);
+        FeatureArcStart {
+            node: first.node,
+            started: true,
+        }
+    }
+}
+
 #[inline(always)]
-pub fn next_feature_node_for_index<G>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn next_feature_node_for_index(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
 ) -> CoreResult<NodeId> {
     let next = runtime.with_metadata_mut(index, RouteMetadata::pop_feature_next)?;
@@ -335,8 +431,8 @@ pub fn next_feature_node_for_index<G>(
 }
 
 #[inline(always)]
-pub fn next_feature_frame<G>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn next_feature_frame(
+    runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let Some(first) = frame.pending_indices().first().copied() else {
@@ -353,8 +449,8 @@ pub fn next_feature_frame<G>(
 }
 
 #[inline(always)]
-pub fn set_buffer_node_error_code<G>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn set_buffer_node_error_code(
+    runtime: &DataPlaneRuntime,
     buffer: &mut Buffer,
     code: u16,
 ) -> CoreResult<()> {
@@ -364,8 +460,8 @@ pub fn set_buffer_node_error_code<G>(
 }
 
 #[inline(always)]
-pub fn set_index_node_error_code<G>(
-    runtime: &DataPlaneRuntime<G>,
+pub fn set_index_node_error_code(
+    runtime: &DataPlaneRuntime,
     index: BufferIndex,
     code: u16,
 ) -> CoreResult<()> {
@@ -539,6 +635,7 @@ impl<A: FeatureArcSpec> FeatureArcInner<A> {
     fn new() -> Self {
         Self {
             state: UnsafeCell::new(FeatureArcState::<A>::default()),
+            start_state: Arc::new(ArcSwap::from_pointee(FeatureArcStartState::default())),
         }
     }
 
@@ -552,6 +649,7 @@ impl<A: FeatureArcSpec> FeatureArcInner<A> {
 
     #[inline]
     fn replace_after_barrier(&self, state: FeatureArcState<A>) {
+        self.start_state.store(Arc::new(state.start_state()));
         // SAFETY: callers replace state either while the runtime data-plane
         // barrier is held, or during single-threaded graph setup in tests.
         unsafe {
@@ -587,6 +685,13 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
         }
         self.chains = chains;
         Ok(())
+    }
+
+    fn start_state(&self) -> FeatureArcStartState {
+        FeatureArcStartState {
+            end_nodes: self.end_nodes.clone(),
+            chains: self.chains.clone(),
+        }
     }
 
     fn sorted_feature_order(&self) -> CoreResult<Vec<A>> {
@@ -676,147 +781,4 @@ fn add_feature_order_edge<A: FeatureArcSpec>(
     }
     edges.entry(*from).or_default().push(*to);
     *indegree.entry(*to).or_default() += 1;
-}
-
-#[hammer_component_macros::node_next]
-pub enum RouteMatchNext {
-    Lookup,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RouteMatchTrace {
-    pub network: Network,
-    pub source: Option<SocksAddr>,
-    pub destination: Option<SocksAddr>,
-    pub decision_kind: RouteDecisionKind,
-}
-
-impl RouteMatchTrace {
-    pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut cursor = TraceDecodeCursor::new(bytes);
-        let network = decode_network(cursor.read_u8()?)?;
-        let source = cursor.read_socks_addr()?;
-        let destination = cursor.read_socks_addr()?;
-        let decision_kind = RouteDecisionKind::decode(cursor.read_u8()?)?;
-        if !cursor.is_empty() {
-            return None;
-        }
-        Some(Self {
-            network,
-            source,
-            destination,
-            decision_kind,
-        })
-    }
-}
-
-impl PacketTrace for RouteMatchTrace {
-    #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
-        put_u8(out, encode_network(self.network));
-        put_socks_addr(out, self.source.as_ref());
-        put_socks_addr(out, self.destination.as_ref());
-        put_u8(out, self.decision_kind.encode());
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RouteDecisionKind {
-    Route,
-    HijackDns,
-    Reject,
-}
-
-impl RouteDecisionKind {
-    #[inline]
-    fn encode(self) -> u8 {
-        match self {
-            Self::Route => 0,
-            Self::HijackDns => 1,
-            Self::Reject => 2,
-        }
-    }
-
-    #[inline]
-    fn decode(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(Self::Route),
-            1 => Some(Self::HijackDns),
-            2 => Some(Self::Reject),
-            _ => None,
-        }
-    }
-}
-
-impl From<&RouteDecision> for RouteDecisionKind {
-    #[inline]
-    fn from(value: &RouteDecision) -> Self {
-        match value {
-            RouteDecision::Route { .. } => Self::Route,
-            RouteDecision::HijackDns => Self::HijackDns,
-            RouteDecision::Reject { .. } => Self::Reject,
-        }
-    }
-}
-
-fn format_route_match_trace(bytes: &[u8]) -> String {
-    match RouteMatchTrace::decode(bytes) {
-        Some(trace) => format!("{trace:?}"),
-        None => format!("RouteMatchTrace invalid={bytes:?}"),
-    }
-}
-
-#[hammer_component_macros::node(role = internal, next = RouteMatchNext)]
-pub struct RouteMatchNode<R> {
-    router: R,
-}
-
-impl<R, T, G> Node<G> for RouteMatchNode<R>
-where
-    R: Deref<Target = T>,
-    T: Router + ?Sized,
-{
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<G>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
-        cursor.prefetch_next(runtime);
-        while let Some(batch) = cursor.next() {
-            cursor.prefetch_next(runtime);
-            for index in batch.indices() {
-                let mut buffer = runtime.get_buffer_mut(index)?;
-                let metadata = buffer.metadata_mut();
-                self.router.prepare_route_metadata(metadata)?;
-                let decision = self.router.match_route(metadata)?;
-                metadata.route_decision = Some(decision);
-                drop(buffer);
-                add_packet_trace!(runtime, index, {
-                    runtime.with_metadata(index, |metadata| {
-                        let decision = metadata.route_decision.as_ref().ok_or_else(|| {
-                            CoreError::internal("missing route decision for route trace")
-                        })?;
-                        Ok(RouteMatchTrace {
-                            network: metadata.network,
-                            source: metadata.source.clone(),
-                            destination: metadata.destination.clone(),
-                            decision_kind: RouteDecisionKind::from(decision),
-                        })
-                    })??
-                })?;
-            }
-        }
-        let next = Self::runtime_nexts(runtime)?;
-        Ok(NodeResult::next_current(NodeNextStorage::next(
-            &next,
-            RouteMatchNext::Lookup,
-        )))
-    }
-
-    #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_route_match_trace)
-    }
 }
