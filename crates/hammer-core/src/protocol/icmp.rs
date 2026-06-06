@@ -82,6 +82,11 @@ impl IcmpErrorMetadata {
     }
 
     #[inline]
+    pub fn ipv6_port_unreachable() -> Self {
+        Self::new(IcmpErrorFamily::Ipv6, 1, 4, 0)
+    }
+
+    #[inline]
     pub const fn family(self) -> IcmpErrorFamily {
         match (self.0.get() >> 48) & 0xff {
             4 => IcmpErrorFamily::Ipv4,
@@ -429,6 +434,31 @@ mod tests {
         assert_eq!(&error.packet[24..40], &source.octets());
         assert_eq!(error.packet[40], 3);
         assert_eq!(error.packet[41], 0);
+        assert_eq!(&error.packet[48..], &original[..]);
+        assert_eq!(
+            ipv6_l4_checksum(local_source, source, 58, &error.packet[40..]),
+            0
+        );
+    }
+
+    #[test]
+    fn build_icmp_error_packet_synthesizes_ipv6_port_unreachable() {
+        let source = "2001:db8::1".parse().expect("source");
+        let destination = "2001:db8::2".parse().expect("destination");
+        let original = ipv6_packet(source, destination, 17, b"closed-port");
+
+        let local_source = "2001:db8::ff".parse().expect("local source");
+        let error = build_icmp_error_packet(
+            &original,
+            IcmpErrorMetadata::ipv6_port_unreachable(),
+            IpAddr::V6(local_source),
+        )
+        .expect("error");
+
+        assert_eq!(&error.packet[8..24], &local_source.octets());
+        assert_eq!(&error.packet[24..40], &source.octets());
+        assert_eq!(error.packet[40], 1);
+        assert_eq!(error.packet[41], 4);
         assert_eq!(&error.packet[48..], &original[..]);
         assert_eq!(
             ipv6_l4_checksum(local_source, source, 58, &error.packet[40..]),

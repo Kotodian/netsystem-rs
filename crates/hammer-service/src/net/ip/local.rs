@@ -931,20 +931,18 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use hammer_adapter::{DataPlaneRuntime, NodeNextStorage};
+    use hammer_adapter::{NodeId, NodeNextStorage};
 
     use super::*;
-    use crate::data_plane::DropNode;
 
     #[test]
     fn ip_local_state_returns_protocol_or_control_next() {
-        let runtime = DataPlaneRuntime::with_capacities(8, 8, 1, 1);
-        let drop = runtime.nodes().register_internal(DropNode::new());
-        let punt = runtime.nodes().register_internal(DropNode::new());
-        let tcp = runtime.nodes().register_internal(DropNode::new());
-        let udp = runtime.nodes().register_internal(DropNode::new());
-        let icmp = runtime.nodes().register_internal(DropNode::new());
-        let reassembly = runtime.nodes().register_internal(DropNode::new());
+        let drop = NodeId::new(1);
+        let punt = NodeId::new(2);
+        let tcp = NodeId::new(3);
+        let udp = NodeId::new(4);
+        let icmp = NodeId::new(5);
+        let reassembly = NodeId::new(6);
         let next = IpLocalNext::nodes(drop, punt, tcp, udp, icmp, reassembly);
         let state = IpLocalState::new();
 

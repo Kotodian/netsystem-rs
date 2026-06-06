@@ -11,6 +11,7 @@ mod probe;
 pub mod route;
 mod service;
 mod trace;
+pub mod transport;
 pub mod tun;
 
 pub mod adapter {
