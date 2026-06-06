@@ -13,7 +13,7 @@ use hammer_infra::{boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
 use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{Node, NodeHandle, NodeId, NodeNext, NodeRuntime, NoopNode};
+use crate::node::{NodeHandle, NodeId, NodeNext, NodeRuntime};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle, TraceMark};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
@@ -478,14 +478,14 @@ pub struct DataPlaneBuffers {
 }
 
 #[derive(Debug)]
-pub struct DataPlaneRuntime<N = NoopNode> {
+pub struct DataPlaneRuntime {
     buffers: DataPlaneBuffers,
-    nodes: NodeRuntime<N>,
+    nodes: NodeRuntime,
     current_node: Rc<Cell<Option<NodeId>>>,
     handoff: Option<DataPlaneHandoffWorker>,
 }
 
-impl<N> Clone for DataPlaneRuntime<N> {
+impl Clone for DataPlaneRuntime {
     fn clone(&self) -> Self {
         Self {
             buffers: self.buffers.clone(),
@@ -496,7 +496,7 @@ impl<N> Clone for DataPlaneRuntime<N> {
     }
 }
 
-impl<N> Deref for DataPlaneRuntime<N> {
+impl Deref for DataPlaneRuntime {
     type Target = DataPlaneBuffers;
 
     fn deref(&self) -> &Self::Target {
@@ -946,7 +946,7 @@ impl DataPlaneBuffers {
     }
 }
 
-impl<N> DataPlaneRuntime<N> {
+impl DataPlaneRuntime {
     #[inline]
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities_and_instruction_set(
@@ -1061,7 +1061,7 @@ impl<N> DataPlaneRuntime<N> {
     }
 
     #[inline]
-    pub fn nodes(&self) -> &NodeRuntime<N> {
+    pub fn nodes(&self) -> &NodeRuntime {
         &self.nodes
     }
 
@@ -1204,12 +1204,9 @@ impl<N> DataPlaneRuntime<N> {
     }
 
     #[inline]
-    pub fn run_ready_nodes(&self) -> CoreResult<usize>
-    where
-        N: Node<N>,
-    {
+    pub fn run_ready_nodes(&self) -> CoreResult<usize> {
         self.drain_handoff_frames()?;
-        self.nodes.run_ready(self)
+        self.nodes.run_ready_function_nodes(self)
     }
 
     #[inline]
@@ -3300,7 +3297,7 @@ impl BufferFrame {
 
 impl BufferFramePairBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next_pair<G>(&self, runtime: &DataPlaneRuntime<G>) {
+    pub fn prefetch_next_pair(&self, runtime: &DataPlaneRuntime) {
         for index in self.indices[self.offset..].iter().take(2).copied() {
             runtime.prefetch_read(index);
         }
@@ -3332,7 +3329,7 @@ impl Iterator for BufferFramePairBatchCursor<'_> {
 
 impl BufferFrameQuadBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next_quad<G>(&self, runtime: &DataPlaneRuntime<G>) {
+    pub fn prefetch_next_quad(&self, runtime: &DataPlaneRuntime) {
         for index in self.indices[self.offset..].iter().take(4).copied() {
             runtime.prefetch_read(index);
         }
@@ -3373,7 +3370,7 @@ impl Iterator for BufferFrameQuadBatchCursor<'_> {
 
 impl BufferFrameBatchCursor<'_> {
     #[inline]
-    pub fn prefetch_next<G>(&self, runtime: &DataPlaneRuntime<G>) {
+    pub fn prefetch_next(&self, runtime: &DataPlaneRuntime) {
         let width = match self.width {
             FrameBatchWidth::Quad => 4,
             FrameBatchWidth::Pair => 2,

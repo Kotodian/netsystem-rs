@@ -1,49 +1,18 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Node, NodeResult, TraceControlPlane, TraceInputPolicy,
-    TracePolicy,
-};
-use hammer_core::error::CoreResult;
+use hammer_adapter::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::interface::{
-    InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind, InterfaceOutputControlPlane,
-    InterfaceOutputNode, InterfaceOutputTrace,
+    InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
+    InterfaceOutputControlPlane, InterfaceOutputTrace,
+};
+use hammer_service::net::{
+    AdjacencyRewriteNode, DpoType, FibTableBuilder, IpLocalControlPlane, IpLocalNext,
+    IpLookupControlPlane,
 };
 use hammer_service::tun::{MemoryTunDevice, TunOutputDriverNode, TunOutputTrace};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-
-enum TestNode {
-    InterfaceOutput(InterfaceOutputNode),
-    TunOutput(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
-}
-
-impl From<InterfaceOutputNode> for TestNode {
-    fn from(node: InterfaceOutputNode) -> Self {
-        Self::InterfaceOutput(node)
-    }
-}
-
-impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
-    fn from(node: TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>) -> Self {
-        Self::TunOutput(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::InterfaceOutput(node) => node.process(runtime, frame),
-            Self::TunOutput(node) => node.process(runtime, frame),
-        }
-    }
-}
 
 #[test]
 fn control_plane_publishes_interfaces_and_addresses_through_handle() {
@@ -155,7 +124,15 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
     let data_runtime =
         DataRuntime::new(1, "interface-control-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let control = InterfaceControlPlane::new().with_data_plane_barrier(barrier.clone());
+    let lookup_table =
+        IpLookupControlPlane::new(FibTableBuilder::new(hammer_adapter::NodeId::new(0)).build());
+    let control = InterfaceControlPlane::new()
+        .with_data_plane_barrier(barrier.clone())
+        .with_connected_routes(InterfaceConnectedRouteControl::new(
+            lookup_table.table_handle(),
+            hammer_adapter::NodeId::new(0),
+            hammer_adapter::NodeId::new(1),
+        ));
     let tun0 = control.register_interface("tun0").expect("register tun0");
     let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 1), 24).unwrap());
 
@@ -165,12 +142,103 @@ fn interface_updates_run_through_configured_runtime_data_plane_barrier() {
         .expect("remove address");
 
     assert_eq!(barrier.sync_count(), 3);
+    assert!(
+        lookup_table
+            .table_handle()
+            .table()
+            .lookup_ip4(Ipv4Addr::new(10, 0, 0, 1), 0)
+            .is_none()
+    );
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
+fn interface_address_publish_installs_receive_route_in_fib() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let drop = runtime
+        .nodes()
+        .register_internal(hammer_service::data_plane::DropNode::new());
+    let lookup_control = IpLookupControlPlane::new(FibTableBuilder::new(drop).build());
+    let adjacency_rewrite = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(lookup_control.table_handle()));
+    let output_control = InterfaceOutputControlPlane::new();
+    let interface_output = runtime.nodes().register_internal(output_control.node());
+    let local_control =
+        IpLocalControlPlane::new(IpLocalNext::nodes(drop, drop, drop, drop, drop, drop));
+    runtime.nodes().register_internal(local_control.node());
+    let receive = runtime
+        .nodes()
+        .register_internal(local_control.receive_node());
+    let lookup = runtime.nodes().register_internal(lookup_control.node());
+    let control = InterfaceControlPlane::new().with_connected_routes(
+        InterfaceConnectedRouteControl::new(lookup_control.table_handle(), drop, receive)
+            .with_connected_adjacency(adjacency_rewrite, interface_output),
+    );
+    let tun0 = control.register_interface("tun0").expect("register tun0");
+    let address = IpNet::V4(Ipv4Net::new(Ipv4Addr::new(10, 255, 0, 1), 24).unwrap());
+
+    control.add_address(tun0, address).expect("add address");
+
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = ipv4_packet([10, 255, 0, 2], [10, 255, 0, 1], b"receive");
+    let index = runtime
+        .alloc_index_with_bytes(hammer_adapter::RouteMetadata::default(), &packet)
+        .expect("alloc packet");
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+
+    assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
+    assert!(runtime.run_ready_nodes().expect("run nodes") >= 2);
+    let stats = runtime.nodes().node_runtime_stats_snapshot();
+    assert_eq!(
+        stats
+            .iter()
+            .find(|row| row.node_id == receive)
+            .map(|row| row.vectors),
+        Some(1)
+    );
+    let lookup_stats = runtime
+        .nodes()
+        .node_runtime_stats_snapshot()
+        .into_iter()
+        .find(|row| row.node_id == lookup)
+        .expect("lookup stats");
+    assert_eq!(lookup_stats.vectors, 1);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+
+    let connected = lookup_control
+        .table_handle()
+        .table()
+        .lookup_ip4(Ipv4Addr::new(10, 255, 0, 2), 0)
+        .expect("connected route lookup");
+    assert_eq!(connected.dpo.kind(), DpoType::ADJACENCY);
+    assert_eq!(connected.dpo.next(), adjacency_rewrite);
+    let adjacency = lookup_control
+        .table_handle()
+        .table()
+        .adjacency(connected.dpo.adjacency_index().expect("adjacency index"))
+        .expect("adjacency entry");
+    assert_eq!(adjacency.egress_interface, Some(tun0));
+    assert_eq!(adjacency.next, interface_output);
+
+    control
+        .remove_address(tun0, address)
+        .expect("remove address");
+    let missing = lookup_control
+        .table_handle()
+        .table()
+        .lookup_ip4(Ipv4Addr::new(10, 255, 0, 1), 0);
+    assert!(missing.is_none());
+}
+
+#[test]
 fn interface_output_dispatches_to_registered_tx_node() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let output_device = MemoryTunDevice::new();
     let tx = runtime
         .nodes()
@@ -254,7 +322,7 @@ fn interface_output_dispatches_to_registered_tx_node() {
 
 #[test]
 fn interface_output_drops_missing_egress_or_tx_mapping() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let output_device = MemoryTunDevice::new();
     let output_control = InterfaceOutputControlPlane::new();
     let output_node = runtime.nodes().register_internal(output_control.node());
@@ -279,7 +347,7 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
     let data_runtime =
         DataRuntime::new(1, "interface-output-barrier-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let tx = runtime
         .nodes()
@@ -295,7 +363,7 @@ fn interface_output_tx_updates_run_through_configured_runtime_data_plane_barrier
 }
 
 fn push_packet_with_egress(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     egress_interface: Option<u32>,
     payload: &[u8],

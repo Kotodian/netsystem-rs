@@ -7,6 +7,11 @@ publish.workspace = true
 [lib]
 name = "hammer_service"
 
+[[example]]
+name = "host-ping"
+path = "examples/tun/host_ping.rs"
+required-features = ["inbound-tun"]
+
 [features]
 default = [
     "inbound-tun",
@@ -21,7 +26,7 @@ default = [
     "probe",
 ]
 probe = ["hammer-runtime/probe"]
-inbound-tun = ["hammer-runtime/inbound-tun"]
+inbound-tun = ["dep:libc"]
 inbound-socks = ["hammer-runtime/inbound-socks"]
 inbound-http = ["hammer-runtime/inbound-http"]
 inbound-mixed = ["hammer-runtime/inbound-mixed"]
@@ -73,9 +78,10 @@ hyper-util = { workspace = true, optional = true }
 ipnet = { workspace = true }
 nom = { workspace = true }
 rustls = { workspace = true, optional = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 smoltcp = { workspace = true }

@@ -35,7 +35,6 @@ pub(crate) fn register_outbound_component<C>(
 }
 
 #[cfg(any(
-    feature = "inbound-tun",
     feature = "inbound-socks",
     feature = "inbound-http",
     feature = "inbound-mixed"
@@ -57,7 +56,6 @@ pub(crate) trait InboundComponentDeclaration {
 }
 
 #[cfg(any(
-    feature = "inbound-tun",
     feature = "inbound-socks",
     feature = "inbound-http",
     feature = "inbound-mixed"
@@ -115,7 +113,6 @@ pub fn register_event_subscriber_component<C>(
     feature = "outbound-direct",
     feature = "outbound-block",
     feature = "outbound-urltest",
-    feature = "inbound-tun",
     feature = "inbound-socks",
     feature = "inbound-http",
     feature = "inbound-mixed",
@@ -142,7 +139,6 @@ macro_rules! register_components {
     feature = "outbound-direct",
     feature = "outbound-block",
     feature = "outbound-urltest",
-    feature = "inbound-tun",
     feature = "inbound-socks",
     feature = "inbound-http",
     feature = "inbound-mixed",

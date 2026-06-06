@@ -17,14 +17,11 @@ use hickory_proto::op::Message;
 use tracing::debug;
 
 #[cfg(any(
-    feature = "inbound-tun",
     feature = "inbound-socks",
     feature = "inbound-http",
     feature = "inbound-mixed"
 ))]
 use crate::component_registry::register_components;
-#[cfg(feature = "inbound-tun")]
-use crate::protocol::tun;
 use crate::{OutboundManager, RuntimePlatform};
 
 pub struct RuntimeDnsRouter {
@@ -137,14 +134,11 @@ impl InboundFactorySet {
 
 fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, InboundBuilder>) {
     #[cfg(not(any(
-        feature = "inbound-tun",
         feature = "inbound-socks",
         feature = "inbound-http",
         feature = "inbound-mixed"
     )))]
     let _ = builders;
-    #[cfg(feature = "inbound-tun")]
-    register_components!(inbound, builders, [tun::RuntimeTunInbound]);
     #[cfg(feature = "inbound-socks")]
     register_components!(
         inbound,

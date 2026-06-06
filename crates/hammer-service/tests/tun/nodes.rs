@@ -1,23 +1,20 @@
-use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec as StdVec;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeResult, RouteMetadata,
-    SocksAddr, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    BufferFrame, DataPlaneRuntime, InternalNode, Network, Node, NodeId, NodeProcessFn, NodeResult,
+    NodeRuntimeData, RouteMetadata, SocksAddr, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
 use hammer_infra::vec::Vec;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::{FeatureArcControl, next_feature_frame};
-use hammer_service::interface::{
-    InterfaceControlPlane, InterfaceMtu, InterfaceOutputControlPlane, InterfaceOutputNode,
-};
+use hammer_service::interface::{InterfaceControlPlane, InterfaceMtu, InterfaceOutputControlPlane};
 use hammer_service::net::{
     AdjacencyRewriteNode, DpoId, DpoProto, FibTableBuilder, IpInputNext, IpInputNode,
-    IpInputTarget, IpInputTrace, IpLookupControlPlane, IpLookupNode, IpProtocol, IpVersion,
+    IpInputTarget, IpInputTrace, IpLookupControlPlane, IpProtocol, IpVersion,
 };
 use hammer_service::tun::{
     MemoryTunDevice, TunInputDriverNode, TunInputTrace, TunOutputDriverNode, TunOutputTrace,
@@ -40,46 +37,63 @@ enum TestIpUnicastArc {
 }
 
 struct ForwardCaptureNode {
-    next: NodeId,
-    metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for ForwardCaptureNode {
+impl Node for ForwardCaptureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            self.metadata.borrow_mut().push(runtime.metadata(index)?);
-        }
-        Ok(NodeResult::next_current(self.next))
+        Err(CoreError::internal(
+            "forward capture node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        forward_capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for ForwardCaptureNode {}
+impl InternalNode for ForwardCaptureNode {}
 
 #[hammer_component_macros::feature(arc = TestIpUnicastArc, id = TunFeature)]
 struct CaptureFeatureNode {
-    metadata: Rc<RefCell<Vec<RouteMetadata>>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for CaptureFeatureNode {
+impl Node for CaptureFeatureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            self.metadata.borrow_mut().push(runtime.metadata(index)?);
-        }
-        next_feature_frame(runtime, frame)
+        Err(CoreError::internal(
+            "capture feature node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_feature_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for CaptureFeatureNode {}
+impl InternalNode for CaptureFeatureNode {}
 
 #[hammer_component_macros::feature(
     arc = TestIpUnicastArc,
@@ -87,29 +101,33 @@ impl InternalNode<TestNode> for CaptureFeatureNode {}
     runs_before = [BetaFeature]
 )]
 struct AlphaFeatureNode {
-    visits: Rc<RefCell<StdVec<FeatureVisit>>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for AlphaFeatureNode {
+impl Node for AlphaFeatureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            let metadata = runtime.metadata(index)?;
-            self.visits.borrow_mut().push(FeatureVisit {
-                name: "alpha",
-                config: metadata.feature_config.clone(),
-                ingress_interface: metadata.ingress_interface,
-            });
-        }
-        next_feature_frame(runtime, frame)
+        Err(CoreError::internal(
+            "alpha feature node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        alpha_feature_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
     }
 }
 
-impl InternalNode<TestNode> for AlphaFeatureNode {}
+impl InternalNode for AlphaFeatureNode {}
 
 #[hammer_component_macros::feature(
     arc = TestIpUnicastArc,
@@ -117,128 +135,215 @@ impl InternalNode<TestNode> for AlphaFeatureNode {}
     runs_after = [AlphaFeature]
 )]
 struct BetaFeatureNode {
-    visits: Rc<RefCell<StdVec<FeatureVisit>>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for BetaFeatureNode {
+impl Node for BetaFeatureNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        for index in frame.pending_indices().iter().copied() {
-            let metadata = runtime.metadata(index)?;
-            self.visits.borrow_mut().push(FeatureVisit {
-                name: "beta",
+        Err(CoreError::internal(
+            "beta feature node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        beta_feature_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for BetaFeatureNode {}
+
+struct ForwardCaptureState {
+    next: NodeId,
+    metadata: Arc<Mutex<Vec<RouteMetadata>>>,
+}
+
+struct MetadataCaptureState {
+    metadata: Arc<Mutex<Vec<RouteMetadata>>>,
+}
+
+struct VisitCaptureState {
+    visits: Arc<Mutex<StdVec<FeatureVisit>>>,
+}
+
+fn forward_capture_states() -> &'static Mutex<Vec<ForwardCaptureState>> {
+    static STATES: OnceLock<Mutex<Vec<ForwardCaptureState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn metadata_capture_states() -> &'static Mutex<Vec<MetadataCaptureState>> {
+    static STATES: OnceLock<Mutex<Vec<MetadataCaptureState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn visit_capture_states() -> &'static Mutex<Vec<VisitCaptureState>> {
+    static STATES: OnceLock<Mutex<Vec<VisitCaptureState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+impl ForwardCaptureNode {
+    fn new(next: NodeId, metadata: Arc<Mutex<Vec<RouteMetadata>>>) -> Self {
+        let mut states = forward_capture_states()
+            .lock()
+            .expect("forward capture state poisoned");
+        let slot = states.len();
+        states.push(ForwardCaptureState { next, metadata });
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("forward capture runtime data"),
+        }
+    }
+}
+
+impl CaptureFeatureNode {
+    fn new(metadata: Arc<Mutex<Vec<RouteMetadata>>>) -> Self {
+        let mut states = metadata_capture_states()
+            .lock()
+            .expect("metadata capture state poisoned");
+        let slot = states.len();
+        states.push(MetadataCaptureState { metadata });
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("feature capture runtime data"),
+        }
+    }
+}
+
+impl AlphaFeatureNode {
+    fn new(visits: Arc<Mutex<StdVec<FeatureVisit>>>) -> Self {
+        let mut states = visit_capture_states()
+            .lock()
+            .expect("visit capture state poisoned");
+        let slot = states.len();
+        states.push(VisitCaptureState { visits });
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("alpha visit runtime data"),
+        }
+    }
+}
+
+impl BetaFeatureNode {
+    fn new(visits: Arc<Mutex<StdVec<FeatureVisit>>>) -> Self {
+        let mut states = visit_capture_states()
+            .lock()
+            .expect("visit capture state poisoned");
+        let slot = states.len();
+        states.push(VisitCaptureState { visits });
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("beta visit runtime data"),
+        }
+    }
+}
+
+fn forward_capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let slot = data.usize_word(0)?;
+    let (next, metadata) = {
+        let states = forward_capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("forward capture state poisoned"))?;
+        let state = states
+            .get(slot)
+            .ok_or_else(|| CoreError::internal("forward capture state slot is invalid"))?;
+        (state.next, Arc::clone(&state.metadata))
+    };
+    for index in frame.pending_indices().iter().copied() {
+        metadata
+            .lock()
+            .expect("forward capture metadata poisoned")
+            .push(runtime.metadata(index)?);
+    }
+    Ok(NodeResult::next_current(next))
+}
+
+fn capture_feature_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let slot = data.usize_word(0)?;
+    let metadata = {
+        let states = metadata_capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("metadata capture state poisoned"))?;
+        Arc::clone(
+            &states
+                .get(slot)
+                .ok_or_else(|| CoreError::internal("metadata capture state slot is invalid"))?
+                .metadata,
+        )
+    };
+    for index in frame.pending_indices().iter().copied() {
+        metadata
+            .lock()
+            .expect("feature metadata poisoned")
+            .push(runtime.metadata(index)?);
+    }
+    next_feature_frame(runtime, frame)
+}
+
+fn alpha_feature_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    visit_feature_process(runtime, data, frame, "alpha")
+}
+
+fn beta_feature_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    visit_feature_process(runtime, data, frame, "beta")
+}
+
+fn visit_feature_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+    name: &'static str,
+) -> CoreResult<NodeResult> {
+    let slot = data.usize_word(0)?;
+    let visits = {
+        let states = visit_capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("visit capture state poisoned"))?;
+        Arc::clone(
+            &states
+                .get(slot)
+                .ok_or_else(|| CoreError::internal("visit capture state slot is invalid"))?
+                .visits,
+        )
+    };
+    for index in frame.pending_indices().iter().copied() {
+        let metadata = runtime.metadata(index)?;
+        visits
+            .lock()
+            .expect("feature visits poisoned")
+            .push(FeatureVisit {
+                name,
                 config: metadata.feature_config.clone(),
                 ingress_interface: metadata.ingress_interface,
             });
-        }
-        next_feature_frame(runtime, frame)
     }
-}
-
-impl InternalNode<TestNode> for BetaFeatureNode {}
-
-enum TestNode {
-    TunInput(TunInputDriverNode<hammer_service::tun::MemoryTunInput>),
-    IpInput(IpInputNode<TestIpUnicastArc>),
-    ForwardCapture(ForwardCaptureNode),
-    CaptureFeature(CaptureFeatureNode),
-    AlphaFeature(AlphaFeatureNode),
-    BetaFeature(BetaFeatureNode),
-    IpLookup(IpLookupNode),
-    AdjacencyRewrite(AdjacencyRewriteNode),
-    InterfaceOutput(InterfaceOutputNode),
-    TunOutputDriver(TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>),
-}
-
-impl From<TunInputDriverNode<hammer_service::tun::MemoryTunInput>> for TestNode {
-    fn from(node: TunInputDriverNode<hammer_service::tun::MemoryTunInput>) -> Self {
-        Self::TunInput(node)
-    }
-}
-
-impl From<IpInputNode<TestIpUnicastArc>> for TestNode {
-    fn from(node: IpInputNode<TestIpUnicastArc>) -> Self {
-        Self::IpInput(node)
-    }
-}
-
-impl From<ForwardCaptureNode> for TestNode {
-    fn from(node: ForwardCaptureNode) -> Self {
-        Self::ForwardCapture(node)
-    }
-}
-
-impl From<CaptureFeatureNode> for TestNode {
-    fn from(node: CaptureFeatureNode) -> Self {
-        Self::CaptureFeature(node)
-    }
-}
-
-impl From<AlphaFeatureNode> for TestNode {
-    fn from(node: AlphaFeatureNode) -> Self {
-        Self::AlphaFeature(node)
-    }
-}
-
-impl From<BetaFeatureNode> for TestNode {
-    fn from(node: BetaFeatureNode) -> Self {
-        Self::BetaFeature(node)
-    }
-}
-
-impl From<IpLookupNode> for TestNode {
-    fn from(node: IpLookupNode) -> Self {
-        Self::IpLookup(node)
-    }
-}
-
-impl From<AdjacencyRewriteNode> for TestNode {
-    fn from(node: AdjacencyRewriteNode) -> Self {
-        Self::AdjacencyRewrite(node)
-    }
-}
-
-impl From<InterfaceOutputNode> for TestNode {
-    fn from(node: InterfaceOutputNode) -> Self {
-        Self::InterfaceOutput(node)
-    }
-}
-
-impl From<TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>> for TestNode {
-    fn from(node: TunOutputDriverNode<hammer_service::tun::MemoryTunOutput>) -> Self {
-        Self::TunOutputDriver(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::TunInput(node) => node.process(runtime, frame),
-            Self::IpInput(node) => node.process(runtime, frame),
-            Self::ForwardCapture(node) => node.process(runtime, frame),
-            Self::CaptureFeature(node) => node.process(runtime, frame),
-            Self::AlphaFeature(node) => node.process(runtime, frame),
-            Self::BetaFeature(node) => node.process(runtime, frame),
-            Self::IpLookup(node) => node.process(runtime, frame),
-            Self::AdjacencyRewrite(node) => node.process(runtime, frame),
-            Self::InterfaceOutput(node) => node.process(runtime, frame),
-            Self::TunOutputDriver(node) => node.process(runtime, frame),
-        }
-    }
+    next_feature_frame(runtime, frame)
 }
 
 #[test]
 fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packets = vec![
         ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query"),
@@ -252,14 +357,13 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
-    let captured = Rc::new(RefCell::new(Vec::new()));
-    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
-        next: output,
-        metadata: Rc::clone(&captured),
-    });
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let capture = runtime
+        .nodes()
+        .register_internal(ForwardCaptureNode::new(output, Arc::clone(&captured)));
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             capture, capture, capture, capture, capture, capture, capture,
         )));
     let driver = runtime.nodes().register_driver(
@@ -274,8 +378,9 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_eq!(device.drain_output_batch_sizes(), vec![3]);
     assert_eq!(device.drain_output(), packets);
-    assert_eq!(captured.borrow().len(), 3);
-    let metadata = &captured.borrow()[0];
+    let captured = captured.lock().expect("captured metadata poisoned");
+    assert_eq!(captured.len(), 3);
+    let metadata = &captured[0];
     assert_eq!(metadata.inbound, "tun0");
     assert_eq!(metadata.ingress_interface, Some(42));
     assert_eq!(metadata.network, Network::Udp);
@@ -293,7 +398,7 @@ fn tun_driver_node_feeds_frame_and_output_node_writes_packet() {
 
 #[test]
 fn tun_driver_nodes_record_node_payloads_for_traced_packets() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
     device.inject(packet.clone()).expect("inject packet");
@@ -303,7 +408,7 @@ fn tun_driver_nodes_record_node_payloads_for_traced_packets() {
         .register_driver(TunOutputDriverNode::new(device.output()));
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             output, output, output, output, output, output, output,
         )));
     let driver = runtime.nodes().register_driver(
@@ -372,7 +477,7 @@ fn tun_driver_nodes_record_node_payloads_for_traced_packets() {
 
 #[test]
 fn tap_input_strips_ethernet_header_before_ip_pipeline() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"tap");
     let frame = ethernet_frame(
@@ -383,16 +488,16 @@ fn tap_input_strips_ethernet_header_before_ip_pipeline() {
     );
     device.inject(frame).expect("inject tap frame");
 
-    let captured = Rc::new(RefCell::new(Vec::new()));
-    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
-        next: runtime
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let capture = runtime.nodes().register_internal(ForwardCaptureNode::new(
+        runtime
             .nodes()
             .register_driver(TunOutputDriverNode::new(device.output())),
-        metadata: Rc::clone(&captured),
-    });
+        Arc::clone(&captured),
+    ));
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             capture, capture, capture, capture, capture, capture, capture,
         )));
     let driver = runtime.nodes().register_driver(
@@ -408,7 +513,8 @@ fn tap_input_strips_ethernet_header_before_ip_pipeline() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
     assert_eq!(device.drain_output(), vec![ip_packet]);
-    let metadata = &captured.borrow()[0];
+    let captured = captured.lock().expect("captured metadata poisoned");
+    let metadata = &captured[0];
     assert_eq!(metadata.ingress_interface, Some(7));
     assert_eq!(metadata.egress_interface, None);
     assert_eq!(metadata.network, Network::Udp);
@@ -426,7 +532,7 @@ fn tap_input_strips_ethernet_header_before_ip_pipeline() {
 
 #[test]
 fn tap_input_drops_truncated_and_unsupported_ethernet_frames() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     device
         .inject(StdVec::from([0u8; 13]).into())
@@ -462,7 +568,7 @@ fn tap_input_drops_truncated_and_unsupported_ethernet_frames() {
 
 #[test]
 fn tap_output_emits_ethernet_frame_from_tap_metadata() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let input_device = MemoryTunDevice::new();
     let output_device = MemoryTunDevice::new();
     let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"tap-out");
@@ -481,7 +587,7 @@ fn tap_output_emits_ethernet_frame_from_tap_metadata() {
         .register_driver(TunOutputDriverNode::new(output_device.output()).with_tap(true));
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             output, output, output, output, output, output, output,
         )));
     let driver = runtime.nodes().register_driver(
@@ -503,7 +609,7 @@ fn tap_output_emits_ethernet_frame_from_tap_metadata() {
 
 #[test]
 fn tun_driver_sets_ingress_interface_from_interface_control_handle() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
     device.inject(packet).expect("inject packet");
@@ -515,14 +621,13 @@ fn tun_driver_sets_ingress_interface_from_interface_control_handle() {
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
-    let captured = Rc::new(RefCell::new(Vec::new()));
-    let capture = runtime.nodes().register_internal(ForwardCaptureNode {
-        next: output,
-        metadata: Rc::clone(&captured),
-    });
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let capture = runtime
+        .nodes()
+        .register_internal(ForwardCaptureNode::new(output, Arc::clone(&captured)));
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             capture, capture, capture, capture, capture, capture, capture,
         )));
     let driver = runtime.nodes().register_driver(
@@ -536,15 +641,16 @@ fn tun_driver_sets_ingress_interface_from_interface_control_handle() {
         .expect("schedule tun driver");
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
-    assert_eq!(captured.borrow().len(), 1);
-    assert_eq!(captured.borrow()[0].ingress_interface, Some(tun0));
+    let captured = captured.lock().expect("captured metadata poisoned");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].ingress_interface, Some(tun0));
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 #[test]
 fn tun_driver_interface_control_handle_exposes_configured_mtu() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
     device.inject(packet).expect("inject packet");
@@ -573,7 +679,7 @@ fn tun_driver_interface_control_handle_exposes_configured_mtu() {
 
 #[test]
 fn tun_driver_errors_when_interface_control_cannot_resolve_interface() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 54_321, [198, 51, 100, 7], 53, b"query");
     device.inject(packet).expect("inject packet");
@@ -603,7 +709,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
     let data_runtime =
         DataRuntime::new(1, "tun-feature-arc-route-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let device = MemoryTunDevice::new();
     let packets = vec![
         ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"hello"),
@@ -631,17 +737,17 @@ fn tun_driver_routes_through_service_internal_nodes() {
         .register_internal(IpLookupControlPlane::new(builder.build()).node());
     let mut unicast_features =
         FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
-    let feature_metadata = Rc::new(RefCell::new(Vec::new()));
-    let feature = runtime.nodes().register_internal(CaptureFeatureNode {
-        metadata: Rc::clone(&feature_metadata),
-    });
+    let feature_metadata = Arc::new(Mutex::new(Vec::new()));
+    let feature = runtime
+        .nodes()
+        .register_internal(CaptureFeatureNode::new(Arc::clone(&feature_metadata)));
     unicast_features
         .register_feature::<CaptureFeatureNode>(feature)
         .expect("register feature");
     unicast_features
         .enable_feature::<CaptureFeatureNode>(7)
         .expect("enable feature");
-    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
         output, output, output, lookup, output, output, output,
     ));
     unicast_features.attach_start(&mut ip_input_node);
@@ -658,9 +764,10 @@ fn tun_driver_routes_through_service_internal_nodes() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
     assert_eq!(device.drain_output_batch_sizes(), vec![2]);
     assert_eq!(device.drain_output(), packets);
-    assert_eq!(feature_metadata.borrow().len(), 2);
-    assert_eq!(feature_metadata.borrow()[0].ingress_interface, Some(7));
-    assert_eq!(feature_metadata.borrow()[1].ingress_interface, Some(7));
+    let feature_metadata = feature_metadata.lock().expect("feature metadata poisoned");
+    assert_eq!(feature_metadata.len(), 2);
+    assert_eq!(feature_metadata[0].ingress_interface, Some(7));
+    assert_eq!(feature_metadata[1].ingress_interface, Some(7));
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
     data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
@@ -668,7 +775,7 @@ fn tun_driver_routes_through_service_internal_nodes() {
 
 #[test]
 fn tap_graph_routes_through_adjacency_rewrite_interface_output_and_tap_output() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let input_device = MemoryTunDevice::new();
     let output_device = MemoryTunDevice::new();
     let ip_packet = ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"graph-tap");
@@ -724,7 +831,7 @@ fn tap_graph_routes_through_adjacency_rewrite_interface_output_and_tap_output() 
     let lookup = runtime.nodes().register_internal(lookup_control.node());
     let ip_input = runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
             interface_output,
             interface_output,
             interface_output,
@@ -755,7 +862,7 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     let data_runtime =
         DataRuntime::new(1, "tun-feature-arc-toggle-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 4);
     let input_device = MemoryTunDevice::new();
     let default_output_device = MemoryTunDevice::new();
     let override_output_device = MemoryTunDevice::new();
@@ -768,10 +875,10 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
         TunOutputDriverNode::new(override_output_device.output())
             .with_node_name("override-tun-output-driver-node"),
     );
-    let feature_metadata = Rc::new(RefCell::new(Vec::new()));
-    let feature = runtime.nodes().register_internal(CaptureFeatureNode {
-        metadata: Rc::clone(&feature_metadata),
-    });
+    let feature_metadata = Arc::new(Mutex::new(Vec::new()));
+    let feature = runtime
+        .nodes()
+        .register_internal(CaptureFeatureNode::new(Arc::clone(&feature_metadata)));
     let mut unicast_features =
         FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
     unicast_features
@@ -780,7 +887,7 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
     unicast_features
         .set_end_node_for_interface(7, override_output)
         .expect("set end node");
-    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
         default_output,
         default_output,
         default_output,
@@ -805,7 +912,12 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
         .schedule_driver_frame(driver, frame)
         .expect("schedule disabled packet");
     assert_eq!(runtime.run_ready_nodes().expect("run disabled packet"), 3);
-    assert!(feature_metadata.borrow().is_empty());
+    assert!(
+        feature_metadata
+            .lock()
+            .expect("feature metadata poisoned")
+            .is_empty()
+    );
     assert!(default_output_device.drain_output().is_empty());
     assert_eq!(
         override_output_device.drain_output(),
@@ -824,8 +936,11 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
         .schedule_driver_frame(driver, frame)
         .expect("schedule enabled packet");
     assert_eq!(runtime.run_ready_nodes().expect("run enabled packet"), 4);
-    assert_eq!(feature_metadata.borrow().len(), 1);
-    assert_eq!(feature_metadata.borrow()[0].ingress_interface, Some(7));
+    {
+        let feature_metadata = feature_metadata.lock().expect("feature metadata poisoned");
+        assert_eq!(feature_metadata.len(), 1);
+        assert_eq!(feature_metadata[0].ingress_interface, Some(7));
+    }
     assert!(default_output_device.drain_output().is_empty());
     assert_eq!(
         override_output_device.drain_output(),
@@ -848,7 +963,13 @@ fn feature_arc_enable_disable_and_end_next_affect_new_packets() {
         runtime.run_ready_nodes().expect("run re-disabled packet"),
         3
     );
-    assert_eq!(feature_metadata.borrow().len(), 1);
+    assert_eq!(
+        feature_metadata
+            .lock()
+            .expect("feature metadata poisoned")
+            .len(),
+        1
+    );
     assert!(default_output_device.drain_output().is_empty());
     assert_eq!(
         override_output_device.drain_output(),
@@ -864,7 +985,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     let data_runtime =
         DataRuntime::new(1, "tun-feature-arc-order-test", 512 * 1024, 2).expect("data runtime");
     let barrier = data_runtime.data_plane_barrier();
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 4);
     let device = MemoryTunDevice::new();
     let packet = ipv4_udp_packet([10, 0, 0, 2], 12_345, [203, 0, 113, 9], 443, b"ordered");
     device.inject(packet.clone()).expect("inject packet");
@@ -872,13 +993,13 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(device.output()));
-    let visits = Rc::new(RefCell::new(StdVec::new()));
-    let beta = runtime.nodes().register_internal(BetaFeatureNode {
-        visits: Rc::clone(&visits),
-    });
-    let alpha = runtime.nodes().register_internal(AlphaFeatureNode {
-        visits: Rc::clone(&visits),
-    });
+    let visits = Arc::new(Mutex::new(StdVec::new()));
+    let beta = runtime
+        .nodes()
+        .register_internal(BetaFeatureNode::new(Arc::clone(&visits)));
+    let alpha = runtime
+        .nodes()
+        .register_internal(AlphaFeatureNode::new(Arc::clone(&visits)));
     let mut unicast_features =
         FeatureArcControl::<TestIpUnicastArc>::new().with_data_plane_barrier(barrier);
     unicast_features
@@ -893,7 +1014,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     unicast_features
         .enable_feature_with_config::<AlphaFeatureNode>(7, b"alpha-config".to_vec())
         .expect("enable alpha");
-    let mut ip_input_node = IpInputNode::new(IpInputNext::nodes(
+    let mut ip_input_node = IpInputNode::<TestIpUnicastArc>::new(IpInputNext::nodes(
         output, output, output, output, output, output, output,
     ));
     unicast_features.attach_start(&mut ip_input_node);
@@ -910,7 +1031,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 5);
     assert_eq!(device.drain_output(), vec![packet]);
     assert_eq!(
-        *visits.borrow(),
+        *visits.lock().expect("feature visits poisoned"),
         vec![
             FeatureVisit {
                 name: "alpha",
@@ -931,7 +1052,7 @@ fn feature_arc_orders_multiple_features_and_exposes_config_metadata() {
 
 #[test]
 fn tun_driver_batch_respects_frame_capacity() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 2, 4);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 2, 4);
     let device = MemoryTunDevice::new();
     let packets = vec![
         ipv4_udp_packet([10, 0, 0, 2], 20_001, [203, 0, 113, 1], 53, b"a"),

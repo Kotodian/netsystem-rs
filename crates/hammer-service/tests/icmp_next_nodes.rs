@@ -1,13 +1,12 @@
-use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, IcmpErrorMetadata, InternalNode, Node,
-    NodeResult, RouteMetadata, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    NodeProcessFn, NodeResult, NodeRuntimeData, RouteMetadata, TraceControlPlane, TraceInputPolicy,
+    TracePolicy,
 };
-use hammer_core::error::CoreResult;
-use hammer_service::data_plane::DropNode;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::net::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
     IcmpErrorSourceTable, IcmpErrorTrace, IcmpNodeError,
@@ -22,92 +21,90 @@ struct CaptureState {
 }
 
 struct CaptureNode {
-    state: Rc<RefCell<CaptureState>>,
+    runtime_data: NodeRuntimeData,
 }
 
 impl CaptureNode {
-    fn new(state: Rc<RefCell<CaptureState>>) -> Self {
-        Self { state }
-    }
-}
-
-impl Node<TestNode> for CaptureNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        for index in frame.drain_pending() {
-            let packet = runtime.copy_current_chain(index)?;
-            let node_error = runtime.node_error(index)?;
-            let mut state = self.state.borrow_mut();
-            state.packets.push(packet.into_iter().collect());
-            state.node_errors.push(node_error);
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
-    }
-}
-
-impl InternalNode<TestNode> for CaptureNode {}
-
-enum TestNode {
-    Drop(DropNode),
-    Capture(CaptureNode),
-    Echo(IcmpEchoRequestNode),
-    Error(IcmpErrorNode),
-}
-
-impl From<DropNode> for TestNode {
-    fn from(node: DropNode) -> Self {
-        Self::Drop(node)
-    }
-}
-
-impl From<CaptureNode> for TestNode {
-    fn from(node: CaptureNode) -> Self {
-        Self::Capture(node)
-    }
-}
-
-impl From<IcmpEchoRequestNode> for TestNode {
-    fn from(node: IcmpEchoRequestNode) -> Self {
-        Self::Echo(node)
-    }
-}
-
-impl From<IcmpErrorNode> for TestNode {
-    fn from(node: IcmpErrorNode) -> Self {
-        Self::Error(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Drop(node) => node.process(runtime, frame),
-            Self::Capture(node) => node.process(runtime, frame),
-            Self::Echo(node) => node.process(runtime, frame),
-            Self::Error(node) => node.process(runtime, frame),
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
         }
     }
+}
+
+impl Node for CaptureNode {
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Err(CoreError::internal(
+            "capture node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for CaptureNode {}
+
+fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = {
+        let states = capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
+        Arc::clone(
+            states
+                .get(data.usize_word(0)?)
+                .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?,
+        )
+    };
+    for index in frame.drain_pending() {
+        let packet = runtime.copy_current_chain(index)?;
+        let node_error = runtime.node_error(index)?;
+        let mut state = state
+            .lock()
+            .map_err(|_| CoreError::internal("capture state poisoned"))?;
+        state.packets.push(packet.into_iter().collect());
+        state.node_errors.push(node_error);
+        runtime.free_index(index);
+    }
+    Ok(NodeResult::drop())
 }
 
 #[test]
 fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let echo =
         runtime
             .nodes()
@@ -137,8 +134,8 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.borrow().packets.is_empty());
-    let lookup_state = lookup_state.borrow();
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    let lookup_state = lookup_state.lock().unwrap();
     assert_eq!(lookup_state.packets.len(), 1);
     assert_eq!(lookup_state.node_errors, vec![None]);
     let reply = &lookup_state.packets[0];
@@ -162,15 +159,15 @@ fn icmp_echo_request_rewrites_ipv4_request_to_lookup_reply() {
 
 #[test]
 fn icmp_echo_request_rewrites_ipv6_request_to_lookup_reply() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let echo =
         runtime
             .nodes()
@@ -186,8 +183,8 @@ fn icmp_echo_request_rewrites_ipv6_request_to_lookup_reply() {
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.borrow().packets.is_empty());
-    let lookup_state = lookup_state.borrow();
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    let lookup_state = lookup_state.lock().unwrap();
     assert_eq!(lookup_state.packets.len(), 1);
     assert_eq!(lookup_state.node_errors, vec![None]);
     let reply = &lookup_state.packets[0];
@@ -203,15 +200,15 @@ fn icmp_echo_request_rewrites_ipv6_request_to_lookup_reply() {
 
 #[test]
 fn icmp_echo_request_sends_wrong_type_to_drop_with_node_error() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let echo =
         runtime
             .nodes()
@@ -230,10 +227,10 @@ fn icmp_echo_request_sends_wrong_type_to_drop_with_node_error() {
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(lookup_state.borrow().packets.is_empty());
-    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert!(lookup_state.lock().unwrap().packets.is_empty());
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        drop_state.borrow().node_errors,
+        drop_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             echo,
             IcmpNodeError::WrongType.code()
@@ -243,15 +240,15 @@ fn icmp_echo_request_sends_wrong_type_to_drop_with_node_error() {
 
 #[test]
 fn icmp_echo_request_sends_bad_checksum_to_drop_with_node_error() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let echo =
         runtime
             .nodes()
@@ -271,10 +268,10 @@ fn icmp_echo_request_sends_bad_checksum_to_drop_with_node_error() {
     assert!(runtime.schedule_frame(echo, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(lookup_state.borrow().packets.is_empty());
-    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert!(lookup_state.lock().unwrap().packets.is_empty());
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        drop_state.borrow().node_errors,
+        drop_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             echo,
             IcmpNodeError::BadChecksum.code()
@@ -284,15 +281,15 @@ fn icmp_echo_request_sends_bad_checksum_to_drop_with_node_error() {
 
 #[test]
 fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let error_sources =
         IcmpErrorSourceTable::from_sources([(7, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)))]);
     let error = runtime.nodes().register_internal(
@@ -326,8 +323,8 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.borrow().packets.is_empty());
-    let lookup_state = lookup_state.borrow();
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    let lookup_state = lookup_state.lock().unwrap();
     assert_eq!(lookup_state.packets.len(), 1);
     assert_eq!(lookup_state.node_errors, vec![None]);
     let reply = &lookup_state.packets[0];
@@ -358,15 +355,15 @@ fn icmp_error_node_synthesizes_ipv4_time_exceeded_to_lookup() {
 
 #[test]
 fn icmp_error_node_synthesizes_ipv6_packet_too_big_to_lookup() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let local_source = "2001:db8::ff".parse().expect("local source");
     let error_sources = IcmpErrorSourceTable::from_sources([(9, IpAddr::V6(local_source))]);
     let error = runtime.nodes().register_internal(
@@ -387,8 +384,8 @@ fn icmp_error_node_synthesizes_ipv6_packet_too_big_to_lookup() {
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(drop_state.borrow().packets.is_empty());
-    let lookup_state = lookup_state.borrow();
+    assert!(drop_state.lock().unwrap().packets.is_empty());
+    let lookup_state = lookup_state.lock().unwrap();
     assert_eq!(lookup_state.packets.len(), 1);
     assert_eq!(lookup_state.node_errors, vec![None]);
     let reply = &lookup_state.packets[0];
@@ -405,15 +402,15 @@ fn icmp_error_node_synthesizes_ipv6_packet_too_big_to_lookup() {
 
 #[test]
 fn icmp_error_node_drops_when_metadata_is_missing() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let error = runtime
         .nodes()
         .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, lookup)));
@@ -428,10 +425,10 @@ fn icmp_error_node_drops_when_metadata_is_missing() {
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(lookup_state.borrow().packets.is_empty());
-    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert!(lookup_state.lock().unwrap().packets.is_empty());
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        drop_state.borrow().node_errors,
+        drop_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             error,
             IcmpNodeError::MissingMetadata.code()
@@ -441,15 +438,15 @@ fn icmp_error_node_drops_when_metadata_is_missing() {
 
 #[test]
 fn icmp_error_node_drops_when_ingress_interface_is_missing() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let error = runtime
         .nodes()
         .register_internal(IcmpErrorNode::new(IcmpErrorNext::nodes(drop, lookup)));
@@ -468,10 +465,10 @@ fn icmp_error_node_drops_when_ingress_interface_is_missing() {
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(lookup_state.borrow().packets.is_empty());
-    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert!(lookup_state.lock().unwrap().packets.is_empty());
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        drop_state.borrow().node_errors,
+        drop_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             error,
             IcmpNodeError::MissingIngressInterface.code()
@@ -481,15 +478,15 @@ fn icmp_error_node_drops_when_ingress_interface_is_missing() {
 
 #[test]
 fn icmp_error_node_drops_when_interface_source_is_missing() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 16, 8, 8);
-    let lookup_state = Rc::new(RefCell::new(CaptureState::default()));
-    let drop_state = Rc::new(RefCell::new(CaptureState::default()));
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let drop_state = Arc::new(Mutex::new(CaptureState::default()));
     let lookup = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&lookup_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
     let drop = runtime
         .nodes()
-        .register_internal(CaptureNode::new(Rc::clone(&drop_state)));
+        .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
     let error_sources =
         IcmpErrorSourceTable::from_sources([(7, IpAddr::V6("2001:db8::ff".parse().unwrap()))]);
     let error = runtime.nodes().register_internal(
@@ -512,10 +509,10 @@ fn icmp_error_node_drops_when_interface_source_is_missing() {
     assert!(runtime.schedule_frame(error, frame).expect("schedule"));
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-    assert!(lookup_state.borrow().packets.is_empty());
-    assert_eq!(drop_state.borrow().packets, vec![packet]);
+    assert!(lookup_state.lock().unwrap().packets.is_empty());
+    assert_eq!(drop_state.lock().unwrap().packets, vec![packet]);
     assert_eq!(
-        drop_state.borrow().node_errors,
+        drop_state.lock().unwrap().node_errors,
         vec![Some(BufferNodeError::new(
             error,
             IcmpNodeError::MissingSource.code()
@@ -524,7 +521,7 @@ fn icmp_error_node_drops_when_interface_source_is_missing() {
 }
 
 fn push_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     packet: &[u8],
     metadata: RouteMetadata,
@@ -540,7 +537,7 @@ fn push_packet(
 }
 
 fn push_marked_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
     trace_input: hammer_adapter::NodeId,
     packet: &[u8],

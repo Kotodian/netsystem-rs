@@ -1,229 +1,147 @@
-use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeResult, RouteMetadata, SocksAddr,
+    BufferFrame, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    RouteMetadata, SocksAddr,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 use hammer_service::tun::{
-    RealTunInput, RealTunOutput, TunBufferIo, TunBufferSendResult, TunFdReadiness,
-    TunInputDriverNode, TunOutputDriverNode,
+    DeviceMain, DriverScheduleMode, RealTunInput, RealTunOutput, ScriptedTunIo,
+    TunBufferSendResult, TunDeviceEventSource, TunInputDriverNode, TunOutputDriverNode,
 };
 
-#[derive(Default)]
-struct FakeTunFdIo {
-    rx: Vec<Vec<u8>>,
-    rx_head: usize,
-    recv_calls: usize,
-    send_calls: usize,
-    send_results: Vec<TunBufferSendResult>,
-    send_result_head: usize,
-    sent: Vec<Vec<u8>>,
-    sent_segment_counts: Vec<usize>,
-}
-
-#[derive(Clone, Default)]
-struct SharedTunFdIo(Rc<RefCell<FakeTunFdIo>>);
-
-impl SharedTunFdIo {
-    fn inject(&self, packet: Vec<u8>) {
-        self.0.borrow_mut().rx.push(packet);
-    }
-
-    fn push_send_result(&self, result: TunBufferSendResult) {
-        self.0.borrow_mut().send_results.push(result);
-    }
-
-    fn recv_calls(&self) -> usize {
-        self.0.borrow().recv_calls
-    }
-
-    fn send_calls(&self) -> usize {
-        self.0.borrow().send_calls
-    }
-
-    fn sent(&self) -> Vec<Vec<u8>> {
-        self.0.borrow().sent.clone()
-    }
-
-    fn sent_segment_counts(&self) -> Vec<usize> {
-        self.0.borrow().sent_segment_counts.clone()
-    }
-}
-
-impl TunBufferIo for SharedTunFdIo {
-    fn try_recv_buffer(&mut self, buffer: &mut [u8]) -> CoreResult<Option<usize>> {
-        let mut inner = self.0.borrow_mut();
-        inner.recv_calls += 1;
-        if inner.rx_head >= inner.rx.len() {
-            return Ok(None);
-        }
-        let packet = &inner.rx[inner.rx_head];
-        let len = packet.len().min(buffer.len());
-        buffer[..len].copy_from_slice(&packet[..len]);
-        inner.rx_head += 1;
-        Ok(Some(len))
-    }
-
-    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult> {
-        self.record_send(&[packet], offset, packet.len())
-    }
-
-    fn try_send_buffers(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
-        self.record_send(segments, offset, total_len)
-    }
-}
-
-impl SharedTunFdIo {
-    fn record_send(
-        &mut self,
-        segments: &[&[u8]],
-        offset: usize,
-        total_len: usize,
-    ) -> CoreResult<TunBufferSendResult> {
-        let mut inner = self.0.borrow_mut();
-        inner.send_calls += 1;
-        let result = if inner.send_result_head < inner.send_results.len() {
-            let result = inner.send_results[inner.send_result_head];
-            inner.send_result_head += 1;
-            result
-        } else {
-            TunBufferSendResult::Complete
-        };
-        inner.sent_segment_counts.push(segments.len());
-        match result {
-            TunBufferSendResult::Complete => {
-                let mut sent = Vec::with_capacity(total_len.saturating_sub(offset));
-                extend_segments_from_offset(&mut sent, segments, offset, total_len);
-                inner.sent.push(sent);
-            }
-            TunBufferSendResult::Partial(next_offset) => {
-                let take = next_offset.saturating_sub(offset).min(total_len - offset);
-                let mut sent = Vec::with_capacity(take);
-                extend_segments_from_offset(&mut sent, segments, offset, offset + take);
-                inner.sent.push(sent);
-            }
-            TunBufferSendResult::Backpressure => {}
-        }
-        Ok(result)
-    }
-}
-
-fn extend_segments_from_offset(
-    out: &mut Vec<u8>,
-    segments: &[&[u8]],
-    offset: usize,
-    end_offset: usize,
-) {
-    let mut base = 0usize;
-    for segment in segments {
-        let end = base + segment.len();
-        if offset < end && base < end_offset {
-            let start_in_segment = offset.saturating_sub(base);
-            let end_in_segment = (end_offset - base).min(segment.len());
-            out.extend_from_slice(&segment[start_in_segment..end_in_segment]);
-        }
-        base = end;
-    }
-}
-
 struct CaptureNode {
-    metadata: Rc<RefCell<Vec<RouteMetadata>>>,
-    packets: Rc<RefCell<Vec<Vec<u8>>>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<TestNode> for CaptureNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        for index in frame.drain_pending() {
-            self.metadata.borrow_mut().push(runtime.metadata(index)?);
-            self.packets.borrow_mut().push(runtime.current(index)?);
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
-    }
+struct CaptureState {
+    metadata: Arc<Mutex<Vec<RouteMetadata>>>,
+    packets: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
-impl InternalNode<TestNode> for CaptureNode {}
-
-enum TestNode {
-    TunInput(TunInputDriverNode<RealTunInput<SharedTunFdIo>>),
-    TunOutput(TunOutputDriverNode<RealTunOutput<SharedTunFdIo>>),
-    Capture(CaptureNode),
-}
-
-impl From<TunInputDriverNode<RealTunInput<SharedTunFdIo>>> for TestNode {
-    fn from(node: TunInputDriverNode<RealTunInput<SharedTunFdIo>>) -> Self {
-        Self::TunInput(node)
-    }
-}
-
-impl From<TunOutputDriverNode<RealTunOutput<SharedTunFdIo>>> for TestNode {
-    fn from(node: TunOutputDriverNode<RealTunOutput<SharedTunFdIo>>) -> Self {
-        Self::TunOutput(node)
-    }
-}
-
-impl From<CaptureNode> for TestNode {
-    fn from(node: CaptureNode) -> Self {
-        Self::Capture(node)
-    }
-}
-
-impl Node<TestNode> for TestNode {
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<TestNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::TunInput(node) => node.process(runtime, frame),
-            Self::TunOutput(node) => node.process(runtime, frame),
-            Self::Capture(node) => node.process(runtime, frame),
+impl CaptureNode {
+    fn new(metadata: Arc<Mutex<Vec<RouteMetadata>>>, packets: Arc<Mutex<Vec<Vec<u8>>>>) -> Self {
+        let mut states = capture_states().lock().expect("capture state poisoned");
+        let slot = states.len();
+        states.push(CaptureState {
+            metadata: Arc::clone(&metadata),
+            packets: Arc::clone(&packets),
+        });
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture runtime data"),
         }
     }
+}
+
+fn capture_states() -> &'static Mutex<Vec<CaptureState>> {
+    static STATES: OnceLock<Mutex<Vec<CaptureState>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+impl Node for CaptureNode {
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Err(CoreError::internal(
+            "capture node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for CaptureNode {}
+
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let slot = data.usize_word(0)?;
+    let (metadata, packets) = {
+        let states = capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("capture state poisoned"))?;
+        let state = states
+            .get(slot)
+            .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?;
+        (Arc::clone(&state.metadata), Arc::clone(&state.packets))
+    };
+    for index in frame.drain_pending() {
+        metadata
+            .lock()
+            .expect("capture metadata poisoned")
+            .push(runtime.metadata(index)?);
+        packets
+            .lock()
+            .expect("capture packets poisoned")
+            .push(runtime.current(index)?);
+        runtime.free_index(index);
+    }
+    Ok(NodeResult::drop())
 }
 
 #[test]
 fn readiness_schedules_only_and_input_driver_reads_packets() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     let packet = ipv4_udp_packet([10, 0, 0, 2], [198, 51, 100, 7], b"rx");
     io.inject(packet.clone());
 
-    let metadata = Rc::new(RefCell::new(Vec::new()));
-    let packets = Rc::new(RefCell::new(Vec::new()));
-    let capture = runtime.nodes().register_internal(CaptureNode {
-        metadata: Rc::clone(&metadata),
-        packets: Rc::clone(&packets),
-    });
-    let input = runtime.nodes().register_driver(
-        TunInputDriverNode::new(RealTunInput::new(io.clone()), "utun-test", capture)
-            .with_interface_index(42),
-    );
-    let readiness = TunFdReadiness::input(input);
+    let metadata = Arc::new(Mutex::new(Vec::new()));
+    let packets = Arc::new(Mutex::new(Vec::new()));
+    let capture = runtime.nodes().register_internal(CaptureNode::new(
+        Arc::clone(&metadata),
+        Arc::clone(&packets),
+    ));
+    let device_main = DeviceMain::new();
+    let input_node = TunInputDriverNode::new(RealTunInput::new(io.clone()), "utun-test", capture)
+        .with_interface_index(42);
+    let input = runtime.nodes().register_driver(input_node.clone());
+    let rx_queue = device_main.register_rx_queue(input, DriverScheduleMode::Interrupt);
+    input_node
+        .bind_rx_queue(device_main.clone(), rx_queue)
+        .expect("bind RX queue");
+    let readiness = TunDeviceEventSource::input(device_main.clone(), rx_queue);
+
+    runtime
+        .schedule_driver_frame(input, runtime.alloc_frame_index().expect("empty frame"))
+        .expect("schedule input without interrupt");
+    assert_eq!(runtime.run_ready_nodes().expect("run no-pending input"), 1);
+    assert_eq!(io.recv_calls(), 0);
 
     readiness
         .schedule_readable(&runtime)
         .expect("schedule readable");
 
     assert_eq!(io.recv_calls(), 0);
-    assert!(metadata.borrow().is_empty());
+    assert!(
+        metadata
+            .lock()
+            .expect("capture metadata poisoned")
+            .is_empty()
+    );
 
     assert_eq!(runtime.run_ready_nodes().expect("run input"), 2);
     assert_eq!(io.recv_calls(), 2);
-    assert_eq!(&*packets.borrow(), &[packet]);
-    let first = &metadata.borrow()[0];
+    assert_eq!(
+        &*packets.lock().expect("capture packets poisoned"),
+        &[packet]
+    );
+    let guard = metadata.lock().expect("capture metadata poisoned");
+    let first = &guard[0];
     assert_eq!(first.inbound, "utun-test");
     assert_eq!(first.ingress_interface, Some(42));
     assert_eq!(
@@ -243,15 +161,17 @@ fn readiness_schedules_only_and_input_driver_reads_packets() {
 
 #[test]
 fn output_driver_writes_packets_and_writable_readiness_drains_pending_tx() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     io.push_send_result(TunBufferSendResult::Backpressure);
     io.push_send_result(TunBufferSendResult::Complete);
     let packet = ipv4_udp_packet([10, 0, 0, 2], [198, 51, 100, 7], b"tx");
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(RealTunOutput::new(io.clone())));
-    let readiness = TunFdReadiness::output(output);
+    let device_main = DeviceMain::new();
+    let tx_queue = device_main.register_tx_queue(output);
+    let readiness = TunDeviceEventSource::output(device_main, tx_queue);
     let frame = runtime.alloc_frame_index().expect("alloc output frame");
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), &packet)
@@ -288,20 +208,22 @@ fn output_driver_writes_packets_and_writable_readiness_drains_pending_tx() {
 
 #[test]
 fn input_driver_rejects_rx_packet_that_fills_entire_buffer() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(40, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(40, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     io.inject((0..40).collect());
 
-    let capture = runtime.nodes().register_internal(CaptureNode {
-        metadata: Rc::new(RefCell::new(Vec::new())),
-        packets: Rc::new(RefCell::new(Vec::new())),
-    });
-    let input = runtime.nodes().register_driver(TunInputDriverNode::new(
-        RealTunInput::new(io.clone()),
-        "utun-test",
-        capture,
+    let capture = runtime.nodes().register_internal(CaptureNode::new(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(Mutex::new(Vec::new())),
     ));
-    let readiness = TunFdReadiness::input(input);
+    let device_main = DeviceMain::new();
+    let input_node = TunInputDriverNode::new(RealTunInput::new(io.clone()), "utun-test", capture);
+    let input = runtime.nodes().register_driver(input_node.clone());
+    let rx_queue = device_main.register_rx_queue(input, DriverScheduleMode::Interrupt);
+    input_node
+        .bind_rx_queue(device_main.clone(), rx_queue)
+        .expect("bind RX queue");
+    let readiness = TunDeviceEventSource::input(device_main, rx_queue);
 
     readiness
         .schedule_readable(&runtime)
@@ -316,8 +238,8 @@ fn input_driver_rejects_rx_packet_that_fills_entire_buffer() {
 
 #[test]
 fn output_driver_drains_pending_tx_before_ring_capacity_admission() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     io.push_send_result(TunBufferSendResult::Backpressure);
     io.push_send_result(TunBufferSendResult::Complete);
     io.push_send_result(TunBufferSendResult::Complete);
@@ -344,15 +266,17 @@ fn output_driver_drains_pending_tx_before_ring_capacity_admission() {
 
 #[test]
 fn output_driver_keeps_partial_packet_in_tx_ring_until_writable() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     io.push_send_result(TunBufferSendResult::Partial(12));
     io.push_send_result(TunBufferSendResult::Complete);
     let packet = ipv4_udp_packet([10, 0, 0, 2], [198, 51, 100, 7], b"partial-tx");
     let output = runtime
         .nodes()
         .register_driver(TunOutputDriverNode::new(RealTunOutput::new(io.clone())));
-    let readiness = TunFdReadiness::output(output);
+    let device_main = DeviceMain::new();
+    let tx_queue = device_main.register_tx_queue(output);
+    let readiness = TunDeviceEventSource::output(device_main, tx_queue);
     let frame = runtime.alloc_frame_index().expect("alloc output frame");
     let index = runtime
         .alloc_index_with_bytes(RouteMetadata::default(), &packet)
@@ -387,8 +311,8 @@ fn output_driver_keeps_partial_packet_in_tx_ring_until_writable() {
 
 #[test]
 fn output_driver_sends_all_segments_of_chained_packet() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(1, 64, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(1, 64, 8, 4);
+    let io = ScriptedTunIo::default();
     let packet: Vec<u8> = (0..40).collect();
     let output = runtime
         .nodes()
@@ -406,8 +330,8 @@ fn output_driver_sends_all_segments_of_chained_packet() {
 
 #[test]
 fn output_driver_rejects_non_advancing_partial_offset() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     io.push_send_result(TunBufferSendResult::Partial(0));
     let packet = ipv4_udp_packet([10, 0, 0, 2], [198, 51, 100, 7], b"partial-tx");
     let output = runtime
@@ -429,8 +353,8 @@ fn output_driver_rejects_non_advancing_partial_offset() {
 
 #[test]
 fn output_driver_rejects_out_of_range_partial_offset() {
-    let runtime = DataPlaneRuntime::<TestNode>::with_capacities(2048, 8, 8, 4);
-    let io = SharedTunFdIo::default();
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
+    let io = ScriptedTunIo::default();
     let packet = ipv4_udp_packet([10, 0, 0, 2], [198, 51, 100, 7], b"partial-tx");
     io.push_send_result(TunBufferSendResult::Partial(packet.len() + 1));
     let output = runtime
@@ -448,7 +372,7 @@ fn output_driver_rejects_out_of_range_partial_offset() {
 }
 
 fn schedule_output_packet(
-    runtime: &DataPlaneRuntime<TestNode>,
+    runtime: &DataPlaneRuntime,
     output: hammer_adapter::NodeId,
     packet: &[u8],
 ) {

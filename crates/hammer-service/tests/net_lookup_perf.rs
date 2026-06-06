@@ -1,18 +1,17 @@
-use std::cell::Cell;
 use std::hint::black_box;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeResult,
-    RouteMetadata,
+    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
+    NodeResult, NodeRuntimeData, RouteMetadata,
 };
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
-    DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpLookupNode,
+    DpoProto, FibTableBuilder, IpInputNext, IpInputNode, IpLookupControlPlane, IpUnicastArc,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
 
@@ -22,80 +21,89 @@ const SAMPLE_COUNT: usize = 5;
 static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
 
 struct SinkNode {
-    packets: Rc<Cell<usize>>,
-    checksum: Rc<Cell<u64>>,
+    runtime_data: NodeRuntimeData,
 }
 
-impl Node<ProbeNode> for SinkNode {
+#[derive(Default)]
+struct SinkCounters {
+    packets: AtomicUsize,
+    checksum: AtomicU64,
+}
+
+impl SinkNode {
+    fn new(counters: Arc<SinkCounters>) -> Self {
+        let mut states = sink_states().lock().expect("sink state registry poisoned");
+        let slot = states.len();
+        states.push(counters);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("sink state slot"),
+        }
+    }
+}
+
+impl Node for SinkNode {
     #[inline(always)]
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<ProbeNode>,
-        frame: &mut BufferFrame,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut packets = self.packets.get();
-        let mut checksum = self.checksum.get();
-        for index in frame.drain_pending() {
-            if let Some(forwarding) = runtime.metadata(index)?.forwarding {
-                checksum = checksum.wrapping_add(u64::from(forwarding.load_balance_index));
-                checksum = checksum.wrapping_add(u64::from(forwarding.bucket_index));
-            }
-            packets += 1;
-            runtime.free_index(index);
+        Err(CoreError::internal(
+            "sink node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        sink_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for SinkNode {}
+
+fn sink_states() -> &'static Mutex<Vec<Arc<SinkCounters>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<SinkCounters>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn sink_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let counters = {
+        let states = sink_states()
+            .lock()
+            .map_err(|_| CoreError::internal("sink state registry poisoned"))?;
+        Arc::clone(
+            states
+                .get(data.usize_word(0)?)
+                .ok_or_else(|| CoreError::internal("sink state slot is invalid"))?,
+        )
+    };
+    let mut packets = 0usize;
+    let mut checksum = 0u64;
+    for index in frame.drain_pending() {
+        if let Some(forwarding) = runtime.metadata(index)?.forwarding {
+            checksum = checksum.wrapping_add(u64::from(forwarding.load_balance_index));
+            checksum = checksum.wrapping_add(u64::from(forwarding.bucket_index));
         }
-        self.packets.set(packets);
-        self.checksum.set(checksum);
-        Ok(NodeResult::drop())
+        packets += 1;
+        runtime.free_index(index);
     }
-}
-
-impl InternalNode<ProbeNode> for SinkNode {}
-
-enum ProbeNode {
-    Sink(SinkNode),
-    Drop(DropNode),
-    Input(IpInputNode),
-    Lookup(IpLookupNode),
-}
-
-impl From<SinkNode> for ProbeNode {
-    fn from(node: SinkNode) -> Self {
-        Self::Sink(node)
-    }
-}
-
-impl From<DropNode> for ProbeNode {
-    fn from(node: DropNode) -> Self {
-        Self::Drop(node)
-    }
-}
-
-impl From<IpInputNode> for ProbeNode {
-    fn from(node: IpInputNode) -> Self {
-        Self::Input(node)
-    }
-}
-
-impl From<IpLookupNode> for ProbeNode {
-    fn from(node: IpLookupNode) -> Self {
-        Self::Lookup(node)
-    }
-}
-
-impl Node<ProbeNode> for ProbeNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime<ProbeNode>,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        match self {
-            Self::Sink(node) => node.process(runtime, frame),
-            Self::Drop(node) => node.process(runtime, frame),
-            Self::Input(node) => node.process(runtime, frame),
-            Self::Lookup(node) => node.process(runtime, frame),
-        }
-    }
+    counters.packets.fetch_add(packets, Ordering::Relaxed);
+    counters
+        .checksum
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.wrapping_add(checksum))
+        })
+        .ok();
+    Ok(NodeResult::drop())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -228,16 +236,15 @@ fn measure_input_lookup_samples(
 }
 
 fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
-    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
         2048,
         1,
         1,
         2,
         DataPlaneInstructionSet::Scalar,
     );
-    let packets = Rc::new(Cell::new(0));
-    let checksum = Rc::new(Cell::new(0));
-    let lookup = build_lookup(&runtime, scenario, &packets, &checksum);
+    let counters = Arc::new(SinkCounters::default());
+    let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
 
     let started = Instant::now();
@@ -260,22 +267,21 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
 
     ProbeStats {
         elapsed,
-        packets: black_box(packets.get()),
-        checksum: black_box(checksum.get()),
+        packets: black_box(counters.packets.load(Ordering::Relaxed)),
+        checksum: black_box(counters.checksum.load(Ordering::Relaxed)),
     }
 }
 
 fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) -> ProbeStats {
-    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
         2048,
         FRAME_PACKETS,
         FRAME_PACKETS,
         32,
         instruction_set,
     );
-    let packets = Rc::new(Cell::new(0));
-    let checksum = Rc::new(Cell::new(0));
-    let lookup = build_lookup(&runtime, scenario, &packets, &checksum);
+    let counters = Arc::new(SinkCounters::default());
+    let lookup = build_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
 
     let started = Instant::now();
@@ -298,8 +304,8 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
 
     ProbeStats {
         elapsed,
-        packets: black_box(packets.get()),
-        checksum: black_box(checksum.get()),
+        packets: black_box(counters.packets.load(Ordering::Relaxed)),
+        checksum: black_box(counters.checksum.load(Ordering::Relaxed)),
     }
 }
 
@@ -307,16 +313,15 @@ fn measure_input_lookup(
     scenario: Scenario,
     instruction_set: DataPlaneInstructionSet,
 ) -> ProbeStats {
-    let runtime = DataPlaneRuntime::<ProbeNode>::with_capacities_and_instruction_set(
+    let runtime = DataPlaneRuntime::with_capacities_and_instruction_set(
         2048,
         FRAME_PACKETS,
         FRAME_PACKETS,
         32,
         instruction_set,
     );
-    let packets = Rc::new(Cell::new(0));
-    let checksum = Rc::new(Cell::new(0));
-    let input = build_input_lookup(&runtime, scenario, &packets, &checksum);
+    let counters = Arc::new(SinkCounters::default());
+    let input = build_input_lookup(&runtime, scenario, &counters);
     let packets_by_frame = build_packets(scenario);
 
     let started = Instant::now();
@@ -339,22 +344,21 @@ fn measure_input_lookup(
 
     ProbeStats {
         elapsed,
-        packets: black_box(packets.get()),
-        checksum: black_box(checksum.get()),
+        packets: black_box(counters.packets.load(Ordering::Relaxed)),
+        checksum: black_box(counters.checksum.load(Ordering::Relaxed)),
     }
 }
 
 fn build_lookup(
-    runtime: &DataPlaneRuntime<ProbeNode>,
+    runtime: &DataPlaneRuntime,
     scenario: Scenario,
-    packets: &Rc<Cell<usize>>,
-    checksum: &Rc<Cell<u64>>,
+    counters: &Arc<SinkCounters>,
 ) -> hammer_adapter::NodeId {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let mut builder = FibTableBuilder::new(drop);
     match scenario {
         Scenario::Ipv4SameNext => {
-            let sink = register_sink(runtime, packets, checksum);
+            let sink = register_sink(runtime, counters);
             let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
             builder.add_ip4_route(
                 Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("default route"),
@@ -363,7 +367,7 @@ fn build_lookup(
         }
         Scenario::Ipv4MixedNext => {
             for route in 1..=4 {
-                let sink = register_sink(runtime, packets, checksum);
+                let sink = register_sink(runtime, counters);
                 let lb = add_single_path(&mut builder, DpoProto::IP4, sink);
                 builder.add_ip4_route(
                     Ipv4Net::new(Ipv4Addr::new(198, 51, route, 0), 24).expect("mixed route"),
@@ -372,7 +376,7 @@ fn build_lookup(
             }
         }
         Scenario::Ipv6SameNext => {
-            let sink = register_sink(runtime, packets, checksum);
+            let sink = register_sink(runtime, counters);
             let lb = add_single_path(&mut builder, DpoProto::IP6, sink);
             builder.add_ip6_route(
                 Ipv6Net::new(Ipv6Addr::new(0x2001, 0x0db8, 0x0064, 0, 0, 0, 0, 0), 64)
@@ -387,29 +391,26 @@ fn build_lookup(
 }
 
 fn build_input_lookup(
-    runtime: &DataPlaneRuntime<ProbeNode>,
+    runtime: &DataPlaneRuntime,
     scenario: Scenario,
-    packets: &Rc<Cell<usize>>,
-    checksum: &Rc<Cell<u64>>,
+    counters: &Arc<SinkCounters>,
 ) -> hammer_adapter::NodeId {
-    let lookup = build_lookup(runtime, scenario, packets, checksum);
+    let lookup = build_lookup(runtime, scenario, counters);
     let drop = runtime.nodes().register_internal(DropNode::new());
     runtime
         .nodes()
-        .register_internal(IpInputNode::new(IpInputNext::nodes(
+        .register_internal(IpInputNode::<IpUnicastArc>::new(IpInputNext::nodes(
             drop, drop, drop, lookup, drop, drop, drop,
         )))
 }
 
 fn register_sink(
-    runtime: &DataPlaneRuntime<ProbeNode>,
-    packets: &Rc<Cell<usize>>,
-    checksum: &Rc<Cell<u64>>,
+    runtime: &DataPlaneRuntime,
+    counters: &Arc<SinkCounters>,
 ) -> hammer_adapter::NodeId {
-    runtime.nodes().register_internal(SinkNode {
-        packets: Rc::clone(packets),
-        checksum: Rc::clone(checksum),
-    })
+    runtime
+        .nodes()
+        .register_internal(SinkNode::new(Arc::clone(counters)))
 }
 
 fn add_single_path(

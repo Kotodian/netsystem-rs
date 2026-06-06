@@ -1,8 +1,9 @@
 //! WireGuard endpoint.
 //!
 //! Owns the boringtun + UDP transport actor and exposes a pure L3 surface
-//! (`Endpoint::ip_send_clone` / `Endpoint::ip_recv_take`) so the TUN packet
-//! loop can forward raw IP packets without any L4 reassembly. The old
+//! (`Endpoint::ip_send_clone` / `Endpoint::ip_recv_take`) so service-side
+//! packet graph/device code can forward raw IP packets without any L4
+//! reassembly. The old
 //! double user-space-IP-stack data path is gone: WG sits next to outbounds,
 //! not under them.
 use arc_swap::ArcSwapOption;
@@ -262,10 +263,10 @@ pub(crate) fn build_wireguard_inbound_control_subscriber(
 }
 
 /// Demuxes decapsulated IP packets from the boringtun transport into two
-/// consumers: the TUN packet loop (default channel) and an opt-in local
-/// consumer such as `EndpointOutboundAdapter` (local channel). Packets
-/// matching a registered adapter-local flow are consumed by the local
-/// channel instead of being mirrored into TUN.
+/// consumers: the default L3 endpoint consumer and an opt-in local consumer
+/// such as `EndpointOutboundAdapter` (local channel). Packets matching a
+/// registered adapter-local flow are consumed by the local channel instead of
+/// being mirrored into the default L3 stream.
 ///
 /// Both receivers are take-once and live behind a `Mutex` because endpoint
 /// startup runs on the control thread while consumers usually run on the
@@ -342,8 +343,8 @@ impl InboundFanout {
     }
 }
 
-/// Default-channel buffer between the boringtun decapsulator and the TUN
-/// packet loop. Mirrors `transport::INBOUND_QUEUE` so the forwarder task
+/// Default-channel buffer between the boringtun decapsulator and the L3
+/// endpoint consumer. Mirrors `transport::INBOUND_QUEUE` so the forwarder task
 /// doesn't impose a tighter bound than the upstream pipeline.
 const DEFAULT_RECV_QUEUE: usize = 256;
 /// Local-channel buffer for opt-in consumers (DNS roundtrip today). 64
@@ -518,7 +519,7 @@ impl WireguardEndpoint {
         } = transport;
 
         // Two-channel fan-out between the boringtun decapsulator and the
-        // consumers. Default channel feeds the TUN packet loop; local
+        // consumers. Default channel feeds the L3 endpoint consumer; local
         // channel is opt-in (EndpointOutboundAdapter) and stays cold via
         // `ArcSwapOption::None` until someone calls `take_local`.
         let (default_tx, default_rx) = mpsc::channel::<Bytes>(DEFAULT_RECV_QUEUE);
@@ -607,8 +608,8 @@ fn stop_runtime(rt: WireguardRuntime) {
 
 /// Pulls decapsulated IP packets out of the boringtun transport and demuxes
 /// them onto two consumer channels. The default channel is always wired
-/// (TUN packet loop); the local channel is gated on `local_tx_slot`, which
-/// stays `None` until an `EndpointOutboundAdapter` takes its receiver.
+/// for L3 endpoint traffic; the local channel is gated on `local_tx_slot`,
+/// which stays `None` until an `EndpointOutboundAdapter` takes its receiver.
 async fn run_inbound_forwarder(
     logger: Logger,
     mut inbound_rx: mpsc::Receiver<Bytes>,
@@ -677,10 +678,10 @@ async fn forward_inbound_packets(
         match default_tx.try_send(default_batch.pop().expect("one packet")) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                logger.debug("wg inbound forwarder: TUN receiver full; dropped packet");
+                logger.debug("wg inbound forwarder: L3 receiver full; dropped packet");
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                logger.debug("wg inbound forwarder: TUN receiver dropped");
+                logger.debug("wg inbound forwarder: L3 receiver dropped");
             }
         }
         return;
@@ -688,10 +689,10 @@ async fn forward_inbound_packets(
     match default_batch_tx.try_send(default_batch) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            logger.debug("wg inbound forwarder: TUN batch receiver full; dropped batch");
+            logger.debug("wg inbound forwarder: L3 batch receiver full; dropped batch");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            logger.debug("wg inbound forwarder: TUN batch receiver dropped");
+            logger.debug("wg inbound forwarder: L3 batch receiver dropped");
         }
     }
 }
@@ -753,9 +754,9 @@ impl Endpoint for WireguardEndpoint {
             WireguardState::Running(rt) => rt.encrypt_tx.clone(),
             // Endpoint not started yet — hand out a sentinel sender whose
             // receiver is immediately dropped, so `try_send` reports the
-            // channel as closed. The TUN packet loop only resolves a route
-            // to this endpoint after lifecycle Start has completed, so this
-            // branch is reachable only in tests / mid-restart races.
+            // channel as closed. Service-side packet graph code only resolves
+            // a route to this endpoint after lifecycle Start has completed,
+            // so this branch is reachable only in tests / mid-restart races.
             WireguardState::Idle | WireguardState::Closed => mpsc::channel::<Bytes>(1).0,
         }
     }
@@ -1244,7 +1245,8 @@ mod tests {
         );
 
         // Step 4: a packet matching a registered adapter-local flow is
-        // consumed by the local receiver and must not leak into the TUN path.
+        // consumed by the local receiver and must not leak into the default
+        // L3 stream.
         let flow = EndpointLocalFlow {
             network: Network::Tcp,
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)), 50000),
@@ -1263,7 +1265,7 @@ mod tests {
         assert_eq!(&matched_local[..], &local_packet[..]);
         assert!(
             default_rx.try_recv().is_err(),
-            "adapter-local packet must not be forwarded into TUN"
+            "adapter-local packet must not be forwarded into the default L3 stream"
         );
 
         // Tear down so the forwarder task exits cleanly.

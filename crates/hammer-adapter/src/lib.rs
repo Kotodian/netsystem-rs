@@ -51,10 +51,11 @@ pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
 pub use node::{
-    DriverNode, InternalNode, NextFrame, Node, NodeErrorCounters, NodeHandle, NodeId, NodeNext,
-    NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue, NodeRegistration,
-    NodeResult, NodeRuntime, NodeRuntimeReady, NoopNode, PacketNextResolver,
-    process_cached_rewrite_next, process_cached_speculative_next,
+    DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeErrorCounters, NodeHandle,
+    NodeId, NodeKind, NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage,
+    NodeNextVectorEnqueue, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntime,
+    NodeRuntimeData, NodeRuntimeReady, NoopNode, PacketNextResolver, process_cached_rewrite_next,
+    process_cached_speculative_next,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,

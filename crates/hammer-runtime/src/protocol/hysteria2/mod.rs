@@ -1376,10 +1376,7 @@ mod tests {
         let mut packet = client.listen_udp().await.expect("open UDP session");
 
         client.close(b"simulate suspended connection loss");
-        let runtime =
-            hammer_adapter::DataPlaneRuntime::<hammer_adapter::NoopNode>::with_buffer_capacity(
-                2048, 8,
-            );
+        let runtime = hammer_adapter::DataPlaneRuntime::with_buffer_capacity(2048, 8);
         let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
         let err = tokio::time::timeout(
             Duration::from_millis(200),

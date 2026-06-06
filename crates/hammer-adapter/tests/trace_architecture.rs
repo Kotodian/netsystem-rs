@@ -49,10 +49,9 @@ fn trace_has_no_global_enable_or_enum_plumbing() {
 #[test]
 fn trace_is_not_wired_through_legacy_inbound_paths() {
     let runtime_inbounds = include_str!("../../hammer-runtime/src/inbounds.rs");
-    let legacy_tun_inbound = include_str!("../../hammer-runtime/src/protocol/tun/inbound.rs");
     let proxy_inbound = include_str!("../../hammer-runtime/src/protocol/proxy/inbound.rs");
 
-    for source in [runtime_inbounds, legacy_tun_inbound, proxy_inbound] {
+    for source in [runtime_inbounds, proxy_inbound] {
         assert!(
             !source.contains("TraceControl")
                 && !source.contains("TracePolicy")

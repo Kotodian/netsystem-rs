@@ -45,17 +45,172 @@ impl NodeHandle {
     }
 }
 
-pub trait Node<G = Self> {
+pub trait Node {
     fn process(
         &mut self,
-        runtime: &DataPlaneRuntime<G>,
+        runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult>;
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        missing_node_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(NodeRuntimeData::empty())
+    }
+
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::Plain
+    }
+
+    #[inline]
+    fn node_initial_nexts(&self) -> &[NodeId] {
+        &[]
+    }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         None
     }
+
+    #[inline]
+    fn node_descriptor(&self) -> CoreResult<NodeDescriptor<'_>>
+    where
+        Self: Sized,
+    {
+        Ok(NodeDescriptor {
+            process: self.node_process(),
+            runtime_data: self.node_runtime_data()?,
+            registration: Node::node_registration(self),
+            initial_nexts: self.node_initial_nexts(),
+            trace_formatter: self.node_trace_formatter(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeKind {
+    Plain,
+    Driver,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NodeRuntimeData {
+    words: [u64; 4],
+}
+
+impl NodeRuntimeData {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        Self { words: [0; 4] }
+    }
+
+    #[inline(always)]
+    pub const fn from_words(words: [u64; 4]) -> Self {
+        Self { words }
+    }
+
+    #[inline]
+    pub fn from_usize(value: usize) -> CoreResult<Self> {
+        Ok(Self::from_words([
+            u64::try_from(value).map_err(|_| CoreError::internal("node runtime data overflow"))?,
+            0,
+            0,
+            0,
+        ]))
+    }
+
+    #[inline(always)]
+    pub const fn word(self, index: usize) -> u64 {
+        self.words[index]
+    }
+
+    #[inline]
+    pub fn usize_word(self, index: usize) -> CoreResult<usize> {
+        usize::try_from(self.word(index))
+            .map_err(|_| CoreError::internal("node runtime data word does not fit usize"))
+    }
+}
+
+pub type NodeProcessFn =
+    fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> CoreResult<NodeResult>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct NodeDescriptor<'a> {
+    process: NodeProcessFn,
+    runtime_data: NodeRuntimeData,
+    registration: NodeRegistration,
+    initial_nexts: &'a [NodeId],
+    trace_formatter: Option<TraceFormatter>,
+}
+
+impl<'a> NodeDescriptor<'a> {
+    #[inline]
+    pub fn new(
+        process: NodeProcessFn,
+        runtime_data: NodeRuntimeData,
+        registration: NodeRegistration,
+        initial_nexts: &'a [NodeId],
+        trace_formatter: Option<TraceFormatter>,
+    ) -> Self {
+        Self {
+            process,
+            runtime_data,
+            registration,
+            initial_nexts,
+            trace_formatter,
+        }
+    }
+
+    #[inline]
+    pub fn process(self) -> NodeProcessFn {
+        self.process
+    }
+
+    #[inline]
+    pub fn runtime_data(self) -> NodeRuntimeData {
+        self.runtime_data
+    }
+
+    #[inline]
+    pub fn registration(self) -> NodeRegistration {
+        self.registration
+    }
+
+    #[inline]
+    pub fn initial_nexts(self) -> &'a [NodeId] {
+        self.initial_nexts
+    }
+
+    #[inline]
+    pub fn trace_formatter(self) -> Option<TraceFormatter> {
+        self.trace_formatter
+    }
+}
+
+fn missing_node_process(
+    runtime: &DataPlaneRuntime,
+    _data: NodeRuntimeData,
+    _frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let current = runtime
+        .current_node()
+        .map(|node| match runtime.nodes().node_name(node) {
+            Ok(Some(name)) => format!("node {name} ({:?})", node),
+            _ => format!("node {:?}", node),
+        })
+        .unwrap_or_else(|| "current node".to_owned());
+    Err(CoreError::internal(format!(
+        "{current} descriptor is missing a packet process function"
+    )))
 }
 
 /// Packet graph node that drives an external input boundary.
@@ -63,7 +218,7 @@ pub trait Node<G = Self> {
 /// Driver nodes are responsible for bringing packets into the data plane from
 /// the operating system or protocol I/O. They are runtime roles, not business
 /// protocol roles.
-pub trait DriverNode<G = Self>: Node<G> {
+pub trait DriverNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -83,7 +238,7 @@ pub trait DriverNode<G = Self>: Node<G> {
 /// Internal nodes are not external I/O drivers. They transform frame metadata,
 /// split frames, or select the next graph edge while keeping packet ownership on
 /// the current data worker.
-pub trait InternalNode<G = Self>: Node<G> {
+pub trait InternalNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -134,11 +289,11 @@ impl NodeRegistration {
 #[derive(Debug, Clone, Copy)]
 pub enum NoopNode {}
 
-impl Node<NoopNode> for NoopNode {
+impl Node for NoopNode {
     #[inline(always)]
     fn process(
         &mut self,
-        _runtime: &DataPlaneRuntime<NoopNode>,
+        _runtime: &DataPlaneRuntime,
         _frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         match *self {}
@@ -211,12 +366,12 @@ impl NodeResult {
     }
 }
 
-pub struct NodeRuntime<N = NoopNode> {
-    inner: Rc<RefCell<NodeRuntimeInner<N>>>,
+pub struct NodeRuntime {
+    inner: Rc<RefCell<NodeRuntimeInner>>,
     readiness: Rc<NodeReadiness>,
 }
 
-impl<N> Clone for NodeRuntime<N> {
+impl Clone for NodeRuntime {
     fn clone(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),
@@ -225,7 +380,7 @@ impl<N> Clone for NodeRuntime<N> {
     }
 }
 
-impl<N> std::fmt::Debug for NodeRuntime<N> {
+impl std::fmt::Debug for NodeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.borrow();
         f.debug_struct("NodeRuntime")
@@ -284,8 +439,8 @@ impl NodeReadiness {
     }
 }
 
-struct NodeRuntimeInner<N> {
-    nodes: Vec<Option<N>>,
+struct NodeRuntimeInner {
+    nodes: Vec<NodeRuntimeSlot>,
     error_counters: Vec<NodeErrorCounters>,
     runtime_stats: Vec<NodeRuntimeStats>,
     queue: VecDeque<ScheduledFrame>,
@@ -295,6 +450,42 @@ struct NodeRuntimeInner<N> {
     node_trace_formatters: Vec<Option<TraceFormatter>>,
     next_nodes: Vec<Vec<Option<NodeId>>>,
     siblings: Vec<Vec<NodeId>>,
+}
+
+struct NodeRuntimeSlot {
+    kind: NodeKind,
+    process: NodeProcessFn,
+    runtime_data: NodeRuntimeData,
+}
+
+impl Copy for NodeRuntimeSlot {}
+
+impl Clone for NodeRuntimeSlot {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl std::fmt::Debug for NodeRuntimeSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NodeRuntimeSlot")
+            .field("kind", &self.kind)
+            .field("runtime_data", &self.runtime_data)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NodeRuntimeSlot {
+    #[inline]
+    fn dispatch(
+        self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        (self.process)(runtime, self.runtime_data, frame)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -345,10 +536,10 @@ struct ScheduledFrame {
     allow_empty: bool,
 }
 
-impl<N> NodeRuntimeInner<N> {
-    fn push_node(&mut self, node: N) -> NodeId {
+impl NodeRuntimeInner {
+    fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
-        self.nodes.push(Some(node));
+        self.nodes.push(slot);
         self.error_counters.push(NodeErrorCounters::default());
         self.runtime_stats.push(NodeRuntimeStats::default());
         self.node_names.push(None);
@@ -358,9 +549,24 @@ impl<N> NodeRuntimeInner<N> {
         id
     }
 
-    fn register_declared(
+    fn push_function_node(
         &mut self,
-        node: N,
+        kind: NodeKind,
+        process: NodeProcessFn,
+        runtime_data: NodeRuntimeData,
+    ) -> NodeId {
+        self.push_node_slot(NodeRuntimeSlot {
+            kind,
+            process,
+            runtime_data,
+        })
+    }
+
+    fn register_function_declared(
+        &mut self,
+        kind: NodeKind,
+        process: NodeProcessFn,
+        runtime_data: NodeRuntimeData,
         registration: NodeRegistration,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
@@ -395,12 +601,12 @@ impl<N> NodeRuntimeInner<N> {
 
         match registration {
             NodeRegistration::Plain => {
-                let id = self.push_node(node);
+                let id = self.push_function_node(kind, process, runtime_data);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 Ok(id)
             }
             NodeRegistration::Next { name, next_count } => {
-                let id = self.push_node(node);
+                let id = self.push_function_node(kind, process, runtime_data);
                 self.node_names[id.0 as usize] = Some(name);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 self.next_nodes[id.0 as usize] = initial_nexts
@@ -423,7 +629,7 @@ impl<N> NodeRuntimeInner<N> {
                     .get(owner.0 as usize)
                     .cloned()
                     .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-                let id = self.push_node(node);
+                let id = self.push_function_node(kind, process, runtime_data);
                 self.node_names[id.0 as usize] = Some(name);
                 self.node_trace_formatters[id.0 as usize] = trace_formatter;
                 self.next_nodes[id.0 as usize] = owner_nexts;
@@ -474,7 +680,7 @@ impl<N> NodeRuntimeInner<N> {
     }
 }
 
-impl<N> Default for NodeRuntime<N> {
+impl Default for NodeRuntime {
     fn default() -> Self {
         Self {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
@@ -494,104 +700,133 @@ impl<N> Default for NodeRuntime<N> {
     }
 }
 
-impl<N> NodeRuntime<N> {
-    pub fn register(&self, node: N) -> NodeId {
-        let mut inner = self.inner.borrow_mut();
-        inner.push_node(node)
-    }
-
-    pub fn register_driver<I>(&self, node: I) -> NodeId
+impl NodeRuntime {
+    pub fn register_driver<N>(&self, node: N) -> NodeId
     where
-        I: DriverNode<N> + Into<N> + 'static,
+        N: DriverNode + Node,
     {
         self.try_register_driver(node)
-            .expect("driver node registration")
+            .expect("register driver node descriptor")
     }
 
-    pub fn try_register_driver<I>(&self, node: I) -> CoreResult<NodeId>
+    pub fn try_register_driver<N>(&self, node: N) -> CoreResult<NodeId>
     where
-        I: DriverNode<N> + Into<N> + 'static,
+        N: DriverNode + Node,
     {
-        let registration = DriverNode::<N>::node_registration(&node);
-        let initial_nexts = DriverNode::<N>::node_initial_nexts(&node).to_vec();
-        let trace_formatter = Node::<N>::node_trace_formatter(&node);
-        self.register_declared(node.into(), registration, &initial_nexts, trace_formatter)
-    }
-
-    pub fn register_internal<I>(&self, node: I) -> NodeId
-    where
-        I: InternalNode<N> + Into<N> + 'static,
-    {
-        self.try_register_internal(node)
-            .expect("internal node registration")
-    }
-
-    pub fn try_register_internal<I>(&self, node: I) -> CoreResult<NodeId>
-    where
-        I: InternalNode<N> + Into<N> + 'static,
-    {
-        let registration = InternalNode::<N>::node_registration(&node);
-        let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
-        let trace_formatter = Node::<N>::node_trace_formatter(&node);
-        self.register_declared(node.into(), registration, &initial_nexts, trace_formatter)
-    }
-
-    pub fn register_internal_with_handle<I>(
-        &self,
-        handle: NodeHandle,
-        node: I,
-    ) -> CoreResult<NodeId>
-    where
-        I: InternalNode<N> + Into<N> + 'static,
-    {
-        let registration = InternalNode::<N>::node_registration(&node);
-        let initial_nexts = InternalNode::<N>::node_initial_nexts(&node).to_vec();
-        let trace_formatter = Node::<N>::node_trace_formatter(&node);
-        self.register_declared_with_handle(
-            handle,
-            node.into(),
-            registration,
-            &initial_nexts,
-            trace_formatter,
+        self.register_descriptor(
+            NodeKind::Driver,
+            NodeDescriptor::new(
+                node.node_process(),
+                node.node_runtime_data()?,
+                DriverNode::node_registration(&node),
+                DriverNode::node_initial_nexts(&node),
+                node.node_trace_formatter(),
+            ),
         )
     }
 
-    pub fn register_with_handle(&self, handle: NodeHandle, node: N) -> CoreResult<NodeId> {
-        self.register_declared_with_handle(handle, node, NodeRegistration::Plain, &[], None)
+    pub fn register_internal<N>(&self, node: N) -> NodeId
+    where
+        N: InternalNode + Node,
+    {
+        self.try_register_internal(node)
+            .expect("register internal node descriptor")
     }
 
-    fn register_declared(
-        &self,
-        node: N,
-        registration: NodeRegistration,
-        initial_nexts: &[NodeId],
-        trace_formatter: Option<TraceFormatter>,
-    ) -> CoreResult<NodeId> {
-        let mut inner = self.inner.borrow_mut();
-        inner.register_declared(node, registration, initial_nexts, trace_formatter, None)
+    pub fn try_register_internal<N>(&self, node: N) -> CoreResult<NodeId>
+    where
+        N: InternalNode + Node,
+    {
+        self.register_descriptor(
+            NodeKind::Internal,
+            NodeDescriptor::new(
+                node.node_process(),
+                node.node_runtime_data()?,
+                InternalNode::node_registration(&node),
+                InternalNode::node_initial_nexts(&node),
+                node.node_trace_formatter(),
+            ),
+        )
     }
 
-    fn register_declared_with_handle(
+    pub fn register_internal_with_handle<N>(
         &self,
         handle: NodeHandle,
         node: N,
-        registration: NodeRegistration,
-        initial_nexts: &[NodeId],
-        trace_formatter: Option<TraceFormatter>,
+    ) -> CoreResult<NodeId>
+    where
+        N: InternalNode + Node,
+    {
+        self.register_descriptor_with_handle(
+            NodeKind::Internal,
+            handle,
+            NodeDescriptor::new(
+                node.node_process(),
+                node.node_runtime_data()?,
+                InternalNode::node_registration(&node),
+                InternalNode::node_initial_nexts(&node),
+                node.node_trace_formatter(),
+            ),
+        )
+    }
+
+    fn register_descriptor(
+        &self,
+        kind: NodeKind,
+        descriptor: NodeDescriptor<'_>,
+    ) -> CoreResult<NodeId> {
+        self.register_function_declared(
+            kind,
+            descriptor.process,
+            descriptor.runtime_data,
+            descriptor.registration,
+            descriptor.initial_nexts,
+            descriptor.trace_formatter,
+        )
+    }
+
+    fn register_descriptor_with_handle(
+        &self,
+        kind: NodeKind,
+        handle: NodeHandle,
+        descriptor: NodeDescriptor<'_>,
     ) -> CoreResult<NodeId> {
         let mut inner = self.inner.borrow_mut();
         if inner.handles.contains_key(&handle) {
             return Err(CoreError::internal("node handle already registered"));
         }
-        let id = inner.register_declared(
-            node,
-            registration,
-            initial_nexts,
-            trace_formatter,
+        let id = inner.register_function_declared(
+            kind,
+            descriptor.process,
+            descriptor.runtime_data,
+            descriptor.registration,
+            descriptor.initial_nexts,
+            descriptor.trace_formatter,
             Some(handle),
         )?;
         inner.handles.insert(handle, id);
         Ok(id)
+    }
+
+    fn register_function_declared(
+        &self,
+        kind: NodeKind,
+        process: NodeProcessFn,
+        runtime_data: NodeRuntimeData,
+        registration: NodeRegistration,
+        initial_nexts: &[NodeId],
+        trace_formatter: Option<TraceFormatter>,
+    ) -> CoreResult<NodeId> {
+        let mut inner = self.inner.borrow_mut();
+        inner.register_function_declared(
+            kind,
+            process,
+            runtime_data,
+            registration,
+            initial_nexts,
+            trace_formatter,
+            None,
+        )
     }
 
     #[inline]
@@ -750,16 +985,12 @@ impl<N> NodeRuntime<N> {
         Ok(())
     }
 
-    pub(crate) fn run_ready(&self, runtime: &DataPlaneRuntime<N>) -> CoreResult<usize>
-    where
-        N: Node<N>,
-    {
+    pub(crate) fn run_ready_function_nodes(&self, runtime: &DataPlaneRuntime) -> CoreResult<usize> {
         let mut processed = 0usize;
         while let Some(scheduled) = self.pop_scheduled() {
-            let mut node = self.take_node(scheduled.node)?;
+            let slot = self.runtime_slot(scheduled.node)?;
             let mut frame = runtime.take_frame_index(scheduled.frame)?;
             if !scheduled.allow_empty && !frame.has_pending() {
-                self.return_node(scheduled.node, node)?;
                 runtime.release_taken_frame_index(scheduled.frame, frame)?;
                 continue;
             }
@@ -768,10 +999,9 @@ impl<N> NodeRuntime<N> {
             runtime.set_current_node(Some(scheduled.node));
             let vectors = frame.pending_len();
             let start = Instant::now();
-            let result = node.process(runtime, &mut frame);
+            let result = slot.dispatch(runtime, &mut frame);
             let elapsed_ns = elapsed_ns(start);
             runtime.set_current_node(None);
-            self.return_node(scheduled.node, node)?;
             self.record_runtime_stats(scheduled.node, vectors, elapsed_ns)?;
             let result = match result {
                 Ok(result) => result,
@@ -809,39 +1039,13 @@ impl<N> NodeRuntime<N> {
         self.inner.borrow().validate_node(node)
     }
 
-    fn take_node(&self, node: NodeId) -> CoreResult<N> {
-        self.inner
-            .borrow_mut()
+    fn runtime_slot(&self, node: NodeId) -> CoreResult<NodeRuntimeSlot> {
+        let inner = self.inner.borrow();
+        inner
             .nodes
-            .get_mut(node.0 as usize)
-            .ok_or_else(|| CoreError::internal("node id out of bounds"))?
-            .take()
-            .ok_or_else(|| CoreError::internal("node is already running"))
-    }
-
-    fn return_node(&self, node: NodeId, value: N) -> CoreResult<()> {
-        let mut inner = self.inner.borrow_mut();
-        let slot = inner
-            .nodes
-            .get_mut(node.0 as usize)
-            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
-        if slot.is_some() {
-            return Err(CoreError::internal("node slot is already occupied"));
-        }
-        *slot = Some(value);
-        Ok(())
-    }
-
-    pub fn with_node_mut<R>(
-        &self,
-        node: NodeId,
-        operation: impl FnOnce(&mut N) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        self.validate_node(node)?;
-        let mut node_value = self.take_node(node)?;
-        let result = operation(&mut node_value);
-        self.return_node(node, node_value)?;
-        result
+            .get(node.0 as usize)
+            .copied()
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {
@@ -855,7 +1059,7 @@ impl<N> NodeRuntime<N> {
 
     fn dispatch_result(
         &self,
-        runtime: &DataPlaneRuntime<N>,
+        runtime: &DataPlaneRuntime,
         current_index: FrameIndex,
         current_frame: BufferFrame,
         result: NodeResult,
@@ -936,7 +1140,7 @@ impl<N> NodeRuntime<N> {
     }
 
     fn release_remaining_next_frames_on_dispatch_error(
-        runtime: &DataPlaneRuntime<N>,
+        runtime: &DataPlaneRuntime,
         result: &NodeResult,
         start: usize,
     ) {
@@ -951,7 +1155,7 @@ impl<N> NodeRuntime<N> {
     }
 
     fn release_current_frame_on_dispatch_error(
-        runtime: &DataPlaneRuntime<N>,
+        runtime: &DataPlaneRuntime,
         current_index: FrameIndex,
         current_frame: &mut Option<BufferFrame>,
     ) {
@@ -961,7 +1165,7 @@ impl<N> NodeRuntime<N> {
     }
 
     fn release_next_frame_and_current_on_dispatch_error(
-        runtime: &DataPlaneRuntime<N>,
+        runtime: &DataPlaneRuntime,
         current_index: FrameIndex,
         current_frame: &mut Option<BufferFrame>,
         next_frame: FrameIndex,
@@ -991,64 +1195,74 @@ impl Future for NodeRuntimeReady {
 mod tests {
     use super::*;
 
-    #[derive(Debug, Default)]
     struct StatsNode;
 
-    impl Node<StatsNode> for StatsNode {
+    impl Node for StatsNode {
         fn process(
             &mut self,
-            runtime: &DataPlaneRuntime<StatsNode>,
-            frame: &mut BufferFrame,
+            _runtime: &DataPlaneRuntime,
+            _frame: &mut BufferFrame,
         ) -> CoreResult<NodeResult> {
-            for buffer in frame.drain_pending() {
-                runtime.free_index(buffer);
-            }
-            Ok(NodeResult::drop())
+            Err(CoreError::internal(
+                "stats test node must run through its function slot",
+            ))
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            stats_function_node
+        }
+
+        fn node_registration(&self) -> NodeRegistration {
+            NodeRegistration::next("function-stats-node", 0)
         }
     }
 
-    impl InternalNode<StatsNode> for StatsNode {
+    impl InternalNode for StatsNode {
         fn node_registration(&self) -> NodeRegistration {
-            NodeRegistration::next("stats-node", 0)
+            NodeRegistration::next("function-stats-node", 0)
         }
+    }
+
+    fn stats_function_node(
+        runtime: &DataPlaneRuntime,
+        _data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        for buffer in frame.drain_pending() {
+            runtime.free_index(buffer);
+        }
+        Ok(NodeResult::drop())
     }
 
     #[test]
-    fn node_runtime_stats_snapshot_counts_named_node_frames() {
-        let runtime = DataPlaneRuntime::<StatsNode>::with_capacities(16, 8, 4, 2);
+    fn function_node_runtime_stats_count_named_node_frames() {
+        let runtime = DataPlaneRuntime::with_capacities(16, 8, 4, 2);
         let node = runtime.nodes().register_internal(StatsNode);
 
-        let first = runtime.alloc_frame_index().expect("alloc first frame");
-        push_packet(&runtime, first, b"one");
-        push_packet(&runtime, first, b"two");
-        let second = runtime.alloc_frame_index().expect("alloc second frame");
-        push_packet(&runtime, second, b"three");
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        push_packet(&runtime, frame, b"one");
+        push_packet(&runtime, frame, b"two");
 
-        assert!(runtime.schedule_frame(node, first).expect("schedule first"));
-        assert!(
-            runtime
-                .schedule_frame(node, second)
-                .expect("schedule second")
-        );
+        assert!(runtime.schedule_frame(node, frame).expect("schedule"));
         runtime
             .nodes()
             .increment_node_error(node, 7)
             .expect("increment error counter");
-        assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
+        assert_eq!(runtime.run_ready_nodes().expect("run function node"), 1);
 
         let rows = runtime.nodes().node_runtime_stats_snapshot();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.node_id, node);
-        assert_eq!(row.node_name, Some("stats-node"));
+        assert_eq!(row.node_name, Some("function-stats-node"));
         assert_eq!(row.error_counters.get(7), 1);
-        assert_eq!(row.calls, 2);
-        assert_eq!(row.vectors, 3);
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.vectors, 2);
         assert_eq!(row.suspends, 0);
         assert!(row.total_elapsed_ns >= row.max_elapsed_ns);
     }
 
-    fn push_packet(runtime: &DataPlaneRuntime<StatsNode>, frame: FrameIndex, payload: &[u8]) {
+    fn push_packet(runtime: &DataPlaneRuntime, frame: FrameIndex, payload: &[u8]) {
         let buffer = runtime
             .alloc_index_with_bytes(crate::RouteMetadata::default(), payload)
             .expect("alloc packet");
