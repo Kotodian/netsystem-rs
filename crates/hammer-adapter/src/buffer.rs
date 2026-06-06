@@ -19,6 +19,7 @@ use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle, TraceMark};
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
+pub const CURRENT_CHAIN_IO_SEGMENT_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -365,6 +366,22 @@ impl Buffer {
         let start = self.current_data;
         let end = start + self.current_len;
         &mut self.storage.as_mut_slice()[start..end]
+    }
+
+    #[inline]
+    pub fn writable_tail_mut(&mut self) -> &mut [u8] {
+        let start = self.current_data + self.current_len;
+        &mut self.storage.as_mut_slice()[start..]
+    }
+
+    #[inline]
+    pub fn commit_writable_tail(&mut self, len: usize) -> CoreResult<()> {
+        if len > self.available_tail() {
+            return Err(CoreError::internal("buffer commit exceeds writable tail"));
+        }
+        self.current_len += len;
+        self.data_len = self.data_len.max(self.current_data + self.current_len);
+        Ok(())
     }
 
     #[inline]
@@ -903,6 +920,15 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.buffers.copy_current_chain(index)
+    }
+
+    #[inline]
+    pub fn with_current_chain_io_segments<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        self.buffers.with_current_chain_io_segments(index, f)
     }
 
     fn finalize_trace_chain(&self, index: BufferIndex) {
@@ -1696,6 +1722,18 @@ impl BufferPool {
     pub fn copy_current_chain(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         self.arena.inner.borrow().copy_current_chain(index)
     }
+
+    #[inline]
+    pub fn with_current_chain_io_segments<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        self.arena
+            .inner
+            .borrow()
+            .with_current_chain_io_segments(index, f)
+    }
 }
 
 impl FramePool {
@@ -2138,6 +2176,35 @@ impl BufferPoolInner {
             next = buffer.next_buffer;
         }
         Ok(bytes)
+    }
+
+    #[inline]
+    fn with_current_chain_io_segments<R>(
+        &self,
+        index: BufferIndex,
+        f: impl FnOnce(&[&[u8]], usize) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        let first = self.buffer(index)?;
+        let total_len = first
+            .current_len()
+            .checked_add(first.total_len_not_including_first())
+            .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
+        let empty: &[u8] = &[];
+        let mut segments = [empty; CURRENT_CHAIN_IO_SEGMENT_CAPACITY];
+        let mut segment_count = 0usize;
+        let mut next = Some(index);
+        while let Some(index) = next {
+            if segment_count == CURRENT_CHAIN_IO_SEGMENT_CAPACITY {
+                return Err(CoreError::internal(
+                    "buffer chain exceeds single TUN writev segment capacity",
+                ));
+            }
+            let buffer = self.buffer(index)?;
+            segments[segment_count] = buffer.current();
+            segment_count += 1;
+            next = buffer.next_buffer;
+        }
+        f(&segments[..segment_count], total_len)
     }
 
     #[inline]
@@ -3667,6 +3734,22 @@ impl BufferRefMut<'_> {
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .current_mut()
+    }
+
+    #[inline]
+    pub fn writable_tail_mut(&mut self) -> &mut [u8] {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .writable_tail_mut()
+    }
+
+    #[inline]
+    pub fn commit_writable_tail(&mut self, len: usize) -> CoreResult<()> {
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .commit_writable_tail(len)
     }
 
     #[inline]

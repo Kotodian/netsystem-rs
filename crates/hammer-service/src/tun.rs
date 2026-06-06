@@ -3,8 +3,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeRegistration, NodeResult,
-    PacketTrace, RouteMetadata, TapEthernetMetadata, TraceFormatter, add_packet_trace, unlikely,
+    BufferFrame, DataPlaneRuntime, DriverNode, FrameIndex, Node, NodeId, NodeRegistration,
+    NodeResult, PacketTrace, RouteMetadata, TapEthernetMetadata, TraceFormatter, add_packet_trace,
+    unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
@@ -39,6 +40,400 @@ pub trait TunPacketSink {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunBufferSendResult {
+    Complete,
+    Partial(usize),
+    Backpressure,
+}
+
+pub trait TunBufferIo {
+    fn try_recv_buffer(&mut self, buffer: &mut [u8]) -> CoreResult<Option<usize>>;
+
+    fn max_recv_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult>;
+
+    fn try_send_buffers(
+        &mut self,
+        segments: &[&[u8]],
+        offset: usize,
+        total_len: usize,
+    ) -> CoreResult<TunBufferSendResult> {
+        if segments.len() > 1 {
+            return Err(CoreError::internal(
+                "chained TUN TX requires vectored IO support",
+            ));
+        }
+        if offset >= total_len {
+            return Ok(TunBufferSendResult::Complete);
+        }
+        self.try_send_buffer(segments.first().copied().unwrap_or_default(), offset)
+    }
+}
+
+#[cfg(feature = "inbound-tun")]
+impl TunBufferIo for hammer_runtime::tun::TunFdIo {
+    #[inline]
+    fn try_recv_buffer(&mut self, buffer: &mut [u8]) -> CoreResult<Option<usize>> {
+        hammer_runtime::tun::TunFdIo::try_recv_buffer(self, buffer)
+    }
+
+    #[inline]
+    fn max_recv_len(&self) -> Option<usize> {
+        Some(hammer_runtime::tun::TunFdIo::mtu(self))
+    }
+
+    #[inline]
+    fn try_send_buffer(&mut self, packet: &[u8], offset: usize) -> CoreResult<TunBufferSendResult> {
+        map_tun_fd_send_result(hammer_runtime::tun::TunFdIo::try_send_buffer(
+            self, packet, offset,
+        )?)
+    }
+
+    #[inline]
+    fn try_send_buffers(
+        &mut self,
+        segments: &[&[u8]],
+        offset: usize,
+        total_len: usize,
+    ) -> CoreResult<TunBufferSendResult> {
+        if segments.len() <= 1 {
+            return self.try_send_buffer(segments.first().copied().unwrap_or_default(), offset);
+        }
+        if offset >= total_len {
+            return Ok(TunBufferSendResult::Complete);
+        }
+        map_tun_fd_send_result(hammer_runtime::tun::TunFdIo::try_send_buffers(
+            self, segments, offset, total_len,
+        )?)
+    }
+}
+
+#[cfg(feature = "inbound-tun")]
+#[inline]
+fn map_tun_fd_send_result(
+    result: hammer_runtime::tun::TunFdSendResult,
+) -> CoreResult<TunBufferSendResult> {
+    match result {
+        hammer_runtime::tun::TunFdSendResult::Complete => Ok(TunBufferSendResult::Complete),
+        hammer_runtime::tun::TunFdSendResult::Partial(offset) => {
+            Ok(TunBufferSendResult::Partial(offset))
+        }
+        hammer_runtime::tun::TunFdSendResult::Backpressure => Ok(TunBufferSendResult::Backpressure),
+    }
+}
+
+pub struct RealTunInput<I> {
+    io: I,
+}
+
+impl<I> RealTunInput<I> {
+    #[inline]
+    pub fn new(io: I) -> Self {
+        Self { io }
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> I {
+        self.io
+    }
+}
+
+impl<I> TunPacketSource for RealTunInput<I>
+where
+    I: TunBufferIo,
+{
+    #[inline]
+    fn recv_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        interface_id: &str,
+        mode: TunDriverMode,
+        max: usize,
+    ) -> CoreResult<usize> {
+        if max == 0 {
+            return Ok(0);
+        }
+        if mode.is_tap() {
+            return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
+        }
+        let mut received = 0usize;
+        while received < max {
+            let index = runtime.alloc_index(RouteMetadata {
+                inbound: interface_id.to_owned(),
+                ..Default::default()
+            })?;
+            let len = match self.recv_into_buffer(runtime, index) {
+                Ok(Some(len)) => len,
+                Ok(None) => {
+                    runtime.free_index(index);
+                    break;
+                }
+                Err(err) => {
+                    runtime.free_index(index);
+                    return Err(err);
+                }
+            };
+            if len == 0 {
+                runtime.free_index(index);
+                break;
+            };
+            self.set_l3_metadata(runtime, index, interface_id)?;
+            if let Err(err) = frame.push_index(index) {
+                runtime.free_index(index);
+                return Err(err);
+            }
+            received += 1;
+        }
+        Ok(received)
+    }
+}
+
+impl<I> RealTunInput<I>
+where
+    I: TunBufferIo,
+{
+    fn recv_into_buffer<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        index: hammer_adapter::BufferIndex,
+    ) -> CoreResult<Option<usize>> {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        let dst = buffer.writable_tail_mut();
+        let dst_len = dst.len();
+        let Some(len) = self.io.try_recv_buffer(dst)? else {
+            return Ok(None);
+        };
+        if len == dst_len && self.io.max_recv_len().is_none_or(|max| dst_len < max) {
+            return Err(CoreError::internal(
+                "TUN packet filled receive buffer; possible truncation",
+            ));
+        }
+        buffer.commit_writable_tail(len)?;
+        Ok(Some(len))
+    }
+
+    fn set_l3_metadata<G>(
+        &self,
+        runtime: &DataPlaneRuntime<G>,
+        index: hammer_adapter::BufferIndex,
+        interface_id: &str,
+    ) -> CoreResult<()> {
+        let metadata = {
+            let buffer = runtime.get_buffer(index)?;
+            packet_route_metadata(interface_id, buffer.current()).unwrap_or_else(|_| {
+                RouteMetadata {
+                    inbound: interface_id.to_owned(),
+                    ..Default::default()
+                }
+            })
+        };
+        *runtime.get_buffer_mut(index)?.metadata_mut() = metadata;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TunPendingTx {
+    index: hammer_adapter::BufferIndex,
+    offset: usize,
+}
+
+pub struct RealTunOutput<I> {
+    io: I,
+    pending_tx: Vec<TunPendingTx>,
+    tx_ring_capacity: usize,
+}
+
+impl<I> RealTunOutput<I> {
+    #[inline]
+    pub fn new(io: I) -> Self {
+        Self {
+            io,
+            pending_tx: Vec::with_capacity(DEFAULT_TUN_RECV_BATCH),
+            tx_ring_capacity: DEFAULT_TUN_RECV_BATCH,
+        }
+    }
+
+    #[inline]
+    pub fn with_tx_ring_capacity(mut self, tx_ring_capacity: usize) -> Self {
+        self.tx_ring_capacity = tx_ring_capacity;
+        self.pending_tx
+            .reserve(tx_ring_capacity.saturating_sub(self.pending_tx.capacity()));
+        self
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> I {
+        self.io
+    }
+}
+
+impl<I> RealTunOutput<I>
+where
+    I: TunBufferIo,
+{
+    fn drain_pending_tx<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        mode: TunDriverMode,
+    ) -> CoreResult<usize> {
+        if mode.is_tap() {
+            return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
+        }
+        let mut completed = 0usize;
+        while completed < self.pending_tx.len() {
+            let pending = self.pending_tx[completed];
+            let send_result = self.try_send_pending_tx(runtime, pending);
+            match send_result {
+                Ok(TunBufferSendResult::Complete) => {
+                    runtime.free_index(pending.index);
+                    completed += 1;
+                }
+                Ok(TunBufferSendResult::Partial(offset)) => {
+                    let total_len = packet_total_len(runtime, pending.index)?;
+                    validate_tun_tx_partial(pending.offset, offset, total_len)?;
+                    if offset == total_len {
+                        runtime.free_index(pending.index);
+                        completed += 1;
+                        continue;
+                    }
+                    self.pending_tx[completed].offset = offset;
+                    break;
+                }
+                Ok(TunBufferSendResult::Backpressure) => break,
+                Err(err) => {
+                    if completed != 0 {
+                        self.pending_tx.drain(..completed);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        if completed != 0 {
+            self.pending_tx.drain(..completed);
+        }
+        Ok(completed)
+    }
+
+    #[inline]
+    fn try_send_pending_tx<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        pending: TunPendingTx,
+    ) -> CoreResult<TunBufferSendResult> {
+        runtime.with_current_chain_io_segments(pending.index, |segments, total_len| {
+            if pending.offset > total_len {
+                return Err(CoreError::internal("TUN TX offset exceeds packet length"));
+            }
+            if pending.offset == total_len {
+                return Ok(TunBufferSendResult::Complete);
+            }
+            self.io
+                .try_send_buffers(segments, pending.offset, total_len)
+        })
+    }
+}
+
+impl<I> TunPacketSink for RealTunOutput<I>
+where
+    I: TunBufferIo,
+{
+    #[inline]
+    fn send_frame<G>(
+        &mut self,
+        runtime: &DataPlaneRuntime<G>,
+        frame: &mut BufferFrame,
+        mode: TunDriverMode,
+    ) -> CoreResult<usize> {
+        if mode.is_tap() {
+            runtime.free_frame(frame);
+            return Err(CoreError::internal("real TUN driver only supports L3 TUN"));
+        }
+        let batch_len = frame.pending_len();
+        self.drain_pending_tx(runtime, mode)?;
+        if self.pending_tx.len().saturating_add(batch_len) > self.tx_ring_capacity {
+            runtime.free_frame(frame);
+            return Err(CoreError::internal("real TUN TX ring full"));
+        }
+        for index in frame.drain_pending() {
+            self.pending_tx.push(TunPendingTx { index, offset: 0 });
+        }
+        self.drain_pending_tx(runtime, mode)?;
+        Ok(batch_len)
+    }
+}
+
+#[inline]
+fn packet_total_len<G>(
+    runtime: &DataPlaneRuntime<G>,
+    index: hammer_adapter::BufferIndex,
+) -> CoreResult<usize> {
+    let packet = runtime.get_buffer(index)?;
+    packet
+        .current_len()
+        .checked_add(packet.total_len_not_including_first())
+        .ok_or_else(|| CoreError::internal("TUN TX packet length overflow"))
+}
+
+#[inline]
+fn validate_tun_tx_partial(previous: usize, next: usize, total_len: usize) -> CoreResult<()> {
+    if next <= previous {
+        return Err(CoreError::internal(format!(
+            "non-advancing TUN TX partial offset: {next} <= {previous}"
+        )));
+    }
+    if next > total_len {
+        return Err(CoreError::internal(format!(
+            "TUN TX partial offset exceeds packet length: {next} > {total_len}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunFdReadiness {
+    input: Option<NodeId>,
+    output: Option<NodeId>,
+}
+
+impl TunFdReadiness {
+    #[inline]
+    pub const fn new(input: Option<NodeId>, output: Option<NodeId>) -> Self {
+        Self { input, output }
+    }
+
+    #[inline]
+    pub const fn input(input: NodeId) -> Self {
+        Self::new(Some(input), None)
+    }
+
+    #[inline]
+    pub const fn output(output: NodeId) -> Self {
+        Self::new(None, Some(output))
+    }
+
+    #[inline]
+    pub fn schedule_readable<G>(&self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+        let input = self
+            .input
+            .ok_or_else(|| CoreError::internal("TUN fd input driver is not configured"))?;
+        schedule_empty_driver_frame(runtime, input)
+    }
+
+    #[inline]
+    pub fn schedule_writable<G>(&self, runtime: &DataPlaneRuntime<G>) -> CoreResult<()> {
+        let output = self
+            .output
+            .ok_or_else(|| CoreError::internal("TUN fd output driver is not configured"))?;
+        schedule_empty_driver_frame(runtime, output)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunDriverMode {
     Tun,
     Tap,
@@ -53,6 +448,27 @@ impl TunDriverMode {
     #[inline(always)]
     pub const fn is_tap(self) -> bool {
         matches!(self, Self::Tap)
+    }
+}
+
+#[inline]
+fn schedule_empty_driver_frame<G>(runtime: &DataPlaneRuntime<G>, node: NodeId) -> CoreResult<()> {
+    let frame = runtime.alloc_frame_index()?;
+    schedule_allocated_driver_frame(runtime, node, frame)
+}
+
+#[inline]
+fn schedule_allocated_driver_frame<G>(
+    runtime: &DataPlaneRuntime<G>,
+    node: NodeId,
+    frame: FrameIndex,
+) -> CoreResult<()> {
+    match runtime.schedule_driver_frame(node, frame) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = runtime.free_frame_index(frame);
+            Err(err)
+        }
     }
 }
 

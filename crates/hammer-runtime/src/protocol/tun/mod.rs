@@ -10,6 +10,12 @@ pub mod stack;
 pub use stack::*;
 
 #[cfg(feature = "inbound-tun")]
+mod fd_io;
+
+#[cfg(feature = "inbound-tun")]
+pub use fd_io::*;
+
+#[cfg(feature = "inbound-tun")]
 mod inbound;
 
 #[cfg(feature = "inbound-tun")]
