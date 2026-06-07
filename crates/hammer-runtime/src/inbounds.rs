@@ -4,11 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use hammer_adapter::{
-    ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, Inbound, InboundComponent,
-    InboundManager as InboundManagerTrait, Lifecycle, PlatformInterface, Router as RouterTrait,
-    RuntimeComponent,
+    ComponentMeta, ComponentMetadata, DnsQueryOptions, DnsRouter as DnsRouterTrait, Inbound,
+    InboundComponent, InboundManager as InboundManagerTrait, Lifecycle, Network, PlatformInterface,
+    Router as RouterTrait, RuntimeComponent, TunOptions,
 };
-use hammer_core::config::{Inbound as InboundOptions, InboundKind};
+use hammer_core::config::{Inbound as InboundOptions, InboundKind, TunInboundOptions};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::lifecycle::StartStage;
 use hammer_core::log::Logger;
@@ -139,6 +139,7 @@ fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, Inbou
         feature = "inbound-mixed"
     )))]
     let _ = builders;
+    builders.insert("tun", build_tun_inbound);
     #[cfg(feature = "inbound-socks")]
     register_components!(
         inbound,
@@ -158,6 +159,119 @@ fn register_standard_inbound_builders(builders: &mut HashMap<&'static str, Inbou
         [crate::protocol::proxy::inbound::MixedInbound]
     );
 }
+
+#[allow(clippy::too_many_arguments)]
+fn build_tun_inbound(
+    id: String,
+    _logger: Logger,
+    kind: &InboundKind,
+    _router: Arc<dyn RouterTrait>,
+    _dns_router: Option<Arc<RuntimeDnsRouter>>,
+    _outbound: Option<Arc<OutboundManager>>,
+    platform: Option<Arc<dyn PlatformInterface>>,
+    _metrics: Arc<MetricsRegistry>,
+) -> HammerResult<InboundComponent> {
+    let InboundKind::Tun(options) = kind else {
+        return Err(HammerError::config_validation(format!(
+            "inbound type mismatch for tun builder: {}",
+            match kind {
+                InboundKind::Tun(_) => "tun",
+                InboundKind::Socks(_) => "socks",
+                InboundKind::Http(_) => "http",
+                InboundKind::Mixed(_) => "mixed",
+            }
+        )));
+    };
+    let runtime: Arc<dyn Inbound> = Arc::new(TunInbound::new(options.clone(), platform));
+    Ok(RuntimeComponent::new(
+        ComponentMeta::new(
+            "inbound",
+            "tun",
+            id,
+            vec![Network::Tcp, Network::Udp],
+            Vec::new(),
+            None,
+        ),
+        runtime,
+    ))
+}
+
+struct TunInbound {
+    options: TunInboundOptions,
+    platform: Option<Arc<dyn PlatformInterface>>,
+    opened_fd: Mutex<Option<i32>>,
+}
+
+impl TunInbound {
+    fn new(options: TunInboundOptions, platform: Option<Arc<dyn PlatformInterface>>) -> Self {
+        Self {
+            options,
+            platform,
+            opened_fd: Mutex::new(None),
+        }
+    }
+}
+
+impl Lifecycle for TunInbound {
+    fn name(&self) -> &str {
+        "tun"
+    }
+
+    fn start(&self, stage: StartStage) -> HammerResult<()> {
+        if stage != StartStage::Start {
+            return Ok(());
+        }
+        let Some(platform) = &self.platform else {
+            return Ok(());
+        };
+        let mut opened_fd = self
+            .opened_fd
+            .lock()
+            .map_err(|_| HammerError::internal("tun inbound state poisoned"))?;
+        if opened_fd.is_some() {
+            return Ok(());
+        }
+        let fd = platform.open_tun(TunOptions {
+            name: self.options.interface_name.clone(),
+            mtu: i32::try_from(self.options.mtu)
+                .map_err(|_| HammerError::internal("tun mtu exceeds i32"))?,
+            address: self
+                .options
+                .address
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            route: self
+                .options
+                .route_address
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            route_exclude: self
+                .options
+                .route_exclude_address
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            auto_route: self.options.auto_route,
+            strict_route: self.options.strict_route,
+            tap: self.options.tap,
+        })?;
+        *opened_fd = Some(fd);
+        Ok(())
+    }
+
+    fn close(&self) -> HammerResult<()> {
+        let mut opened_fd = self
+            .opened_fd
+            .lock()
+            .map_err(|_| HammerError::internal("tun inbound state poisoned"))?;
+        *opened_fd = None;
+        Ok(())
+    }
+}
+
+impl Inbound for TunInbound {}
 
 pub struct InboundManager {
     items: Mutex<HashMap<String, InboundComponent>>,
@@ -334,5 +448,167 @@ impl InboundManagerTrait for InboundManager {
             .expect("InboundManager poisoned")
             .remove(id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use hammer_adapter::{
+        DefaultInterfaceUpdateListener, NetworkInterface, RouteDecision, RouteMetadata, TunOptions,
+        WifiState,
+    };
+    use hammer_core::config::{TunInboundOptions, TunStack};
+    use hammer_core::log::{DiscardWriter, Factory};
+
+    struct TestPlatform;
+
+    impl PlatformInterface for TestPlatform {
+        fn open_tun(&self, _options: TunOptions) -> HammerResult<i32> {
+            Ok(-1)
+        }
+
+        fn use_platform_auto_detect_interface_control(&self) -> bool {
+            false
+        }
+
+        fn auto_detect_interface_control(&self, _fd: i32) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn start_default_interface_monitor(
+            &self,
+            _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+        ) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close_default_interface_monitor(
+            &self,
+            _listener: Arc<dyn DefaultInterfaceUpdateListener>,
+        ) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn get_interfaces(&self) -> HammerResult<Vec<NetworkInterface>> {
+            Ok(Vec::new())
+        }
+
+        fn read_wifi_state(&self) -> Option<WifiState> {
+            None
+        }
+    }
+
+    struct NoopRouter;
+
+    impl Lifecycle for NoopRouter {
+        fn name(&self) -> &str {
+            "noop-router"
+        }
+
+        fn start(&self, _stage: StartStage) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn close(&self) -> HammerResult<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl DnsRouterTrait for NoopRouter {
+        async fn exchange(
+            &self,
+            _message: Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Message> {
+            Err(HammerError::internal("noop dns router"))
+        }
+
+        async fn lookup(
+            &self,
+            _domain: &str,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Vec<IpAddr>> {
+            Ok(Vec::new())
+        }
+
+        fn try_exchange_fast(
+            &self,
+            _message: &Message,
+            _options: DnsQueryOptions,
+        ) -> HammerResult<Option<Message>> {
+            Ok(None)
+        }
+
+        fn clear_cache(&self) {}
+
+        fn lookup_reverse_mapping(&self, _ip: IpAddr) -> Option<String> {
+            None
+        }
+
+        fn reset_network(&self) {}
+    }
+
+    impl RouterTrait for NoopRouter {
+        fn reset_network(&self) {}
+
+        fn match_route(&self, _metadata: &mut RouteMetadata) -> HammerResult<RouteDecision> {
+            Err(HammerError::internal("noop router"))
+        }
+
+        fn prepare_route_metadata(&self, _metadata: &mut RouteMetadata) -> HammerResult<()> {
+            Ok(())
+        }
+
+        fn sniff_timeout(&self, _metadata: &RouteMetadata) -> Option<std::time::Duration> {
+            None
+        }
+
+        fn should_sniff(&self, _metadata: &RouteMetadata) -> bool {
+            false
+        }
+    }
+
+    fn test_logger(id: &str) -> Logger {
+        Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
+    }
+
+    #[test]
+    fn standard_factory_accepts_tun_inbounds() {
+        let options = vec![hammer_core::config::Inbound {
+            id: "tun".to_owned(),
+            kind: InboundKind::Tun(TunInboundOptions {
+                interface_name: "utun".to_owned(),
+                mtu: 1400,
+                address: Vec::new(),
+                route_address: Vec::new(),
+                route_exclude_address: Vec::new(),
+                auto_route: false,
+                strict_route: true,
+                stack: TunStack::Disabled,
+                tap: false,
+                udp_timeout: None,
+            }),
+        }];
+        let outbound = Arc::new(OutboundManager::new(test_logger("outbound"), "direct"));
+        let router = Arc::new(NoopRouter);
+        let dns_router: Arc<dyn DnsRouterTrait> = Arc::new(NoopRouter);
+
+        let manager = InboundManager::from_options_with_runtime_and_metrics(
+            test_logger("inbound"),
+            &options,
+            router,
+            dns_router,
+            outbound,
+            Arc::new(TestPlatform),
+            MetricsRegistry::new(),
+        )
+        .expect("tun inbound should register");
+
+        let registered = manager.get("tun").expect("registered inbound");
+        assert_eq!(registered.type_name(), "tun");
     }
 }

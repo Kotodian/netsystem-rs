@@ -311,15 +311,13 @@ fn build_options(raw: RawConfig) -> Result<Options, HammerError> {
 
     #[cfg(feature = "wireguard")]
     let has_explicit_endpoints = !raw_endpoints.is_empty();
-    #[cfg(not(feature = "wireguard"))]
-    let has_explicit_endpoints = false;
     #[cfg(feature = "hysteria2")]
     let has_legacy_hysteria = !raw_hysteria.is_default();
     #[cfg(not(feature = "hysteria2"))]
     let has_legacy_hysteria = false;
 
     let (outbounds, default_route_final) = if raw_outbounds.is_empty() {
-        if has_explicit_endpoints && !has_legacy_hysteria {
+        if !has_legacy_hysteria {
             outbound::build_default_outbounds()
         } else {
             #[cfg(feature = "hysteria2")]
