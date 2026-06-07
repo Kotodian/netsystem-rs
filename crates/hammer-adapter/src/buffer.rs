@@ -2677,6 +2677,20 @@ impl BufferFrame {
     }
 
     #[inline]
+    pub fn discard_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = count.min(self.indices.len());
+        drop(self.indices.drain(..count));
+        if self.indices.is_empty() {
+            self.readiness.clear_pending();
+        } else {
+            self.readiness.mark_pending();
+        }
+    }
+
+    #[inline]
     pub fn drain_pending(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)

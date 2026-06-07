@@ -90,18 +90,26 @@ fn drop_node_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let dropped = frame.pending_len();
+    let mut first_error = None;
     {
         let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
         cursor.prefetch_next(runtime);
         while let Some(batch) = cursor.next() {
             cursor.prefetch_next(runtime);
             for index in batch.indices() {
-                add_packet_trace!(runtime, index, DropTrace { dropped })?;
+                if first_error.is_none()
+                    && let Err(err) = add_packet_trace!(runtime, index, DropTrace { dropped })
+                {
+                    first_error = Some(err);
+                }
                 runtime.free_index(index);
             }
         }
     }
     frame.clear();
+    if let Some(err) = first_error {
+        return Err(err);
+    }
     Ok(NodeResult::drop())
 }
 
@@ -112,6 +120,40 @@ impl InternalNode for DropNode {
         Self: Sized,
     {
         NodeRegistration::next(Self::NODE_NAME, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_adapter::RouteMetadata;
+
+    #[test]
+    fn drop_node_clears_frame_after_trace_error_following_freed_packet() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+        let drop = runtime.nodes().register_internal(DropNode::new());
+        let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+        let first = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+            .expect("alloc first");
+        let stale = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"stale")
+            .expect("alloc stale");
+        frame.push_index(first).expect("push first");
+        frame.push_index(stale).expect("push stale");
+        runtime.free_index(stale);
+        let _ = drop;
+
+        let err = drop_node_process(
+            &runtime,
+            hammer_adapter::NodeRuntimeData::empty(),
+            &mut frame,
+        )
+        .expect_err("stale packet should fail trace check");
+
+        assert_eq!(err.to_string(), "buffer slot is free");
+        assert!(!frame.has_pending());
+        assert_eq!(runtime.in_use_buffers(), 0);
     }
 }
 
