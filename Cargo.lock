@@ -1243,6 +1243,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bitflags 2.11.1",
  "bytes",
  "hammer-adapter",
  "hammer-component-macros",
