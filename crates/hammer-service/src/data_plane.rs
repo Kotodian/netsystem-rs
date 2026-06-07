@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
-    NodeId, NodeNextEnqueue, NodeProcessFn, NodeRegistration, NodeResult, PacketTrace,
+    NodeId, NodeProcessFn, NodeRegistration, NodeResult, NodeVectorDispatch, PacketTrace,
     RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -90,10 +90,18 @@ fn drop_node_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let dropped = frame.pending_len();
-    for index in frame.drain_pending() {
-        add_packet_trace!(runtime, index, DropTrace { dropped })?;
-        runtime.free_index(index);
+    {
+        let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
+        cursor.prefetch_next(runtime);
+        while let Some(batch) = cursor.next() {
+            cursor.prefetch_next(runtime);
+            for index in batch.indices() {
+                add_packet_trace!(runtime, index, DropTrace { dropped })?;
+                runtime.free_index(index);
+            }
+        }
     }
+    frame.clear();
     Ok(NodeResult::drop())
 }
 
@@ -435,17 +443,10 @@ pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let Some(first) = frame.pending_indices().first().copied() else {
-        return Ok(NodeResult::drop());
-    };
-    let speculative = next_feature_node_for_index(runtime, first)?;
-    NodeNextEnqueue::new(speculative).validate_frame_with_first_next(
-        runtime,
-        frame,
-        first,
-        speculative,
-        |index| next_feature_node_for_index(runtime, index),
-    )
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        Ok(Some(next_feature_node_for_index(runtime, index)?))
+    })?;
+    Ok(result)
 }
 
 #[inline(always)]

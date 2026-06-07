@@ -96,19 +96,11 @@ pub trait PacketTrace {
 macro_rules! add_packet_trace {
     ($runtime:expr, $index:expr, $trace:expr $(,)?) => {{
         match $runtime.should_trace_packet($index) {
-            Ok(traced) if $crate::trace::unlikely(traced) => $runtime.add_trace($index, $trace),
+            Ok(traced) if $crate::unlikely(traced) => $runtime.add_trace($index, $trace),
             Ok(_) => Ok(()),
             Err(err) => Err(err),
         }
     }};
-}
-
-#[inline(always)]
-pub fn unlikely(value: bool) -> bool {
-    if value {
-        core::hint::cold_path();
-    }
-    value
 }
 
 #[derive(Debug, Clone)]

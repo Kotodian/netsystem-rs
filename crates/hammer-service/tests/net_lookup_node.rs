@@ -845,8 +845,8 @@ fn ip_input_to_lookup_graph_routes_packet_by_fib() {
 }
 
 #[test]
-fn ip_input_keeps_lookup_packets_in_current_frame_without_allocating_next_frame() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 1);
+fn ip_input_batches_lookup_packets_into_one_scheduled_next_frame() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 4);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
     let drop = runtime.nodes().register_internal(DropNode::new());

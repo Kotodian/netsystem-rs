@@ -2,7 +2,7 @@ use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
-    NodeNextEnqueue, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace,
     SocksAddr, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -109,7 +109,7 @@ where
         let mut last_next = None;
         let cached_next = self.cached_next;
         let mut traces = std::vec::Vec::new();
-        let speculative = if let Some(cached_next) = cached_next {
+        let first_next = if let Some(cached_next) = cached_next {
             cached_next
         } else {
             let mut batch = runtime.buffer_batch_mut();
@@ -126,7 +126,7 @@ where
             first_next
         };
         let mut first_chunk = true;
-        let result = NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
             runtime,
             frame,
             |batch, indices| {
@@ -136,7 +136,7 @@ where
                 let start_offset = if first_chunk {
                     first_chunk = false;
                     if cached_next.is_none() {
-                        nexts[0] = speculative;
+                        nexts[0] = Some(first_next);
                         1
                     } else {
                         0
@@ -160,9 +160,7 @@ where
         for (index, trace) in traces {
             add_packet_trace!(runtime, index, trace)?;
         }
-        if let Some(node) = last_next {
-            self.cached_next = Some(node);
-        }
+        self.cached_next = cached_next;
         Ok(result)
     }
 
@@ -204,7 +202,7 @@ where
     let width = frame_batch_width(runtime);
     let cached_next: Option<NodeId> = None;
     let mut traces = std::vec::Vec::new();
-    let speculative = {
+    let first_next = {
         let mut batch = runtime.buffer_batch_mut();
         prefetch_range_with_batch(&mut batch, indices, 0, width);
         let first_next = next_node_for_index_with_batch(
@@ -217,9 +215,9 @@ where
         )?;
         first_next
     };
-    let mut last_next = Some(speculative);
+    let mut last_next = Some(first_next);
     let mut first_chunk = true;
-    let result = NodeNextEnqueue::new(speculative).validate_frame_with_buffer_batch_chunks(
+    let (result, _) = NodeVectorDispatch::new(Some(first_next)).route_frame(
         runtime,
         frame,
         |batch, indices| {
@@ -229,7 +227,7 @@ where
             let start_offset = if first_chunk {
                 first_chunk = false;
                 if cached_next.is_none() {
-                    nexts[0] = speculative;
+                    nexts[0] = Some(first_next);
                     1
                 } else {
                     0
@@ -462,7 +460,7 @@ fn next_nodes_for_indices_with_batch(
     runtime: &DataPlaneRuntime,
     batch: &mut BufferBatchMut<'_>,
     indices: &[BufferIndex],
-    nexts: &mut [NodeId; 4],
+    nexts: &mut [Option<NodeId>; 4],
     start_offset: usize,
     next: [NodeId; IpInputNext::COUNT],
     feature_arc: Option<&FeatureArcStartHandle>,
@@ -472,7 +470,7 @@ fn next_nodes_for_indices_with_batch(
     for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
         let node =
             next_node_for_index_with_batch(runtime, batch, index, next, feature_arc, traces)?;
-        nexts[offset] = node;
+        nexts[offset] = Some(node);
         *last_next = Some(node);
     }
     Ok(())

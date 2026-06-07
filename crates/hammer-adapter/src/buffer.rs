@@ -939,8 +939,9 @@ impl DataPlaneBuffers {
                 Err(_) => return,
             };
             next = buffer.next_buffer();
-            if let Some(mark) = buffer.take_trace_mark() {
-                self.trace.finalize(mark);
+            let mark = buffer.take_trace_mark();
+            if crate::unlikely(mark.is_some()) {
+                self.trace.finalize(mark.expect("trace mark checked"));
             }
         }
     }
@@ -1125,7 +1126,7 @@ impl DataPlaneRuntime {
 
     #[inline(always)]
     pub fn should_trace_packet(&self, index: BufferIndex) -> CoreResult<bool> {
-        Ok(crate::trace::unlikely(
+        Ok(crate::unlikely(
             self.get_buffer(index)?.trace_mark().is_some(),
         ))
     }

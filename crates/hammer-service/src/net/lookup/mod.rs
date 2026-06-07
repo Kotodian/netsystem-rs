@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeNextFrames, NodeNextVectorEnqueue,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, RouteMetadata,
-    TraceFormatter, add_packet_trace, unlikely,
+    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeProcessFn, NodeRegistration,
+    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, RouteMetadata, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -395,21 +395,6 @@ impl IpLookupNode {
             Self::prefetch_index_with_batch(batch, table, index);
         }
     }
-
-    #[inline(always)]
-    fn process_indices_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        table: &FibTable,
-        indices: &[BufferIndex],
-        nexts: &mut [NodeId; 4],
-        start_offset: usize,
-        traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
-    ) -> CoreResult<()> {
-        for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
-            nexts[offset] = Self::process_index_with_batch(batch, table, index, traces)?;
-        }
-        Ok(())
-    }
 }
 
 impl Node for IpLookupNode {
@@ -431,37 +416,36 @@ impl Node for IpLookupNode {
             Self::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
             Self::process_index_with_batch(&mut batch, &table, first, &mut traces)?
         };
-        let cached_next = self.cached_next.unwrap_or(first_next);
         let mut first_chunk = true;
-        let (result, cached_next) = NodeNextVectorEnqueue::new(cached_next)
-            .enqueue_frame_with_buffer_batch_chunks(
-                runtime,
-                frame,
-                |batch, indices| {
-                    Self::prefetch_indices_with_batch(batch, &table, indices);
-                },
-                |batch, indices, nexts| {
-                    let start_offset = if first_chunk {
-                        first_chunk = false;
-                        nexts[0] = first_next;
-                        1
-                    } else {
-                        0
-                    };
-                    Self::process_indices_with_batch(
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
+            runtime,
+            frame,
+            |batch, indices| {
+                Self::prefetch_indices_with_batch(batch, &table, indices);
+            },
+            |batch, indices, nexts| {
+                let start_offset = if first_chunk {
+                    first_chunk = false;
+                    nexts[0] = Some(first_next);
+                    1
+                } else {
+                    0
+                };
+                for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
+                    nexts[offset] = Some(Self::process_index_with_batch(
                         batch,
                         &table,
-                        indices,
-                        nexts,
-                        start_offset,
+                        index,
                         &mut traces,
-                    )
-                },
-            )?;
+                    )?);
+                }
+                Ok(())
+            },
+        )?;
         for (index, trace) in traces {
             add_packet_trace!(runtime, index, trace)?;
         }
-        self.cached_next = Some(cached_next);
+        self.cached_next = cached_next;
         Ok(result)
     }
 
@@ -611,43 +595,13 @@ impl Node for AdjacencyRewriteNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut next_frames = NodeNextFrames::default();
-        let mut current_next = self.cached_next;
-        let mut last_next = None;
-        let result =
-            frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-                let Some(node) = Self::next_for_index(&self.table, runtime, index)? else {
-                    return Ok(None);
-                };
-                last_next = Some(node);
-                match current_next {
-                    Some(current) if current == node => Ok(Some(index)),
-                    Some(_) => {
-                        next_frames.enqueue(runtime, node, index)?;
-                        Ok(None)
-                    }
-                    None => {
-                        current_next = Some(node);
-                        Ok(Some(index))
-                    }
-                }
-            });
-        if let Err(err) = result {
-            next_frames.free(runtime);
-            return Err(err);
-        }
-
-        next_frames.schedule(runtime)?;
-        if let Some(node) = last_next {
-            self.cached_next = Some(node);
-        }
-        if frame.has_pending()
-            && let Some(node) = current_next
-        {
-            Ok(NodeResult::next_current(node))
-        } else {
-            Ok(NodeResult::drop())
-        }
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| Self::next_for_index(&self.table, runtime, index),
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -753,31 +707,31 @@ fn ip_lookup_process(
         IpLookupNode::process_index_with_batch(&mut batch, &table, first, &mut traces)?
     };
     let mut first_chunk = true;
-    let (result, _) = NodeNextVectorEnqueue::new(first_next)
-        .enqueue_frame_with_buffer_batch_chunks(
-            runtime,
-            frame,
-            |batch, indices| {
-                IpLookupNode::prefetch_indices_with_batch(batch, &table, indices);
-            },
-            |batch, indices, nexts| {
-                let start_offset = if first_chunk {
-                    first_chunk = false;
-                    nexts[0] = first_next;
-                    1
-                } else {
-                    0
-                };
-                IpLookupNode::process_indices_with_batch(
+    let (result, _) = NodeVectorDispatch::new(Some(first_next)).route_frame(
+        runtime,
+        frame,
+        |batch, indices| {
+            IpLookupNode::prefetch_indices_with_batch(batch, &table, indices);
+        },
+        |batch, indices, nexts| {
+            let start_offset = if first_chunk {
+                first_chunk = false;
+                nexts[0] = Some(first_next);
+                1
+            } else {
+                0
+            };
+            for (offset, index) in indices.iter().copied().enumerate().skip(start_offset) {
+                nexts[offset] = Some(IpLookupNode::process_index_with_batch(
                     batch,
                     &table,
-                    indices,
-                    nexts,
-                    start_offset,
+                    index,
                     &mut traces,
-                )
-            },
-        )?;
+                )?);
+            }
+            Ok(())
+        },
+    )?;
     for (index, trace) in traces {
         add_packet_trace!(runtime, index, trace)?;
     }
@@ -790,37 +744,10 @@ fn adjacency_rewrite_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = adjacency_rewrite_runtime(data)?;
-    let mut next_frames = NodeNextFrames::default();
-    let mut current_next = None;
-    let result = frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        let Some(node) = AdjacencyRewriteNode::next_for_index(&state.table, runtime, index)? else {
-            return Ok(None);
-        };
-        match current_next {
-            Some(current) if current == node => Ok(Some(index)),
-            Some(_) => {
-                next_frames.enqueue(runtime, node, index)?;
-                Ok(None)
-            }
-            None => {
-                current_next = Some(node);
-                Ok(Some(index))
-            }
-        }
-    });
-    if let Err(err) = result {
-        next_frames.free(runtime);
-        return Err(err);
-    }
-
-    next_frames.schedule(runtime)?;
-    if frame.has_pending()
-        && let Some(node) = current_next
-    {
-        Ok(NodeResult::next_current(node))
-    } else {
-        Ok(NodeResult::drop())
-    }
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        AdjacencyRewriteNode::next_for_index(&state.table, runtime, index)
+    })?;
+    Ok(result)
 }
 
 #[inline(always)]

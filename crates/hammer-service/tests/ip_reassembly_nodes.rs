@@ -542,7 +542,7 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
 
 #[test]
 fn ipv4_reassembly_reuses_current_frame_for_complete_packet() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 1);
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 4);
     let capture = SinkCapture::new();
     let sink = runtime.nodes().register_internal(capture.node());
     let drop = runtime.nodes().register_internal(DropNode::new());

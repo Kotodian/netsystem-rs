@@ -32,6 +32,7 @@ pub use hammer_core::lifecycle::{
     ALL_STAGES, LIFECYCLE_ORDER, Lifecycle, LifecycleService, StartStage,
 };
 pub use hammer_core::protocol::icmp::IcmpErrorMetadata;
+pub use hammer_infra::hint::unlikely;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
 pub use instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 
@@ -54,8 +55,7 @@ pub use node::{
     DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeErrorCounters, NodeHandle,
     NodeId, NodeKind, NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage,
     NodeNextVectorEnqueue, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntime,
-    NodeRuntimeData, NodeRuntimeReady, NoopNode, PacketNextResolver, process_cached_rewrite_next,
-    process_cached_speculative_next,
+    NodeRuntimeData, NodeRuntimeReady, NodeVectorDispatch, NoopNode, default_prefetch_indices,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,
@@ -79,5 +79,5 @@ pub use rule::{
 pub use service::ServiceManager;
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
-    TraceInputPolicy, TraceMark, TracePolicy, TraceRecord, TraceRecordSink, unlikely,
+    TraceInputPolicy, TraceMark, TracePolicy, TraceRecord, TraceRecordSink,
 };

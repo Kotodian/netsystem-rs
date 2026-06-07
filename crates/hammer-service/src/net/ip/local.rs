@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeProcessFn, NodeResult, NodeRuntimeData, PacketNextResolver, PacketTrace, SocksAddr,
-    TraceFormatter, add_packet_trace, process_cached_rewrite_next,
+    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, SocksAddr,
+    TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -489,34 +489,19 @@ fn process_frame(
     feature_arc: Option<&FeatureArcStartHandle>,
     cached_next: &mut Option<NodeId>,
 ) -> CoreResult<NodeResult> {
-    let resolver = IpLocalNextResolver {
-        state,
-        next,
-        stage,
-        feature_arc,
-    };
-    process_cached_rewrite_next(runtime, frame, cached_next, &resolver)
-}
-
-struct IpLocalNextResolver<'a> {
-    state: &'a IpLocalState,
-    next: [NodeId; IpLocalNext::COUNT],
-    stage: LocalStage,
-    feature_arc: Option<&'a FeatureArcStartHandle>,
-}
-
-impl PacketNextResolver for IpLocalNextResolver<'_> {
-    #[inline(always)]
-    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
-        process_index(
-            runtime,
-            index,
-            self.state,
-            &self.next,
-            self.stage,
-            self.feature_arc,
-        )
-    }
+    let (result, next_cache) =
+        NodeVectorDispatch::new(*cached_next).route_frame_index(runtime, frame, |index| {
+            Ok(Some(process_index(
+                runtime,
+                index,
+                state,
+                &next,
+                stage,
+                feature_arc,
+            )?))
+        })?;
+    *cached_next = next_cache;
+    Ok(result)
 }
 
 #[inline(always)]
