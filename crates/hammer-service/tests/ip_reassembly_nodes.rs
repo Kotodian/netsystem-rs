@@ -541,8 +541,8 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
 }
 
 #[test]
-fn ipv4_reassembly_reuses_current_frame_for_complete_packet() {
-    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 1);
+fn ipv4_reassembly_emits_complete_packet_from_ip_input_path() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 4);
     let capture = SinkCapture::new();
     let sink = runtime.nodes().register_internal(capture.node());
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -573,6 +573,39 @@ fn ipv4_reassembly_reuses_current_frame_for_complete_packet() {
         capture.packets(),
         vec![ipv4_reassembled_packet(&original, 110)]
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn ipv4_reassembly_node_reuses_current_frame_without_allocating_output_frame() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 1);
+    let capture = SinkCapture::new();
+    let sink = runtime.nodes().register_internal(capture.node());
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let reassembly = runtime
+        .nodes()
+        .register_internal(IpReassemblyNode::new(ip_reassembly_nexts(sink, drop)));
+    let original = ipv4_udp_packet(
+        [10, 0, 0, 42],
+        12_385,
+        [198, 51, 100, 47],
+        53,
+        b"abcdefghijklmnopqrstuvwx",
+    );
+    let fragments = ipv4_fragments(&original, 130, 16);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    push_packet(&runtime, frame, &fragments[1]);
+    let first_fragment = push_packet(&runtime, frame, &fragments[0]);
+
+    assert!(runtime.schedule_frame(reassembly, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(
+        capture.packets(),
+        vec![ipv4_reassembled_packet(&original, 130)]
+    );
+    assert_eq!(capture.buffer_indices(), vec![first_fragment]);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }

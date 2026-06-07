@@ -9,7 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
-    NodeId, NodeNextEnqueue, NodeProcessFn, NodeRegistration, NodeResult, PacketTrace,
+    NodeId, NodeProcessFn, NodeRegistration, NodeResult, NodeVectorDispatch, PacketTrace,
     RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -90,9 +90,25 @@ fn drop_node_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let dropped = frame.pending_len();
-    for index in frame.drain_pending() {
-        add_packet_trace!(runtime, index, DropTrace { dropped })?;
-        runtime.free_index(index);
+    let mut first_error = None;
+    {
+        let mut cursor = frame.batch_cursor(runtime.preferred_frame_batch_width());
+        cursor.prefetch_next(runtime);
+        while let Some(batch) = cursor.next() {
+            cursor.prefetch_next(runtime);
+            for index in batch.indices() {
+                if first_error.is_none()
+                    && let Err(err) = add_packet_trace!(runtime, index, DropTrace { dropped })
+                {
+                    first_error = Some(err);
+                }
+                runtime.free_index(index);
+            }
+        }
+    }
+    frame.clear();
+    if let Some(err) = first_error {
+        return Err(err);
     }
     Ok(NodeResult::drop())
 }
@@ -104,6 +120,40 @@ impl InternalNode for DropNode {
         Self: Sized,
     {
         NodeRegistration::next(Self::NODE_NAME, 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_adapter::RouteMetadata;
+
+    #[test]
+    fn drop_node_clears_frame_after_trace_error_following_freed_packet() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+        let drop = runtime.nodes().register_internal(DropNode::new());
+        let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
+        let first = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+            .expect("alloc first");
+        let stale = runtime
+            .alloc_index_with_bytes(RouteMetadata::default(), b"stale")
+            .expect("alloc stale");
+        frame.push_index(first).expect("push first");
+        frame.push_index(stale).expect("push stale");
+        runtime.free_index(stale);
+        let _ = drop;
+
+        let err = drop_node_process(
+            &runtime,
+            hammer_adapter::NodeRuntimeData::empty(),
+            &mut frame,
+        )
+        .expect_err("stale packet should fail trace check");
+
+        assert_eq!(err.to_string(), "buffer slot is free");
+        assert!(!frame.has_pending());
+        assert_eq!(runtime.in_use_buffers(), 0);
     }
 }
 
@@ -435,17 +485,10 @@ pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let Some(first) = frame.pending_indices().first().copied() else {
-        return Ok(NodeResult::drop());
-    };
-    let speculative = next_feature_node_for_index(runtime, first)?;
-    NodeNextEnqueue::new(speculative).validate_frame_with_first_next(
-        runtime,
-        frame,
-        first,
-        speculative,
-        |index| next_feature_node_for_index(runtime, index),
-    )
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        Ok(Some(next_feature_node_for_index(runtime, index)?))
+    })?;
+    Ok(result)
 }
 
 #[inline(always)]

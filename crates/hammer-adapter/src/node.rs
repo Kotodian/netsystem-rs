@@ -17,7 +17,7 @@ pub const MAX_NODE_NEXT_FRAMES: usize = 8;
 
 pub use next::{
     NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,
-    PacketNextResolver, process_cached_rewrite_next, process_cached_speculative_next,
+    NodeVectorDispatch, default_prefetch_indices,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

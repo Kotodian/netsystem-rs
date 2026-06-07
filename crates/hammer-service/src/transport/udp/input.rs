@@ -3,8 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeProcessFn,
-    NodeResult, NodeRuntimeData, PacketNextResolver, PacketTrace, TraceFormatter, add_packet_trace,
-    process_cached_rewrite_next,
+    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -225,11 +224,15 @@ impl Node for UdpInputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = UdpInputNextResolver {
-            snapshot: self.snapshot.load(),
-            next: Self::runtime_nexts(runtime)?,
-        };
-        process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+        let snapshot = self.snapshot.load();
+        let next = Self::runtime_nexts(runtime)?;
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| Ok(Some(next_node_for_index(runtime, index, &snapshot, &next)?)),
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -245,18 +248,6 @@ impl Node for UdpInputNode {
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
         Ok(self.runtime_data)
-    }
-}
-
-struct UdpInputNextResolver {
-    snapshot: arc_swap::Guard<Arc<UdpInputSnapshot>>,
-    next: [NodeId; UdpInputNext::COUNT],
-}
-
-impl PacketNextResolver for UdpInputNextResolver {
-    #[inline(always)]
-    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
-        next_node_for_index(runtime, index, &self.snapshot, &self.next)
     }
 }
 
@@ -295,12 +286,12 @@ fn udp_input_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = udp_input_runtime(data)?;
-    let resolver = UdpInputNextResolver {
-        snapshot: state.snapshot.load(),
-        next: UdpInputNode::runtime_nexts(runtime)?,
-    };
-    let mut cached_next = None;
-    process_cached_rewrite_next(runtime, frame, &mut cached_next, &resolver)
+    let snapshot = state.snapshot.load();
+    let next = UdpInputNode::runtime_nexts(runtime)?;
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        Ok(Some(next_node_for_index(runtime, index, &snapshot, &next)?))
+    })?;
+    Ok(result)
 }
 
 #[derive(Debug, Clone, Copy)]

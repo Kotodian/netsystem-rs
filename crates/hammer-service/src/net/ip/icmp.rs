@@ -4,9 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
-    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketNextResolver,
-    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace, process_cached_rewrite_next,
-    process_cached_speculative_next,
+    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
@@ -587,17 +586,6 @@ pub struct IcmpInputNode {
     cached_next: Option<NodeId>,
 }
 
-struct IcmpInputNextResolver {
-    snapshot: arc_swap::Guard<Arc<IcmpInputSnapshot>>,
-}
-
-impl PacketNextResolver for IcmpInputNextResolver {
-    #[inline(always)]
-    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
-        next_node_for_index(runtime, index, &self.snapshot)
-    }
-}
-
 impl Node for IcmpInputNode {
     #[inline(always)]
     fn process(
@@ -605,10 +593,14 @@ impl Node for IcmpInputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = IcmpInputNextResolver {
-            snapshot: self.snapshot.load(),
-        };
-        process_cached_speculative_next(runtime, frame, &mut self.cached_next, &resolver)
+        let snapshot = self.snapshot.load();
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| Ok(Some(next_node_for_index(runtime, index, &snapshot)?)),
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -641,17 +633,6 @@ pub struct IcmpEchoRequestNode {
     cached_next: Option<NodeId>,
 }
 
-struct IcmpEchoRequestNextResolver {
-    next: [NodeId; IcmpEchoRequestNext::COUNT],
-}
-
-impl PacketNextResolver for IcmpEchoRequestNextResolver {
-    #[inline(always)]
-    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
-        next_node_for_echo_request_index(runtime, index, self.next)
-    }
-}
-
 impl Node for IcmpEchoRequestNode {
     #[inline(always)]
     fn process(
@@ -659,10 +640,18 @@ impl Node for IcmpEchoRequestNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = IcmpEchoRequestNextResolver {
-            next: Self::runtime_nexts(runtime)?,
-        };
-        process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+        let next = Self::runtime_nexts(runtime)?;
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| {
+                Ok(Some(next_node_for_echo_request_index(
+                    runtime, index, next,
+                )?))
+            },
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -711,11 +700,11 @@ fn icmp_input_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = icmp_input_runtime(data)?;
-    let resolver = IcmpInputNextResolver {
-        snapshot: state.snapshot.load(),
-    };
-    let mut cached_next = None;
-    process_cached_speculative_next(runtime, frame, &mut cached_next, &resolver)
+    let snapshot = state.snapshot.load();
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        Ok(Some(next_node_for_index(runtime, index, &snapshot)?))
+    })?;
+    Ok(result)
 }
 
 fn icmp_echo_request_process(
@@ -723,11 +712,13 @@ fn icmp_echo_request_process(
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let resolver = IcmpEchoRequestNextResolver {
-        next: IcmpEchoRequestNode::runtime_nexts(runtime)?,
-    };
-    let mut cached_next = None;
-    process_cached_rewrite_next(runtime, frame, &mut cached_next, &resolver)
+    let next = IcmpEchoRequestNode::runtime_nexts(runtime)?;
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        Ok(Some(next_node_for_echo_request_index(
+            runtime, index, next,
+        )?))
+    })?;
+    Ok(result)
 }
 
 #[hammer_component_macros::node_next]
@@ -744,22 +735,6 @@ pub struct IcmpErrorNode {
     source_table: Option<IcmpErrorSourceTableHandle>,
     #[node(default)]
     cached_next: Option<NodeId>,
-}
-
-struct IcmpErrorNextResolver {
-    next: [NodeId; IcmpErrorNext::COUNT],
-    source_table: Option<arc_swap::Guard<Arc<IcmpErrorSourceSnapshot>>>,
-}
-
-impl PacketNextResolver for IcmpErrorNextResolver {
-    #[inline(always)]
-    fn next_for_index(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<NodeId> {
-        let source_table = self
-            .source_table
-            .as_ref()
-            .map(|source_table| source_table.as_ref());
-        next_node_for_icmp_error_index(runtime, index, self.next, source_table)
-    }
 }
 
 impl IcmpErrorNode {
@@ -779,14 +754,28 @@ impl Node for IcmpErrorNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let resolver = IcmpErrorNextResolver {
-            next: Self::runtime_nexts(runtime)?,
-            source_table: self
-                .source_table
-                .as_ref()
-                .map(IcmpErrorSourceTableHandle::load),
-        };
-        process_cached_rewrite_next(runtime, frame, &mut self.cached_next, &resolver)
+        let next = Self::runtime_nexts(runtime)?;
+        let source_table = self
+            .source_table
+            .as_ref()
+            .map(IcmpErrorSourceTableHandle::load);
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| {
+                let source_table = source_table
+                    .as_ref()
+                    .map(|source_table| source_table.as_ref());
+                Ok(Some(next_node_for_icmp_error_index(
+                    runtime,
+                    index,
+                    next,
+                    source_table,
+                )?))
+            },
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -858,15 +847,23 @@ fn icmp_error_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = icmp_error_runtime(data)?;
-    let resolver = IcmpErrorNextResolver {
-        next: IcmpErrorNode::runtime_nexts(runtime)?,
-        source_table: state
-            .source_table
+    let next = IcmpErrorNode::runtime_nexts(runtime)?;
+    let source_table = state
+        .source_table
+        .as_ref()
+        .map(IcmpErrorSourceTableHandle::load);
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        let source_table = source_table
             .as_ref()
-            .map(IcmpErrorSourceTableHandle::load),
-    };
-    let mut cached_next = None;
-    process_cached_rewrite_next(runtime, frame, &mut cached_next, &resolver)
+            .map(|source_table| source_table.as_ref());
+        Ok(Some(next_node_for_icmp_error_index(
+            runtime,
+            index,
+            next,
+            source_table,
+        )?))
+    })?;
+    Ok(result)
 }
 
 #[inline(always)]

@@ -939,8 +939,9 @@ impl DataPlaneBuffers {
                 Err(_) => return,
             };
             next = buffer.next_buffer();
-            if let Some(mark) = buffer.take_trace_mark() {
-                self.trace.finalize(mark);
+            let mark = buffer.take_trace_mark();
+            if crate::unlikely(mark.is_some()) {
+                self.trace.finalize(mark.expect("trace mark checked"));
             }
         }
     }
@@ -1125,7 +1126,7 @@ impl DataPlaneRuntime {
 
     #[inline(always)]
     pub fn should_trace_packet(&self, index: BufferIndex) -> CoreResult<bool> {
-        Ok(crate::trace::unlikely(
+        Ok(crate::unlikely(
             self.get_buffer(index)?.trace_mark().is_some(),
         ))
     }
@@ -2676,6 +2677,20 @@ impl BufferFrame {
     }
 
     #[inline]
+    pub fn discard_prefix(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count = count.min(self.indices.len());
+        drop(self.indices.drain(..count));
+        if self.indices.is_empty() {
+            self.readiness.clear_pending();
+        } else {
+            self.readiness.mark_pending();
+        }
+    }
+
+    #[inline]
     pub fn drain_pending(&mut self) -> hammer_infra::vec::Drain<'_, BufferIndex> {
         self.readiness.clear_pending();
         self.indices.drain(..)
@@ -2753,7 +2768,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    pub fn retain_indices_batched_with_prefetch_state_lazy<S>(
+    pub fn buffer_node_inline<S>(
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,
@@ -2771,7 +2786,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    pub(crate) fn retain_indices_batched_with_prefetch_state_lazy_chunks<S>(
+    pub(crate) fn buffer_node_inline_chunks<S>(
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,

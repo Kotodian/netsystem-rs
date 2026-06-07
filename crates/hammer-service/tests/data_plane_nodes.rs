@@ -606,6 +606,52 @@ fn drop_node_adds_trace_payload_before_freeing_packet() {
 }
 
 #[test]
+fn drop_node_returns_trace_error_and_frees_scheduled_frame_with_stale_index() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let control = TraceControlPlane::new(4);
+    control.publish(TracePolicy {
+        enabled: true,
+        record_capacity: 4,
+        packet_capacity: 2,
+        inputs: vec![TraceInputPolicy {
+            node: drop,
+            count: 1,
+        }],
+    });
+    runtime.set_trace_control(Some(control.handle()), 2);
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let first = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .expect("alloc first");
+    let stale = runtime
+        .alloc_index_with_bytes(RouteMetadata::default(), b"stale")
+        .expect("alloc stale");
+    runtime.try_mark_trace(drop, stale).expect("mark stale");
+    {
+        let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
+        frame_ref.push_index(first).expect("push first");
+        frame_ref.push_index(stale).expect("push stale");
+    }
+    runtime.free_index(stale);
+
+    assert!(runtime.schedule_frame(drop, frame).expect("schedule drop"));
+
+    let err = runtime
+        .run_ready_nodes()
+        .expect_err("stale packet should fail trace check");
+
+    assert_eq!(err.to_string(), "buffer slot is free");
+    let frame_err = match runtime.get_frame_mut(frame) {
+        Ok(_) => panic!("frame should be freed"),
+        Err(err) => err,
+    };
+    assert_eq!(frame_err.to_string(), "frame slot is free");
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn static_route_node_adds_trace_payload_for_route_decision() {
     let runtime = DataPlaneRuntime::with_capacities(128, 4, 2, 4);
     let decisions = Arc::new(Mutex::new(Vec::new()));

@@ -3,8 +3,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeNextFrames,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter,
     add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
@@ -892,43 +892,13 @@ impl Node for InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let mut next_frames = NodeNextFrames::default();
-        let mut current_next = self.cached_next;
-        let mut last_next = None;
-        let result =
-            frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-                let Some(node) = Self::tx_for_index(&self.output, runtime, index)? else {
-                    return Ok(None);
-                };
-                last_next = Some(node);
-                match current_next {
-                    Some(current) if current == node => Ok(Some(index)),
-                    Some(_) => {
-                        next_frames.enqueue(runtime, node, index)?;
-                        Ok(None)
-                    }
-                    None => {
-                        current_next = Some(node);
-                        Ok(Some(index))
-                    }
-                }
-            });
-        if let Err(err) = result {
-            next_frames.free(runtime);
-            return Err(err);
-        }
-
-        next_frames.schedule(runtime)?;
-        if let Some(node) = last_next {
-            self.cached_next = Some(node);
-        }
-        if frame.has_pending()
-            && let Some(node) = current_next
-        {
-            Ok(NodeResult::next_current(node))
-        } else {
-            Ok(NodeResult::drop())
-        }
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+            runtime,
+            frame,
+            |index| Self::tx_for_index(&self.output, runtime, index),
+        )?;
+        self.cached_next = cached_next;
+        Ok(result)
     }
 
     #[inline]
@@ -992,35 +962,8 @@ fn interface_output_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = interface_output_runtime(data)?;
-    let mut next_frames = NodeNextFrames::default();
-    let mut current_next = None;
-    let result = frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        let Some(node) = InterfaceOutputNode::tx_for_index(&state.output, runtime, index)? else {
-            return Ok(None);
-        };
-        match current_next {
-            Some(current) if current == node => Ok(Some(index)),
-            Some(_) => {
-                next_frames.enqueue(runtime, node, index)?;
-                Ok(None)
-            }
-            None => {
-                current_next = Some(node);
-                Ok(Some(index))
-            }
-        }
-    });
-    if let Err(err) = result {
-        next_frames.free(runtime);
-        return Err(err);
-    }
-
-    next_frames.schedule(runtime)?;
-    if frame.has_pending()
-        && let Some(node) = current_next
-    {
-        Ok(NodeResult::next_current(node))
-    } else {
-        Ok(NodeResult::drop())
-    }
+    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+        InterfaceOutputNode::tx_for_index(&state.output, runtime, index)
+    })?;
+    Ok(result)
 }
