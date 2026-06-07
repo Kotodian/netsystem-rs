@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, DataPlaneInstructionSet, DataPlaneRuntime,
-    DriverNode, Node, NodeId, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PooledBufferFrame, RouteMetadata,
+    DriverNode, NextFrame, Node, NodeId, NodeProcessFn, NodeResult, NodeRuntimeData,
+    NodeVectorDispatch, PooledBufferFrame, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -63,9 +63,12 @@ fn quad_prefetches_future_chunks_before_later_chunk_processing() {
         )
         .expect("route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(node)]);
     assert_eq!(cached_next, Some(node));
-    assert!(!frame.has_pending());
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[0, 1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
     assert_eq!(
         *events.borrow(),
         vec![
@@ -94,9 +97,12 @@ fn pair_prefetches_future_chunks_before_later_chunk_processing() {
         )
         .expect("route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(node)]);
     assert_eq!(cached_next, Some(node));
-    assert!(!frame.has_pending());
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[0, 1, 2, 3, 4]);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
     assert_eq!(
         *events.borrow(),
         vec![
@@ -112,7 +118,7 @@ fn pair_prefetches_future_chunks_before_later_chunk_processing() {
 }
 
 #[test]
-fn mixed_next_nodes_split_into_scheduled_frames() {
+fn mixed_next_nodes_keep_current_next_packets_in_current_frame() {
     let runtime = runtime_with_instruction_set(DataPlaneInstructionSet::Avx2);
     reset_sink_packets();
     let default = register_sink(&runtime, 0);
@@ -138,11 +144,14 @@ fn mixed_next_nodes_split_into_scheduled_frames() {
         )
         .expect("route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(default)]);
     assert_eq!(cached_next, Some(default));
-    assert!(!frame.has_pending());
-    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
-    assert_eq!(sink_packets(0), vec![0, 1, 4, 7]);
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[0, 1, 4, 7]);
+    assert_eq!(runtime.frames_in_use(), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
     assert_eq!(sink_packets(1), vec![2, 3, 5, 6]);
 
     runtime.free_frame(&mut frame);
@@ -171,13 +180,15 @@ fn none_decisions_expect_callback_to_handle_packet_ownership() {
         )
         .expect("route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(routed)]);
     assert_eq!(cached_next, Some(routed));
-    assert!(!frame.has_pending());
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[0, 2, 4]);
+    assert_eq!(runtime.frames_in_use(), 1);
     assert_eq!(runtime.in_use_buffers(), 5);
-    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
-    assert_eq!(sink_packets(0), vec![0, 2, 4]);
-    assert_eq!(runtime.in_use_buffers(), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
+    assert_eq!(runtime.in_use_buffers(), 5);
 
     runtime.free_frame(&mut frame);
     for index in consumed {
@@ -202,7 +213,7 @@ fn route_frame_prefetch_matches_custom_prefetch_routing_behavior() {
     ]);
 
     let mut custom_frame = packet_frame(&runtime, 6);
-    let (_, custom_cache) = NodeVectorDispatch::new(Some(default))
+    let (custom_result, custom_cache) = NodeVectorDispatch::new(Some(default))
         .route_frame(
             &runtime,
             &mut custom_frame,
@@ -215,31 +226,51 @@ fn route_frame_prefetch_matches_custom_prefetch_routing_behavior() {
         )
         .expect("custom route frame");
 
+    assert_eq!(
+        next_frames(&custom_result),
+        vec![NextFrame::Current(default)]
+    );
     assert_eq!(custom_cache, Some(default));
-    assert!(!custom_frame.has_pending());
+    assert!(custom_frame.has_pending());
+    assert_pending_ids(&runtime, &custom_frame, &[0, 2, 4, 5]);
+    assert_eq!(runtime.frames_in_use(), 2);
     assert_eq!(
         runtime.run_ready_nodes().expect("run custom ready nodes"),
-        2
+        1
     );
-    assert_eq!(sink_packets(0), vec![0, 2, 4, 5]);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
     assert_eq!(sink_packets(1), vec![1, 3]);
     runtime.free_frame(&mut custom_frame);
+    runtime
+        .release_pooled_frame(custom_frame)
+        .expect("release custom frame");
 
     reset_sink_packets();
     let mut prefetch_frame = packet_frame(&runtime, 6);
-    let (_, prefetch_cache) = NodeVectorDispatch::new(Some(default))
+    let (prefetch_result, prefetch_cache) = NodeVectorDispatch::new(Some(default))
         .route_frame_prefetch(&runtime, &mut prefetch_frame, route_by_packet_id(route))
         .expect("default prefetch route frame");
 
+    assert_eq!(
+        next_frames(&prefetch_result),
+        vec![NextFrame::Current(default)]
+    );
     assert_eq!(prefetch_cache, Some(default));
-    assert!(!prefetch_frame.has_pending());
+    assert!(prefetch_frame.has_pending());
+    assert_pending_ids(&runtime, &prefetch_frame, &[0, 2, 4, 5]);
+    assert_eq!(runtime.frames_in_use(), 2);
     assert_eq!(
         runtime.run_ready_nodes().expect("run prefetch ready nodes"),
-        2
+        1
     );
-    assert_eq!(sink_packets(0), vec![0, 2, 4, 5]);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
     assert_eq!(sink_packets(1), vec![1, 3]);
     runtime.free_frame(&mut prefetch_frame);
+    runtime
+        .release_pooled_frame(prefetch_frame)
+        .expect("release prefetch frame");
 }
 
 #[test]
@@ -262,14 +293,17 @@ fn route_frame_map_routes_indices_and_leaves_none_ownership_to_callback() {
         })
         .expect("map route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(default)]);
     assert_eq!(cached_next, Some(alternate));
-    assert!(!frame.has_pending());
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[1, 2]);
+    assert_eq!(runtime.frames_in_use(), 2);
     assert_eq!(runtime.in_use_buffers(), 6);
-    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 2);
-    assert_eq!(sink_packets(0), vec![1, 2]);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+    assert_eq!(runtime.frames_in_use(), 1);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
     assert_eq!(sink_packets(1), vec![4, 5]);
-    assert_eq!(runtime.in_use_buffers(), 2);
+    assert_eq!(runtime.in_use_buffers(), 4);
 
     runtime.free_frame(&mut frame);
     for index in consumed {
@@ -303,13 +337,15 @@ fn route_frame_index_allows_runtime_owned_consumption_without_batch_borrow() {
         })
         .expect("index route frame");
 
-    assert!(result.is_empty());
+    assert_eq!(next_frames(&result), vec![NextFrame::Current(routed)]);
     assert_eq!(cached_next, Some(routed));
-    assert!(!frame.has_pending());
+    assert!(frame.has_pending());
+    assert_pending_ids(&runtime, &frame, &[0, 2]);
+    assert_eq!(runtime.frames_in_use(), 1);
     assert_eq!(runtime.in_use_buffers(), 2);
-    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
-    assert_eq!(sink_packets(0), vec![0, 2]);
-    assert_eq!(runtime.in_use_buffers(), 0);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+    assert_eq!(sink_packets(0), Vec::<u8>::new());
+    assert_eq!(runtime.in_use_buffers(), 2);
 
     for index in consumed.borrow().iter().copied() {
         let _ = index;
@@ -425,7 +461,7 @@ fn route_frame_error_after_partial_enqueue_keeps_tail_in_current_frame() {
 }
 
 #[test]
-fn route_frame_error_after_partial_next_enqueue_releases_moved_indices_once() {
+fn route_frame_error_after_partial_current_frame_commit_keeps_only_uncommitted_tail() {
     let runtime = runtime_with_instruction_set(DataPlaneInstructionSet::Scalar);
     reset_sink_packets();
     let routed = register_sink(&runtime, 0);
@@ -451,10 +487,8 @@ fn route_frame_error_after_partial_next_enqueue_releases_moved_indices_once() {
 
     assert_eq!(err.to_string(), "forced route failure");
     assert_eq!(frame.pending_len(), 2);
-    assert_eq!(
-        packet_ids(&runtime.buffer_batch_mut(), frame.pending_indices()).unwrap(),
-        vec![2, 3]
-    );
+    assert_pending_ids(&runtime, &frame, &[2, 3]);
+    assert_eq!(runtime.frames_in_use(), 1);
     assert_eq!(runtime.in_use_buffers(), 2);
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
 
@@ -695,6 +729,17 @@ fn packet_ids(batch: &BufferBatchMut<'_>, indices: &[BufferIndex]) -> CoreResult
         .copied()
         .map(|index| packet_id(batch, index))
         .collect()
+}
+
+fn next_frames(result: &NodeResult) -> Vec<NextFrame> {
+    result.iter().collect()
+}
+
+fn assert_pending_ids(runtime: &DataPlaneRuntime, frame: &BufferFrame, expected: &[u8]) {
+    assert_eq!(
+        packet_ids(&runtime.buffer_batch_mut(), frame.pending_indices()).unwrap(),
+        expected
+    );
 }
 
 fn packet_id(batch: &BufferBatchMut<'_>, index: BufferIndex) -> CoreResult<u8> {

@@ -2768,7 +2768,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    pub fn retain_indices_batched_with_prefetch_state_lazy<S>(
+    pub fn buffer_node_inline<S>(
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,
@@ -2786,7 +2786,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    pub(crate) fn retain_indices_batched_with_prefetch_state_lazy_chunks<S>(
+    pub(crate) fn buffer_node_inline_chunks<S>(
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,

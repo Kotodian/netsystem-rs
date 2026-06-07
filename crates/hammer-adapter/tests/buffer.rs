@@ -1067,7 +1067,7 @@ fn buffer_frame_lazy_state_retain_compacts_after_first_drop() {
     let mut prefetched = 0usize;
 
     frame
-        .retain_indices_batched_with_prefetch_state_lazy(
+        .buffer_node_inline(
             FrameBatchWidth::Quad,
             &mut prefetched,
             |prefetched, _index| {

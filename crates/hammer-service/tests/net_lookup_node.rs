@@ -303,7 +303,7 @@ fn ip_lookup_vector_enqueue_batches_same_next_in_one_output_frame() {
 }
 
 #[test]
-fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
+fn ip_lookup_vector_enqueue_reuses_current_frame_for_same_next() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 8, 8, 1);
     let state = Arc::new(Mutex::new(SinkState::default()));
     let sink = register_sink(&runtime, &state);
@@ -331,14 +331,10 @@ fn ip_lookup_vector_enqueue_requires_owned_output_frame_for_same_next() {
 
     assert!(runtime.schedule_frame(lookup, frame).expect("schedule"));
 
-    let err = runtime
-        .run_ready_nodes()
-        .expect_err("lookup needs an owned output frame");
-    assert!(
-        err.to_string().contains("frame pool exhausted"),
-        "unexpected error: {err}"
-    );
-    assert_eq!(state.lock().unwrap().payloads.len(), 0);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_payloads(&state, &[b"one".as_slice(), b"two".as_slice()]);
+    assert_frame_lens(&state, &[2]);
+    assert_forwarding(&state, lb.get());
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
