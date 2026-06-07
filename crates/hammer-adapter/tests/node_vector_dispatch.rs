@@ -463,6 +463,50 @@ fn route_frame_error_after_partial_next_enqueue_releases_moved_indices_once() {
 }
 
 #[test]
+fn route_frame_error_after_partial_chunk_commit_keeps_only_uncommitted_tail() {
+    let runtime = runtime_with_instruction_set(DataPlaneInstructionSet::Avx2);
+    reset_sink_packets();
+    let routed = register_sink(&runtime, 0);
+    let mut frame = packet_frame(&runtime, 4);
+    let consumed = indices_with_ids(&runtime, &frame, &[0, 1]);
+
+    let err = NodeVectorDispatch::new(Some(routed))
+        .route_frame(
+            &runtime,
+            &mut frame,
+            |_batch, _indices| {},
+            |batch, indices, nexts| {
+                for (offset, index) in indices.iter().copied().enumerate() {
+                    let id = packet_id(batch, index)?;
+                    match id {
+                        0 | 1 => nexts[offset] = None,
+                        2 => return Err(CoreError::internal("forced route failure")),
+                        _ => nexts[offset] = Some(routed),
+                    }
+                }
+                Ok(())
+            },
+        )
+        .expect_err("route failure");
+
+    assert_eq!(err.to_string(), "forced route failure");
+    assert_eq!(frame.pending_len(), 2);
+    assert_eq!(
+        packet_ids(&runtime.buffer_batch_mut(), frame.pending_indices()).unwrap(),
+        vec![2, 3]
+    );
+    assert_eq!(runtime.in_use_buffers(), 4);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+
+    runtime.free_frame(&mut frame);
+    assert_eq!(runtime.in_use_buffers(), 2);
+    for index in consumed {
+        runtime.free_index(index);
+    }
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn route_frame_requires_every_active_decision_slot_to_be_written() {
     let runtime = runtime_with_instruction_set(DataPlaneInstructionSet::Scalar);
     let routed = register_sink(&runtime, 0);
@@ -524,6 +568,35 @@ fn route_frame_index_error_after_consuming_index_keeps_unprocessed_tail() {
     for index in consumed {
         let _ = index;
     }
+}
+
+#[test]
+fn route_frame_schedule_failure_discards_processed_frame_and_releases_staged_next_frames() {
+    let runtime = runtime_with_instruction_set(DataPlaneInstructionSet::Scalar);
+    let invalid = NodeId::new(9_999);
+    let mut frame = packet_frame(&runtime, 3);
+
+    let err = NodeVectorDispatch::new(Some(invalid))
+        .route_frame(
+            &runtime,
+            &mut frame,
+            |_batch, _indices| {},
+            |_batch, indices, nexts| {
+                for offset in 0..indices.len() {
+                    nexts[offset] = Some(invalid);
+                }
+                Ok(())
+            },
+        )
+        .expect_err("schedule failure");
+
+    assert_eq!(err.to_string(), "node id out of bounds");
+    assert!(!frame.has_pending());
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+
+    runtime.free_frame(&mut frame);
+    assert_eq!(runtime.in_use_buffers(), 0);
 }
 
 fn runtime_with_instruction_set(instruction_set: DataPlaneInstructionSet) -> DataPlaneRuntime {

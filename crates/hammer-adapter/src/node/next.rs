@@ -576,6 +576,9 @@ impl NodeVectorDispatch {
             &mut [Option<NodeId>; 4],
         ) -> CoreResult<()>,
     ) -> CoreResult<(NodeResult, Option<NodeId>)> {
+        // `route_chunk` may inspect or mutate packet contents/metadata while filling decisions,
+        // but ownership stays with this dispatcher until the callback returns. On error we only
+        // commit the written prefix and roll back any staged next frames for the remaining tail.
         let mut cached_next = self.cached_next;
         let mut processed = 0usize;
         let width = runtime.preferred_frame_batch_width();
@@ -604,7 +607,7 @@ impl NodeVectorDispatch {
         }
         result?;
 
-        frame.clear();
+        frame.discard_prefix(processed);
         self.frames.schedule(runtime)?;
         Ok((NodeResult::drop(), cached_next))
     }
@@ -671,7 +674,7 @@ impl NodeVectorDispatch {
         }
         result?;
 
-        frame.clear();
+        frame.discard_prefix(processed);
         self.frames.schedule(runtime)?;
         Ok((NodeResult::drop(), cached_next))
     }
@@ -823,8 +826,19 @@ impl NodeVectorDispatch {
     ) -> CoreResult<()> {
         let mut nexts = [Some(NODE_VECTOR_DISPATCH_UNSET); 4];
         let mut batch = runtime.buffer_batch_mut();
-        route_chunk(&mut batch, indices, &mut nexts)?;
+        let route = route_chunk(&mut batch, indices, &mut nexts);
         drop(batch);
+        if let Err(err) = route {
+            let committed = Self::committed_prefix_len(&nexts, N);
+            self.flush_next_runs(
+                runtime,
+                &indices[..committed],
+                &nexts[..committed],
+                cached_next,
+                processed,
+            )?;
+            return Err(err);
+        }
         Self::validate_active_nexts(&nexts, N)?;
 
         self.flush_next_runs(runtime, indices, &nexts[..N], cached_next, processed)
@@ -930,6 +944,14 @@ impl NodeVectorDispatch {
             }
         }
         Ok(())
+    }
+
+    #[inline(always)]
+    fn committed_prefix_len(nexts: &[Option<NodeId>; 4], len: usize) -> usize {
+        nexts[..len]
+            .iter()
+            .position(|next| *next == Some(NODE_VECTOR_DISPATCH_UNSET))
+            .unwrap_or(len)
     }
 }
 

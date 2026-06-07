@@ -541,7 +541,7 @@ fn ipv4_reassembly_emits_complete_packet_after_out_of_order_fragments() {
 }
 
 #[test]
-fn ipv4_reassembly_reuses_current_frame_for_complete_packet() {
+fn ipv4_reassembly_emits_complete_packet_from_ip_input_path() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 4);
     let capture = SinkCapture::new();
     let sink = runtime.nodes().register_internal(capture.node());
