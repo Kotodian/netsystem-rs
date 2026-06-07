@@ -663,6 +663,12 @@ const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
     "ip-lookup-node",
     "adjacency-rewrite-node",
     "ip-local-node",
+    "tcp-input-node",
+    "tcp-listen-node",
+    "tcp-rcv-process-node",
+    "tcp-syn-sent-node",
+    "tcp-established-node",
+    "tcp-reset-node",
     "ip-receive-node",
     "ip-reassembly-node",
     "icmp-echo-request-node",
@@ -1285,5 +1291,17 @@ interval = "5s"
         assert!(lines[1].contains("        30"), "{lines:?}");
         assert!(lines[2].contains("node-2"), "{lines:?}");
         assert!(lines[3].contains("node-10"), "{lines:?}");
+    }
+
+    #[test]
+    fn service_packet_graph_resolves_tcp_nodes() {
+        let graph = ServicePacketGraphDeclarations::default();
+
+        assert!(graph.resolve("tcp-input-node").is_some());
+        assert!(graph.resolve("tcp-listen-node").is_some());
+        assert!(graph.resolve("tcp-rcv-process-node").is_some());
+        assert!(graph.resolve("tcp-syn-sent-node").is_some());
+        assert!(graph.resolve("tcp-established-node").is_some());
+        assert!(graph.resolve("tcp-reset-node").is_some());
     }
 }

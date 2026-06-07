@@ -67,7 +67,7 @@ bytes = "1.11"
 crossbeam-queue = "0.3"
 etherparse = "0.20.1"
 arc-swap = "1"
-smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "socket-tcp"] }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-tcp-cubic"] }
 http = "1.4"
 hyper = { version = "1.9", default-features = false, features = ["client", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
