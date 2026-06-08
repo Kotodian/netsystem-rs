@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneRuntime, IcmpErrorMetadata,
@@ -8,15 +9,18 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorFamily;
+use hammer_runtime::app::{AppContext, AppFlowId};
+use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
+use hammer_service::transport::udp::input::UdpAppRegistration;
 use hammer_service::transport::udp::{
     UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputNode, UdpInputTrace,
 };
-
 const REGISTERED_PORT: u16 = 5353;
 const PUNT_PORT: u16 = 1900;
 const UNKNOWN_PORT: u16 = 65_000;
+const APP_PORT: u16 = 9_999;
 
 #[derive(Default)]
 struct CaptureState {
@@ -501,6 +505,339 @@ fn udp_input_unregister_port_falls_back_to_icmp_error() {
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn udp_input_dispatches_selected_port_into_runtime_app_flow() {
+    let data_runtime =
+        DataRuntime::new(1, "udp-app-input-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let packet = ipv4_udp_packet(
+        Ipv4Addr::new(10, 0, 0, 11),
+        40_011,
+        Ipv4Addr::new(192, 0, 2, 11),
+        APP_PORT,
+        b"app-first-touch",
+    );
+    let flow = AppFlowId::new(0x55aa);
+    let received = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let recv_task = tokio::spawn({
+                let app = app.clone();
+                async move {
+                    app.spawn_on_flow(flow, move |worker| async move {
+                        let backend = worker.backend();
+                        let recv_future = worker.runtime().recv();
+                        let recv_sqe = backend
+                            .next_sqe_descriptor()
+                            .await
+                            .expect("next recv sqe descriptor");
+                        assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
+                        ready_tx.send(()).expect("send recv-ready signal");
+                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
+                            .await
+                            .expect("app recv timeout")
+                            .expect("app recv");
+                        let payload = recv.lease().copy_current().expect("copy app payload");
+                        let metadata = recv
+                            .lease()
+                            .runtime()
+                            .metadata(recv.lease().index())
+                            .expect("app metadata");
+                        let cursor = recv
+                            .lease()
+                            .runtime()
+                            .packet_cursor(recv.lease().index())
+                            .expect("app cursor");
+                        recv.release();
+                        (payload, metadata, cursor, worker.owner_worker())
+                    })
+                    .await
+                    .expect("spawn recv flow task")
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), ready_rx)
+                .await
+                .expect("recv ready timeout")
+                .expect("recv ready closed");
+
+            data_runtime
+                .context()
+                .for_each_worker({
+                    let packet = packet.clone();
+                    let app = app.clone();
+                    move |_| {
+                        let runtime = hammer_runtime::spawn::with_data_plane_buffers(|buffers| {
+                            DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+                                buffers.buffers().arena(),
+                                16,
+                                8,
+                                buffers.instruction_set(),
+                            )
+                        });
+                        let graph = UdpGraph::new(&runtime);
+                        graph
+                            .udp_control
+                            .register_app(APP_PORT, UdpAppRegistration::new(app.clone(), flow))
+                            .expect("register UDP app port");
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        push_udp_packet(
+                            &runtime,
+                            frame,
+                            &packet,
+                            Ipv4Addr::new(10, 0, 0, 11).into(),
+                            40_011,
+                            Ipv4Addr::new(192, 0, 2, 11).into(),
+                            APP_PORT,
+                        );
+                        assert!(
+                            runtime
+                                .schedule_frame(graph.udp_input, frame)
+                                .expect("schedule")
+                        );
+                        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+                        assert!(graph.service_state.lock().unwrap().packets.is_empty());
+                        assert!(graph.punt_state.lock().unwrap().packets.is_empty());
+                        assert!(graph.icmp_error_state.lock().unwrap().packets.is_empty());
+                    }
+                })
+                .expect("run UDP input on worker");
+            recv_task.await.expect("join recv task")
+        });
+
+    assert_eq!(received.0, packet);
+    assert_metadata(
+        &received.1,
+        Ipv4Addr::new(10, 0, 0, 11).into(),
+        40_011,
+        Ipv4Addr::new(192, 0, 2, 11).into(),
+        APP_PORT,
+    );
+    assert_eq!(received.1.icmp_error, None);
+    assert_eq!(received.2.packet_len(), packet.len());
+    assert_eq!(received.2.transport_header_offset(), 20);
+    assert_eq!(received.2.transport_header_len(), 8);
+    assert_eq!(received.2.transport_payload_offset(), 28);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn udp_input_app_dispatch_releases_runtime_buffers_after_app_recv_release() {
+    let data_runtime =
+        DataRuntime::new(1, "udp-app-buffer-lifetime", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let packet = ipv4_udp_packet(
+        Ipv4Addr::new(10, 0, 0, 21),
+        40_021,
+        Ipv4Addr::new(192, 0, 2, 21),
+        APP_PORT,
+        b"lease-lifetime",
+    );
+    let flow = AppFlowId::new(0x55ab);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let recv_task = tokio::spawn({
+                let app = app.clone();
+                async move {
+                    app.spawn_on_flow(flow, move |worker| async move {
+                        let backend = worker.backend();
+                        let recv_future = worker.runtime().recv();
+                        let recv_sqe = backend
+                            .next_sqe_descriptor()
+                            .await
+                            .expect("next recv sqe descriptor");
+                        assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
+                        ready_tx.send(()).expect("send recv-ready signal");
+                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
+                            .await
+                            .expect("app recv timeout")
+                            .expect("app recv");
+                        let before_release = recv.lease().runtime().in_use_buffers();
+                        recv.release();
+                        let after_release = worker
+                            .spawn_local(move || async move {
+                                hammer_runtime::spawn::with_data_plane_buffers(|runtime| {
+                                    runtime.in_use_buffers()
+                                })
+                            })
+                            .await
+                            .expect("inspect after release");
+                        (before_release, after_release, worker.owner_worker())
+                    })
+                    .await
+                    .expect("spawn recv flow task")
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), ready_rx)
+                .await
+                .expect("recv ready timeout")
+                .expect("recv ready closed");
+
+            data_runtime
+                .context()
+                .for_each_worker({
+                    let packet = packet.clone();
+                    let app = app.clone();
+                    move |_| {
+                        let runtime = hammer_runtime::spawn::with_data_plane_buffers(|buffers| {
+                            DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+                                buffers.buffers().arena(),
+                                16,
+                                8,
+                                buffers.instruction_set(),
+                            )
+                        });
+                        let graph = UdpGraph::new(&runtime);
+                        graph
+                            .udp_control
+                            .register_app(APP_PORT, UdpAppRegistration::new(app.clone(), flow))
+                            .expect("register UDP app port");
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        push_udp_packet(
+                            &runtime,
+                            frame,
+                            &packet,
+                            Ipv4Addr::new(10, 0, 0, 21).into(),
+                            40_021,
+                            Ipv4Addr::new(192, 0, 2, 21).into(),
+                            APP_PORT,
+                        );
+                        assert!(
+                            runtime
+                                .schedule_frame(graph.udp_input, frame)
+                                .expect("schedule")
+                        );
+                        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
+                        assert_eq!(runtime.frames_in_use(), 0);
+                        assert_eq!(runtime.in_use_buffers(), 1);
+                    }
+                })
+                .expect("run UDP input on worker");
+            let (before_release, after_release, owner_worker) =
+                recv_task.await.expect("join recv task");
+            assert_eq!(owner_worker, 0);
+            assert_eq!(before_release, 1);
+            assert_eq!(after_release, 0);
+        });
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn udp_input_app_dispatch_rejects_non_owner_worker_without_copying_packet() {
+    let data_runtime =
+        DataRuntime::new(2, "udp-app-non-owner", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let packet = ipv4_udp_packet(
+        Ipv4Addr::new(10, 0, 0, 31),
+        40_031,
+        Ipv4Addr::new(192, 0, 2, 31),
+        APP_PORT,
+        b"owner-mismatch",
+    );
+    let flow = AppFlowId::new(0x55ab);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let recv_task = tokio::spawn({
+                let app = app.clone();
+                async move {
+                    app.spawn_on_flow(flow, move |worker| async move {
+                        let backend = worker.backend();
+                        let recv_future = worker.runtime().recv();
+                        let recv_sqe = backend
+                            .next_sqe_descriptor()
+                            .await
+                            .expect("next recv sqe descriptor");
+                        assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
+                        ready_tx.send(()).expect("send recv-ready signal");
+                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
+                            .await
+                            .expect("app recv timeout")
+                            .expect("app recv");
+                        recv.release();
+                        worker.owner_worker()
+                    })
+                    .await
+                    .expect("spawn recv flow task")
+                }
+            });
+
+            tokio::time::timeout(Duration::from_secs(1), ready_rx)
+                .await
+                .expect("recv ready timeout")
+                .expect("recv ready closed");
+
+            let results = data_runtime
+                .context()
+                .for_each_worker({
+                    let packet = packet.clone();
+                    let app = app.clone();
+                    move |worker| {
+                        let runtime = hammer_runtime::spawn::with_data_plane_buffers(|buffers| {
+                            DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+                                buffers.buffers().arena(),
+                                16,
+                                8,
+                                buffers.instruction_set(),
+                            )
+                        });
+                        let graph = UdpGraph::new(&runtime);
+                        graph
+                            .udp_control
+                            .register_app(APP_PORT, UdpAppRegistration::new(app.clone(), flow))
+                            .expect("register UDP app port");
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        push_udp_packet(
+                            &runtime,
+                            frame,
+                            &packet,
+                            Ipv4Addr::new(10, 0, 0, 31).into(),
+                            40_031,
+                            Ipv4Addr::new(192, 0, 2, 31).into(),
+                            APP_PORT,
+                        );
+                        assert!(
+                            runtime
+                                .schedule_frame(graph.udp_input, frame)
+                                .expect("schedule")
+                        );
+                        let result = runtime.run_ready_nodes();
+                        (
+                            worker,
+                            result,
+                            runtime.frames_in_use(),
+                            runtime.in_use_buffers(),
+                        )
+                    }
+                })
+                .expect("run UDP input on workers");
+            let owner_worker = recv_task.await.expect("join recv task");
+            let non_owner = (owner_worker + 1) % 2;
+            assert!(results[non_owner].1.is_err());
+            assert_eq!(results[non_owner].2, 0);
+            assert_eq!(results[non_owner].3, 0);
+            assert!(results[owner_worker].1.is_ok());
+            assert_eq!(results[owner_worker].2, 0);
+            assert_eq!(results[owner_worker].3, 1);
+        });
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 struct UdpGraph {

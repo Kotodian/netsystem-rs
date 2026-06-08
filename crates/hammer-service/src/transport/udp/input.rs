@@ -7,7 +7,10 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
+use hammer_infra::boxed::Slice;
+use hammer_runtime::app::{AppContext, AppFlowId};
 
+use crate::app::{AppIngressRegistry, AppIngressTarget};
 use crate::data_plane::set_index_node_error_code;
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 use crate::trace::codec::{
@@ -116,6 +119,16 @@ impl UdpInputControlPlane {
     }
 
     #[inline]
+    pub fn register_app(&self, port: u16, registration: UdpAppRegistration) -> CoreResult<()> {
+        self.inner.rcu(|current| {
+            let mut next = UdpInputSnapshot::clone(current);
+            next.register_app(port, registration.clone());
+            next
+        });
+        Ok(())
+    }
+
+    #[inline]
     pub fn unregister_port(&self, port: u16) -> CoreResult<()> {
         self.inner.rcu(|current| {
             let mut next = UdpInputSnapshot::clone(current);
@@ -134,16 +147,18 @@ impl UdpInputControlPlane {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct UdpInputSnapshot {
-    ports: Box<[UdpPortAction; UDP_PORT_COUNT]>,
+    ports: Slice<UdpPortAction>,
+    app_registry: AppIngressRegistry<u16>,
 }
 
 impl UdpInputSnapshot {
     #[inline]
     fn new() -> Self {
         Self {
-            ports: Box::new([UdpPortAction::IcmpError; UDP_PORT_COUNT]),
+            ports: Slice::from_elem(UDP_PORT_COUNT, UdpPortAction::IcmpError),
+            app_registry: AppIngressRegistry::new(),
         }
     }
 
@@ -158,21 +173,60 @@ impl UdpInputSnapshot {
     }
 
     #[inline(always)]
+    fn register_app(&mut self, port: u16, registration: UdpAppRegistration) {
+        self.ports[port as usize] = UdpPortAction::App;
+        self.app_registry.insert(port, registration.into_target());
+    }
+
+    #[inline(always)]
     fn unregister_port(&mut self, port: u16) {
         self.ports[port as usize] = UdpPortAction::IcmpError;
     }
 
     #[inline(always)]
     fn action(&self, port: u16) -> UdpPortAction {
-        self.ports[port as usize]
+        self.ports[port as usize].clone()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum UdpPortAction {
     IcmpError,
     Punt,
     Dispatch(NodeId),
+    App,
+}
+
+#[derive(Clone)]
+pub struct UdpAppRegistration {
+    target: AppIngressTarget,
+}
+
+impl UdpAppRegistration {
+    #[inline]
+    pub fn new(app: AppContext, flow: AppFlowId) -> Self {
+        Self {
+            target: AppIngressTarget::new(app, flow),
+        }
+    }
+
+    #[inline]
+    fn into_target(self) -> AppIngressTarget {
+        self.target
+    }
+
+    #[inline]
+    fn target(&self) -> &AppIngressTarget {
+        &self.target
+    }
+}
+
+impl std::fmt::Debug for UdpAppRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UdpAppRegistration")
+            .field("flow", &self.target().flow().value())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,7 +283,7 @@ impl Node for UdpInputNode {
         let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
             runtime,
             frame,
-            |index| Ok(Some(next_node_for_index(runtime, index, &snapshot, &next)?)),
+            |index| next_node_for_index(runtime, index, &snapshot, &next),
         )?;
         self.cached_next = cached_next;
         Ok(result)
@@ -289,7 +343,7 @@ fn udp_input_process(
     let snapshot = state.snapshot.load();
     let next = UdpInputNode::runtime_nexts(runtime)?;
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        Ok(Some(next_node_for_index(runtime, index, &snapshot, &next)?))
+        next_node_for_index(runtime, index, &snapshot, &next)
     })?;
     Ok(result)
 }
@@ -338,7 +392,7 @@ fn next_node_for_index(
     index: BufferIndex,
     snapshot: &UdpInputSnapshot,
     next: &[NodeId; UdpInputNext::COUNT],
-) -> CoreResult<NodeId> {
+) -> CoreResult<Option<NodeId>> {
     let parsed = match parse_udp_input(runtime, index)? {
         Ok(parsed) => parsed,
         Err(UdpInputParseError::BadLength) => {
@@ -376,7 +430,7 @@ fn next_node_for_index(
                     next: node,
                 },
             )?;
-            Ok(node)
+            Ok(Some(node))
         }
         UdpPortAction::Punt => {
             clear_success_metadata(runtime, index)?;
@@ -393,7 +447,33 @@ fn next_node_for_index(
                     next: resolved,
                 },
             )?;
-            Ok(resolved)
+            Ok(Some(resolved))
+        }
+        UdpPortAction::App => {
+            let registration = snapshot
+                .app_registry
+                .get(&parsed.destination_port)
+                .ok_or_else(|| {
+                    CoreError::internal(format!(
+                        "UDP app registration missing for port {}",
+                        parsed.destination_port
+                    ))
+                })?;
+            clear_success_metadata(runtime, index)?;
+            dispatch_udp_input_to_app(runtime, index, &registration)?;
+            add_packet_trace!(
+                runtime,
+                index,
+                UdpInputTrace {
+                    version: Some(parsed.version),
+                    protocol: Some(parsed.protocol),
+                    source_port: Some(parsed.source_port),
+                    destination_port: Some(parsed.destination_port),
+                    error: None,
+                    next: NodeId::new(0),
+                },
+            )?;
+            Ok(None)
         }
         UdpPortAction::IcmpError => resolve_unknown_port(runtime, index, next, parsed, snapshot),
     }
@@ -406,7 +486,7 @@ fn resolve_drop_error(
     next: &[NodeId; UdpInputNext::COUNT],
     error: UdpInputError,
     trace: UdpInputTraceContext,
-) -> CoreResult<NodeId> {
+) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, error.code())?;
     let resolved = NodeNextStorage::next(next, UdpInputNext::Drop);
     add_packet_trace!(
@@ -421,7 +501,7 @@ fn resolve_drop_error(
             next: resolved,
         },
     )?;
-    Ok(resolved)
+    Ok(Some(resolved))
 }
 
 #[inline(always)]
@@ -431,7 +511,7 @@ fn resolve_unknown_port(
     next: &[NodeId; UdpInputNext::COUNT],
     parsed: ParsedUdpInput,
     snapshot: &UdpInputSnapshot,
-) -> CoreResult<NodeId> {
+) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, UdpInputError::UnknownPort.code())?;
     runtime.with_metadata_mut(index, |metadata| {
         metadata.icmp_error = port_unreachable_metadata(parsed.version);
@@ -449,7 +529,7 @@ fn resolve_unknown_port(
             next: resolved,
         },
     )?;
-    Ok(resolved)
+    Ok(Some(resolved))
 }
 
 #[inline(always)]
@@ -458,6 +538,15 @@ fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> Cor
     buffer.clear_node_error();
     buffer.metadata_mut().icmp_error = None;
     Ok(())
+}
+
+#[inline(always)]
+fn dispatch_udp_input_to_app(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    target: &AppIngressTarget,
+) -> CoreResult<()> {
+    target.deliver_recv(runtime, index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

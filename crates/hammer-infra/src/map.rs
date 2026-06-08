@@ -27,6 +27,13 @@ impl FlatHashKey for u32 {
     }
 }
 
+impl FlatHashKey for u16 {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        splitmix64(u64::from(self)) as usize
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FlatHashTable<K: FlatHashKey, V: Copy> {
     buckets: Slice<FlatHashBucket<K, V>>,

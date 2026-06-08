@@ -1,0 +1,100 @@
+use hammer_infra::ring::{CompletionDescriptor, LocalRing, RingEntry, SubmissionDescriptor};
+
+#[test]
+fn local_ring_preserves_fifo_order_across_wraparound() {
+    let mut ring = LocalRing::with_capacity(3);
+
+    assert_eq!(ring.pop(), None);
+
+    assert!(ring.try_push(1).is_ok());
+    assert!(ring.try_push(2).is_ok());
+    assert_eq!(ring.pop(), Some(1));
+
+    assert!(ring.try_push(3).is_ok());
+    assert!(ring.try_push(4).is_ok());
+
+    assert_eq!(ring.len(), 3);
+    assert_eq!(ring.capacity(), 3);
+    assert_eq!(ring.pop(), Some(2));
+    assert_eq!(ring.pop(), Some(3));
+    assert_eq!(ring.pop(), Some(4));
+    assert_eq!(ring.pop(), None);
+    assert!(ring.is_empty());
+}
+
+#[test]
+fn local_ring_rejects_push_when_full_without_dropping_value() {
+    let mut ring = LocalRing::with_capacity(2);
+
+    assert!(ring.try_push(10).is_ok());
+    assert!(ring.try_push(20).is_ok());
+
+    let value = ring.try_push(30).unwrap_err();
+    assert_eq!(value, 30);
+
+    assert_eq!(ring.len(), 2);
+    assert_eq!(ring.pop(), Some(10));
+    assert_eq!(ring.pop(), Some(20));
+    assert_eq!(ring.pop(), None);
+}
+
+#[test]
+fn generic_submission_and_completion_descriptors_are_transport_agnostic() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Opcode {
+        Send,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Object {
+        Flow(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Payload {
+        Buffer(u64),
+    }
+
+    let sqe = SubmissionDescriptor::new(Opcode::Send, 11_u64, Object::Flow(7), Payload::Buffer(9));
+    assert_eq!(sqe.opcode(), Opcode::Send);
+    assert_eq!(sqe.user_data(), 11);
+    assert_eq!(sqe.object(), Object::Flow(7));
+    assert_eq!(sqe.payload(), Payload::Buffer(9));
+
+    let cqe =
+        CompletionDescriptor::new(11_u64, 128_i32, 3_u32, Object::Flow(7), Payload::Buffer(9));
+    assert_eq!(cqe.user_data(), 11);
+    assert_eq!(cqe.result(), 128);
+    assert_eq!(cqe.flags(), 3);
+    assert_eq!(cqe.object(), Object::Flow(7));
+    assert_eq!(cqe.payload(), Payload::Buffer(9));
+}
+
+#[test]
+fn ring_entry_can_attach_transport_specific_state_to_generic_descriptors() {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Opcode {
+        Recv,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Object {
+        Flow(u64),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Payload {
+        Buffer(u64),
+    }
+
+    let descriptor =
+        SubmissionDescriptor::new(Opcode::Recv, 7_u64, Object::Flow(11), Payload::Buffer(19));
+    let entry = RingEntry::with_attachment(descriptor, "registered-buffer");
+
+    assert_eq!(*entry.descriptor(), descriptor);
+    assert_eq!(entry.attachment(), Some(&"registered-buffer"));
+
+    let (round_trip_descriptor, attachment) = entry.into_parts();
+    assert_eq!(round_trip_descriptor, descriptor);
+    assert_eq!(attachment, Some("registered-buffer"));
+}

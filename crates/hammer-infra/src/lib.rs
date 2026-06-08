@@ -5,5 +5,6 @@ pub mod map;
 pub mod mtrie;
 pub mod pool;
 pub mod prefetch;
+pub mod ring;
 pub mod timer_wheel;
 pub mod vec;
