@@ -236,90 +236,6 @@ impl AppSqeDescriptor {
     }
 }
 
-#[derive(Debug)]
-pub struct AppRegisteredBuffer {
-    inner: hammer_runtime::app::AppRegisteredBuffer,
-}
-
-impl AppRegisteredBuffer {
-    #[inline]
-    pub fn from_lease(lease: AppBufferLease) -> HammerResult<Self> {
-        Ok(Self {
-            inner: hammer_runtime::app::AppRegisteredBuffer::from_lease(lease.into_inner())?,
-        })
-    }
-
-    #[inline]
-    pub fn index(&self) -> BufferIndex {
-        self.inner.index()
-    }
-
-    #[inline]
-    pub fn lease(&self) -> &AppBufferLease {
-        // SAFETY: `AppBufferLease` is a transparent wrapper over the runtime lease.
-        unsafe { &*std::ptr::from_ref(self.inner.lease()).cast::<AppBufferLease>() }
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (BufferIndex, AppBufferLease) {
-        let (index, lease) = self.inner.into_parts();
-        (index, AppBufferLease::from_inner(lease))
-    }
-
-    #[inline]
-    pub(crate) fn into_inner(self) -> hammer_runtime::app::AppRegisteredBuffer {
-        self.inner
-    }
-}
-
-pub struct AppSubmissionEntry {
-    inner: hammer_runtime::app::AppSubmissionEntry,
-}
-
-impl AppSubmissionEntry {
-    #[inline]
-    pub fn with_attachment(descriptor: AppSqeDescriptor, attachment: AppRegisteredBuffer) -> Self {
-        Self {
-            inner: hammer_runtime::app::AppSubmissionEntry::with_attachment(
-                descriptor.into_inner(),
-                attachment.into_inner(),
-            ),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn into_inner(self) -> hammer_runtime::app::AppSubmissionEntry {
-        self.inner
-    }
-
-    #[inline]
-    pub(crate) fn from_inner(inner: hammer_runtime::app::AppSubmissionEntry) -> Self {
-        Self { inner }
-    }
-
-    #[inline]
-    pub fn descriptor(&self) -> &AppSqeDescriptor {
-        // SAFETY: `AppSqeDescriptor` is a transparent wrapper over the runtime descriptor.
-        unsafe { &*std::ptr::from_ref(self.inner.descriptor()).cast::<AppSqeDescriptor>() }
-    }
-
-    #[inline]
-    pub fn attachment(&self) -> Option<&AppRegisteredBuffer> {
-        self.inner
-            .attachment()
-            .map(|inner| unsafe { &*std::ptr::from_ref(inner).cast::<AppRegisteredBuffer>() })
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (AppSqeDescriptor, Option<AppRegisteredBuffer>) {
-        let (descriptor, registered) = self.inner.into_parts();
-        (
-            AppSqeDescriptor::from_inner(descriptor),
-            registered.map(|inner| AppRegisteredBuffer { inner }),
-        )
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AppCqeFlags {
     inner: hammer_runtime::app::AppCqeFlags,
@@ -412,39 +328,6 @@ impl AppCqeDescriptor {
 
     #[inline]
     pub(crate) const fn from_inner(inner: hammer_runtime::app::AppCqeDescriptor) -> Self {
-        Self { inner }
-    }
-}
-
-pub struct AppCompletionEntry {
-    inner: hammer_runtime::app::AppCompletionEntry,
-}
-
-impl AppCompletionEntry {
-    #[inline]
-    pub fn descriptor(&self) -> &AppCqeDescriptor {
-        // SAFETY: `AppCqeDescriptor` is a transparent wrapper over the runtime descriptor.
-        unsafe { &*std::ptr::from_ref(self.inner.descriptor()).cast::<AppCqeDescriptor>() }
-    }
-
-    #[inline]
-    pub fn attachment(&self) -> Option<&AppRegisteredBuffer> {
-        self.inner
-            .attachment()
-            .map(|inner| unsafe { &*std::ptr::from_ref(inner).cast::<AppRegisteredBuffer>() })
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (AppCqeDescriptor, Option<AppRegisteredBuffer>) {
-        let (descriptor, registered) = self.inner.into_parts();
-        (
-            AppCqeDescriptor::from_inner(descriptor),
-            registered.map(|inner| AppRegisteredBuffer { inner }),
-        )
-    }
-
-    #[inline]
-    pub(crate) fn from_inner(inner: hammer_runtime::app::AppCompletionEntry) -> Self {
         Self { inner }
     }
 }
@@ -544,22 +427,27 @@ impl AppRing {
     }
 
     #[inline]
-    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.inner.try_push_submission_entry(entry)
+    pub fn try_push_submission_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
+        self.inner.try_push_submission_descriptor(descriptor)
     }
 
     #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.inner.next_submission_entry().await
+    pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.inner.next_submission_descriptor().await
     }
 
     #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        self.inner.next_completion_entry().await
+    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
+        self.inner.take_submission_buffer(index)
     }
 
     #[inline]
-    pub async fn recv_entry(&self) -> Option<AppCompletionEntry> {
-        self.inner.next_completion_entry().await
+    pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
+        self.inner.next_completion_descriptor().await
+    }
+
+    #[inline]
+    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.inner.take_completion_buffer(index)
     }
 }

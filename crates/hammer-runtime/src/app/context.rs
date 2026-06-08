@@ -242,6 +242,11 @@ impl AppRuntime {
     }
 
     #[inline]
+    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
+        self.send.ring().take_send_buffer(index)
+    }
+
+    #[inline]
     pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
         self.recv.ring().next_completion_entry().await
     }
@@ -249,6 +254,11 @@ impl AppRuntime {
     #[inline]
     pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
         self.recv.ring().next_completion_descriptor().await
+    }
+
+    #[inline]
+    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.recv.ring().take_recv_buffer(index)
     }
 }
 

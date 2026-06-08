@@ -44,7 +44,7 @@ use hammer_core::log::Logger;
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
+use tokio::task::JoinHandle as TokioJoinHandle;
 use tracing::instrument::WithSubscriber;
 
 #[derive(Clone)]
@@ -522,6 +522,45 @@ impl DataRuntimeContext {
         DataRemoteJoinHandle { state }.await
     }
 
+    fn spawn_send_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let context = self.clone();
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let control = Arc::new(DataLocalTaskControl::new());
+        let state = Arc::new(DataLocalJoinState::new(Arc::clone(&control)));
+        let join = DataLocalJoinHandle {
+            state: Arc::clone(&state),
+        };
+        let panic_state = Arc::clone(&state);
+        self.schedule_local_on_worker(
+            worker,
+            Box::new(move || {
+                THREAD_DATA_CONTEXT.with(|slot| slot.borrow_mut().push(context.clone()));
+                let _guard = ThreadDataContextGuard;
+                let task_state = Arc::clone(&state);
+                let future = TASK_DATA_CONTEXT
+                    .scope(context, async move {
+                        let output = future.await;
+                        task_state.complete(output);
+                    })
+                    .with_subscriber(dispatcher);
+                DATA_LOCAL_TASKS.with(|queue| {
+                    queue.borrow_mut().push_back(Rc::new(DataLocalTask {
+                        control,
+                        future: RefCell::new(Some(Box::pin(future))),
+                        on_panic: Box::new(move || panic_state.panic()),
+                    }));
+                });
+                wake_data_local_driver();
+            }),
+        )
+        .expect("target worker index is valid");
+        JoinHandle::from_local(join)
+    }
+
     fn schedule_local_on_worker(
         &self,
         worker: usize,
@@ -537,16 +576,16 @@ impl DataRuntimeContext {
         Ok(())
     }
 
-    fn spawn_worker(&self) -> DataRuntimeContextWorker {
+    fn spawn_worker_index(&self) -> usize {
         if let Some(index) = self.current_worker_index() {
-            return self.inner.workers[index].clone();
+            return index;
         }
-        self.next_worker()
+        self.next_worker_index()
     }
 
-    fn next_worker(&self) -> DataRuntimeContextWorker {
+    fn next_worker_index(&self) -> usize {
         let index = self.inner.next.fetch_add(1, Ordering::Relaxed);
-        self.inner.workers[index % self.inner.workers.len()].clone()
+        index % self.inner.workers.len()
     }
 
     pub(crate) fn current_worker_index(&self) -> Option<usize> {
@@ -720,10 +759,8 @@ impl DataPlaneExecutor {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let future = future.with_current_subscriber();
-        let worker = self.context.spawn_worker();
-        let scoped = TASK_DATA_CONTEXT.scope(self.context.clone(), future);
-        worker.handle.spawn(scoped)
+        let worker = self.context.spawn_worker_index();
+        self.context.spawn_send_on_worker(worker, future)
     }
 }
 
@@ -924,6 +961,100 @@ impl<T> Future for DataRemoteJoinHandle<T> {
     }
 }
 
+enum JoinHandleKind<T> {
+    Tokio(TokioJoinHandle<T>),
+    Local(DataLocalJoinHandle<T>),
+}
+
+pub struct JoinHandle<T> {
+    inner: JoinHandleKind<T>,
+}
+
+impl<T> JoinHandle<T> {
+    fn from_tokio(inner: TokioJoinHandle<T>) -> Self {
+        Self {
+            inner: JoinHandleKind::Tokio(inner),
+        }
+    }
+
+    fn from_local(inner: DataLocalJoinHandle<T>) -> Self {
+        Self {
+            inner: JoinHandleKind::Local(inner),
+        }
+    }
+
+    pub fn abort(&mut self) {
+        match &mut self.inner {
+            JoinHandleKind::Tokio(inner) => inner.abort(),
+            JoinHandleKind::Local(inner) => inner.abort(),
+        }
+    }
+}
+
+impl<T> Unpin for JoinHandle<T> {}
+
+#[derive(Debug)]
+pub struct JoinError {
+    kind: JoinErrorKind,
+}
+
+#[derive(Debug)]
+enum JoinErrorKind {
+    Tokio(tokio::task::JoinError),
+    Local(DataLocalJoinError),
+}
+
+impl JoinError {
+    fn from_tokio(err: tokio::task::JoinError) -> Self {
+        Self {
+            kind: JoinErrorKind::Tokio(err),
+        }
+    }
+
+    fn from_local(err: DataLocalJoinError) -> Self {
+        Self {
+            kind: JoinErrorKind::Local(err),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        match &self.kind {
+            JoinErrorKind::Tokio(err) => err.is_cancelled(),
+            JoinErrorKind::Local(err) => err.is_cancelled(),
+        }
+    }
+
+    pub fn is_panic(&self) -> bool {
+        match &self.kind {
+            JoinErrorKind::Tokio(err) => err.is_panic(),
+            JoinErrorKind::Local(err) => err.is_panic(),
+        }
+    }
+}
+
+impl fmt::Display for JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            JoinErrorKind::Tokio(err) => fmt::Display::fmt(err, f),
+            JoinErrorKind::Local(err) => fmt::Display::fmt(err, f),
+        }
+    }
+}
+
+impl Error for JoinError {}
+
+impl<T> Future for JoinHandle<T> {
+    type Output = Result<T, JoinError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match &mut this.inner {
+            JoinHandleKind::Tokio(inner) => Pin::new(inner).poll(cx).map_err(JoinError::from_tokio),
+            JoinHandleKind::Local(inner) => Pin::new(inner).poll(cx).map_err(JoinError::from_local),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataLocalJoinError {
     kind: DataLocalJoinErrorKind,
@@ -1105,9 +1236,9 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match current_data_context() {
+    match current_task_data_context() {
         Some(context) => context.executor().execute(future),
-        None => tokio::spawn(future.with_current_subscriber()),
+        None => JoinHandle::from_tokio(tokio::spawn(future.with_current_subscriber())),
     }
 }
 
@@ -1232,6 +1363,10 @@ fn current_data_context() -> Option<DataRuntimeContext> {
         .or_else(|| THREAD_DATA_CONTEXT.with(|slot| slot.borrow().last().cloned()))
 }
 
+fn current_task_data_context() -> Option<DataRuntimeContext> {
+    TASK_DATA_CONTEXT.try_with(Clone::clone).ok()
+}
+
 fn next_data_runtime_context_id() -> usize {
     NEXT_DATA_RUNTIME_CONTEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -1282,26 +1417,21 @@ mod tests {
             .build()
             .expect("driver runtime");
 
-        let names = context.enter(|| {
-            driver.block_on(async {
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
-                for _ in 0..8 {
-                    let tx = tx.clone();
-                    drop(spawn(async move {
-                        let name = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let _ = tx.send(name).await;
-                    }));
-                }
-                drop(tx);
-                let mut names = Vec::new();
-                while let Some(name) = rx.recv().await {
-                    names.push(name);
-                }
-                names
-            })
+        let names = driver.block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                handles.push(context.executor().execute(async {
+                    thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default()
+                }));
+            }
+            let mut names = Vec::new();
+            for handle in handles {
+                names.push(handle.await.expect("data task finished"));
+            }
+            names
         });
 
         assert!(
@@ -1351,34 +1481,22 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-buffer", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (before, during, after) = context.enter(|| {
-            driver.block_on(async {
-                let (tx, rx) = oneshot::channel();
-                drop(spawn(async move {
-                    let stats = with_data_plane_runtime(|runtime| {
-                        let before = runtime.in_use_buffers();
-                        {
-                            let index = runtime
-                                .alloc_index_with_bytes(Default::default(), b"packet")
-                                .expect("alloc data buffer");
-                            let during = runtime.in_use_buffers();
-                            runtime.free_index(index);
-                            (before, during)
-                        }
-                    });
-                    let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
-                    let _ = tx.send((stats.0, stats.1, after));
-                }));
-                tokio::time::timeout(Duration::from_secs(2), rx)
-                    .await
-                    .expect("buffer task timed out")
-                    .expect("buffer task dropped sender")
+        let (before, during, after) = run_on_context(&context, async {
+            spawn(async move {
+                let stats = with_data_plane_runtime(|runtime| {
+                    let before = runtime.in_use_buffers();
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .expect("alloc data buffer");
+                    let during = runtime.in_use_buffers();
+                    runtime.free_index(index);
+                    (before, during)
+                });
+                let after = with_data_plane_runtime(|runtime| runtime.in_use_buffers());
+                (stats.0, stats.1, after)
             })
+            .await
+            .expect("buffer task finished")
         });
 
         assert_eq!(before, 0);
@@ -1517,13 +1635,8 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (thread_before, thread_after, before, during, after, payload) = context.enter(|| {
-            driver.block_on(async {
+        let (thread_before, thread_after, before, during, after, payload) =
+            run_on_context(&context, async {
                 spawn(async {
                     spawn_local(|| async {
                         let thread_before = thread::current()
@@ -1565,8 +1678,7 @@ mod tests {
                 })
                 .await
                 .expect("data task finished")
-            })
-        });
+            });
 
         assert_eq!(thread_before, "spawn-test-local-0");
         assert_eq!(thread_after, "spawn-test-local-0");
@@ -1584,47 +1696,40 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-current-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (thread_before, thread_after, payload) = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    spawn_local(|| async {
-                        let join = spawn_current_local(async {
-                            let thread_before = thread::current()
-                                .name()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_default();
-                            let buffer = with_data_plane_runtime(|runtime| {
-                                runtime
-                                    .alloc_index_with_bytes(Default::default(), b"packet")
-                                    .expect("alloc local data buffer")
-                            });
-                            yield_local_now().await;
-                            let thread_after = thread::current()
-                                .name()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_default();
-                            let payload = with_data_plane_runtime(|runtime| {
-                                let payload = runtime
-                                    .copy_current(buffer)
-                                    .expect("copy current local data buffer");
-                                runtime.free_index(buffer);
-                                payload
-                            });
-                            (thread_before, thread_after, payload)
+        let (thread_before, thread_after, payload) = run_on_context(&context, async {
+            spawn(async {
+                spawn_local(|| async {
+                    let join = spawn_current_local(async {
+                        let thread_before = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let buffer = with_data_plane_runtime(|runtime| {
+                            runtime
+                                .alloc_index_with_bytes(Default::default(), b"packet")
+                                .expect("alloc local data buffer")
                         });
-                        join.await.expect("current local task joined")
-                    })
-                    .await
-                    .expect("outer local data task finished")
+                        yield_local_now().await;
+                        let thread_after = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let payload = with_data_plane_runtime(|runtime| {
+                            let payload = runtime
+                                .copy_current(buffer)
+                                .expect("copy current local data buffer");
+                            runtime.free_index(buffer);
+                            payload
+                        });
+                        (thread_before, thread_after, payload)
+                    });
+                    join.await.expect("current local task joined")
                 })
                 .await
-                .expect("data task finished")
+                .expect("outer local data task finished")
             })
+            .await
+            .expect("data task finished")
         });
 
         assert_eq!(thread_before, "spawn-test-current-local-0");
@@ -1640,21 +1745,14 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-no-tokio-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let has_tokio_handle = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    spawn_local(|| async { tokio::runtime::Handle::try_current().is_ok() })
-                        .await
-                        .expect("local task finished")
-                })
-                .await
-                .expect("data task finished")
+        let has_tokio_handle = run_on_context(&context, async {
+            spawn(async {
+                spawn_local(|| async { tokio::runtime::Handle::try_current().is_ok() })
+                    .await
+                    .expect("local task finished")
             })
+            .await
+            .expect("data task finished")
         });
 
         assert!(
@@ -1666,75 +1764,88 @@ mod tests {
     }
 
     #[test]
+    fn data_runtime_spawn_is_not_polled_under_tokio_worker_context() {
+        let _guard = test_lock();
+        let data_runtime = DataRuntime::new(1, "spawn-test-no-tokio-generic", 512 * 1024, 2)
+            .expect("data runtime");
+        let context = data_runtime.context();
+        let has_tokio_handle = run_on_context(&context, async {
+            spawn(async { tokio::runtime::Handle::try_current().is_ok() })
+                .await
+                .expect("data task finished")
+        });
+
+        assert!(
+            !has_tokio_handle,
+            "dataplane spawned task should not inherit a Tokio worker runtime"
+        );
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
     fn frame_pending_future_resumes_on_current_data_worker() {
         let _guard = test_lock();
         let data_runtime =
             DataRuntime::new(1, "spawn-test-frame", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (before_thread, after_thread, payload) = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    spawn_local(|| async {
-                        let runtime = with_data_plane_buffers(Clone::clone);
-                        let frame = std::rc::Rc::new(RefCell::new(
-                            runtime.alloc_pooled_frame().expect("alloc pooled frame"),
-                        ));
-                        let index = runtime
-                            .alloc_index_with_bytes(Default::default(), b"packet")
-                            .expect("alloc data buffer");
-                        let consumer_frame = std::rc::Rc::clone(&frame);
-                        let consumer_runtime = runtime.clone();
-                        let consumer = spawn_current_local(async move {
-                            let before_thread = thread::current()
-                                .name()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_default();
-                            let pending = consumer_frame.borrow().pending();
-                            pending.await;
-                            let after_thread = thread::current()
-                                .name()
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_default();
-                            let buffer = consumer_frame
-                                .borrow_mut()
-                                .drain_pending()
-                                .next()
-                                .expect("pending buffer");
-                            let payload = consumer_runtime
-                                .copy_current(buffer)
-                                .expect("copy pending buffer");
-                            consumer_runtime.free_index(buffer);
-                            (before_thread, after_thread, payload)
-                        });
-                        let producer_frame = std::rc::Rc::clone(&frame);
-                        let producer = spawn_current_local(async move {
-                            yield_local_now().await;
-                            producer_frame
-                                .borrow_mut()
-                                .push_index(index)
-                                .expect("push pending buffer");
-                        });
-                        producer.await.expect("producer joined");
-                        let result = consumer.await.expect("consumer joined");
-                        let frame = std::rc::Rc::try_unwrap(frame)
-                            .expect("frame has no remaining references")
-                            .into_inner();
-                        runtime
-                            .release_pooled_frame(frame)
-                            .expect("release pooled frame");
-                        result
-                    })
-                    .await
-                    .expect("local frame task finished")
+        let (before_thread, after_thread, payload) = run_on_context(&context, async {
+            spawn(async {
+                spawn_local(|| async {
+                    let runtime = with_data_plane_buffers(Clone::clone);
+                    let frame = std::rc::Rc::new(RefCell::new(
+                        runtime.alloc_pooled_frame().expect("alloc pooled frame"),
+                    ));
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .expect("alloc data buffer");
+                    let consumer_frame = std::rc::Rc::clone(&frame);
+                    let consumer_runtime = runtime.clone();
+                    let consumer = spawn_current_local(async move {
+                        let before_thread = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let pending = consumer_frame.borrow().pending();
+                        pending.await;
+                        let after_thread = thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default();
+                        let buffer = consumer_frame
+                            .borrow_mut()
+                            .drain_pending()
+                            .next()
+                            .expect("pending buffer");
+                        let payload = consumer_runtime
+                            .copy_current(buffer)
+                            .expect("copy pending buffer");
+                        consumer_runtime.free_index(buffer);
+                        (before_thread, after_thread, payload)
+                    });
+                    let producer_frame = std::rc::Rc::clone(&frame);
+                    let producer = spawn_current_local(async move {
+                        yield_local_now().await;
+                        producer_frame
+                            .borrow_mut()
+                            .push_index(index)
+                            .expect("push pending buffer");
+                    });
+                    producer.await.expect("producer joined");
+                    let result = consumer.await.expect("consumer joined");
+                    let frame = std::rc::Rc::try_unwrap(frame)
+                        .expect("frame has no remaining references")
+                        .into_inner();
+                    runtime
+                        .release_pooled_frame(frame)
+                        .expect("release pooled frame");
+                    result
                 })
                 .await
-                .expect("data task finished")
+                .expect("local frame task finished")
             })
+            .await
+            .expect("data task finished")
         });
 
         assert_eq!(before_thread, "spawn-test-frame-0");
@@ -1750,31 +1861,24 @@ mod tests {
         let data_runtime =
             DataRuntime::new(2, "spawn-test-pipeline", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (parent_thread, child_thread) = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    let parent_thread = thread::current()
+        let (parent_thread, child_thread) = run_on_context(&context, async {
+            spawn(async {
+                let parent_thread = thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let child_thread = spawn_local(|| async {
+                    thread::current()
                         .name()
                         .map(ToOwned::to_owned)
-                        .unwrap_or_default();
-                    let child_thread = spawn_local(|| async {
-                        thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .expect("local child task finished");
-                    (parent_thread, child_thread)
+                        .unwrap_or_default()
                 })
                 .await
-                .expect("parent task finished")
+                .expect("local child task finished");
+                (parent_thread, child_thread)
             })
+            .await
+            .expect("parent task finished")
         });
 
         assert_eq!(parent_thread, child_thread);
@@ -1789,31 +1893,24 @@ mod tests {
         let data_runtime =
             DataRuntime::new(2, "spawn-test-nested", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        let (parent_thread, child_thread) = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    let parent_thread = thread::current()
+        let (parent_thread, child_thread) = run_on_context(&context, async {
+            spawn(async {
+                let parent_thread = thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let child_thread = spawn(async {
+                    thread::current()
                         .name()
                         .map(ToOwned::to_owned)
-                        .unwrap_or_default();
-                    let child_thread = spawn(async {
-                        thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default()
-                    })
-                    .await
-                    .expect("nested task finished");
-                    (parent_thread, child_thread)
+                        .unwrap_or_default()
                 })
                 .await
-                .expect("parent task finished")
+                .expect("nested task finished");
+                (parent_thread, child_thread)
             })
+            .await
+            .expect("parent task finished")
         });
 
         assert_eq!(parent_thread, child_thread);
@@ -1915,28 +2012,20 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-abort-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    let mut task = spawn_local(|| async {
-                        std::future::pending::<()>().await;
-                        1usize
-                    });
-                    task.abort();
-                    let result = tokio::time::timeout(Duration::from_secs(1), task)
-                        .await
-                        .expect("aborted local task should finish");
-                    let err = result.expect_err("aborted local task must not produce output");
-                    assert!(err.is_cancelled(), "{err}");
-                })
-                .await
-                .expect("data task finished")
+        run_on_context(&context, async {
+            spawn(async {
+                let mut task = spawn_local(|| async {
+                    std::future::pending::<()>().await;
+                    1usize
+                });
+                task.abort();
+                let err = task
+                    .await
+                    .expect_err("aborted local task must not produce output");
+                assert!(err.is_cancelled(), "{err}");
             })
+            .await
+            .expect("data task finished")
         });
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
@@ -1948,28 +2037,18 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-drop-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-
-        context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    let (tx, rx) = oneshot::channel();
-                    let task = spawn_local(move || async move {
-                        yield_local_now().await;
-                        let _ = tx.send(());
-                    });
-                    drop(task);
-                    tokio::time::timeout(Duration::from_secs(1), rx)
-                        .await
-                        .expect("dropped local handle should not abort task")
-                        .expect("local task should send completion");
-                })
-                .await
-                .expect("data task finished")
+        run_on_context(&context, async {
+            spawn(async {
+                let (tx, rx) = oneshot::channel();
+                let task = spawn_local(move || async move {
+                    yield_local_now().await;
+                    let _ = tx.send(());
+                });
+                drop(task);
+                rx.await.expect("local task should send completion");
             })
+            .await
+            .expect("data task finished")
         });
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
@@ -1981,30 +2060,22 @@ mod tests {
         let data_runtime =
             DataRuntime::new(1, "spawn-test-panic-local", 512 * 1024, 2).expect("data runtime");
         let context = data_runtime.context();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
+        let output = run_on_context(&context, async {
+            spawn(async {
+                let panicking = spawn_local(|| async {
+                    panic!("local task panic");
+                });
+                let err = panicking
+                    .await
+                    .expect_err("panic should be reported as join error");
+                assert!(err.is_panic(), "{err}");
 
-        let output = context.enter(|| {
-            driver.block_on(async {
-                spawn(async {
-                    let panicking = spawn_local(|| async {
-                        panic!("local task panic");
-                    });
-                    let result = tokio::time::timeout(Duration::from_secs(1), panicking)
-                        .await
-                        .expect("panicking local task should finish");
-                    let err = result.expect_err("panic should be reported as join error");
-                    assert!(err.is_panic(), "{err}");
-
-                    spawn_local(|| async { 42usize })
-                        .await
-                        .expect("driver should continue after panic")
-                })
-                .await
-                .expect("data task finished")
+                spawn_local(|| async { 42usize })
+                    .await
+                    .expect("driver should continue after panic")
             })
+            .await
+            .expect("data task finished")
         });
 
         assert_eq!(output, 42);
@@ -2015,26 +2086,18 @@ mod tests {
     #[test]
     fn spawn_targets_current_data_context() {
         let _guard = test_lock();
-        let first = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("spawn-test-first")
-            .enable_all()
-            .build()
-            .expect("first runtime");
-        let first_context = DataRuntimeContext::new(first.handle().clone());
-        let second = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("spawn-test-second")
-            .enable_all()
-            .build()
-            .expect("second runtime");
-        let second_context = DataRuntimeContext::new(second.handle().clone());
+        let first =
+            DataRuntime::new(1, "spawn-test-first", 512 * 1024, 2).expect("first data runtime");
+        let first_context = first.context();
+        let second =
+            DataRuntime::new(1, "spawn-test-second", 512 * 1024, 2).expect("second data runtime");
+        let second_context = second.context();
 
         let first_name = spawn_thread_name(&first_context);
         let second_name = spawn_thread_name(&second_context);
 
-        assert_eq!(first_name, "spawn-test-first");
-        assert_eq!(second_name, "spawn-test-second");
+        assert_eq!(first_name, "spawn-test-first-0");
+        assert_eq!(second_name, "spawn-test-second-0");
 
         second.shutdown_timeout(Duration::from_secs(1));
         first.shutdown_timeout(Duration::from_secs(1));
@@ -2071,31 +2134,31 @@ mod tests {
     #[test]
     fn nested_data_context_restores_outer_context() {
         let _guard = test_lock();
-        let first = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("spawn-test-outer")
-            .enable_all()
-            .build()
-            .expect("first runtime");
-        let first_context = DataRuntimeContext::new(first.handle().clone());
-        let second = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("spawn-test-inner")
-            .enable_all()
-            .build()
-            .expect("second runtime");
-        let second_context = DataRuntimeContext::new(second.handle().clone());
+        let first =
+            DataRuntime::new(1, "spawn-test-outer", 512 * 1024, 2).expect("first data runtime");
+        let first_context = first.context();
+        let second =
+            DataRuntime::new(1, "spawn-test-inner", 512 * 1024, 2).expect("second data runtime");
+        let second_context = second.context();
 
-        let names = first_context.enter(|| {
-            let outer_before = spawn_thread_name_without_enter();
-            let inner = second_context.enter(spawn_thread_name_without_enter);
-            let outer_after = spawn_thread_name_without_enter();
+        let ids = first_context.enter(|| {
+            let outer_before = current_data_context()
+                .map(|context| context.inner.id)
+                .expect("outer context present");
+            let inner = second_context.enter(|| {
+                current_data_context()
+                    .map(|context| context.inner.id)
+                    .expect("inner context present")
+            });
+            let outer_after = current_data_context()
+                .map(|context| context.inner.id)
+                .expect("outer context restored");
             (outer_before, inner, outer_after)
         });
 
-        assert_eq!(names.0, "spawn-test-outer");
-        assert_eq!(names.1, "spawn-test-inner");
-        assert_eq!(names.2, "spawn-test-outer");
+        assert_eq!(ids.0, first_context.inner.id);
+        assert_eq!(ids.1, second_context.inner.id);
+        assert_eq!(ids.2, first_context.inner.id);
 
         second.shutdown_timeout(Duration::from_secs(1));
         first.shutdown_timeout(Duration::from_secs(1));
@@ -2104,72 +2167,59 @@ mod tests {
     #[test]
     fn spawned_task_inherits_data_context_for_nested_spawn() {
         let _guard = test_lock();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("spawn-test-inherited")
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let context = DataRuntimeContext::new(runtime.handle().clone());
+        let runtime = DataRuntime::new(1, "spawn-test-inherited", 512 * 1024, 2).expect("runtime");
+        let context = runtime.context();
 
-        let (tx, rx) = oneshot::channel::<String>();
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("driver runtime");
-        context.enter(|| {
-            driver.block_on(async move {
-                drop(spawn(async move {
-                    let (inner_tx, inner_rx) = oneshot::channel::<String>();
-                    drop(spawn(async move {
-                        let name = thread::current()
-                            .name()
-                            .map(ToOwned::to_owned)
-                            .unwrap_or_default();
-                        let _ = inner_tx.send(name);
-                    }));
-                    let name = inner_rx.await.expect("inner sender dropped");
-                    let _ = tx.send(name);
-                }));
-                tokio::time::timeout(Duration::from_secs(2), rx)
-                    .await
-                    .expect("spawned task timed out")
-                    .expect("spawned task dropped sender")
+        let name = run_on_context(&context, async move {
+            spawn(async move {
+                spawn(async move {
+                    thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default()
+                })
+                .await
+                .expect("inner task finished")
             })
+            .await
+            .expect("outer task finished")
         });
 
+        assert_eq!(name, "spawn-test-inherited-0");
         runtime.shutdown_timeout(Duration::from_secs(1));
     }
 
-    fn spawn_thread_name(context: &DataRuntimeContext) -> String {
-        context.enter(spawn_thread_name_without_enter)
-    }
-
-    fn spawn_thread_name_without_enter() -> String {
-        let observed: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
-        let observed_clone = Arc::clone(&observed);
-        let (tx, rx) = oneshot::channel::<()>();
+    fn run_on_executor<T>(
+        executor: DataPlaneExecutor,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+    {
         let driver = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("driver runtime");
-        driver.block_on(async move {
-            drop(spawn(async move {
-                let name = thread::current()
-                    .name()
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_default();
-                *observed_clone.lock().expect("observed lock") = Some(name);
-                let _ = tx.send(());
-            }));
-            tokio::time::timeout(Duration::from_secs(2), rx)
-                .await
-                .expect("spawned task timed out")
-                .expect("spawned task dropped sender");
-        });
+        driver.block_on(async { executor.execute(future).await.expect("data task finished") })
+    }
 
-        let name = observed.lock().expect("observed lock").clone();
-        name.expect("thread name missing")
+    fn run_on_context<T>(
+        context: &DataRuntimeContext,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> T
+    where
+        T: Send + 'static,
+    {
+        run_on_executor(context.executor(), future)
+    }
+
+    fn spawn_thread_name(context: &DataRuntimeContext) -> String {
+        run_on_context(context, async {
+            thread::current()
+                .name()
+                .map(ToOwned::to_owned)
+                .unwrap_or_default()
+        })
     }
 
     #[test]
@@ -2182,23 +2232,19 @@ mod tests {
             .build()
             .expect("data runtime");
 
-        let (tx, rx) = oneshot::channel::<String>();
         let driver = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("driver runtime");
         let name = driver.block_on(async move {
-            drop(spawn(async move {
-                let name = thread::current()
+            spawn(async move {
+                thread::current()
                     .name()
                     .map(ToOwned::to_owned)
-                    .unwrap_or_default();
-                let _ = tx.send(name);
-            }));
-            tokio::time::timeout(Duration::from_secs(2), rx)
-                .await
-                .expect("spawned task timed out")
-                .expect("spawned task dropped sender")
+                    .unwrap_or_default()
+            })
+            .await
+            .expect("spawned task finished")
         });
         assert_ne!(name, "spawn-test-unused");
 

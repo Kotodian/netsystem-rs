@@ -127,7 +127,7 @@ impl UrltestOutbound {
             }
         };
 
-        let mut handles: Vec<(String, tokio::task::JoinHandle<HammerResult<Duration>>)> =
+        let mut handles: Vec<(String, crate::spawn::JoinHandle<HammerResult<Duration>>)> =
             Vec::with_capacity(self.children_ids.len());
         let mut missing: Vec<String> = Vec::new();
         for child_id in &self.children_ids {

@@ -1,9 +1,10 @@
+use hammer_adapter::BufferIndex;
 use hammer_core::error::HammerResult;
 
 use crate::app::context::AppFlowId;
 use crate::app::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppRingHandle, AppSend, AppSqe,
-    AppSqeDescriptor, AppSubmissionEntry,
+    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppRecv, AppRingHandle, AppSend,
+    AppSqe, AppSqeDescriptor, AppSubmissionEntry,
 };
 
 #[derive(Clone, Debug)]
@@ -132,6 +133,11 @@ impl AppBackend {
     }
 
     #[inline]
+    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
+        self.ring.take_send_buffer(index)
+    }
+
+    #[inline]
     pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
         self.ring.next_submission_entry().await
     }
@@ -164,6 +170,11 @@ impl AppBackend {
     #[inline]
     pub async fn next_cqe_descriptor(&self) -> Option<AppCqeDescriptor> {
         self.ring.next_completion_descriptor().await
+    }
+
+    #[inline]
+    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.ring.take_recv_buffer(index)
     }
 
     #[inline]

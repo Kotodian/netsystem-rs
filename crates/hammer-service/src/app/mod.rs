@@ -1,5 +1,5 @@
 mod backend;
-mod bridge;
+mod ingress;
 mod registry;
 
 use std::any::Any;
@@ -7,7 +7,7 @@ use std::any::Any;
 use hammer_core::Lifecycle;
 
 pub use backend::AppIngressBackend;
-pub use bridge::AppIngressTarget;
+pub use ingress::AppIngressTarget;
 pub(crate) use registry::AppIngressRegistry;
 
 pub trait AppHost: Lifecycle + Any + Send + Sync {}
