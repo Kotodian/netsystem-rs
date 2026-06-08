@@ -8,7 +8,7 @@ pub mod reset;
 pub mod state;
 pub mod syn_sent;
 
-pub use app::TcpAppBridge;
+pub use app::TcpAppIngress;
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};

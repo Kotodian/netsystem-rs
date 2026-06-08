@@ -434,7 +434,7 @@ fn tcp_rcv_process_node_passes_packets_to_configured_next() {
 #[test]
 fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
     let data_runtime =
-        DataRuntime::new(1, "tcp-app-bridge-test", 512 * 1024, 2).expect("data runtime");
+        DataRuntime::new(1, "tcp-app-ingress-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
     let flow = AppFlowId::new(ESTABLISHED_ID as u64);
     let bridge_app = app.clone();
@@ -540,7 +540,7 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
                     Ipv4Addr::new(192, 0, 2, 41),
                     LISTEN_PORT,
                     tcp_flags(false, false, false, true),
-                    b"app-bridge",
+                    b"app-ingress",
                 );
                 let metadata = tcp_metadata(
                     Ipv4Addr::new(198, 51, 100, 41).into(),
@@ -580,7 +580,7 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
         Ipv4Addr::new(192, 0, 2, 41),
         LISTEN_PORT,
         tcp_flags(false, false, false, true),
-        b"app-bridge",
+        b"app-ingress",
     );
     assert_eq!(result.0.0, expected_packet);
     assert_metadata(

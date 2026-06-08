@@ -1,1 +1,1 @@
-pub type UdpAppBridge = crate::app::AppIngressTarget;
+pub type UdpAppIngress = crate::app::AppIngressTarget;
