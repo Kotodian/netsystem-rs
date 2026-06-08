@@ -1,1 +1,1 @@
-pub type TcpAppBridge = crate::app::AppIngressTarget;
+pub type TcpAppIngress = crate::app::AppIngressTarget;
