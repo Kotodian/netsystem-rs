@@ -458,6 +458,39 @@ impl DataRuntimeContext {
         &self.inner.workers[0].handle
     }
 
+    pub(crate) fn worker_count(&self) -> usize {
+        self.inner.workers.len()
+    }
+
+    pub fn spawn_local_on_worker<F, Fut>(&self, worker: usize, factory: F) -> HammerResult<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        if worker >= self.inner.workers.len() {
+            return Err(HammerError::internal(format!(
+                "invalid app worker {worker}; worker_count={}",
+                self.inner.workers.len()
+            )));
+        }
+        let handle = self.execute_on_worker(worker, async move {
+            let _ = spawn_local(factory);
+        });
+        drop(handle);
+        Ok(())
+    }
+
+    pub(crate) fn execute_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let future = future.with_current_subscriber();
+        let index = worker % self.inner.workers.len();
+        let scoped = TASK_DATA_CONTEXT.scope(self.clone(), future);
+        self.inner.workers[index].handle.spawn(scoped)
+    }
+
     fn spawn_worker(&self) -> DataRuntimeContextWorker {
         if let Some(index) = self.current_worker_index() {
             return self.inner.workers[index].clone();
@@ -470,7 +503,7 @@ impl DataRuntimeContext {
         self.inner.workers[index % self.inner.workers.len()].clone()
     }
 
-    fn current_worker_index(&self) -> Option<usize> {
+    pub(crate) fn current_worker_index(&self) -> Option<usize> {
         CURRENT_DATA_WORKER.with(|slot| match slot.get() {
             Some((id, index)) if id == self.inner.id && index < self.inner.workers.len() => {
                 Some(index)

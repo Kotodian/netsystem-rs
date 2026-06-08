@@ -23,6 +23,7 @@ pub fn install_default_crypto_provider() {
 #[cfg(not(feature = "tls"))]
 pub fn install_default_crypto_provider() {}
 
+pub mod app;
 mod component_registry;
 mod control_thread;
 mod data_plane;

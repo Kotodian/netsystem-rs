@@ -1120,6 +1120,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-app"
+version = "0.1.0"
+dependencies = [
+ "hammer-adapter",
+ "hammer-core",
+ "hammer-infra",
+ "hammer-runtime",
+ "tokio",
+]
+
+[[package]]
 name = "hammer-component-macros"
 version = "0.1.0"
 dependencies = [

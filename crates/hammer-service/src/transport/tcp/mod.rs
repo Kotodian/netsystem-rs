@@ -1,3 +1,4 @@
+pub mod app;
 pub mod established;
 pub mod input;
 pub mod listen;
@@ -7,6 +8,7 @@ pub mod reset;
 pub mod state;
 pub mod syn_sent;
 
+pub use app::TcpAppBridge;
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};

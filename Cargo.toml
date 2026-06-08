@@ -8,6 +8,7 @@ members = [
     "crates/hammer-control",
     "crates/hammer-runtime",
     "crates/hammer-service",
+    "crates/hammer-app",
     "crates/hammer-ffi",
     "crates/hammer-uniffi-bindgen",
 ]

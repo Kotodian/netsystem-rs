@@ -1,13 +1,6 @@
+use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
-
-use arc_swap::ArcSwap;
-use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node, NodeHandle,
-    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
-};
-use hammer_core::error::{CoreError, CoreResult};
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
@@ -15,11 +8,19 @@ use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u8,
 };
+use arc_swap::ArcSwap;
+use hammer_adapter::{
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node, NodeHandle,
+    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
+};
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
 use super::{
-    TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext, TcpLookupKind, TcpLookupSnapshot,
-    TcpLookupValue, TcpState, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV6ConnectionKey,
-    TcpV6ListenerKey,
+    TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext, TcpLookupId, TcpLookupKind,
+    TcpLookupSnapshot, TcpLookupValue, TcpState, TcpV4ConnectionKey, TcpV4ListenerKey,
+    TcpV6ConnectionKey, TcpV6ListenerKey,
 };
 
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -92,6 +93,7 @@ fn format_tcp_input_trace(bytes: &[u8]) -> String {
 struct TcpInputSnapshot {
     lookup: TcpLookupSnapshot,
     dispatch: TcpDispatchTable,
+    app_bridges: Arc<FlatHashTable<TcpLookupId, ()>>,
 }
 
 impl TcpInputSnapshot {
@@ -100,6 +102,7 @@ impl TcpInputSnapshot {
         Self {
             lookup: TcpLookupSnapshot::default(),
             dispatch: TcpDispatchTable::default(),
+            app_bridges: Arc::new(FlatHashTable::new()),
         }
     }
 }
@@ -150,6 +153,24 @@ impl TcpInputControlPlane {
         self.inner.rcu(|current| {
             let mut next = TcpInputSnapshot::clone(current);
             next.dispatch = dispatch.clone();
+            next
+        });
+        Ok(())
+    }
+
+    #[inline]
+    pub fn publish_app_bridges(
+        &self,
+        app_bridges: impl IntoIterator<Item = TcpLookupId>,
+    ) -> CoreResult<()> {
+        let app_bridges = Arc::new(FlatHashTable::from_entries(
+            app_bridges
+                .into_iter()
+                .map(|connection_id| (connection_id, ())),
+        ));
+        self.inner.rcu(|current| {
+            let mut next = TcpInputSnapshot::clone(current);
+            next.app_bridges = Arc::clone(&app_bridges);
             next
         });
         Ok(())
@@ -280,6 +301,115 @@ fn tcp_input_process(
     Ok(result)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingTcpAppBridgeEntry {
+    generation: u32,
+    connection_id: TcpLookupId,
+    occupied: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingTcpAppBridgePool {
+    pool_id: u64,
+    entries: InfraVec<PendingTcpAppBridgeEntry>,
+}
+
+impl PendingTcpAppBridgePool {
+    #[inline]
+    const fn new(pool_id: u64) -> Self {
+        Self {
+            pool_id,
+            entries: InfraVec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingTcpAppBridgeStore {
+    pools: InfraVec<PendingTcpAppBridgePool>,
+}
+
+thread_local! {
+    static TCP_APP_BRIDGE_PENDING: RefCell<PendingTcpAppBridgeStore> =
+        const { RefCell::new(PendingTcpAppBridgeStore::new()) };
+}
+
+impl PendingTcpAppBridgeStore {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            pools: InfraVec::new(),
+        }
+    }
+
+    #[inline]
+    fn mark(&mut self, index: BufferIndex, connection_id: TcpLookupId) {
+        let pool = self.pool_mut(index.pool_id());
+        let slot = index.slot() as usize;
+        while pool.entries.len() <= slot {
+            pool.entries.push(PendingTcpAppBridgeEntry::default());
+        }
+        pool.entries[slot] = PendingTcpAppBridgeEntry {
+            generation: index.generation(),
+            connection_id,
+            occupied: true,
+        };
+    }
+
+    #[inline]
+    fn take(&mut self, index: BufferIndex) -> Option<TcpLookupId> {
+        let pool = self
+            .pools
+            .iter_mut()
+            .find(|pool| pool.pool_id == index.pool_id())?;
+        let entry = pool.entries.get_mut(index.slot() as usize)?;
+        if !entry.occupied {
+            return None;
+        }
+        if entry.generation != index.generation() {
+            *entry = PendingTcpAppBridgeEntry::default();
+            return None;
+        }
+        let connection_id = entry.connection_id;
+        *entry = PendingTcpAppBridgeEntry::default();
+        Some(connection_id)
+    }
+
+    #[inline]
+    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAppBridgePool {
+        if let Some(position) = self.pools.iter().position(|pool| pool.pool_id == pool_id) {
+            return &mut self.pools[position];
+        }
+        self.pools.push(PendingTcpAppBridgePool::new(pool_id));
+        let position = self.pools.len() - 1;
+        &mut self.pools[position]
+    }
+}
+
+#[inline]
+pub(crate) fn mark_pending_tcp_app_bridge(
+    index: BufferIndex,
+    connection_id: TcpLookupId,
+) -> CoreResult<()> {
+    TCP_APP_BRIDGE_PENDING.with(|pending| {
+        pending
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP app bridge pending store borrowed"))?
+            .mark(index, connection_id);
+        Ok(())
+    })
+}
+
+#[inline]
+pub(crate) fn take_pending_tcp_app_bridge(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
+    TCP_APP_BRIDGE_PENDING.with(|pending| {
+        Ok(pending
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP app bridge pending store borrowed"))?
+            .take(index))
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParsedTcpInput {
     version: IpVersion,
@@ -348,6 +478,15 @@ fn next_node_for_index(
         Some(value) if value.kind == TcpLookupKind::EstablishedConnection => TcpState::Established,
         _ => TcpState::Listen,
     };
+    let app_bridge_connection = match lookup {
+        Some(value)
+            if value.kind == TcpLookupKind::EstablishedConnection
+                && snapshot.app_bridges.lookup(&value.id).is_some() =>
+        {
+            Some(value.id)
+        }
+        _ => None,
+    };
     let entry = snapshot.dispatch.entry(state, parsed.flags);
     if let Some(error) = entry.error {
         return resolve_error_next(
@@ -360,6 +499,11 @@ fn next_node_for_index(
             Some(parsed.protocol),
             parsed.flags.bits(),
         );
+    }
+    if entry.next == TcpInputNext::Established
+        && let Some(connection_id) = app_bridge_connection
+    {
+        mark_pending_tcp_app_bridge(index, connection_id)?;
     }
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, entry.next);
@@ -415,6 +559,42 @@ fn established_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
             Some(value.owner_worker)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hammer_adapter::{DataPlaneRuntime, RouteMetadata};
+
+    use super::PendingTcpAppBridgeStore;
+
+    #[test]
+    fn pending_tcp_app_bridge_store_consumes_once_and_ignores_reused_slots() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 2, 1, 1);
+        let mut pending = PendingTcpAppBridgeStore::new();
+
+        let first = runtime
+            .alloc_index(RouteMetadata::default())
+            .expect("allocate first buffer");
+        pending.mark(first, 11);
+        assert_eq!(pending.take(first), Some(11));
+        assert_eq!(pending.take(first), None);
+        runtime.free_index(first);
+
+        let stale = runtime
+            .alloc_index(RouteMetadata::default())
+            .expect("allocate stale buffer");
+        pending.mark(stale, 37);
+        runtime.free_index(stale);
+
+        let reused = runtime
+            .alloc_index(RouteMetadata::default())
+            .expect("allocate reused buffer");
+        assert_eq!(reused.slot(), stale.slot());
+        assert_ne!(reused.generation(), stale.generation());
+        assert_eq!(pending.take(reused), None);
+
+        runtime.free_index(reused);
     }
 }
 

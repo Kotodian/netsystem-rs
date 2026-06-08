@@ -25,6 +25,7 @@ use hammer_runtime::adapter::{
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
+use hammer_runtime::app::AppContext;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
@@ -38,6 +39,7 @@ use std::time::Duration;
 
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
+use crate::app::AppHost;
 use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -122,6 +124,7 @@ struct ServiceInner {
     /// already happened or the runtime was never installed.
     data_runtime: Option<DataRuntime>,
     data_context: DataRuntimeContext,
+    app_context: AppContext,
     _options: Options,
 }
 
@@ -162,6 +165,7 @@ impl RuntimeService {
             DATA_MAX_BLOCKING_THREADS,
         )?;
         let data_context = data_runtime.context();
+        let app_context = AppContext::with_ring_capacity(data_context.clone(), 256);
         let writer: Arc<dyn LogWriter> = if options.log.disabled {
             Arc::new(DiscardWriter)
         } else {
@@ -384,9 +388,19 @@ impl RuntimeService {
                 probe,
                 data_runtime: Some(data_runtime),
                 data_context,
+                app_context,
                 _options: options,
             })),
         }))
+    }
+
+    #[inline]
+    pub fn app_context(&self) -> AppContext {
+        self.inner
+            .lock()
+            .expect("service mutex poisoned")
+            .app_context
+            .clone()
     }
 
     /// Run a one-shot latency probe to every registered outbound's probe endpoint
@@ -553,6 +567,38 @@ impl RuntimeService {
     pub fn metrics_snapshot(&self) -> Vec<MetricSample> {
         self.control_call(|inner| inner.metrics.snapshot())
             .unwrap_or_default()
+    }
+
+    pub fn spawn_app_on_worker<F, Fut>(&self, worker: usize, factory: F) -> HammerResult<()>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + 'static,
+    {
+        self.control_call(move |inner| {
+            if inner.state == ServiceState::Closed {
+                return Err(HammerError::service_closed());
+            }
+            inner.data_context.spawn_local_on_worker(worker, factory)
+        })?
+    }
+
+    pub fn register_app_host<T>(&self, host: Arc<T>) -> HammerResult<()>
+    where
+        T: AppHost + 'static,
+    {
+        self.control_call(move |inner| {
+            if inner.state == ServiceState::Closed {
+                return Err(HammerError::service_closed());
+            }
+
+            inner._registry.set::<T>(Arc::clone(&host));
+            let lifecycle = host as Arc<dyn Lifecycle>;
+            if inner.state == ServiceState::Running {
+                start_lifecycle_now(&lifecycle)?;
+            }
+            inner.lifecycles.push(lifecycle);
+            Ok(())
+        })?
     }
 
     fn control_call<R>(
@@ -854,6 +900,15 @@ fn close_lifecycles(lifecycles: &[Arc<dyn Lifecycle>]) -> HammerResult<()> {
     }
 }
 
+fn start_lifecycle_now(lifecycle: &Arc<dyn Lifecycle>) -> HammerResult<()> {
+    for stage in ALL_STAGES {
+        lifecycle
+            .start(stage)
+            .map_err(|err| HammerError::lifecycle(stage.name(), err.to_string()))?;
+    }
+    Ok(())
+}
+
 fn finish_close(
     inner: &Arc<Mutex<ServiceInner>>,
     close_result: HammerResult<()>,
@@ -1033,6 +1088,10 @@ fn build_probe_protocol(protocol: &str) -> HammerResult<ProbeProtocolComponent> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_core::StartStage;
+    use hammer_runtime::app::{AppBufferLease, AppFlowId};
+    use hammer_runtime::spawn::with_data_plane_buffers;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     struct NoopPlatform;
@@ -1070,6 +1129,36 @@ mod tests {
 
         fn read_wifi_state(&self) -> Option<hammer_runtime::adapter::WifiState> {
             None
+        }
+    }
+
+    struct TestAppHost {
+        starts: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    impl TestAppHost {
+        fn new() -> Self {
+            Self {
+                starts: AtomicUsize::new(0),
+                closes: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Lifecycle for TestAppHost {
+        fn name(&self) -> &str {
+            "test-app-host"
+        }
+
+        fn start(&self, _stage: StartStage) -> Result<(), HammerError> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn close(&self) -> Result<(), HammerError> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1303,5 +1392,121 @@ interval = "5s"
         assert!(graph.resolve("tcp-syn-sent-node").is_some());
         assert!(graph.resolve("tcp-established-node").is_some());
         assert!(graph.resolve("tcp-reset-node").is_some());
+    }
+
+    #[test]
+    fn runtime_service_app_context_runs_app_flow_on_service_data_workers() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let flow = AppFlowId::new(3);
+
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime")
+            .block_on(async {
+                app.spawn_on_flow(flow, move |worker| async move {
+                    let recv_future = worker.runtime().recv();
+                    let recv_sqe = worker
+                        .backend()
+                        .next_sqe_descriptor()
+                        .await
+                        .expect("recv sqe descriptor");
+                    let runtime = with_data_plane_buffers(Clone::clone);
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"service-app-context")
+                        .expect("alloc buffer");
+                    worker
+                        .backend()
+                        .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                        .await
+                        .expect("push recv");
+                    assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
+                    let recv = recv_future.await.expect("recv app payload");
+                    let payload = recv.lease().copy_current().expect("payload copy");
+                    recv.release();
+                    (
+                        worker.owner_worker(),
+                        std::thread::current()
+                            .name()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_default(),
+                        payload,
+                    )
+                })
+                .await
+                .expect("spawn app flow")
+            });
+
+        assert_eq!(result.0, 1);
+        assert!(result.1.contains("hammer-data-1"), "thread={}", result.1);
+        assert_eq!(result.2, b"service-app-context");
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_spawns_app_task_on_requested_worker() {
+        let service = new_test_service("");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        service
+            .spawn_app_on_worker(1, move || async move {
+                tx.send(
+                    std::thread::current()
+                        .name()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_default(),
+                )
+                .expect("send worker thread");
+            })
+            .expect("spawn app task");
+
+        let thread = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive worker thread");
+        assert!(thread.contains("hammer-data-1"), "thread={thread}");
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_rejects_invalid_app_worker_index() {
+        let service = new_test_service("");
+        let err = service
+            .spawn_app_on_worker(99, || async {})
+            .expect_err("invalid worker must fail");
+        assert!(err.to_string().contains("invalid app worker"), "err={err}");
+        assert!(err.to_string().contains("worker_count="), "err={err}");
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_register_app_host_defers_start_until_service_start() {
+        let service = new_test_service("");
+        let host = Arc::new(TestAppHost::new());
+
+        service
+            .register_app_host(Arc::clone(&host))
+            .expect("register app host");
+
+        assert_eq!(host.starts.load(Ordering::SeqCst), 0);
+        service.start().expect("start service");
+        assert_eq!(host.starts.load(Ordering::SeqCst), ALL_STAGES.len());
+        service.close().expect("close service");
+        assert_eq!(host.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn runtime_service_register_app_host_starts_immediately_when_running() {
+        let service = new_test_service("");
+        service.start().expect("start service");
+        let host = Arc::new(TestAppHost::new());
+
+        service
+            .register_app_host(Arc::clone(&host))
+            .expect("register running app host");
+
+        assert_eq!(host.starts.load(Ordering::SeqCst), ALL_STAGES.len());
+        service.close().expect("close service");
+        assert_eq!(host.closes.load(Ordering::SeqCst), 1);
     }
 }

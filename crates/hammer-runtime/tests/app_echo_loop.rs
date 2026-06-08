@@ -1,0 +1,80 @@
+use std::time::Duration;
+
+use hammer_runtime::app::{AppBufferLease, AppContext, AppFlowId};
+use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
+
+#[test]
+fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
+    let data_runtime = DataRuntime::new(1, "app-echo-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(11);
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let app_runtime = worker.runtime();
+                let backend = worker.backend();
+                let owner_thread = std::thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let before = std::thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let recv_future = app_runtime.recv();
+
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let recv_descriptor = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("collect recv descriptor");
+                let index = runtime
+                    .alloc_index_with_bytes(Default::default(), b"echo-from-app")
+                    .expect("alloc app echo buffer");
+                backend
+                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .await
+                    .expect("push recv");
+                let recv = recv_future.await.expect("recv echo buffer");
+                let recv_ptr = recv.lease().current_ptr().expect("recv pointer") as usize;
+                let copied = recv.lease().copy_current().expect("copy echo payload");
+                let send = recv.into_send();
+                let send_ptr = send.lease().current_ptr().expect("send pointer") as usize;
+                app_runtime.send(send).await.expect("echo send");
+                let after = std::thread::current()
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                let send_descriptor = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("collect echo send descriptor");
+
+                (
+                    owner_thread,
+                    before,
+                    after,
+                    copied,
+                    recv_ptr,
+                    send_ptr,
+                    recv_descriptor,
+                    send_descriptor,
+                )
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(result.0, result.1);
+    assert_eq!(result.1, result.2);
+    assert_eq!(result.3, b"echo-from-app");
+    assert_eq!(result.4, result.5);
+    assert_eq!(result.6.opcode(), hammer_runtime::app::AppOpcode::Recv);
+    assert_eq!(result.7.opcode(), hammer_runtime::app::AppOpcode::Send);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
