@@ -7,7 +7,7 @@ use std::any::Any;
 use hammer_core::Lifecycle;
 
 pub use backend::AppIngressBackend;
-pub use bridge::{AppIngressDelivery, AppIngressTarget};
+pub use bridge::AppIngressTarget;
 pub(crate) use registry::AppIngressRegistry;
 
 pub trait AppHost: Lifecycle + Any + Send + Sync {}
