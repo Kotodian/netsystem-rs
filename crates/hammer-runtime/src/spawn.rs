@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -131,6 +131,7 @@ thread_local! {
 
 const DATA_BUFFER_SLOT_CAPACITY: usize = 2048;
 const DATA_BUFFER_SLOTS: usize = 4096;
+const DATA_WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 
 impl DataRuntime {
     pub fn new(
@@ -167,14 +168,8 @@ impl DataRuntime {
                     match runtime {
                         Ok(runtime) => {
                             CURRENT_DATA_WORKER.with(|slot| slot.set(Some((context_id, index))));
-                            drop(runtime.spawn(DataLocalDriver {
-                                worker: index,
-                                barrier: worker_barrier,
-                            }));
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
-                            runtime.block_on(async move {
-                                let _ = shutdown_rx.await;
-                            });
+                            run_data_worker_loop(index, &worker_barrier, &runtime, shutdown_rx);
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
@@ -651,25 +646,18 @@ impl DataPlaneExecutor {
     }
 }
 
-struct DataLocalDriver {
-    worker: usize,
-    barrier: Arc<DataPlaneBarrierState>,
+#[derive(Debug)]
+struct DataWorkerThreadWake {
+    thread: thread::Thread,
 }
 
-impl Future for DataLocalDriver {
-    type Output = ();
+impl Wake for DataWorkerThreadWake {
+    fn wake(self: Arc<Self>) {
+        self.thread.unpark();
+    }
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        DATA_LOCAL_DRIVER_WAKER.with(|waker| {
-            *waker.borrow_mut() = Some(cx.waker().clone());
-        });
-        if self.barrier.worker_poll(self.worker, cx).is_pending() {
-            return Poll::Pending;
-        }
-        poll_data_plane_nodes(cx);
-        poll_data_local_tasks(cx);
-        poll_data_plane_nodes(cx);
-        Poll::Pending
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.thread.unpark();
     }
 }
 
@@ -844,19 +832,23 @@ impl fmt::Display for DataLocalJoinError {
 
 impl Error for DataLocalJoinError {}
 
-fn poll_data_local_tasks(cx: &mut Context<'_>) {
+fn poll_data_local_tasks(cx: &mut Context<'_>) -> bool {
     let initial_len = DATA_LOCAL_TASKS.with(|queue| queue.borrow().len());
+    let mut progressed = false;
     for _ in 0..initial_len {
         let Some(task) = DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().pop_front()) else {
             break;
         };
+        progressed = true;
         if task.poll(cx) {
             DATA_LOCAL_TASKS.with(|queue| queue.borrow_mut().push_back(task));
         }
     }
+    progressed
 }
 
-fn poll_data_plane_nodes(cx: &mut Context<'_>) {
+fn poll_data_plane_nodes(cx: &mut Context<'_>) -> bool {
+    let mut progressed = false;
     loop {
         let ready = with_data_plane_runtime(|runtime| {
             let mut ready = runtime.nodes().ready();
@@ -865,16 +857,20 @@ fn poll_data_plane_nodes(cx: &mut Context<'_>) {
         if !matches!(ready, Poll::Ready(())) {
             break;
         }
+        progressed = true;
         let result = with_data_plane_runtime(|runtime| runtime.run_ready_nodes());
         match result {
             Ok(0) => continue,
-            Ok(_) => {}
+            Ok(_) => {
+                progressed = true;
+            }
             Err(err) => {
                 tracing::debug!("data plane node scheduler failed: {err}");
                 break;
             }
         }
     }
+    progressed
 }
 
 fn wake_data_local_driver() {
@@ -882,6 +878,67 @@ fn wake_data_local_driver() {
         if let Some(waker) = waker.borrow().as_ref().cloned() {
             waker.wake();
         }
+    });
+}
+
+fn run_data_worker_loop(
+    worker: usize,
+    barrier: &Arc<DataPlaneBarrierState>,
+    runtime: &tokio::runtime::Runtime,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let worker_waker = Waker::from(Arc::new(DataWorkerThreadWake {
+        thread: thread::current(),
+    }));
+    DATA_LOCAL_DRIVER_WAKER.with(|slot| {
+        *slot.borrow_mut() = Some(worker_waker.clone());
+    });
+
+    loop {
+        match shutdown_rx.try_recv() {
+            Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        }
+
+        let local_progress = poll_data_worker_once(worker, barrier, &worker_waker);
+        drive_tokio_worker_once(runtime, local_progress);
+
+        if !local_progress {
+            thread::park_timeout(DATA_WORKER_IDLE_SLICE);
+        }
+    }
+}
+
+fn poll_data_worker_once(
+    worker: usize,
+    barrier: &Arc<DataPlaneBarrierState>,
+    worker_waker: &Waker,
+) -> bool {
+    let mut cx = Context::from_waker(worker_waker);
+    DATA_LOCAL_DRIVER_WAKER.with(|slot| {
+        *slot.borrow_mut() = Some(worker_waker.clone());
+    });
+    if barrier.worker_poll(worker, &mut cx).is_pending() {
+        return false;
+    }
+
+    let mut progressed = false;
+    progressed |= poll_data_plane_nodes(&mut cx);
+    progressed |= poll_data_local_tasks(&mut cx);
+    progressed |= poll_data_plane_nodes(&mut cx);
+    progressed
+}
+
+fn drive_tokio_worker_once(runtime: &tokio::runtime::Runtime, local_progress: bool) {
+    if local_progress {
+        runtime.block_on(async {
+            tokio::task::yield_now().await;
+        });
+        return;
+    }
+
+    runtime.block_on(async {
+        tokio::time::sleep(DATA_WORKER_IDLE_SLICE).await;
     });
 }
 
@@ -989,6 +1046,27 @@ where
         "current local spawn requires the current data worker thread"
     );
     spawn_local(move || future)
+}
+
+pub async fn yield_local_now() {
+    struct YieldLocal {
+        yielded: bool,
+    }
+
+    impl Future for YieldLocal {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if self.yielded {
+                return Poll::Ready(());
+            }
+            self.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    YieldLocal { yielded: false }.await
 }
 
 pub(crate) fn with_data_plane_runtime<R>(f: impl FnOnce(&RuntimeDataPlaneRuntime) -> R) -> R {
@@ -1312,7 +1390,7 @@ mod tests {
                             let during = runtime.in_use_buffers();
                             (before, during, buffer)
                         });
-                        tokio::task::yield_now().await;
+                        yield_local_now().await;
                         let thread_after = thread::current()
                             .name()
                             .map(ToOwned::to_owned)
@@ -1377,7 +1455,7 @@ mod tests {
                                     .alloc_index_with_bytes(Default::default(), b"packet")
                                     .expect("alloc local data buffer")
                             });
-                            tokio::task::yield_now().await;
+                            yield_local_now().await;
                             let thread_after = thread::current()
                                 .name()
                                 .map(ToOwned::to_owned)
@@ -1404,6 +1482,37 @@ mod tests {
         assert_eq!(thread_before, "spawn-test-current-local-0");
         assert_eq!(thread_after, "spawn-test-current-local-0");
         assert_eq!(payload, b"packet");
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_runtime_local_spawn_is_not_polled_under_tokio_worker_context() {
+        let _guard = test_lock();
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-no-tokio-local", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime");
+
+        let has_tokio_handle = context.enter(|| {
+            driver.block_on(async {
+                spawn(async {
+                    spawn_local(|| async { tokio::runtime::Handle::try_current().is_ok() })
+                        .await
+                        .expect("local task finished")
+                })
+                .await
+                .expect("data task finished")
+            })
+        });
+
+        assert!(
+            !has_tokio_handle,
+            "app/dataplane local task should not inherit a Tokio worker runtime"
+        );
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }
@@ -1456,7 +1565,7 @@ mod tests {
                         });
                         let producer_frame = std::rc::Rc::clone(&frame);
                         let producer = spawn_current_local(async move {
-                            tokio::task::yield_now().await;
+                            yield_local_now().await;
                             producer_frame
                                 .borrow_mut()
                                 .push_index(index)
@@ -1588,7 +1697,7 @@ mod tests {
                     let mut release_rx = release_tx.subscribe();
                     drop(spawn_current_local(async move {
                         entered_tx.send(index).expect("send entered worker");
-                        tokio::task::yield_now().await;
+                        yield_local_now().await;
                         release_rx.recv().await.expect("release worker");
                     }));
                 }
@@ -1701,7 +1810,7 @@ mod tests {
                 spawn(async {
                     let (tx, rx) = oneshot::channel();
                     let task = spawn_local(move || async move {
-                        tokio::task::yield_now().await;
+                        yield_local_now().await;
                         let _ = tx.send(());
                     });
                     drop(task);

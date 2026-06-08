@@ -1,4 +1,6 @@
-use hammer_infra::ring::{CompletionDescriptor, LocalRing, RingEntry, SubmissionDescriptor};
+use hammer_infra::ring::{
+    CompletionDescriptor, IndexedRing, LocalRing, RingEntry, SubmissionDescriptor,
+};
 
 #[test]
 fn local_ring_preserves_fifo_order_across_wraparound() {
@@ -97,4 +99,47 @@ fn ring_entry_can_attach_transport_specific_state_to_generic_descriptors() {
     let (round_trip_descriptor, attachment) = entry.into_parts();
     assert_eq!(round_trip_descriptor, descriptor);
     assert_eq!(attachment, Some("registered-buffer"));
+}
+
+#[test]
+fn indexed_ring_queues_slot_ids_while_entries_live_in_a_slot_table() {
+    let mut ring = IndexedRing::with_capacity(2);
+
+    let first = ring.try_push("first").expect("push first");
+    let second = ring.try_push("second").expect("push second");
+
+    assert_eq!(ring.len(), 2);
+    assert_eq!(ring.capacity(), 2);
+    assert_eq!(ring.entry(first), Some(&"first"));
+    assert_eq!(ring.entry(second), Some(&"second"));
+
+    let (first_slot, first_entry) = ring.pop().expect("pop first");
+    assert_eq!(first_slot, first);
+    assert_eq!(first_entry, "first");
+    assert_eq!(ring.entry(first), None);
+    assert_eq!(ring.entry(second), Some(&"second"));
+
+    let (second_slot, second_entry) = ring.pop().expect("pop second");
+    assert_eq!(second_slot, second);
+    assert_eq!(second_entry, "second");
+    assert_eq!(ring.entry(second), None);
+    assert!(ring.pop().is_none());
+}
+
+#[test]
+fn indexed_ring_reuses_released_slots_after_pop() {
+    let mut ring = IndexedRing::with_capacity(2);
+
+    let first = ring.try_push("first").expect("push first");
+    let second = ring.try_push("second").expect("push second");
+    assert_ne!(first, second);
+
+    let (released, value) = ring.pop().expect("pop first");
+    assert_eq!(released, first);
+    assert_eq!(value, "first");
+
+    let recycled = ring.try_push("third").expect("push third");
+    assert_eq!(recycled, first);
+    assert_eq!(ring.entry(recycled), Some(&"third"));
+    assert_eq!(ring.entry(second), Some(&"second"));
 }

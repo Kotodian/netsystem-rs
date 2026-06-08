@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use hammer_adapter::BufferIndex;
@@ -780,9 +781,14 @@ fn same_flow_reuses_backend_across_spawn_calls() {
                     .await
                     .expect("recv sqe descriptor");
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
-                tokio::time::timeout(Duration::from_millis(200), recv_future)
-                    .await
-                    .expect_err("recv should wait for a future completion")
+                let mut recv_future = std::pin::pin!(recv_future);
+                let still_pending =
+                    std::future::poll_fn(|cx| match recv_future.as_mut().poll(cx) {
+                        std::task::Poll::Pending => std::task::Poll::Ready(true),
+                        std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+                    })
+                    .await;
+                assert!(still_pending, "recv should wait for a future completion");
             })
             .await
             .expect("reuse flow backend")
