@@ -27,17 +27,21 @@ impl AppIngressTarget {
     }
 
     #[inline]
-    pub fn deliver_descriptor(
+    pub fn complete_ingress_descriptor(
         &self,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<()> {
-        AppIngressBackend.deliver_descriptor(runtime, index, self)
+        AppIngressBackend.complete_ingress(runtime, index, self)
     }
 
     #[inline]
-    pub fn deliver_recv(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
-        self.deliver_descriptor(runtime, index)
+    pub fn complete_ingress(
+        &self,
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        self.complete_ingress_descriptor(runtime, index)
     }
 }
 
@@ -56,7 +60,5 @@ pub fn deliver_buffer_to_app(
     index: BufferIndex,
     target: &AppIngressTarget,
 ) -> CoreResult<()> {
-    target.deliver_descriptor(runtime, index)
+    target.complete_ingress(runtime, index)
 }
-
-pub type AppIngressDelivery = AppIngressTarget;

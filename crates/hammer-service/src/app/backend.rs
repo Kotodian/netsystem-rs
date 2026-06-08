@@ -7,7 +7,7 @@ pub struct AppIngressBackend;
 
 impl AppIngressBackend {
     #[inline]
-    pub fn deliver_descriptor(
+    pub fn complete_ingress(
         &self,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
@@ -32,6 +32,6 @@ impl AppIngressBackend {
         index: BufferIndex,
         target: &AppIngressTarget,
     ) -> CoreResult<()> {
-        self.deliver_descriptor(runtime, index, target)
+        self.complete_ingress(runtime, index, target)
     }
 }

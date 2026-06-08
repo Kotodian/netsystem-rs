@@ -158,8 +158,8 @@ fn service_tcp_app_backend_delivers_recv_descriptor_into_service_app_flow() {
                             .with_transport_payload_offset(0),
                     );
                 target
-                    .deliver_descriptor(&runtime, index)
-                    .expect("deliver descriptor to app");
+                    .complete_ingress(&runtime, index)
+                    .expect("complete ingress to app");
             }
         })
         .expect("spawn deliver task");
@@ -197,7 +197,7 @@ fn service_tcp_app_backend_rejects_descriptor_delivery_from_non_owner_worker() {
             let index = runtime
                 .alloc_index_with_bytes(tcp_metadata(), b"owner-mismatch")
                 .expect("alloc TCP buffer");
-            let result = target.deliver_descriptor(&runtime, index);
+            let result = target.complete_ingress(&runtime, index);
             tx.send((
                 result.map(|_| ()).map_err(|err| err.to_string()),
                 runtime.in_use_buffers(),
@@ -295,8 +295,8 @@ fn service_tcp_app_target_enqueues_recv_cqe_descriptor_into_runtime_backend() {
                             .with_transport_payload_offset(0),
                     );
                 target
-                    .deliver_descriptor(&runtime, index)
-                    .expect("deliver descriptor");
+                    .complete_ingress(&runtime, index)
+                    .expect("complete ingress");
             }
         })
         .expect("spawn deliver task");

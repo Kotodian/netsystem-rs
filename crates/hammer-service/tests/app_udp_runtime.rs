@@ -152,8 +152,8 @@ fn service_udp_app_bridge_delivers_recv_descriptor_into_service_app_flow() {
                 .expect("alloc UDP buffer");
             stamp_udp_cursor(&runtime, index, &packet);
             AppIngressTarget::new(app.clone(), flow)
-                .deliver_descriptor(&runtime, index)
-                .expect("deliver UDP descriptor to app");
+                .complete_ingress(&runtime, index)
+                .expect("complete UDP ingress to app");
         })
         .expect("spawn deliver task");
 
@@ -198,7 +198,7 @@ fn service_udp_app_bridge_rejects_descriptor_delivery_from_non_owner_worker() {
                 .alloc_index_with_bytes(udp_metadata_for_ports(40_031, 9_999), &packet)
                 .expect("alloc UDP buffer");
             stamp_udp_cursor(&runtime, index, &packet);
-            let result = target.deliver_descriptor(&runtime, index);
+            let result = target.complete_ingress(&runtime, index);
             tx.send((
                 result.map(|_| ()).map_err(|err| err.to_string()),
                 runtime.in_use_buffers(),

@@ -546,7 +546,7 @@ fn dispatch_udp_input_to_app(
     index: BufferIndex,
     target: &AppIngressTarget,
 ) -> CoreResult<()> {
-    target.deliver_recv(runtime, index)
+    target.complete_ingress(runtime, index)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

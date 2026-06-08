@@ -499,7 +499,7 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
                                     .nodes()
                                     .register_internal(CaptureNode::new(Arc::clone(&sink_state))),
                             ))
-                            .with_app_bridge(
+                            .with_app_ingress(
                                 ESTABLISHED_ID,
                                 AppIngressTarget::new(bridge_app.clone(), flow),
                             ),
@@ -530,8 +530,8 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
                     .publish_lookup(owner.publish_snapshot())
                     .expect("publish established lookup");
                 tcp_control
-                    .publish_app_bridges([ESTABLISHED_ID])
-                    .expect("publish app bridge");
+                    .publish_app_ingress([ESTABLISHED_ID])
+                    .expect("publish app ingress");
                 let tcp_input = runtime.nodes().register_internal(tcp_control.node());
 
                 let packet = ipv4_tcp_packet(

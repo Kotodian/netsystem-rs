@@ -93,7 +93,7 @@ fn format_tcp_input_trace(bytes: &[u8]) -> String {
 struct TcpInputSnapshot {
     lookup: TcpLookupSnapshot,
     dispatch: TcpDispatchTable,
-    app_bridges: Arc<FlatHashTable<TcpLookupId, ()>>,
+    app_ingress: Arc<FlatHashTable<TcpLookupId, ()>>,
 }
 
 impl TcpInputSnapshot {
@@ -102,7 +102,7 @@ impl TcpInputSnapshot {
         Self {
             lookup: TcpLookupSnapshot::default(),
             dispatch: TcpDispatchTable::default(),
-            app_bridges: Arc::new(FlatHashTable::new()),
+            app_ingress: Arc::new(FlatHashTable::new()),
         }
     }
 }
@@ -159,18 +159,18 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub fn publish_app_bridges(
+    pub fn publish_app_ingress(
         &self,
-        app_bridges: impl IntoIterator<Item = TcpLookupId>,
+        app_ingress: impl IntoIterator<Item = TcpLookupId>,
     ) -> CoreResult<()> {
-        let app_bridges = Arc::new(FlatHashTable::from_entries(
-            app_bridges
+        let app_ingress = Arc::new(FlatHashTable::from_entries(
+            app_ingress
                 .into_iter()
                 .map(|connection_id| (connection_id, ())),
         ));
         self.inner.rcu(|current| {
             let mut next = TcpInputSnapshot::clone(current);
-            next.app_bridges = Arc::clone(&app_bridges);
+            next.app_ingress = Arc::clone(&app_ingress);
             next
         });
         Ok(())
@@ -302,19 +302,19 @@ fn tcp_input_process(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PendingTcpAppBridgeEntry {
+struct PendingTcpAppIngressEntry {
     generation: u32,
     connection_id: TcpLookupId,
     occupied: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-struct PendingTcpAppBridgePool {
+struct PendingTcpAppIngressPool {
     pool_id: u64,
-    entries: InfraVec<PendingTcpAppBridgeEntry>,
+    entries: InfraVec<PendingTcpAppIngressEntry>,
 }
 
-impl PendingTcpAppBridgePool {
+impl PendingTcpAppIngressPool {
     #[inline]
     const fn new(pool_id: u64) -> Self {
         Self {
@@ -325,16 +325,16 @@ impl PendingTcpAppBridgePool {
 }
 
 #[derive(Debug, Clone, Default)]
-struct PendingTcpAppBridgeStore {
-    pools: InfraVec<PendingTcpAppBridgePool>,
+struct PendingTcpAppIngressStore {
+    pools: InfraVec<PendingTcpAppIngressPool>,
 }
 
 thread_local! {
-    static TCP_APP_BRIDGE_PENDING: RefCell<PendingTcpAppBridgeStore> =
-        const { RefCell::new(PendingTcpAppBridgeStore::new()) };
+    static TCP_APP_INGRESS_PENDING: RefCell<PendingTcpAppIngressStore> =
+        const { RefCell::new(PendingTcpAppIngressStore::new()) };
 }
 
-impl PendingTcpAppBridgeStore {
+impl PendingTcpAppIngressStore {
     #[inline]
     const fn new() -> Self {
         Self {
@@ -347,9 +347,9 @@ impl PendingTcpAppBridgeStore {
         let pool = self.pool_mut(index.pool_id());
         let slot = index.slot() as usize;
         while pool.entries.len() <= slot {
-            pool.entries.push(PendingTcpAppBridgeEntry::default());
+            pool.entries.push(PendingTcpAppIngressEntry::default());
         }
-        pool.entries[slot] = PendingTcpAppBridgeEntry {
+        pool.entries[slot] = PendingTcpAppIngressEntry {
             generation: index.generation(),
             connection_id,
             occupied: true,
@@ -367,45 +367,45 @@ impl PendingTcpAppBridgeStore {
             return None;
         }
         if entry.generation != index.generation() {
-            *entry = PendingTcpAppBridgeEntry::default();
+            *entry = PendingTcpAppIngressEntry::default();
             return None;
         }
         let connection_id = entry.connection_id;
-        *entry = PendingTcpAppBridgeEntry::default();
+        *entry = PendingTcpAppIngressEntry::default();
         Some(connection_id)
     }
 
     #[inline]
-    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAppBridgePool {
+    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAppIngressPool {
         if let Some(position) = self.pools.iter().position(|pool| pool.pool_id == pool_id) {
             return &mut self.pools[position];
         }
-        self.pools.push(PendingTcpAppBridgePool::new(pool_id));
+        self.pools.push(PendingTcpAppIngressPool::new(pool_id));
         let position = self.pools.len() - 1;
         &mut self.pools[position]
     }
 }
 
 #[inline]
-pub(crate) fn mark_pending_tcp_app_bridge(
+pub(crate) fn mark_pending_tcp_app_ingress(
     index: BufferIndex,
     connection_id: TcpLookupId,
 ) -> CoreResult<()> {
-    TCP_APP_BRIDGE_PENDING.with(|pending| {
+    TCP_APP_INGRESS_PENDING.with(|pending| {
         pending
             .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP app bridge pending store borrowed"))?
+            .map_err(|_| CoreError::internal("TCP app ingress pending store borrowed"))?
             .mark(index, connection_id);
         Ok(())
     })
 }
 
 #[inline]
-pub(crate) fn take_pending_tcp_app_bridge(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
-    TCP_APP_BRIDGE_PENDING.with(|pending| {
+pub(crate) fn take_pending_tcp_app_ingress(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
+    TCP_APP_INGRESS_PENDING.with(|pending| {
         Ok(pending
             .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP app bridge pending store borrowed"))?
+            .map_err(|_| CoreError::internal("TCP app ingress pending store borrowed"))?
             .take(index))
     })
 }
@@ -478,10 +478,10 @@ fn next_node_for_index(
         Some(value) if value.kind == TcpLookupKind::EstablishedConnection => TcpState::Established,
         _ => TcpState::Listen,
     };
-    let app_bridge_connection = match lookup {
+    let app_ingress_connection = match lookup {
         Some(value)
             if value.kind == TcpLookupKind::EstablishedConnection
-                && snapshot.app_bridges.lookup(&value.id).is_some() =>
+                && snapshot.app_ingress.lookup(&value.id).is_some() =>
         {
             Some(value.id)
         }
@@ -501,9 +501,9 @@ fn next_node_for_index(
         );
     }
     if entry.next == TcpInputNext::Established
-        && let Some(connection_id) = app_bridge_connection
+        && let Some(connection_id) = app_ingress_connection
     {
-        mark_pending_tcp_app_bridge(index, connection_id)?;
+        mark_pending_tcp_app_ingress(index, connection_id)?;
     }
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, entry.next);
@@ -566,12 +566,12 @@ fn established_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
 mod tests {
     use hammer_adapter::{DataPlaneRuntime, RouteMetadata};
 
-    use super::PendingTcpAppBridgeStore;
+    use super::PendingTcpAppIngressStore;
 
     #[test]
-    fn pending_tcp_app_bridge_store_consumes_once_and_ignores_reused_slots() {
+    fn pending_tcp_app_ingress_store_consumes_once_and_ignores_reused_slots() {
         let runtime = DataPlaneRuntime::with_capacities(64, 2, 1, 1);
-        let mut pending = PendingTcpAppBridgeStore::new();
+        let mut pending = PendingTcpAppIngressStore::new();
 
         let first = runtime
             .alloc_index(RouteMetadata::default())
