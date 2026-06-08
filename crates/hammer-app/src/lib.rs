@@ -95,8 +95,8 @@ pub struct AppBackend {
 
 impl AppBackend {
     #[inline]
-    pub async fn push_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
-        self.inner.push_recv(lease.into_inner()).await
+    pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
+        self.inner.complete_recv(lease.into_inner()).await
     }
 
     #[inline]

@@ -47,9 +47,9 @@ fn app_wrapper_keeps_flow_pinned_and_zero_copy() {
                 let expected_ptr = runtime.current_ptr(index).expect("buffer pointer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv");
+                    .expect("complete recv");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv");
@@ -253,9 +253,9 @@ fn hammer_app_ring_exposes_completion_entry_without_recv_wrapper() {
                     .expect("alloc app buffer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime, index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime, index))
                     .await
-                    .expect("push recv");
+                    .expect("complete recv");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 drop(recv_future);
@@ -360,9 +360,9 @@ fn hammer_app_ring_exposes_symmetric_entry_surfaces_without_send_recv_wrappers()
                     .await
                     .expect("recv sqe descriptor");
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime, recv_index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime, recv_index))
                     .await
-                    .expect("push recv");
+                    .expect("complete recv");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 drop(recv_future);

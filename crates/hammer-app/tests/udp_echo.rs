@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use hammer_app::echo::run_udp_echo;
 use hammer_app::udp::UdpSocket;
-use hammer_app::{App, AppBufferLease, AppFlowId};
+use hammer_app::{App, AppBufferLease, AppFlowId, AppOpcode};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
@@ -19,7 +19,15 @@ fn udp_echo_helper_reuses_same_ring() {
         .block_on(async {
             app.spawn(flow, move |flow| async move {
                 let backend = flow.backend();
+                let ring = flow.ring();
+                let udp = UdpSocket::new(ring.clone(), "127.0.0.1:5353".parse().expect("peer"));
+                let udp_echo = flow.spawn_local({
+                    let udp = udp.clone();
+                    move || async move { run_udp_echo(&udp).await.expect("udp echo once") }
+                });
                 let runtime = with_data_plane_buffers(Clone::clone);
+                let first_recv_sqe = backend.next_sqe_descriptor().await.expect("first recv sqe");
+                assert_eq!(first_recv_sqe.opcode(), AppOpcode::Recv);
                 let echo_index = runtime
                     .alloc_index_with_bytes(Default::default(), b"udp-echo")
                     .expect("alloc udp buffer");
@@ -28,22 +36,25 @@ fn udp_echo_helper_reuses_same_ring() {
                     .expect("alloc ring buffer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), echo_index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), echo_index))
                     .await
-                    .expect("push udp recv");
-
-                let ring = flow.ring();
-                let udp = UdpSocket::new(ring.clone(), "127.0.0.1:5353".parse().expect("peer"));
-                let peer = run_udp_echo(&udp).await.expect("udp echo once");
+                    .expect("complete udp recv");
+                let peer = udp_echo.await.expect("join udp echo");
                 let udp_send = backend.next_send().await.expect("udp send");
                 let udp_payload = udp_send.lease().copy_current().expect("copy udp payload");
 
-                backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), replay_index))
+                let ring_recv_future = ring.recv();
+                let second_recv_sqe = backend
+                    .next_sqe_descriptor()
                     .await
-                    .expect("push ring recv");
+                    .expect("second recv sqe");
+                assert_eq!(second_recv_sqe.opcode(), AppOpcode::Recv);
+                backend
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), replay_index))
+                    .await
+                    .expect("complete ring recv");
 
-                let ring_recv = ring.recv().await.expect("ring recv after udp");
+                let ring_recv = ring_recv_future.await.expect("ring recv after udp");
                 let udp_ptr = ring_recv.lease().current_ptr().expect("udp recv ptr") as usize;
                 let expected_udp_ptr =
                     runtime.current_ptr(replay_index).expect("udp expected ptr") as usize;

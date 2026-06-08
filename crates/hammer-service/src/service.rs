@@ -1418,9 +1418,9 @@ interval = "5s"
                         .expect("alloc buffer");
                     worker
                         .backend()
-                        .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                        .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                         .await
-                        .expect("push recv");
+                        .expect("complete recv");
                     assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
                     let recv = recv_future.await.expect("recv app payload");
                     let payload = recv.lease().copy_current().expect("payload copy");
