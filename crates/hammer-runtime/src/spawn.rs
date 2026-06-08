@@ -323,7 +323,6 @@ impl DataRuntimeContext {
     pub fn enter<R>(&self, f: impl FnOnce() -> R) -> R {
         THREAD_DATA_CONTEXT.with(|slot| slot.borrow_mut().push(self.clone()));
         let _guard = ThreadDataContextGuard;
-        let _runtime_guard = self.first_handle().enter();
         f()
     }
 
@@ -470,10 +469,6 @@ impl DataRuntimeContext {
                 })
             })
             .collect()
-    }
-
-    fn first_handle(&self) -> &Handle {
-        &self.inner.workers[0].handle
     }
 
     pub(crate) fn worker_count(&self) -> usize {
@@ -2046,7 +2041,7 @@ mod tests {
     }
 
     #[test]
-    fn data_context_enters_tokio_runtime_handle() {
+    fn data_context_enter_does_not_install_tokio_runtime_handle() {
         let _guard = test_lock();
         let data_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -2061,10 +2056,12 @@ mod tests {
             .expect("control runtime");
 
         control_runtime.block_on(async {
-            let current = data_context.enter(Handle::current);
-            assert_eq!(
-                current.runtime_flavor(),
-                data_runtime.handle().runtime_flavor()
+            assert!(
+                matches!(
+                    data_context.enter(|| Handle::current().runtime_flavor()),
+                    tokio::runtime::RuntimeFlavor::CurrentThread
+                ),
+                "enter should preserve the ambient control runtime handle instead of installing a data-worker Tokio handle"
             );
         });
 
