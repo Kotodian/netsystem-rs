@@ -300,3 +300,137 @@ impl<T: fmt::Debug> fmt::Debug for LocalRing<T> {
             .finish()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RingSlotId(u32);
+
+impl RingSlotId {
+    #[inline]
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+pub struct IndexedRing<T> {
+    ready: LocalRing<RingSlotId>,
+    slots: Vec<Option<T>>,
+    free: Vec<RingSlotId>,
+}
+
+impl<T> IndexedRing<T> {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            ready: LocalRing::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        assert!(
+            u32::try_from(capacity).is_ok(),
+            "indexed ring capacity exceeds u32 slots"
+        );
+        let mut slots = Vec::with_capacity(capacity);
+        let mut free = Vec::with_capacity(capacity);
+        for index in 0..capacity {
+            slots.push(None);
+            let slot = RingSlotId::new((capacity - index - 1) as u32);
+            free.push(slot);
+        }
+        Self {
+            ready: LocalRing::with_capacity(capacity),
+            slots,
+            free,
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.ready.len()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.ready.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline(always)]
+    pub fn is_full(&self) -> bool {
+        self.free.is_empty()
+    }
+
+    #[inline]
+    pub fn entry(&self, slot: RingSlotId) -> Option<&T> {
+        self.slots.get(slot.as_usize()).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    pub fn entry_mut(&mut self, slot: RingSlotId) -> Option<&mut T> {
+        self.slots.get_mut(slot.as_usize()).and_then(Option::as_mut)
+    }
+
+    #[inline]
+    pub fn try_push(&mut self, value: T) -> Result<RingSlotId, T> {
+        let Some(slot) = self.free.pop() else {
+            return Err(value);
+        };
+        self.slots[slot.as_usize()] = Some(value);
+        if self.ready.try_push(slot).is_err() {
+            let value = self.slots[slot.as_usize()]
+                .take()
+                .expect("slot was just populated");
+            self.free.push(slot);
+            return Err(value);
+        }
+        Ok(slot)
+    }
+
+    #[inline]
+    pub fn pop(&mut self) -> Option<(RingSlotId, T)> {
+        let slot = self.ready.pop()?;
+        let value = self.slots[slot.as_usize()]
+            .take()
+            .expect("ready slot must have an entry");
+        self.free.push(slot);
+        Some((slot, value))
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+impl<T> Default for IndexedRing<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for IndexedRing<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexedRing")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}

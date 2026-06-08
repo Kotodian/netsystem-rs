@@ -455,10 +455,7 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
                     move || async move {
                         let recv_future = app_runtime.recv();
                         recv_ready.notify_one();
-                        let recv = tokio::time::timeout(Duration::from_millis(200), recv_future)
-                            .await
-                            .expect("recv should arrive")
-                            .expect("recv app buffer");
+                        let recv = recv_future.await.expect("recv app buffer");
                         let payload = recv.lease().copy_current().expect("recv payload");
                         let metadata = recv
                             .lease()

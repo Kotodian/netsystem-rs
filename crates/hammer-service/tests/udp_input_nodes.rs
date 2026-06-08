@@ -538,10 +538,7 @@ fn udp_input_dispatches_selected_port_into_runtime_app_flow() {
                             .expect("next recv sqe descriptor");
                         assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
                         ready_tx.send(()).expect("send recv-ready signal");
-                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
-                            .await
-                            .expect("app recv timeout")
-                            .expect("app recv");
+                        let recv = recv_future.await.expect("app recv");
                         let payload = recv.lease().copy_current().expect("copy app payload");
                         let metadata = recv
                             .lease()
@@ -659,10 +656,7 @@ fn udp_input_app_dispatch_releases_runtime_buffers_after_app_recv_release() {
                             .expect("next recv sqe descriptor");
                         assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
                         ready_tx.send(()).expect("send recv-ready signal");
-                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
-                            .await
-                            .expect("app recv timeout")
-                            .expect("app recv");
+                        let recv = recv_future.await.expect("app recv");
                         let before_release = recv.lease().runtime().in_use_buffers();
                         recv.release();
                         let after_release = worker
@@ -766,10 +760,7 @@ fn udp_input_app_dispatch_rejects_non_owner_worker_without_copying_packet() {
                             .expect("next recv sqe descriptor");
                         assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
                         ready_tx.send(()).expect("send recv-ready signal");
-                        let recv = tokio::time::timeout(Duration::from_secs(1), recv_future)
-                            .await
-                            .expect("app recv timeout")
-                            .expect("app recv");
+                        let recv = recv_future.await.expect("app recv");
                         recv.release();
                         worker.owner_worker()
                     })

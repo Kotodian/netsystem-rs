@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
-use hammer_infra::ring::{CompletionDescriptor, LocalRing, RingEntry, SubmissionDescriptor};
+use hammer_infra::ring::{CompletionDescriptor, IndexedRing, RingEntry, SubmissionDescriptor};
 use hammer_infra::vec::Vec;
 
 use crate::app::context::AppFlowId;
@@ -748,7 +748,7 @@ pub struct AppSend {
 
 #[derive(Debug)]
 struct AppRingState<T> {
-    ring: LocalRing<T>,
+    ring: IndexedRing<T>,
     waker: Option<Waker>,
 }
 
@@ -756,7 +756,7 @@ impl<T> AppRingState<T> {
     #[inline]
     fn new(capacity: usize) -> Self {
         Self {
-            ring: LocalRing::with_capacity(capacity),
+            ring: IndexedRing::with_capacity(capacity),
             waker: None,
         }
     }
@@ -769,17 +769,17 @@ impl<T> AppRingState<T> {
         {
             waker.wake();
         }
-        pushed
+        pushed.map(|_| ())
     }
 
     #[inline]
     fn pop(&mut self) -> Option<T> {
-        self.ring.pop()
+        self.ring.pop().map(|(_, value)| value)
     }
 
     #[inline]
     fn poll_pop(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Some(value) = self.ring.pop() {
+        if let Some((_, value)) = self.ring.pop() {
             return Poll::Ready(Some(value));
         }
         let replace = match self.waker.as_ref() {
@@ -789,7 +789,7 @@ impl<T> AppRingState<T> {
         if replace {
             self.waker = Some(cx.waker().clone());
         }
-        if let Some(value) = self.ring.pop() {
+        if let Some((_, value)) = self.ring.pop() {
             self.waker.take();
             Poll::Ready(Some(value))
         } else {
