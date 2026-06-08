@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use hammer_app::echo::{echo_once, run_tcp_echo};
 use hammer_app::tcp::TcpStream;
-use hammer_app::{App, AppBufferLease, AppFlowId};
+use hammer_app::{App, AppBufferLease, AppFlowId, AppOpcode};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
@@ -19,19 +19,26 @@ fn tcp_echo_helpers_round_trip_without_copying() {
         .block_on(async {
             app.spawn(flow, move |flow| async move {
                 let backend = flow.backend();
+                let stream = TcpStream::new(flow.ring());
+                let echo = flow.spawn_local({
+                    let stream = stream.clone();
+                    move || async move {
+                        echo_once(&stream).await.expect("echo once");
+                    }
+                });
                 let runtime = with_data_plane_buffers(Clone::clone);
+                let recv_sqe = backend.next_sqe_descriptor().await.expect("next recv sqe");
+                assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let index = runtime
                     .alloc_index_with_bytes(Default::default(), b"tcp-echo")
                     .expect("alloc tcp buffer");
                 let expected_ptr = runtime.current_ptr(index).expect("buffer pointer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv");
-
-                let stream = TcpStream::new(flow.ring());
-                echo_once(&stream).await.expect("echo once");
+                    .expect("complete recv");
+                echo.await.expect("join echo");
 
                 let send = backend.next_send().await.expect("next send");
                 let send_ptr = send.lease().current_ptr().expect("send pointer");
@@ -67,16 +74,6 @@ fn tcp_echo_loop_uses_local_executor() {
                     .map(ToOwned::to_owned)
                     .unwrap_or_default();
                 let backend = flow.backend();
-                let runtime = with_data_plane_buffers(Clone::clone);
-                let first = runtime
-                    .alloc_index_with_bytes(Default::default(), b"loop-echo")
-                    .expect("alloc loop buffer");
-
-                backend
-                    .push_recv(AppBufferLease::from_buffer(runtime, first))
-                    .await
-                    .expect("push loop recv");
-
                 let stream = TcpStream::new(flow.ring());
                 let echo = flow.spawn_local({
                     let stream = stream.clone();
@@ -88,6 +85,17 @@ fn tcp_echo_loop_uses_local_executor() {
                             .unwrap_or_default()
                     }
                 });
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let recv_sqe = backend.next_sqe_descriptor().await.expect("next recv sqe");
+                assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
+                let first = runtime
+                    .alloc_index_with_bytes(Default::default(), b"loop-echo")
+                    .expect("alloc loop buffer");
+
+                backend
+                    .complete_recv(AppBufferLease::from_buffer(runtime, first))
+                    .await
+                    .expect("complete loop recv");
 
                 let loop_send = backend.next_send().await.expect("loop send");
                 let loop_payload = loop_send.lease().copy_current().expect("copy loop payload");

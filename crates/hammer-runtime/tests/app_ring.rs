@@ -127,9 +127,9 @@ fn app_runtime_send_enqueues_flow_owned_send_sqe_descriptor() {
                     .expect("alloc app send buffer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv cqe");
+                    .expect("complete recv cqe");
 
                 let recv = recv_future.await.expect("recv cqe");
                 app_runtime.send(recv.into_send()).await.expect("send sqe");
@@ -624,9 +624,9 @@ fn app_ring_zero_copy_recv_and_stable_flow_owner() {
                 let expected_ptr = runtime.current_ptr(index).expect("buffer pointer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv cqe");
+                    .expect("complete recv cqe");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv cqe");
@@ -713,9 +713,9 @@ fn app_recv_drop_releases_buffer_lease() {
                     .expect("alloc app recv buffer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv cqe");
+                    .expect("complete recv cqe");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv cqe");
@@ -762,9 +762,9 @@ fn same_flow_reuses_backend_across_spawn_calls() {
                     .expect("alloc app recv buffer");
 
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv cqe");
+                    .expect("complete recv cqe");
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 recv_future.await.expect("recv cqe").release();
             })

@@ -36,9 +36,9 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                     .alloc_index_with_bytes(Default::default(), b"echo-from-app")
                     .expect("alloc app echo buffer");
                 backend
-                    .push_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
-                    .expect("push recv");
+                    .expect("complete recv");
                 let recv = recv_future.await.expect("recv echo buffer");
                 let recv_ptr = recv.lease().current_ptr().expect("recv pointer") as usize;
                 let copied = recv.lease().copy_current().expect("copy echo payload");

@@ -102,12 +102,12 @@ impl AppBackend {
     }
 
     #[inline]
-    pub async fn push_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
-        self.try_push_recv(lease)
+    pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
+        self.try_complete_recv(lease)
     }
 
     #[inline]
-    pub fn try_push_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
+    pub fn try_complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
         self.ring.try_complete_recv_lease(self.flow, lease, false)
     }
 
