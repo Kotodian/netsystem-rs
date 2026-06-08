@@ -66,20 +66,15 @@ impl AppContext {
         let owner_worker = self.owner_for(flow)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
-        let context = self.data_context.clone();
-        let handle = context.execute_on_worker(owner_worker, async move {
-            let local = spawn_local(move || async move {
+        self.data_context
+            .call_local_on_worker(owner_worker, move || async move {
                 let worker = AppWorkerContext {
                     owner_worker,
                     backend: worker_backend(app_context_id, flow, ring_capacity),
                 };
                 f(worker).await
-            });
-            local.await.expect("app local worker task")
-        });
-        handle
+            })
             .await
-            .map_err(|err| HammerError::internal(format!("join app flow task: {err}")))
     }
 
     #[inline]

@@ -98,6 +98,7 @@ pub struct DataPlaneBarrierGuard {
 #[derive(Clone)]
 struct DataRuntimeContextWorker {
     handle: Handle,
+    remote_local: DataRemoteLocalQueue,
 }
 
 pub struct DataRuntime {
@@ -112,6 +113,7 @@ struct DataRuntimeWorker {
 }
 
 type DataLocalTaskFuture = Pin<Box<dyn Future<Output = ()> + 'static>>;
+type RemoteDataLocalTask = Box<dyn FnOnce() + Send + 'static>;
 
 static NEXT_DATA_RUNTIME_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -133,6 +135,12 @@ const DATA_BUFFER_SLOT_CAPACITY: usize = 2048;
 const DATA_BUFFER_SLOTS: usize = 4096;
 const DATA_WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 
+#[derive(Clone, Default)]
+struct DataRemoteLocalQueue {
+    tasks: Arc<Mutex<VecDeque<RemoteDataLocalTask>>>,
+    thread: Arc<Mutex<Option<thread::Thread>>>,
+}
+
 impl DataRuntime {
     pub fn new(
         worker_threads: usize,
@@ -153,6 +161,8 @@ impl DataRuntime {
         for index in 0..worker_threads {
             let worker_name = format!("{thread_name}-{index}");
             let worker_barrier = Arc::clone(&barrier);
+            let remote_local = DataRemoteLocalQueue::default();
+            let worker_remote_local = remote_local.clone();
             let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<Handle, String>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -168,8 +178,15 @@ impl DataRuntime {
                     match runtime {
                         Ok(runtime) => {
                             CURRENT_DATA_WORKER.with(|slot| slot.set(Some((context_id, index))));
+                            worker_remote_local.attach_current_thread();
                             let _ = handle_tx.send(Ok(runtime.handle().clone()));
-                            run_data_worker_loop(index, &worker_barrier, &runtime, shutdown_rx);
+                            run_data_worker_loop(
+                                index,
+                                &worker_barrier,
+                                &worker_remote_local,
+                                &runtime,
+                                shutdown_rx,
+                            );
                             DATA_LOCAL_TASKS.with(|tasks| tasks.borrow_mut().clear());
                             DATA_LOCAL_DRIVER_WAKER.with(|waker| waker.borrow_mut().take());
                             CURRENT_DATA_WORKER.with(|slot| slot.set(None));
@@ -190,7 +207,10 @@ impl DataRuntime {
                 HammerError::internal(format!("receive data runtime handle: {err}"))
             })?;
             let handle = handle.map_err(HammerError::internal)?;
-            context_workers.push(DataRuntimeContextWorker { handle });
+            context_workers.push(DataRuntimeContextWorker {
+                handle,
+                remote_local,
+            });
             workers.push(DataRuntimeWorker {
                 shutdown_tx: Some(shutdown_tx),
                 done_rx,
@@ -264,7 +284,10 @@ impl DataRuntimeContext {
         );
         let workers = handles
             .into_iter()
-            .map(|handle| DataRuntimeContextWorker { handle })
+            .map(|handle| DataRuntimeContextWorker {
+                handle,
+                remote_local: DataRemoteLocalQueue::default(),
+            })
             .collect();
         Self::from_workers(next_data_runtime_context_id(), workers)
     }
@@ -462,28 +485,61 @@ impl DataRuntimeContext {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
+        let context = self.clone();
+        self.schedule_local_on_worker(
+            worker,
+            Box::new(move || {
+                THREAD_DATA_CONTEXT.with(|slot| slot.borrow_mut().push(context.clone()));
+                let _guard = ThreadDataContextGuard;
+                let _ = spawn_local(factory);
+            }),
+        )
+    }
+
+    pub(crate) async fn call_local_on_worker<F, Fut, T>(
+        &self,
+        worker: usize,
+        factory: F,
+    ) -> HammerResult<T>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let context = self.clone();
+        let state = Arc::new(DataRemoteJoinState::new());
+        let complete_state = Arc::clone(&state);
+        self.schedule_local_on_worker(
+            worker,
+            Box::new(move || {
+                THREAD_DATA_CONTEXT.with(|slot| slot.borrow_mut().push(context.clone()));
+                let _guard = ThreadDataContextGuard;
+                let join = spawn_local(factory);
+                let complete_state = Arc::clone(&complete_state);
+                drop(spawn_local(move || async move {
+                    let result = join.await.map_err(|err| {
+                        HammerError::internal(format!("join worker-local task: {err}"))
+                    });
+                    complete_state.complete(result);
+                }));
+            }),
+        )?;
+        DataRemoteJoinHandle { state }.await
+    }
+
+    fn schedule_local_on_worker(
+        &self,
+        worker: usize,
+        task: RemoteDataLocalTask,
+    ) -> HammerResult<()> {
         if worker >= self.inner.workers.len() {
             return Err(HammerError::internal(format!(
                 "invalid app worker {worker}; worker_count={}",
                 self.inner.workers.len()
             )));
         }
-        let handle = self.execute_on_worker(worker, async move {
-            let _ = spawn_local(factory);
-        });
-        drop(handle);
+        self.inner.workers[worker].remote_local.push(task);
         Ok(())
-    }
-
-    pub(crate) fn execute_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let future = future.with_current_subscriber();
-        let index = worker % self.inner.workers.len();
-        let scoped = TASK_DATA_CONTEXT.scope(self.clone(), future);
-        self.inner.workers[index].handle.spawn(scoped)
     }
 
     fn spawn_worker(&self) -> DataRuntimeContextWorker {
@@ -630,6 +686,36 @@ impl Drop for DataPlaneBarrierGuard {
             }
         }
         self.state.condvar.notify_all();
+    }
+}
+
+impl DataRemoteLocalQueue {
+    fn attach_current_thread(&self) {
+        *self
+            .thread
+            .lock()
+            .expect("remote local thread handle poisoned") = Some(thread::current());
+    }
+
+    fn push(&self, task: RemoteDataLocalTask) {
+        self.tasks
+            .lock()
+            .expect("remote local queue poisoned")
+            .push_back(task);
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .expect("remote local thread handle poisoned")
+            .as_ref()
+            .cloned()
+        {
+            thread.unpark();
+        }
+    }
+
+    fn drain(&self) -> VecDeque<RemoteDataLocalTask> {
+        let mut tasks = self.tasks.lock().expect("remote local queue poisoned");
+        std::mem::take(&mut *tasks)
     }
 }
 
@@ -788,6 +874,61 @@ impl<T> DataLocalJoinState<T> {
     }
 }
 
+struct DataRemoteJoinState<T> {
+    result: Mutex<Option<HammerResult<T>>>,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl<T> DataRemoteJoinState<T> {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            waker: Mutex::new(None),
+        }
+    }
+
+    fn complete(&self, result: HammerResult<T>) {
+        let mut slot = self.result.lock().expect("remote local result poisoned");
+        if slot.is_none() {
+            *slot = Some(result);
+            drop(slot);
+            if let Some(waker) = self
+                .waker
+                .lock()
+                .expect("remote local waker poisoned")
+                .take()
+            {
+                waker.wake();
+            }
+        }
+    }
+}
+
+struct DataRemoteJoinHandle<T> {
+    state: Arc<DataRemoteJoinState<T>>,
+}
+
+impl<T> Future for DataRemoteJoinHandle<T> {
+    type Output = HammerResult<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut slot = self
+            .state
+            .result
+            .lock()
+            .expect("remote local result poisoned");
+        if let Some(result) = slot.take() {
+            return Poll::Ready(result);
+        }
+        *self
+            .state
+            .waker
+            .lock()
+            .expect("remote local waker poisoned") = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DataLocalJoinError {
     kind: DataLocalJoinErrorKind,
@@ -847,6 +988,15 @@ fn poll_data_local_tasks(cx: &mut Context<'_>) -> bool {
     progressed
 }
 
+fn poll_remote_local_tasks(queue: &DataRemoteLocalQueue) -> bool {
+    let mut progressed = false;
+    for task in queue.drain() {
+        progressed = true;
+        task();
+    }
+    progressed
+}
+
 fn poll_data_plane_nodes(cx: &mut Context<'_>) -> bool {
     let mut progressed = false;
     loop {
@@ -884,6 +1034,7 @@ fn wake_data_local_driver() {
 fn run_data_worker_loop(
     worker: usize,
     barrier: &Arc<DataPlaneBarrierState>,
+    remote_local: &DataRemoteLocalQueue,
     runtime: &tokio::runtime::Runtime,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
@@ -900,7 +1051,7 @@ fn run_data_worker_loop(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         }
 
-        let local_progress = poll_data_worker_once(worker, barrier, &worker_waker);
+        let local_progress = poll_data_worker_once(worker, barrier, remote_local, &worker_waker);
         drive_tokio_worker_once(runtime, local_progress);
 
         if !local_progress {
@@ -912,6 +1063,7 @@ fn run_data_worker_loop(
 fn poll_data_worker_once(
     worker: usize,
     barrier: &Arc<DataPlaneBarrierState>,
+    remote_local: &DataRemoteLocalQueue,
     worker_waker: &Waker,
 ) -> bool {
     let mut cx = Context::from_waker(worker_waker);
@@ -923,6 +1075,7 @@ fn poll_data_worker_once(
     }
 
     let mut progressed = false;
+    progressed |= poll_remote_local_tasks(remote_local);
     progressed |= poll_data_plane_nodes(&mut cx);
     progressed |= poll_data_local_tasks(&mut cx);
     progressed |= poll_data_plane_nodes(&mut cx);
