@@ -806,6 +806,8 @@ struct RegisteredBufferLease {
 
 #[derive(Debug, Default)]
 struct AppRingBufferRegistry {
+    // Descriptors only carry buffer indices; the lease stays here until the
+    // consumer explicitly resolves that index back into a zero-copy buffer view.
     leases: Vec<RegisteredBufferLease>,
 }
 
@@ -981,6 +983,28 @@ impl AppRingHandle {
             .borrow_mut()
             .try_push(cqe)
             .map_err(|_| HammerError::internal("app completion descriptor ring full"))
+    }
+
+    #[inline]
+    pub fn take_buffer_lease(&self, index: BufferIndex) -> HammerResult<AppBufferLease> {
+        self.buffers.borrow_mut().take(index).ok_or_else(|| {
+            HammerError::internal(format!(
+                "registered app buffer {}:{}:{} is missing",
+                index.pool_id(),
+                index.slot(),
+                index.generation()
+            ))
+        })
+    }
+
+    #[inline]
+    pub fn take_send_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
+        self.take_buffer_lease(index).map(AppSend::new)
+    }
+
+    #[inline]
+    pub fn take_recv_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.take_buffer_lease(index).map(AppRecv::new)
     }
 
     #[inline]

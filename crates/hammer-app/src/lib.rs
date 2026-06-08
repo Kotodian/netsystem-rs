@@ -28,13 +28,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use hammer_adapter::BufferIndex;
 use hammer_core::error::{HammerError, HammerResult};
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
 pub use crate::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppObjectRef,
-    AppOpcode, AppRecv, AppRegisteredBuffer, AppRing, AppSend, AppSqeData, AppSqeDescriptor,
-    AppSubmissionEntry, AppUserData,
+    AppBufferLease, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppObjectRef, AppOpcode, AppRecv,
+    AppRing, AppSend, AppSqeData, AppSqeDescriptor, AppUserData,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -105,8 +105,8 @@ impl AppBackend {
     }
 
     #[inline]
-    pub fn try_push_sqe_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.inner.try_push_submission_entry(entry.into_inner())
+    pub fn try_push_sqe_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
+        self.inner.try_push_sqe_descriptor(descriptor.into_inner())
     }
 
     #[inline]
@@ -118,19 +118,25 @@ impl AppBackend {
     }
 
     #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
+    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
         self.inner
-            .next_submission_entry()
-            .await
-            .map(crate::ring::AppSubmissionEntry::from_inner)
+            .take_submission_buffer(index)
+            .map(AppSend::from_inner)
     }
 
     #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
+    pub async fn next_cqe_descriptor(&self) -> Option<AppCqeDescriptor> {
         self.inner
-            .next_completion_entry()
+            .next_cqe_descriptor()
             .await
-            .map(crate::ring::AppCompletionEntry::from_inner)
+            .map(crate::ring::AppCqeDescriptor::from_inner)
+    }
+
+    #[inline]
+    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.inner
+            .take_completion_buffer(index)
+            .map(AppRecv::from_inner)
     }
 
     #[inline]
@@ -158,24 +164,39 @@ impl AppRuntime {
     }
 
     #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
+    pub fn try_push_submission_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
         self.inner
-            .next_submission_entry()
-            .await
-            .map(crate::ring::AppSubmissionEntry::from_inner)
+            .try_push_submission_descriptor(descriptor.into_inner())
     }
 
     #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
+    pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
         self.inner
-            .next_completion_entry()
+            .next_submission_descriptor()
             .await
-            .map(crate::ring::AppCompletionEntry::from_inner)
+            .map(crate::ring::AppSqeDescriptor::from_inner)
     }
 
     #[inline]
-    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.inner.try_push_submission_entry(entry.into_inner())
+    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
+        self.inner
+            .take_submission_buffer(index)
+            .map(AppSend::from_inner)
+    }
+
+    #[inline]
+    pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
+        self.inner
+            .next_completion_descriptor()
+            .await
+            .map(crate::ring::AppCqeDescriptor::from_inner)
+    }
+
+    #[inline]
+    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
+        self.inner
+            .take_completion_buffer(index)
+            .map(AppRecv::from_inner)
     }
 
     #[inline]

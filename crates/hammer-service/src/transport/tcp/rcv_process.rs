@@ -151,6 +151,6 @@ fn tcp_rcv_process_next_for_index(
     let Some(target) = app_ingress.get(&connection_id) else {
         return Ok(Some(drop_next));
     };
-    target.complete_ingress(runtime, index)?;
+    target.post_recv_cqe(runtime, index)?;
     Ok(None)
 }

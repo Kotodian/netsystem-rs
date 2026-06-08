@@ -27,21 +27,17 @@ impl AppIngressTarget {
     }
 
     #[inline]
-    pub fn complete_ingress_descriptor(
+    pub fn post_recv_cqe_descriptor(
         &self,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<()> {
-        AppIngressBackend.complete_ingress(runtime, index, self)
+        AppIngressBackend.post_recv_cqe(runtime, index, self)
     }
 
     #[inline]
-    pub fn complete_ingress(
-        &self,
-        runtime: &DataPlaneRuntime,
-        index: BufferIndex,
-    ) -> CoreResult<()> {
-        self.complete_ingress_descriptor(runtime, index)
+    pub fn post_recv_cqe(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
+        self.post_recv_cqe_descriptor(runtime, index)
     }
 }
 
@@ -60,5 +56,5 @@ pub fn deliver_buffer_to_app(
     index: BufferIndex,
     target: &AppIngressTarget,
 ) -> CoreResult<()> {
-    target.complete_ingress(runtime, index)
+    target.post_recv_cqe(runtime, index)
 }

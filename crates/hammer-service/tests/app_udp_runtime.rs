@@ -87,7 +87,7 @@ fn new_test_service() -> Arc<RuntimeService> {
 }
 
 #[test]
-fn service_udp_app_bridge_delivers_recv_descriptor_into_service_app_flow() {
+fn service_udp_app_target_delivers_recv_descriptor_into_service_app_flow() {
     let service = new_test_service();
     let app = service.app_context();
     let flow = AppFlowId::new(0x8100);
@@ -152,7 +152,7 @@ fn service_udp_app_bridge_delivers_recv_descriptor_into_service_app_flow() {
                 .expect("alloc UDP buffer");
             stamp_udp_cursor(&runtime, index, &packet);
             AppIngressTarget::new(app.clone(), flow)
-                .complete_ingress(&runtime, index)
+                .post_recv_cqe(&runtime, index)
                 .expect("complete UDP ingress to app");
         })
         .expect("spawn deliver task");
@@ -166,7 +166,7 @@ fn service_udp_app_bridge_delivers_recv_descriptor_into_service_app_flow() {
 }
 
 #[test]
-fn service_udp_app_bridge_rejects_descriptor_delivery_from_non_owner_worker() {
+fn service_udp_app_target_rejects_descriptor_delivery_from_non_owner_worker() {
     let service = new_test_service();
     let app = service.app_context();
     let flow = AppFlowId::new(0x8101);
@@ -198,7 +198,7 @@ fn service_udp_app_bridge_rejects_descriptor_delivery_from_non_owner_worker() {
                 .alloc_index_with_bytes(udp_metadata_for_ports(40_031, 9_999), &packet)
                 .expect("alloc UDP buffer");
             stamp_udp_cursor(&runtime, index, &packet);
-            let result = target.complete_ingress(&runtime, index);
+            let result = target.post_recv_cqe(&runtime, index);
             tx.send((
                 result.map(|_| ()).map_err(|err| err.to_string()),
                 runtime.in_use_buffers(),

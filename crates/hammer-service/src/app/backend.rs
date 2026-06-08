@@ -7,7 +7,7 @@ pub struct AppIngressBackend;
 
 impl AppIngressBackend {
     #[inline]
-    pub fn complete_ingress(
+    pub fn post_recv_cqe(
         &self,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
@@ -32,6 +32,6 @@ impl AppIngressBackend {
         index: BufferIndex,
         target: &AppIngressTarget,
     ) -> CoreResult<()> {
-        self.complete_ingress(runtime, index, target)
+        self.post_recv_cqe(runtime, index, target)
     }
 }

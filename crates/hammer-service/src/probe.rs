@@ -381,21 +381,24 @@ mod tests {
         let probe_manager = ProbeManager::new(manager);
         let data_runtime = hammer_runtime::spawn::DataRuntime::new(1, "probe-data", 512 * 1024, 2)
             .expect("data runtime");
-        let context = data_runtime.context();
+        let executor = data_runtime.executor();
         let driver = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("driver runtime");
 
-        let reports = context.enter(|| {
-            driver.block_on(async {
-                probe_manager
-                    .probe_all(
-                        Arc::new(IcmpOutboundProbe::new()),
-                        Duration::from_millis(250),
-                    )
-                    .await
-            })
+        let reports = driver.block_on(async {
+            executor
+                .execute(async move {
+                    probe_manager
+                        .probe_all(
+                            Arc::new(IcmpOutboundProbe::new()),
+                            Duration::from_millis(250),
+                        )
+                        .await
+                })
+                .await
+                .expect("probe task")
         });
 
         assert_eq!(reports.len(), 1);
