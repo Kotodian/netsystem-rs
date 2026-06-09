@@ -1,7 +1,7 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -41,6 +41,7 @@ use hammer_runtime::app::{AppContext, AppControl, AppControlBackend, AppFlowId, 
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::inbounds::RuntimeDnsRouter;
+use hammer_runtime::protocol::tcp::TcpControlPlane as SharedTcpControlPlane;
 use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 use hammer_runtime::{
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, ControlTimerHandle,
@@ -52,12 +53,12 @@ use std::time::Duration;
 use crate::ProbeManager;
 use crate::app::{AppHost, AppIngressTarget};
 use crate::transport::tcp::{
-    TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpInputControlPlane,
-    TcpInputNext, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
-    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpSynSentBackend, TcpSynSentControlPlane,
-    TcpSynSentNext, TcpSynSentObservation, TcpSynSentRegistration, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
-    TcpV6PendingConnectionKey,
+    TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpCongestionRegistry,
+    TcpConnectionState, TcpInputControlPlane, TcpInputNext, TcpListenerConfig, TcpLookupId,
+    TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpRcvProcessControlPlane, TcpRcvProcessNext,
+    TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentNext, TcpSynSentObservation,
+    TcpSynSentRegistration, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey,
+    TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
 };
 use crate::transport::udp::input::UdpAppRegistration;
 use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
@@ -197,8 +198,10 @@ struct RuntimeAppControlState {
     flows: DescriptorTable<(), RuntimeFlowTag>,
     next_tcp_lookup_id: TcpLookupId,
     next_tcp_ephemeral_port: u16,
+    tcp_congestion: TcpCongestionRegistry,
     tcp_accept_control: Option<TcpAcceptControlPlane>,
     tcp_syn_sent_control: Option<TcpSynSentControlPlane>,
+    shared_tcp_control: Option<SharedTcpControlPlane>,
     tcp_control: TcpInputControlPlane,
     tcp_rcv_process_control: TcpRcvProcessControlPlane,
     udp_control: UdpInputControlPlane,
@@ -256,6 +259,15 @@ struct RuntimeTcpListenerSnapshot {
     lookup_id: TcpLookupId,
 }
 
+struct BindTcpListenerResult {
+    socket: AppSocketId,
+    shared_action: Option<hammer_core::protocol::tcp::TcpControlPlaneAction>,
+}
+
+struct CloseSocketResult {
+    shared_action: Option<hammer_core::protocol::tcp::TcpControlPlaneAction>,
+}
+
 impl RuntimeAppControlState {
     fn new() -> HammerResult<Self> {
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
@@ -280,8 +292,10 @@ impl RuntimeAppControlState {
             flows: DescriptorTable::new(),
             next_tcp_lookup_id: 1,
             next_tcp_ephemeral_port: 49_152,
+            tcp_congestion: TcpCongestionRegistry::default(),
             tcp_accept_control: None,
             tcp_syn_sent_control: None,
+            shared_tcp_control: None,
             tcp_control,
             tcp_rcv_process_control,
             udp_control: UdpInputControlPlane::new(UdpInputNext::nodes(
@@ -311,12 +325,16 @@ impl RuntimeAppControlState {
         self.publish_tcp_lookup()
     }
 
+    fn install_shared_tcp_control(&mut self, control: SharedTcpControlPlane) {
+        self.shared_tcp_control = Some(control);
+    }
+
     fn bind_tcp_listener(
         &mut self,
         app: &AppContext,
         bind: SocketAddr,
         owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
+    ) -> HammerResult<BindTcpListenerResult> {
         if self
             .tcp_listeners
             .iter()
@@ -329,6 +347,13 @@ impl RuntimeAppControlState {
 
         let socket = self.alloc_socket(RuntimeSocketKind::TcpListener);
         let lookup_id = self.alloc_tcp_lookup_id()?;
+        let listener_id = TcpListenerId::new(lookup_id as u64);
+        let listener_key = socket_addr_to_listener_key(bind)?;
+        let install_action = TcpListenerConfig::new().install_listener_action(
+            &self.tcp_congestion,
+            listener_id,
+            listener_key,
+        )?;
         self.tcp_listeners.push(TcpListenerRegistration {
             app: app.clone(),
             socket,
@@ -340,7 +365,10 @@ impl RuntimeAppControlState {
         self.publish_tcp_lookup()?;
         self.publish_tcp_accept()?;
 
-        Ok(socket)
+        Ok(BindTcpListenerResult {
+            socket,
+            shared_action: self.shared_tcp_control.as_ref().map(|_| install_action),
+        })
     }
 
     fn bind_udp_socket(
@@ -370,7 +398,7 @@ impl RuntimeAppControlState {
         Ok(socket)
     }
 
-    fn close_socket(&mut self, socket: AppSocketId) -> HammerResult<()> {
+    fn close_socket(&mut self, socket: AppSocketId) -> HammerResult<CloseSocketResult> {
         let descriptor = RuntimeSocketDescriptor::new(socket.value());
         let kind = self.sockets.remove(descriptor).ok_or_else(|| {
             HammerError::internal(format!(
@@ -389,14 +417,22 @@ impl RuntimeAppControlState {
                             socket.value()
                         ))
                     })?;
-                self.tcp_listeners
+                let removed = self
+                    .tcp_listeners
                     .drain(slot..slot + 1)
                     .next()
                     .expect("tcp listener exists at computed slot");
                 self.rebuild_tcp_listener_slots();
                 self.publish_tcp_lookup()?;
                 self.publish_tcp_accept()?;
-                Ok(())
+                Ok(CloseSocketResult {
+                    shared_action: self.shared_tcp_control.as_ref().map(|_| {
+                        hammer_core::protocol::tcp::TcpControlPlaneAction::RemoveListener {
+                            listener_id: TcpListenerId::new(removed.lookup_id as u64),
+                            reason: hammer_core::protocol::tcp::TcpCloseReason::LocalRequest,
+                        }
+                    }),
+                })
             }
             RuntimeSocketKind::UdpSocket => {
                 let slot = self
@@ -419,7 +455,9 @@ impl RuntimeAppControlState {
                         HammerError::internal(format!("unregister udp app socket: {err}"))
                     })?;
                 self.rebuild_udp_socket_slots();
-                Ok(())
+                Ok(CloseSocketResult {
+                    shared_action: None,
+                })
             }
         }
     }
@@ -913,6 +951,14 @@ impl RuntimeAppControlHandle {
     }
 
     #[inline]
+    fn install_shared_tcp_control(&self, control: SharedTcpControlPlane) -> HammerResult<()> {
+        self.with_state_mut(move |state| {
+            state.install_shared_tcp_control(control);
+            Ok(())
+        })
+    }
+
+    #[inline]
     fn connect_tcp_stream(
         &self,
         app: &AppContext,
@@ -921,6 +967,41 @@ impl RuntimeAppControlHandle {
     ) -> HammerResult<AppFlowId> {
         let app = app.clone();
         self.with_state_mut(move |state| state.connect_tcp_stream(&app, peer, owner_worker))
+    }
+
+    fn bind_tcp_listener(
+        &self,
+        app: &AppContext,
+        bind: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        let app = app.clone();
+        let result =
+            self.with_state_mut(move |state| state.bind_tcp_listener(&app, bind, owner_worker))?;
+        if let Some(action) = result.shared_action {
+            let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+            else {
+                return Ok(result.socket);
+            };
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("install shared tcp listener control: {err}"))
+            })?;
+        }
+        Ok(result.socket)
+    }
+
+    fn close_socket(&self, socket: AppSocketId) -> HammerResult<()> {
+        let result = self.with_state_mut(move |state| state.close_socket(socket))?;
+        if let Some(action) = result.shared_action {
+            let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+            else {
+                return Ok(());
+            };
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("apply shared tcp close action: {err}"))
+            })?;
+        }
+        Ok(())
     }
 
     fn handle_tcp_syn_sent_observation(
@@ -950,16 +1031,30 @@ impl RuntimeAppControlHandle {
     }
 
     #[inline]
-    fn handle_tcp_worker_event(&self, event: TcpWorkerEvent) -> HammerResult<()> {
+    fn handle_projected_tcp_worker_event(&self, event: TcpWorkerEvent) -> HammerResult<()> {
+        Self::schedule_projected_tcp_worker_event(
+            Arc::clone(&self.control_handle),
+            Arc::downgrade(&self.state),
+            event,
+        )
+    }
+
+    fn schedule_projected_tcp_worker_event(
+        control_handle: Arc<ControlThreadHandle>,
+        state: Weak<RuntimeAppControlCell>,
+        event: TcpWorkerEvent,
+    ) -> HammerResult<()> {
         match event {
             TcpWorkerEvent::IncomingConnection {
                 listener_id, key, ..
             } => {
-                let state = Arc::clone(&self.state);
-                self.control_handle
+                control_handle
                     .schedule_once(Duration::ZERO, move || {
-                        let state = Arc::clone(&state);
+                        let state = state.clone();
                         async move {
+                            let Some(state) = state.upgrade() else {
+                                return;
+                            };
                             let (local, remote) = socket_addrs_from_connection_key(key);
                             // SAFETY: this closure runs on the single control thread.
                             let state = unsafe { state.get_mut() };
@@ -980,19 +1075,21 @@ impl RuntimeAppControlHandle {
             TcpWorkerEvent::StateChanged {
                 connection_id,
                 key,
-                state,
+                state: tcp_state,
             } => {
-                let state_cell = Arc::clone(&self.state);
-                self.control_handle
+                control_handle
                     .schedule_once(Duration::ZERO, move || {
-                        let state_cell = Arc::clone(&state_cell);
+                        let state_ref = state.clone();
                         async move {
+                            let Some(state_cell) = state_ref.upgrade() else {
+                                return;
+                            };
                             // SAFETY: this closure runs on the single control thread.
                             let state_cell = unsafe { state_cell.get_mut() };
                             let result = state_cell.observe_tcp_connection_state_change(
                                 connection_id,
                                 key,
-                                state,
+                                tcp_state,
                             );
                             debug_assert!(
                                 result.is_ok(),
@@ -1005,11 +1102,13 @@ impl RuntimeAppControlHandle {
             }
             TcpWorkerEvent::ShutdownObserved { .. } => Ok(()),
             TcpWorkerEvent::Closed { connection_id, .. } => {
-                let state_cell = Arc::clone(&self.state);
-                self.control_handle
+                control_handle
                     .schedule_once(Duration::ZERO, move || {
-                        let state_cell = Arc::clone(&state_cell);
+                        let state = state.clone();
                         async move {
+                            let Some(state_cell) = state.upgrade() else {
+                                return;
+                            };
                             // SAFETY: this closure runs on the single control thread.
                             let state_cell = unsafe { state_cell.get_mut() };
                             let result =
@@ -1022,6 +1121,113 @@ impl RuntimeAppControlHandle {
                         }
                     })
                     .map(|_| ())
+            }
+            other => Err(HammerError::internal(format!(
+                "runtime tcp worker event is not supported yet: {other:?}"
+            ))),
+        }
+    }
+
+    #[inline]
+    fn handle_tcp_worker_event(&self, event: TcpWorkerEvent) -> HammerResult<()> {
+        match event {
+            TcpWorkerEvent::IncomingConnection { .. } => {
+                self.handle_projected_tcp_worker_event(event)
+            }
+            TcpWorkerEvent::StateChanged {
+                connection_id,
+                key,
+                state: tcp_state,
+            } => {
+                let Some((control, congestion)) = self.with_state(|state| {
+                    Ok(state
+                        .shared_tcp_control
+                        .clone()
+                        .map(|control| (control, state.tcp_congestion)))
+                })?
+                else {
+                    return self.handle_projected_tcp_worker_event(TcpWorkerEvent::StateChanged {
+                        connection_id,
+                        key,
+                        state: tcp_state,
+                    });
+                };
+                if control.has_connection(connection_id) {
+                    control
+                        .apply(hammer_core::protocol::tcp::TcpControlPlaneAction::TransitionConnection {
+                            connection_id,
+                            state: tcp_state,
+                        })
+                        .map_err(|err| {
+                            HammerError::internal(format!(
+                                "transition shared tcp connection control: {err}"
+                            ))
+                        })
+                } else {
+                    let action = TcpConnectionState::new(&congestion, None)?
+                        .install_connection_action(connection_id, key, tcp_state);
+                    control.apply(action).map_err(|err| {
+                        HammerError::internal(format!(
+                            "install shared tcp connection control: {err}"
+                        ))
+                    })
+                }
+            }
+            TcpWorkerEvent::ShutdownObserved {
+                connection_id,
+                direction,
+                reason,
+            } => {
+                let Some(control) =
+                    self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+                else {
+                    return Ok(());
+                };
+                if !control.has_connection(connection_id) {
+                    return Ok(());
+                }
+                control
+                    .apply(
+                        hammer_core::protocol::tcp::TcpControlPlaneAction::ShutdownConnection {
+                            connection_id,
+                            direction,
+                            reason,
+                        },
+                    )
+                    .map_err(|err| {
+                        HammerError::internal(format!(
+                            "shutdown shared tcp connection control: {err}"
+                        ))
+                    })
+            }
+            TcpWorkerEvent::Closed {
+                connection_id,
+                reason,
+            } => {
+                let Some(control) =
+                    self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+                else {
+                    return self.handle_projected_tcp_worker_event(TcpWorkerEvent::Closed {
+                        connection_id,
+                        reason,
+                    });
+                };
+                if !control.has_connection(connection_id) {
+                    return self.handle_projected_tcp_worker_event(TcpWorkerEvent::Closed {
+                        connection_id,
+                        reason,
+                    });
+                }
+                control
+                    .apply(
+                        hammer_core::protocol::tcp::TcpControlPlaneAction::CloseConnection {
+                            connection_id,
+                            reason,
+                        },
+                    )
+                    .map_err(|err| {
+                        HammerError::internal(format!("close shared tcp connection control: {err}"))
+                    })
             }
             other => Err(HammerError::internal(format!(
                 "runtime tcp worker event is not supported yet: {other:?}"
@@ -1090,8 +1296,7 @@ impl AppControlBackend for RuntimeAppControlHandle {
         bind: SocketAddr,
         owner_worker: usize,
     ) -> HammerResult<AppSocketId> {
-        let app = app.clone();
-        self.with_state_mut(move |state| state.bind_tcp_listener(&app, bind, owner_worker))
+        RuntimeAppControlHandle::bind_tcp_listener(self, app, bind, owner_worker)
     }
 
     fn connect_tcp_stream(
@@ -1114,7 +1319,7 @@ impl AppControlBackend for RuntimeAppControlHandle {
     }
 
     fn close_socket(&self, _app: &AppContext, socket: AppSocketId) -> HammerResult<()> {
-        self.with_state_mut(move |state| state.close_socket(socket))
+        RuntimeAppControlHandle::close_socket(self, socket)
     }
 }
 
@@ -1143,6 +1348,15 @@ fn socket_addrs_from_connection_key(key: TcpConnectionKey) -> (SocketAddr, Socke
     let local = SocketAddr::new(key.local_addr(), key.local_port());
     let remote = SocketAddr::new(key.remote_addr(), key.remote_port());
     (local, remote)
+}
+
+fn socket_addr_to_listener_key(
+    bind: SocketAddr,
+) -> HammerResult<hammer_core::protocol::tcp::TcpListenerKey> {
+    Ok(match bind.ip() {
+        IpAddr::V4(addr) => hammer_core::protocol::tcp::TcpListenerKey::v4(0, addr, bind.port()),
+        IpAddr::V6(addr) => hammer_core::protocol::tcp::TcpListenerKey::v6(0, addr, bind.port()),
+    })
 }
 
 impl RuntimeService {
@@ -1220,6 +1434,23 @@ impl RuntimeService {
         app_control.install_tcp_syn_sent_control(TcpSynSentControlPlane::new(
             Arc::new(app_control.clone()),
             TcpSynSentNext::nodes(unused_node_id()),
+        ))?;
+        let projected_control_handle = Arc::clone(&control_handle);
+        let projected_state = Arc::downgrade(&app_control.state);
+        app_control.install_shared_tcp_control(SharedTcpControlPlane::new(
+            Arc::clone(&control_handle),
+            move |event| {
+                let result = RuntimeAppControlHandle::schedule_projected_tcp_worker_event(
+                    Arc::clone(&projected_control_handle),
+                    projected_state.clone(),
+                    event,
+                );
+                debug_assert!(
+                    result.is_ok(),
+                    "runtime projected tcp control event failed: {result:?}"
+                );
+                let _ = result;
+            },
         ))?;
         let trace_enabled_with_inputs = trace_worker_control(&options.trace);
         let packet_graph = ServicePacketGraphDeclarations::default();
@@ -2158,6 +2389,32 @@ impl RuntimeService {
             )
         })
     }
+
+    fn shared_tcp_listener_installed_for_test(&self, listener_id: TcpListenerId) -> bool {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let control = inner
+            .app_control
+            .with_state(move |state| Ok(state.shared_tcp_control.clone()))
+            .ok()
+            .flatten();
+        drop(inner);
+        control.is_some_and(|control| control.has_listener(listener_id))
+    }
+
+    fn shared_tcp_connection_state_for_test(
+        &self,
+        connection_id: TcpConnectionId,
+    ) -> Option<crate::transport::tcp::TcpState> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let control = inner
+            .app_control
+            .with_state(move |state| Ok(state.shared_tcp_control.clone()))
+            .ok()
+            .flatten()
+            .and_then(|control| control.connection_state_for_test(connection_id));
+        drop(inner);
+        control
+    }
 }
 
 #[cfg(test)]
@@ -2778,6 +3035,38 @@ interval = "5s"
     }
 
     #[test]
+    fn runtime_service_bind_tcp_listener_updates_shared_tcp_control_plane() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let bind: SocketAddr = "127.0.0.1:7301".parse().expect("listener bind");
+
+        let listener = app.bind_tcp_listener(bind, 1).expect("bind tcp listener");
+        let listener_id = {
+            let state = service.app_control_snapshot_for_test();
+            let registration = state
+                .tcp_listeners
+                .iter()
+                .find(|registration| registration.socket == listener)
+                .expect("listener registration");
+            TcpListenerId::new(registration.lookup_id as u64)
+        };
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_listener_installed_for_test(listener_id)
+        });
+        assert!(service.shared_tcp_listener_installed_for_test(listener_id));
+
+        app.close_socket(listener).expect("close tcp listener");
+
+        wait_for(Duration::from_secs(1), || {
+            !service.shared_tcp_listener_installed_for_test(listener_id)
+        });
+        assert!(!service.shared_tcp_listener_installed_for_test(listener_id));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
     fn runtime_service_connect_promotes_pending_syn_sent_lookup_to_established_lookup() {
         let service = new_test_service("");
         let app = service.app_context();
@@ -2835,6 +3124,59 @@ interval = "5s"
         assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(established.id, pending.id);
         assert_eq!(established.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_state_events_update_shared_tcp_control_plane() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let connection_id = TcpConnectionId::new(191);
+
+        let _flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("ingest state change");
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+        assert_eq!(
+            service.shared_tcp_connection_state_for_test(connection_id),
+            Some(crate::transport::tcp::TcpState::Established)
+        );
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("ingest close event");
+
+        wait_for(Duration::from_secs(1), || {
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+        });
+        assert!(
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+        );
 
         service.close().expect("close service");
     }

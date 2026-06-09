@@ -173,6 +173,55 @@ fn tcp_control_plane_emits_connection_lifecycle_events() {
 }
 
 #[test]
+fn tcp_control_plane_clone_keeps_event_sink_alive() {
+    let (control_handle, control_thread) = ControlThread::new(
+        Instant::now(),
+        Arc::new(DiscardWriter),
+        MetricsRegistry::new(),
+        Duration::from_secs(60),
+        Level::Info,
+    );
+    let join = run_control_thread(control_thread);
+    let (tx, rx) = mpsc::channel();
+    let plane = TcpControlPlane::new(Arc::clone(&control_handle), move |event| {
+        tx.send(event).expect("forward lifecycle event");
+    });
+    let clone = plane.clone();
+    drop(plane);
+
+    let connection = TcpConnectionId::new(71);
+    let key = TcpConnectionKey::V4(TcpV4ConnectionKey::new(
+        0,
+        Ipv4Addr::new(127, 0, 0, 1),
+        7310,
+        Ipv4Addr::new(198, 51, 100, 71),
+        43_100,
+    ));
+
+    clone
+        .apply(TcpControlPlaneAction::InstallConnection {
+            connection_id: connection,
+            key,
+            state: TcpState::SynSent,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("install connection through cloned plane");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive install event from cloned plane"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::SynSent,
+        }
+    );
+
+    assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+    join.join().expect("control thread join");
+}
+
+#[test]
 fn tcp_control_plane_emits_timer_expiry_and_cancellation_from_control_thread() {
     let (control_handle, control_thread) = ControlThread::new(
         Instant::now(),

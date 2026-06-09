@@ -33,6 +33,106 @@ pub trait TcpAcceptBackend: Send + Sync {
     ) -> CoreResult<()>;
 }
 
+struct TcpAcceptBackendHandle {
+    raw: *const (),
+    clone_raw: fn(*const ()) -> *const (),
+    drop_raw: fn(*const ()),
+    accept: fn(
+        *const (),
+        TcpLookupId,
+        &TcpAcceptRegistration,
+        SocketAddr,
+        SocketAddr,
+        TcpWorkerEvent,
+    ) -> CoreResult<()>,
+}
+
+unsafe impl Send for TcpAcceptBackendHandle {}
+unsafe impl Sync for TcpAcceptBackendHandle {}
+
+impl Clone for TcpAcceptBackendHandle {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            raw: (self.clone_raw)(self.raw),
+            clone_raw: self.clone_raw,
+            drop_raw: self.drop_raw,
+            accept: self.accept,
+        }
+    }
+}
+
+impl Drop for TcpAcceptBackendHandle {
+    #[inline]
+    fn drop(&mut self) {
+        (self.drop_raw)(self.raw);
+    }
+}
+
+impl TcpAcceptBackendHandle {
+    #[inline]
+    fn new<O>(backend: Arc<O>) -> Self
+    where
+        O: TcpAcceptBackend + 'static,
+    {
+        Self {
+            raw: Arc::into_raw(backend) as *const (),
+            clone_raw: clone_tcp_accept_arc_handle::<O>,
+            drop_raw: drop_tcp_accept_arc_handle::<O>,
+            accept: accept_with::<O>,
+        }
+    }
+
+    #[inline]
+    fn accept(
+        &self,
+        listener_id: TcpLookupId,
+        registration: &TcpAcceptRegistration,
+        remote: SocketAddr,
+        local: SocketAddr,
+        event: TcpWorkerEvent,
+    ) -> CoreResult<()> {
+        (self.accept)(self.raw, listener_id, registration, remote, local, event)
+    }
+}
+
+#[inline]
+fn clone_tcp_accept_arc_handle<O>(raw: *const ()) -> *const ()
+where
+    O: TcpAcceptBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    unsafe {
+        Arc::increment_strong_count(raw);
+    }
+    raw.cast()
+}
+
+#[inline]
+fn drop_tcp_accept_arc_handle<O>(raw: *const ())
+where
+    O: TcpAcceptBackend + 'static,
+{
+    unsafe {
+        drop(Arc::from_raw(raw.cast::<O>()));
+    }
+}
+
+#[inline]
+fn accept_with<O>(
+    raw: *const (),
+    listener_id: TcpLookupId,
+    registration: &TcpAcceptRegistration,
+    remote: SocketAddr,
+    local: SocketAddr,
+    event: TcpWorkerEvent,
+) -> CoreResult<()>
+where
+    O: TcpAcceptBackend + 'static,
+{
+    unsafe { (&*raw.cast::<O>()).accept(listener_id, registration, remote, local, event) }
+}
+
 #[derive(Clone)]
 pub struct TcpAcceptRegistration {
     app: AppContext,
@@ -139,16 +239,19 @@ impl TcpAcceptSnapshotHandle {
 
 pub struct TcpAcceptControlPlane {
     inner: Arc<ArcSwap<TcpAcceptSnapshot>>,
-    backend: Arc<dyn TcpAcceptBackend>,
+    backend: TcpAcceptBackendHandle,
     next: [NodeId; TcpAcceptNext::COUNT],
 }
 
 impl TcpAcceptControlPlane {
     #[inline]
-    pub fn new(backend: Arc<dyn TcpAcceptBackend>, next: [NodeId; TcpAcceptNext::COUNT]) -> Self {
+    pub fn new<O>(backend: Arc<O>, next: [NodeId; TcpAcceptNext::COUNT]) -> Self
+    where
+        O: TcpAcceptBackend + 'static,
+    {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(TcpAcceptSnapshot::new())),
-            backend,
+            backend: TcpAcceptBackendHandle::new(backend),
             next,
         }
     }
@@ -167,10 +270,10 @@ impl TcpAcceptControlPlane {
         TcpAcceptNode::new(
             register_tcp_accept_runtime(
                 TcpAcceptSnapshotHandle::new(Arc::clone(&self.inner)),
-                Arc::clone(&self.backend),
+                self.backend.clone(),
             ),
             TcpAcceptSnapshotHandle::new(Arc::clone(&self.inner)),
-            Arc::clone(&self.backend),
+            self.backend.clone(),
             self.next,
         )
     }
@@ -179,7 +282,7 @@ impl TcpAcceptControlPlane {
 #[derive(Clone)]
 struct TcpAcceptRuntime {
     snapshot: TcpAcceptSnapshotHandle,
-    backend: Arc<dyn TcpAcceptBackend>,
+    backend: TcpAcceptBackendHandle,
 }
 
 thread_local! {
@@ -189,7 +292,7 @@ thread_local! {
 
 fn register_tcp_accept_runtime(
     snapshot: TcpAcceptSnapshotHandle,
-    backend: Arc<dyn TcpAcceptBackend>,
+    backend: TcpAcceptBackendHandle,
 ) -> NodeRuntimeData {
     TCP_ACCEPT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
@@ -213,7 +316,7 @@ fn tcp_accept_runtime(data: NodeRuntimeData) -> CoreResult<TcpAcceptRuntime> {
 fn sync_tcp_accept_runtime(
     data: NodeRuntimeData,
     snapshot: TcpAcceptSnapshotHandle,
-    backend: Arc<dyn TcpAcceptBackend>,
+    backend: TcpAcceptBackendHandle,
 ) -> CoreResult<()> {
     let slot = data.usize_word(0)?;
     TCP_ACCEPT_RUNTIMES.with(|runtimes| {
@@ -231,7 +334,7 @@ fn sync_tcp_accept_runtime(
 pub struct TcpAcceptNode {
     runtime_data: NodeRuntimeData,
     snapshot: TcpAcceptSnapshotHandle,
-    backend: Arc<dyn TcpAcceptBackend>,
+    backend: TcpAcceptBackendHandle,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
@@ -246,7 +349,7 @@ impl Node for TcpAcceptNode {
         sync_tcp_accept_runtime(
             self.runtime_data,
             self.snapshot.clone(),
-            Arc::clone(&self.backend),
+            self.backend.clone(),
         )?;
         let snapshot = self.snapshot.load();
         let next = Self::runtime_nexts(runtime)?;
@@ -254,7 +357,7 @@ impl Node for TcpAcceptNode {
         let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
             runtime,
             frame,
-            |index| tcp_accept_next_for_index(runtime, index, drop_next, &snapshot, &*self.backend),
+            |index| tcp_accept_next_for_index(runtime, index, drop_next, &snapshot, &self.backend),
         )?;
         self.cached_next = cached_next;
         Ok(result)
@@ -270,7 +373,7 @@ impl Node for TcpAcceptNode {
         sync_tcp_accept_runtime(
             self.runtime_data,
             self.snapshot.clone(),
-            Arc::clone(&self.backend),
+            self.backend.clone(),
         )?;
         Ok(self.runtime_data)
     }
@@ -286,7 +389,7 @@ fn tcp_accept_process(
     let next = TcpAcceptNode::runtime_nexts(runtime)?;
     let drop_next = next[TcpAcceptNext::Drop as usize];
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        tcp_accept_next_for_index(runtime, index, drop_next, &snapshot, &*state.backend)
+        tcp_accept_next_for_index(runtime, index, drop_next, &snapshot, &state.backend)
     })?;
     Ok(result)
 }
@@ -296,7 +399,7 @@ fn tcp_accept_next_for_index(
     index: BufferIndex,
     drop_next: NodeId,
     snapshot: &TcpAcceptSnapshot,
-    backend: &dyn TcpAcceptBackend,
+    backend: &TcpAcceptBackendHandle,
 ) -> CoreResult<Option<NodeId>> {
     let Some(listener_id) = take_pending_tcp_accept(index)? else {
         return Ok(Some(drop_next));
@@ -354,4 +457,85 @@ fn incoming_connection_event(
         key,
         capabilities: TcpCapabilities::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use hammer_runtime::spawn::DataRuntime;
+
+    #[derive(Clone)]
+    struct CountingAcceptBackend {
+        accepted: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountingAcceptBackend {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl TcpAcceptBackend for CountingAcceptBackend {
+        fn accept(
+            &self,
+            _listener_id: TcpLookupId,
+            _registration: &TcpAcceptRegistration,
+            _remote: SocketAddr,
+            _local: SocketAddr,
+            _event: TcpWorkerEvent,
+        ) -> CoreResult<()> {
+            self.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tcp_accept_backend_handle_clones_forwards_and_drops_once() {
+        let data_runtime = DataRuntime::new(1, "tcp-accept-backend-handle-test", 512 * 1024, 2)
+            .expect("data runtime");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(CountingAcceptBackend {
+            accepted: Arc::clone(&accepted),
+            dropped: Arc::clone(&dropped),
+        });
+        let registration = TcpAcceptRegistration::new(
+            AppContext::with_ring_capacity(data_runtime.context(), 1),
+            AppSocketId::new(9),
+        );
+
+        let handle = TcpAcceptBackendHandle::new(Arc::clone(&backend));
+        let cloned = handle.clone();
+        drop(handle);
+        drop(backend);
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 0);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        cloned
+            .accept(
+                7,
+                &registration,
+                "198.51.100.7:40007".parse().expect("remote"),
+                "192.0.2.7:7443".parse().expect("local"),
+                incoming_connection_event(
+                    7,
+                    "198.51.100.7:40007".parse().expect("remote"),
+                    "192.0.2.7:7443".parse().expect("local"),
+                )
+                .expect("incoming connection event"),
+            )
+            .expect("forward accept");
+
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+
+        drop(cloned);
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+
+        data_runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
 }
