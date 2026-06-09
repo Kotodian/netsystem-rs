@@ -169,7 +169,7 @@ struct UdpSocketRegistration {
     bind: SocketAddr,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct TcpConnectionRegistration {
     #[allow(dead_code)]
     flow: AppFlowId,
@@ -777,14 +777,14 @@ impl RuntimeAppControlState {
     fn remove_tcp_connection_by_connection_id(
         &mut self,
         connection_id: TcpConnectionId,
-    ) -> HammerResult<bool> {
+    ) -> HammerResult<Option<TcpConnectionRegistration>> {
         self.remember_closed_connection(connection_id);
         let Some(index) = self
             .tcp_connections
             .iter()
             .position(|registration| registration.connection_id == Some(connection_id))
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let released =
             self.tcp_connections.get(index).cloned().ok_or_else(|| {
@@ -796,7 +796,7 @@ impl RuntimeAppControlState {
         }
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
-        Ok(true)
+        Ok(Some(released))
     }
 
     fn discard_state_change_for_closed_connection(
@@ -1287,6 +1287,17 @@ impl RuntimeAppControlHandle {
                                 result.is_ok(),
                                 "runtime tcp close event failed: {result:?}"
                             );
+                            if let Ok(Some(released)) = &result
+                                && let Some(flow) = released.target.flow_id()
+                            {
+                                let close_result =
+                                    released.target.app().try_complete_closed_flow(flow);
+                                debug_assert!(
+                                    close_result.is_ok(),
+                                    "runtime tcp closed completion failed: {close_result:?}"
+                                );
+                                let _ = close_result;
+                            }
                             let _ = result;
                         }
                     })
@@ -3982,6 +3993,75 @@ interval = "5s"
                 .shared_tcp_connection_state_for_test(connection_id)
                 .is_none()
         );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_closed_worker_event_posts_app_closed_cqe() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("bind established connection");
+
+        service
+            .spawn_app_on_worker(1, {
+                let app = app.clone();
+                move || async move {
+                    let backend = app.local_backend_for_flow(flow).expect("flow backend");
+                    ready_tx.send(()).expect("signal closed cqe ready");
+                    let cqe = backend
+                        .next_cqe_descriptor()
+                        .await
+                        .expect("closed cqe descriptor");
+                    tx.send(cqe).expect("send closed cqe");
+                }
+            })
+            .expect("spawn closed cqe worker");
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait closed cqe ready");
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("ingest close event");
+
+        let closed_cqe = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive closed cqe");
+        match closed_cqe.payload() {
+            AppCqeData::Closed {
+                flow: Some(cqe_flow),
+                socket: None,
+            } => {
+                assert_eq!(cqe_flow, flow);
+            }
+            other => panic!("unexpected closed cqe payload: {other:?}"),
+        }
 
         service.close().expect("close service");
     }
