@@ -367,6 +367,7 @@ impl LogWriter for ControlThreadHandle {
 pub struct ControlThread {
     event_rx: Receiver<ControlEvent>,
     command_rx: UnboundedReceiver<ControlCommand>,
+    command_tx: UnboundedSender<ControlCommand>,
     inner: Arc<dyn LogWriter>,
     timers: TimerRegistry,
     events: EventRegistry,
@@ -383,14 +384,16 @@ impl ControlThread {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(CONTROL_EVENT_QUEUE_CAPACITY);
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let scope = metrics.scope("runtime", "control_thread", "hammer-main");
+        let handle_command_tx = command_tx.clone();
         let handle = ControlThreadHandle::new(
             event_tx,
-            command_tx,
+            handle_command_tx,
             scope.counter("event_dropped_full_total"),
         );
         let thread = Self {
             event_rx,
             command_rx,
+            command_tx: command_tx.clone(),
             inner,
             timers: TimerRegistry::new(),
             events: EventRegistry::new(
@@ -409,50 +412,24 @@ impl ControlThread {
         // command channel itself closes.
         let mut event_open = true;
         loop {
-            self.timers.reap_finished();
             self.events.reap_finished();
-            if let Some(deadline) = self.timers.next_deadline() {
-                tokio::select! {
-                    command = self.command_rx.recv() => {
-                        let Some(command) = command else {
-                            self.timers.shutdown();
-                            break;
-                        };
-                        if self.handle_command(command) {
-                            break;
-                        }
-                    }
-                    event = self.event_rx.recv(), if event_open => {
-                        let Some(event) = event else {
-                            event_open = false;
-                            continue;
-                        };
-                        self.handle_event(event);
-                        self.drain_events();
-                    }
-                    _ = tokio::time::sleep_until(deadline) => {
-                        self.timers.fire_due(&*self.inner);
+            tokio::select! {
+                command = self.command_rx.recv() => {
+                    let Some(command) = command else {
+                        self.timers.shutdown();
+                        break;
+                    };
+                    if self.handle_command(command) {
+                        break;
                     }
                 }
-            } else {
-                tokio::select! {
-                    command = self.command_rx.recv() => {
-                        let Some(command) = command else {
-                            self.timers.shutdown();
-                            break;
-                        };
-                        if self.handle_command(command) {
-                            break;
-                        }
-                    }
-                    event = self.event_rx.recv(), if event_open => {
-                        let Some(event) = event else {
-                            event_open = false;
-                            continue;
-                        };
-                        self.handle_event(event);
-                        self.drain_events();
-                    }
+                event = self.event_rx.recv(), if event_open => {
+                    let Some(event) = event else {
+                        event_open = false;
+                        continue;
+                    };
+                    self.handle_event(event);
+                    self.drain_events();
                 }
             }
         }
@@ -481,12 +458,20 @@ impl ControlThread {
                 false
             }
             ControlCommand::RegisterTimer(registration) => {
-                self.timers.register(registration);
+                self.timers.register(
+                    registration,
+                    self.command_tx.clone(),
+                    Arc::clone(&self.inner),
+                );
                 false
             }
             ControlCommand::CancelTimer(id, done) => {
                 let canceled = self.timers.cancel(id);
                 let _ = done.send(canceled);
+                false
+            }
+            ControlCommand::TimerFinished(id) => {
+                self.timers.finish(id);
                 false
             }
             ControlCommand::RegisterEventSubscriber(registration, done) => {
@@ -527,6 +512,7 @@ enum ControlCommand {
     AsyncCall(Box<dyn FnOnce() + Send>),
     RegisterTimer(ControlTimerRegistration),
     CancelTimer(ControlTimerId, mpsc::Sender<bool>),
+    TimerFinished(ControlTimerId),
     RegisterEventSubscriber(EventSubscriberRegistration, mpsc::Sender<()>),
     CancelEventSubscription(ControlEventSubscriptionId, mpsc::Sender<bool>),
 }

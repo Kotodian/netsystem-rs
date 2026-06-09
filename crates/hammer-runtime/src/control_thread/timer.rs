@@ -1,20 +1,23 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::mpsc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hammer_core::log::{Level, LogWriter};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio::time::Instant as TokioInstant;
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
 use super::ControlCommand;
 
 pub(crate) type TimerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 pub(crate) type TimerCallback = Box<dyn FnMut() -> TimerFuture + Send + 'static>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ControlTimerId(pub(crate) u64);
 
 pub struct ControlTimerHandle {
@@ -84,127 +87,158 @@ impl ControlTimerRegistration {
 }
 
 pub(crate) struct TimerRegistry {
-    entries: Vec<TimerEntry>,
+    entries: HashMap<ControlTimerId, TimerEntry>,
 }
 
 impl TimerRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: HashMap::new(),
         }
     }
 
-    pub(crate) fn register(&mut self, registration: ControlTimerRegistration) {
-        let next_deadline = TokioInstant::now() + registration.initial_delay;
-        self.entries.push(TimerEntry {
-            id: registration.id,
-            next_deadline: Some(next_deadline),
-            schedule: registration.schedule,
-            callback: Some(registration.callback),
-            running: None,
-        });
+    pub(crate) fn register(
+        &mut self,
+        registration: ControlTimerRegistration,
+        command_tx: UnboundedSender<ControlCommand>,
+        log: Arc<dyn LogWriter>,
+    ) {
+        let id = registration.id;
+        if let Some(previous) = self.entries.remove(&id) {
+            previous.task.abort();
+        }
+        let task = spawn_timer_task(registration, command_tx, log);
+        self.entries.insert(id, TimerEntry { task });
     }
 
     pub(crate) fn cancel(&mut self, id: ControlTimerId) -> bool {
-        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
+        let Some(entry) = self.entries.remove(&id) else {
             return false;
         };
-        if let Some(handle) = self.entries[index].running.take() {
-            handle.abort();
-        }
-        self.entries.swap_remove(index);
+        entry.task.abort();
         true
     }
 
+    pub(crate) fn finish(&mut self, id: ControlTimerId) {
+        self.entries.remove(&id);
+    }
+
     pub(crate) fn shutdown(&mut self) {
-        for entry in self.entries.drain(..) {
-            if let Some(handle) = entry.running {
-                handle.abort();
-            }
+        for (_, entry) in self.entries.drain() {
+            entry.task.abort();
         }
-    }
-
-    pub(crate) fn next_deadline(&self) -> Option<TokioInstant> {
-        self.entries
-            .iter()
-            .filter_map(|entry| entry.next_deadline)
-            .min()
-    }
-
-    pub(crate) fn reap_finished(&mut self) {
-        for entry in &mut self.entries {
-            if entry.running.as_ref().is_some_and(JoinHandle::is_finished) {
-                entry.running = None;
-            }
-        }
-        self.entries.retain(|entry| !entry.is_complete());
-    }
-
-    pub(crate) fn fire_due(&mut self, log: &dyn LogWriter) {
-        self.reap_finished();
-        let now = TokioInstant::now();
-        for entry in &mut self.entries {
-            let Some(deadline) = entry.next_deadline else {
-                continue;
-            };
-            if deadline > now {
-                continue;
-            }
-            entry.advance_deadline(now);
-            if entry.running.is_some() {
-                continue;
-            }
-            let Some(callback) = entry.callback.as_mut() else {
-                continue;
-            };
-            let future = match std::panic::catch_unwind(AssertUnwindSafe(callback)) {
-                Ok(future) => future,
-                Err(_) => {
-                    log.write_message(
-                        Level::Error,
-                        format!("control timer {:?} callback panicked", entry.id),
-                    );
-                    entry.callback = None;
-                    entry.next_deadline = None;
-                    continue;
-                }
-            };
-            entry.running = Some(tokio::spawn(future));
-            if matches!(entry.schedule, TimerSchedule::Once) {
-                entry.callback = None;
-            }
-        }
-        self.reap_finished();
     }
 }
 
 struct TimerEntry {
-    id: ControlTimerId,
-    next_deadline: Option<TokioInstant>,
-    schedule: TimerSchedule,
-    callback: Option<TimerCallback>,
-    running: Option<JoinHandle<()>>,
-}
-
-impl TimerEntry {
-    fn advance_deadline(&mut self, now: TokioInstant) {
-        match self.schedule {
-            TimerSchedule::Once => {
-                self.next_deadline = None;
-            }
-            TimerSchedule::Interval { interval } => {
-                self.next_deadline = Some(now + interval);
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.next_deadline.is_none() && self.callback.is_none() && self.running.is_none()
-    }
+    task: JoinHandle<()>,
 }
 
 #[derive(Clone, Copy)]
 enum TimerSchedule {
     Once,
     Interval { interval: Duration },
+}
+
+fn spawn_timer_task(
+    registration: ControlTimerRegistration,
+    command_tx: UnboundedSender<ControlCommand>,
+    log: Arc<dyn LogWriter>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let ControlTimerRegistration {
+            id,
+            initial_delay,
+            schedule,
+            callback,
+        } = registration;
+        match schedule {
+            TimerSchedule::Once => {
+                run_one_shot(id, initial_delay, callback, Arc::clone(&log)).await;
+                let _ = command_tx.send(ControlCommand::TimerFinished(id));
+            }
+            TimerSchedule::Interval { interval } => {
+                if run_interval(id, initial_delay, interval, callback, Arc::clone(&log)).await {
+                    let _ = command_tx.send(ControlCommand::TimerFinished(id));
+                }
+            }
+        }
+    })
+}
+
+async fn run_one_shot(
+    id: ControlTimerId,
+    delay: Duration,
+    mut callback: TimerCallback,
+    log: Arc<dyn LogWriter>,
+) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    let _ = run_timer_callback(id, &mut callback, log).await;
+}
+
+async fn run_interval(
+    id: ControlTimerId,
+    initial_delay: Duration,
+    interval: Duration,
+    mut callback: TimerCallback,
+    log: Arc<dyn LogWriter>,
+) -> bool {
+    let start = TokioInstant::now() + initial_delay;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if !run_timer_callback(id, &mut callback, Arc::clone(&log)).await {
+            return true;
+        }
+    }
+}
+
+async fn run_timer_callback(
+    id: ControlTimerId,
+    callback: &mut TimerCallback,
+    log: Arc<dyn LogWriter>,
+) -> bool {
+    let future = match std::panic::catch_unwind(AssertUnwindSafe(|| callback())) {
+        Ok(future) => future,
+        Err(_) => {
+            log.write_message(
+                Level::Error,
+                format!("control timer {:?} callback panicked", id),
+            );
+            return false;
+        }
+    };
+    PanicLoggedFuture {
+        id,
+        future,
+        log: Arc::clone(&log),
+    }
+    .await
+}
+
+struct PanicLoggedFuture {
+    id: ControlTimerId,
+    future: TimerFuture,
+    log: Arc<dyn LogWriter>,
+}
+
+impl Future for PanicLoggedFuture {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| self.future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(())) => Poll::Ready(true),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => {
+                self.log.write_message(
+                    Level::Error,
+                    format!("control timer {:?} callback panicked", self.id),
+                );
+                Poll::Ready(false)
+            }
+        }
+    }
 }
