@@ -564,6 +564,7 @@ pub enum TcpWorkerEvent {
     },
     StateChanged {
         connection_id: TcpConnectionId,
+        key: TcpConnectionKey,
         state: TcpState,
     },
     TimerExpired {

@@ -79,6 +79,100 @@ fn tcp_control_plane_tracks_connection_lifecycle_actions() {
 }
 
 #[test]
+fn tcp_control_plane_emits_connection_lifecycle_events() {
+    let (control_handle, control_thread) = ControlThread::new(
+        Instant::now(),
+        Arc::new(DiscardWriter),
+        MetricsRegistry::new(),
+        Duration::from_secs(60),
+        Level::Info,
+    );
+    let join = run_control_thread(control_thread);
+    let (tx, rx) = mpsc::channel();
+    let plane = TcpControlPlane::new(Arc::clone(&control_handle), move |event| {
+        tx.send(event).expect("forward lifecycle event");
+    });
+    let connection = TcpConnectionId::new(61);
+    let key = TcpConnectionKey::V4(TcpV4ConnectionKey::new(
+        0,
+        Ipv4Addr::new(127, 0, 0, 1),
+        7300,
+        Ipv4Addr::new(198, 51, 100, 61),
+        43_000,
+    ));
+
+    plane
+        .apply(TcpControlPlaneAction::InstallConnection {
+            connection_id: connection,
+            key,
+            state: TcpState::SynSent,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("install connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive install event"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::SynSent,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::TransitionConnection {
+            connection_id: connection,
+            state: TcpState::Established,
+        })
+        .expect("transition connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive transition event"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::Established,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::ShutdownConnection {
+            connection_id: connection,
+            direction: hammer_core::protocol::tcp::TcpShutdownDirection::Write,
+            reason: TcpCloseReason::LocalShutdown,
+        })
+        .expect("shutdown connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive shutdown event"),
+        TcpWorkerEvent::ShutdownObserved {
+            connection_id: connection,
+            direction: hammer_core::protocol::tcp::TcpShutdownDirection::Write,
+            reason: TcpCloseReason::LocalShutdown,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::CloseConnection {
+            connection_id: connection,
+            reason: TcpCloseReason::LocalRequest,
+        })
+        .expect("close connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive close event"),
+        TcpWorkerEvent::Closed {
+            connection_id: connection,
+            reason: TcpCloseReason::LocalRequest,
+        }
+    );
+
+    assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+    join.join().expect("control thread join");
+}
+
+#[test]
 fn tcp_control_plane_emits_timer_expiry_and_cancellation_from_control_thread() {
     let (control_handle, control_thread) = ControlThread::new(
         Instant::now(),
@@ -120,6 +214,15 @@ fn tcp_control_plane_emits_timer_expiry_and_cancellation_from_control_thread() {
                 negotiated: TcpNegotiatedOptions::default(),
             })
             .expect("install connection");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("receive install state event"),
+            TcpWorkerEvent::StateChanged {
+                connection_id: connection,
+                key,
+                state: TcpState::Established,
+            }
+        );
     }
 
     plane

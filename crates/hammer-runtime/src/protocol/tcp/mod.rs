@@ -325,51 +325,84 @@ impl TcpControlPlane {
                 state: tcp_state,
                 capabilities,
                 negotiated,
-            } => self.with_state_mut(move |state| {
-                state.connections.insert(
+            } => {
+                self.with_state_mut(move |state| {
+                    state.connections.insert(
+                        connection_id,
+                        TcpManagedConnection {
+                            key,
+                            state: tcp_state,
+                            capabilities,
+                            negotiated,
+                            shutdown: None,
+                            close_reason: None,
+                        },
+                    );
+                    Ok(())
+                })?;
+                (self.events)(TcpWorkerEvent::StateChanged {
                     connection_id,
-                    TcpManagedConnection {
-                        key,
-                        state: tcp_state,
-                        capabilities,
-                        negotiated,
-                        shutdown: None,
-                        close_reason: None,
-                    },
-                );
+                    key,
+                    state: tcp_state,
+                });
                 Ok(())
-            }),
+            }
             TcpControlPlaneAction::TransitionConnection {
                 connection_id,
                 state: tcp_state,
-            } => self.with_state_mut(move |state| {
-                let connection = state.connections.get_mut(&connection_id).ok_or_else(|| {
-                    HammerError::internal(format!(
-                        "tcp connection {} is not installed",
-                        connection_id.get()
-                    ))
+            } => {
+                let key = self.with_state_mut(move |state| {
+                    let connection =
+                        state.connections.get_mut(&connection_id).ok_or_else(|| {
+                            HammerError::internal(format!(
+                                "tcp connection {} is not installed",
+                                connection_id.get()
+                            ))
+                        })?;
+                    connection.state = tcp_state;
+                    Ok(connection.key)
                 })?;
-                connection.state = tcp_state;
+                (self.events)(TcpWorkerEvent::StateChanged {
+                    connection_id,
+                    key,
+                    state: tcp_state,
+                });
                 Ok(())
-            }),
+            }
             TcpControlPlaneAction::ShutdownConnection {
                 connection_id,
                 direction,
                 reason,
-            } => self.with_state_mut(move |state| {
-                let connection = state.connections.get_mut(&connection_id).ok_or_else(|| {
-                    HammerError::internal(format!(
-                        "tcp connection {} is not installed",
-                        connection_id.get()
-                    ))
+            } => {
+                self.with_state_mut(move |state| {
+                    let connection =
+                        state.connections.get_mut(&connection_id).ok_or_else(|| {
+                            HammerError::internal(format!(
+                                "tcp connection {} is not installed",
+                                connection_id.get()
+                            ))
+                        })?;
+                    connection.shutdown = Some((direction, reason));
+                    Ok(())
                 })?;
-                connection.shutdown = Some((direction, reason));
+                (self.events)(TcpWorkerEvent::ShutdownObserved {
+                    connection_id,
+                    direction,
+                    reason,
+                });
                 Ok(())
-            }),
+            }
             TcpControlPlaneAction::CloseConnection {
                 connection_id,
                 reason,
-            } => self.close_connection(connection_id, reason),
+            } => {
+                self.close_connection(connection_id, reason)?;
+                (self.events)(TcpWorkerEvent::Closed {
+                    connection_id,
+                    reason,
+                });
+                Ok(())
+            }
             TcpControlPlaneAction::ArmTimer {
                 connection_id,
                 timer_id,

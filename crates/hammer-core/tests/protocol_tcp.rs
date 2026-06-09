@@ -154,6 +154,24 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         other => panic!("unexpected event: {other:?}"),
     }
 
+    let state_changed = TcpWorkerEvent::StateChanged {
+        connection_id: TcpConnectionId::new(42),
+        key,
+        state: TcpState::Established,
+    };
+    match state_changed {
+        TcpWorkerEvent::StateChanged {
+            connection_id,
+            key: changed_key,
+            state,
+        } => {
+            assert_eq!(connection_id.get(), 42);
+            assert_eq!(changed_key, key);
+            assert_eq!(state, TcpState::Established);
+        }
+        other => panic!("unexpected state event: {other:?}"),
+    }
+
     let closed = TcpWorkerEvent::Closed {
         connection_id: TcpConnectionId::new(42),
         reason: TcpCloseReason::RemoteReset,

@@ -14,7 +14,9 @@ use hammer_core::config::{self, Options, TraceOptions};
 use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
-use hammer_core::protocol::tcp::{TcpConnectionKey, TcpListenerId, TcpWorkerEvent};
+use hammer_core::protocol::tcp::{
+    TcpConnectionId, TcpConnectionKey, TcpListenerId, TcpWorkerEvent,
+};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::{
     descriptor::{Descriptor, DescriptorTable},
@@ -168,6 +170,7 @@ struct UdpSocketRegistration {
 struct TcpConnectionRegistration {
     #[allow(dead_code)]
     flow: AppFlowId,
+    connection_id: Option<TcpConnectionId>,
     lookup_id: TcpLookupId,
     owner_worker: DataWorkerId,
     state: hammer_core::protocol::tcp::TcpState,
@@ -461,6 +464,7 @@ impl RuntimeAppControlState {
         let lookup_id = self.alloc_tcp_lookup_id()?;
         self.tcp_connections.push(TcpConnectionRegistration {
             flow,
+            connection_id: None,
             lookup_id,
             owner_worker: listener_registration.owner_worker,
             state: hammer_core::protocol::tcp::TcpState::Established,
@@ -505,6 +509,7 @@ impl RuntimeAppControlState {
         let local_port = self.alloc_tcp_ephemeral_port()?;
         self.tcp_connections.push(TcpConnectionRegistration {
             flow,
+            connection_id: None,
             lookup_id,
             owner_worker: worker_id(owner_worker)?,
             state: hammer_core::protocol::tcp::TcpState::SynSent,
@@ -571,6 +576,106 @@ impl RuntimeAppControlState {
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
         Ok(())
+    }
+
+    fn observe_tcp_connection_state_change(
+        &mut self,
+        connection_id: TcpConnectionId,
+        key: TcpConnectionKey,
+        state: hammer_core::protocol::tcp::TcpState,
+    ) -> HammerResult<()> {
+        let (local, remote) = socket_addrs_from_connection_key(key);
+        let index = self
+            .tcp_connections
+            .iter()
+            .position(|registration| registration.connection_id == Some(connection_id))
+            .or_else(|| {
+                self.tcp_connections.iter().position(|registration| {
+                    registration.connection_id.is_none()
+                        && registration.local_port == local.port()
+                        && registration.remote == remote
+                })
+            })
+            .ok_or_else(|| {
+                HammerError::internal(format!(
+                    "tcp connection state change {} {} -> {} is not registered in runtime service",
+                    connection_id.get(),
+                    local,
+                    remote
+                ))
+            })?;
+        let current =
+            self.tcp_connections.get(index).cloned().ok_or_else(|| {
+                HammerError::internal("tcp connection registration slot is invalid")
+            })?;
+        if current
+            .connection_id
+            .is_some_and(|current_id| current_id != connection_id)
+        {
+            return Err(HammerError::internal(format!(
+                "tcp connection {} conflicts with registration {}",
+                connection_id.get(),
+                current
+                    .connection_id
+                    .map(TcpConnectionId::get)
+                    .unwrap_or_default()
+            )));
+        }
+        if current.local_port != local.port() {
+            return Err(HammerError::internal(format!(
+                "tcp connection {} local port mismatch: expected {}, got {}",
+                connection_id.get(),
+                current.local_port,
+                local.port()
+            )));
+        }
+        if current.remote != remote {
+            return Err(HammerError::internal(format!(
+                "tcp connection {} remote mismatch: expected {}, got {}",
+                connection_id.get(),
+                current.remote,
+                remote
+            )));
+        }
+        if current.state != hammer_core::protocol::tcp::TcpState::Established
+            && state == hammer_core::protocol::tcp::TcpState::Established
+        {
+            self.ensure_connection_absent(local, remote)?;
+        }
+        let registration = self
+            .tcp_connections
+            .get_mut(index)
+            .ok_or_else(|| HammerError::internal("tcp connection registration slot is invalid"))?;
+        registration.connection_id = Some(connection_id);
+        registration.local = Some(local);
+        registration.state = state;
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+        Ok(())
+    }
+
+    fn remove_tcp_connection_by_connection_id(
+        &mut self,
+        connection_id: TcpConnectionId,
+    ) -> HammerResult<bool> {
+        let Some(index) = self
+            .tcp_connections
+            .iter()
+            .position(|registration| registration.connection_id == Some(connection_id))
+        else {
+            return Ok(false);
+        };
+        let released =
+            self.tcp_connections.get(index).cloned().ok_or_else(|| {
+                HammerError::internal("tcp connection registration slot is invalid")
+            })?;
+        self.tcp_connections.drain(index..index + 1);
+        if released.local_port < self.next_tcp_ephemeral_port {
+            self.next_tcp_ephemeral_port = released.local_port;
+        }
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+        Ok(true)
     }
 
     fn publish_tcp_lookup(&mut self) -> HammerResult<()> {
@@ -866,6 +971,52 @@ impl RuntimeAppControlHandle {
                             debug_assert!(
                                 result.is_ok(),
                                 "runtime tcp incoming-connection event failed: {result:?}"
+                            );
+                            let _ = result;
+                        }
+                    })
+                    .map(|_| ())
+            }
+            TcpWorkerEvent::StateChanged {
+                connection_id,
+                key,
+                state,
+            } => {
+                let state_cell = Arc::clone(&self.state);
+                self.control_handle
+                    .schedule_once(Duration::ZERO, move || {
+                        let state_cell = Arc::clone(&state_cell);
+                        async move {
+                            // SAFETY: this closure runs on the single control thread.
+                            let state_cell = unsafe { state_cell.get_mut() };
+                            let result = state_cell.observe_tcp_connection_state_change(
+                                connection_id,
+                                key,
+                                state,
+                            );
+                            debug_assert!(
+                                result.is_ok(),
+                                "runtime tcp state-change event failed: {result:?}"
+                            );
+                            let _ = result;
+                        }
+                    })
+                    .map(|_| ())
+            }
+            TcpWorkerEvent::ShutdownObserved { .. } => Ok(()),
+            TcpWorkerEvent::Closed { connection_id, .. } => {
+                let state_cell = Arc::clone(&self.state);
+                self.control_handle
+                    .schedule_once(Duration::ZERO, move || {
+                        let state_cell = Arc::clone(&state_cell);
+                        async move {
+                            // SAFETY: this closure runs on the single control thread.
+                            let state_cell = unsafe { state_cell.get_mut() };
+                            let result =
+                                state_cell.remove_tcp_connection_by_connection_id(connection_id);
+                            debug_assert!(
+                                result.is_ok(),
+                                "runtime tcp close event failed: {result:?}"
                             );
                             let _ = result;
                         }
@@ -2015,7 +2166,8 @@ mod tests {
     use crate::transport::tcp::TcpSynSentObservation;
     use hammer_core::StartStage;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
+        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpListenerId,
+        TcpListenerKey, TcpWorkerEvent,
     };
     use hammer_runtime::app::{
         AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,
@@ -2025,9 +2177,20 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     struct NoopPlatform;
+
+    fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if ready() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready(), "condition was not satisfied before timeout");
+    }
 
     impl PlatformInterface for NoopPlatform {
         fn open_tun(&self, _options: hammer_runtime::adapter::TunOptions) -> HammerResult<i32> {
@@ -2672,6 +2835,148 @@ interval = "5s"
         assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(established.id, pending.id);
         assert_eq!(established.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_state_changed_promotes_pending_connect_to_established_lookup() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id: TcpConnectionId::new(91),
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("promote pending connect via state change");
+
+        wait_for(Duration::from_secs(1), || {
+            let state = service.app_control_snapshot_for_test();
+            state
+                .tcp_lookup
+                .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                    0,
+                    local.port(),
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none()
+                && state
+                    .tcp_lookup
+                    .lookup_connection_v4(TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 44),
+                        local.port(),
+                        Ipv4Addr::new(198, 51, 100, 88),
+                        443,
+                    ))
+                    .is_some()
+        });
+
+        let state = service.app_control_snapshot_for_test();
+        let established = state
+            .tcp_lookup
+            .lookup_connection_v4(TcpV4ConnectionKey::new(
+                0,
+                Ipv4Addr::new(192, 0, 2, 44),
+                local.port(),
+                Ipv4Addr::new(198, 51, 100, 88),
+                443,
+            ))
+            .expect("published established tcp lookup");
+        assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
+        assert_eq!(established.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_closed_reclaims_active_connect_lookup_and_ephemeral_port() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
+        let connection_id = TcpConnectionId::new(92);
+
+        let first = app
+            .connect_tcp_stream(peer, 1)
+            .expect("first connect tcp stream");
+        assert_eq!(app.owner_worker_for_flow(first).expect("flow owner"), 1);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("bind established active connect");
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("close active connect");
+
+        wait_for(Duration::from_secs(1), || {
+            let state = service.app_control_snapshot_for_test();
+            state
+                .tcp_lookup
+                .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                    0,
+                    local.port(),
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none()
+                && state
+                    .tcp_lookup
+                    .lookup_connection_v4(TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 44),
+                        local.port(),
+                        Ipv4Addr::new(198, 51, 100, 88),
+                        443,
+                    ))
+                    .is_none()
+        });
+
+        let second = app
+            .connect_tcp_stream(peer, 1)
+            .expect("second connect tcp stream");
+        assert_ne!(first, second);
+
+        let reused = service
+            .app_control_snapshot_for_test()
+            .tcp_lookup
+            .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                0,
+                49_152,
+                Ipv4Addr::new(198, 51, 100, 88),
+                443,
+            ))
+            .expect("reused pending syn-sent lookup");
+        assert_eq!(reused.kind, TcpLookupKind::SynSentConnection);
+        assert_eq!(reused.owner_worker, DataWorkerId::new(1));
 
         service.close().expect("close service");
     }
