@@ -18,6 +18,7 @@ pub(crate) mod icmp;
 pub mod proxy;
 #[cfg(feature = "outbound-vless")]
 pub(crate) mod server_tcp;
+pub mod tcp;
 #[cfg(feature = "outbound-urltest")]
 pub mod urltest;
 #[cfg(feature = "outbound-vless")]

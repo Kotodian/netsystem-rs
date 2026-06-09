@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -39,6 +39,17 @@ pub trait AppControlBackend: Send + Sync {
         owner_worker: usize,
     ) -> HammerResult<AppSocketId>;
 
+    fn connect_tcp_stream(
+        &self,
+        _app: &AppContext,
+        _peer: SocketAddr,
+        _owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        Err(HammerError::internal(
+            "app tcp connect is not implemented by the control backend",
+        ))
+    }
+
     fn bind_udp_socket(
         &self,
         app: &AppContext,
@@ -68,6 +79,16 @@ impl AppControl {
         owner_worker: usize,
     ) -> HammerResult<AppSocketId> {
         self.backend.bind_tcp_listener(app, bind, owner_worker)
+    }
+
+    #[inline]
+    pub fn connect_tcp_stream(
+        &self,
+        app: &AppContext,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        self.backend.connect_tcp_stream(app, peer, owner_worker)
     }
 
     #[inline]
@@ -130,6 +151,19 @@ impl AppContext {
             .bind_tcp_listener(self, bind, owner_worker)?;
         self.register_socket_owner(socket, owner_worker)?;
         Ok(socket)
+    }
+
+    pub fn connect_tcp_stream(
+        &self,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        self.validate_owner_worker(owner_worker)?;
+        let flow = self
+            .control()?
+            .connect_tcp_stream(self, peer, owner_worker)?;
+        self.register_flow_owner(flow, owner_worker)?;
+        Ok(flow)
     }
 
     pub fn bind_udp_socket(
@@ -433,6 +467,13 @@ impl AppRuntime {
         self.send
             .ring()
             .try_push_submission_entry(AppSubmissionEntry::with_attachment(descriptor, registered))
+    }
+
+    #[inline]
+    pub async fn shutdown(&self, how: Shutdown) -> HammerResult<()> {
+        self.send
+            .ring()
+            .try_push_tcp_shutdown(crate::app::ring::AppTcpShutdown::new(self.flow, how))
     }
 
     #[inline]

@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::future::poll_fn;
-use std::net::SocketAddr;
+use std::net::{Shutdown, SocketAddr};
 use std::ops::Deref;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -141,6 +141,29 @@ pub enum AppCqeData {
 
 pub type AppCqeDescriptor =
     CompletionDescriptor<AppUserData, i32, AppCqeFlags, AppObjectRef, AppCqeData>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppTcpShutdown {
+    flow: AppFlowId,
+    how: Shutdown,
+}
+
+impl AppTcpShutdown {
+    #[inline]
+    pub const fn new(flow: AppFlowId, how: Shutdown) -> Self {
+        Self { flow, how }
+    }
+
+    #[inline]
+    pub const fn flow(self) -> AppFlowId {
+        self.flow
+    }
+
+    #[inline]
+    pub const fn how(self) -> Shutdown {
+        self.how
+    }
+}
 
 #[derive(Debug)]
 pub enum AppSqe {
@@ -909,6 +932,7 @@ impl AppPendingSubmissionRegistry {
 pub struct AppRingHandle {
     submissions: Rc<RefCell<AppRingState<AppSqeDescriptor>>>,
     completions: Rc<RefCell<AppRingState<AppCqeDescriptor>>>,
+    tcp_shutdowns: Rc<RefCell<AppRingState<AppTcpShutdown>>>,
     buffers: Rc<RefCell<AppRingBufferRegistry>>,
     pending_submissions: Rc<RefCell<AppPendingSubmissionRegistry>>,
 }
@@ -919,6 +943,7 @@ impl AppRingHandle {
         Self {
             submissions: Rc::new(RefCell::new(AppRingState::new(submission_capacity))),
             completions: Rc::new(RefCell::new(AppRingState::new(completion_capacity))),
+            tcp_shutdowns: Rc::new(RefCell::new(AppRingState::new(submission_capacity))),
             buffers: Rc::new(RefCell::new(AppRingBufferRegistry::default())),
             pending_submissions: Rc::new(RefCell::new(AppPendingSubmissionRegistry::default())),
         }
@@ -974,6 +999,19 @@ impl AppRingHandle {
     pub async fn next_completion(&self) -> Option<AppCqe> {
         let descriptor = poll_fn(|cx| self.completions.borrow_mut().poll_pop(cx)).await?;
         Some(cqe_from_descriptor(descriptor, &self.buffers))
+    }
+
+    #[inline]
+    pub fn try_push_tcp_shutdown(&self, shutdown: AppTcpShutdown) -> HammerResult<()> {
+        self.tcp_shutdowns
+            .borrow_mut()
+            .try_push(shutdown)
+            .map_err(|_| HammerError::internal("app tcp shutdown ring full"))
+    }
+
+    #[inline]
+    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        poll_fn(|cx| self.tcp_shutdowns.borrow_mut().poll_pop(cx)).await
     }
 
     #[inline]

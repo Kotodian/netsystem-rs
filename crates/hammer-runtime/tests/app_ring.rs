@@ -1,6 +1,8 @@
 use std::future::Future;
+use std::net::Shutdown;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -18,11 +20,17 @@ use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 #[derive(Default)]
 struct MockControlBackend {
     next_socket: AtomicU64,
+    next_flow: AtomicU64,
+    tcp_connects: Mutex<Vec<(SocketAddr, usize, u64)>>,
 }
 
 impl MockControlBackend {
     fn alloc_socket(&self) -> AppSocketId {
         AppSocketId::new(self.next_socket.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn alloc_flow(&self) -> AppFlowId {
+        AppFlowId::new(self.next_flow.fetch_add(1, Ordering::Relaxed) + 1)
     }
 }
 
@@ -43,6 +51,20 @@ impl AppControlBackend for MockControlBackend {
         _owner_worker: usize,
     ) -> hammer_core::error::HammerResult<AppSocketId> {
         Ok(self.alloc_socket())
+    }
+
+    fn connect_tcp_stream(
+        &self,
+        _app: &AppContext,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> hammer_core::error::HammerResult<AppFlowId> {
+        let flow = self.alloc_flow();
+        self.tcp_connects
+            .lock()
+            .expect("tcp connects poisoned")
+            .push((peer, owner_worker, flow.value()));
+        Ok(flow)
     }
 
     fn close_socket(
@@ -109,6 +131,125 @@ fn app_ring_handle_batches_submissions_and_completions() {
     assert_eq!(cqes.len(), 1);
     assert_eq!(cqes[0].user_data(), AppUserData::new(2));
     assert_eq!(cqes[0].opcode(), AppOpcode::Close);
+}
+
+#[test]
+fn app_context_connect_tcp_stream_registers_owner_via_control_backend() {
+    let data_runtime =
+        DataRuntime::new(2, "app-connect-control-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let control_backend = Arc::new(MockControlBackend::default());
+    let control: Arc<dyn AppControlBackend> = control_backend.clone();
+    app.install_control(AppControl::new(control))
+        .expect("install control");
+
+    let peer: SocketAddr = "198.51.100.42:443".parse().expect("tcp peer");
+    let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+
+    assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+    let connects = control_backend
+        .tcp_connects
+        .lock()
+        .expect("tcp connects poisoned");
+    assert_eq!(connects.as_slice(), &[(peer, 1, flow.value())]);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_runtime_shutdown_enqueues_flow_owned_tcp_shutdown_request() {
+    let data_runtime =
+        DataRuntime::new(1, "app-runtime-shutdown-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let flow = AppFlowId::new(0x51);
+
+    let shutdown = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let app_runtime = worker.runtime();
+
+                app_runtime
+                    .shutdown(Shutdown::Write)
+                    .await
+                    .expect("enqueue shutdown");
+
+                backend
+                    .next_tcp_shutdown()
+                    .await
+                    .expect("tcp shutdown request")
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(shutdown.flow(), flow);
+    assert_eq!(shutdown.how(), Shutdown::Write);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
+    let data_runtime = DataRuntime::new(1, "app-runtime-shutdown-directions-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(0x52);
+
+    let shutdowns = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let app_runtime = worker.runtime();
+
+                app_runtime
+                    .shutdown(Shutdown::Read)
+                    .await
+                    .expect("enqueue read shutdown");
+                app_runtime
+                    .shutdown(Shutdown::Write)
+                    .await
+                    .expect("enqueue write shutdown");
+                app_runtime
+                    .shutdown(Shutdown::Both)
+                    .await
+                    .expect("enqueue both shutdown");
+
+                [
+                    backend
+                        .next_tcp_shutdown()
+                        .await
+                        .expect("read shutdown request"),
+                    backend
+                        .next_tcp_shutdown()
+                        .await
+                        .expect("write shutdown request"),
+                    backend
+                        .next_tcp_shutdown()
+                        .await
+                        .expect("both shutdown request"),
+                ]
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(
+        shutdowns.map(|shutdown| shutdown.flow()),
+        [flow, flow, flow]
+    );
+    assert_eq!(
+        shutdowns.map(|shutdown| shutdown.how()),
+        [Shutdown::Read, Shutdown::Write, Shutdown::Both]
+    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]

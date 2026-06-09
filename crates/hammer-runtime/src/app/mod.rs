@@ -10,6 +10,6 @@ pub use context::{
 pub use ring::{
     AppBufferLease, AppCompletionEntry, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags,
     AppCqeKind, AppObjectRef, AppOpcode, AppRecv, AppRegisteredBuffer, AppRingHandle, AppSend,
-    AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
-    TransportKind,
+    AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppTcpShutdown,
+    AppUserData, TransportKind,
 };
