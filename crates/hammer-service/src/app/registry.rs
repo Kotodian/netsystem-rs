@@ -18,12 +18,6 @@ impl<K: FlatHashKey> AppIngressRegistry<K> {
     }
 
     #[inline]
-    pub fn with_target(mut self, key: K, target: AppIngressTarget) -> Self {
-        self.insert(key, target);
-        self
-    }
-
-    #[inline]
     pub fn insert(&mut self, key: K, target: AppIngressTarget) {
         let slot = self.targets.len() as u32;
         if let Some(existing) = self.slots.lookup(&key) {

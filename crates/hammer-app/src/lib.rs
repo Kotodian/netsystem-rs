@@ -30,11 +30,13 @@ use std::task::{Context, Poll};
 
 use hammer_adapter::BufferIndex;
 use hammer_core::error::{HammerError, HammerResult};
+pub use hammer_runtime::app::{AppControl, AppControlBackend};
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
 pub use crate::ring::{
-    AppBufferLease, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppObjectRef, AppOpcode, AppRecv,
-    AppRing, AppSend, AppSqeData, AppSqeDescriptor, AppUserData,
+    AppBufferLease, AppCompletionEntry, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppObjectRef,
+    AppOpcode, AppRecv, AppRegisteredBuffer, AppRing, AppSend, AppSocketId, AppSqeData,
+    AppSqeDescriptor, AppSubmissionEntry, AppUserData, TransportKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -53,6 +55,16 @@ impl AppFlowId {
     #[inline]
     pub const fn value(self) -> u64 {
         self.inner.value()
+    }
+
+    #[inline]
+    pub const fn slot(self) -> u32 {
+        self.inner.slot()
+    }
+
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        self.inner.generation()
     }
 
     #[inline]
@@ -86,6 +98,98 @@ impl AppContext {
             })
             .await
     }
+
+    #[inline]
+    pub fn install_control(&self, control: AppControl) -> HammerResult<()> {
+        self.inner.install_control(control)
+    }
+
+    #[inline]
+    pub fn bind_tcp_listener(
+        &self,
+        bind: std::net::SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        self.inner
+            .bind_tcp_listener(bind, owner_worker)
+            .map(|socket| AppSocketId::new(socket.value()))
+    }
+
+    #[inline]
+    pub fn bind_udp_socket(
+        &self,
+        bind: std::net::SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        self.inner
+            .bind_udp_socket(bind, owner_worker)
+            .map(|socket| AppSocketId::new(socket.value()))
+    }
+
+    #[inline]
+    pub fn close_socket(&self, socket: AppSocketId) -> HammerResult<()> {
+        self.inner.close_socket(socket.into_inner())
+    }
+
+    #[inline]
+    pub fn owner_worker_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
+        self.inner.owner_worker_for_socket(socket.into_inner())
+    }
+
+    #[inline]
+    pub fn owner_worker_for_flow(&self, flow: AppFlowId) -> HammerResult<usize> {
+        self.inner.owner_worker_for_flow(flow.into_inner())
+    }
+
+    #[inline]
+    pub fn local_backend_for_socket(&self, socket: AppSocketId) -> HammerResult<AppBackend> {
+        self.inner
+            .local_backend_for_socket(socket.into_inner())
+            .map(AppBackend::from_inner)
+    }
+
+    #[inline]
+    pub fn local_backend_for_flow(&self, flow: AppFlowId) -> HammerResult<AppBackend> {
+        self.inner
+            .local_backend_for_flow(flow.into_inner())
+            .map(AppBackend::from_inner)
+    }
+
+    #[inline]
+    pub fn try_complete_recv_buffer(
+        &self,
+        flow: AppFlowId,
+        buffers: hammer_adapter::DataPlaneBuffers,
+        index: BufferIndex,
+        fin: bool,
+    ) -> HammerResult<()> {
+        self.inner
+            .try_complete_recv_buffer(flow.into_inner(), buffers, index, fin)
+    }
+
+    #[inline]
+    pub fn try_complete_recv_from_buffer(
+        &self,
+        socket: AppSocketId,
+        source: std::net::SocketAddr,
+        buffers: hammer_adapter::DataPlaneBuffers,
+        index: BufferIndex,
+        truncated: bool,
+    ) -> HammerResult<()> {
+        self.inner.try_complete_recv_from_buffer(
+            socket.into_inner(),
+            source,
+            buffers,
+            index,
+            truncated,
+        )
+    }
+
+    #[inline]
+    pub fn try_complete_accept(&self, listener: AppSocketId, flow: AppFlowId) -> HammerResult<()> {
+        self.inner
+            .try_complete_accept(listener.into_inner(), flow.into_inner())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -110,6 +214,11 @@ impl AppBackend {
     }
 
     #[inline]
+    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
+        self.inner.try_push_submission_entry(entry.into_inner())
+    }
+
+    #[inline]
     pub async fn next_sqe_descriptor(&self) -> Option<AppSqeDescriptor> {
         self.inner
             .next_sqe_descriptor()
@@ -125,6 +234,24 @@ impl AppBackend {
     }
 
     #[inline]
+    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.inner
+            .next_submission_entry()
+            .await
+            .map(crate::ring::AppSubmissionEntry::from_inner)
+    }
+
+    #[inline]
+    pub fn try_push_cqe_descriptor(&self, descriptor: AppCqeDescriptor) -> HammerResult<()> {
+        self.inner.try_push_cqe_descriptor(descriptor.into_inner())
+    }
+
+    #[inline]
+    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
+        self.inner.try_push_completion_entry(entry.into_inner())
+    }
+
+    #[inline]
     pub async fn next_cqe_descriptor(&self) -> Option<AppCqeDescriptor> {
         self.inner
             .next_cqe_descriptor()
@@ -137,6 +264,14 @@ impl AppBackend {
         self.inner
             .take_completion_buffer(index)
             .map(AppRecv::from_inner)
+    }
+
+    #[inline]
+    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
+        self.inner
+            .next_completion_entry()
+            .await
+            .map(crate::ring::AppCompletionEntry::from_inner)
     }
 
     #[inline]
@@ -170,6 +305,11 @@ impl AppRuntime {
     }
 
     #[inline]
+    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
+        self.inner.try_push_submission_entry(entry.into_inner())
+    }
+
+    #[inline]
     pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
         self.inner
             .next_submission_descriptor()
@@ -185,6 +325,25 @@ impl AppRuntime {
     }
 
     #[inline]
+    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.inner
+            .next_submission_entry()
+            .await
+            .map(crate::ring::AppSubmissionEntry::from_inner)
+    }
+
+    #[inline]
+    pub fn try_push_completion_descriptor(&self, descriptor: AppCqeDescriptor) -> HammerResult<()> {
+        self.inner
+            .try_push_completion_descriptor(descriptor.into_inner())
+    }
+
+    #[inline]
+    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
+        self.inner.try_push_completion_entry(entry.into_inner())
+    }
+
+    #[inline]
     pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
         self.inner
             .next_completion_descriptor()
@@ -197,6 +356,14 @@ impl AppRuntime {
         self.inner
             .take_completion_buffer(index)
             .map(AppRecv::from_inner)
+    }
+
+    #[inline]
+    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
+        self.inner
+            .next_completion_entry()
+            .await
+            .map(crate::ring::AppCompletionEntry::from_inner)
     }
 
     #[inline]
@@ -328,6 +495,11 @@ impl App {
     #[inline]
     pub fn context(&self) -> &AppContext {
         &self.inner
+    }
+
+    #[inline]
+    pub fn install_control(&self, control: AppControl) -> HammerResult<()> {
+        self.inner.install_control(control)
     }
 
     #[inline]

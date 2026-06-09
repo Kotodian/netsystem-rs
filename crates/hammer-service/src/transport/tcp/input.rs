@@ -332,6 +332,8 @@ struct PendingTcpAppIngressStore {
 thread_local! {
     static TCP_APP_INGRESS_PENDING: RefCell<PendingTcpAppIngressStore> =
         const { RefCell::new(PendingTcpAppIngressStore::new()) };
+    static TCP_ACCEPT_PENDING: RefCell<PendingTcpAcceptStore> =
+        const { RefCell::new(PendingTcpAcceptStore::new()) };
 }
 
 impl PendingTcpAppIngressStore {
@@ -410,6 +412,110 @@ pub(crate) fn take_pending_tcp_app_ingress(index: BufferIndex) -> CoreResult<Opt
     })
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingTcpAcceptEntry {
+    generation: u32,
+    listener_id: TcpLookupId,
+    occupied: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingTcpAcceptPool {
+    pool_id: u64,
+    entries: InfraVec<PendingTcpAcceptEntry>,
+}
+
+impl PendingTcpAcceptPool {
+    #[inline]
+    const fn new(pool_id: u64) -> Self {
+        Self {
+            pool_id,
+            entries: InfraVec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingTcpAcceptStore {
+    pools: InfraVec<PendingTcpAcceptPool>,
+}
+
+impl PendingTcpAcceptStore {
+    #[inline]
+    const fn new() -> Self {
+        Self {
+            pools: InfraVec::new(),
+        }
+    }
+
+    #[inline]
+    fn mark(&mut self, index: BufferIndex, listener_id: TcpLookupId) {
+        let pool = self.pool_mut(index.pool_id());
+        let slot = index.slot() as usize;
+        while pool.entries.len() <= slot {
+            pool.entries.push(PendingTcpAcceptEntry::default());
+        }
+        pool.entries[slot] = PendingTcpAcceptEntry {
+            generation: index.generation(),
+            listener_id,
+            occupied: true,
+        };
+    }
+
+    #[inline]
+    fn take(&mut self, index: BufferIndex) -> Option<TcpLookupId> {
+        let pool = self
+            .pools
+            .iter_mut()
+            .find(|pool| pool.pool_id == index.pool_id())?;
+        let entry = pool.entries.get_mut(index.slot() as usize)?;
+        if !entry.occupied {
+            return None;
+        }
+        if entry.generation != index.generation() {
+            *entry = PendingTcpAcceptEntry::default();
+            return None;
+        }
+        let listener_id = entry.listener_id;
+        *entry = PendingTcpAcceptEntry::default();
+        Some(listener_id)
+    }
+
+    #[inline]
+    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAcceptPool {
+        if let Some(position) = self.pools.iter().position(|pool| pool.pool_id == pool_id) {
+            return &mut self.pools[position];
+        }
+        self.pools.push(PendingTcpAcceptPool::new(pool_id));
+        let position = self.pools.len() - 1;
+        &mut self.pools[position]
+    }
+}
+
+#[inline]
+pub(crate) fn mark_pending_tcp_accept(
+    index: BufferIndex,
+    listener_id: TcpLookupId,
+) -> CoreResult<()> {
+    TCP_ACCEPT_PENDING.with(|pending| {
+        pending
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP accept pending store borrowed"))?
+            .mark(index, listener_id);
+        Ok(())
+    })
+}
+
+#[inline]
+pub(crate) fn take_pending_tcp_accept(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
+    TCP_ACCEPT_PENDING.with(|pending| {
+        Ok(pending
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP accept pending store borrowed"))?
+            .take(index))
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParsedTcpInput {
     version: IpVersion,
@@ -467,7 +573,7 @@ fn next_node_for_index(
     };
 
     let lookup = lookup_for_packet(runtime.metadata(index)?, &snapshot.lookup, &parsed);
-    if let Some(owner) = established_owner(lookup)
+    if let Some(owner) = lookup_owner(lookup)
         && let Some(handoff) = handoff
         && owner != handoff.current_worker()
     {
@@ -504,6 +610,12 @@ fn next_node_for_index(
         && let Some(connection_id) = app_ingress_connection
     {
         mark_pending_tcp_app_ingress(index, connection_id)?;
+    }
+    if entry.next == TcpInputNext::Listen
+        && let Some(value) = lookup
+        && value.kind == TcpLookupKind::Listener
+    {
+        mark_pending_tcp_accept(index, value.id)?;
     }
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, entry.next);
@@ -553,9 +665,14 @@ fn resolve_error_next(
 }
 
 #[inline(always)]
-fn established_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
+fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
     match lookup {
-        Some(value) if value.kind == TcpLookupKind::EstablishedConnection => {
+        Some(value)
+            if matches!(
+                value.kind,
+                TcpLookupKind::EstablishedConnection | TcpLookupKind::Listener
+            ) =>
+        {
             Some(value.owner_worker)
         }
         _ => None,

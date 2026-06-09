@@ -2,15 +2,20 @@ use std::time::Duration;
 
 use hammer_app::echo::run_udp_echo;
 use hammer_app::udp::UdpSocket;
-use hammer_app::{App, AppBufferLease, AppFlowId, AppOpcode};
+use hammer_app::{
+    App, AppBufferLease, AppCompletionEntry, AppCqeData, AppCqeDescriptor, AppCqeFlags,
+    AppObjectRef, AppOpcode, AppRegisteredBuffer, AppSocketId, AppSqeData, AppUserData,
+};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
-fn udp_echo_helper_reuses_same_ring() {
+fn udp_echo_helper_reuses_same_zero_copy_buffer_via_recv_from_send_to() {
     let data_runtime =
         DataRuntime::new(2, "hammer-app-udp-echo", 512 * 1024, 2).expect("data runtime");
     let app = App::with_ring_capacity(data_runtime.context(), 4);
-    let flow = AppFlowId::new(19);
+    let flow = hammer_app::AppFlowId::new(19);
+    let socket = AppSocketId::new(53);
+    let peer = "127.0.0.1:5353".parse().expect("peer");
 
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -19,61 +24,82 @@ fn udp_echo_helper_reuses_same_ring() {
         .block_on(async {
             app.spawn(flow, move |flow| async move {
                 let backend = flow.backend();
-                let ring = flow.ring();
-                let udp = UdpSocket::new(ring.clone(), "127.0.0.1:5353".parse().expect("peer"));
+                let udp = UdpSocket::new(flow.ring(), socket);
                 let udp_echo = flow.spawn_local({
                     let udp = udp.clone();
                     move || async move { run_udp_echo(&udp).await.expect("udp echo once") }
                 });
                 let runtime = with_data_plane_buffers(Clone::clone);
-                let first_recv_sqe = backend.next_sqe_descriptor().await.expect("first recv sqe");
-                assert_eq!(first_recv_sqe.opcode(), AppOpcode::Recv);
+                let recv_sqe = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("udp recv_from sqe");
+                assert_eq!(recv_sqe.opcode(), AppOpcode::RecvFrom);
+                assert_eq!(recv_sqe.object(), AppObjectRef::Socket(socket));
+                assert_eq!(
+                    recv_sqe.payload(),
+                    AppSqeData::RecvFrom { max_len: u32::MAX }
+                );
+
                 let echo_index = runtime
                     .alloc_index_with_bytes(Default::default(), b"udp-echo")
                     .expect("alloc udp buffer");
-                let replay_index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"ring-echo")
-                    .expect("alloc ring buffer");
-
+                let expected_ptr = runtime.current_ptr(echo_index).expect("udp ptr");
+                let registered = AppRegisteredBuffer::from_lease(AppBufferLease::from_buffer(
+                    runtime, echo_index,
+                ))
+                .expect("register udp buffer");
                 backend
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), echo_index))
-                    .await
-                    .expect("complete udp recv");
-                let peer = udp_echo.await.expect("join udp echo");
-                let udp_send = backend.next_send().await.expect("udp send");
-                let udp_payload = udp_send.lease().copy_current().expect("copy udp payload");
+                    .try_push_completion_entry(AppCompletionEntry::with_attachment(
+                        AppCqeDescriptor::new(
+                            AppUserData::new(0),
+                            b"udp-echo".len() as i32,
+                            AppCqeFlags::BUFFER,
+                            AppObjectRef::Socket(socket),
+                            AppCqeData::RecvFrom {
+                                socket,
+                                source: peer,
+                                buffer: registered.index(),
+                            },
+                        ),
+                        registered,
+                    ))
+                    .expect("push udp recv_from cqe");
 
-                let ring_recv_future = ring.recv();
-                let second_recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_peer = udp_echo.await.expect("join udp echo");
+                let send_entry = backend
+                    .next_submission_entry()
                     .await
-                    .expect("second recv sqe");
-                assert_eq!(second_recv_sqe.opcode(), AppOpcode::Recv);
-                backend
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), replay_index))
-                    .await
-                    .expect("complete ring recv");
+                    .expect("udp send_to entry");
+                let send_descriptor = send_entry.descriptor();
+                let send_attachment = send_entry.attachment().expect("udp send attachment");
+                let send_ptr = send_attachment.lease().current_ptr().expect("send ptr");
+                let send_payload = send_attachment
+                    .lease()
+                    .copy_current()
+                    .expect("copy udp payload");
 
-                let ring_recv = ring_recv_future.await.expect("ring recv after udp");
-                let udp_ptr = ring_recv.lease().current_ptr().expect("udp recv ptr") as usize;
-                let expected_udp_ptr =
-                    runtime.current_ptr(replay_index).expect("udp expected ptr") as usize;
-                ring.send(ring_recv.into_send())
-                    .await
-                    .expect("ring send back");
-                let replay = backend.next_send().await.expect("replay send");
-                let replay_payload = replay.lease().copy_current().expect("replay payload");
-
-                (peer, udp_payload, udp_ptr, expected_udp_ptr, replay_payload)
+                (
+                    recv_peer,
+                    expected_ptr as usize,
+                    send_ptr as usize,
+                    send_descriptor,
+                    send_payload,
+                )
             })
             .await
             .expect("spawn flow")
         });
 
-    assert_eq!(result.0, "127.0.0.1:5353".parse().expect("peer"));
-    assert_eq!(result.1, b"udp-echo");
-    assert_eq!(result.2, result.3);
-    assert_eq!(result.4, b"ring-echo");
+    assert_eq!(result.0, peer);
+    assert_eq!(result.1, result.2);
+    assert_eq!(result.3.opcode(), AppOpcode::SendTo);
+    assert_eq!(result.3.object(), AppObjectRef::Socket(socket));
+    match result.3.payload() {
+        AppSqeData::SendTo { target, .. } => assert_eq!(target, peer),
+        other => panic!("expected send_to payload, got {other:?}"),
+    }
+    assert_eq!(result.4, b"udp-echo");
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

@@ -522,6 +522,30 @@ impl DataRuntimeContext {
         DataRemoteJoinHandle { state }.await
     }
 
+    pub(crate) fn call_blocking_on_worker<R>(
+        &self,
+        worker: usize,
+        f: impl FnOnce() -> HammerResult<R> + Send + 'static,
+    ) -> HammerResult<R>
+    where
+        R: Send + 'static,
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        self.schedule_local_on_worker(
+            worker,
+            Box::new(move || {
+                let result = match catch_unwind(AssertUnwindSafe(f)) {
+                    Ok(result) => result,
+                    Err(_) => Err(HammerError::internal("data worker closure panicked")),
+                };
+                let _ = done_tx.send(result);
+            }),
+        )?;
+        done_rx
+            .recv()
+            .map_err(|_| HammerError::internal("data worker closure canceled"))?
+    }
+
     fn spawn_send_on_worker<F>(&self, worker: usize, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,

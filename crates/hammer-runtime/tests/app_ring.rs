@@ -1,14 +1,58 @@
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hammer_adapter::BufferIndex;
+use hammer_adapter::RouteMetadata;
+use hammer_core::SocksAddr;
 use hammer_runtime::app::{
-    AppBufferLease, AppCompletionEntry, AppContext, AppCqe, AppCqeData, AppCqeDescriptor,
-    AppCqeFlags, AppCqeKind, AppFlowId, AppObjectRef, AppOpcode, AppRegisteredBuffer,
-    AppRingHandle, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
-    AppUserData, TransportKind,
+    AppBufferLease, AppCompletionEntry, AppContext, AppControl, AppControlBackend, AppCqe,
+    AppCqeData, AppCqeDescriptor, AppCqeFlags, AppCqeKind, AppFlowId, AppObjectRef, AppOpcode,
+    AppRegisteredBuffer, AppRingHandle, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor,
+    AppSubmissionEntry, AppUserData, TransportKind,
 };
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
+
+#[derive(Default)]
+struct MockControlBackend {
+    next_socket: AtomicU64,
+}
+
+impl MockControlBackend {
+    fn alloc_socket(&self) -> AppSocketId {
+        AppSocketId::new(self.next_socket.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+}
+
+impl AppControlBackend for MockControlBackend {
+    fn bind_tcp_listener(
+        &self,
+        _app: &AppContext,
+        _bind: SocketAddr,
+        _owner_worker: usize,
+    ) -> hammer_core::error::HammerResult<AppSocketId> {
+        Ok(self.alloc_socket())
+    }
+
+    fn bind_udp_socket(
+        &self,
+        _app: &AppContext,
+        _bind: SocketAddr,
+        _owner_worker: usize,
+    ) -> hammer_core::error::HammerResult<AppSocketId> {
+        Ok(self.alloc_socket())
+    }
+
+    fn close_socket(
+        &self,
+        _app: &AppContext,
+        _socket: AppSocketId,
+    ) -> hammer_core::error::HammerResult<()> {
+        Ok(())
+    }
+}
 
 #[test]
 fn app_ring_surface_covers_tcp_and_udp_shapes() {
@@ -286,6 +330,248 @@ fn app_context_try_complete_recv_buffer_requires_pending_recv_submission() {
         result.0
     );
     assert_eq!(result.1, 1);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_context_try_complete_recv_from_buffer_enqueues_socket_owned_cqe() {
+    let data_runtime = DataRuntime::new(1, "app-complete-recv-from-cqe-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    app.install_control(AppControl::new(Arc::new(MockControlBackend::default())))
+        .expect("install control");
+    let socket = app
+        .bind_udp_socket("127.0.0.1:5353".parse().expect("udp bind"), 0)
+        .expect("bind udp socket");
+    let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 40007);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    data_runtime
+        .context()
+        .spawn_local_on_worker(0, {
+            let app = app.clone();
+            move || async move {
+                let backend = app
+                    .local_backend_for_socket(socket)
+                    .expect("socket backend");
+                backend
+                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                        AppOpcode::RecvFrom,
+                        AppUserData::new(17),
+                        AppObjectRef::Socket(socket),
+                        AppSqeData::RecvFrom { max_len: u32::MAX },
+                    ))
+                    .expect("push recv_from sqe");
+
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let before_in_use = runtime.in_use_buffers();
+                let index = runtime
+                    .alloc_index_with_bytes(
+                        RouteMetadata {
+                            source: Some(SocksAddr::ip(source.ip(), source.port())),
+                            ..Default::default()
+                        },
+                        b"complete-recv-from",
+                    )
+                    .expect("alloc recv_from buffer");
+                let expected_ptr = runtime.current_ptr(index).expect("buffer pointer") as usize;
+
+                app.try_complete_recv_from_buffer(socket, source, runtime.clone(), index, false)
+                    .expect("enqueue recv_from cqe");
+
+                let descriptor = backend
+                    .next_cqe_descriptor()
+                    .await
+                    .expect("recv_from cqe descriptor");
+                let recv = backend
+                    .take_completion_buffer(match descriptor.payload() {
+                        AppCqeData::RecvFrom { buffer, .. } => buffer,
+                        other => panic!("unexpected cqe payload: {other:?}"),
+                    })
+                    .expect("take recv_from buffer");
+                let recv_ptr = recv.lease().current_ptr().expect("recv pointer") as usize;
+                let recv_payload = recv.lease().copy_current().expect("recv payload");
+                recv.release();
+                let after_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
+
+                tx.send((
+                    descriptor,
+                    expected_ptr,
+                    recv_ptr,
+                    recv_payload,
+                    before_in_use,
+                    after_in_use,
+                ))
+                .expect("send recv_from result");
+            }
+        })
+        .expect("spawn recv_from worker");
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive recv_from result");
+
+    assert_eq!(result.0.user_data(), AppUserData::new(17));
+    assert_eq!(result.0.object(), AppObjectRef::Socket(socket));
+    assert!(result.0.flags().contains(AppCqeFlags::BUFFER));
+    match result.0.payload() {
+        AppCqeData::RecvFrom {
+            socket: recv_socket,
+            source: recv_source,
+            buffer,
+        } => {
+            assert_eq!(recv_socket, socket);
+            assert_eq!(recv_source, source);
+            assert_ne!(buffer, buffer_index(0, 0, 0));
+        }
+        other => panic!("unexpected cqe payload: {other:?}"),
+    }
+    assert_eq!(result.1, result.2);
+    assert_eq!(result.3, b"complete-recv-from");
+    assert_eq!(result.4, 0);
+    assert_eq!(result.5, 0);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_context_try_complete_accept_enqueues_listener_owned_cqe() {
+    let data_runtime =
+        DataRuntime::new(1, "app-complete-accept-cqe-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    app.install_control(AppControl::new(Arc::new(MockControlBackend::default())))
+        .expect("install control");
+    let listener = app
+        .bind_tcp_listener("127.0.0.1:7000".parse().expect("tcp bind"), 0)
+        .expect("bind tcp listener");
+    let accepted_flow = AppFlowId::new(0x7001);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    data_runtime
+        .context()
+        .spawn_local_on_worker(0, {
+            let app = app.clone();
+            move || async move {
+                let backend = app
+                    .local_backend_for_socket(listener)
+                    .expect("listener backend");
+                backend
+                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                        AppOpcode::Accept,
+                        AppUserData::new(23),
+                        AppObjectRef::Socket(listener),
+                        AppSqeData::Accept,
+                    ))
+                    .expect("push accept sqe");
+
+                app.try_complete_accept(listener, accepted_flow)
+                    .expect("enqueue accept cqe");
+
+                tx.send((
+                    backend
+                        .next_cqe_descriptor()
+                        .await
+                        .expect("accept cqe descriptor"),
+                    app.owner_worker_for_flow(accepted_flow)
+                        .expect("accepted flow owner"),
+                ))
+                .expect("send accept result");
+            }
+        })
+        .expect("spawn accept worker");
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive accept result");
+
+    assert_eq!(result.0.user_data(), AppUserData::new(23));
+    assert_eq!(result.0.object(), AppObjectRef::Socket(listener));
+    match result.0.payload() {
+        AppCqeData::Accepted {
+            listener: cqe_listener,
+            flow,
+        } => {
+            assert_eq!(cqe_listener, listener);
+            assert_eq!(flow, accepted_flow);
+        }
+        other => panic!("unexpected accept payload: {other:?}"),
+    }
+    assert_eq!(result.1, 0);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_context_try_complete_accept_enqueues_listener_owned_cqe_from_non_worker_thread() {
+    let data_runtime = DataRuntime::new(1, "app-complete-accept-cross-thread-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    app.install_control(AppControl::new(Arc::new(MockControlBackend::default())))
+        .expect("install control");
+    let listener = app
+        .bind_tcp_listener("127.0.0.1:7001".parse().expect("tcp bind"), 0)
+        .expect("bind tcp listener");
+    let accepted_flow = AppFlowId::new(0x7002);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    data_runtime
+        .context()
+        .spawn_local_on_worker(0, {
+            let app = app.clone();
+            move || async move {
+                let backend = app
+                    .local_backend_for_socket(listener)
+                    .expect("listener backend");
+                backend
+                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                        AppOpcode::Accept,
+                        AppUserData::new(24),
+                        AppObjectRef::Socket(listener),
+                        AppSqeData::Accept,
+                    ))
+                    .expect("push accept sqe");
+                ready_tx.send(()).expect("signal ready");
+                result_tx
+                    .send(
+                        backend
+                            .next_cqe_descriptor()
+                            .await
+                            .expect("accept cqe descriptor"),
+                    )
+                    .expect("send accept cqe");
+            }
+        })
+        .expect("spawn accept worker");
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("wait pending accept");
+    app.try_complete_accept(listener, accepted_flow)
+        .expect("enqueue accept cqe from non-worker thread");
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive accept result");
+
+    assert_eq!(result.user_data(), AppUserData::new(24));
+    assert_eq!(result.object(), AppObjectRef::Socket(listener));
+    match result.payload() {
+        AppCqeData::Accepted {
+            listener: cqe_listener,
+            flow,
+        } => {
+            assert_eq!(cqe_listener, listener);
+            assert_eq!(flow, accepted_flow);
+        }
+        other => panic!("unexpected accept payload: {other:?}"),
+    }
+    assert_eq!(
+        app.owner_worker_for_flow(accepted_flow)
+            .expect("accepted flow owner"),
+        0
+    );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

@@ -8,7 +8,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_infra::boxed::Slice;
-use hammer_runtime::app::{AppContext, AppFlowId};
+use hammer_runtime::app::{AppContext, AppFlowId, AppSocketId};
 
 use crate::app::{AppIngressRegistry, AppIngressTarget};
 use crate::data_plane::set_index_node_error_code;
@@ -206,7 +206,14 @@ impl UdpAppRegistration {
     #[inline]
     pub fn new(app: AppContext, flow: AppFlowId) -> Self {
         Self {
-            target: AppIngressTarget::new(app, flow),
+            target: AppIngressTarget::flow(app, flow),
+        }
+    }
+
+    #[inline]
+    pub fn socket(app: AppContext, socket: AppSocketId) -> Self {
+        Self {
+            target: AppIngressTarget::socket(app, socket),
         }
     }
 
@@ -224,7 +231,7 @@ impl UdpAppRegistration {
 impl std::fmt::Debug for UdpAppRegistration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UdpAppRegistration")
-            .field("flow", &self.target().flow().value())
+            .field("object", &self.target().object())
             .finish_non_exhaustive()
     }
 }
