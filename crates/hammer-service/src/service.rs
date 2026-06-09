@@ -2552,9 +2552,8 @@ mod tests {
     use crate::transport::tcp::TcpSynSentObservation;
     use hammer_core::StartStage;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey,
-        TcpControlPlaneAction, TcpListenerId, TcpListenerKey, TcpTimerId, TcpTimerKind,
-        TcpWorkerEvent,
+        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction,
+        TcpListenerId, TcpListenerKey, TcpTimerId, TcpTimerKind, TcpWorkerEvent,
     };
     use hammer_runtime::app::{
         AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,

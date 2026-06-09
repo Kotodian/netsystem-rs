@@ -173,7 +173,10 @@ fn tcp_reset_observer_synthesizes_rst_ack_for_non_ack_segments() {
     runtime
         .get_buffer_mut(buffer)
         .expect("buffer mut")
-        .set_node_error(BufferNodeError::new(reset, TcpInputError::ConnectionClosed.code()));
+        .set_node_error(BufferNodeError::new(
+            reset,
+            TcpInputError::ConnectionClosed.code(),
+        ));
 
     assert!(runtime.schedule_frame(reset, frame).expect("schedule"));
 
@@ -254,7 +257,10 @@ fn tcp_reset_observer_synthesizes_wrapped_rst_ack_for_non_ack_segments() {
     runtime
         .get_buffer_mut(buffer)
         .expect("buffer mut")
-        .set_node_error(BufferNodeError::new(reset, TcpInputError::ConnectionClosed.code()));
+        .set_node_error(BufferNodeError::new(
+            reset,
+            TcpInputError::ConnectionClosed.code(),
+        ));
 
     assert!(runtime.schedule_frame(reset, frame).expect("schedule"));
 

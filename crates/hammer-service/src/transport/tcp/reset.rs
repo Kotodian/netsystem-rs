@@ -357,7 +357,11 @@ fn tcp_synthesized_reset(
     index: BufferIndex,
     metadata: &RouteMetadata,
 ) -> Option<TcpSynthesizedReset> {
-    let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index).ok()?.into_iter().collect();
+    let packet: std::vec::Vec<u8> = runtime
+        .copy_current_chain(index)
+        .ok()?
+        .into_iter()
+        .collect();
     let cursor = runtime.packet_cursor(index).ok()?;
     synthesize_ipv4_tcp_reset(&packet, cursor, metadata)
 }
