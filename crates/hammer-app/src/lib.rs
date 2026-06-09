@@ -132,6 +132,11 @@ impl AppContext {
     }
 
     #[inline]
+    pub fn close_tcp_flow(&self, flow: AppFlowId) -> HammerResult<()> {
+        self.inner.close_tcp_flow(flow.into_inner())
+    }
+
+    #[inline]
     pub fn owner_worker_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
         self.inner.owner_worker_for_socket(socket.into_inner())
     }

@@ -176,6 +176,14 @@ impl AppControlBackend for TestAppControlBackend {
     ) -> hammer_core::error::HammerResult<()> {
         Ok(())
     }
+
+    fn close_tcp_flow(
+        &self,
+        _app: &AppContext,
+        _flow: hammer_runtime::app::AppFlowId,
+    ) -> hammer_core::error::HammerResult<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
