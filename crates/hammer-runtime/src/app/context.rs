@@ -12,8 +12,8 @@ use hammer_infra::vec::Vec;
 
 use crate::app::backend::{AppBackend, AppBackendRecvQueue, AppBackendSendQueue};
 use crate::app::ring::{
-    AppCompletionEntry, AppCqeDescriptor, AppObjectRef, AppRecv, AppRegisteredBuffer, AppSend,
-    AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
+    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv, AppRegisteredBuffer,
+    AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
 };
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
@@ -326,6 +326,27 @@ impl AppContext {
     }
 
     #[inline]
+    pub fn try_complete_closed_flow(&self, flow: AppFlowId) -> HammerResult<bool> {
+        let Some(owner_worker) = self.registered_flow_owner(flow)? else {
+            return Ok(false);
+        };
+        if self.current_worker_index().ok() == Some(owner_worker) {
+            let backend = self.local_backend_for_flow(flow)?;
+            backend.try_push_cqe(AppCqe::closed(AppUserData::new(0), Some(flow)))?;
+        } else {
+            let app_context_id = self.id;
+            let ring_capacity = self.ring_capacity;
+            self.data_context
+                .call_blocking_on_worker(owner_worker, move || {
+                    worker_backend(app_context_id, flow, ring_capacity)
+                        .try_push_cqe(AppCqe::closed(AppUserData::new(0), Some(flow)))
+                })?;
+        }
+        self.unregister_flow_owner(flow)?;
+        Ok(true)
+    }
+
+    #[inline]
     fn current_worker_index(&self) -> HammerResult<usize> {
         self.data_context.current_worker_index().ok_or_else(|| {
             HammerError::internal("local app backend lookup requires a data worker thread")
@@ -351,6 +372,9 @@ impl AppContext {
     }
 
     fn owner_for(&self, flow: AppFlowId) -> HammerResult<usize> {
+        if let Some(owner) = self.registered_flow_owner(flow)? {
+            return Ok(owner);
+        }
         let mut owners = self
             .owners
             .lock()
@@ -405,6 +429,16 @@ impl AppContext {
             .map_err(|_| HammerError::internal("app owner map poisoned"))?;
         owners.insert(flow.value(), CLOSED_OWNER_WORKER);
         Ok(())
+    }
+
+    fn registered_flow_owner(&self, flow: AppFlowId) -> HammerResult<Option<usize>> {
+        let owners = self
+            .owners
+            .lock()
+            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
+        Ok(owners
+            .lookup(&flow.value())
+            .filter(|owner| *owner != CLOSED_OWNER_WORKER))
     }
 
     fn owner_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
