@@ -2,6 +2,7 @@ pub mod congestion;
 pub mod dns;
 pub mod icmp;
 pub mod ip;
+pub mod tcp;
 
 #[cfg(feature = "hysteria2")]
 pub mod hysteria2;

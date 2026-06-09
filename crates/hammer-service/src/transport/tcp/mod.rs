@@ -1,3 +1,5 @@
+pub use hammer_core::protocol::tcp::TcpState;
+
 pub mod accept;
 pub mod app;
 pub mod established;
@@ -24,7 +26,7 @@ pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProces
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use state::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState, TcpDispatchEntry,
-    TcpDispatchTable, TcpInputFlags, TcpListenerConfig, TcpState,
+    TcpDispatchTable, TcpInputFlags, TcpListenerConfig,
 };
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 

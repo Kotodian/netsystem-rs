@@ -4,7 +4,7 @@ use hammer_core::error::HammerResult;
 use crate::app::context::AppFlowId;
 use crate::app::ring::{
     AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppRecv, AppRingHandle, AppSend,
-    AppSqe, AppSqeDescriptor, AppSubmissionEntry,
+    AppSqe, AppSqeDescriptor, AppSubmissionEntry, AppTcpShutdown,
 };
 
 #[derive(Clone, Debug)]
@@ -113,8 +113,18 @@ impl AppBackend {
     }
 
     #[inline]
+    pub fn try_push_tcp_shutdown(&self, shutdown: AppTcpShutdown) -> HammerResult<()> {
+        self.ring.try_push_tcp_shutdown(shutdown)
+    }
+
+    #[inline]
     pub async fn next_send(&self) -> Option<AppSend> {
         self.next_sqe().await.and_then(AppSqe::into_send)
+    }
+
+    #[inline]
+    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.ring.next_tcp_shutdown().await
     }
 
     #[inline]

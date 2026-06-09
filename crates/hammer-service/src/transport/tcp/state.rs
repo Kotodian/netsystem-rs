@@ -1,30 +1,10 @@
 use super::{TcpInputError, TcpInputNext};
+use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
+    TcpListenerKey, TcpNegotiatedOptions, TcpState,
+};
 use smoltcp::socket::tcp::CongestionControl as SmolTcpCongestionControl;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TcpState {
-    Closed,
-    Listen,
-    SynSent,
-    SynRcvd,
-    Established,
-    FinWait1,
-    FinWait2,
-    CloseWait,
-    Closing,
-    LastAck,
-    TimeWait,
-}
-
-impl TcpState {
-    pub const COUNT: usize = 11;
-
-    #[inline]
-    pub const fn index(self) -> usize {
-        self as usize
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TcpCongestionAlgorithm {
@@ -64,8 +44,14 @@ impl TcpCongestionRegistry {
     pub fn selected_algorithm(
         &self,
         algorithm: Option<TcpCongestionAlgorithm>,
-    ) -> TcpCongestionAlgorithm {
-        algorithm.unwrap_or(self.default_algorithm)
+    ) -> HammerResult<TcpCongestionAlgorithm> {
+        let selected = algorithm.unwrap_or(self.default_algorithm);
+        if !matches!(selected, TcpCongestionAlgorithm::Bbr) {
+            return Err(HammerError::config_validation(format!(
+                "tcp congestion algorithm {selected:?} is not implemented; only Bbr is currently supported"
+            )));
+        }
+        Ok(selected)
     }
 }
 
@@ -75,6 +61,7 @@ impl Default for TcpCongestionRegistry {
     }
 }
 
+#[derive(Debug)]
 pub struct TcpConnectionState {
     selected_algorithm: TcpCongestionAlgorithm,
 }
@@ -84,10 +71,10 @@ impl TcpConnectionState {
     pub fn new(
         registry: &TcpCongestionRegistry,
         algorithm: Option<TcpCongestionAlgorithm>,
-    ) -> Self {
-        Self {
-            selected_algorithm: registry.selected_algorithm(algorithm),
-        }
+    ) -> HammerResult<Self> {
+        Ok(Self {
+            selected_algorithm: registry.selected_algorithm(algorithm)?,
+        })
     }
 
     #[inline]
@@ -98,6 +85,37 @@ impl TcpConnectionState {
     #[inline]
     pub fn smoltcp_congestion_fallback(&self) -> Option<SmolTcpCongestionControl> {
         self.selected_algorithm.smoltcp_fallback()
+    }
+
+    #[inline]
+    pub fn install_listener_action(
+        &self,
+        listener_id: TcpListenerId,
+        listener: TcpListenerKey,
+    ) -> TcpControlPlaneAction {
+        let _ = self;
+        TcpControlPlaneAction::InstallListener {
+            listener_id,
+            listener,
+            capabilities: TcpCapabilities::default(),
+        }
+    }
+
+    #[inline]
+    pub fn install_connection_action(
+        &self,
+        connection_id: TcpConnectionId,
+        key: TcpConnectionKey,
+        state: TcpState,
+    ) -> TcpControlPlaneAction {
+        let _ = self;
+        TcpControlPlaneAction::InstallConnection {
+            connection_id,
+            key,
+            state,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        }
     }
 }
 
@@ -121,6 +139,19 @@ impl TcpListenerConfig {
     #[inline]
     pub fn congestion_algorithm(self) -> Option<TcpCongestionAlgorithm> {
         self.congestion_algorithm
+    }
+
+    #[inline]
+    pub fn install_listener_action(
+        self,
+        registry: &TcpCongestionRegistry,
+        listener_id: TcpListenerId,
+        listener: TcpListenerKey,
+    ) -> HammerResult<TcpControlPlaneAction> {
+        Ok(
+            TcpConnectionState::new(registry, self.congestion_algorithm())?
+                .install_listener_action(listener_id, listener),
+        )
     }
 }
 

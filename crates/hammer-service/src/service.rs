@@ -163,9 +163,11 @@ struct UdpSocketRegistration {
 
 #[derive(Clone)]
 struct TcpConnectionRegistration {
+    #[allow(dead_code)]
+    flow: AppFlowId,
     lookup_id: TcpLookupId,
     owner_worker: DataWorkerId,
-    local: SocketAddr,
+    local: Option<SocketAddr>,
     remote: SocketAddr,
     target: AppIngressTarget,
 }
@@ -441,10 +443,32 @@ impl RuntimeAppControlState {
         app.try_complete_accept(listener, flow)?;
         let lookup_id = self.alloc_tcp_lookup_id()?;
         self.tcp_connections.push(TcpConnectionRegistration {
+            flow,
             lookup_id,
             owner_worker: listener_registration.owner_worker,
-            local,
+            local: Some(local),
             remote,
+            target: AppIngressTarget::flow(app.clone(), flow),
+        });
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+        Ok(flow)
+    }
+
+    fn connect_tcp_stream(
+        &mut self,
+        app: &AppContext,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        let flow = self.alloc_flow();
+        let lookup_id = self.alloc_tcp_lookup_id()?;
+        self.tcp_connections.push(TcpConnectionRegistration {
+            flow,
+            lookup_id,
+            owner_worker: worker_id(owner_worker)?,
+            local: None,
+            remote: peer,
             target: AppIngressTarget::flow(app.clone(), flow),
         });
         self.publish_tcp_lookup()?;
@@ -472,27 +496,30 @@ impl RuntimeAppControlState {
             }
         }
         for registration in self.tcp_connections.iter().cloned() {
+            let Some(local) = registration.local else {
+                continue;
+            };
             let value = TcpLookupValue {
                 kind: TcpLookupKind::EstablishedConnection,
                 id: registration.lookup_id,
                 owner_worker: registration.owner_worker,
             };
-            match (registration.local.ip(), registration.remote.ip()) {
-                (IpAddr::V4(local), IpAddr::V4(remote)) => snapshot.insert_connection_v4(
+            match (local.ip(), registration.remote.ip()) {
+                (IpAddr::V4(local_ip), IpAddr::V4(remote)) => snapshot.insert_connection_v4(
                     TcpV4ConnectionKey::new(
                         0,
-                        local,
-                        registration.local.port(),
+                        local_ip,
+                        local.port(),
                         remote,
                         registration.remote.port(),
                     ),
                     value,
                 ),
-                (IpAddr::V6(local), IpAddr::V6(remote)) => snapshot.insert_connection_v6(
+                (IpAddr::V6(local_ip), IpAddr::V6(remote)) => snapshot.insert_connection_v6(
                     TcpV6ConnectionKey::new(
                         0,
-                        local,
-                        registration.local.port(),
+                        local_ip,
+                        local.port(),
                         remote,
                         registration.remote.port(),
                     ),
@@ -501,7 +528,7 @@ impl RuntimeAppControlState {
                 _ => {
                     return Err(HammerError::internal(format!(
                         "tcp connection {} -> {} mixes IP versions",
-                        registration.remote, registration.local
+                        registration.remote, local
                     )));
                 }
             }
@@ -631,6 +658,17 @@ impl RuntimeAppControlHandle {
     }
 
     #[inline]
+    fn connect_tcp_stream(
+        &self,
+        app: &AppContext,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        let app = app.clone();
+        self.with_state_mut(move |state| state.connect_tcp_stream(&app, peer, owner_worker))
+    }
+
+    #[inline]
     fn schedule_accept_tcp_connection(
         &self,
         app: &AppContext,
@@ -721,6 +759,15 @@ impl AppControlBackend for RuntimeAppControlHandle {
     ) -> HammerResult<AppSocketId> {
         let app = app.clone();
         self.with_state_mut(move |state| state.bind_tcp_listener(&app, bind, owner_worker))
+    }
+
+    fn connect_tcp_stream(
+        &self,
+        app: &AppContext,
+        peer: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        RuntimeAppControlHandle::connect_tcp_stream(self, app, peer, owner_worker)
     }
 
     fn bind_udp_socket(
