@@ -540,6 +540,8 @@ impl TcpControlPlane {
         })?;
         let events = self.events.clone();
         let timer_state_cell = Arc::clone(&self.timers.state);
+        let tcp_state_cell = Arc::clone(&self.state);
+        let callback_timer_state_cell = Arc::clone(&self.timers.state);
         let control_handle = Arc::clone(&self.control_handle);
         self.control_handle.call_blocking(move || {
             // SAFETY: the timer registry is owned by the control thread.
@@ -554,11 +556,39 @@ impl TcpControlPlane {
                 timeout,
                 move || {
                     let events = events.clone();
+                    let tcp_state_cell = Arc::clone(&tcp_state_cell);
+                    let timer_state_cell = Arc::clone(&callback_timer_state_cell);
                     async move {
                         events.emit(TcpWorkerEvent::TimerExpired {
                             connection_id,
                             timer_id,
                             kind,
+                        });
+                        let Some(reason) = kind.close_reason_on_expiry() else {
+                            return;
+                        };
+
+                        // SAFETY: timer callbacks run on the control thread runtime,
+                        // sharing the same single-thread ownership as direct apply().
+                        let tcp_state = unsafe { tcp_state_cell.get_mut() };
+                        if tcp_state.closed_connections.contains_key(&connection_id) {
+                            return;
+                        }
+                        if let Some(connection) = tcp_state.connections.get_mut(&connection_id) {
+                            connection.close_reason = Some(reason);
+                        } else {
+                            return;
+                        }
+                        tcp_state.closed_connections.insert(connection_id, reason);
+                        tcp_state.connections.remove(&connection_id);
+
+                        // SAFETY: timer callbacks share control-thread ownership with the registry.
+                        let timer_state = unsafe { timer_state_cell.get_mut() };
+                        TcpControlTimerSet::cancel_all_on_control(timer_state, connection_id);
+
+                        events.emit(TcpWorkerEvent::Closed {
+                            connection_id,
+                            reason,
                         });
                     }
                 },

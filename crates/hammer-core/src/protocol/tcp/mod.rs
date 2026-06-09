@@ -39,6 +39,18 @@ pub enum TcpTimerKind {
     TimeWait,
 }
 
+impl TcpTimerKind {
+    #[inline]
+    pub const fn close_reason_on_expiry(self) -> Option<TcpCloseReason> {
+        match self {
+            Self::Connect => Some(TcpCloseReason::ConnectTimeout),
+            Self::Retransmit => Some(TcpCloseReason::RetransmitTimeout),
+            Self::KeepAlive => Some(TcpCloseReason::KeepAliveTimeout),
+            Self::DelayedAck | Self::Persist | Self::TimeWait => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct TcpTimerId(u64);
