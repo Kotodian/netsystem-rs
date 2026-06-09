@@ -266,14 +266,19 @@ fn recv_buffer_from_completion(
     payload: AppCqeData,
     take: impl FnOnce() -> HammerResult<crate::AppRecv>,
 ) -> HammerResult<AppBufferLease> {
-    let AppCqeData::Recv {
-        flow: recv_flow,
-        buffer: _,
-    } = payload
-    else {
-        return Err(HammerError::internal(format!(
-            "expected tcp recv cqe, got {payload:?}"
-        )));
+    let recv_flow = match payload {
+        AppCqeData::Recv { flow: recv_flow, .. } => recv_flow,
+        AppCqeData::Closed {
+            flow: Some(closed_flow),
+            ..
+        } if closed_flow == flow => {
+            return Err(HammerError::internal("tcp stream closed"));
+        }
+        _ => {
+            return Err(HammerError::internal(format!(
+                "expected tcp recv cqe, got {payload:?}"
+            )));
+        }
     };
     if recv_flow != flow {
         return Err(HammerError::internal(format!(
