@@ -672,7 +672,7 @@ impl RuntimeAppControlState {
             return Ok(());
         }
         let (local, remote) = socket_addrs_from_connection_key(key);
-        let index = self
+        let Some(index) = self
             .tcp_connections
             .iter()
             .position(|registration| registration.connection_id == Some(connection_id))
@@ -683,14 +683,9 @@ impl RuntimeAppControlState {
                         && registration.remote == remote
                 })
             })
-            .ok_or_else(|| {
-                HammerError::internal(format!(
-                    "tcp connection state change {} {} -> {} is not registered in runtime service",
-                    connection_id.get(),
-                    local,
-                    remote
-                ))
-            })?;
+        else {
+            return Ok(());
+        };
         let current =
             self.tcp_connections.get(index).cloned().ok_or_else(|| {
                 HammerError::internal("tcp connection registration slot is invalid")
@@ -1281,26 +1276,14 @@ impl RuntimeAppControlHandle {
                         state: tcp_state,
                     });
                 };
-                if control.has_connection(connection_id) {
-                    control
-                        .apply(hammer_core::protocol::tcp::TcpControlPlaneAction::TransitionConnection {
-                            connection_id,
-                            state: tcp_state,
-                        })
-                        .map_err(|err| {
-                            HammerError::internal(format!(
-                                "transition shared tcp connection control: {err}"
-                            ))
-                        })
-                } else {
-                    let action = TcpConnectionState::new(&congestion, None)?
-                        .install_connection_action(connection_id, key, tcp_state);
-                    control.apply(action).map_err(|err| {
-                        HammerError::internal(format!(
-                            "install shared tcp connection control: {err}"
-                        ))
-                    })
-                }
+                let action = TcpConnectionState::new(&congestion, None)?.upsert_connection_action(
+                    connection_id,
+                    key,
+                    tcp_state,
+                );
+                control.apply(action).map_err(|err| {
+                    HammerError::internal(format!("upsert shared tcp connection control: {err}"))
+                })
             }
             TcpWorkerEvent::ShutdownObserved {
                 connection_id,
@@ -1312,22 +1295,19 @@ impl RuntimeAppControlHandle {
                 else {
                     return Ok(());
                 };
-                if !control.has_connection(connection_id) {
-                    return Ok(());
+                let action =
+                    hammer_core::protocol::tcp::TcpControlPlaneAction::ShutdownConnection {
+                        connection_id,
+                        direction,
+                        reason,
+                    };
+                match control.apply(action) {
+                    Ok(()) => Ok(()),
+                    Err(_err) if !control.has_connection(connection_id) => Ok(()),
+                    Err(err) => Err(HammerError::internal(format!(
+                        "shutdown shared tcp connection control: {err}"
+                    ))),
                 }
-                control
-                    .apply(
-                        hammer_core::protocol::tcp::TcpControlPlaneAction::ShutdownConnection {
-                            connection_id,
-                            direction,
-                            reason,
-                        },
-                    )
-                    .map_err(|err| {
-                        HammerError::internal(format!(
-                            "shutdown shared tcp connection control: {err}"
-                        ))
-                    })
             }
             TcpWorkerEvent::Closed {
                 connection_id,
@@ -1345,13 +1325,7 @@ impl RuntimeAppControlHandle {
                         reason,
                     });
                 };
-                if !control.has_connection(connection_id) {
-                    return self.handle_projected_tcp_worker_event(TcpWorkerEvent::Closed {
-                        connection_id,
-                        reason,
-                    });
-                }
-                control
+                let result = control
                     .apply(
                         hammer_core::protocol::tcp::TcpControlPlaneAction::CloseConnection {
                             connection_id,
@@ -1360,7 +1334,12 @@ impl RuntimeAppControlHandle {
                     )
                     .map_err(|err| {
                         HammerError::internal(format!("close shared tcp connection control: {err}"))
-                    })
+                    });
+                self.handle_projected_tcp_worker_event(TcpWorkerEvent::Closed {
+                    connection_id,
+                    reason,
+                })?;
+                result
             }
             other => Err(HammerError::internal(format!(
                 "runtime tcp worker event is not supported yet: {other:?}"
@@ -3624,6 +3603,176 @@ interval = "5s"
                 .shared_tcp_connection_state_for_test(connection_id)
                 .is_none(),
             "shared control plane must not retain a revived connection"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_duplicate_closed_worker_event_is_idempotent() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let connection_id = TcpConnectionId::new(205);
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("bind established connection");
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("ingest first close");
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("ingest duplicate close");
+
+        wait_for(Duration::from_secs(1), || {
+            let state = service.app_control_snapshot_for_test();
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+                && state
+                    .tcp_lookup
+                    .lookup_connection_v4(TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 44),
+                        49_152,
+                        Ipv4Addr::new(198, 51, 100, 88),
+                        443,
+                    ))
+                    .is_none()
+        });
+
+        assert!(
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none(),
+            "duplicate close must leave shared control plane closed"
+        );
+        assert!(
+            service
+                .app_control_snapshot_for_test()
+                .tcp_lookup
+                .lookup_connection_v4(TcpV4ConnectionKey::new(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none(),
+            "duplicate close must not republish projected connection lookup"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_shutdown_before_state_changed_does_not_error_or_block_late_install() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let connection_id = TcpConnectionId::new(204);
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::ShutdownObserved {
+                connection_id,
+                direction: hammer_core::protocol::tcp::TcpShutdownDirection::Write,
+                reason: TcpCloseReason::LocalShutdown,
+            })
+            .expect("ingest early shutdown");
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("ingest late state change");
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+        assert_eq!(
+            service.shared_tcp_connection_state_for_test(connection_id),
+            Some(crate::transport::tcp::TcpState::Established)
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_app_close_then_closed_event_is_idempotent() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let connection_id = TcpConnectionId::new(205);
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("bind established connection");
+
+        app.close_tcp_flow(flow).expect("close established flow");
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::Closed {
+                connection_id,
+                reason: TcpCloseReason::LocalRequest,
+            })
+            .expect("duplicate close remains idempotent");
+
+        wait_for(Duration::from_secs(1), || {
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+        });
+        assert!(
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
         );
 
         service.close().expect("close service");

@@ -529,6 +529,13 @@ pub enum TcpControlPlaneAction {
         capabilities: TcpCapabilities,
         negotiated: TcpNegotiatedOptions,
     },
+    UpsertConnectionState {
+        connection_id: TcpConnectionId,
+        key: TcpConnectionKey,
+        state: TcpState,
+        capabilities: TcpCapabilities,
+        negotiated: TcpNegotiatedOptions,
+    },
     TransitionConnection {
         connection_id: TcpConnectionId,
         state: TcpState,
