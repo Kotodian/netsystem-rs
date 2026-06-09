@@ -52,8 +52,10 @@ use crate::app::{AppHost, AppIngressTarget};
 use crate::transport::tcp::{
     TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpInputControlPlane,
     TcpInputNext, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
-    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpV4ConnectionKey, TcpV4ListenerKey,
-    TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpSynSentBackend, TcpSynSentControlPlane,
+    TcpSynSentNext, TcpSynSentObservation, TcpSynSentRegistration, TcpV4ConnectionKey,
+    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV6PendingConnectionKey,
 };
 use crate::transport::udp::input::UdpAppRegistration;
 use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
@@ -193,6 +195,7 @@ struct RuntimeAppControlState {
     next_tcp_lookup_id: TcpLookupId,
     next_tcp_ephemeral_port: u16,
     tcp_accept_control: Option<TcpAcceptControlPlane>,
+    tcp_syn_sent_control: Option<TcpSynSentControlPlane>,
     tcp_control: TcpInputControlPlane,
     tcp_rcv_process_control: TcpRcvProcessControlPlane,
     udp_control: UdpInputControlPlane,
@@ -275,6 +278,7 @@ impl RuntimeAppControlState {
             next_tcp_lookup_id: 1,
             next_tcp_ephemeral_port: 49_152,
             tcp_accept_control: None,
+            tcp_syn_sent_control: None,
             tcp_control,
             tcp_rcv_process_control,
             udp_control: UdpInputControlPlane::new(UdpInputNext::nodes(
@@ -294,6 +298,14 @@ impl RuntimeAppControlState {
     fn install_tcp_accept_control(&mut self, control: TcpAcceptControlPlane) -> HammerResult<()> {
         self.tcp_accept_control = Some(control);
         self.publish_tcp_accept()
+    }
+
+    fn install_tcp_syn_sent_control(
+        &mut self,
+        control: TcpSynSentControlPlane,
+    ) -> HammerResult<()> {
+        self.tcp_syn_sent_control = Some(control);
+        self.publish_tcp_lookup()
     }
 
     fn bind_tcp_listener(
@@ -506,8 +518,64 @@ impl RuntimeAppControlState {
         Ok(flow)
     }
 
+    fn promote_pending_syn_sent_connection(
+        &mut self,
+        lookup_id: TcpLookupId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> HammerResult<()> {
+        let index = self
+            .tcp_connections
+            .iter()
+            .position(|registration| registration.lookup_id == lookup_id)
+            .ok_or_else(|| {
+                HammerError::internal(format!(
+                    "tcp syn-sent lookup {lookup_id} is not registered in runtime service"
+                ))
+            })?;
+        let current =
+            self.tcp_connections.get(index).cloned().ok_or_else(|| {
+                HammerError::internal("tcp syn-sent registration slot is invalid")
+            })?;
+        if current.remote != remote {
+            return Err(HammerError::internal(format!(
+                "tcp syn-sent lookup {lookup_id} remote mismatch: expected {}, got {}",
+                current.remote, remote
+            )));
+        }
+        if current.local_port != local.port() {
+            return Err(HammerError::internal(format!(
+                "tcp syn-sent lookup {lookup_id} local port mismatch: expected {}, got {}",
+                current.local_port,
+                local.port()
+            )));
+        }
+        if current.state == hammer_core::protocol::tcp::TcpState::Established
+            && current.local == Some(local)
+        {
+            return Ok(());
+        }
+        if current.state != hammer_core::protocol::tcp::TcpState::SynSent {
+            return Err(HammerError::internal(format!(
+                "tcp syn-sent lookup {lookup_id} cannot promote from state {:?}",
+                current.state
+            )));
+        }
+        self.ensure_connection_absent(local, remote)?;
+        let registration = self
+            .tcp_connections
+            .get_mut(index)
+            .ok_or_else(|| HammerError::internal("tcp syn-sent registration slot is invalid"))?;
+        registration.state = hammer_core::protocol::tcp::TcpState::Established;
+        registration.local = Some(local);
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+        Ok(())
+    }
+
     fn publish_tcp_lookup(&mut self) -> HammerResult<()> {
         let mut snapshot = TcpLookupSnapshot::empty();
+        let mut syn_sent_connections = InfraVec::new();
         for registration in self.tcp_listeners.iter().cloned() {
             let value = TcpLookupValue {
                 kind: TcpLookupKind::Listener,
@@ -538,24 +606,28 @@ impl RuntimeAppControlState {
             };
             if registration.state == hammer_core::protocol::tcp::TcpState::SynSent {
                 match registration.remote.ip() {
-                    IpAddr::V4(remote) => snapshot.insert_syn_sent_connection_v4(
-                        TcpV4PendingConnectionKey::new(
+                    IpAddr::V4(remote) => {
+                        let key = TcpV4PendingConnectionKey::new(
                             0,
                             registration.local_port,
                             remote,
                             registration.remote.port(),
-                        ),
-                        value,
-                    ),
-                    IpAddr::V6(remote) => snapshot.insert_syn_sent_connection_v6(
-                        TcpV6PendingConnectionKey::new(
+                        );
+                        snapshot.insert_syn_sent_connection_v4(key, value);
+                        syn_sent_connections
+                            .push(TcpSynSentRegistration::v4(registration.lookup_id, key));
+                    }
+                    IpAddr::V6(remote) => {
+                        let key = TcpV6PendingConnectionKey::new(
                             0,
                             registration.local_port,
                             remote,
                             registration.remote.port(),
-                        ),
-                        value,
-                    ),
+                        );
+                        snapshot.insert_syn_sent_connection_v6(key, value);
+                        syn_sent_connections
+                            .push(TcpSynSentRegistration::v6(registration.lookup_id, key));
+                    }
                 }
                 continue;
             }
@@ -594,6 +666,13 @@ impl RuntimeAppControlState {
         self.tcp_control
             .publish_lookup(snapshot.clone())
             .map_err(|err| HammerError::internal(format!("publish tcp lookup snapshot: {err}")))?;
+        if let Some(control) = &self.tcp_syn_sent_control {
+            control
+                .publish_connections(syn_sent_connections)
+                .map_err(|err| {
+                    HammerError::internal(format!("publish tcp syn-sent snapshot: {err}"))
+                })?;
+        }
         self.tcp_lookup = snapshot;
         Ok(())
     }
@@ -724,6 +803,11 @@ impl RuntimeAppControlHandle {
     }
 
     #[inline]
+    fn install_tcp_syn_sent_control(&self, control: TcpSynSentControlPlane) -> HammerResult<()> {
+        self.with_state_mut(move |state| state.install_tcp_syn_sent_control(control))
+    }
+
+    #[inline]
     fn connect_tcp_stream(
         &self,
         app: &AppContext,
@@ -732,6 +816,32 @@ impl RuntimeAppControlHandle {
     ) -> HammerResult<AppFlowId> {
         let app = app.clone();
         self.with_state_mut(move |state| state.connect_tcp_stream(&app, peer, owner_worker))
+    }
+
+    fn handle_tcp_syn_sent_observation(
+        &self,
+        observation: TcpSynSentObservation,
+    ) -> HammerResult<()> {
+        let state = Arc::clone(&self.state);
+        self.control_handle
+            .schedule_once(Duration::ZERO, move || {
+                let state = Arc::clone(&state);
+                async move {
+                    // SAFETY: this closure runs on the single control thread.
+                    let state = unsafe { state.get_mut() };
+                    let result = state.promote_pending_syn_sent_connection(
+                        observation.connection_id,
+                        observation.local,
+                        observation.remote,
+                    );
+                    debug_assert!(
+                        result.is_ok(),
+                        "runtime tcp syn-sent observation failed: {result:?}"
+                    );
+                    let _ = result;
+                }
+            })
+            .map(|_| ())
     }
 
     #[inline]
@@ -871,6 +981,13 @@ impl crate::transport::tcp::TcpAcceptBackend for RuntimeAppControlHandle {
     }
 }
 
+impl TcpSynSentBackend for RuntimeAppControlHandle {
+    fn observe_syn_ack(&self, observation: TcpSynSentObservation) -> Result<(), CoreError> {
+        self.handle_tcp_syn_sent_observation(observation)
+            .map_err(|err| CoreError::internal(format!("runtime tcp syn-sent: {err}")))
+    }
+}
+
 fn socket_addrs_from_connection_key(key: TcpConnectionKey) -> (SocketAddr, SocketAddr) {
     let local = SocketAddr::new(key.local_addr(), key.local_port());
     let remote = SocketAddr::new(key.remote_addr(), key.remote_port());
@@ -948,6 +1065,10 @@ impl RuntimeService {
         app_control.install_tcp_accept_control(TcpAcceptControlPlane::new(
             Arc::new(app_control.clone()),
             TcpAcceptNext::nodes(unused_node_id()),
+        ))?;
+        app_control.install_tcp_syn_sent_control(TcpSynSentControlPlane::new(
+            Arc::new(app_control.clone()),
+            TcpSynSentNext::nodes(unused_node_id()),
         ))?;
         let trace_enabled_with_inputs = trace_worker_control(&options.trace);
         let packet_graph = ServicePacketGraphDeclarations::default();
@@ -1872,11 +1993,26 @@ impl RuntimeService {
         let inner = self.inner.lock().expect("service mutex poisoned");
         inner.app_control.handle_tcp_worker_event(event)
     }
+
+    fn promote_pending_syn_sent_for_test(
+        &self,
+        observation: TcpSynSentObservation,
+    ) -> HammerResult<()> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner.app_control.with_state_mut(move |state| {
+            state.promote_pending_syn_sent_connection(
+                observation.connection_id,
+                observation.local,
+                observation.remote,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::tcp::TcpSynSentObservation;
     use hammer_core::StartStage;
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
@@ -2474,6 +2610,68 @@ interval = "5s"
             .expect("published pending syn-sent lookup");
         assert_eq!(pending.kind, TcpLookupKind::SynSentConnection);
         assert_eq!(pending.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_connect_promotes_pending_syn_sent_lookup_to_established_lookup() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        let pending = service
+            .app_control_snapshot_for_test()
+            .tcp_lookup
+            .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                0,
+                local.port(),
+                Ipv4Addr::new(198, 51, 100, 88),
+                443,
+            ))
+            .expect("published pending syn-sent lookup");
+
+        service
+            .promote_pending_syn_sent_for_test(TcpSynSentObservation::new(
+                pending.id,
+                peer,
+                local,
+                crate::transport::tcp::TcpState::SynSent,
+                crate::transport::tcp::TcpState::Established,
+            ))
+            .expect("promote syn-sent connection");
+
+        let state = service.app_control_snapshot_for_test();
+        assert!(
+            state
+                .tcp_lookup
+                .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                    0,
+                    local.port(),
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none(),
+            "pending syn-sent lookup must be revoked after promotion"
+        );
+        let established = state
+            .tcp_lookup
+            .lookup_connection_v4(TcpV4ConnectionKey::new(
+                0,
+                Ipv4Addr::new(192, 0, 2, 44),
+                local.port(),
+                Ipv4Addr::new(198, 51, 100, 88),
+                443,
+            ))
+            .expect("published established tcp lookup");
+        assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
+        assert_eq!(established.id, pending.id);
+        assert_eq!(established.owner_worker, DataWorkerId::new(1));
 
         service.close().expect("close service");
     }

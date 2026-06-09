@@ -29,7 +29,10 @@ pub use state::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState, TcpDispatchEntry,
     TcpDispatchTable, TcpInputFlags, TcpListenerConfig,
 };
-pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
+pub use syn_sent::{
+    TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentNext, TcpSynSentNode,
+    TcpSynSentObservation, TcpSynSentRegistration,
+};
 
 #[hammer_component_macros::node_next]
 pub enum TcpInputNext {
