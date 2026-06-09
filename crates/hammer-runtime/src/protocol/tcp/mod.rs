@@ -274,20 +274,20 @@ impl TcpControlTimerSet {
 pub struct TcpControlPlane {
     control_handle: Arc<ControlThreadHandle>,
     timers: TcpControlTimerSet,
-    events: Arc<dyn Fn(TcpWorkerEvent) + Send + Sync>,
+    events: TcpWorkerEventSink,
     state: Arc<TcpControlPlaneCell>,
 }
 
 impl TcpControlPlane {
     #[inline]
-    pub fn new(
-        control_handle: Arc<ControlThreadHandle>,
-        on_event: impl Fn(TcpWorkerEvent) + Send + Sync + 'static,
-    ) -> Self {
+    pub fn new<F>(control_handle: Arc<ControlThreadHandle>, on_event: F) -> Self
+    where
+        F: Fn(TcpWorkerEvent) + Send + Sync + 'static,
+    {
         Self {
             control_handle: Arc::clone(&control_handle),
             timers: TcpControlTimerSet::new(control_handle),
-            events: Arc::new(on_event),
+            events: TcpWorkerEventSink::new(on_event),
             state: Arc::new(TcpControlPlaneCell::new()),
         }
     }
@@ -340,7 +340,7 @@ impl TcpControlPlane {
                     );
                     Ok(())
                 })?;
-                (self.events)(TcpWorkerEvent::StateChanged {
+                self.events.emit(TcpWorkerEvent::StateChanged {
                     connection_id,
                     key,
                     state: tcp_state,
@@ -362,7 +362,7 @@ impl TcpControlPlane {
                     connection.state = tcp_state;
                     Ok(connection.key)
                 })?;
-                (self.events)(TcpWorkerEvent::StateChanged {
+                self.events.emit(TcpWorkerEvent::StateChanged {
                     connection_id,
                     key,
                     state: tcp_state,
@@ -385,7 +385,7 @@ impl TcpControlPlane {
                     connection.shutdown = Some((direction, reason));
                     Ok(())
                 })?;
-                (self.events)(TcpWorkerEvent::ShutdownObserved {
+                self.events.emit(TcpWorkerEvent::ShutdownObserved {
                     connection_id,
                     direction,
                     reason,
@@ -397,7 +397,7 @@ impl TcpControlPlane {
                 reason,
             } => {
                 self.close_connection(connection_id, reason)?;
-                (self.events)(TcpWorkerEvent::Closed {
+                self.events.emit(TcpWorkerEvent::Closed {
                     connection_id,
                     reason,
                 });
@@ -485,7 +485,7 @@ impl TcpControlPlane {
                 )))
             }
         })?;
-        let events = Arc::clone(&self.events);
+        let events = self.events.clone();
         let timer_state_cell = Arc::clone(&self.timers.state);
         let control_handle = Arc::clone(&self.control_handle);
         self.control_handle.call_blocking(move || {
@@ -500,9 +500,9 @@ impl TcpControlPlane {
                 kind,
                 timeout,
                 move || {
-                    let events = Arc::clone(&events);
+                    let events = events.clone();
                     async move {
-                        (events)(TcpWorkerEvent::TimerExpired {
+                        events.emit(TcpWorkerEvent::TimerExpired {
                             connection_id,
                             timer_id,
                             kind,
@@ -525,6 +525,20 @@ impl TcpControlPlane {
 
     #[doc(hidden)]
     #[inline]
+    pub fn has_listener(&self, listener_id: TcpListenerId) -> bool {
+        self.with_state(move |state| Ok(state.listeners.contains_key(&listener_id)))
+            .unwrap_or(false)
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn has_connection(&self, connection_id: TcpConnectionId) -> bool {
+        self.with_state(move |state| Ok(state.connections.contains_key(&connection_id)))
+            .unwrap_or(false)
+    }
+
+    #[doc(hidden)]
+    #[inline]
     pub fn connection_state_for_test(&self, connection_id: TcpConnectionId) -> Option<TcpState> {
         self.with_state(move |state| {
             Ok(state
@@ -534,5 +548,87 @@ impl TcpControlPlane {
         })
         .ok()
         .flatten()
+    }
+}
+
+struct TcpWorkerEventSink {
+    raw: *const (),
+    clone_raw: fn(*const ()) -> *const (),
+    drop_raw: fn(*const ()),
+    emit: fn(*const (), TcpWorkerEvent),
+}
+
+unsafe impl Send for TcpWorkerEventSink {}
+unsafe impl Sync for TcpWorkerEventSink {}
+
+impl Clone for TcpWorkerEventSink {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            raw: (self.clone_raw)(self.raw),
+            clone_raw: self.clone_raw,
+            drop_raw: self.drop_raw,
+            emit: self.emit,
+        }
+    }
+}
+
+impl Drop for TcpWorkerEventSink {
+    #[inline]
+    fn drop(&mut self) {
+        (self.drop_raw)(self.raw);
+    }
+}
+
+impl TcpWorkerEventSink {
+    #[inline]
+    fn new<F>(sink: F) -> Self
+    where
+        F: Fn(TcpWorkerEvent) + Send + Sync + 'static,
+    {
+        let sink = Arc::new(sink);
+        Self {
+            raw: Arc::into_raw(sink) as *const (),
+            clone_raw: clone_event_sink_arc_handle::<F>,
+            drop_raw: drop_event_sink_arc_handle::<F>,
+            emit: emit_event_with::<F>,
+        }
+    }
+
+    #[inline]
+    fn emit(&self, event: TcpWorkerEvent) {
+        (self.emit)(self.raw, event);
+    }
+}
+
+#[inline]
+fn clone_event_sink_arc_handle<F>(raw: *const ()) -> *const ()
+where
+    F: Fn(TcpWorkerEvent) + Send + Sync + 'static,
+{
+    let raw = raw.cast::<F>();
+    unsafe {
+        Arc::increment_strong_count(raw);
+    }
+    raw.cast()
+}
+
+#[inline]
+fn drop_event_sink_arc_handle<F>(raw: *const ())
+where
+    F: Fn(TcpWorkerEvent) + Send + Sync + 'static,
+{
+    unsafe {
+        drop(Arc::from_raw(raw.cast::<F>()));
+    }
+}
+
+#[inline]
+fn emit_event_with<F>(raw: *const (), event: TcpWorkerEvent)
+where
+    F: Fn(TcpWorkerEvent) + Send + Sync + 'static,
+{
+    unsafe {
+        (&*raw.cast::<F>())(event);
     }
 }

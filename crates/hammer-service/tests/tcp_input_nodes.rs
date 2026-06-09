@@ -715,6 +715,7 @@ fn tcp_accept_node_completes_listener_accept_into_app_ring() {
                             )])
                             .expect("publish tcp accept listener");
                         let accept_node = accept_control.node();
+                        std::mem::drop(accept_control);
                         assert_internal_node(&accept_node);
                         let accept = runtime.nodes().register_internal(accept_node);
                         let listen_node = TcpListenNode::new(TcpListenNext::nodes(accept));
