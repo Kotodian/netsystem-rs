@@ -252,13 +252,8 @@ impl TcpControlTimerSet {
         }
     }
 
-    #[allow(dead_code)]
-    #[cfg(test)]
-    pub(crate) fn has_timer_for_test(
-        &self,
-        connection: TcpConnectionId,
-        kind: TcpTimerKind,
-    ) -> bool {
+    #[doc(hidden)]
+    pub fn has_timer_for_test(&self, connection: TcpConnectionId, kind: TcpTimerKind) -> bool {
         let state = Arc::clone(&self.state);
         self.control_handle
             .call_blocking(move || {
@@ -631,6 +626,12 @@ impl TcpControlPlane {
         })
         .ok()
         .flatten()
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn has_timer_for_test(&self, connection_id: TcpConnectionId, kind: TcpTimerKind) -> bool {
+        self.timers.has_timer_for_test(connection_id, kind)
     }
 }
 

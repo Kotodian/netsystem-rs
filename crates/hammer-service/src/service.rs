@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -86,6 +86,7 @@ const DATA_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// cleanly and report a result before the outer wait gives up.
 const CONTROL_ASYNC_BUFFER: Duration = Duration::from_secs(5);
 const CLOSED_TCP_CONNECTION_TOMBSTONE_LIMIT: usize = 1024;
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn debug_assert_lifecycle_order(lifecycles: &[Arc<dyn Lifecycle>]) {
     let mut previous = None;
@@ -198,6 +199,7 @@ struct RuntimeAppControlState {
     sockets: DescriptorTable<RuntimeSocketKind, RuntimeSocketTag>,
     flows: DescriptorTable<(), RuntimeFlowTag>,
     next_tcp_lookup_id: TcpLookupId,
+    next_tcp_connection_id: u64,
     next_tcp_ephemeral_port: u16,
     tcp_congestion: TcpCongestionRegistry,
     tcp_accept_control: Option<TcpAcceptControlPlane>,
@@ -274,6 +276,11 @@ struct CloseTcpFlowResult {
     shared_action: Option<hammer_core::protocol::tcp::TcpControlPlaneAction>,
 }
 
+struct ConnectTcpFlowResult {
+    flow: AppFlowId,
+    shared_actions: InfraVec<hammer_core::protocol::tcp::TcpControlPlaneAction>,
+}
+
 impl RuntimeAppControlState {
     fn new() -> HammerResult<Self> {
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
@@ -297,6 +304,7 @@ impl RuntimeAppControlState {
             sockets: DescriptorTable::new(),
             flows: DescriptorTable::new(),
             next_tcp_lookup_id: 1,
+            next_tcp_connection_id: 1,
             next_tcp_ephemeral_port: 49_152,
             tcp_congestion: TcpCongestionRegistry::default(),
             tcp_accept_control: None,
@@ -548,13 +556,15 @@ impl RuntimeAppControlState {
         app: &AppContext,
         peer: SocketAddr,
         owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
+    ) -> HammerResult<ConnectTcpFlowResult> {
         let flow = self.alloc_flow();
         let lookup_id = self.alloc_tcp_lookup_id()?;
+        let connection_id = self.alloc_tcp_connection_id();
         let local_port = self.alloc_tcp_ephemeral_port()?;
+        let local = SocketAddr::new(unspecified_ip_for(peer.ip()), local_port);
         self.tcp_connections.push(TcpConnectionRegistration {
             flow,
-            connection_id: None,
+            connection_id: Some(connection_id),
             lookup_id,
             owner_worker: worker_id(owner_worker)?,
             state: hammer_core::protocol::tcp::TcpState::SynSent,
@@ -565,7 +575,27 @@ impl RuntimeAppControlState {
         });
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
-        Ok(flow)
+        let mut shared_actions = InfraVec::new();
+        if self.shared_tcp_control.is_some() {
+            let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+            shared_actions.push(congestion.install_connection_action(
+                connection_id,
+                socket_addrs_to_connection_key(local, peer)?,
+                hammer_core::protocol::tcp::TcpState::SynSent,
+            ));
+            shared_actions.push(
+                hammer_core::protocol::tcp::TcpControlPlaneAction::ArmTimer {
+                    connection_id,
+                    timer_id: hammer_core::protocol::tcp::TcpTimerId::new(lookup_id as u64),
+                    kind: hammer_core::protocol::tcp::TcpTimerKind::Connect,
+                    timeout: TCP_CONNECT_TIMEOUT,
+                },
+            );
+        }
+        Ok(ConnectTcpFlowResult {
+            flow,
+            shared_actions,
+        })
     }
 
     fn close_tcp_flow(&mut self, flow: AppFlowId) -> HammerResult<CloseTcpFlowResult> {
@@ -586,6 +616,14 @@ impl RuntimeAppControlState {
 
         if let Some(connection_id) = released.connection_id {
             self.remember_closed_connection(connection_id);
+            if released.state == hammer_core::protocol::tcp::TcpState::SynSent {
+                self.tcp_connections.drain(index..index + 1);
+                if released.local_port < self.next_tcp_ephemeral_port {
+                    self.next_tcp_ephemeral_port = released.local_port;
+                }
+                self.publish_tcp_lookup()?;
+                self.publish_tcp_app_ingress()?;
+            }
             return Ok(CloseTcpFlowResult {
                 shared_action: self.shared_tcp_control.as_ref().map(|_| {
                     hammer_core::protocol::tcp::TcpControlPlaneAction::CloseConnection {
@@ -941,6 +979,13 @@ impl RuntimeAppControlState {
         ))
     }
 
+    #[inline]
+    fn alloc_tcp_connection_id(&mut self) -> TcpConnectionId {
+        let connection_id = TcpConnectionId::new(self.next_tcp_connection_id);
+        self.next_tcp_connection_id = self.next_tcp_connection_id.wrapping_add(1).max(1);
+        connection_id
+    }
+
     fn publish_tcp_accept(&self) -> HammerResult<()> {
         let Some(control) = &self.tcp_accept_control else {
             return Ok(());
@@ -1066,7 +1111,17 @@ impl RuntimeAppControlHandle {
         owner_worker: usize,
     ) -> HammerResult<AppFlowId> {
         let app = app.clone();
-        self.with_state_mut(move |state| state.connect_tcp_stream(&app, peer, owner_worker))
+        let result =
+            self.with_state_mut(move |state| state.connect_tcp_stream(&app, peer, owner_worker))?;
+        let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))? else {
+            return Ok(result.flow);
+        };
+        for action in result.shared_actions.iter().copied() {
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("apply shared tcp connect action: {err}"))
+            })?;
+        }
+        Ok(result.flow)
     }
 
     fn bind_tcp_listener(
@@ -1460,6 +1515,40 @@ fn socket_addrs_from_connection_key(key: TcpConnectionKey) -> (SocketAddr, Socke
     let local = SocketAddr::new(key.local_addr(), key.local_port());
     let remote = SocketAddr::new(key.remote_addr(), key.remote_port());
     (local, remote)
+}
+
+fn socket_addrs_to_connection_key(
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> HammerResult<TcpConnectionKey> {
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) => Ok(TcpConnectionKey::v4(
+            0,
+            local_ip,
+            local.port(),
+            remote_ip,
+            remote.port(),
+        )),
+        (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => Ok(TcpConnectionKey::v6(
+            0,
+            local_ip,
+            local.port(),
+            remote_ip,
+            remote.port(),
+        )),
+        _ => Err(HammerError::internal(format!(
+            "tcp connection {} -> {} mixes IP versions",
+            remote, local
+        ))),
+    }
+}
+
+#[inline]
+fn unspecified_ip_for(remote: IpAddr) -> IpAddr {
+    match remote {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    }
 }
 
 fn socket_addr_to_listener_key(
@@ -2528,6 +2617,38 @@ impl RuntimeService {
         control
     }
 
+    fn tcp_connection_id_for_flow_for_test(&self, flow: AppFlowId) -> Option<TcpConnectionId> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let connection_id = inner
+            .app_control
+            .with_state(move |state| {
+                Ok(state
+                    .tcp_connections
+                    .iter()
+                    .find(|registration| registration.flow == flow)
+                    .and_then(|registration| registration.connection_id))
+            })
+            .ok()
+            .flatten();
+        drop(inner);
+        connection_id
+    }
+
+    fn shared_tcp_has_timer_for_test(
+        &self,
+        connection_id: TcpConnectionId,
+        kind: hammer_core::protocol::tcp::TcpTimerKind,
+    ) -> bool {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let control = inner
+            .app_control
+            .with_state(move |state| Ok(state.shared_tcp_control.clone()))
+            .ok()
+            .flatten();
+        drop(inner);
+        control.is_some_and(|control| control.has_timer_for_test(connection_id, kind))
+    }
+
     fn apply_shared_tcp_action_for_test(
         &self,
         action: hammer_core::protocol::tcp::TcpControlPlaneAction,
@@ -2552,8 +2673,8 @@ mod tests {
     use crate::transport::tcp::TcpSynSentObservation;
     use hammer_core::StartStage;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction,
-        TcpListenerId, TcpListenerKey, TcpTimerId, TcpTimerKind, TcpWorkerEvent,
+        TcpCapabilities, TcpCloseReason, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
+        TcpListenerKey, TcpTimerId, TcpTimerKind, TcpWorkerEvent,
     };
     use hammer_runtime::app::{
         AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,
@@ -3164,6 +3285,63 @@ interval = "5s"
     }
 
     #[test]
+    fn runtime_service_connect_installs_shared_syn_sent_connection_and_timer() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::SynSent)
+                && service.shared_tcp_has_timer_for_test(connection_id, TcpTimerKind::Connect)
+        });
+
+        assert_eq!(
+            service.shared_tcp_connection_state_for_test(connection_id),
+            Some(crate::transport::tcp::TcpState::SynSent)
+        );
+        assert!(
+            service.shared_tcp_has_timer_for_test(connection_id, TcpTimerKind::Connect),
+            "active connect must arm a control-plane connect timer"
+        );
+
+        let state = service.app_control_snapshot_for_test();
+        assert!(
+            state
+                .tcp_lookup
+                .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                    0,
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_some(),
+            "connect must remain published as pending syn-sent until promotion"
+        );
+        assert!(
+            state
+                .tcp_lookup
+                .lookup_connection_v4(TcpV4ConnectionKey::new(
+                    0,
+                    Ipv4Addr::UNSPECIFIED,
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none(),
+            "installing shared syn-sent state must not publish an established lookup"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
     fn runtime_service_bind_tcp_listener_updates_shared_tcp_control_plane() {
         let service = new_test_service("");
         let app = service.app_context();
@@ -3262,9 +3440,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(191);
 
-        let _flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
 
         service
             .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
@@ -3318,12 +3498,15 @@ interval = "5s"
         let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
 
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service
             .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
-                connection_id: TcpConnectionId::new(91),
+                connection_id,
                 key: TcpConnectionKey::v4(
                     0,
                     Ipv4Addr::new(192, 0, 2, 44),
@@ -3381,11 +3564,13 @@ interval = "5s"
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
         let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
-        let connection_id = TcpConnectionId::new(92);
 
         let first = app
             .connect_tcp_stream(peer, 1)
             .expect("first connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(first)
+            .expect("active connect connection id");
         assert_eq!(app.owner_worker_for_flow(first).expect("flow owner"), 1);
 
         service
@@ -3502,9 +3687,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(202);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         service
             .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
                 connection_id,
@@ -3547,9 +3734,11 @@ interval = "5s"
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
         let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
-        let connection_id = TcpConnectionId::new(203);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service
@@ -3626,9 +3815,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(205);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service
@@ -3709,9 +3900,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(204);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service
@@ -3752,9 +3945,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(205);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         service
             .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
                 connection_id,
@@ -3796,9 +3991,11 @@ interval = "5s"
         let service = new_test_service("");
         let app = service.app_context();
         let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
-        let connection_id = TcpConnectionId::new(206);
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service
@@ -3865,6 +4062,66 @@ interval = "5s"
                 ))
                 .is_none(),
             "terminal timer expiry must revoke projected established lookup"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_connect_timer_expiry_reclaims_pending_active_connect() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        service
+            .apply_shared_tcp_action_for_test(TcpControlPlaneAction::ArmTimer {
+                connection_id,
+                timer_id: TcpTimerId::new(77),
+                kind: TcpTimerKind::Connect,
+                timeout: Duration::from_millis(20),
+            })
+            .expect("re-arm connect timer");
+
+        wait_for(Duration::from_secs(1), || {
+            let state = service.app_control_snapshot_for_test();
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+                && state
+                    .tcp_lookup
+                    .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                        0,
+                        49_152,
+                        Ipv4Addr::new(198, 51, 100, 88),
+                        443,
+                    ))
+                    .is_none()
+        });
+
+        assert!(
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none(),
+            "connect timeout must remove the shared syn-sent connection"
+        );
+        assert!(
+            service
+                .app_control_snapshot_for_test()
+                .tcp_lookup
+                .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                    0,
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none(),
+            "connect timeout must revoke the pending syn-sent lookup"
         );
 
         service.close().expect("close service");
