@@ -117,6 +117,23 @@ impl TcpConnectionState {
             negotiated: TcpNegotiatedOptions::default(),
         }
     }
+
+    #[inline]
+    pub fn upsert_connection_action(
+        &self,
+        connection_id: TcpConnectionId,
+        key: TcpConnectionKey,
+        state: TcpState,
+    ) -> TcpControlPlaneAction {
+        let _ = self;
+        TcpControlPlaneAction::UpsertConnectionState {
+            connection_id,
+            key,
+            state,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

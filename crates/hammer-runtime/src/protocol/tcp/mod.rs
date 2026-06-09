@@ -100,6 +100,7 @@ unsafe impl Sync for TcpTimerRegistryCell {}
 struct TcpControlPlaneState {
     listeners: HashMap<TcpListenerId, TcpManagedListener>,
     connections: HashMap<TcpConnectionId, TcpManagedConnection>,
+    closed_connections: HashMap<TcpConnectionId, TcpCloseReason>,
 }
 
 struct TcpControlPlaneCell {
@@ -113,6 +114,7 @@ impl TcpControlPlaneCell {
             inner: UnsafeCell::new(TcpControlPlaneState {
                 listeners: HashMap::new(),
                 connections: HashMap::new(),
+                closed_connections: HashMap::new(),
             }),
         }
     }
@@ -327,6 +329,7 @@ impl TcpControlPlane {
                 negotiated,
             } => {
                 self.with_state_mut(move |state| {
+                    state.closed_connections.remove(&connection_id);
                     state.connections.insert(
                         connection_id,
                         TcpManagedConnection {
@@ -347,11 +350,57 @@ impl TcpControlPlane {
                 });
                 Ok(())
             }
+            TcpControlPlaneAction::UpsertConnectionState {
+                connection_id,
+                key,
+                state: tcp_state,
+                capabilities,
+                negotiated,
+            } => {
+                let should_emit = self.with_state_mut(move |state| {
+                    if state.closed_connections.contains_key(&connection_id) {
+                        return Ok(false);
+                    }
+                    match state.connections.get_mut(&connection_id) {
+                        Some(connection) => {
+                            connection.key = key;
+                            connection.state = tcp_state;
+                            connection.capabilities = capabilities;
+                            connection.negotiated = negotiated;
+                        }
+                        None => {
+                            state.connections.insert(
+                                connection_id,
+                                TcpManagedConnection {
+                                    key,
+                                    state: tcp_state,
+                                    capabilities,
+                                    negotiated,
+                                    shutdown: None,
+                                    close_reason: None,
+                                },
+                            );
+                        }
+                    }
+                    Ok(true)
+                })?;
+                if should_emit {
+                    self.events.emit(TcpWorkerEvent::StateChanged {
+                        connection_id,
+                        key,
+                        state: tcp_state,
+                    });
+                }
+                Ok(())
+            }
             TcpControlPlaneAction::TransitionConnection {
                 connection_id,
                 state: tcp_state,
             } => {
                 let key = self.with_state_mut(move |state| {
+                    if state.closed_connections.contains_key(&connection_id) {
+                        return Ok(None);
+                    }
                     let connection =
                         state.connections.get_mut(&connection_id).ok_or_else(|| {
                             HammerError::internal(format!(
@@ -360,13 +409,15 @@ impl TcpControlPlane {
                             ))
                         })?;
                     connection.state = tcp_state;
-                    Ok(connection.key)
+                    Ok(Some(connection.key))
                 })?;
-                self.events.emit(TcpWorkerEvent::StateChanged {
-                    connection_id,
-                    key,
-                    state: tcp_state,
-                });
+                if let Some(key) = key {
+                    self.events.emit(TcpWorkerEvent::StateChanged {
+                        connection_id,
+                        key,
+                        state: tcp_state,
+                    });
+                }
                 Ok(())
             }
             TcpControlPlaneAction::ShutdownConnection {
@@ -374,22 +425,23 @@ impl TcpControlPlane {
                 direction,
                 reason,
             } => {
-                self.with_state_mut(move |state| {
-                    let connection =
-                        state.connections.get_mut(&connection_id).ok_or_else(|| {
-                            HammerError::internal(format!(
-                                "tcp connection {} is not installed",
-                                connection_id.get()
-                            ))
-                        })?;
+                let should_emit = self.with_state_mut(move |state| {
+                    if state.closed_connections.contains_key(&connection_id) {
+                        return Ok(false);
+                    }
+                    let Some(connection) = state.connections.get_mut(&connection_id) else {
+                        return Ok(false);
+                    };
                     connection.shutdown = Some((direction, reason));
-                    Ok(())
+                    Ok(true)
                 })?;
-                self.events.emit(TcpWorkerEvent::ShutdownObserved {
-                    connection_id,
-                    direction,
-                    reason,
-                });
+                if should_emit {
+                    self.events.emit(TcpWorkerEvent::ShutdownObserved {
+                        connection_id,
+                        direction,
+                        reason,
+                    });
+                }
                 Ok(())
             }
             TcpControlPlaneAction::CloseConnection {
@@ -457,6 +509,7 @@ impl TcpControlPlane {
         self.control_handle.call_blocking(move || {
             // SAFETY: both cells are owned by the single control thread.
             let state = unsafe { state.get_mut() };
+            state.closed_connections.insert(connection_id, reason);
             if let Some(connection) = state.connections.get_mut(&connection_id) {
                 connection.close_reason = Some(reason);
             }

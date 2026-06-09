@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use crate::data_plane::set_index_node_error_code;
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
@@ -245,31 +245,32 @@ struct TcpInputRuntime {
     handoff: Option<TcpInputHandoff>,
 }
 
-fn tcp_input_runtimes() -> &'static Mutex<Vec<TcpInputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<TcpInputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
+thread_local! {
+    static TCP_INPUT_RUNTIMES: RefCell<InfraVec<TcpInputRuntime>> =
+        const { RefCell::new(InfraVec::new()) };
 }
 
 fn register_tcp_input_runtime(snapshot: TcpInputSnapshotHandle) -> NodeRuntimeData {
-    let mut runtimes = tcp_input_runtimes()
-        .lock()
-        .expect("TCP input runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(TcpInputRuntime {
-        snapshot,
-        handoff: None,
-    });
-    NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
+    TCP_INPUT_RUNTIMES.with(|runtimes| {
+        let mut runtimes = runtimes.borrow_mut();
+        let slot = runtimes.len();
+        runtimes.push(TcpInputRuntime {
+            snapshot,
+            handoff: None,
+        });
+        NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
+    })
 }
 
 fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
-    tcp_input_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("TCP input runtime registry poisoned"))?
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))
+    TCP_INPUT_RUNTIMES.with(|runtimes| {
+        runtimes
+            .borrow()
+            .get(slot)
+            .cloned()
+            .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))
+    })
 }
 
 fn sync_tcp_input_runtime(
@@ -277,14 +278,14 @@ fn sync_tcp_input_runtime(
     handoff: Option<TcpInputHandoff>,
 ) -> CoreResult<()> {
     let slot = data.usize_word(0)?;
-    let mut runtimes = tcp_input_runtimes()
-        .lock()
-        .map_err(|_| CoreError::internal("TCP input runtime registry poisoned"))?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
-    runtime.handoff = handoff;
-    Ok(())
+    TCP_INPUT_RUNTIMES.with(|runtimes| {
+        let mut runtimes = runtimes.borrow_mut();
+        let runtime = runtimes
+            .get_mut(slot)
+            .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
+        runtime.handoff = handoff;
+        Ok(())
+    })
 }
 
 fn tcp_input_process(
@@ -684,9 +685,15 @@ fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arc_swap::ArcSwap;
     use hammer_adapter::{DataPlaneRuntime, RouteMetadata};
 
-    use super::PendingTcpAppIngressStore;
+    use super::{
+        PendingTcpAppIngressStore, TcpInputSnapshot, TcpInputSnapshotHandle,
+        register_tcp_input_runtime,
+    };
 
     #[test]
     fn pending_tcp_app_ingress_store_consumes_once_and_ignores_reused_slots() {
@@ -715,6 +722,29 @@ mod tests {
         assert_eq!(pending.take(reused), None);
 
         runtime.free_index(reused);
+    }
+
+    #[test]
+    fn tcp_input_runtime_registry_is_isolated_per_thread() {
+        let main_snapshot =
+            TcpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(TcpInputSnapshot::new())));
+        let main_runtime = register_tcp_input_runtime(main_snapshot)
+            .usize_word(0)
+            .expect("main runtime slot");
+        assert_eq!(main_runtime, 0);
+
+        let worker_runtime = std::thread::spawn(|| {
+            let worker_snapshot = TcpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
+                TcpInputSnapshot::new(),
+            )));
+            register_tcp_input_runtime(worker_snapshot)
+                .usize_word(0)
+                .expect("worker runtime slot")
+        })
+        .join()
+        .expect("worker thread joins");
+
+        assert_eq!(worker_runtime, 0);
     }
 }
 
