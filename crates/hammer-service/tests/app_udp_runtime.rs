@@ -127,6 +127,14 @@ impl AppControlBackend for MockControlBackend {
     ) -> HammerResult<()> {
         Ok(())
     }
+
+    fn close_tcp_flow(
+        &self,
+        _app: &hammer_runtime::app::AppContext,
+        _flow: AppFlowId,
+    ) -> HammerResult<()> {
+        Ok(())
+    }
 }
 
 #[test]

@@ -57,6 +57,12 @@ pub trait AppControlBackend: Send + Sync {
         owner_worker: usize,
     ) -> HammerResult<AppSocketId>;
 
+    fn close_tcp_flow(&self, _app: &AppContext, _flow: AppFlowId) -> HammerResult<()> {
+        Err(HammerError::internal(
+            "app tcp flow close is not implemented by the control backend",
+        ))
+    }
+
     fn close_socket(&self, app: &AppContext, socket: AppSocketId) -> HammerResult<()>;
 }
 
@@ -99,6 +105,11 @@ impl AppControl {
         owner_worker: usize,
     ) -> HammerResult<AppSocketId> {
         self.backend.bind_udp_socket(app, bind, owner_worker)
+    }
+
+    #[inline]
+    pub fn close_tcp_flow(&self, app: &AppContext, flow: AppFlowId) -> HammerResult<()> {
+        self.backend.close_tcp_flow(app, flow)
     }
 
     #[inline]
@@ -181,6 +192,12 @@ impl AppContext {
     pub fn close_socket(&self, socket: AppSocketId) -> HammerResult<()> {
         self.control()?.close_socket(self, socket)?;
         self.unregister_socket_owner(socket)
+    }
+
+    #[inline]
+    pub fn close_tcp_flow(&self, flow: AppFlowId) -> HammerResult<()> {
+        self.control()?.close_tcp_flow(self, flow)?;
+        self.unregister_flow_owner(flow)
     }
 
     pub async fn spawn_on_flow<F, Fut, T>(&self, flow: AppFlowId, f: F) -> HammerResult<T>
@@ -339,7 +356,13 @@ impl AppContext {
             .lock()
             .map_err(|_| HammerError::internal("app owner map poisoned"))?;
         if let Some(owner) = owners.lookup(&flow.value()) {
-            return Ok(owner);
+            if owner != CLOSED_OWNER_WORKER {
+                return Ok(owner);
+            }
+            return Err(HammerError::internal(format!(
+                "app flow {} owner is not registered",
+                flow.value()
+            )));
         }
         let owner = (flow.value() as usize) % self.data_context.worker_count();
         owners.insert(flow.value(), owner);
@@ -372,6 +395,15 @@ impl AppContext {
             .lock()
             .map_err(|_| HammerError::internal("app owner map poisoned"))?;
         owners.insert(flow.value(), owner_worker);
+        Ok(())
+    }
+
+    fn unregister_flow_owner(&self, flow: AppFlowId) -> HammerResult<()> {
+        let mut owners = self
+            .owners
+            .lock()
+            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
+        owners.insert(flow.value(), CLOSED_OWNER_WORKER);
         Ok(())
     }
 

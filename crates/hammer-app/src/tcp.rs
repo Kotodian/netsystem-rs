@@ -256,10 +256,7 @@ impl TcpStream {
             TcpStreamInner::Local { ring } => {
                 ring.try_push_submission_descriptor(self.close_descriptor(AppUserData::new(0)))
             }
-            TcpStreamInner::Context { app } => {
-                let backend = app.local_backend_for_flow(self.flow)?;
-                backend.try_push_sqe_descriptor(self.close_descriptor(AppUserData::new(0)))
-            }
+            TcpStreamInner::Context { app } => app.close_tcp_flow(self.flow),
         }
     }
 }
