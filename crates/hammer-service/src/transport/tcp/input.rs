@@ -20,7 +20,7 @@ use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 use super::{
     TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext, TcpLookupId, TcpLookupKind,
     TcpLookupSnapshot, TcpLookupValue, TcpState, TcpV4ConnectionKey, TcpV4ListenerKey,
-    TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
 };
 
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -582,6 +582,7 @@ fn next_node_for_index(
     }
     let state = match lookup {
         Some(value) if value.kind == TcpLookupKind::EstablishedConnection => TcpState::Established,
+        Some(value) if value.kind == TcpLookupKind::SynSentConnection => TcpState::SynSent,
         _ => TcpState::Listen,
     };
     let app_ingress_connection = match lookup {
@@ -670,7 +671,9 @@ fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
         Some(value)
             if matches!(
                 value.kind,
-                TcpLookupKind::EstablishedConnection | TcpLookupKind::Listener
+                TcpLookupKind::EstablishedConnection
+                    | TcpLookupKind::SynSentConnection
+                    | TcpLookupKind::Listener
             ) =>
         {
             Some(value.owner_worker)
@@ -866,10 +869,12 @@ fn lookup_for_packet(
     match (local.0, remote.0, parsed.version) {
         (IpAddr::V4(local_addr), IpAddr::V4(remote_addr), IpVersion::V4) => snapshot.lookup_v4(
             TcpV4ConnectionKey::new(0, local_addr, local.1, remote_addr, remote.1),
+            TcpV4PendingConnectionKey::new(0, local.1, remote_addr, remote.1),
             TcpV4ListenerKey::new(0, local_addr, local.1),
         ),
         (IpAddr::V6(local_addr), IpAddr::V6(remote_addr), IpVersion::V6) => snapshot.lookup_v6(
             TcpV6ConnectionKey::new(0, local_addr, local.1, remote_addr, remote.1),
+            TcpV6PendingConnectionKey::new(0, local.1, remote_addr, remote.1),
             TcpV6ListenerKey::new(0, local_addr, local.1),
         ),
         _ => None,

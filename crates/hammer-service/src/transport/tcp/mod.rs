@@ -20,7 +20,8 @@ pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTra
 pub use listen::{TcpListenNext, TcpListenNode};
 pub use lookup::{
     TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpWorkerOwnedState,
+    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV6PendingConnectionKey, TcpWorkerOwnedState,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reset::{TcpResetNext, TcpResetNode};

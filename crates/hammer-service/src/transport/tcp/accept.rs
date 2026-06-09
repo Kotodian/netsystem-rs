@@ -8,6 +8,9 @@ use hammer_adapter::{
     NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
+};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 use hammer_runtime::app::{AppContext, AppSocketId};
 
@@ -26,6 +29,7 @@ pub trait TcpAcceptBackend: Send + Sync {
         registration: &TcpAcceptRegistration,
         remote: SocketAddr,
         local: SocketAddr,
+        event: TcpWorkerEvent,
     ) -> CoreResult<()>;
 }
 
@@ -307,11 +311,47 @@ fn tcp_accept_next_for_index(
     let local = metadata
         .destination
         .ok_or_else(|| CoreError::internal("tcp accept requires destination metadata"))?;
+    let event = incoming_connection_event(
+        listener_id,
+        SocketAddr::new(remote.host, remote.port),
+        SocketAddr::new(local.host, local.port),
+    )?;
     backend.accept(
         listener_id,
         registration,
         SocketAddr::new(remote.host, remote.port),
         SocketAddr::new(local.host, local.port),
+        event,
     )?;
     Ok(Some(drop_next))
+}
+
+fn incoming_connection_event(
+    listener_id: TcpLookupId,
+    remote: SocketAddr,
+    local: SocketAddr,
+) -> CoreResult<TcpWorkerEvent> {
+    let listener = match local.ip() {
+        std::net::IpAddr::V4(local_ip) => TcpListenerKey::v4(0, local_ip, local.port()),
+        std::net::IpAddr::V6(local_ip) => TcpListenerKey::v6(0, local_ip, local.port()),
+    };
+    let key = match (local.ip(), remote.ip()) {
+        (std::net::IpAddr::V4(local_ip), std::net::IpAddr::V4(remote_ip)) => {
+            TcpConnectionKey::v4(0, local_ip, local.port(), remote_ip, remote.port())
+        }
+        (std::net::IpAddr::V6(local_ip), std::net::IpAddr::V6(remote_ip)) => {
+            TcpConnectionKey::v6(0, local_ip, local.port(), remote_ip, remote.port())
+        }
+        _ => {
+            return Err(CoreError::internal(format!(
+                "tcp accept requires matching IP versions: local={local} remote={remote}"
+            )));
+        }
+    };
+    Ok(TcpWorkerEvent::IncomingConnection {
+        listener_id: TcpListenerId::new(listener_id as u64),
+        listener,
+        key,
+        capabilities: TcpCapabilities::default(),
+    })
 }
