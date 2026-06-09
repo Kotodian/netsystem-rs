@@ -238,3 +238,152 @@ fn tcp_stream_close_uses_control_plane_for_context_streams_without_enqueuing_clo
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
+
+#[test]
+fn tcp_stream_context_backend_observes_closed_cqe_after_control_plane_close() {
+    let data_runtime =
+        DataRuntime::new(1, "hammer-app-tcp-closed-cqe-phase1", 512 * 1024, 2).expect("data runtime");
+    let app = App::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(0x7200);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+    let observer = {
+        let app = app.clone();
+        thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("driver runtime")
+                .block_on(async move {
+                    let _ = app
+                        .spawn(flow, move |flow| async move {
+                            let backend = flow.backend();
+                            ready_tx.send(()).expect("closed observer ready");
+                            let _ = go_rx.await;
+                            let cqe = backend
+                                .next_cqe_descriptor()
+                                .await
+                                .expect("closed cqe descriptor");
+                            result_tx.send(cqe.payload()).expect("send closed payload");
+                        })
+                        .await
+                        .expect("observe closed cqe");
+                })
+        })
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async { ready_rx.await.expect("wait for closed observer") });
+
+    let app_for_enqueue = app.clone();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async move {
+            app_for_enqueue
+                .spawn(flow, move |flow| async move {
+                    flow.backend()
+                        .try_push_cqe_descriptor(hammer_app::AppCqeDescriptor::new(
+                            hammer_app::AppUserData::new(0),
+                            0,
+                            hammer_app::AppCqeFlags::NONE,
+                            hammer_app::AppObjectRef::Flow(flow.id()),
+                            hammer_app::AppCqeData::Closed {
+                                flow: Some(flow.id()),
+                                socket: None,
+                            },
+                        ))
+                        .expect("enqueue closed cqe");
+                })
+                .await
+                .expect("spawn closed cqe enqueue");
+        });
+
+    go_tx.send(()).expect("release closed observer");
+    let observed = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive closed payload");
+    observer.join().expect("closed observer join");
+
+    assert_eq!(
+        observed,
+        hammer_app::AppCqeData::Closed {
+            flow: Some(flow),
+            socket: None,
+        }
+    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn tcp_stream_recv_buffer_reports_stream_closed_when_closed_cqe_arrives() {
+    let data_runtime =
+        DataRuntime::new(1, "hammer-app-tcp-closed-recv-phase1", 512 * 1024, 2).expect("data runtime");
+    let app = App::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(0x7201);
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn(flow, move |flow| async move {
+                let backend = flow.backend();
+                let stream = TcpStream::new(flow.ring(), flow.id());
+                let recv = flow.spawn_local({
+                    let stream = stream.clone();
+                    move || async move {
+                        match stream.recv_buffer().await {
+                            Ok(lease) => {
+                                let len = lease.current_len().expect("recv lease len");
+                                lease.release();
+                                format!("unexpected recv:{len}")
+                            }
+                            Err(err) => err.to_string(),
+                        }
+                    }
+                });
+
+                let recv_sqe = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("recv sqe descriptor");
+                assert_eq!(recv_sqe.opcode(), hammer_app::AppOpcode::Recv);
+                assert_eq!(
+                    recv_sqe.object(),
+                    hammer_app::AppObjectRef::Flow(flow.id())
+                );
+
+                backend
+                    .try_push_cqe_descriptor(hammer_app::AppCqeDescriptor::new(
+                        hammer_app::AppUserData::new(0),
+                        0,
+                        hammer_app::AppCqeFlags::NONE,
+                        hammer_app::AppObjectRef::Flow(flow.id()),
+                        hammer_app::AppCqeData::Closed {
+                            flow: Some(flow.id()),
+                            socket: None,
+                        },
+                    ))
+                    .expect("push closed cqe");
+
+                recv.await.expect("join recv future")
+            })
+            .await
+            .expect("spawn closed recv flow")
+        });
+
+    assert!(
+        result.contains("tcp stream closed"),
+        "unexpected recv result: {result}"
+    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
