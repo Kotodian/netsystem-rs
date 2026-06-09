@@ -7,6 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
+use hammer_infra::descriptor::Descriptor;
 use hammer_infra::ring::{CompletionDescriptor, IndexedRing, RingEntry, SubmissionDescriptor};
 use hammer_infra::vec::Vec;
 
@@ -27,20 +28,8 @@ impl AppUserData {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AppSocketId(u64);
-
-impl AppSocketId {
-    #[inline]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
-    #[inline]
-    pub const fn value(self) -> u64 {
-        self.0
-    }
-}
+pub enum AppSocketTag {}
+pub type AppSocketId = Descriptor<AppSocketTag>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
@@ -838,46 +827,81 @@ impl AppRingBufferRegistry {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PendingRecvSubmission {
+struct PendingSubmission {
     user_data: AppUserData,
     object: AppObjectRef,
+    opcode: AppOpcode,
     payload: AppSqeData,
 }
 
 #[derive(Debug, Default)]
-struct AppPendingRecvRegistry {
-    recvs: Vec<PendingRecvSubmission>,
+struct AppPendingSubmissionRegistry {
+    submissions: Vec<PendingSubmission>,
 }
 
-impl AppPendingRecvRegistry {
+impl AppPendingSubmissionRegistry {
     #[inline]
     fn record_descriptor(&mut self, descriptor: AppSqeDescriptor) {
-        match descriptor.payload() {
-            AppSqeData::Recv { .. } | AppSqeData::RecvFrom { .. } => {
-                self.recvs.push(PendingRecvSubmission {
+        match descriptor.opcode() {
+            AppOpcode::Accept | AppOpcode::Recv | AppOpcode::RecvFrom => {
+                self.submissions.push(PendingSubmission {
                     user_data: descriptor.user_data(),
                     object: descriptor.object(),
+                    opcode: descriptor.opcode(),
                     payload: descriptor.payload(),
                 });
             }
-            _ => {}
+            _ => {
+                let _ = descriptor.payload();
+            }
         }
     }
 
     #[inline]
-    fn find_flow_recv(&self, flow: AppFlowId) -> Option<(usize, PendingRecvSubmission)> {
-        self.recvs.iter().copied().enumerate().find(|(_, pending)| {
-            pending.object == AppObjectRef::Flow(flow)
-                && matches!(pending.payload, AppSqeData::Recv { .. })
-        })
+    fn find_flow_recv(&self, flow: AppFlowId) -> Option<(usize, PendingSubmission)> {
+        self.submissions
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, pending)| {
+                pending.object == AppObjectRef::Flow(flow)
+                    && pending.opcode == AppOpcode::Recv
+                    && matches!(pending.payload, AppSqeData::Recv { .. })
+            })
     }
 
     #[inline]
-    fn remove_at(&mut self, index: usize) -> PendingRecvSubmission {
-        self.recvs
+    fn find_socket_recv_from(&self, socket: AppSocketId) -> Option<(usize, PendingSubmission)> {
+        self.submissions
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, pending)| {
+                pending.object == AppObjectRef::Socket(socket)
+                    && pending.opcode == AppOpcode::RecvFrom
+                    && matches!(pending.payload, AppSqeData::RecvFrom { .. })
+            })
+    }
+
+    #[inline]
+    fn find_socket_accept(&self, socket: AppSocketId) -> Option<(usize, PendingSubmission)> {
+        self.submissions
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, pending)| {
+                pending.object == AppObjectRef::Socket(socket)
+                    && pending.opcode == AppOpcode::Accept
+                    && matches!(pending.payload, AppSqeData::Accept)
+            })
+    }
+
+    #[inline]
+    fn remove_at(&mut self, index: usize) -> PendingSubmission {
+        self.submissions
             .drain(index..index + 1)
             .next()
-            .expect("pending recv exists at computed index")
+            .expect("pending submission exists at computed index")
     }
 }
 
@@ -886,7 +910,7 @@ pub struct AppRingHandle {
     submissions: Rc<RefCell<AppRingState<AppSqeDescriptor>>>,
     completions: Rc<RefCell<AppRingState<AppCqeDescriptor>>>,
     buffers: Rc<RefCell<AppRingBufferRegistry>>,
-    pending_recvs: Rc<RefCell<AppPendingRecvRegistry>>,
+    pending_submissions: Rc<RefCell<AppPendingSubmissionRegistry>>,
 }
 
 impl AppRingHandle {
@@ -896,7 +920,7 @@ impl AppRingHandle {
             submissions: Rc::new(RefCell::new(AppRingState::new(submission_capacity))),
             completions: Rc::new(RefCell::new(AppRingState::new(completion_capacity))),
             buffers: Rc::new(RefCell::new(AppRingBufferRegistry::default())),
-            pending_recvs: Rc::new(RefCell::new(AppPendingRecvRegistry::default())),
+            pending_submissions: Rc::new(RefCell::new(AppPendingSubmissionRegistry::default())),
         }
     }
 
@@ -958,7 +982,7 @@ impl AppRingHandle {
             .borrow_mut()
             .try_push(sqe)
             .map_err(|_| HammerError::internal("app submission descriptor ring full"))?;
-        self.pending_recvs.borrow_mut().record_descriptor(sqe);
+        self.pending_submissions.borrow_mut().record_descriptor(sqe);
         Ok(())
     }
 
@@ -1031,7 +1055,7 @@ impl AppRingHandle {
         fin: bool,
     ) -> HammerResult<()> {
         let (pending_index, pending) = {
-            let pending = self.pending_recvs.borrow();
+            let pending = self.pending_submissions.borrow();
             pending.find_flow_recv(flow).ok_or_else(|| {
                 HammerError::internal(format!(
                     "pending recv submission missing for flow {}",
@@ -1056,7 +1080,7 @@ impl AppRingHandle {
         fin: bool,
     ) -> HammerResult<()> {
         let (pending_index, pending) = {
-            let pending = self.pending_recvs.borrow();
+            let pending = self.pending_submissions.borrow();
             pending.find_flow_recv(flow).ok_or_else(|| {
                 HammerError::internal(format!(
                     "pending recv submission missing for flow {}",
@@ -1065,6 +1089,63 @@ impl AppRingHandle {
             })?
         };
         self.try_complete_recv_pending(flow, pending_index, pending, lease, fin)
+    }
+
+    #[inline]
+    pub(crate) fn try_complete_recv_from_buffer(
+        &self,
+        socket: AppSocketId,
+        source: SocketAddr,
+        buffers: DataPlaneBuffers,
+        index: BufferIndex,
+        truncated: bool,
+    ) -> HammerResult<()> {
+        let (pending_index, pending) = {
+            let pending = self.pending_submissions.borrow();
+            pending.find_socket_recv_from(socket).ok_or_else(|| {
+                HammerError::internal(format!(
+                    "pending recv_from submission missing for socket {}",
+                    socket.value()
+                ))
+            })?
+        };
+        self.try_complete_recv_from_pending(
+            socket,
+            source,
+            pending_index,
+            pending,
+            AppBufferLease::from_buffer(buffers, index),
+            truncated,
+        )
+    }
+
+    #[inline]
+    pub(crate) fn try_complete_accept(
+        &self,
+        listener: AppSocketId,
+        flow: AppFlowId,
+    ) -> HammerResult<()> {
+        let (pending_index, pending) = {
+            let pending = self.pending_submissions.borrow();
+            pending.find_socket_accept(listener).ok_or_else(|| {
+                HammerError::internal(format!(
+                    "pending accept submission missing for listener {}",
+                    listener.value()
+                ))
+            })?
+        };
+        let descriptor = AppCqeDescriptor::new(
+            pending.user_data,
+            0,
+            AppCqeFlags::NONE,
+            pending.object,
+            AppCqeData::Accepted { listener, flow },
+        );
+        self.try_push_completion_descriptor(descriptor)?;
+        self.pending_submissions
+            .borrow_mut()
+            .remove_at(pending_index);
+        Ok(())
     }
 
     #[inline]
@@ -1130,7 +1211,7 @@ impl AppRingHandle {
         &self,
         flow: AppFlowId,
         pending_index: usize,
-        pending: PendingRecvSubmission,
+        pending: PendingSubmission,
         lease: AppBufferLease,
         fin: bool,
     ) -> HammerResult<()> {
@@ -1152,7 +1233,44 @@ impl AppRingHandle {
         self.try_push_completion_entry(AppCompletionEntry::with_attachment(
             descriptor, registered,
         ))?;
-        self.pending_recvs.borrow_mut().remove_at(pending_index);
+        self.pending_submissions
+            .borrow_mut()
+            .remove_at(pending_index);
+        Ok(())
+    }
+
+    #[inline]
+    fn try_complete_recv_from_pending(
+        &self,
+        socket: AppSocketId,
+        source: SocketAddr,
+        pending_index: usize,
+        pending: PendingSubmission,
+        lease: AppBufferLease,
+        truncated: bool,
+    ) -> HammerResult<()> {
+        let registered = AppRegisteredBuffer::from_lease(lease)?;
+        let descriptor = AppCqeDescriptor::new(
+            pending.user_data,
+            registered.lease().current_len()? as i32,
+            if truncated {
+                AppCqeFlags::BUFFER.union(AppCqeFlags::TRUNCATED)
+            } else {
+                AppCqeFlags::BUFFER
+            },
+            pending.object,
+            AppCqeData::RecvFrom {
+                socket,
+                source,
+                buffer: registered.index(),
+            },
+        );
+        self.try_push_completion_entry(AppCompletionEntry::with_attachment(
+            descriptor, registered,
+        ))?;
+        self.pending_submissions
+            .borrow_mut()
+            .remove_at(pending_index);
         Ok(())
     }
 }

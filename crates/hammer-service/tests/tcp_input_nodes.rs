@@ -8,15 +8,20 @@ use hammer_adapter::{
     NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_runtime::app::{AppContext, AppFlowId};
+use hammer_runtime::app::{
+    AppContext, AppControl, AppControlBackend, AppCqeData, AppFlowId, AppObjectRef, AppOpcode,
+    AppSocketId, AppSqeData, AppSqeDescriptor, AppUserData,
+};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::app::AppIngressTarget;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::tcp::{
+    TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration,
     TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputError, TcpInputHandoff,
-    TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode, TcpRcvProcessNext, TcpRcvProcessNode,
-    TcpResetNext, TcpResetNode, TcpV4ConnectionKey, TcpV4ListenerKey, TcpWorkerOwnedState,
+    TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode, TcpLookupId,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode, TcpV4ConnectionKey,
+    TcpV4ListenerKey, TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -121,6 +126,78 @@ where
     I: InternalNode,
 {
     let _ = node;
+}
+
+#[derive(Clone)]
+struct TestAppControlBackend {
+    next_socket: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Default for TestAppControlBackend {
+    fn default() -> Self {
+        Self {
+            next_socket: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+        }
+    }
+}
+
+impl AppControlBackend for TestAppControlBackend {
+    fn bind_tcp_listener(
+        &self,
+        _app: &AppContext,
+        _bind: std::net::SocketAddr,
+        _owner_worker: usize,
+    ) -> hammer_core::error::HammerResult<AppSocketId> {
+        Ok(AppSocketId::new(
+            self.next_socket
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ))
+    }
+
+    fn bind_udp_socket(
+        &self,
+        _app: &AppContext,
+        _bind: std::net::SocketAddr,
+        _owner_worker: usize,
+    ) -> hammer_core::error::HammerResult<AppSocketId> {
+        Err(hammer_core::error::HammerError::internal(
+            "udp bind is not used in tcp input tests",
+        ))
+    }
+
+    fn close_socket(
+        &self,
+        _app: &AppContext,
+        _socket: AppSocketId,
+    ) -> hammer_core::error::HammerResult<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct RecordingTcpAcceptBackend {
+    accepted_flow: AppFlowId,
+    records: Arc<Mutex<Vec<(TcpLookupId, std::net::SocketAddr, std::net::SocketAddr)>>>,
+}
+
+impl TcpAcceptBackend for RecordingTcpAcceptBackend {
+    fn accept(
+        &self,
+        listener_id: TcpLookupId,
+        registration: &TcpAcceptRegistration,
+        remote: std::net::SocketAddr,
+        local: std::net::SocketAddr,
+    ) -> CoreResult<()> {
+        registration
+            .app()
+            .try_complete_accept(registration.listener(), self.accepted_flow)
+            .map_err(|err| CoreError::internal(format!("complete accept cqe: {err}")))?;
+        self.records
+            .lock()
+            .map_err(|_| CoreError::internal("accept records poisoned"))?
+            .push((listener_id, remote, local));
+        Ok(())
+    }
 }
 
 #[test]
@@ -382,13 +459,99 @@ fn tcp_input_handoffs_established_packets_to_owner_worker() {
 }
 
 #[test]
+fn tcp_input_handoffs_listener_packets_to_listener_owner_worker() {
+    const TCP_INPUT_HANDLE: NodeHandle = NodeHandle::new(42);
+
+    let handoff = DataPlaneHandoff::new(2, 8);
+    let first_runtime = DataPlaneRuntime::with_handoff(
+        DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+        DataWorkerId::new(0),
+        handoff.worker(DataWorkerId::new(0)),
+    );
+    let second_runtime = DataPlaneRuntime::with_handoff(
+        DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+        DataWorkerId::new(1),
+        handoff.worker(DataWorkerId::new(1)),
+    );
+    let first_graph =
+        TcpGraph::new_with_handoff(&first_runtime, TCP_INPUT_HANDLE, DataWorkerId::new(0));
+    let second_graph =
+        TcpGraph::new_with_handoff(&second_runtime, TCP_INPUT_HANDLE, DataWorkerId::new(1));
+
+    let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(1));
+    owner.insert_listener_v4(
+        TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 33), LISTEN_PORT),
+        LISTENER_ID,
+    );
+    let snapshot = owner.publish_snapshot();
+    first_graph
+        .tcp_control
+        .publish_lookup(snapshot.clone())
+        .expect("publish first listener snapshot");
+    second_graph
+        .tcp_control
+        .publish_lookup(snapshot)
+        .expect("publish second listener snapshot");
+
+    let packet = ipv4_tcp_packet(
+        Ipv4Addr::new(203, 0, 113, 33),
+        40_033,
+        Ipv4Addr::new(203, 0, 113, 34),
+        LISTEN_PORT,
+        tcp_flags(false, true, false, false),
+        b"listener-handoff",
+    );
+    let frame = first_runtime.alloc_frame_index().expect("alloc frame");
+    let metadata = tcp_metadata(
+        Ipv4Addr::new(198, 51, 100, 33).into(),
+        50_033,
+        Ipv4Addr::new(192, 0, 2, 33).into(),
+        LISTEN_PORT,
+    );
+    let buffer = push_packet(&first_runtime, frame, &packet, metadata);
+    stamp_tcp_cursor(&first_runtime, buffer, &packet);
+
+    assert!(
+        first_runtime
+            .schedule_frame(first_graph.tcp_input, frame)
+            .expect("schedule first")
+    );
+
+    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 1);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run second"), 3);
+    assert!(
+        first_graph.listen_state.lock().unwrap().packets.is_empty(),
+        "listener packet must not be processed on non-owner worker"
+    );
+    assert_capture_packets(&second_graph.listen_state, &[packet]);
+    let state = second_graph.listen_state.lock().unwrap();
+    assert_eq!(
+        state.handoff_source_workers,
+        vec![Some(DataWorkerId::new(0))]
+    );
+    assert_metadata(
+        &state.metadata[0],
+        Ipv4Addr::new(198, 51, 100, 33).into(),
+        50_033,
+        Ipv4Addr::new(192, 0, 2, 33).into(),
+        LISTEN_PORT,
+    );
+    drop(state);
+    assert_eq!(first_runtime.frames_in_use(), 0);
+    assert_eq!(second_runtime.frames_in_use(), 0);
+    assert_eq!(first_runtime.in_use_buffers(), 0);
+    assert_eq!(second_runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn tcp_rcv_process_node_passes_packets_to_configured_next() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let sink_state = Arc::new(Mutex::new(CaptureState::default()));
     let sink = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&sink_state)));
-    let node = TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(sink));
+    let control = TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(sink));
+    let node = control.node();
     assert_internal_node(&node);
     let rcv_process = runtime.nodes().register_internal(node);
 
@@ -429,6 +592,144 @@ fn tcp_rcv_process_node_passes_packets_to_configured_next() {
     drop(state);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_accept_node_completes_listener_accept_into_app_ring() {
+    let data_runtime =
+        DataRuntime::new(1, "tcp-accept-node-test", 512 * 1024, 2).expect("data runtime");
+    let data_context = data_runtime.context();
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    app.install_control(AppControl::new(Arc::new(TestAppControlBackend::default())))
+        .expect("install app control");
+    let listener = app
+        .bind_tcp_listener("127.0.0.1:7443".parse().expect("listener bind"), 0)
+        .expect("bind listener");
+    let accepted_flow = AppFlowId::new(0x7443);
+    let accepted_records = Arc::new(Mutex::new(Vec::new()));
+    let accept_backend = Arc::new(RecordingTcpAcceptBackend {
+        accepted_flow,
+        records: Arc::clone(&accepted_records),
+    });
+
+    let result =
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime")
+            .block_on(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                data_context
+                    .spawn_local_on_worker(0, move || async move {
+                        let listener_backend = app
+                            .local_backend_for_socket(listener)
+                            .expect("listener backend");
+                        listener_backend
+                            .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                                AppOpcode::Accept,
+                                AppUserData::new(77),
+                                AppObjectRef::Socket(listener),
+                                AppSqeData::Accept,
+                            ))
+                            .expect("push accept sqe");
+
+                        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+                        let drop = runtime.nodes().register_internal(DropNode::new());
+                        let punt = runtime.nodes().register_internal(CaptureNode::new(Arc::new(
+                            Mutex::new(CaptureState::default()),
+                        )));
+                        let accept_control =
+                            TcpAcceptControlPlane::new(accept_backend, TcpAcceptNext::nodes(drop));
+                        accept_control
+                            .publish_listeners([(
+                                LISTENER_ID,
+                                TcpAcceptRegistration::new(app.clone(), listener),
+                            )])
+                            .expect("publish tcp accept listener");
+                        let accept_node = accept_control.node();
+                        assert_internal_node(&accept_node);
+                        let accept = runtime.nodes().register_internal(accept_node);
+                        let listen_node = TcpListenNode::new(TcpListenNext::nodes(accept));
+                        assert_internal_node(&listen_node);
+                        let listen = runtime.nodes().register_internal(listen_node);
+                        let reset = runtime
+                            .nodes()
+                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop)));
+                        let established = runtime.nodes().register_internal(
+                            TcpEstablishedNode::new(TcpEstablishedNext::nodes(drop)),
+                        );
+                        let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+                            drop,
+                            punt,
+                            listen,
+                            drop,
+                            drop,
+                            established,
+                            reset,
+                        ));
+                        let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+                        owner.insert_listener_v4(
+                            TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7443),
+                            LISTENER_ID,
+                        );
+                        tcp_control
+                            .publish_lookup(owner.publish_snapshot())
+                            .expect("publish listener lookup");
+                        let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+                        let packet = ipv4_tcp_packet(
+                            Ipv4Addr::new(198, 51, 100, 74),
+                            40_743,
+                            Ipv4Addr::new(127, 0, 0, 1),
+                            7443,
+                            tcp_flags(false, true, false, false),
+                            b"accept",
+                        );
+                        let metadata = tcp_metadata(
+                            Ipv4Addr::new(198, 51, 100, 74).into(),
+                            40_743,
+                            Ipv4Addr::new(127, 0, 0, 1).into(),
+                            7443,
+                        );
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        let buffer = push_packet(&runtime, frame, &packet, metadata);
+                        stamp_tcp_cursor(&runtime, buffer, &packet);
+                        assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+                        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+
+                        let accept_cqe = listener_backend
+                            .next_cqe_descriptor()
+                            .await
+                            .expect("accept cqe");
+                        tx.send(accept_cqe).expect("send accept cqe");
+                    })
+                    .expect("spawn worker-local accept task");
+                tokio::time::timeout(Duration::from_secs(1), rx)
+                    .await
+                    .expect("wait accept cqe")
+                    .expect("receive accept cqe")
+            });
+
+    match result.payload() {
+        AppCqeData::Accepted {
+            listener: cqe_listener,
+            flow,
+        } => {
+            assert_eq!(cqe_listener, listener);
+            assert_eq!(flow, accepted_flow);
+        }
+        other => panic!("unexpected accept completion payload: {other:?}"),
+    }
+    assert_eq!(
+        *accepted_records.lock().unwrap(),
+        vec![(
+            LISTENER_ID,
+            "198.51.100.74:40743".parse().expect("remote"),
+            "127.0.0.1:7443".parse().expect("local"),
+        )]
+    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
@@ -488,19 +789,23 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
                         .register_internal(CaptureNode::new(Arc::new(Mutex::new(
                             CaptureState::default(),
                         ))));
+                let tcp_rcv_process_control =
+                    TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(
+                        runtime
+                            .nodes()
+                            .register_internal(CaptureNode::new(Arc::clone(&sink_state))),
+                    ));
+                tcp_rcv_process_control
+                    .publish_app_ingress([(
+                        ESTABLISHED_ID,
+                        AppIngressTarget::new(bridge_app.clone(), flow),
+                    )])
+                    .expect("publish tcp app ingress");
                 let established = runtime.nodes().register_internal(TcpEstablishedNode::new(
                     TcpEstablishedNext::nodes(
-                        runtime.nodes().register_internal(
-                            TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(
-                                runtime
-                                    .nodes()
-                                    .register_internal(CaptureNode::new(Arc::clone(&sink_state))),
-                            ))
-                            .with_app_ingress(
-                                ESTABLISHED_ID,
-                                AppIngressTarget::new(bridge_app.clone(), flow),
-                            ),
-                        ),
+                        runtime
+                            .nodes()
+                            .register_internal(tcp_rcv_process_control.node()),
                     ),
                 ));
                 let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(

@@ -1,5 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::vec::Vec;
 
@@ -8,7 +9,10 @@ use hammer_adapter::{
 };
 use hammer_core::error::HammerResult;
 use hammer_core::log::DiscardWriter;
-use hammer_runtime::app::AppFlowId;
+use hammer_runtime::app::{
+    AppControl, AppControlBackend, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSocketId,
+    AppSqeData, AppSqeDescriptor, AppUserData,
+};
 use hammer_runtime::spawn::with_data_plane_buffers;
 use hammer_service::RuntimeService;
 use hammer_service::app::AppIngressTarget;
@@ -84,6 +88,45 @@ fn new_test_service() -> Arc<RuntimeService> {
         Arc::new(DiscardWriter),
     )
     .expect("test service should build")
+}
+
+#[derive(Default)]
+struct MockControlBackend {
+    next_socket: AtomicU64,
+}
+
+impl MockControlBackend {
+    fn alloc_socket(&self) -> AppSocketId {
+        AppSocketId::new(self.next_socket.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+}
+
+impl AppControlBackend for MockControlBackend {
+    fn bind_tcp_listener(
+        &self,
+        _app: &hammer_runtime::app::AppContext,
+        _bind: std::net::SocketAddr,
+        _owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        Ok(self.alloc_socket())
+    }
+
+    fn bind_udp_socket(
+        &self,
+        _app: &hammer_runtime::app::AppContext,
+        _bind: std::net::SocketAddr,
+        _owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        Ok(self.alloc_socket())
+    }
+
+    fn close_socket(
+        &self,
+        _app: &hammer_runtime::app::AppContext,
+        _socket: AppSocketId,
+    ) -> HammerResult<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -214,6 +257,125 @@ fn service_udp_app_target_rejects_descriptor_delivery_from_non_owner_worker() {
     let err = result.expect_err("non-owner worker should fail");
     assert!(err.contains("owned by worker"), "unexpected error: {err}");
     assert_eq!(buffers_after, 1);
+
+    service.close().expect("close service");
+}
+
+#[test]
+fn service_udp_socket_target_delivers_recv_from_descriptor_into_socket_backend() {
+    let service = new_test_service();
+    let app = service.app_context();
+    app.install_control(AppControl::new(Arc::new(MockControlBackend::default())))
+        .expect("install control");
+    let owner_worker = 0usize;
+    let socket = app
+        .bind_udp_socket("127.0.0.1:9999".parse().expect("udp bind"), owner_worker)
+        .expect("bind udp socket");
+    let packet = ipv4_udp_packet(
+        Ipv4Addr::new(10, 0, 0, 41),
+        40_041,
+        Ipv4Addr::new(192, 0, 2, 41),
+        9_999,
+        b"service-udp-socket",
+    );
+    let expected_source =
+        std::net::SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 41)), 40_041);
+    let deliver_metadata = RouteMetadata {
+        network: Network::Udp,
+        source: Some(SocksAddr::ip(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 41)),
+            40_041,
+        )),
+        destination: Some(SocksAddr::ip(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 41)),
+            9_999,
+        )),
+        ..Default::default()
+    };
+    let expected_packet = packet.clone();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    service
+        .spawn_app_on_worker(owner_worker, {
+            let app = app.clone();
+            move || async move {
+                let backend = app
+                    .local_backend_for_socket(socket)
+                    .expect("socket backend");
+                backend
+                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                        AppOpcode::RecvFrom,
+                        AppUserData::new(31),
+                        AppObjectRef::Socket(socket),
+                        AppSqeData::RecvFrom { max_len: u32::MAX },
+                    ))
+                    .expect("push recv_from sqe");
+                ready_tx.send(()).expect("send ready");
+
+                let descriptor = backend
+                    .next_cqe_descriptor()
+                    .await
+                    .expect("recv_from cqe descriptor");
+                let recv = backend
+                    .take_completion_buffer(match descriptor.payload() {
+                        AppCqeData::RecvFrom { buffer, .. } => buffer,
+                        other => panic!("unexpected cqe payload: {other:?}"),
+                    })
+                    .expect("take recv_from buffer");
+                let payload = recv.lease().copy_current().expect("recv payload");
+                recv.release();
+                tx.send((descriptor, payload))
+                    .expect("send recv_from result");
+            }
+        })
+        .expect("spawn recv_from task");
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("wait for recv_from readiness");
+
+    service
+        .spawn_app_on_worker(owner_worker, {
+            let app = app.clone();
+            move || async move {
+                let runtime = with_data_plane_buffers(|buffers| {
+                    DataPlaneRuntime::with_buffer_arena_and_frame_capacity(
+                        buffers.buffers().arena(),
+                        16,
+                        8,
+                        buffers.instruction_set(),
+                    )
+                });
+                let index = runtime
+                    .alloc_index_with_bytes(deliver_metadata, &packet)
+                    .expect("alloc UDP buffer");
+                stamp_udp_cursor(&runtime, index, &packet);
+                AppIngressTarget::socket(app.clone(), socket)
+                    .post_recv_cqe(&runtime, index)
+                    .expect("complete UDP socket ingress to app");
+            }
+        })
+        .expect("spawn deliver task");
+
+    let result = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("receive recv_from result");
+
+    assert_eq!(result.0.user_data(), AppUserData::new(31));
+    assert_eq!(result.0.object(), AppObjectRef::Socket(socket));
+    match result.0.payload() {
+        AppCqeData::RecvFrom {
+            socket: recv_socket,
+            source,
+            buffer: _,
+        } => {
+            assert_eq!(recv_socket, socket);
+            assert_eq!(source, expected_source);
+        }
+        other => panic!("unexpected cqe payload: {other:?}"),
+    }
+    assert_eq!(result.1, expected_packet);
 
     service.close().expect("close service");
 }

@@ -1,17 +1,25 @@
+use std::cell::UnsafeCell;
 use std::fmt;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use hammer_adapter::DataWorkerId;
 use hammer_control::{
     CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
     ServiceManager,
 };
 use hammer_core::config::{self, Options, TraceOptions};
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::registry::RuntimeRegistry;
+use hammer_infra::{
+    descriptor::{Descriptor, DescriptorTable},
+    map::FlatHashTable,
+    vec::Vec as InfraVec,
+};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::EndpointManager;
 #[cfg(test)]
@@ -25,7 +33,7 @@ use hammer_runtime::adapter::{
 };
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
-use hammer_runtime::app::AppContext;
+use hammer_runtime::app::{AppContext, AppControl, AppControlBackend, AppFlowId, AppSocketId};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
 #[cfg(feature = "endpoint")]
@@ -39,7 +47,15 @@ use std::time::Duration;
 
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
-use crate::app::AppHost;
+use crate::app::{AppHost, AppIngressTarget};
+use crate::transport::tcp::{
+    TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpInputControlPlane,
+    TcpInputNext, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpV4ConnectionKey, TcpV4ListenerKey,
+    TcpV6ConnectionKey, TcpV6ListenerKey,
+};
+use crate::transport::udp::input::UdpAppRegistration;
+use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
 use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -125,7 +141,619 @@ struct ServiceInner {
     data_runtime: Option<DataRuntime>,
     data_context: DataRuntimeContext,
     app_context: AppContext,
+    #[cfg_attr(not(test), allow(dead_code))]
+    app_control: RuntimeAppControlHandle,
     _options: Options,
+}
+
+#[derive(Clone)]
+struct TcpListenerRegistration {
+    app: AppContext,
+    socket: AppSocketId,
+    lookup_id: TcpLookupId,
+    owner_worker: DataWorkerId,
+    bind: SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UdpSocketRegistration {
+    socket: AppSocketId,
+    bind: SocketAddr,
+}
+
+#[derive(Clone)]
+struct TcpConnectionRegistration {
+    lookup_id: TcpLookupId,
+    owner_worker: DataWorkerId,
+    local: SocketAddr,
+    remote: SocketAddr,
+    target: AppIngressTarget,
+}
+
+enum RuntimeSocketTag {}
+
+type RuntimeSocketDescriptor = Descriptor<RuntimeSocketTag>;
+
+enum RuntimeFlowTag {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeSocketKind {
+    TcpListener,
+    UdpSocket,
+}
+
+struct RuntimeAppControlState {
+    sockets: DescriptorTable<RuntimeSocketKind, RuntimeSocketTag>,
+    flows: DescriptorTable<(), RuntimeFlowTag>,
+    next_tcp_lookup_id: TcpLookupId,
+    tcp_accept_control: Option<TcpAcceptControlPlane>,
+    tcp_control: TcpInputControlPlane,
+    tcp_rcv_process_control: TcpRcvProcessControlPlane,
+    udp_control: UdpInputControlPlane,
+    tcp_lookup: TcpLookupSnapshot,
+    tcp_listeners: InfraVec<TcpListenerRegistration>,
+    tcp_listener_slots: FlatHashTable<u64, usize>,
+    tcp_connections: InfraVec<TcpConnectionRegistration>,
+    udp_sockets: InfraVec<UdpSocketRegistration>,
+    udp_socket_slots: FlatHashTable<u64, usize>,
+}
+
+struct RuntimeAppControlCell {
+    inner: UnsafeCell<RuntimeAppControlState>,
+}
+
+impl RuntimeAppControlCell {
+    #[inline]
+    fn new(state: RuntimeAppControlState) -> Self {
+        Self {
+            inner: UnsafeCell::new(state),
+        }
+    }
+
+    #[inline]
+    unsafe fn get_mut(&self) -> &mut RuntimeAppControlState {
+        unsafe { &mut *self.inner.get() }
+    }
+}
+
+// SAFETY: access is serialized by RuntimeAppControlHandle through the single
+// control thread. The cell is never mutated concurrently from multiple threads.
+unsafe impl Send for RuntimeAppControlCell {}
+// SAFETY: shared references may cross threads, but all dereferences route
+// through the control-thread serialization contract above.
+unsafe impl Sync for RuntimeAppControlCell {}
+
+#[derive(Clone)]
+struct RuntimeAppControlHandle {
+    control_handle: Arc<ControlThreadHandle>,
+    state: Arc<RuntimeAppControlCell>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RuntimeAppControlSnapshot {
+    tcp_listeners: InfraVec<RuntimeTcpListenerSnapshot>,
+    udp_sockets: InfraVec<UdpSocketRegistration>,
+    tcp_lookup: TcpLookupSnapshot,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct RuntimeTcpListenerSnapshot {
+    socket: AppSocketId,
+    lookup_id: TcpLookupId,
+}
+
+impl RuntimeAppControlState {
+    fn new() -> HammerResult<Self> {
+        let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+        ));
+        tcp_control
+            .publish_dispatch(crate::transport::tcp::TcpDispatchTable::default())
+            .map_err(|err| {
+                HammerError::internal(format!("publish tcp dispatch defaults: {err}"))
+            })?;
+        let tcp_rcv_process_control =
+            TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(unused_node_id()));
+
+        Ok(Self {
+            sockets: DescriptorTable::new(),
+            flows: DescriptorTable::new(),
+            next_tcp_lookup_id: 1,
+            tcp_accept_control: None,
+            tcp_control,
+            tcp_rcv_process_control,
+            udp_control: UdpInputControlPlane::new(UdpInputNext::nodes(
+                unused_node_id(),
+                unused_node_id(),
+                unused_node_id(),
+            )),
+            tcp_lookup: TcpLookupSnapshot::empty(),
+            tcp_listeners: InfraVec::new(),
+            tcp_listener_slots: FlatHashTable::new(),
+            tcp_connections: InfraVec::new(),
+            udp_sockets: InfraVec::new(),
+            udp_socket_slots: FlatHashTable::new(),
+        })
+    }
+
+    fn install_tcp_accept_control(&mut self, control: TcpAcceptControlPlane) -> HammerResult<()> {
+        self.tcp_accept_control = Some(control);
+        self.publish_tcp_accept()
+    }
+
+    fn bind_tcp_listener(
+        &mut self,
+        app: &AppContext,
+        bind: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        if self
+            .tcp_listeners
+            .iter()
+            .any(|registration| registration.bind == bind)
+        {
+            return Err(HammerError::internal(format!(
+                "tcp listener {bind} is already registered"
+            )));
+        }
+
+        let socket = self.alloc_socket(RuntimeSocketKind::TcpListener);
+        let lookup_id = self.alloc_tcp_lookup_id()?;
+        self.tcp_listeners.push(TcpListenerRegistration {
+            app: app.clone(),
+            socket,
+            lookup_id,
+            owner_worker: worker_id(owner_worker)?,
+            bind,
+        });
+        self.rebuild_tcp_listener_slots();
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_accept()?;
+
+        Ok(socket)
+    }
+
+    fn bind_udp_socket(
+        &mut self,
+        app: &AppContext,
+        bind: SocketAddr,
+        _owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        if self
+            .udp_sockets
+            .iter()
+            .any(|registration| registration.bind.port() == bind.port())
+        {
+            return Err(HammerError::internal(format!(
+                "udp socket port {} is already registered",
+                bind.port()
+            )));
+        }
+
+        let socket = self.alloc_socket(RuntimeSocketKind::UdpSocket);
+        self.udp_control
+            .register_app(bind.port(), UdpAppRegistration::socket(app.clone(), socket))
+            .map_err(|err| HammerError::internal(format!("register udp app socket: {err}")))?;
+        self.udp_sockets
+            .push(UdpSocketRegistration { socket, bind });
+        self.rebuild_udp_socket_slots();
+        Ok(socket)
+    }
+
+    fn close_socket(&mut self, socket: AppSocketId) -> HammerResult<()> {
+        let descriptor = RuntimeSocketDescriptor::new(socket.value());
+        let kind = self.sockets.remove(descriptor).ok_or_else(|| {
+            HammerError::internal(format!(
+                "app socket {} is not registered in runtime service",
+                socket.value()
+            ))
+        })?;
+        match kind {
+            RuntimeSocketKind::TcpListener => {
+                let slot = self
+                    .tcp_listener_slots
+                    .lookup(&socket.value())
+                    .ok_or_else(|| {
+                        HammerError::internal(format!(
+                            "tcp listener {} missing listener slot entry",
+                            socket.value()
+                        ))
+                    })?;
+                self.tcp_listeners
+                    .drain(slot..slot + 1)
+                    .next()
+                    .expect("tcp listener exists at computed slot");
+                self.rebuild_tcp_listener_slots();
+                self.publish_tcp_lookup()?;
+                self.publish_tcp_accept()?;
+                Ok(())
+            }
+            RuntimeSocketKind::UdpSocket => {
+                let slot = self
+                    .udp_socket_slots
+                    .lookup(&socket.value())
+                    .ok_or_else(|| {
+                        HammerError::internal(format!(
+                            "udp socket {} missing socket slot entry",
+                            socket.value()
+                        ))
+                    })?;
+                let registration = self
+                    .udp_sockets
+                    .drain(slot..slot + 1)
+                    .next()
+                    .expect("udp socket exists at computed slot");
+                self.udp_control
+                    .unregister_port(registration.bind.port())
+                    .map_err(|err| {
+                        HammerError::internal(format!("unregister udp app socket: {err}"))
+                    })?;
+                self.rebuild_udp_socket_slots();
+                Ok(())
+            }
+        }
+    }
+
+    fn alloc_socket(&mut self, kind: RuntimeSocketKind) -> AppSocketId {
+        AppSocketId::new(self.sockets.insert(kind).value())
+    }
+
+    fn alloc_flow(&mut self) -> AppFlowId {
+        AppFlowId::new(self.flows.insert(()).value())
+    }
+
+    fn alloc_tcp_lookup_id(&mut self) -> HammerResult<TcpLookupId> {
+        let id = self.next_tcp_lookup_id;
+        self.next_tcp_lookup_id = self
+            .next_tcp_lookup_id
+            .checked_add(1)
+            .ok_or_else(|| HammerError::internal("tcp lookup id overflow"))?;
+        Ok(id)
+    }
+
+    fn accept_tcp_connection(
+        &mut self,
+        app: &AppContext,
+        listener: AppSocketId,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> HammerResult<AppFlowId> {
+        let listener_slot = self
+            .tcp_listener_slots
+            .lookup(&listener.value())
+            .ok_or_else(|| {
+                HammerError::internal(format!(
+                    "tcp listener {} is not registered in runtime service",
+                    listener.value()
+                ))
+            })?;
+        let listener_registration = self.tcp_listeners[listener_slot].clone();
+        self.ensure_connection_absent(local, remote)?;
+        let flow = self.alloc_flow();
+        app.try_complete_accept(listener, flow)?;
+        let lookup_id = self.alloc_tcp_lookup_id()?;
+        self.tcp_connections.push(TcpConnectionRegistration {
+            lookup_id,
+            owner_worker: listener_registration.owner_worker,
+            local,
+            remote,
+            target: AppIngressTarget::flow(app.clone(), flow),
+        });
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+        Ok(flow)
+    }
+
+    fn publish_tcp_lookup(&mut self) -> HammerResult<()> {
+        let mut snapshot = TcpLookupSnapshot::empty();
+        for registration in self.tcp_listeners.iter().cloned() {
+            let value = TcpLookupValue {
+                kind: TcpLookupKind::Listener,
+                id: registration.lookup_id,
+                owner_worker: registration.owner_worker,
+            };
+            match registration.bind.ip() {
+                IpAddr::V4(addr) => snapshot.insert_listener_v4(
+                    TcpV4ListenerKey::new(0, addr, registration.bind.port()),
+                    value,
+                ),
+                IpAddr::V6(addr) => snapshot.insert_listener_v6(
+                    TcpV6ListenerKey::new(0, addr, registration.bind.port()),
+                    value,
+                ),
+            }
+        }
+        for registration in self.tcp_connections.iter().cloned() {
+            let value = TcpLookupValue {
+                kind: TcpLookupKind::EstablishedConnection,
+                id: registration.lookup_id,
+                owner_worker: registration.owner_worker,
+            };
+            match (registration.local.ip(), registration.remote.ip()) {
+                (IpAddr::V4(local), IpAddr::V4(remote)) => snapshot.insert_connection_v4(
+                    TcpV4ConnectionKey::new(
+                        0,
+                        local,
+                        registration.local.port(),
+                        remote,
+                        registration.remote.port(),
+                    ),
+                    value,
+                ),
+                (IpAddr::V6(local), IpAddr::V6(remote)) => snapshot.insert_connection_v6(
+                    TcpV6ConnectionKey::new(
+                        0,
+                        local,
+                        registration.local.port(),
+                        remote,
+                        registration.remote.port(),
+                    ),
+                    value,
+                ),
+                _ => {
+                    return Err(HammerError::internal(format!(
+                        "tcp connection {} -> {} mixes IP versions",
+                        registration.remote, registration.local
+                    )));
+                }
+            }
+        }
+        self.tcp_control
+            .publish_lookup(snapshot.clone())
+            .map_err(|err| HammerError::internal(format!("publish tcp lookup snapshot: {err}")))?;
+        self.tcp_lookup = snapshot;
+        Ok(())
+    }
+
+    fn publish_tcp_accept(&self) -> HammerResult<()> {
+        let Some(control) = &self.tcp_accept_control else {
+            return Ok(());
+        };
+        control
+            .publish_listeners(self.tcp_listeners.iter().cloned().map(|registration| {
+                (
+                    registration.lookup_id,
+                    TcpAcceptRegistration::new(registration.app, registration.socket),
+                )
+            }))
+            .map_err(|err| HammerError::internal(format!("publish tcp accept listeners: {err}")))
+    }
+
+    fn publish_tcp_app_ingress(&self) -> HammerResult<()> {
+        self.tcp_control
+            .publish_app_ingress(
+                self.tcp_connections
+                    .iter()
+                    .map(|registration| registration.lookup_id),
+            )
+            .map_err(|err| HammerError::internal(format!("publish tcp app ingress ids: {err}")))?;
+        self.tcp_rcv_process_control
+            .publish_app_ingress(
+                self.tcp_connections
+                    .iter()
+                    .cloned()
+                    .map(|registration| (registration.lookup_id, registration.target)),
+            )
+            .map_err(|err| {
+                HammerError::internal(format!("publish tcp rcv-process ingress targets: {err}"))
+            })?;
+        Ok(())
+    }
+
+    fn ensure_connection_absent(&self, local: SocketAddr, remote: SocketAddr) -> HammerResult<()> {
+        let duplicate = match (local.ip(), remote.ip()) {
+            (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) => self
+                .tcp_lookup
+                .lookup_connection_v4(TcpV4ConnectionKey::new(
+                    0,
+                    local_ip,
+                    local.port(),
+                    remote_ip,
+                    remote.port(),
+                ))
+                .is_some(),
+            (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => self
+                .tcp_lookup
+                .lookup_connection_v6(TcpV6ConnectionKey::new(
+                    0,
+                    local_ip,
+                    local.port(),
+                    remote_ip,
+                    remote.port(),
+                ))
+                .is_some(),
+            _ => {
+                return Err(HammerError::internal(format!(
+                    "tcp connection {} -> {} mixes IP versions",
+                    remote, local
+                )));
+            }
+        };
+        if duplicate {
+            return Err(HammerError::internal(format!(
+                "tcp connection {} -> {} is already registered",
+                remote, local
+            )));
+        }
+        Ok(())
+    }
+
+    fn rebuild_tcp_listener_slots(&mut self) {
+        let mut slots = FlatHashTable::new();
+        for (index, registration) in self.tcp_listeners.iter().cloned().enumerate() {
+            slots.insert(registration.socket.value(), index);
+        }
+        self.tcp_listener_slots = slots;
+    }
+
+    fn rebuild_udp_socket_slots(&mut self) {
+        let mut slots = FlatHashTable::new();
+        for (index, registration) in self.udp_sockets.iter().copied().enumerate() {
+            slots.insert(registration.socket.value(), index);
+        }
+        self.udp_socket_slots = slots;
+    }
+}
+
+impl RuntimeAppControlHandle {
+    #[inline]
+    fn new(control_handle: Arc<ControlThreadHandle>, state: RuntimeAppControlState) -> Self {
+        Self {
+            control_handle,
+            state: Arc::new(RuntimeAppControlCell::new(state)),
+        }
+    }
+
+    #[inline]
+    fn install_tcp_accept_control(&self, control: TcpAcceptControlPlane) -> HammerResult<()> {
+        self.with_state_mut(move |state| state.install_tcp_accept_control(control))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    fn accept_tcp_connection(
+        &self,
+        app: &AppContext,
+        listener: AppSocketId,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> HammerResult<AppFlowId> {
+        let app = app.clone();
+        self.with_state_mut(move |state| state.accept_tcp_connection(&app, listener, remote, local))
+    }
+
+    #[inline]
+    fn schedule_accept_tcp_connection(
+        &self,
+        app: &AppContext,
+        listener: AppSocketId,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> HammerResult<()> {
+        let state = Arc::clone(&self.state);
+        let app = app.clone();
+        self.control_handle
+            .schedule_once(Duration::ZERO, move || {
+                let state = Arc::clone(&state);
+                let app = app.clone();
+                async move {
+                    // SAFETY: this closure runs on the single control thread.
+                    let state = unsafe { state.get_mut() };
+                    let result = state.accept_tcp_connection(&app, listener, remote, local);
+                    debug_assert!(
+                        result.is_ok(),
+                        "runtime tcp accept async failed: {result:?}"
+                    );
+                    let _ = result;
+                }
+            })
+            .map(|_| ())
+    }
+
+    #[inline]
+    fn with_state_mut<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeAppControlState) -> HammerResult<R> + Send + 'static,
+    ) -> HammerResult<R>
+    where
+        R: Send + 'static,
+    {
+        let state = Arc::clone(&self.state);
+        self.control_handle.call_blocking(move || {
+            // SAFETY: RuntimeAppControlState is owned by the control plane.
+            // All mutable access routes through this control-thread dispatch.
+            let state = unsafe { state.get_mut() };
+            f(state)
+        })?
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline]
+    fn with_state<R>(
+        &self,
+        f: impl FnOnce(&RuntimeAppControlState) -> HammerResult<R> + Send + 'static,
+    ) -> HammerResult<R>
+    where
+        R: Send + 'static,
+    {
+        let state = Arc::clone(&self.state);
+        self.control_handle.call_blocking(move || {
+            // SAFETY: RuntimeAppControlState reads are also serialized on
+            // the control thread, keeping the ownership model single-threaded.
+            let state = unsafe { &*state.inner.get() };
+            f(state)
+        })?
+    }
+
+    #[cfg(test)]
+    fn snapshot_for_test(&self) -> HammerResult<RuntimeAppControlSnapshot> {
+        self.with_state(|state| {
+            let mut tcp_listeners = InfraVec::new();
+            for registration in state.tcp_listeners.iter() {
+                tcp_listeners.push(RuntimeTcpListenerSnapshot {
+                    socket: registration.socket,
+                    lookup_id: registration.lookup_id,
+                });
+            }
+            Ok(RuntimeAppControlSnapshot {
+                tcp_listeners,
+                udp_sockets: state.udp_sockets.clone(),
+                tcp_lookup: state.tcp_lookup.clone(),
+            })
+        })
+    }
+}
+
+impl AppControlBackend for RuntimeAppControlHandle {
+    fn bind_tcp_listener(
+        &self,
+        app: &AppContext,
+        bind: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        let app = app.clone();
+        self.with_state_mut(move |state| state.bind_tcp_listener(&app, bind, owner_worker))
+    }
+
+    fn bind_udp_socket(
+        &self,
+        app: &AppContext,
+        bind: SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppSocketId> {
+        let app = app.clone();
+        self.with_state_mut(move |state| state.bind_udp_socket(&app, bind, owner_worker))
+    }
+
+    fn close_socket(&self, _app: &AppContext, socket: AppSocketId) -> HammerResult<()> {
+        self.with_state_mut(move |state| state.close_socket(socket))
+    }
+}
+
+impl crate::transport::tcp::TcpAcceptBackend for RuntimeAppControlHandle {
+    fn accept(
+        &self,
+        _listener_id: TcpLookupId,
+        registration: &TcpAcceptRegistration,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> Result<(), CoreError> {
+        self.schedule_accept_tcp_connection(
+            registration.app(),
+            registration.listener(),
+            remote,
+            local,
+        )
+        .map_err(|err| CoreError::internal(format!("runtime tcp accept: {err}")))
+    }
 }
 
 impl RuntimeService {
@@ -188,8 +816,18 @@ impl RuntimeService {
                 return Err(err);
             }
         };
+        let app_control = RuntimeAppControlHandle::new(
+            Arc::clone(&control_handle),
+            RuntimeAppControlState::new()?,
+        );
+        let app_control_backend: Arc<dyn AppControlBackend> = Arc::new(app_control.clone());
+        app_context.install_control(AppControl::new(app_control_backend))?;
         let writer: Arc<dyn LogWriter> = Arc::clone(&control_handle) as Arc<dyn LogWriter>;
         let log_factory = Factory::new_with_min_level(base_time, writer, options.log.level);
+        app_control.install_tcp_accept_control(TcpAcceptControlPlane::new(
+            Arc::new(app_control.clone()),
+            TcpAcceptNext::nodes(unused_node_id()),
+        ))?;
         let trace_enabled_with_inputs = trace_worker_control(&options.trace);
         let packet_graph = ServicePacketGraphDeclarations::default();
         trace.publish_options(&options.trace, |name| packet_graph.resolve(name))?;
@@ -389,6 +1027,7 @@ impl RuntimeService {
                 data_runtime: Some(data_runtime),
                 data_context,
                 app_context,
+                app_control,
                 _options: options,
             })),
         }))
@@ -678,6 +1317,18 @@ fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
     factory.new_logger(id.to_owned())
 }
 
+#[inline]
+const fn unused_node_id() -> NodeId {
+    NodeId::new(0)
+}
+
+#[inline]
+fn worker_id(worker: usize) -> HammerResult<DataWorkerId> {
+    u32::try_from(worker)
+        .map(DataWorkerId::new)
+        .map_err(|_| HammerError::internal(format!("worker index {worker} does not fit into u32")))
+}
+
 fn trace_worker_control(options: &TraceOptions) -> bool {
     options.enabled && !options.inputs.is_empty()
 }
@@ -711,6 +1362,7 @@ const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
     "ip-local-node",
     "tcp-input-node",
     "tcp-listen-node",
+    "tcp-accept-node",
     "tcp-rcv-process-node",
     "tcp-syn-sent-node",
     "tcp-established-node",
@@ -1086,11 +1738,40 @@ fn build_probe_protocol(protocol: &str) -> HammerResult<ProbeProtocolComponent> 
 }
 
 #[cfg(test)]
+impl RuntimeService {
+    fn app_control_snapshot_for_test(&self) -> RuntimeAppControlSnapshot {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner
+            .app_control
+            .snapshot_for_test()
+            .expect("snapshot runtime app control")
+    }
+
+    fn accept_tcp_connection_for_test(
+        &self,
+        app: &AppContext,
+        listener: AppSocketId,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> HammerResult<AppFlowId> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner
+            .app_control
+            .accept_tcp_connection(app, listener, remote, local)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use hammer_core::StartStage;
-    use hammer_runtime::app::{AppBufferLease, AppFlowId};
+    use hammer_runtime::app::{
+        AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,
+        AppSqeDescriptor, AppUserData,
+    };
     use hammer_runtime::spawn::with_data_plane_buffers;
+    use std::net::Ipv4Addr;
+    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -1441,6 +2122,207 @@ interval = "5s"
         assert_eq!(result.0, 1);
         assert!(result.1.contains("hammer-data-1"), "thread={}", result.1);
         assert_eq!(result.2, b"service-app-context");
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_app_context_installs_control_backend_and_publishes_binds() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let listener = app
+            .bind_tcp_listener("127.0.0.1:7000".parse().expect("tcp bind"), 1)
+            .expect("bind tcp listener");
+        let socket = app
+            .bind_udp_socket("127.0.0.1:9000".parse().expect("udp bind"), 0)
+            .expect("bind udp socket");
+
+        assert_eq!(
+            app.owner_worker_for_socket(listener)
+                .expect("tcp listener owner"),
+            1
+        );
+        assert_eq!(
+            app.owner_worker_for_socket(socket)
+                .expect("udp socket owner"),
+            0
+        );
+
+        let state = service.app_control_snapshot_for_test();
+        assert_eq!(state.tcp_listeners.len(), 1);
+        assert_eq!(state.tcp_listeners[0].socket, listener);
+        assert_eq!(state.udp_sockets.len(), 1);
+        assert_eq!(state.udp_sockets[0].socket, socket);
+
+        let published = state
+            .tcp_lookup
+            .lookup_listener_v4(TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7000))
+            .expect("published tcp listener lookup");
+        assert_eq!(published.kind, TcpLookupKind::Listener);
+        assert_eq!(published.owner_worker, DataWorkerId::new(1));
+        assert_eq!(published.id, state.tcp_listeners[0].lookup_id);
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_app_context_rebinds_after_close_socket() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let listener = app
+            .bind_tcp_listener("127.0.0.1:7100".parse().expect("tcp bind"), 0)
+            .expect("bind tcp listener");
+        let socket = app
+            .bind_udp_socket("127.0.0.1:9100".parse().expect("udp bind"), 0)
+            .expect("bind udp socket");
+
+        let tcp_err = app
+            .bind_tcp_listener("127.0.0.1:7100".parse().expect("tcp bind"), 0)
+            .expect_err("duplicate tcp listener must fail");
+        assert!(
+            tcp_err.to_string().contains("already registered"),
+            "err={tcp_err}"
+        );
+        let udp_err = app
+            .bind_udp_socket("127.0.0.1:9100".parse().expect("udp bind"), 0)
+            .expect_err("duplicate udp socket must fail");
+        assert!(
+            udp_err.to_string().contains("already registered"),
+            "err={udp_err}"
+        );
+
+        app.close_socket(listener).expect("close tcp listener");
+        app.close_socket(socket).expect("close udp socket");
+        assert!(
+            app.owner_worker_for_socket(listener).is_err(),
+            "stale tcp listener handle must be invalid after close"
+        );
+        assert!(
+            app.owner_worker_for_socket(socket).is_err(),
+            "stale udp socket handle must be invalid after close"
+        );
+
+        let rebound_listener = app
+            .bind_tcp_listener("127.0.0.1:7100".parse().expect("tcp bind"), 1)
+            .expect("rebind tcp listener");
+        let rebound_socket = app
+            .bind_udp_socket("127.0.0.1:9100".parse().expect("udp bind"), 1)
+            .expect("rebind udp socket");
+        assert_eq!(
+            listener.value() as u32,
+            rebound_listener.value() as u32,
+            "tcp listener rebind should reuse freed descriptor slot"
+        );
+        assert_ne!(
+            (listener.value() >> 32) as u32,
+            (rebound_listener.value() >> 32) as u32,
+            "tcp listener rebind should advance descriptor generation"
+        );
+        assert_eq!(
+            socket.value() as u32,
+            rebound_socket.value() as u32,
+            "udp socket rebind should reuse freed descriptor slot"
+        );
+        assert_ne!(
+            (socket.value() >> 32) as u32,
+            (rebound_socket.value() >> 32) as u32,
+            "udp socket rebind should advance descriptor generation"
+        );
+
+        assert_eq!(
+            app.owner_worker_for_socket(rebound_listener)
+                .expect("rebound tcp listener owner"),
+            1
+        );
+        assert_eq!(
+            app.owner_worker_for_socket(rebound_socket)
+                .expect("rebound udp socket owner"),
+            1
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_accepts_tcp_listener_into_established_lookup() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let listener = app
+            .bind_tcp_listener("127.0.0.1:7200".parse().expect("tcp bind"), 1)
+            .expect("bind tcp listener");
+        let remote: SocketAddr = "198.51.100.72:40720".parse().expect("remote addr");
+        let local: SocketAddr = "127.0.0.1:7200".parse().expect("local addr");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        service
+            .spawn_app_on_worker(1, {
+                let app = app.clone();
+                move || async move {
+                    let backend = app
+                        .local_backend_for_socket(listener)
+                        .expect("listener backend");
+                    backend
+                        .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                            AppOpcode::Accept,
+                            AppUserData::new(91),
+                            AppObjectRef::Socket(listener),
+                            AppSqeData::Accept,
+                        ))
+                        .expect("push accept sqe");
+                    ready_tx.send(()).expect("signal accept ready");
+
+                    let accept_cqe = backend
+                        .next_cqe_descriptor()
+                        .await
+                        .expect("accept cqe descriptor");
+                    tx.send(accept_cqe).expect("send accept result");
+                }
+            })
+            .expect("spawn accept worker");
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait accept ready");
+        let flow = service
+            .accept_tcp_connection_for_test(&app, listener, remote, local)
+            .expect("accept tcp connection");
+        let accept_cqe = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive accept result");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+        match accept_cqe.payload() {
+            AppCqeData::Accepted {
+                listener: cqe_listener,
+                flow: cqe_flow,
+            } => {
+                assert_eq!(cqe_listener, listener);
+                assert_eq!(cqe_flow, flow);
+            }
+            other => panic!("unexpected accept cqe payload: {other:?}"),
+        }
+
+        let state = service.app_control_snapshot_for_test();
+        let published = state
+            .tcp_lookup
+            .lookup_connection_v4(TcpV4ConnectionKey::new(
+                0,
+                local
+                    .ip()
+                    .to_string()
+                    .parse::<Ipv4Addr>()
+                    .expect("local ipv4"),
+                local.port(),
+                remote
+                    .ip()
+                    .to_string()
+                    .parse::<Ipv4Addr>()
+                    .expect("remote ipv4"),
+                remote.port(),
+            ))
+            .expect("published tcp connection lookup");
+        assert_eq!(published.kind, TcpLookupKind::EstablishedConnection);
+        assert_eq!(published.owner_worker, DataWorkerId::new(1));
+
         service.close().expect("close service");
     }
 

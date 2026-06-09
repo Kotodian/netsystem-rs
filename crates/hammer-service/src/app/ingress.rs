@@ -1,24 +1,62 @@
 use hammer_adapter::{BufferIndex, DataPlaneRuntime};
 use hammer_core::error::CoreResult;
-use hammer_runtime::app::{AppContext, AppFlowId};
+use hammer_runtime::app::{AppContext, AppFlowId, AppSocketId};
 
 use super::backend::AppIngressBackend;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppIngressObject {
+    Flow(AppFlowId),
+    Socket(AppSocketId),
+}
 
 #[derive(Clone)]
 pub struct AppIngressTarget {
     app: AppContext,
-    flow: AppFlowId,
+    object: AppIngressObject,
 }
 
 impl AppIngressTarget {
     #[inline]
     pub fn new(app: AppContext, flow: AppFlowId) -> Self {
-        Self { app, flow }
+        Self::flow(app, flow)
     }
 
     #[inline]
-    pub fn flow(&self) -> AppFlowId {
-        self.flow
+    pub fn flow(app: AppContext, flow: AppFlowId) -> Self {
+        Self {
+            app,
+            object: AppIngressObject::Flow(flow),
+        }
+    }
+
+    #[inline]
+    pub fn socket(app: AppContext, socket: AppSocketId) -> Self {
+        Self {
+            app,
+            object: AppIngressObject::Socket(socket),
+        }
+    }
+
+    #[inline]
+    pub fn object(&self) -> AppIngressObject {
+        self.object
+    }
+
+    #[inline]
+    pub fn flow_id(&self) -> Option<AppFlowId> {
+        match self.object {
+            AppIngressObject::Flow(flow) => Some(flow),
+            AppIngressObject::Socket(_) => None,
+        }
+    }
+
+    #[inline]
+    pub fn socket_id(&self) -> Option<AppSocketId> {
+        match self.object {
+            AppIngressObject::Flow(_) => None,
+            AppIngressObject::Socket(socket) => Some(socket),
+        }
     }
 
     #[inline]
@@ -44,7 +82,7 @@ impl AppIngressTarget {
 impl std::fmt::Debug for AppIngressTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppIngressTarget")
-            .field("flow", &self.flow.value())
+            .field("object", &self.object)
             .finish_non_exhaustive()
     }
 }

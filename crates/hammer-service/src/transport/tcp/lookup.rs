@@ -187,6 +187,26 @@ impl TcpLookupSnapshot {
     pub fn lookup_connection_v6(&self, key: TcpV6ConnectionKey) -> Option<TcpLookupValue> {
         self.connections_v6.lookup(&key)
     }
+
+    #[inline]
+    pub(crate) fn insert_listener_v4(&mut self, key: TcpV4ListenerKey, value: TcpLookupValue) {
+        self.listeners_v4.insert(key, value);
+    }
+
+    #[inline]
+    pub(crate) fn insert_listener_v6(&mut self, key: TcpV6ListenerKey, value: TcpLookupValue) {
+        self.listeners_v6.insert(key, value);
+    }
+
+    #[inline]
+    pub(crate) fn insert_connection_v4(&mut self, key: TcpV4ConnectionKey, value: TcpLookupValue) {
+        self.connections_v4.insert(key, value);
+    }
+
+    #[inline]
+    pub(crate) fn insert_connection_v6(&mut self, key: TcpV6ConnectionKey, value: TcpLookupValue) {
+        self.connections_v6.insert(key, value);
+    }
 }
 
 impl Default for TcpLookupSnapshot {

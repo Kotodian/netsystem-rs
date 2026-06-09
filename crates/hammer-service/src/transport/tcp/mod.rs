@@ -1,3 +1,4 @@
+pub mod accept;
 pub mod app;
 pub mod established;
 pub mod input;
@@ -8,6 +9,9 @@ pub mod reset;
 pub mod state;
 pub mod syn_sent;
 
+pub use accept::{
+    TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptNode, TcpAcceptRegistration,
+};
 pub use app::TcpAppIngress;
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
@@ -16,7 +20,7 @@ pub use lookup::{
     TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpV4ConnectionKey,
     TcpV4ListenerKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpWorkerOwnedState,
 };
-pub use rcv_process::{TcpRcvProcessNext, TcpRcvProcessNode};
+pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use state::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState, TcpDispatchEntry,

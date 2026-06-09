@@ -6,8 +6,8 @@ use crate::tcp::TcpStream;
 use crate::udp::UdpSocket;
 
 pub async fn echo_once(stream: &TcpStream) -> HammerResult<()> {
-    let recv = stream.recv().await?;
-    stream.send(recv.into_send()).await
+    let recv = stream.recv_buffer().await?;
+    stream.send_buffer(recv).await
 }
 
 pub async fn run_tcp_echo(stream: &TcpStream, iterations: usize) -> HammerResult<()> {
@@ -23,9 +23,9 @@ pub async fn run_echo_loop(stream: &TcpStream, iterations: usize) -> HammerResul
 }
 
 pub async fn run_udp_echo(socket: &UdpSocket) -> HammerResult<SocketAddr> {
-    let (lease, peer) = socket.recv_from_buffer().await?;
-    socket.send_buffer_to(lease, peer).await?;
-    Ok(peer)
+    let (recv, source) = socket.recv_from_buffer().await?;
+    socket.send_buffer_to(recv, source).await?;
+    Ok(source)
 }
 
 #[inline]
