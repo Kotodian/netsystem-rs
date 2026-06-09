@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
-    NodeRuntimeData, NodeVectorDispatch, SocksAddr,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeProcessFn,
+    NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec as InfraVec;
@@ -41,6 +41,13 @@ pub struct TcpResetObservation {
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub reason: TcpResetReason,
+    pub synthesized_reset: Option<TcpSynthesizedReset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpSynthesizedReset {
+    pub metadata: RouteMetadata,
+    pub packet: std::vec::Vec<u8>,
 }
 
 pub trait TcpResetObserver: Send + Sync {
@@ -321,12 +328,13 @@ fn tcp_reset_observation(
     index: BufferIndex,
 ) -> CoreResult<TcpResetObservation> {
     let metadata = runtime.metadata(index)?;
+    let synthesized_reset = tcp_synthesized_reset(runtime, index, &metadata);
     let remote = socket_addr(
-        metadata.source,
+        metadata.source.clone(),
         "tcp reset observer requires remote source metadata",
     )?;
     let local = socket_addr(
-        metadata.destination,
+        metadata.destination.clone(),
         "tcp reset observer requires local destination metadata",
     )?;
     let reason =
@@ -335,10 +343,145 @@ fn tcp_reset_observation(
         local,
         remote,
         reason,
+        synthesized_reset,
     })
 }
 
 fn socket_addr(value: Option<SocksAddr>, missing: &'static str) -> CoreResult<SocketAddr> {
     let value = value.ok_or_else(|| CoreError::internal(missing))?;
     Ok(SocketAddr::new(value.host, value.port))
+}
+
+fn tcp_synthesized_reset(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    metadata: &RouteMetadata,
+) -> Option<TcpSynthesizedReset> {
+    let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index).ok()?.into_iter().collect();
+    let cursor = runtime.packet_cursor(index).ok()?;
+    synthesize_ipv4_tcp_reset(&packet, cursor, metadata)
+}
+
+fn synthesize_ipv4_tcp_reset(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
+    metadata: &RouteMetadata,
+) -> Option<TcpSynthesizedReset> {
+    const IPV4_MIN_HEADER_LEN: usize = 20;
+    const TCP_MIN_HEADER_LEN: usize = 20;
+    const TCP_FLAG_FIN: u8 = 0x01;
+    const TCP_FLAG_SYN: u8 = 0x02;
+    const TCP_FLAG_RST: u8 = 0x04;
+    const TCP_FLAG_ACK: u8 = 0x10;
+
+    if cursor.network_header_len() < IPV4_MIN_HEADER_LEN
+        || cursor.transport_header_len() < TCP_MIN_HEADER_LEN
+    {
+        return None;
+    }
+
+    let available_len = packet.len().min(cursor.packet_len());
+    let network_offset = cursor.network_header_offset();
+    let transport_offset = cursor.transport_header_offset();
+    let payload_offset = cursor.transport_payload_offset();
+    if network_offset > available_len
+        || transport_offset > available_len
+        || payload_offset > available_len
+    {
+        return None;
+    }
+
+    let network_end = network_offset.checked_add(cursor.network_header_len())?;
+    let transport_end = transport_offset.checked_add(cursor.transport_header_len())?;
+    if network_end > available_len || transport_end > available_len {
+        return None;
+    }
+
+    let version_ihl = *packet.get(network_offset)?;
+    if version_ihl >> 4 != 4 {
+        return None;
+    }
+
+    let tcp = &packet[transport_offset..transport_end];
+    let flags = *tcp.get(13)?;
+    let ack_flag = flags & TCP_FLAG_ACK != 0;
+    let sequence_number = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
+    let acknowledgment_number = u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?);
+    let payload_len = available_len.checked_sub(payload_offset)?;
+    let segment_len = payload_len
+        .checked_add(usize::from(flags & TCP_FLAG_SYN != 0))?
+        .checked_add(usize::from(flags & TCP_FLAG_FIN != 0))?;
+    let response_sequence = if ack_flag { acknowledgment_number } else { 0 };
+    let response_acknowledgment = if ack_flag {
+        0
+    } else {
+        sequence_number.wrapping_add(u32::try_from(segment_len).ok()?)
+    };
+    let response_flags = if ack_flag {
+        TCP_FLAG_RST
+    } else {
+        TCP_FLAG_RST | TCP_FLAG_ACK
+    };
+
+    let total_len = IPV4_MIN_HEADER_LEN + TCP_MIN_HEADER_LEN;
+    let mut reset = vec![0u8; total_len];
+    reset[..IPV4_MIN_HEADER_LEN].copy_from_slice(&packet[network_offset..network_offset + 20]);
+    reset[0] = 0x45;
+    reset[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    reset[10] = 0;
+    reset[11] = 0;
+    reset[12..16].copy_from_slice(packet.get(network_offset + 16..network_offset + 20)?);
+    reset[16..20].copy_from_slice(packet.get(network_offset + 12..network_offset + 16)?);
+
+    reset[20..22].copy_from_slice(tcp.get(2..4)?);
+    reset[22..24].copy_from_slice(tcp.get(0..2)?);
+    reset[24..28].copy_from_slice(&response_sequence.to_be_bytes());
+    reset[28..32].copy_from_slice(&response_acknowledgment.to_be_bytes());
+    reset[32] = 0x50;
+    reset[33] = response_flags;
+    reset[36] = 0;
+    reset[37] = 0;
+
+    let source = reset.get(12..16)?.try_into().ok()?;
+    let destination = reset.get(16..20)?.try_into().ok()?;
+    let checksum = ipv4_l4_checksum(source, destination, 6, &reset[20..]);
+    reset[36..38].copy_from_slice(&checksum.to_be_bytes());
+    let header_checksum = internet_checksum(&reset[..IPV4_MIN_HEADER_LEN]);
+    reset[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+
+    let mut response_metadata = metadata.clone();
+    response_metadata.source = metadata.destination.clone();
+    response_metadata.destination = metadata.source.clone();
+
+    Some(TcpSynthesizedReset {
+        metadata: response_metadata,
+        packet: reset,
+    })
+}
+
+fn ipv4_l4_checksum(source: [u8; 4], destination: [u8; 4], protocol: u8, segment: &[u8]) -> u16 {
+    let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
+    pseudo.extend_from_slice(&source);
+    pseudo.extend_from_slice(&destination);
+    pseudo.push(0);
+    pseudo.push(protocol);
+    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+    pseudo.extend_from_slice(segment);
+    internet_checksum(&pseudo)
+}
+
+fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in bytes.chunks(2) {
+        let word = match chunk {
+            [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
+            [hi] => u16::from_be_bytes([*hi, 0]) as u32,
+            _ => unreachable!(),
+        };
+        sum += word;
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    !(sum as u16)
 }

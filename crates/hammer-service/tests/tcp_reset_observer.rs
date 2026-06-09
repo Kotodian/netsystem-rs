@@ -1,11 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, Network, RouteMetadata, SocksAddr};
+use hammer_adapter::{
+    BufferNodeError, BufferPacketCursor, DataPlaneRuntime, Network, RouteMetadata, SocksAddr,
+};
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::reset::{
-    TcpResetObservation, TcpResetObserver, TcpResetReason,
+    TcpResetObservation, TcpResetObserver, TcpResetReason, TcpSynthesizedReset,
 };
 use hammer_service::transport::tcp::{
     TcpInputControlPlane, TcpInputError, TcpInputNext, TcpResetNext, TcpResetNode,
@@ -27,7 +29,7 @@ impl TcpResetObserver for RecordingTcpResetObserver {
 }
 
 #[test]
-fn tcp_reset_observer_records_local_remote_metadata_and_reason() {
+fn tcp_reset_observer_records_local_remote_metadata_reason_and_synthesized_reset() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let drop = runtime.nodes().register_internal(DropNode::new());
     let observer = Arc::new(RecordingTcpResetObserver::default());
@@ -45,7 +47,7 @@ fn tcp_reset_observer_records_local_remote_metadata_and_reason() {
 
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 50_002);
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 20)), 443);
-    let packet = ipv4_tcp_packet(
+    let packet = ipv4_tcp_packet_with_numbers(
         match remote.ip() {
             IpAddr::V4(ip) => ip,
             _ => unreachable!(),
@@ -56,8 +58,26 @@ fn tcp_reset_observer_records_local_remote_metadata_and_reason() {
             _ => unreachable!(),
         },
         local.port(),
+        0x0102_0304,
+        0x1020_3040,
         tcp_flags(false, false, false, true),
         b"ack",
+    );
+    let expected_reset = ipv4_tcp_packet_with_numbers(
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        0x1020_3040,
+        0,
+        tcp_flags(false, false, true, false),
+        b"",
     );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let buffer = push_packet(
@@ -87,6 +107,172 @@ fn tcp_reset_observer_records_local_remote_metadata_and_reason() {
             local,
             remote,
             reason: TcpResetReason::AckInvalid,
+            synthesized_reset: Some(TcpSynthesizedReset {
+                metadata: tcp_metadata(local.ip(), local.port(), remote.ip(), remote.port()),
+                packet: expected_reset,
+            }),
+        }]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_reset_observer_synthesizes_rst_ack_for_non_ack_segments() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let observer = Arc::new(RecordingTcpResetObserver::default());
+    let reset = runtime.nodes().register_internal(
+        TcpResetNode::new(TcpResetNext::nodes(drop))
+            .with_observer(Arc::clone(&observer))
+            .expect("attach tcp reset observer"),
+    );
+
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 40_123);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)), 8080);
+    let packet = ipv4_tcp_packet_with_numbers(
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        0x5566_7788,
+        0,
+        tcp_flags(false, false, false, false),
+        b"closed",
+    );
+    let expected_reset = ipv4_tcp_packet_with_numbers(
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        0,
+        0x5566_778e,
+        tcp_flags(false, false, true, true),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(remote.ip(), remote.port(), local.ip(), local.port()),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+    runtime
+        .get_buffer_mut(buffer)
+        .expect("buffer mut")
+        .set_node_error(BufferNodeError::new(reset, TcpInputError::ConnectionClosed.code()));
+
+    assert!(runtime.schedule_frame(reset, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(
+        observer
+            .observations
+            .lock()
+            .expect("tcp reset observations poisoned")
+            .as_slice(),
+        &[TcpResetObservation {
+            local,
+            remote,
+            reason: TcpResetReason::ConnectionClosed,
+            synthesized_reset: Some(TcpSynthesizedReset {
+                metadata: tcp_metadata(local.ip(), local.port(), remote.ip(), remote.port()),
+                packet: expected_reset,
+            }),
+        }]
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_reset_observer_synthesizes_wrapped_rst_ack_for_non_ack_segments() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let observer = Arc::new(RecordingTcpResetObserver::default());
+    let reset = runtime.nodes().register_internal(
+        TcpResetNode::new(TcpResetNext::nodes(drop))
+            .with_observer(Arc::clone(&observer))
+            .expect("attach tcp reset observer"),
+    );
+
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 11)), 40_124);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 56)), 8081);
+    let packet = ipv4_tcp_packet_with_numbers(
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        u32::MAX - 3,
+        0,
+        tcp_flags(false, false, false, false),
+        b"wrapped",
+    );
+    let expected_reset = ipv4_tcp_packet_with_numbers(
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        0,
+        3,
+        tcp_flags(false, false, true, true),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(remote.ip(), remote.port(), local.ip(), local.port()),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+    runtime
+        .get_buffer_mut(buffer)
+        .expect("buffer mut")
+        .set_node_error(BufferNodeError::new(reset, TcpInputError::ConnectionClosed.code()));
+
+    assert!(runtime.schedule_frame(reset, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(
+        observer
+            .observations
+            .lock()
+            .expect("tcp reset observations poisoned")
+            .as_slice(),
+        &[TcpResetObservation {
+            local,
+            remote,
+            reason: TcpResetReason::ConnectionClosed,
+            synthesized_reset: Some(TcpSynthesizedReset {
+                metadata: tcp_metadata(local.ip(), local.port(), remote.ip(), remote.port()),
+                packet: expected_reset,
+            }),
         }]
     );
     assert_eq!(runtime.frames_in_use(), 0);
@@ -145,11 +331,13 @@ fn tcp_metadata(
     }
 }
 
-fn ipv4_tcp_packet(
+fn ipv4_tcp_packet_with_numbers(
     source: Ipv4Addr,
     source_port: u16,
     destination: Ipv4Addr,
     destination_port: u16,
+    sequence_number: u32,
+    acknowledgment_number: u32,
     flags: u8,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -158,6 +346,8 @@ fn ipv4_tcp_packet(
         &mut packet[20..],
         source_port,
         destination_port,
+        sequence_number,
+        acknowledgment_number,
         flags,
         payload,
     );
@@ -189,11 +379,15 @@ fn write_tcp_segment(
     segment: &mut [u8],
     source_port: u16,
     destination_port: u16,
+    sequence_number: u32,
+    acknowledgment_number: u32,
     flags: u8,
     payload: &[u8],
 ) {
     segment[0..2].copy_from_slice(&source_port.to_be_bytes());
     segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&sequence_number.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgment_number.to_be_bytes());
     segment[12] = 0x50;
     segment[13] = flags;
     segment[20..].copy_from_slice(payload);

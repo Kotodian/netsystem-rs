@@ -1214,6 +1214,7 @@ impl RuntimeAppControlHandle {
                     })
                     .map(|_| ())
             }
+            TcpWorkerEvent::TimerExpired { .. } => Ok(()),
             TcpWorkerEvent::ShutdownObserved { .. } => Ok(()),
             TcpWorkerEvent::Closed { connection_id, .. } => {
                 control_handle
@@ -1236,9 +1237,6 @@ impl RuntimeAppControlHandle {
                     })
                     .map(|_| ())
             }
-            other => Err(HammerError::internal(format!(
-                "runtime tcp worker event is not supported yet: {other:?}"
-            ))),
         }
     }
 
@@ -1309,6 +1307,7 @@ impl RuntimeAppControlHandle {
                     ))),
                 }
             }
+            TcpWorkerEvent::TimerExpired { .. } => Ok(()),
             TcpWorkerEvent::Closed {
                 connection_id,
                 reason,
@@ -1341,9 +1340,6 @@ impl RuntimeAppControlHandle {
                 })?;
                 result
             }
-            other => Err(HammerError::internal(format!(
-                "runtime tcp worker event is not supported yet: {other:?}"
-            ))),
         }
     }
 
@@ -2531,6 +2527,23 @@ impl RuntimeService {
         drop(inner);
         control
     }
+
+    fn apply_shared_tcp_action_for_test(
+        &self,
+        action: hammer_core::protocol::tcp::TcpControlPlaneAction,
+    ) -> HammerResult<()> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let control = inner
+            .app_control
+            .with_state(move |state| Ok(state.shared_tcp_control.clone()))
+            .ok()
+            .flatten()
+            .ok_or_else(|| HammerError::internal("shared tcp control is not installed"))?;
+        drop(inner);
+        control
+            .apply(action)
+            .map_err(|err| HammerError::internal(format!("apply shared tcp test action: {err}")))
+    }
 }
 
 #[cfg(test)]
@@ -2539,8 +2552,9 @@ mod tests {
     use crate::transport::tcp::TcpSynSentObservation;
     use hammer_core::StartStage;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpListenerId,
-        TcpListenerKey, TcpWorkerEvent,
+        TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey,
+        TcpControlPlaneAction, TcpListenerId, TcpListenerKey, TcpTimerId, TcpTimerKind,
+        TcpWorkerEvent,
     };
     use hammer_runtime::app::{
         AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,
@@ -3773,6 +3787,85 @@ interval = "5s"
             service
                 .shared_tcp_connection_state_for_test(connection_id)
                 .is_none()
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_terminal_timer_expiry_is_projected_without_panicking() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let connection_id = TcpConnectionId::new(206);
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("bind established connection");
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        service
+            .apply_shared_tcp_action_for_test(TcpControlPlaneAction::ArmTimer {
+                connection_id,
+                timer_id: TcpTimerId::new(16),
+                kind: TcpTimerKind::KeepAlive,
+                timeout: Duration::from_millis(20),
+            })
+            .expect("arm keepalive timer");
+
+        wait_for(Duration::from_secs(1), || {
+            let state = service.app_control_snapshot_for_test();
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+                && state
+                    .tcp_lookup
+                    .lookup_connection_v4(TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 44),
+                        49_152,
+                        Ipv4Addr::new(198, 51, 100, 88),
+                        443,
+                    ))
+                    .is_none()
+        });
+
+        assert!(
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none(),
+            "terminal timer expiry must close the shared connection"
+        );
+        assert!(
+            service
+                .app_control_snapshot_for_test()
+                .tcp_lookup
+                .lookup_connection_v4(TcpV4ConnectionKey::new(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ))
+                .is_none(),
+            "terminal timer expiry must revoke projected established lookup"
         );
 
         service.close().expect("close service");
