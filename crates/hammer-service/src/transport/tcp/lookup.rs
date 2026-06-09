@@ -10,6 +10,7 @@ pub type TcpLookupId = u32;
 pub enum TcpLookupKind {
     Listener = 0,
     EstablishedConnection = 1,
+    SynSentConnection = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +64,28 @@ impl TcpV4ConnectionKey {
 }
 
 impl FlatHashKey for TcpV4ConnectionKey {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        self.0.hash_key()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpV4PendingConnectionKey(u128);
+
+impl TcpV4PendingConnectionKey {
+    #[inline]
+    pub fn new(scope_id: u32, local_port: u16, remote_addr: Ipv4Addr, remote_port: u16) -> Self {
+        Self(
+            (u128::from(scope_id) << 64)
+                | (u128::from(u32::from(remote_addr)) << 32)
+                | (u128::from(local_port) << 16)
+                | u128::from(remote_port),
+        )
+    }
+}
+
+impl FlatHashKey for TcpV4PendingConnectionKey {
     #[inline(always)]
     fn hash_key(self) -> usize {
         self.0.hash_key()
@@ -129,12 +152,39 @@ impl FlatHashKey for TcpV6ConnectionKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpV6PendingConnectionKey {
+    remote_addr: u128,
+    scope_ports: u64,
+}
+
+impl TcpV6PendingConnectionKey {
+    #[inline]
+    pub fn new(scope_id: u32, local_port: u16, remote_addr: Ipv6Addr, remote_port: u16) -> Self {
+        Self {
+            remote_addr: u128::from(remote_addr),
+            scope_ports: (u64::from(scope_id) << 32)
+                | (u64::from(local_port) << 16)
+                | u64::from(remote_port),
+        }
+    }
+}
+
+impl FlatHashKey for TcpV6PendingConnectionKey {
+    #[inline(always)]
+    fn hash_key(self) -> usize {
+        hash_words(&[fold_u128(self.remote_addr), self.scope_ports])
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TcpLookupSnapshot {
     listeners_v4: FlatHashTable<TcpV4ListenerKey, TcpLookupValue>,
     listeners_v6: FlatHashTable<TcpV6ListenerKey, TcpLookupValue>,
     connections_v4: FlatHashTable<TcpV4ConnectionKey, TcpLookupValue>,
     connections_v6: FlatHashTable<TcpV6ConnectionKey, TcpLookupValue>,
+    syn_sent_connections_v4: FlatHashTable<TcpV4PendingConnectionKey, TcpLookupValue>,
+    syn_sent_connections_v6: FlatHashTable<TcpV6PendingConnectionKey, TcpLookupValue>,
 }
 
 impl TcpLookupSnapshot {
@@ -145,6 +195,8 @@ impl TcpLookupSnapshot {
             listeners_v6: FlatHashTable::new(),
             connections_v4: FlatHashTable::new(),
             connections_v6: FlatHashTable::new(),
+            syn_sent_connections_v4: FlatHashTable::new(),
+            syn_sent_connections_v6: FlatHashTable::new(),
         }
     }
 
@@ -152,9 +204,11 @@ impl TcpLookupSnapshot {
     pub fn lookup_v4(
         &self,
         connection: TcpV4ConnectionKey,
+        syn_sent: TcpV4PendingConnectionKey,
         listener: TcpV4ListenerKey,
     ) -> Option<TcpLookupValue> {
         self.lookup_connection_v4(connection)
+            .or_else(|| self.lookup_pending_v4(syn_sent))
             .or_else(|| self.lookup_listener_v4(listener))
     }
 
@@ -162,9 +216,11 @@ impl TcpLookupSnapshot {
     pub fn lookup_v6(
         &self,
         connection: TcpV6ConnectionKey,
+        syn_sent: TcpV6PendingConnectionKey,
         listener: TcpV6ListenerKey,
     ) -> Option<TcpLookupValue> {
         self.lookup_connection_v6(connection)
+            .or_else(|| self.lookup_pending_v6(syn_sent))
             .or_else(|| self.lookup_listener_v6(listener))
     }
 
@@ -189,6 +245,16 @@ impl TcpLookupSnapshot {
     }
 
     #[inline]
+    pub fn lookup_pending_v4(&self, key: TcpV4PendingConnectionKey) -> Option<TcpLookupValue> {
+        self.syn_sent_connections_v4.lookup(&key)
+    }
+
+    #[inline]
+    pub fn lookup_pending_v6(&self, key: TcpV6PendingConnectionKey) -> Option<TcpLookupValue> {
+        self.syn_sent_connections_v6.lookup(&key)
+    }
+
+    #[inline]
     pub(crate) fn insert_listener_v4(&mut self, key: TcpV4ListenerKey, value: TcpLookupValue) {
         self.listeners_v4.insert(key, value);
     }
@@ -207,6 +273,24 @@ impl TcpLookupSnapshot {
     pub(crate) fn insert_connection_v6(&mut self, key: TcpV6ConnectionKey, value: TcpLookupValue) {
         self.connections_v6.insert(key, value);
     }
+
+    #[inline]
+    pub(crate) fn insert_syn_sent_connection_v4(
+        &mut self,
+        key: TcpV4PendingConnectionKey,
+        value: TcpLookupValue,
+    ) {
+        self.syn_sent_connections_v4.insert(key, value);
+    }
+
+    #[inline]
+    pub(crate) fn insert_syn_sent_connection_v6(
+        &mut self,
+        key: TcpV6PendingConnectionKey,
+        value: TcpLookupValue,
+    ) {
+        self.syn_sent_connections_v6.insert(key, value);
+    }
 }
 
 impl Default for TcpLookupSnapshot {
@@ -223,6 +307,8 @@ pub struct TcpWorkerOwnedState {
     listeners_v6: FlatHashTable<TcpV6ListenerKey, TcpLookupValue>,
     connections_v4: FlatHashTable<TcpV4ConnectionKey, TcpLookupValue>,
     connections_v6: FlatHashTable<TcpV6ConnectionKey, TcpLookupValue>,
+    syn_sent_connections_v4: FlatHashTable<TcpV4PendingConnectionKey, TcpLookupValue>,
+    syn_sent_connections_v6: FlatHashTable<TcpV6PendingConnectionKey, TcpLookupValue>,
 }
 
 impl TcpWorkerOwnedState {
@@ -234,6 +320,8 @@ impl TcpWorkerOwnedState {
             listeners_v6: FlatHashTable::new(),
             connections_v4: FlatHashTable::new(),
             connections_v6: FlatHashTable::new(),
+            syn_sent_connections_v4: FlatHashTable::new(),
+            syn_sent_connections_v6: FlatHashTable::new(),
         }
     }
 
@@ -267,12 +355,34 @@ impl TcpWorkerOwnedState {
     }
 
     #[inline]
+    pub fn insert_syn_sent_connection_v4(
+        &mut self,
+        key: TcpV4PendingConnectionKey,
+        id: TcpLookupId,
+    ) {
+        self.syn_sent_connections_v4
+            .insert(key, self.value(TcpLookupKind::SynSentConnection, id));
+    }
+
+    #[inline]
+    pub fn insert_syn_sent_connection_v6(
+        &mut self,
+        key: TcpV6PendingConnectionKey,
+        id: TcpLookupId,
+    ) {
+        self.syn_sent_connections_v6
+            .insert(key, self.value(TcpLookupKind::SynSentConnection, id));
+    }
+
+    #[inline]
     pub fn publish_snapshot(&self) -> TcpLookupSnapshot {
         TcpLookupSnapshot {
             listeners_v4: self.listeners_v4.clone(),
             listeners_v6: self.listeners_v6.clone(),
             connections_v4: self.connections_v4.clone(),
             connections_v6: self.connections_v6.clone(),
+            syn_sent_connections_v4: self.syn_sent_connections_v4.clone(),
+            syn_sent_connections_v6: self.syn_sent_connections_v6.clone(),
         }
     }
 

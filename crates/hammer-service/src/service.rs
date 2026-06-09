@@ -14,6 +14,7 @@ use hammer_core::config::{self, Options, TraceOptions};
 use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
+use hammer_core::protocol::tcp::{TcpConnectionKey, TcpListenerId, TcpWorkerEvent};
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::{
     descriptor::{Descriptor, DescriptorTable},
@@ -52,7 +53,7 @@ use crate::transport::tcp::{
     TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpInputControlPlane,
     TcpInputNext, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
     TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpV4ConnectionKey, TcpV4ListenerKey,
-    TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
 };
 use crate::transport::udp::input::UdpAppRegistration;
 use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
@@ -167,6 +168,8 @@ struct TcpConnectionRegistration {
     flow: AppFlowId,
     lookup_id: TcpLookupId,
     owner_worker: DataWorkerId,
+    state: hammer_core::protocol::tcp::TcpState,
+    local_port: u16,
     local: Option<SocketAddr>,
     remote: SocketAddr,
     target: AppIngressTarget,
@@ -188,6 +191,7 @@ struct RuntimeAppControlState {
     sockets: DescriptorTable<RuntimeSocketKind, RuntimeSocketTag>,
     flows: DescriptorTable<(), RuntimeFlowTag>,
     next_tcp_lookup_id: TcpLookupId,
+    next_tcp_ephemeral_port: u16,
     tcp_accept_control: Option<TcpAcceptControlPlane>,
     tcp_control: TcpInputControlPlane,
     tcp_rcv_process_control: TcpRcvProcessControlPlane,
@@ -269,6 +273,7 @@ impl RuntimeAppControlState {
             sockets: DescriptorTable::new(),
             flows: DescriptorTable::new(),
             next_tcp_lookup_id: 1,
+            next_tcp_ephemeral_port: 49_152,
             tcp_accept_control: None,
             tcp_control,
             tcp_rcv_process_control,
@@ -446,6 +451,8 @@ impl RuntimeAppControlState {
             flow,
             lookup_id,
             owner_worker: listener_registration.owner_worker,
+            state: hammer_core::protocol::tcp::TcpState::Established,
+            local_port: local.port(),
             local: Some(local),
             remote,
             target: AppIngressTarget::flow(app.clone(), flow),
@@ -453,6 +460,26 @@ impl RuntimeAppControlState {
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
         Ok(flow)
+    }
+
+    fn accept_tcp_connection_by_listener_id(
+        &mut self,
+        listener_id: TcpListenerId,
+        remote: SocketAddr,
+        local: SocketAddr,
+    ) -> HammerResult<AppFlowId> {
+        let registration = self
+            .tcp_listeners
+            .iter()
+            .find(|registration| registration.lookup_id as u64 == listener_id.get())
+            .cloned()
+            .ok_or_else(|| {
+                HammerError::internal(format!(
+                    "tcp listener lookup {} is not registered in runtime service",
+                    listener_id.get()
+                ))
+            })?;
+        self.accept_tcp_connection(&registration.app, registration.socket, remote, local)
     }
 
     fn connect_tcp_stream(
@@ -463,10 +490,13 @@ impl RuntimeAppControlState {
     ) -> HammerResult<AppFlowId> {
         let flow = self.alloc_flow();
         let lookup_id = self.alloc_tcp_lookup_id()?;
+        let local_port = self.alloc_tcp_ephemeral_port()?;
         self.tcp_connections.push(TcpConnectionRegistration {
             flow,
             lookup_id,
             owner_worker: worker_id(owner_worker)?,
+            state: hammer_core::protocol::tcp::TcpState::SynSent,
+            local_port,
             local: None,
             remote: peer,
             target: AppIngressTarget::flow(app.clone(), flow),
@@ -496,13 +526,41 @@ impl RuntimeAppControlState {
             }
         }
         for registration in self.tcp_connections.iter().cloned() {
-            let Some(local) = registration.local else {
-                continue;
-            };
             let value = TcpLookupValue {
-                kind: TcpLookupKind::EstablishedConnection,
+                kind: match registration.state {
+                    hammer_core::protocol::tcp::TcpState::SynSent => {
+                        TcpLookupKind::SynSentConnection
+                    }
+                    _ => TcpLookupKind::EstablishedConnection,
+                },
                 id: registration.lookup_id,
                 owner_worker: registration.owner_worker,
+            };
+            if registration.state == hammer_core::protocol::tcp::TcpState::SynSent {
+                match registration.remote.ip() {
+                    IpAddr::V4(remote) => snapshot.insert_syn_sent_connection_v4(
+                        TcpV4PendingConnectionKey::new(
+                            0,
+                            registration.local_port,
+                            remote,
+                            registration.remote.port(),
+                        ),
+                        value,
+                    ),
+                    IpAddr::V6(remote) => snapshot.insert_syn_sent_connection_v6(
+                        TcpV6PendingConnectionKey::new(
+                            0,
+                            registration.local_port,
+                            remote,
+                            registration.remote.port(),
+                        ),
+                        value,
+                    ),
+                }
+                continue;
+            }
+            let Some(local) = registration.local else {
+                continue;
             };
             match (local.ip(), registration.remote.ip()) {
                 (IpAddr::V4(local_ip), IpAddr::V4(remote)) => snapshot.insert_connection_v4(
@@ -538,6 +596,27 @@ impl RuntimeAppControlState {
             .map_err(|err| HammerError::internal(format!("publish tcp lookup snapshot: {err}")))?;
         self.tcp_lookup = snapshot;
         Ok(())
+    }
+
+    fn alloc_tcp_ephemeral_port(&mut self) -> HammerResult<u16> {
+        for _ in 0..u16::MAX {
+            let port = self.next_tcp_ephemeral_port;
+            self.next_tcp_ephemeral_port = self.next_tcp_ephemeral_port.wrapping_add(1).max(49_152);
+            let in_use_by_listener = self
+                .tcp_listeners
+                .iter()
+                .any(|registration| registration.bind.port() == port);
+            let in_use_by_connection = self
+                .tcp_connections
+                .iter()
+                .any(|registration| registration.local_port == port);
+            if !in_use_by_listener && !in_use_by_connection {
+                return Ok(port);
+            }
+        }
+        Err(HammerError::internal(
+            "no ephemeral tcp port is available for pending connect",
+        ))
     }
 
     fn publish_tcp_accept(&self) -> HammerResult<()> {
@@ -644,19 +723,6 @@ impl RuntimeAppControlHandle {
         self.with_state_mut(move |state| state.install_tcp_accept_control(control))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[inline]
-    fn accept_tcp_connection(
-        &self,
-        app: &AppContext,
-        listener: AppSocketId,
-        remote: SocketAddr,
-        local: SocketAddr,
-    ) -> HammerResult<AppFlowId> {
-        let app = app.clone();
-        self.with_state_mut(move |state| state.accept_tcp_connection(&app, listener, remote, local))
-    }
-
     #[inline]
     fn connect_tcp_stream(
         &self,
@@ -669,31 +735,37 @@ impl RuntimeAppControlHandle {
     }
 
     #[inline]
-    fn schedule_accept_tcp_connection(
-        &self,
-        app: &AppContext,
-        listener: AppSocketId,
-        remote: SocketAddr,
-        local: SocketAddr,
-    ) -> HammerResult<()> {
-        let state = Arc::clone(&self.state);
-        let app = app.clone();
-        self.control_handle
-            .schedule_once(Duration::ZERO, move || {
-                let state = Arc::clone(&state);
-                let app = app.clone();
-                async move {
-                    // SAFETY: this closure runs on the single control thread.
-                    let state = unsafe { state.get_mut() };
-                    let result = state.accept_tcp_connection(&app, listener, remote, local);
-                    debug_assert!(
-                        result.is_ok(),
-                        "runtime tcp accept async failed: {result:?}"
-                    );
-                    let _ = result;
-                }
-            })
-            .map(|_| ())
+    fn handle_tcp_worker_event(&self, event: TcpWorkerEvent) -> HammerResult<()> {
+        match event {
+            TcpWorkerEvent::IncomingConnection {
+                listener_id, key, ..
+            } => {
+                let state = Arc::clone(&self.state);
+                self.control_handle
+                    .schedule_once(Duration::ZERO, move || {
+                        let state = Arc::clone(&state);
+                        async move {
+                            let (local, remote) = socket_addrs_from_connection_key(key);
+                            // SAFETY: this closure runs on the single control thread.
+                            let state = unsafe { state.get_mut() };
+                            let result = state.accept_tcp_connection_by_listener_id(
+                                listener_id,
+                                remote,
+                                local,
+                            );
+                            debug_assert!(
+                                result.is_ok(),
+                                "runtime tcp incoming-connection event failed: {result:?}"
+                            );
+                            let _ = result;
+                        }
+                    })
+                    .map(|_| ())
+            }
+            other => Err(HammerError::internal(format!(
+                "runtime tcp worker event is not supported yet: {other:?}"
+            ))),
+        }
     }
 
     #[inline]
@@ -789,18 +861,20 @@ impl crate::transport::tcp::TcpAcceptBackend for RuntimeAppControlHandle {
     fn accept(
         &self,
         _listener_id: TcpLookupId,
-        registration: &TcpAcceptRegistration,
-        remote: SocketAddr,
-        local: SocketAddr,
+        _registration: &TcpAcceptRegistration,
+        _remote: SocketAddr,
+        _local: SocketAddr,
+        event: TcpWorkerEvent,
     ) -> Result<(), CoreError> {
-        self.schedule_accept_tcp_connection(
-            registration.app(),
-            registration.listener(),
-            remote,
-            local,
-        )
-        .map_err(|err| CoreError::internal(format!("runtime tcp accept: {err}")))
+        self.handle_tcp_worker_event(event)
+            .map_err(|err| CoreError::internal(format!("runtime tcp accept: {err}")))
     }
+}
+
+fn socket_addrs_from_connection_key(key: TcpConnectionKey) -> (SocketAddr, SocketAddr) {
+    let local = SocketAddr::new(key.local_addr(), key.local_port());
+    let remote = SocketAddr::new(key.remote_addr(), key.remote_port());
+    (local, remote)
 }
 
 impl RuntimeService {
@@ -1794,17 +1868,9 @@ impl RuntimeService {
             .expect("snapshot runtime app control")
     }
 
-    fn accept_tcp_connection_for_test(
-        &self,
-        app: &AppContext,
-        listener: AppSocketId,
-        remote: SocketAddr,
-        local: SocketAddr,
-    ) -> HammerResult<AppFlowId> {
+    fn handle_tcp_worker_event_for_test(&self, event: TcpWorkerEvent) -> HammerResult<()> {
         let inner = self.inner.lock().expect("service mutex poisoned");
-        inner
-            .app_control
-            .accept_tcp_connection(app, listener, remote, local)
+        inner.app_control.handle_tcp_worker_event(event)
     }
 }
 
@@ -1812,6 +1878,9 @@ impl RuntimeService {
 mod tests {
     use super::*;
     use hammer_core::StartStage;
+    use hammer_core::protocol::tcp::{
+        TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
+    };
     use hammer_runtime::app::{
         AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSqeData,
         AppSqeDescriptor, AppUserData,
@@ -2330,20 +2399,30 @@ interval = "5s"
         ready_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("wait accept ready");
-        let flow = service
-            .accept_tcp_connection_for_test(&app, listener, remote, local)
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::IncomingConnection {
+                listener_id: TcpListenerId::new(1),
+                listener: TcpListenerKey::v4(0, Ipv4Addr::new(127, 0, 0, 1), 7200),
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                    7200,
+                    Ipv4Addr::new(198, 51, 100, 72),
+                    40_720,
+                ),
+                capabilities: TcpCapabilities::default(),
+            })
             .expect("accept tcp connection");
         let accept_cqe = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("receive accept result");
-        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
         match accept_cqe.payload() {
             AppCqeData::Accepted {
                 listener: cqe_listener,
                 flow: cqe_flow,
             } => {
                 assert_eq!(cqe_listener, listener);
-                assert_eq!(cqe_flow, flow);
+                assert_eq!(app.owner_worker_for_flow(cqe_flow).expect("flow owner"), 1);
             }
             other => panic!("unexpected accept cqe payload: {other:?}"),
         }
@@ -2369,6 +2448,32 @@ interval = "5s"
             .expect("published tcp connection lookup");
         assert_eq!(published.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(published.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_connect_publishes_pending_syn_sent_lookup() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
+
+        let state = service.app_control_snapshot_for_test();
+        let pending = state
+            .tcp_lookup
+            .lookup_pending_v4(TcpV4PendingConnectionKey::new(
+                0,
+                49_152,
+                Ipv4Addr::new(198, 51, 100, 88),
+                443,
+            ))
+            .expect("published pending syn-sent lookup");
+        assert_eq!(pending.kind, TcpLookupKind::SynSentConnection);
+        assert_eq!(pending.owner_worker, DataWorkerId::new(1));
 
         service.close().expect("close service");
     }

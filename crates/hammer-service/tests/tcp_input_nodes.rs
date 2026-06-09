@@ -8,6 +8,9 @@ use hammer_adapter::{
     NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
+};
 use hammer_runtime::app::{
     AppContext, AppControl, AppControlBackend, AppCqeData, AppFlowId, AppObjectRef, AppOpcode,
     AppSocketId, AppSqeData, AppSqeDescriptor, AppUserData,
@@ -20,8 +23,9 @@ use hammer_service::transport::tcp::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration,
     TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputError, TcpInputHandoff,
     TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode, TcpLookupId,
-    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpWorkerOwnedState,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode, TcpSynSentNext,
+    TcpSynSentNode, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey,
+    TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -178,6 +182,7 @@ impl AppControlBackend for TestAppControlBackend {
 struct RecordingTcpAcceptBackend {
     accepted_flow: AppFlowId,
     records: Arc<Mutex<Vec<(TcpLookupId, std::net::SocketAddr, std::net::SocketAddr)>>>,
+    events: Arc<Mutex<Vec<TcpWorkerEvent>>>,
 }
 
 impl TcpAcceptBackend for RecordingTcpAcceptBackend {
@@ -187,6 +192,7 @@ impl TcpAcceptBackend for RecordingTcpAcceptBackend {
         registration: &TcpAcceptRegistration,
         remote: std::net::SocketAddr,
         local: std::net::SocketAddr,
+        event: TcpWorkerEvent,
     ) -> CoreResult<()> {
         registration
             .app()
@@ -196,6 +202,10 @@ impl TcpAcceptBackend for RecordingTcpAcceptBackend {
             .lock()
             .map_err(|_| CoreError::internal("accept records poisoned"))?
             .push((listener_id, remote, local));
+        self.events
+            .lock()
+            .map_err(|_| CoreError::internal("accept events poisoned"))?
+            .push(event);
         Ok(())
     }
 }
@@ -544,6 +554,62 @@ fn tcp_input_handoffs_listener_packets_to_listener_owner_worker() {
 }
 
 #[test]
+fn tcp_input_routes_syn_ack_for_syn_sent_connection_to_syn_sent_node() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let graph = TcpGraph::new(&runtime);
+    let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    let syn_sent_key =
+        TcpV4PendingConnectionKey::new(0, 40_144, Ipv4Addr::new(198, 51, 100, 44), 443);
+    owner.insert_syn_sent_connection_v4(syn_sent_key, 144);
+    graph
+        .tcp_control
+        .publish_lookup(owner.publish_snapshot())
+        .expect("publish syn-sent lookup snapshot");
+
+    let packet = ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 44),
+        443,
+        Ipv4Addr::new(192, 0, 2, 44),
+        40_144,
+        tcp_flags(false, true, false, true),
+        b"syn-ack",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let metadata = tcp_metadata(
+        Ipv4Addr::new(198, 51, 100, 44).into(),
+        443,
+        Ipv4Addr::new(192, 0, 2, 44).into(),
+        40_144,
+    );
+    let buffer = push_packet(&runtime, frame, &packet, metadata);
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(
+        runtime
+            .schedule_frame(graph.tcp_input, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_capture_packets(&graph.syn_sent_state, &[packet]);
+    assert!(graph.listen_state.lock().unwrap().packets.is_empty());
+    assert!(graph.reset_state.lock().unwrap().packets.is_empty());
+    assert!(graph.established_state.lock().unwrap().packets.is_empty());
+    let state = graph.syn_sent_state.lock().unwrap();
+    assert_eq!(state.node_errors, vec![None]);
+    assert_metadata(
+        &state.metadata[0],
+        Ipv4Addr::new(198, 51, 100, 44).into(),
+        443,
+        Ipv4Addr::new(192, 0, 2, 44).into(),
+        40_144,
+    );
+    drop(state);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
 fn tcp_rcv_process_node_passes_packets_to_configured_next() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let sink_state = Arc::new(Mutex::new(CaptureState::default()));
@@ -607,9 +673,11 @@ fn tcp_accept_node_completes_listener_accept_into_app_ring() {
         .expect("bind listener");
     let accepted_flow = AppFlowId::new(0x7443);
     let accepted_records = Arc::new(Mutex::new(Vec::new()));
+    let accepted_events = Arc::new(Mutex::new(Vec::new()));
     let accept_backend = Arc::new(RecordingTcpAcceptBackend {
         accepted_flow,
         records: Arc::clone(&accepted_records),
+        events: Arc::clone(&accepted_events),
     });
 
     let result =
@@ -727,6 +795,21 @@ fn tcp_accept_node_completes_listener_accept_into_app_ring() {
             "198.51.100.74:40743".parse().expect("remote"),
             "127.0.0.1:7443".parse().expect("local"),
         )]
+    );
+    assert_eq!(
+        *accepted_events.lock().unwrap(),
+        vec![TcpWorkerEvent::IncomingConnection {
+            listener_id: TcpListenerId::new(LISTENER_ID as u64),
+            listener: TcpListenerKey::v4(0, Ipv4Addr::new(127, 0, 0, 1), 7443),
+            key: TcpConnectionKey::v4(
+                0,
+                Ipv4Addr::new(127, 0, 0, 1),
+                7443,
+                Ipv4Addr::new(198, 51, 100, 74),
+                40_743,
+            ),
+            capabilities: TcpCapabilities::default(),
+        }]
     );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
@@ -906,6 +989,7 @@ struct TcpGraph {
     tcp_input: NodeId,
     tcp_control: TcpInputControlPlane,
     listen_state: Arc<Mutex<CaptureState>>,
+    syn_sent_state: Arc<Mutex<CaptureState>>,
     reset_state: Arc<Mutex<CaptureState>>,
     established_state: Arc<Mutex<CaptureState>>,
 }
@@ -925,6 +1009,7 @@ impl TcpGraph {
 
     fn new_inner(runtime: &DataPlaneRuntime, handoff: Option<(NodeHandle, DataWorkerId)>) -> Self {
         let listen_state = Arc::new(Mutex::new(CaptureState::default()));
+        let syn_sent_state = Arc::new(Mutex::new(CaptureState::default()));
         let reset_state = Arc::new(Mutex::new(CaptureState::default()));
         let established_state = Arc::new(Mutex::new(CaptureState::default()));
         let drop = runtime.nodes().register_internal(DropNode::new());
@@ -950,6 +1035,14 @@ impl TcpGraph {
         let listen_node = TcpListenNode::new(TcpListenNext::nodes(listen_sink));
         assert_internal_node(&listen_node);
         let listen = runtime.nodes().register_internal(listen_node);
+        let syn_sent =
+            runtime
+                .nodes()
+                .register_internal(TcpSynSentNode::new(TcpSynSentNext::nodes(
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::clone(&syn_sent_state))),
+                )));
         let reset_node = TcpResetNode::new(TcpResetNext::nodes(reset_sink));
         assert_internal_node(&reset_node);
         let reset = runtime.nodes().register_internal(reset_node);
@@ -958,7 +1051,7 @@ impl TcpGraph {
             punt,
             listen,
             drop,
-            drop,
+            syn_sent,
             established,
             reset,
         ));
@@ -982,6 +1075,7 @@ impl TcpGraph {
             tcp_input,
             tcp_control,
             listen_state,
+            syn_sent_state,
             reset_state,
             established_state,
         }
