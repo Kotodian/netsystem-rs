@@ -274,6 +274,14 @@ fn tcp_input_routes_listen_ack_to_reset_node() {
         tcp_flags(false, false, false, true),
         b"ack",
     );
+    let expected_reset = ipv4_tcp_packet(
+        Ipv4Addr::new(192, 0, 2, 20),
+        LISTEN_PORT,
+        Ipv4Addr::new(10, 0, 0, 2),
+        50_002,
+        tcp_flags(false, false, true, false),
+        b"",
+    );
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     push_tcp_packet(
         &runtime,
@@ -292,23 +300,17 @@ fn tcp_input_routes_listen_ack_to_reset_node() {
     );
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
-    assert_capture_packets(&graph.reset_state, &[packet]);
+    assert_capture_packets(&graph.reset_state, &[expected_reset]);
     assert!(graph.listen_state.lock().unwrap().packets.is_empty());
     assert!(graph.established_state.lock().unwrap().packets.is_empty());
     let state = graph.reset_state.lock().unwrap();
-    assert_eq!(
-        state.node_errors,
-        vec![Some(BufferNodeError::new(
-            graph.tcp_input,
-            TcpInputError::AckInvalid.code(),
-        ))]
-    );
+    assert_eq!(state.node_errors, vec![None]);
     assert_metadata(
         &state.metadata[0],
-        Ipv4Addr::new(10, 0, 0, 2).into(),
-        50_002,
         Ipv4Addr::new(192, 0, 2, 20).into(),
         LISTEN_PORT,
+        Ipv4Addr::new(10, 0, 0, 2).into(),
+        50_002,
     );
     drop(state);
     assert_eq!(
@@ -753,7 +755,7 @@ fn tcp_input_syn_rcvd_final_ack_completes_listener_accept_into_app_ring() {
                             .register_internal(TcpListenNode::new(TcpListenNext::nodes(accept)));
                         let reset = runtime
                             .nodes()
-                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop)));
+                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, drop)));
                         let established = runtime.nodes().register_internal(
                             TcpEstablishedNode::new(TcpEstablishedNext::nodes(drop)),
                         );
@@ -983,7 +985,7 @@ fn tcp_accept_node_completes_listener_accept_into_app_ring() {
                         let listen = runtime.nodes().register_internal(listen_node);
                         let reset = runtime
                             .nodes()
-                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop)));
+                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, drop)));
                         let established = runtime.nodes().register_internal(
                             TcpEstablishedNode::new(TcpEstablishedNext::nodes(drop)),
                         );
@@ -1304,7 +1306,7 @@ impl TcpGraph {
                         .nodes()
                         .register_internal(CaptureNode::new(Arc::clone(&syn_sent_state))),
                 )));
-        let reset_node = TcpResetNode::new(TcpResetNext::nodes(reset_sink));
+        let reset_node = TcpResetNode::new(TcpResetNext::nodes(drop, reset_sink));
         assert_internal_node(&reset_node);
         let reset = runtime.nodes().register_internal(reset_node);
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(

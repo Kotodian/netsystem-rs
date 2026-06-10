@@ -151,7 +151,7 @@ fn tcp_listen_accept_recovers_socket_addrs_from_packet_when_route_metadata_is_mi
                         .register_internal(TcpListenNode::new(TcpListenNext::nodes(accept)));
                     let reset = runtime
                         .nodes()
-                        .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop)));
+                        .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, drop)));
                     let established = runtime.nodes().register_internal(TcpEstablishedNode::new(
                         TcpEstablishedNext::nodes(drop),
                     ));

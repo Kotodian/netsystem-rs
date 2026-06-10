@@ -1,8 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferNodeError, BufferPacketCursor, DataPlaneRuntime, Network, RouteMetadata, SocksAddr,
+    BufferFrame, BufferNodeError, BufferPacketCursor, DataPlaneRuntime, Network, NodeProcessFn,
+    NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
@@ -28,19 +29,99 @@ impl TcpResetObserver for RecordingTcpResetObserver {
     }
 }
 
+#[derive(Default)]
+struct CaptureState {
+    packets: Vec<Vec<u8>>,
+    metadata: Vec<RouteMetadata>,
+    node_errors: Vec<Option<BufferNodeError>>,
+}
+
+struct CaptureNode {
+    runtime_data: NodeRuntimeData,
+}
+
+impl CaptureNode {
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
+        }
+    }
+}
+
+impl hammer_adapter::Node for CaptureNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        panic!("capture node must run through descriptor process");
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl hammer_adapter::InternalNode for CaptureNode {}
+
+fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = {
+        let states = capture_states()
+            .lock()
+            .expect("capture state registry poisoned");
+        Arc::clone(
+            states
+                .get(data.usize_word(0).expect("capture state slot"))
+                .expect("capture state slot exists"),
+        )
+    };
+    for index in frame.drain_pending() {
+        let packet = runtime.copy_current_chain(index)?;
+        let metadata = runtime.metadata(index)?;
+        let node_error = runtime.node_error(index)?;
+        let mut state = state.lock().expect("capture state poisoned");
+        state.packets.push(packet.into_iter().collect());
+        state.metadata.push(metadata);
+        state.node_errors.push(node_error);
+        runtime.free_index(index);
+    }
+    Ok(NodeResult::drop())
+}
+
 #[test]
 fn tcp_reset_observer_records_local_remote_metadata_reason_and_synthesized_reset() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-    let drop = runtime.nodes().register_internal(DropNode::new());
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
     let observer = Arc::new(RecordingTcpResetObserver::default());
     let reset = runtime.nodes().register_internal(
-        TcpResetNode::new(TcpResetNext::nodes(drop))
+        TcpResetNode::new(TcpResetNext::nodes(drop_node, drop_node))
             .with_observer(Arc::clone(&observer))
             .expect("attach tcp reset observer"),
     );
     let tcp_input = runtime.nodes().register_internal(
         TcpInputControlPlane::new(TcpInputNext::nodes(
-            drop, drop, drop, drop, drop, drop, reset,
+            drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, reset,
         ))
         .node(),
     );
@@ -123,7 +204,7 @@ fn tcp_reset_observer_synthesizes_rst_ack_for_non_ack_segments() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let observer = Arc::new(RecordingTcpResetObserver::default());
     let reset = runtime.nodes().register_internal(
-        TcpResetNode::new(TcpResetNext::nodes(drop))
+        TcpResetNode::new(TcpResetNext::nodes(drop, drop))
             .with_observer(Arc::clone(&observer))
             .expect("attach tcp reset observer"),
     );
@@ -207,7 +288,7 @@ fn tcp_reset_observer_synthesizes_wrapped_rst_ack_for_non_ack_segments() {
     let drop = runtime.nodes().register_internal(DropNode::new());
     let observer = Arc::new(RecordingTcpResetObserver::default());
     let reset = runtime.nodes().register_internal(
-        TcpResetNode::new(TcpResetNext::nodes(drop))
+        TcpResetNode::new(TcpResetNext::nodes(drop, drop))
             .with_observer(Arc::clone(&observer))
             .expect("attach tcp reset observer"),
     );
@@ -281,6 +362,107 @@ fn tcp_reset_observer_synthesizes_wrapped_rst_ack_for_non_ack_segments() {
             }),
         }]
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_reset_node_reinjects_synthesized_reset_into_lookup_next() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+    let lookup = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
+    let observer = Arc::new(RecordingTcpResetObserver::default());
+    let reset = runtime.nodes().register_internal(
+        TcpResetNode::new(TcpResetNext::nodes(drop_node, lookup))
+            .with_observer(Arc::clone(&observer))
+            .expect("attach tcp reset observer"),
+    );
+
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 12)), 40_125);
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 57)), 8082);
+    let packet = ipv4_tcp_packet_with_numbers(
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        0x0102_0304,
+        0x1020_3040,
+        tcp_flags(false, false, false, true),
+        b"ack",
+    );
+    let expected_reset = ipv4_tcp_packet_with_numbers(
+        match local.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        local.port(),
+        match remote.ip() {
+            IpAddr::V4(ip) => ip,
+            _ => unreachable!(),
+        },
+        remote.port(),
+        0x1020_3040,
+        0,
+        tcp_flags(false, false, true, false),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(remote.ip(), remote.port(), local.ip(), local.port()),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+    runtime
+        .get_buffer_mut(buffer)
+        .expect("buffer mut")
+        .set_node_error(BufferNodeError::new(
+            reset,
+            TcpInputError::AckInvalid.code(),
+        ));
+
+    assert!(runtime.schedule_frame(reset, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(
+        observer
+            .observations
+            .lock()
+            .expect("tcp reset observations poisoned")
+            .as_slice(),
+        &[TcpResetObservation {
+            local,
+            remote,
+            reason: TcpResetReason::AckInvalid,
+            synthesized_reset: Some(TcpSynthesizedReset {
+                metadata: tcp_metadata(local.ip(), local.port(), remote.ip(), remote.port()),
+                packet: expected_reset.clone(),
+            }),
+        }]
+    );
+    let state = lookup_state.lock().expect("lookup capture state poisoned");
+    assert_eq!(state.packets, vec![expected_reset]);
+    assert_eq!(
+        state.metadata,
+        vec![tcp_metadata(
+            local.ip(),
+            local.port(),
+            remote.ip(),
+            remote.port()
+        )]
+    );
+    assert_eq!(state.node_errors, vec![None]);
+    std::mem::drop(state);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
