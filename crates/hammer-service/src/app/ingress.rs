@@ -70,12 +70,32 @@ impl AppIngressTarget {
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<()> {
-        AppIngressBackend.post_recv_cqe(runtime, index, self)
+        self.post_recv_cqe_descriptor_with_fin(runtime, index, false)
+    }
+
+    #[inline]
+    pub fn post_recv_cqe_descriptor_with_fin(
+        &self,
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+        fin: bool,
+    ) -> CoreResult<()> {
+        AppIngressBackend.post_recv_cqe_with_fin(runtime, index, self, fin)
     }
 
     #[inline]
     pub fn post_recv_cqe(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
         self.post_recv_cqe_descriptor(runtime, index)
+    }
+
+    #[inline]
+    pub fn post_recv_cqe_with_fin(
+        &self,
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+        fin: bool,
+    ) -> CoreResult<()> {
+        self.post_recv_cqe_descriptor_with_fin(runtime, index, fin)
     }
 }
 

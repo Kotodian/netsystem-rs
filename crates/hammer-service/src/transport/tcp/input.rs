@@ -316,9 +316,15 @@ fn tcp_input_process(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PendingTcpAppIngress {
+    pub(crate) connection_id: TcpLookupId,
+    pub(crate) fin: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PendingTcpAppIngressEntry {
     generation: u32,
-    connection_id: TcpLookupId,
+    pending: PendingTcpAppIngress,
     occupied: bool,
 }
 
@@ -359,7 +365,7 @@ impl PendingTcpAppIngressStore {
     }
 
     #[inline]
-    fn mark(&mut self, index: BufferIndex, connection_id: TcpLookupId) {
+    fn mark(&mut self, index: BufferIndex, pending: PendingTcpAppIngress) {
         let pool = self.pool_mut(index.pool_id());
         let slot = index.slot() as usize;
         while pool.entries.len() <= slot {
@@ -367,13 +373,13 @@ impl PendingTcpAppIngressStore {
         }
         pool.entries[slot] = PendingTcpAppIngressEntry {
             generation: index.generation(),
-            connection_id,
+            pending,
             occupied: true,
         };
     }
 
     #[inline]
-    fn take(&mut self, index: BufferIndex) -> Option<TcpLookupId> {
+    fn take(&mut self, index: BufferIndex) -> Option<PendingTcpAppIngress> {
         let pool = self
             .pools
             .iter_mut()
@@ -386,9 +392,9 @@ impl PendingTcpAppIngressStore {
             *entry = PendingTcpAppIngressEntry::default();
             return None;
         }
-        let connection_id = entry.connection_id;
+        let pending = entry.pending;
         *entry = PendingTcpAppIngressEntry::default();
-        Some(connection_id)
+        Some(pending)
     }
 
     #[inline]
@@ -406,18 +412,21 @@ impl PendingTcpAppIngressStore {
 pub(crate) fn mark_pending_tcp_app_ingress(
     index: BufferIndex,
     connection_id: TcpLookupId,
+    fin: bool,
 ) -> CoreResult<()> {
     TCP_APP_INGRESS_PENDING.with(|pending| {
         pending
             .try_borrow_mut()
             .map_err(|_| CoreError::internal("TCP app ingress pending store borrowed"))?
-            .mark(index, connection_id);
+            .mark(index, PendingTcpAppIngress { connection_id, fin });
         Ok(())
     })
 }
 
 #[inline]
-pub(crate) fn take_pending_tcp_app_ingress(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
+pub(crate) fn take_pending_tcp_app_ingress(
+    index: BufferIndex,
+) -> CoreResult<Option<PendingTcpAppIngress>> {
     TCP_APP_INGRESS_PENDING.with(|pending| {
         Ok(pending
             .try_borrow_mut()
@@ -621,7 +630,7 @@ fn next_node_for_index(
     if entry.next == TcpInputNext::Established
         && let Some(connection_id) = app_ingress_connection
     {
-        mark_pending_tcp_app_ingress(index, connection_id)?;
+        mark_pending_tcp_app_ingress(index, connection_id, false)?;
     }
     if entry.next == TcpInputNext::Listen
         && let Some(listener_id) =
@@ -735,7 +744,7 @@ mod tests {
     use hammer_adapter::{DataPlaneRuntime, RouteMetadata};
 
     use super::{
-        PendingTcpAppIngressStore, TcpInputSnapshot, TcpInputSnapshotHandle,
+        PendingTcpAppIngress, PendingTcpAppIngressStore, TcpInputSnapshot, TcpInputSnapshotHandle,
         register_tcp_input_runtime,
     };
 
@@ -747,15 +756,33 @@ mod tests {
         let first = runtime
             .alloc_index(RouteMetadata::default())
             .expect("allocate first buffer");
-        pending.mark(first, 11);
-        assert_eq!(pending.take(first), Some(11));
+        pending.mark(
+            first,
+            PendingTcpAppIngress {
+                connection_id: 11,
+                fin: false,
+            },
+        );
+        assert_eq!(
+            pending.take(first),
+            Some(PendingTcpAppIngress {
+                connection_id: 11,
+                fin: false,
+            })
+        );
         assert_eq!(pending.take(first), None);
         runtime.free_index(first);
 
         let stale = runtime
             .alloc_index(RouteMetadata::default())
             .expect("allocate stale buffer");
-        pending.mark(stale, 37);
+        pending.mark(
+            stale,
+            PendingTcpAppIngress {
+                connection_id: 37,
+                fin: true,
+            },
+        );
         runtime.free_index(stale);
 
         let reused = runtime
