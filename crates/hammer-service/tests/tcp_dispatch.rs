@@ -56,6 +56,12 @@ fn tcp_dispatch_table_matches_expected_state_flag_matrix() {
         ),
         (
             TcpState::Established,
+            TcpInputFlags::RST,
+            TcpInputNext::Established,
+            None,
+        ),
+        (
+            TcpState::Established,
             TcpInputFlags::FIN | TcpInputFlags::ACK,
             TcpInputNext::Established,
             None,
