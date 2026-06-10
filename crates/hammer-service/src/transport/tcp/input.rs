@@ -18,9 +18,10 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
 use super::{
-    TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext, TcpLookupId, TcpLookupKind,
-    TcpLookupSnapshot, TcpLookupValue, TcpState, TcpV4ConnectionKey, TcpV4ListenerKey,
-    TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
+    TcpConnectionSnapshotPool, TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext,
+    TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpState, TcpV4ConnectionKey,
+    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV6PendingConnectionKey,
 };
 
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -92,6 +93,7 @@ fn format_tcp_input_trace(bytes: &[u8]) -> String {
 #[derive(Debug, Clone)]
 struct TcpInputSnapshot {
     lookup: TcpLookupSnapshot,
+    connections: TcpConnectionSnapshotPool,
     dispatch: TcpDispatchTable,
     app_ingress: Arc<FlatHashTable<TcpLookupId, ()>>,
 }
@@ -101,6 +103,7 @@ impl TcpInputSnapshot {
     fn new() -> Self {
         Self {
             lookup: TcpLookupSnapshot::default(),
+            connections: TcpConnectionSnapshotPool::empty(),
             dispatch: TcpDispatchTable::default(),
             app_ingress: Arc::new(FlatHashTable::new()),
         }
@@ -153,6 +156,16 @@ impl TcpInputControlPlane {
         self.inner.rcu(|current| {
             let mut next = TcpInputSnapshot::clone(current);
             next.dispatch = dispatch.clone();
+            next
+        });
+        Ok(())
+    }
+
+    #[inline]
+    pub fn publish_connections(&self, connections: TcpConnectionSnapshotPool) -> CoreResult<()> {
+        self.inner.rcu(|current| {
+            let mut next = TcpInputSnapshot::clone(current);
+            next.connections = connections.clone();
             next
         });
         Ok(())
@@ -573,7 +586,8 @@ fn next_node_for_index(
         }
     };
 
-    let lookup = lookup_for_packet(runtime.metadata(index)?, &snapshot.lookup, &parsed);
+    let metadata = runtime.metadata(index)?;
+    let lookup = lookup_for_packet(&metadata, &snapshot.lookup, &parsed);
     if let Some(owner) = lookup_owner(lookup)
         && let Some(handoff) = handoff
         && owner != handoff.current_worker()
@@ -581,11 +595,7 @@ fn next_node_for_index(
         runtime.handoff_index(owner, handoff.tcp_input, index)?;
         return Ok(None);
     }
-    let state = match lookup {
-        Some(value) if value.kind == TcpLookupKind::EstablishedConnection => TcpState::Established,
-        Some(value) if value.kind == TcpLookupKind::SynSentConnection => TcpState::SynSent,
-        _ => TcpState::Listen,
-    };
+    let state = tcp_state_for_lookup(lookup, &snapshot.connections);
     let app_ingress_connection = match lookup {
         Some(value)
             if value.kind == TcpLookupKind::EstablishedConnection
@@ -614,10 +624,10 @@ fn next_node_for_index(
         mark_pending_tcp_app_ingress(index, connection_id)?;
     }
     if entry.next == TcpInputNext::Listen
-        && let Some(value) = lookup
-        && value.kind == TcpLookupKind::Listener
+        && let Some(listener_id) =
+            pending_tcp_accept_listener_id(&metadata, lookup, &snapshot.lookup, &parsed, state)
     {
-        mark_pending_tcp_accept(index, value.id)?;
+        mark_pending_tcp_accept(index, listener_id)?;
     }
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, entry.next);
@@ -680,6 +690,40 @@ fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
             Some(value.owner_worker)
         }
         _ => None,
+    }
+}
+
+#[inline(always)]
+fn pending_tcp_accept_listener_id(
+    metadata: &RouteMetadata,
+    lookup: Option<TcpLookupValue>,
+    snapshot: &TcpLookupSnapshot,
+    parsed: &ParsedTcpInput,
+    state: TcpState,
+) -> Option<TcpLookupId> {
+    match lookup {
+        Some(value) if value.kind == TcpLookupKind::Listener => Some(value.id),
+        Some(_) if state == TcpState::SynRcvd => {
+            listener_lookup_for_packet(metadata, snapshot, parsed)
+                .filter(|value| value.kind == TcpLookupKind::Listener)
+                .map(|value| value.id)
+        }
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn tcp_state_for_lookup(
+    lookup: Option<TcpLookupValue>,
+    connections: &TcpConnectionSnapshotPool,
+) -> TcpState {
+    match lookup {
+        Some(value) if value.kind == TcpLookupKind::SynSentConnection => TcpState::SynSent,
+        Some(value) if value.kind == TcpLookupKind::EstablishedConnection => connections
+            .lookup_by_lookup_id(value.id)
+            .map(|snapshot| snapshot.state)
+            .unwrap_or(TcpState::Established),
+        _ => TcpState::Listen,
     }
 }
 
@@ -882,7 +926,7 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
 
 #[inline(always)]
 fn lookup_for_packet(
-    metadata: RouteMetadata,
+    metadata: &RouteMetadata,
     snapshot: &TcpLookupSnapshot,
     parsed: &ParsedTcpInput,
 ) -> Option<TcpLookupValue> {
@@ -907,6 +951,28 @@ fn lookup_for_packet(
             TcpV6PendingConnectionKey::new(0, local.1, remote_addr, remote.1),
             TcpV6ListenerKey::new(0, local_addr, local.1),
         ),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn listener_lookup_for_packet(
+    metadata: &RouteMetadata,
+    snapshot: &TcpLookupSnapshot,
+    parsed: &ParsedTcpInput,
+) -> Option<TcpLookupValue> {
+    let local = metadata
+        .destination
+        .as_ref()
+        .map(|addr| (addr.host, addr.port))
+        .unwrap_or((parsed.destination_ip, parsed.destination_port));
+    match (local.0, parsed.version) {
+        (IpAddr::V4(local_addr), IpVersion::V4) => {
+            snapshot.lookup_listener_v4(TcpV4ListenerKey::new(0, local_addr, local.1))
+        }
+        (IpAddr::V6(local_addr), IpVersion::V6) => {
+            snapshot.lookup_listener_v6(TcpV6ListenerKey::new(0, local_addr, local.1))
+        }
         _ => None,
     }
 }

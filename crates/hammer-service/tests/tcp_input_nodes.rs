@@ -21,11 +21,11 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::tcp::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration,
-    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputError, TcpInputHandoff,
-    TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode, TcpLookupId,
-    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode, TcpSynSentNext,
-    TcpSynSentNode, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey,
-    TcpWorkerOwnedState,
+    TcpConnectionSnapshot, TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane,
+    TcpInputError, TcpInputHandoff, TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode,
+    TcpLookupId, TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode,
+    TcpState, TcpSynSentNext, TcpSynSentNode, TcpV4ConnectionKey, TcpV4ListenerKey,
+    TcpV4PendingConnectionKey, TcpWorkerOwnedConnectionState, TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -615,6 +615,258 @@ fn tcp_input_routes_syn_ack_for_syn_sent_connection_to_syn_sent_node() {
     drop(state);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_input_uses_connection_snapshot_state_for_syn_rcvd_ack() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let graph = TcpGraph::new(&runtime);
+    let local = Ipv4Addr::new(192, 0, 2, 45);
+    let remote = Ipv4Addr::new(198, 51, 100, 45);
+
+    let mut lookup_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    lookup_owner.insert_connection_v4(
+        TcpV4ConnectionKey::new(0, local, LISTEN_PORT, remote, 50_045),
+        ESTABLISHED_ID,
+    );
+    graph
+        .tcp_control
+        .publish_lookup(lookup_owner.publish_snapshot())
+        .expect("publish lookup snapshot");
+
+    let mut connections = TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+    connections.insert(TcpConnectionSnapshot {
+        lookup_id: ESTABLISHED_ID,
+        connection_id: None,
+        owner_worker: DataWorkerId::new(0),
+        state: TcpState::SynRcvd,
+        local_port: LISTEN_PORT,
+        local: Some(std::net::SocketAddr::new(IpAddr::V4(local), LISTEN_PORT)),
+        remote: std::net::SocketAddr::new(IpAddr::V4(remote), 50_045),
+        iss: 1_000,
+        irs: 2_000,
+        snd_una: 1_001,
+        snd_nxt: 1_002,
+        snd_wnd: 65_535,
+        rcv_nxt: 2_001,
+        rcv_wnd: 65_535,
+    });
+    graph
+        .tcp_control
+        .publish_connections(connections.publish_snapshot())
+        .expect("publish connection snapshot");
+
+    let packet = ipv4_tcp_packet(
+        remote,
+        50_045,
+        local,
+        LISTEN_PORT,
+        tcp_flags(false, false, false, true),
+        b"final-ack",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let metadata = tcp_metadata(IpAddr::V4(remote), 50_045, IpAddr::V4(local), LISTEN_PORT);
+    let buffer = push_packet(&runtime, frame, &packet, metadata);
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(
+        runtime
+            .schedule_frame(graph.tcp_input, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+    assert_capture_packets(&graph.listen_state, &[packet]);
+    assert!(graph.established_state.lock().unwrap().packets.is_empty());
+    assert!(graph.reset_state.lock().unwrap().packets.is_empty());
+    let state = graph.listen_state.lock().unwrap();
+    assert_eq!(state.node_errors, vec![None]);
+    assert_metadata(
+        &state.metadata[0],
+        IpAddr::V4(remote),
+        50_045,
+        IpAddr::V4(local),
+        LISTEN_PORT,
+    );
+    drop(state);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_input_syn_rcvd_final_ack_completes_listener_accept_into_app_ring() {
+    let data_runtime =
+        DataRuntime::new(1, "tcp-syn-rcvd-final-ack-test", 512 * 1024, 2).expect("data runtime");
+    let data_context = data_runtime.context();
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    app.install_control(AppControl::new(Arc::new(TestAppControlBackend::default())))
+        .expect("install app control");
+    let listener = app
+        .bind_tcp_listener("127.0.0.1:7443".parse().expect("listener bind"), 0)
+        .expect("bind listener");
+    let accepted_flow = AppFlowId::new(0x7555);
+    let accepted_records = Arc::new(Mutex::new(Vec::new()));
+    let accepted_events = Arc::new(Mutex::new(Vec::new()));
+    let accept_backend = Arc::new(RecordingTcpAcceptBackend {
+        accepted_flow,
+        records: Arc::clone(&accepted_records),
+        events: Arc::clone(&accepted_events),
+    });
+
+    let result =
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime")
+            .block_on(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                data_context
+                    .spawn_local_on_worker(0, move || async move {
+                        let listener_backend = app
+                            .local_backend_for_socket(listener)
+                            .expect("listener backend");
+                        listener_backend
+                            .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                                AppOpcode::Accept,
+                                AppUserData::new(78),
+                                AppObjectRef::Socket(listener),
+                                AppSqeData::Accept,
+                            ))
+                            .expect("push accept sqe");
+
+                        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+                        let drop = runtime.nodes().register_internal(DropNode::new());
+                        let punt = runtime.nodes().register_internal(CaptureNode::new(Arc::new(
+                            Mutex::new(CaptureState::default()),
+                        )));
+                        let accept_control =
+                            TcpAcceptControlPlane::new(accept_backend, TcpAcceptNext::nodes(drop));
+                        accept_control
+                            .publish_listeners([(
+                                LISTENER_ID,
+                                TcpAcceptRegistration::new(app.clone(), listener),
+                            )])
+                            .expect("publish tcp accept listener");
+                        let accept = runtime.nodes().register_internal(accept_control.node());
+                        let listen = runtime
+                            .nodes()
+                            .register_internal(TcpListenNode::new(TcpListenNext::nodes(accept)));
+                        let reset = runtime
+                            .nodes()
+                            .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop)));
+                        let established = runtime.nodes().register_internal(
+                            TcpEstablishedNode::new(TcpEstablishedNext::nodes(drop)),
+                        );
+                        let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+                            drop,
+                            punt,
+                            listen,
+                            drop,
+                            drop,
+                            established,
+                            reset,
+                        ));
+
+                        let local = Ipv4Addr::new(127, 0, 0, 1);
+                        let remote = Ipv4Addr::new(198, 51, 100, 75);
+                        let mut lookup_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+                        lookup_owner
+                            .insert_listener_v4(TcpV4ListenerKey::new(0, local, 7443), LISTENER_ID);
+                        lookup_owner.insert_connection_v4(
+                            TcpV4ConnectionKey::new(0, local, 7443, remote, 40_755),
+                            ESTABLISHED_ID,
+                        );
+                        tcp_control
+                            .publish_lookup(lookup_owner.publish_snapshot())
+                            .expect("publish lookup snapshot");
+
+                        let mut connections =
+                            TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+                        connections.insert(TcpConnectionSnapshot {
+                            lookup_id: ESTABLISHED_ID,
+                            connection_id: None,
+                            owner_worker: DataWorkerId::new(0),
+                            state: TcpState::SynRcvd,
+                            local_port: 7443,
+                            local: Some(std::net::SocketAddr::new(IpAddr::V4(local), 7443)),
+                            remote: std::net::SocketAddr::new(IpAddr::V4(remote), 40_755),
+                            iss: 1_000,
+                            irs: 2_000,
+                            snd_una: 1_001,
+                            snd_nxt: 1_002,
+                            snd_wnd: 65_535,
+                            rcv_nxt: 2_001,
+                            rcv_wnd: 65_535,
+                        });
+                        tcp_control
+                            .publish_connections(connections.publish_snapshot())
+                            .expect("publish connection snapshot");
+                        let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+                        let packet = ipv4_tcp_packet(
+                            remote,
+                            40_755,
+                            local,
+                            7443,
+                            tcp_flags(false, false, false, true),
+                            b"final-ack",
+                        );
+                        let metadata =
+                            tcp_metadata(IpAddr::V4(remote), 40_755, IpAddr::V4(local), 7443);
+                        let frame = runtime.alloc_frame_index().expect("alloc frame");
+                        let buffer = push_packet(&runtime, frame, &packet, metadata);
+                        stamp_tcp_cursor(&runtime, buffer, &packet);
+                        assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+                        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+
+                        let accept_cqe = listener_backend
+                            .next_cqe_descriptor()
+                            .await
+                            .expect("accept cqe");
+                        tx.send(accept_cqe).expect("send accept cqe");
+                    })
+                    .expect("spawn worker-local accept task");
+                tokio::time::timeout(Duration::from_secs(1), rx)
+                    .await
+                    .expect("wait accept cqe")
+                    .expect("receive accept cqe")
+            });
+
+    match result.payload() {
+        AppCqeData::Accepted {
+            listener: cqe_listener,
+            flow,
+        } => {
+            assert_eq!(cqe_listener, listener);
+            assert_eq!(flow, accepted_flow);
+        }
+        other => panic!("unexpected accept completion payload: {other:?}"),
+    }
+    assert_eq!(
+        *accepted_records.lock().unwrap(),
+        vec![(
+            LISTENER_ID,
+            "198.51.100.75:40755".parse().expect("remote"),
+            "127.0.0.1:7443".parse().expect("local"),
+        )]
+    );
+    assert_eq!(
+        *accepted_events.lock().unwrap(),
+        vec![TcpWorkerEvent::IncomingConnection {
+            listener_id: TcpListenerId::new(LISTENER_ID as u64),
+            listener: TcpListenerKey::v4(0, Ipv4Addr::new(127, 0, 0, 1), 7443),
+            key: TcpConnectionKey::v4(
+                0,
+                Ipv4Addr::new(127, 0, 0, 1),
+                7443,
+                Ipv4Addr::new(198, 51, 100, 75),
+                40_755,
+            ),
+            capabilities: TcpCapabilities::default(),
+        }]
+    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]

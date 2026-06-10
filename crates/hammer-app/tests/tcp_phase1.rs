@@ -241,8 +241,8 @@ fn tcp_stream_close_uses_control_plane_for_context_streams_without_enqueuing_clo
 
 #[test]
 fn tcp_stream_context_backend_observes_closed_cqe_after_control_plane_close() {
-    let data_runtime =
-        DataRuntime::new(1, "hammer-app-tcp-closed-cqe-phase1", 512 * 1024, 2).expect("data runtime");
+    let data_runtime = DataRuntime::new(1, "hammer-app-tcp-closed-cqe-phase1", 512 * 1024, 2)
+        .expect("data runtime");
     let app = App::with_ring_capacity(data_runtime.context(), 4);
     let flow = AppFlowId::new(0x7200);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -324,8 +324,8 @@ fn tcp_stream_context_backend_observes_closed_cqe_after_control_plane_close() {
 
 #[test]
 fn tcp_stream_recv_buffer_reports_stream_closed_when_closed_cqe_arrives() {
-    let data_runtime =
-        DataRuntime::new(1, "hammer-app-tcp-closed-recv-phase1", 512 * 1024, 2).expect("data runtime");
+    let data_runtime = DataRuntime::new(1, "hammer-app-tcp-closed-recv-phase1", 512 * 1024, 2)
+        .expect("data runtime");
     let app = App::with_ring_capacity(data_runtime.context(), 4);
     let flow = AppFlowId::new(0x7201);
 
@@ -356,10 +356,7 @@ fn tcp_stream_recv_buffer_reports_stream_closed_when_closed_cqe_arrives() {
                     .await
                     .expect("recv sqe descriptor");
                 assert_eq!(recv_sqe.opcode(), hammer_app::AppOpcode::Recv);
-                assert_eq!(
-                    recv_sqe.object(),
-                    hammer_app::AppObjectRef::Flow(flow.id())
-                );
+                assert_eq!(recv_sqe.object(), hammer_app::AppObjectRef::Flow(flow.id()));
 
                 backend
                     .try_push_cqe_descriptor(hammer_app::AppCqeDescriptor::new(

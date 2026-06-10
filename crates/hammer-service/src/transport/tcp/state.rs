@@ -249,6 +249,11 @@ impl Default for TcpDispatchTable {
             TcpDispatchEntry::new(TcpInputNext::SynSent, None),
         );
         table.set(
+            TcpState::SynRcvd,
+            TcpInputFlags::ACK,
+            TcpDispatchEntry::new(TcpInputNext::Listen, None),
+        );
+        table.set(
             TcpState::Established,
             TcpInputFlags::ACK,
             TcpDispatchEntry::new(TcpInputNext::Established, None),
