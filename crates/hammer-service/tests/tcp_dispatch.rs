@@ -43,6 +43,12 @@ fn tcp_dispatch_table_matches_expected_state_flag_matrix() {
             None,
         ),
         (
+            TcpState::SynRcvd,
+            TcpInputFlags::ACK,
+            TcpInputNext::Listen,
+            None,
+        ),
+        (
             TcpState::Established,
             TcpInputFlags::ACK,
             TcpInputNext::Established,

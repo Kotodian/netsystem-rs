@@ -267,7 +267,9 @@ fn recv_buffer_from_completion(
     take: impl FnOnce() -> HammerResult<crate::AppRecv>,
 ) -> HammerResult<AppBufferLease> {
     let recv_flow = match payload {
-        AppCqeData::Recv { flow: recv_flow, .. } => recv_flow,
+        AppCqeData::Recv {
+            flow: recv_flow, ..
+        } => recv_flow,
         AppCqeData::Closed {
             flow: Some(closed_flow),
             ..

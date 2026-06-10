@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -407,26 +407,81 @@ fn tcp_accept_next_for_index(
     let Some(registration) = snapshot.registry.get(&listener_id) else {
         return Ok(Some(drop_next));
     };
+    let (remote, local) = tcp_accept_socket_addrs(runtime, index)?;
+    let event = incoming_connection_event(listener_id, remote, local)?;
+    backend.accept(listener_id, registration, remote, local, event)?;
+    Ok(Some(drop_next))
+}
+
+fn tcp_accept_socket_addrs(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+) -> CoreResult<(SocketAddr, SocketAddr)> {
     let metadata = runtime.metadata(index)?;
+    let buffer = runtime.get_buffer(index)?;
+    let packet = buffer.current();
+    let cursor = buffer.packet_cursor();
+    let (packet_remote_ip, packet_local_ip) = tcp_accept_ips_from_packet(packet)?;
+    let ports = tcp_accept_ports_from_packet(packet, cursor.transport_header_offset())?;
     let remote = metadata
         .source
-        .ok_or_else(|| CoreError::internal("tcp accept requires source metadata"))?;
+        .map(|addr| SocketAddr::new(addr.host, addr.port))
+        .unwrap_or_else(|| SocketAddr::new(packet_remote_ip, ports.0));
     let local = metadata
         .destination
-        .ok_or_else(|| CoreError::internal("tcp accept requires destination metadata"))?;
-    let event = incoming_connection_event(
-        listener_id,
-        SocketAddr::new(remote.host, remote.port),
-        SocketAddr::new(local.host, local.port),
-    )?;
-    backend.accept(
-        listener_id,
-        registration,
-        SocketAddr::new(remote.host, remote.port),
-        SocketAddr::new(local.host, local.port),
-        event,
-    )?;
-    Ok(Some(drop_next))
+        .map(|addr| SocketAddr::new(addr.host, addr.port))
+        .unwrap_or_else(|| SocketAddr::new(packet_local_ip, ports.1));
+    Ok((remote, local))
+}
+
+fn tcp_accept_ips_from_packet(packet: &[u8]) -> CoreResult<(IpAddr, IpAddr)> {
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => {
+            let remote = packet
+                .get(12..16)
+                .ok_or_else(|| CoreError::internal("tcp accept missing IPv4 source"))?;
+            let local = packet
+                .get(16..20)
+                .ok_or_else(|| CoreError::internal("tcp accept missing IPv4 destination"))?;
+            Ok((
+                IpAddr::V4(Ipv4Addr::new(remote[0], remote[1], remote[2], remote[3])),
+                IpAddr::V4(Ipv4Addr::new(local[0], local[1], local[2], local[3])),
+            ))
+        }
+        Some(6) => {
+            let remote: [u8; 16] = packet
+                .get(8..24)
+                .ok_or_else(|| CoreError::internal("tcp accept missing IPv6 source"))?
+                .try_into()
+                .map_err(|_| CoreError::internal("tcp accept invalid IPv6 source"))?;
+            let local: [u8; 16] = packet
+                .get(24..40)
+                .ok_or_else(|| CoreError::internal("tcp accept missing IPv6 destination"))?
+                .try_into()
+                .map_err(|_| CoreError::internal("tcp accept invalid IPv6 destination"))?;
+            Ok((
+                IpAddr::V6(Ipv6Addr::from(remote)),
+                IpAddr::V6(Ipv6Addr::from(local)),
+            ))
+        }
+        Some(version) => Err(CoreError::internal(format!(
+            "tcp accept does not support IP version {version}"
+        ))),
+        None => Err(CoreError::internal("tcp accept requires packet bytes")),
+    }
+}
+
+fn tcp_accept_ports_from_packet(
+    packet: &[u8],
+    transport_header_offset: usize,
+) -> CoreResult<(u16, u16)> {
+    let ports = packet
+        .get(transport_header_offset..transport_header_offset + 4)
+        .ok_or_else(|| CoreError::internal("tcp accept missing TCP ports"))?;
+    Ok((
+        u16::from_be_bytes([ports[0], ports[1]]),
+        u16::from_be_bytes([ports[2], ports[3]]),
+    ))
 }
 
 fn incoming_connection_event(

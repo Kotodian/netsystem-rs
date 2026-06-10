@@ -54,11 +54,13 @@ use crate::ProbeManager;
 use crate::app::{AppHost, AppIngressTarget};
 use crate::transport::tcp::{
     TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpCongestionRegistry,
-    TcpConnectionState, TcpInputControlPlane, TcpInputNext, TcpListenerConfig, TcpLookupId,
-    TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpRcvProcessControlPlane, TcpRcvProcessNext,
-    TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentNext, TcpSynSentObservation,
-    TcpSynSentRegistration, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey,
-    TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
+    TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpConnectionState,
+    TcpEstablishedControlPlane, TcpEstablishedNext, TcpInputControlPlane, TcpInputNext,
+    TcpListenerConfig, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpSynSentBackend, TcpSynSentControlPlane,
+    TcpSynSentNext, TcpSynSentObservation, TcpSynSentRegistration, TcpV4ConnectionKey,
+    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpV6PendingConnectionKey,
 };
 use crate::transport::udp::input::UdpAppRegistration;
 use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
@@ -180,6 +182,7 @@ struct TcpConnectionRegistration {
     local_port: u16,
     local: Option<SocketAddr>,
     remote: SocketAddr,
+    listener: Option<AppSocketId>,
     target: AppIngressTarget,
 }
 
@@ -206,9 +209,11 @@ struct RuntimeAppControlState {
     tcp_syn_sent_control: Option<TcpSynSentControlPlane>,
     shared_tcp_control: Option<SharedTcpControlPlane>,
     tcp_control: TcpInputControlPlane,
+    tcp_established_control: TcpEstablishedControlPlane,
     tcp_rcv_process_control: TcpRcvProcessControlPlane,
     udp_control: UdpInputControlPlane,
     tcp_lookup: TcpLookupSnapshot,
+    tcp_connection_snapshot: TcpConnectionSnapshotPool,
     tcp_listeners: InfraVec<TcpListenerRegistration>,
     tcp_listener_slots: FlatHashTable<u64, usize>,
     tcp_connections: InfraVec<TcpConnectionRegistration>,
@@ -254,6 +259,7 @@ struct RuntimeAppControlSnapshot {
     tcp_listeners: InfraVec<RuntimeTcpListenerSnapshot>,
     udp_sockets: InfraVec<UdpSocketRegistration>,
     tcp_lookup: TcpLookupSnapshot,
+    tcp_connections: TcpConnectionSnapshotPool,
 }
 
 #[cfg(test)]
@@ -281,6 +287,11 @@ struct ConnectTcpFlowResult {
     shared_actions: InfraVec<hammer_core::protocol::tcp::TcpControlPlaneAction>,
 }
 
+#[derive(Debug)]
+struct IncomingTcpConnectionResult {
+    shared_actions: InfraVec<hammer_core::protocol::tcp::TcpControlPlaneAction>,
+}
+
 impl RuntimeAppControlState {
     fn new() -> HammerResult<Self> {
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
@@ -297,6 +308,8 @@ impl RuntimeAppControlState {
             .map_err(|err| {
                 HammerError::internal(format!("publish tcp dispatch defaults: {err}"))
             })?;
+        let tcp_established_control =
+            TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(unused_node_id()));
         let tcp_rcv_process_control =
             TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(unused_node_id()));
 
@@ -311,6 +324,7 @@ impl RuntimeAppControlState {
             tcp_syn_sent_control: None,
             shared_tcp_control: None,
             tcp_control,
+            tcp_established_control,
             tcp_rcv_process_control,
             udp_control: UdpInputControlPlane::new(UdpInputNext::nodes(
                 unused_node_id(),
@@ -318,6 +332,7 @@ impl RuntimeAppControlState {
                 unused_node_id(),
             )),
             tcp_lookup: TcpLookupSnapshot::empty(),
+            tcp_connection_snapshot: TcpConnectionSnapshotPool::empty(),
             tcp_listeners: InfraVec::new(),
             tcp_listener_slots: FlatHashTable::new(),
             tcp_connections: InfraVec::new(),
@@ -494,50 +509,105 @@ impl RuntimeAppControlState {
         Ok(id)
     }
 
-    fn accept_tcp_connection(
+    fn handle_incoming_tcp_connection(
         &mut self,
-        app: &AppContext,
-        listener: AppSocketId,
+        listener_registration: TcpListenerRegistration,
         remote: SocketAddr,
         local: SocketAddr,
-    ) -> HammerResult<AppFlowId> {
-        let listener_slot = self
-            .tcp_listener_slots
-            .lookup(&listener.value())
-            .ok_or_else(|| {
-                HammerError::internal(format!(
-                    "tcp listener {} is not registered in runtime service",
-                    listener.value()
-                ))
+    ) -> HammerResult<IncomingTcpConnectionResult> {
+        if let Some(index) = self.tcp_connections.iter().position(|registration| {
+            registration.local == Some(local) && registration.remote == remote
+        }) {
+            let current = self.tcp_connections.get(index).cloned().ok_or_else(|| {
+                HammerError::internal("tcp connection registration slot is invalid")
             })?;
-        let listener_registration = self.tcp_listeners[listener_slot].clone();
+            if current.state == hammer_core::protocol::tcp::TcpState::Established {
+                return Ok(IncomingTcpConnectionResult {
+                    shared_actions: InfraVec::new(),
+                });
+            }
+            if current.state != hammer_core::protocol::tcp::TcpState::SynRcvd {
+                return Err(HammerError::internal(format!(
+                    "tcp incoming connection {} -> {} cannot promote from state {:?}",
+                    remote, local, current.state
+                )));
+            }
+
+            let mut complete_accept = None;
+            let connection_id = {
+                let registration = self.tcp_connections.get_mut(index).ok_or_else(|| {
+                    HammerError::internal("tcp connection registration slot is invalid")
+                })?;
+                registration.state = hammer_core::protocol::tcp::TcpState::Established;
+                registration.local = Some(local);
+                if let Some(listener) = registration.listener.take() {
+                    complete_accept = Some((
+                        registration.target.app().clone(),
+                        listener,
+                        registration.flow,
+                    ));
+                }
+                registration.connection_id.ok_or_else(|| {
+                    HammerError::internal("passive-open tcp connection is missing connection id")
+                })?
+            };
+
+            if let Some((app, listener, flow)) = complete_accept {
+                app.try_complete_accept(listener, flow)?;
+            }
+            self.publish_tcp_lookup()?;
+            self.publish_tcp_app_ingress()?;
+
+            let mut shared_actions = InfraVec::new();
+            if self.shared_tcp_control.is_some() {
+                let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+                shared_actions.push(congestion.upsert_connection_action(
+                    connection_id,
+                    socket_addrs_to_connection_key(local, remote)?,
+                    hammer_core::protocol::tcp::TcpState::Established,
+                ));
+            }
+            return Ok(IncomingTcpConnectionResult { shared_actions });
+        }
+
         self.ensure_connection_absent(local, remote)?;
         let flow = self.alloc_flow();
-        app.try_complete_accept(listener, flow)?;
         let lookup_id = self.alloc_tcp_lookup_id()?;
+        let connection_id = self.alloc_tcp_connection_id();
         self.tcp_connections.push(TcpConnectionRegistration {
             flow,
-            connection_id: None,
+            connection_id: Some(connection_id),
             lookup_id,
             owner_worker: listener_registration.owner_worker,
-            state: hammer_core::protocol::tcp::TcpState::Established,
+            state: hammer_core::protocol::tcp::TcpState::SynRcvd,
             local_port: local.port(),
             local: Some(local),
             remote,
-            target: AppIngressTarget::flow(app.clone(), flow),
+            listener: Some(listener_registration.socket),
+            target: AppIngressTarget::flow(listener_registration.app, flow),
         });
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
-        Ok(flow)
+
+        let mut shared_actions = InfraVec::new();
+        if self.shared_tcp_control.is_some() {
+            let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+            shared_actions.push(congestion.install_connection_action(
+                connection_id,
+                socket_addrs_to_connection_key(local, remote)?,
+                hammer_core::protocol::tcp::TcpState::SynRcvd,
+            ));
+        }
+        Ok(IncomingTcpConnectionResult { shared_actions })
     }
 
-    fn accept_tcp_connection_by_listener_id(
+    fn handle_incoming_tcp_connection_by_listener_id(
         &mut self,
         listener_id: TcpListenerId,
         remote: SocketAddr,
         local: SocketAddr,
-    ) -> HammerResult<AppFlowId> {
-        let registration = self
+    ) -> HammerResult<IncomingTcpConnectionResult> {
+        let listener_registration = self
             .tcp_listeners
             .iter()
             .find(|registration| registration.lookup_id as u64 == listener_id.get())
@@ -548,7 +618,7 @@ impl RuntimeAppControlState {
                     listener_id.get()
                 ))
             })?;
-        self.accept_tcp_connection(&registration.app, registration.socket, remote, local)
+        self.handle_incoming_tcp_connection(listener_registration, remote, local)
     }
 
     fn connect_tcp_stream(
@@ -571,6 +641,7 @@ impl RuntimeAppControlState {
             local_port,
             local: None,
             remote: peer,
+            listener: None,
             target: AppIngressTarget::flow(app.clone(), flow),
         });
         self.publish_tcp_lookup()?;
@@ -650,7 +721,7 @@ impl RuntimeAppControlState {
         lookup_id: TcpLookupId,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> HammerResult<()> {
+    ) -> HammerResult<InfraVec<hammer_core::protocol::tcp::TcpControlPlaneAction>> {
         let index = self
             .tcp_connections
             .iter()
@@ -680,7 +751,25 @@ impl RuntimeAppControlState {
         if current.state == hammer_core::protocol::tcp::TcpState::Established
             && current.local == Some(local)
         {
-            return Ok(());
+            let mut shared_actions = InfraVec::new();
+            if self.shared_tcp_control.is_some() {
+                let connection_id = current.connection_id.ok_or_else(|| {
+                    HammerError::internal("tcp syn-sent registration is missing connection id")
+                })?;
+                let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+                shared_actions.push(congestion.upsert_connection_action(
+                    connection_id,
+                    socket_addrs_to_connection_key(local, remote)?,
+                    hammer_core::protocol::tcp::TcpState::Established,
+                ));
+                shared_actions.push(
+                    hammer_core::protocol::tcp::TcpControlPlaneAction::CancelTimer {
+                        connection_id,
+                        kind: hammer_core::protocol::tcp::TcpTimerKind::Connect,
+                    },
+                );
+            }
+            return Ok(shared_actions);
         }
         if current.state != hammer_core::protocol::tcp::TcpState::SynSent {
             return Err(HammerError::internal(format!(
@@ -689,6 +778,9 @@ impl RuntimeAppControlState {
             )));
         }
         self.ensure_connection_absent(local, remote)?;
+        let connection_id = current.connection_id.ok_or_else(|| {
+            HammerError::internal("tcp syn-sent registration is missing connection id")
+        })?;
         let registration = self
             .tcp_connections
             .get_mut(index)
@@ -697,7 +789,22 @@ impl RuntimeAppControlState {
         registration.local = Some(local);
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
-        Ok(())
+        let mut shared_actions = InfraVec::new();
+        if self.shared_tcp_control.is_some() {
+            let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+            shared_actions.push(congestion.upsert_connection_action(
+                connection_id,
+                socket_addrs_to_connection_key(local, remote)?,
+                hammer_core::protocol::tcp::TcpState::Established,
+            ));
+            shared_actions.push(
+                hammer_core::protocol::tcp::TcpControlPlaneAction::CancelTimer {
+                    connection_id,
+                    kind: hammer_core::protocol::tcp::TcpTimerKind::Connect,
+                },
+            );
+        }
+        Ok(shared_actions)
     }
 
     fn observe_tcp_connection_state_change(
@@ -759,16 +866,33 @@ impl RuntimeAppControlState {
         }
         if current.state != hammer_core::protocol::tcp::TcpState::Established
             && state == hammer_core::protocol::tcp::TcpState::Established
+            && !(current.local == Some(local) && current.remote == remote)
         {
             self.ensure_connection_absent(local, remote)?;
         }
-        let registration = self
-            .tcp_connections
-            .get_mut(index)
-            .ok_or_else(|| HammerError::internal("tcp connection registration slot is invalid"))?;
-        registration.connection_id = Some(connection_id);
-        registration.local = Some(local);
-        registration.state = state;
+        let mut complete_accept = None;
+        {
+            let registration = self.tcp_connections.get_mut(index).ok_or_else(|| {
+                HammerError::internal("tcp connection registration slot is invalid")
+            })?;
+            let was_established =
+                registration.state == hammer_core::protocol::tcp::TcpState::Established;
+            registration.connection_id = Some(connection_id);
+            registration.local = Some(local);
+            registration.state = state;
+            if !was_established && state == hammer_core::protocol::tcp::TcpState::Established {
+                if let Some(listener) = registration.listener.take() {
+                    complete_accept = Some((
+                        registration.target.app().clone(),
+                        listener,
+                        registration.flow,
+                    ));
+                }
+            }
+        }
+        if let Some((app, listener, flow)) = complete_accept {
+            app.try_complete_accept(listener, flow)?;
+        }
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
         Ok(())
@@ -856,6 +980,7 @@ impl RuntimeAppControlState {
 
     fn publish_tcp_lookup(&mut self) -> HammerResult<()> {
         let mut snapshot = TcpLookupSnapshot::empty();
+        let mut connection_snapshot = TcpConnectionSnapshotPool::empty();
         let mut syn_sent_connections = InfraVec::new();
         for registration in self.tcp_listeners.iter().cloned() {
             let value = TcpLookupValue {
@@ -875,6 +1000,15 @@ impl RuntimeAppControlState {
             }
         }
         for registration in self.tcp_connections.iter().cloned() {
+            connection_snapshot.insert(TcpConnectionSnapshot::with_default_windows(
+                registration.lookup_id,
+                registration.connection_id,
+                registration.owner_worker,
+                registration.state,
+                registration.local_port,
+                registration.local,
+                registration.remote,
+            ));
             let value = TcpLookupValue {
                 kind: match registration.state {
                     hammer_core::protocol::tcp::TcpState::SynSent => {
@@ -947,6 +1081,16 @@ impl RuntimeAppControlState {
         self.tcp_control
             .publish_lookup(snapshot.clone())
             .map_err(|err| HammerError::internal(format!("publish tcp lookup snapshot: {err}")))?;
+        self.tcp_control
+            .publish_connections(connection_snapshot.clone())
+            .map_err(|err| {
+                HammerError::internal(format!("publish tcp input connection snapshot: {err}"))
+            })?;
+        self.tcp_established_control
+            .publish_connections(connection_snapshot.clone())
+            .map_err(|err| {
+                HammerError::internal(format!("publish tcp connection snapshot: {err}"))
+            })?;
         if let Some(control) = &self.tcp_syn_sent_control {
             control
                 .publish_connections(syn_sent_connections)
@@ -955,6 +1099,7 @@ impl RuntimeAppControlState {
                 })?;
         }
         self.tcp_lookup = snapshot;
+        self.tcp_connection_snapshot = connection_snapshot;
         Ok(())
     }
 
@@ -1177,26 +1322,22 @@ impl RuntimeAppControlHandle {
         &self,
         observation: TcpSynSentObservation,
     ) -> HammerResult<()> {
-        let state = Arc::clone(&self.state);
-        self.control_handle
-            .schedule_once(Duration::ZERO, move || {
-                let state = Arc::clone(&state);
-                async move {
-                    // SAFETY: this closure runs on the single control thread.
-                    let state = unsafe { state.get_mut() };
-                    let result = state.promote_pending_syn_sent_connection(
-                        observation.connection_id,
-                        observation.local,
-                        observation.remote,
-                    );
-                    debug_assert!(
-                        result.is_ok(),
-                        "runtime tcp syn-sent observation failed: {result:?}"
-                    );
-                    let _ = result;
-                }
-            })
-            .map(|_| ())
+        let result = self.with_state_mut(move |state| {
+            state.promote_pending_syn_sent_connection(
+                observation.connection_id,
+                observation.local,
+                observation.remote,
+            )
+        })?;
+        let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))? else {
+            return Ok(());
+        };
+        for action in result.iter().copied() {
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("apply shared tcp syn-sent action: {err}"))
+            })?;
+        }
+        Ok(())
     }
 
     #[inline]
@@ -1227,7 +1368,7 @@ impl RuntimeAppControlHandle {
                             let (local, remote) = socket_addrs_from_connection_key(key);
                             // SAFETY: this closure runs on the single control thread.
                             let state = unsafe { state.get_mut() };
-                            let result = state.accept_tcp_connection_by_listener_id(
+                            let result = state.handle_incoming_tcp_connection_by_listener_id(
                                 listener_id,
                                 remote,
                                 local,
@@ -1309,8 +1450,26 @@ impl RuntimeAppControlHandle {
     #[inline]
     fn handle_tcp_worker_event(&self, event: TcpWorkerEvent) -> HammerResult<()> {
         match event {
-            TcpWorkerEvent::IncomingConnection { .. } => {
-                self.handle_projected_tcp_worker_event(event)
+            TcpWorkerEvent::IncomingConnection {
+                listener_id, key, ..
+            } => {
+                let (local, remote) = socket_addrs_from_connection_key(key);
+                let result = self.with_state_mut(move |state| {
+                    state.handle_incoming_tcp_connection_by_listener_id(listener_id, remote, local)
+                })?;
+                let Some(control) =
+                    self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+                else {
+                    return Ok(());
+                };
+                for action in result.shared_actions.iter().copied() {
+                    control.apply(action).map_err(|err| {
+                        HammerError::internal(format!(
+                            "apply shared tcp incoming-connection action: {err}"
+                        ))
+                    })?;
+                }
+                Ok(())
             }
             TcpWorkerEvent::StateChanged {
                 connection_id,
@@ -1458,6 +1617,7 @@ impl RuntimeAppControlHandle {
                 tcp_listeners,
                 udp_sockets: state.udp_sockets.clone(),
                 tcp_lookup: state.tcp_lookup.clone(),
+                tcp_connections: state.tcp_connection_snapshot.clone(),
             })
         })
     }
@@ -2593,13 +2753,9 @@ impl RuntimeService {
         observation: TcpSynSentObservation,
     ) -> HammerResult<()> {
         let inner = self.inner.lock().expect("service mutex poisoned");
-        inner.app_control.with_state_mut(move |state| {
-            state.promote_pending_syn_sent_connection(
-                observation.connection_id,
-                observation.local,
-                observation.remote,
-            )
-        })
+        inner
+            .app_control
+            .handle_tcp_syn_sent_observation(observation)
     }
 
     fn shared_tcp_listener_installed_for_test(&self, listener_id: TcpListenerId) -> bool {
@@ -3176,7 +3332,7 @@ interval = "5s"
     }
 
     #[test]
-    fn runtime_service_accepts_tcp_listener_into_established_lookup() {
+    fn runtime_service_accepts_tcp_listener_after_final_ack() {
         let service = new_test_service("");
         let app = service.app_context();
         let listener = app
@@ -3216,20 +3372,64 @@ interval = "5s"
         ready_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("wait accept ready");
+        let incoming = TcpWorkerEvent::IncomingConnection {
+            listener_id: TcpListenerId::new(1),
+            listener: TcpListenerKey::v4(0, Ipv4Addr::new(127, 0, 0, 1), 7200),
+            key: TcpConnectionKey::v4(
+                0,
+                Ipv4Addr::new(127, 0, 0, 1),
+                7200,
+                Ipv4Addr::new(198, 51, 100, 72),
+                40_720,
+            ),
+            capabilities: TcpCapabilities::default(),
+        };
+
         service
-            .handle_tcp_worker_event_for_test(TcpWorkerEvent::IncomingConnection {
-                listener_id: TcpListenerId::new(1),
-                listener: TcpListenerKey::v4(0, Ipv4Addr::new(127, 0, 0, 1), 7200),
-                key: TcpConnectionKey::v4(
-                    0,
-                    Ipv4Addr::new(127, 0, 0, 1),
-                    7200,
-                    Ipv4Addr::new(198, 51, 100, 72),
-                    40_720,
-                ),
-                capabilities: TcpCapabilities::default(),
-            })
-            .expect("accept tcp connection");
+            .handle_tcp_worker_event_for_test(incoming)
+            .expect("register passive-open tcp connection");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "initial SYN/passive-open must not complete listener accept"
+        );
+
+        let syn_rcvd = service
+            .app_control_snapshot_for_test()
+            .tcp_lookup
+            .lookup_connection_v4(TcpV4ConnectionKey::new(
+                0,
+                Ipv4Addr::new(127, 0, 0, 1),
+                local.port(),
+                Ipv4Addr::new(198, 51, 100, 72),
+                remote.port(),
+            ))
+            .expect("published passive-open lookup");
+        let connection_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_lookup_id(syn_rcvd.id)
+            .expect("published passive-open snapshot")
+            .connection_id
+            .expect("passive-open connection id");
+        assert_eq!(syn_rcvd.kind, TcpLookupKind::EstablishedConnection);
+        assert_eq!(syn_rcvd.owner_worker, DataWorkerId::new(1));
+        assert_eq!(
+            service
+                .app_control_snapshot_for_test()
+                .tcp_connections
+                .lookup_by_lookup_id(syn_rcvd.id)
+                .expect("published passive-open snapshot")
+                .state,
+            crate::transport::tcp::TcpState::SynRcvd
+        );
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::SynRcvd)
+        });
+
+        service
+            .handle_tcp_worker_event_for_test(incoming)
+            .expect("complete passive-open tcp connection");
         let accept_cqe = rx
             .recv_timeout(Duration::from_secs(1))
             .expect("receive accept result");
@@ -3265,6 +3465,18 @@ interval = "5s"
             .expect("published tcp connection lookup");
         assert_eq!(published.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(published.owner_worker, DataWorkerId::new(1));
+        assert_eq!(
+            state
+                .tcp_connections
+                .lookup_by_lookup_id(published.id)
+                .expect("published established snapshot")
+                .state,
+            crate::transport::tcp::TcpState::Established
+        );
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
 
         service.close().expect("close service");
     }
@@ -3291,6 +3503,79 @@ interval = "5s"
             .expect("published pending syn-sent lookup");
         assert_eq!(pending.kind, TcpLookupKind::SynSentConnection);
         assert_eq!(pending.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_publishes_tcp_connection_receive_snapshots() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        let state = service.app_control_snapshot_for_test();
+        let pending = state
+            .tcp_connections
+            .lookup_by_lookup_id(1)
+            .expect("published pending connection snapshot");
+        assert_eq!(pending.connection_id, Some(connection_id));
+        assert_eq!(pending.owner_worker, DataWorkerId::new(1));
+        assert_eq!(pending.state, crate::transport::tcp::TcpState::SynSent);
+        assert_eq!(pending.local_port, 49_152);
+        assert_eq!(
+            pending.local,
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 49_152))
+        );
+        assert_eq!(pending.remote, peer);
+        assert_eq!(pending.snd_wnd, 65_535);
+        assert_eq!(pending.rcv_wnd, 65_535);
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("promote pending connect via state change");
+
+        wait_for(Duration::from_secs(1), || {
+            service
+                .app_control_snapshot_for_test()
+                .tcp_connections
+                .lookup_by_connection_id(connection_id)
+                .is_some_and(|snapshot| {
+                    snapshot.state == crate::transport::tcp::TcpState::Established
+                        && snapshot.local == Some(local)
+                })
+        });
+
+        let established = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .expect("published established connection snapshot");
+        assert_eq!(established.lookup_id, 1);
+        assert_eq!(established.connection_id, Some(connection_id));
+        assert_eq!(established.owner_worker, DataWorkerId::new(1));
+        assert_eq!(
+            established.state,
+            crate::transport::tcp::TcpState::Established
+        );
+        assert_eq!(established.local_port, local.port());
+        assert_eq!(established.local, Some(local));
+        assert_eq!(established.remote, peer);
 
         service.close().expect("close service");
     }
@@ -3392,6 +3677,9 @@ interval = "5s"
         let local: SocketAddr = "192.0.2.44:49152".parse().expect("local addr");
 
         let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
 
         assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
@@ -3442,6 +3730,14 @@ interval = "5s"
         assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(established.id, pending.id);
         assert_eq!(established.owner_worker, DataWorkerId::new(1));
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+                && !service.shared_tcp_has_timer_for_test(
+                    connection_id,
+                    hammer_core::protocol::tcp::TcpTimerKind::Connect,
+                )
+        });
 
         service.close().expect("close service");
     }

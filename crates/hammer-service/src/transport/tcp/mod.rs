@@ -2,6 +2,7 @@ pub use hammer_core::protocol::tcp::TcpState;
 
 pub mod accept;
 pub mod app;
+pub mod connection;
 pub mod established;
 pub mod input;
 pub mod listen;
@@ -15,6 +16,10 @@ pub use accept::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptNode, TcpAcceptRegistration,
 };
 pub use app::TcpAppIngress;
+pub use connection::{
+    TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpEstablishedControlPlane,
+    TcpWorkerOwnedConnectionState,
+};
 pub use established::{TcpEstablishedNext, TcpEstablishedNode};
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};
