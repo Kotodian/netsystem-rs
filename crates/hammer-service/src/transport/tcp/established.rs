@@ -270,14 +270,20 @@ fn tcp_established_next_for_index(
     if ack_validation.is_invalid() {
         return Ok(Some(rcv_process));
     }
+    let starts_at_receive_next = tcp_segment_starts_at_receive_next(connection, segment);
     let next_state = tcp_state_after_receive_segment(
         connection_state,
         segment,
         ack_validation,
         ack_state_transition,
+        starts_at_receive_next,
     );
-    let deliver_to_app =
-        tcp_segment_is_deliverable_to_app(connection_state, segment, ack_validation);
+    let deliver_to_app = tcp_segment_is_deliverable_to_app(
+        connection_state,
+        segment,
+        ack_validation,
+        starts_at_receive_next,
+    );
     let should_apply_progress = deliver_to_app
         || next_state.is_some()
         || ack_validation.accepted_acknowledgment().is_some();
@@ -311,7 +317,13 @@ fn tcp_established_next_for_index(
     {
         backend.observe_ack_progress(observation)?;
     }
-    if tcp_should_observe_remote_fin(connection_state, next_state, segment, ack_validation) {
+    if tcp_should_observe_remote_fin(
+        connection_state,
+        next_state,
+        segment,
+        ack_validation,
+        starts_at_receive_next,
+    ) {
         if let Some(backend) = backend
             && let Some(observation) = tcp_established_close_observation(
                 runtime,
@@ -584,6 +596,18 @@ fn tcp_connection_has_initialized_receive_state(connection: TcpConnectionSnapsho
 }
 
 #[inline]
+fn tcp_segment_starts_at_receive_next(
+    connection: Option<TcpConnectionSnapshot>,
+    segment: TcpObservedSegment,
+) -> bool {
+    let Some(connection) = connection else {
+        return true;
+    };
+    !tcp_connection_has_initialized_receive_state(connection)
+        || segment.sequence == connection.rcv_nxt
+}
+
+#[inline]
 fn tcp_connection_has_initialized_send_state(connection: TcpConnectionSnapshot) -> bool {
     connection.iss != 0 || connection.snd_una != 0 || connection.snd_nxt != 0
 }
@@ -599,15 +623,19 @@ fn tcp_state_after_receive_segment(
     segment: TcpObservedSegment,
     acknowledgment: TcpAckValidation,
     ack_state_transition: Option<TcpState>,
+    starts_at_receive_next: bool,
 ) -> Option<TcpState> {
     let state = state?;
     match state {
         TcpState::Established => {
-            (segment.fin() && acknowledgment.is_accepted()).then_some(TcpState::CloseWait)
+            (segment.fin() && starts_at_receive_next && acknowledgment.is_accepted())
+                .then_some(TcpState::CloseWait)
         }
         TcpState::FinWait1 => {
             if segment.fin() {
-                if !acknowledgment.is_accepted() {
+                if !starts_at_receive_next {
+                    ack_state_transition
+                } else if !acknowledgment.is_accepted() {
                     None
                 } else if acknowledgment.acknowledges_local_fin() {
                     Some(TcpState::TimeWait)
@@ -619,7 +647,8 @@ fn tcp_state_after_receive_segment(
             }
         }
         TcpState::FinWait2 => {
-            (segment.fin() && acknowledgment.is_accepted()).then_some(TcpState::TimeWait)
+            (segment.fin() && starts_at_receive_next && acknowledgment.is_accepted())
+                .then_some(TcpState::TimeWait)
         }
         TcpState::Closing | TcpState::LastAck => ack_state_transition,
         TcpState::CloseWait
@@ -653,8 +682,10 @@ fn tcp_segment_is_deliverable_to_app(
     state: Option<TcpState>,
     segment: TcpObservedSegment,
     acknowledgment: TcpAckValidation,
+    starts_at_receive_next: bool,
 ) -> bool {
-    (segment.fin() || segment.has_payload())
+    starts_at_receive_next
+        && (segment.fin() || segment.has_payload())
         && acknowledgment.is_accepted()
         && state.is_none_or(tcp_state_allows_app_delivery)
 }
@@ -665,8 +696,10 @@ fn tcp_should_observe_remote_fin(
     next_state: Option<TcpState>,
     segment: TcpObservedSegment,
     acknowledgment: TcpAckValidation,
+    starts_at_receive_next: bool,
 ) -> bool {
-    segment.fin()
+    starts_at_receive_next
+        && segment.fin()
         && acknowledgment.is_accepted()
         && next_state.is_some()
         && matches!(
@@ -1332,6 +1365,76 @@ mod tests {
             capture_state.lock().unwrap().packets.is_empty(),
             "close-wait FIN retransmits must not be delivered as repeated app EOF"
         );
+        assert_eq!(runtime.frames_in_use(), 0);
+        assert_eq!(runtime.in_use_buffers(), 0);
+    }
+
+    #[test]
+    fn tcp_established_node_withholds_out_of_order_payload_from_app_delivery() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
+        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
+
+        let local: SocketAddr = "192.0.2.95:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.95:40095".parse().expect("remote");
+        let mut connections =
+            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+        connections.insert(TcpConnectionSnapshot {
+            lookup_id: LOOKUP_ID,
+            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
+            owner_worker: DataWorkerId::new(0),
+            state: TcpState::Established,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            iss: 0x1020_303f,
+            irs: 0x0102_0303,
+            snd_una: 0x1020_3040,
+            snd_nxt: 0x1020_3048,
+            snd_wnd: 0x4000,
+            rcv_nxt: 0x0102_0304,
+            rcv_wnd: u16::MAX as u32,
+        });
+        control
+            .publish_connections(connections.publish_snapshot())
+            .expect("publish established connection snapshot");
+        let established = runtime.nodes().register_internal(control.node());
+
+        let packet = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 95),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 95),
+            local.port(),
+            0x0102_0308,
+            0x1020_3040,
+            0x4000,
+            tcp_flags(false, false, false, true),
+            b"hole",
+        );
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, buffer, &packet);
+        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, frame)
+                .expect("schedule")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+        assert!(
+            capture_state.lock().unwrap().packets.is_empty(),
+            "out-of-order payload must not be delivered to the app"
+        );
+        let snapshot = control
+            .connection_snapshot_for_test(LOOKUP_ID)
+            .expect("snapshot after out-of-order payload");
+        assert_eq!(snapshot.state, TcpState::Established);
+        assert_eq!(snapshot.rcv_nxt, 0x0102_0304);
         assert_eq!(runtime.frames_in_use(), 0);
         assert_eq!(runtime.in_use_buffers(), 0);
     }

@@ -117,6 +117,48 @@ fn tcp_remote_fin_transitions_fin_wait2_to_time_wait_once() {
     );
 }
 
+#[test]
+fn tcp_out_of_order_fin_does_not_transition_established_flow() {
+    let octet = 44;
+    let snapshot = connected_snapshot(
+        TcpState::Established,
+        octet,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+    );
+    let packet = tcp_packet_with_seq_ack_flags(
+        octet,
+        0x0102_0308,
+        0x1020_3040,
+        tcp_flags(true, false, false, true),
+    );
+    let result = run_snapshot_packet_case(snapshot, packet, octet);
+
+    assert_eq!(result.first_run_count, 4);
+    assert_eq!(result.second_run_count, 4);
+    assert_eq!(result.state_after_first, Some(TcpState::Established));
+    assert_eq!(result.state_after_second, Some(TcpState::Established));
+    assert_snapshot_progress_with_ack(
+        result
+            .snapshot_after_first
+            .expect("snapshot after first out-of-order FIN"),
+        TcpState::Established,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+    );
+    assert_snapshot_progress_with_ack(
+        result
+            .snapshot_after_second
+            .expect("snapshot after second out-of-order FIN"),
+        TcpState::Established,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+    );
+}
+
 struct FinDeliveryResult {
     state_after_first: Option<TcpState>,
     state_after_second: Option<TcpState>,

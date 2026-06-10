@@ -146,6 +146,49 @@ pub struct TcpNegotiatedOptions {
     pub ecn: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpHandshakeObservation {
+    pub flags: u8,
+    pub sequence: u32,
+    pub acknowledgment: Option<u32>,
+    pub advertised_window: u32,
+    pub next_sequence: u32,
+}
+
+impl TcpHandshakeObservation {
+    #[inline]
+    pub const fn new(
+        flags: u8,
+        sequence: u32,
+        acknowledgment: Option<u32>,
+        advertised_window: u32,
+        next_sequence: u32,
+    ) -> Self {
+        Self {
+            flags,
+            sequence,
+            acknowledgment,
+            advertised_window,
+            next_sequence,
+        }
+    }
+
+    #[inline]
+    pub const fn syn(self) -> bool {
+        self.flags & 0x02 != 0
+    }
+
+    #[inline]
+    pub const fn ack(self) -> bool {
+        self.flags & 0x10 != 0
+    }
+
+    #[inline]
+    pub const fn fin(self) -> bool {
+        self.flags & 0x01 != 0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct TcpConnectionId(u64);

@@ -162,6 +162,56 @@ fn tcp_out_of_window_fin_does_not_advance_receive_state() {
 }
 
 #[test]
+fn tcp_in_window_out_of_order_payload_does_not_advance_receive_state() {
+    let octet = 71;
+    let initial = established_snapshot(
+        TcpState::Established,
+        octet,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+        DEFAULT_WINDOW,
+    );
+    let packet = tcp_packet(
+        octet,
+        initial.rcv_nxt + 4,
+        Some(initial.snd_una),
+        tcp_flags(false, false, false, true),
+        b"late",
+    );
+
+    let result = run_receive_case(initial, &packet, octet);
+
+    assert_eq!(result.state_after_packet, Some(TcpState::Established));
+    assert_eq!(result.snapshot_after_packet, initial);
+}
+
+#[test]
+fn tcp_in_window_out_of_order_fin_does_not_advance_receive_state() {
+    let octet = 72;
+    let initial = established_snapshot(
+        TcpState::Established,
+        octet,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+        DEFAULT_WINDOW,
+    );
+    let packet = tcp_packet(
+        octet,
+        initial.rcv_nxt + 4,
+        Some(initial.snd_una),
+        tcp_flags(true, false, false, true),
+        b"",
+    );
+
+    let result = run_receive_case(initial, &packet, octet);
+
+    assert_eq!(result.state_after_packet, Some(TcpState::Established));
+    assert_eq!(result.snapshot_after_packet, initial);
+}
+
+#[test]
 fn tcp_out_of_window_rst_does_not_close_established_flow() {
     let octet = 64;
     let initial = established_snapshot(
@@ -293,6 +343,32 @@ fn tcp_in_window_syn_does_not_advance_fin_wait1_or_update_window() {
     let result = run_receive_case(initial, &packet, octet);
 
     assert_eq!(result.state_after_packet, Some(TcpState::FinWait1));
+    assert_eq!(result.snapshot_after_packet, initial);
+}
+
+#[test]
+fn tcp_in_window_out_of_order_payload_does_not_advance_receive_progress() {
+    let octet = 71;
+    let initial = established_snapshot(
+        TcpState::Established,
+        octet,
+        0x1020_3040,
+        0x1020_3048,
+        0x0102_0304,
+        DEFAULT_WINDOW,
+    );
+    let packet = tcp_packet_with_window(
+        octet,
+        initial.rcv_nxt + 4,
+        Some(initial.snd_una),
+        tcp_flags(false, false, false, true),
+        DEFAULT_WINDOW as u16,
+        b"hole",
+    );
+
+    let result = run_receive_case(initial, &packet, octet);
+
+    assert_eq!(result.state_after_packet, Some(TcpState::Established));
     assert_eq!(result.snapshot_after_packet, initial);
 }
 
