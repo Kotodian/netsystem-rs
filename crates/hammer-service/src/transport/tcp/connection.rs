@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{DataWorkerId, NodeId};
 use hammer_core::error::CoreResult;
-use hammer_core::protocol::tcp::TcpConnectionId;
+use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
 use super::{TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpLookupId, TcpState};
@@ -27,6 +28,15 @@ pub struct TcpConnectionSnapshot {
     pub snd_wnd: u32,
     pub rcv_nxt: u32,
     pub rcv_wnd: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TcpReceiveProgress {
+    pub(crate) state: Option<TcpState>,
+    pub(crate) sequence: u32,
+    pub(crate) acknowledgment: Option<u32>,
+    pub(crate) advertised_window: u32,
+    pub(crate) next_receive_sequence: Option<u32>,
 }
 
 impl TcpConnectionSnapshot {
@@ -101,6 +111,38 @@ impl TcpConnectionSnapshotPool {
             self.connection_slots.insert(connection_id.get(), slot);
         }
         self.connections.push(snapshot);
+    }
+
+    #[inline]
+    pub(crate) fn apply_receive_progress(
+        &mut self,
+        lookup_id: TcpLookupId,
+        progress: TcpReceiveProgress,
+    ) {
+        let Some(slot) = self.lookup_slots.lookup(&lookup_id) else {
+            return;
+        };
+        let Some(connection) = self.connections.get_mut(slot) else {
+            return;
+        };
+        if connection.irs == 0 && connection.rcv_nxt == 0 {
+            connection.irs = progress.sequence.wrapping_sub(1);
+            connection.rcv_nxt = progress.sequence;
+        }
+        if let Some(acknowledgment) = progress.acknowledgment {
+            if connection.iss == 0 && connection.snd_una == 0 && connection.snd_nxt == 0 {
+                connection.iss = acknowledgment.wrapping_sub(1);
+            }
+            connection.snd_una = tcp_seq_max(connection.snd_una, acknowledgment);
+            connection.snd_nxt = tcp_seq_max(connection.snd_nxt, connection.snd_una);
+            connection.snd_wnd = progress.advertised_window;
+        }
+        if let Some(next_receive_sequence) = progress.next_receive_sequence {
+            connection.rcv_nxt = tcp_seq_max(connection.rcv_nxt, next_receive_sequence);
+        }
+        if let Some(state) = progress.state {
+            connection.state = state;
+        }
     }
 }
 
@@ -181,6 +223,32 @@ impl TcpEstablishedSnapshotHandle {
             next
         });
     }
+
+    #[inline]
+    pub(crate) fn connection_state(&self, lookup_id: TcpLookupId) -> Option<TcpState> {
+        self.load()
+            .connections
+            .lookup_by_lookup_id(lookup_id)
+            .map(|connection| connection.state)
+    }
+
+    #[inline]
+    pub(crate) fn connection(&self, lookup_id: TcpLookupId) -> Option<TcpConnectionSnapshot> {
+        self.load().connections.lookup_by_lookup_id(lookup_id)
+    }
+
+    #[inline]
+    pub(crate) fn apply_receive_progress(
+        &self,
+        lookup_id: TcpLookupId,
+        progress: TcpReceiveProgress,
+    ) {
+        self.inner.rcu(|current| {
+            let mut next = TcpEstablishedSnapshot::clone(current);
+            next.connections.apply_receive_progress(lookup_id, progress);
+            next
+        });
+    }
 }
 
 fn default_tcp_established_snapshot() -> TcpEstablishedSnapshotHandle {
@@ -191,7 +259,7 @@ fn default_tcp_established_snapshot() -> TcpEstablishedSnapshotHandle {
 
 pub struct TcpEstablishedControlPlane {
     inner: Arc<ArcSwap<TcpEstablishedSnapshot>>,
-    backend: Option<Arc<dyn TcpEstablishedBackend>>,
+    backend: Arc<RwLock<Option<Arc<dyn TcpEstablishedBackend>>>>,
     next: [NodeId; TcpEstablishedNext::COUNT],
 }
 
@@ -200,18 +268,29 @@ impl TcpEstablishedControlPlane {
     pub fn new(next: [NodeId; TcpEstablishedNext::COUNT]) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(TcpEstablishedSnapshot::new())),
-            backend: None,
+            backend: Arc::new(RwLock::new(None)),
             next,
         }
     }
 
     #[inline]
-    pub fn with_backend<O>(mut self, backend: Arc<O>) -> Self
+    pub fn with_backend<O>(self, backend: Arc<O>) -> Self
     where
         O: TcpEstablishedBackend + 'static,
     {
-        self.backend = Some(backend);
+        self.install_backend(backend);
         self
+    }
+
+    #[inline]
+    pub fn install_backend<O>(&self, backend: Arc<O>)
+    where
+        O: TcpEstablishedBackend + 'static,
+    {
+        *self
+            .backend
+            .write()
+            .expect("tcp established backend lock poisoned") = Some(backend);
     }
 
     #[inline]
@@ -224,8 +303,35 @@ impl TcpEstablishedControlPlane {
     pub fn node(&self) -> TcpEstablishedNode {
         TcpEstablishedNode::new(self.next).with_runtime(
             TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)),
-            self.backend.clone(),
+            self.backend
+                .read()
+                .expect("tcp established backend lock poisoned")
+                .clone(),
         )
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn connection_state_for_test(&self, lookup_id: TcpLookupId) -> Option<TcpState> {
+        TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)).connection_state(lookup_id)
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub fn connection_snapshot_for_test(
+        &self,
+        lookup_id: TcpLookupId,
+    ) -> Option<TcpConnectionSnapshot> {
+        TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)).connection(lookup_id)
+    }
+}
+
+#[inline]
+fn tcp_seq_max(current: u32, candidate: u32) -> u32 {
+    if current == 0 || TcpSeq::new(current).before(TcpSeq::new(candidate)) {
+        candidate
+    } else {
+        current
     }
 }
 

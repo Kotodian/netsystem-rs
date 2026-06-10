@@ -30,6 +30,7 @@ use std::task::{Context, Poll};
 
 use hammer_adapter::BufferIndex;
 use hammer_core::error::{HammerError, HammerResult};
+pub use hammer_runtime::app::AppTcpShutdown;
 pub use hammer_runtime::app::{AppControl, AppControlBackend};
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
@@ -105,6 +106,17 @@ impl AppContext {
     }
 
     #[inline]
+    pub fn connect_tcp_stream(
+        &self,
+        peer: std::net::SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        self.inner
+            .connect_tcp_stream(peer, owner_worker)
+            .map(|flow| AppFlowId::new(flow.value()))
+    }
+
+    #[inline]
     pub fn bind_tcp_listener(
         &self,
         bind: std::net::SocketAddr,
@@ -134,6 +146,22 @@ impl AppContext {
     #[inline]
     pub fn close_tcp_flow(&self, flow: AppFlowId) -> HammerResult<()> {
         self.inner.close_tcp_flow(flow.into_inner())
+    }
+
+    #[inline]
+    pub async fn send_on_flow(&self, flow: AppFlowId, send: AppSend) -> HammerResult<()> {
+        self.inner
+            .send_on_flow(flow.into_inner(), send.into_inner())
+            .await
+    }
+
+    #[inline]
+    pub async fn shutdown_flow(
+        &self,
+        flow: AppFlowId,
+        how: std::net::Shutdown,
+    ) -> HammerResult<()> {
+        self.inner.shutdown_flow(flow.into_inner(), how).await
     }
 
     #[inline]
@@ -247,6 +275,11 @@ impl AppBackend {
     }
 
     #[inline]
+    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.inner.next_tcp_shutdown().await
+    }
+
+    #[inline]
     pub fn try_push_cqe_descriptor(&self, descriptor: AppCqeDescriptor) -> HammerResult<()> {
         self.inner.try_push_cqe_descriptor(descriptor.into_inner())
     }
@@ -301,6 +334,11 @@ impl AppRuntime {
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
         self.inner.send(send.into_inner()).await
+    }
+
+    #[inline]
+    pub async fn shutdown(&self, how: std::net::Shutdown) -> HammerResult<()> {
+        self.inner.shutdown(how).await
     }
 
     #[inline]
@@ -508,6 +546,15 @@ impl App {
     }
 
     #[inline]
+    pub fn connect_tcp_stream(
+        &self,
+        peer: std::net::SocketAddr,
+        owner_worker: usize,
+    ) -> HammerResult<AppFlowId> {
+        self.inner.connect_tcp_stream(peer, owner_worker)
+    }
+
+    #[inline]
     pub fn flow(&self, flow: AppFlowId) -> AppFlow {
         AppFlow::new(self.clone(), flow)
     }
@@ -610,6 +657,26 @@ impl AppFlow {
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
         self.runtime().send(send).await
+    }
+
+    #[inline]
+    pub async fn shutdown(&self, how: std::net::Shutdown) -> HammerResult<()> {
+        self.runtime().shutdown(how).await
+    }
+
+    #[inline]
+    pub async fn shutdown_read(&self) -> HammerResult<()> {
+        self.shutdown(std::net::Shutdown::Read).await
+    }
+
+    #[inline]
+    pub async fn shutdown_write(&self) -> HammerResult<()> {
+        self.shutdown(std::net::Shutdown::Write).await
+    }
+
+    #[inline]
+    pub async fn shutdown_both(&self) -> HammerResult<()> {
+        self.shutdown(std::net::Shutdown::Both).await
     }
 
     #[inline]

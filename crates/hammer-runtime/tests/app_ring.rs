@@ -12,10 +12,12 @@ use hammer_core::SocksAddr;
 use hammer_runtime::app::{
     AppBufferLease, AppCompletionEntry, AppContext, AppControl, AppControlBackend, AppCqe,
     AppCqeData, AppCqeDescriptor, AppCqeFlags, AppCqeKind, AppFlowId, AppObjectRef, AppOpcode,
-    AppRegisteredBuffer, AppRingHandle, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor,
+    AppRegisteredBuffer, AppRingHandle, AppSend, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor,
     AppSubmissionEntry, AppUserData, TransportKind,
 };
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
+
+const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct MockControlBackend {
@@ -169,7 +171,12 @@ fn app_runtime_shutdown_enqueues_flow_owned_tcp_shutdown_request() {
     let data_runtime =
         DataRuntime::new(1, "app-runtime-shutdown-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
-    let flow = AppFlowId::new(0x51);
+    let control_backend = Arc::new(MockControlBackend::default());
+    let control: Arc<dyn AppControlBackend> = control_backend.clone();
+    app.install_control(AppControl::new(control))
+        .expect("install control");
+    let peer: SocketAddr = "198.51.100.43:443".parse().expect("tcp peer");
+    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
 
     let shutdown = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -177,7 +184,6 @@ fn app_runtime_shutdown_enqueues_flow_owned_tcp_shutdown_request() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
 
                 app_runtime
@@ -185,10 +191,11 @@ fn app_runtime_shutdown_enqueues_flow_owned_tcp_shutdown_request() {
                     .await
                     .expect("enqueue shutdown");
 
-                backend
+                worker
+                    .backend()
                     .next_tcp_shutdown()
                     .await
-                    .expect("tcp shutdown request")
+                    .expect("shutdown request")
             })
             .await
             .expect("spawn flow task")
@@ -205,7 +212,12 @@ fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
     let data_runtime = DataRuntime::new(1, "app-runtime-shutdown-directions-test", 512 * 1024, 2)
         .expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
-    let flow = AppFlowId::new(0x52);
+    let control_backend = Arc::new(MockControlBackend::default());
+    let control: Arc<dyn AppControlBackend> = control_backend.clone();
+    app.install_control(AppControl::new(control))
+        .expect("install control");
+    let peer: SocketAddr = "198.51.100.44:443".parse().expect("tcp peer");
+    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
 
     let shutdowns = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -213,7 +225,6 @@ fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
 
                 app_runtime
@@ -229,6 +240,7 @@ fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
                     .await
                     .expect("enqueue both shutdown");
 
+                let backend = worker.backend();
                 [
                     backend
                         .next_tcp_shutdown()
@@ -249,13 +261,85 @@ fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
         });
 
     assert_eq!(
-        shutdowns.map(|shutdown| shutdown.flow()),
-        [flow, flow, flow]
+        shutdowns.map(|shutdown| (shutdown.flow().value(), shutdown.how())),
+        [
+            (flow.value(), Shutdown::Read),
+            (flow.value(), Shutdown::Write),
+            (flow.value(), Shutdown::Both),
+        ]
     );
-    assert_eq!(
-        shutdowns.map(|shutdown| shutdown.how()),
-        [Shutdown::Read, Shutdown::Write, Shutdown::Both]
-    );
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_runtime_send_remains_observable_before_shutdown_request() {
+    let data_runtime =
+        DataRuntime::new(1, "app-runtime-send-shutdown-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let control_backend = Arc::new(MockControlBackend::default());
+    let control: Arc<dyn AppControlBackend> = control_backend.clone();
+    app.install_control(AppControl::new(control))
+        .expect("install control");
+    let peer: SocketAddr = "198.51.100.45:443".parse().expect("tcp peer");
+    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let app_runtime = worker.runtime();
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let index = runtime
+                    .alloc_index_with_bytes(Default::default(), b"send-before-shutdown")
+                    .expect("alloc send buffer");
+                let expected_ptr = runtime.current_ptr(index).expect("send pointer") as usize;
+
+                app_runtime
+                    .send(AppSend::new(AppBufferLease::from_buffer(runtime, index)))
+                    .await
+                    .expect("enqueue send");
+                app_runtime
+                    .shutdown(Shutdown::Write)
+                    .await
+                    .expect("enqueue shutdown");
+
+                let entry = backend
+                    .next_submission_entry()
+                    .await
+                    .expect("send submission entry");
+                let descriptor = *entry.descriptor();
+                let (send_ptr, send_payload) = {
+                    let attachment = entry.attachment().expect("send attachment");
+                    let send_ptr =
+                        attachment.lease().current_ptr().expect("attachment ptr") as usize;
+                    let send_payload = attachment
+                        .lease()
+                        .copy_current()
+                        .expect("attachment payload");
+                    (send_ptr, send_payload)
+                };
+                let shutdown = backend.next_tcp_shutdown().await.expect("shutdown request");
+
+                (descriptor, expected_ptr, send_ptr, send_payload, shutdown)
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(result.0.opcode(), AppOpcode::Send);
+    assert_eq!(result.0.object(), AppObjectRef::Flow(flow));
+    match result.0.payload() {
+        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        other => panic!("unexpected sqe data: {other:?}"),
+    }
+    assert_eq!(result.1, result.2);
+    assert_eq!(result.3, b"send-before-shutdown");
+    assert_eq!(result.4.flow(), flow);
+    assert_eq!(result.4.how(), Shutdown::Write);
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
@@ -558,7 +642,7 @@ fn app_context_try_complete_recv_from_buffer_enqueues_socket_owned_cqe() {
         .expect("spawn recv_from worker");
 
     let result = rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_TEST_TIMEOUT)
         .expect("receive recv_from result");
 
     assert_eq!(result.0.user_data(), AppUserData::new(17));
@@ -631,7 +715,7 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe() {
         .expect("spawn accept worker");
 
     let result = rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_TEST_TIMEOUT)
         .expect("receive accept result");
 
     assert_eq!(result.0.user_data(), AppUserData::new(23));
@@ -695,13 +779,13 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe_from_non_worker_t
         .expect("spawn accept worker");
 
     ready_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_TEST_TIMEOUT)
         .expect("wait pending accept");
     app.try_complete_accept(listener, accepted_flow)
         .expect("enqueue accept cqe from non-worker thread");
 
     let result = result_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(ASYNC_TEST_TIMEOUT)
         .expect("receive accept result");
 
     assert_eq!(result.user_data(), AppUserData::new(24));

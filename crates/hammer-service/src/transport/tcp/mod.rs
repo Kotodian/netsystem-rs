@@ -7,6 +7,7 @@ pub mod established;
 pub mod input;
 pub mod listen;
 pub mod lookup;
+pub mod output;
 pub mod rcv_process;
 pub mod reset;
 pub mod state;
@@ -21,7 +22,8 @@ pub use connection::{
     TcpWorkerOwnedConnectionState,
 };
 pub use established::{
-    TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpEstablishedObservation,
+    TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode,
+    TcpEstablishedObservation,
 };
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};
@@ -29,6 +31,12 @@ pub use lookup::{
     TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpV4ConnectionKey,
     TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
     TcpV6PendingConnectionKey, TcpWorkerOwnedState,
+};
+pub use output::{
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, NoopTcpOutputBackend, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TCP_FLAG_SYN, TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue,
+    TcpOutputRetransmitSegment, TcpOutputSegment, build_tcp_output_segment,
+    build_tcp_output_segment_with_flags,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reset::{TcpResetNext, TcpResetNode};

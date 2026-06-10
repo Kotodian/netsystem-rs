@@ -4,8 +4,8 @@ use hammer_core::error::{HammerError, HammerResult};
 
 use crate::{
     App, AppBufferLease, AppContext, AppCqeData, AppFlowId, AppObjectRef, AppOpcode,
-    AppRegisteredBuffer, AppRing, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
-    AppUserData,
+    AppRegisteredBuffer, AppRing, AppSend, AppSocketId, AppSqeData, AppSqeDescriptor,
+    AppSubmissionEntry, AppUserData,
 };
 
 fn missing_completion(op: &str) -> HammerError {
@@ -216,21 +216,19 @@ impl TcpStream {
                 ring.try_push_submission_entry(self.send_entry(AppUserData::new(0), lease)?)
             }
             TcpStreamInner::Context { app } => {
-                let backend = app.local_backend_for_flow(self.flow)?;
-                backend.try_push_submission_entry(self.send_entry(AppUserData::new(0), lease)?)
+                app.send_on_flow(self.flow, AppSend::new(lease)).await
             }
         }
     }
 
     pub async fn shutdown(&self, how: Shutdown) -> HammerResult<()> {
         match &self.inner {
-            TcpStreamInner::Local { ring } => ring.runtime().inner.shutdown(how).await,
+            TcpStreamInner::Local { ring } => ring.runtime().shutdown(how).await,
             TcpStreamInner::Context { app } => {
-                let backend = app.inner.local_backend_for_flow(self.flow.into_inner())?;
-                backend.try_push_tcp_shutdown(hammer_runtime::app::AppTcpShutdown::new(
-                    self.flow.into_inner(),
-                    how,
-                ))
+                app.spawn_on_flow(self.flow, move |worker| async move {
+                    worker.runtime().shutdown(how).await
+                })
+                .await?
             }
         }
     }

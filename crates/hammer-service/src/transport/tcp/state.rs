@@ -194,6 +194,24 @@ impl TcpInputFlags {
         let ack = usize::from(bits & Self::ACK.bits() != 0) << 3;
         fin | syn | rst | ack
     }
+
+    #[inline]
+    fn from_table_index(index: usize) -> Self {
+        let mut flags = Self::empty();
+        if index & 0x01 != 0 {
+            flags |= Self::FIN;
+        }
+        if index & 0x02 != 0 {
+            flags |= Self::SYN;
+        }
+        if index & 0x04 != 0 {
+            flags |= Self::RST;
+        }
+        if index & 0x08 != 0 {
+            flags |= Self::ACK;
+        }
+        flags
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -223,6 +241,28 @@ impl TcpDispatchTable {
     #[inline]
     fn set(&mut self, state: TcpState, flags: TcpInputFlags, entry: TcpDispatchEntry) {
         self.entries[state.index()][flags.table_index()] = entry;
+    }
+
+    #[inline]
+    fn fill_row(&mut self, state: TcpState, entry: TcpDispatchEntry) {
+        for index in 0..TcpInputFlags::TABLE_LEN {
+            self.set(state, TcpInputFlags::from_table_index(index), entry);
+        }
+    }
+
+    #[inline]
+    fn set_row_when_contains(
+        &mut self,
+        state: TcpState,
+        mask: TcpInputFlags,
+        entry: TcpDispatchEntry,
+    ) {
+        for index in 0..TcpInputFlags::TABLE_LEN {
+            let flags = TcpInputFlags::from_table_index(index);
+            if flags.intersects(mask) {
+                self.set(state, flags, entry);
+            }
+        }
     }
 }
 
@@ -268,11 +308,42 @@ impl Default for TcpDispatchTable {
             TcpInputFlags::FIN | TcpInputFlags::ACK,
             TcpDispatchEntry::new(TcpInputNext::Established, None),
         );
-        table.set(
-            TcpState::Closed,
-            TcpInputFlags::RST,
-            TcpDispatchEntry::new(TcpInputNext::Drop, Some(TcpInputError::ConnectionClosed)),
+        let established = TcpDispatchEntry::new(TcpInputNext::Established, None);
+        let rcv_process = TcpDispatchEntry::new(TcpInputNext::RcvProcess, None);
+        for state in [TcpState::FinWait1, TcpState::FinWait2] {
+            table.fill_row(state, rcv_process);
+            table.set_row_when_contains(
+                state,
+                TcpInputFlags::ACK | TcpInputFlags::RST | TcpInputFlags::FIN,
+                established,
+            );
+        }
+        table.fill_row(TcpState::CloseWait, rcv_process);
+        table.set_row_when_contains(TcpState::CloseWait, TcpInputFlags::RST, established);
+        table.fill_row(TcpState::Closing, rcv_process);
+        table.set_row_when_contains(
+            TcpState::Closing,
+            TcpInputFlags::ACK | TcpInputFlags::RST | TcpInputFlags::FIN,
+            established,
         );
+        table.fill_row(TcpState::LastAck, rcv_process);
+        table.set_row_when_contains(
+            TcpState::LastAck,
+            TcpInputFlags::ACK | TcpInputFlags::RST,
+            established,
+        );
+        table.fill_row(TcpState::TimeWait, rcv_process);
+        let closed_reset =
+            TcpDispatchEntry::new(TcpInputNext::Reset, Some(TcpInputError::ConnectionClosed));
+        let closed_drop =
+            TcpDispatchEntry::new(TcpInputNext::Drop, Some(TcpInputError::ConnectionClosed));
+        table.fill_row(TcpState::Closed, closed_reset);
+        for index in 0..TcpInputFlags::TABLE_LEN {
+            let flags = TcpInputFlags::from_table_index(index);
+            if flags.contains(TcpInputFlags::RST) {
+                table.set(TcpState::Closed, flags, closed_drop);
+            }
+        }
 
         table
     }
