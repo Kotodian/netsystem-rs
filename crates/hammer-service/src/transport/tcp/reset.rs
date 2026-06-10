@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeProcessFn,
-    NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Network, Node, NodeId,
+    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec as InfraVec;
@@ -14,6 +14,7 @@ use super::TcpInputError;
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
     Drop,
+    Lookup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,10 +277,13 @@ impl Node for TcpResetNode {
         sync_tcp_reset_runtime(self.runtime_data, self.observer.clone())?;
         let next = Self::runtime_nexts(runtime)?;
         let drop_next = next[TcpResetNext::Drop as usize];
+        let lookup_next = next[TcpResetNext::Lookup as usize];
         let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
             runtime,
             frame,
-            |index| tcp_reset_next_for_index(runtime, index, drop_next, &self.observer),
+            |index| {
+                tcp_reset_next_for_index(runtime, index, drop_next, lookup_next, &self.observer)
+            },
         )?;
         self.cached_next = cached_next;
         Ok(result)
@@ -305,8 +309,9 @@ fn tcp_reset_process(
     let state = tcp_reset_runtime(data)?;
     let next = TcpResetNode::runtime_nexts(runtime)?;
     let drop_next = next[TcpResetNext::Drop as usize];
+    let lookup_next = next[TcpResetNext::Lookup as usize];
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        tcp_reset_next_for_index(runtime, index, drop_next, &state.observer)
+        tcp_reset_next_for_index(runtime, index, drop_next, lookup_next, &state.observer)
     })?;
     Ok(result)
 }
@@ -315,12 +320,19 @@ fn tcp_reset_next_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     drop_next: NodeId,
+    lookup_next: NodeId,
     observer: &TcpResetObserverHandle,
 ) -> CoreResult<Option<NodeId>> {
+    let observation = tcp_reset_observation(runtime, index)?;
     if observer.is_registered() {
-        observer.observe_reset(tcp_reset_observation(runtime, index)?)?;
+        observer.observe_reset(observation.clone())?;
     }
-    Ok(Some(drop_next))
+    let Some(synthesized_reset) = observation.synthesized_reset else {
+        return Ok(Some(drop_next));
+    };
+    replace_current_chain(runtime, index, &synthesized_reset.packet)?;
+    refresh_synthesized_reset_metadata(runtime, index, &synthesized_reset)?;
+    Ok(Some(lookup_next))
 }
 
 fn tcp_reset_observation(
@@ -488,4 +500,39 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
         }
     }
     !(sum as u16)
+}
+
+#[inline(always)]
+fn replace_current_chain(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    packet: &[u8],
+) -> CoreResult<()> {
+    runtime.truncate_chain(index, 0)?;
+    runtime.append(index, packet)
+}
+
+#[inline(always)]
+fn refresh_synthesized_reset_metadata(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    synthesized_reset: &TcpSynthesizedReset,
+) -> CoreResult<()> {
+    const IPV4_HEADER_LEN: usize = 20;
+    const TCP_HEADER_LEN: usize = 20;
+
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    buffer.clear_node_error();
+    buffer.set_packet_cursor(
+        BufferPacketCursor::new()
+            .with_packet_len(synthesized_reset.packet.len())
+            .with_network_header(0, IPV4_HEADER_LEN)
+            .with_transport_header(IPV4_HEADER_LEN, TCP_HEADER_LEN)
+            .with_transport_payload_offset(IPV4_HEADER_LEN + TCP_HEADER_LEN),
+    );
+    let metadata = buffer.metadata_mut();
+    *metadata = synthesized_reset.metadata.clone();
+    metadata.network = Network::Tcp;
+    metadata.icmp_error = None;
+    Ok(())
 }
