@@ -12,8 +12,8 @@ use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
 };
 use hammer_runtime::app::{
-    AppContext, AppControl, AppControlBackend, AppCqeData, AppFlowId, AppObjectRef, AppOpcode,
-    AppSocketId, AppSqeData, AppSqeDescriptor, AppUserData,
+    AppContext, AppControl, AppControlBackend, AppCqeData, AppCqeFlags, AppFlowId, AppObjectRef,
+    AppOpcode, AppSocketId, AppSqeData, AppSqeDescriptor, AppUserData,
 };
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::app::AppIngressTarget;
@@ -1242,6 +1242,320 @@ fn tcp_rcv_process_handoffs_selected_established_flow_to_app() {
     assert!(result.2.is_empty());
     assert_eq!(result.3, 0);
     assert_eq!(result.4, 0);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn tcp_rcv_process_does_not_deliver_ack_only_established_flow_to_app() {
+    let data_runtime =
+        DataRuntime::new(1, "tcp-app-ack-only-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(ESTABLISHED_ID as u64);
+    let bridge_app = app.clone();
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async move {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let recv_future = worker.runtime().recv();
+                let recv_sqe = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("next recv sqe descriptor");
+                assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
+
+                let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+                let sink_state = Arc::new(Mutex::new(CaptureState::default()));
+                let drop = runtime.nodes().register_internal(DropNode::new());
+                let punt =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let listen =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let reset =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let tcp_rcv_process_control =
+                    TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(
+                        runtime
+                            .nodes()
+                            .register_internal(CaptureNode::new(Arc::clone(&sink_state))),
+                    ));
+                tcp_rcv_process_control
+                    .publish_app_ingress([(
+                        ESTABLISHED_ID,
+                        AppIngressTarget::new(bridge_app.clone(), flow),
+                    )])
+                    .expect("publish tcp app ingress");
+                let established = runtime.nodes().register_internal(TcpEstablishedNode::new(
+                    TcpEstablishedNext::nodes(
+                        runtime
+                            .nodes()
+                            .register_internal(tcp_rcv_process_control.node()),
+                    ),
+                ));
+                let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+                    drop,
+                    punt,
+                    listen,
+                    drop,
+                    drop,
+                    established,
+                    reset,
+                ));
+                let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+                owner.insert_connection_v4(
+                    TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 42),
+                        LISTEN_PORT,
+                        Ipv4Addr::new(198, 51, 100, 42),
+                        40_042,
+                    ),
+                    ESTABLISHED_ID,
+                );
+                tcp_control
+                    .publish_lookup(owner.publish_snapshot())
+                    .expect("publish established lookup");
+                tcp_control
+                    .publish_app_ingress([ESTABLISHED_ID])
+                    .expect("publish app ingress");
+                let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+                let packet = ipv4_tcp_packet(
+                    Ipv4Addr::new(198, 51, 100, 42),
+                    40_042,
+                    Ipv4Addr::new(192, 0, 2, 42),
+                    LISTEN_PORT,
+                    tcp_flags(false, false, false, true),
+                    b"",
+                );
+                let metadata = tcp_metadata(
+                    Ipv4Addr::new(198, 51, 100, 42).into(),
+                    40_042,
+                    Ipv4Addr::new(192, 0, 2, 42).into(),
+                    LISTEN_PORT,
+                );
+                let frame = runtime.alloc_frame_index().expect("alloc frame");
+                let buffer = push_packet(&runtime, frame, &packet, metadata);
+                stamp_tcp_cursor(&runtime, buffer, &packet);
+
+                assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+                assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+
+                std::mem::drop(recv_future);
+
+                let sink_packets = sink_state.lock().unwrap().packets.clone();
+                let sink_errors = sink_state.lock().unwrap().node_errors.clone();
+                let buffers_after = runtime.in_use_buffers();
+                let frames_after = runtime.frames_in_use();
+
+                (sink_packets, sink_errors, buffers_after, frames_after)
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    let expected_packet = ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 42),
+        40_042,
+        Ipv4Addr::new(192, 0, 2, 42),
+        LISTEN_PORT,
+        tcp_flags(false, false, false, true),
+        b"",
+    );
+    assert_eq!(
+        result.0,
+        vec![expected_packet],
+        "ack-only established traffic must fall through the rcv-process next instead of completing app recv"
+    );
+    assert_eq!(result.1, vec![None]);
+    assert_eq!(result.2, 0);
+    assert_eq!(result.3, 0);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn tcp_rcv_process_marks_fin_on_established_flow_to_app() {
+    let data_runtime =
+        DataRuntime::new(1, "tcp-app-fin-test", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let flow = AppFlowId::new(ESTABLISHED_ID as u64);
+    let bridge_app = app.clone();
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async move {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let recv_future = worker.runtime().recv();
+                let recv_sqe = backend
+                    .next_sqe_descriptor()
+                    .await
+                    .expect("next recv sqe descriptor");
+                assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
+
+                let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+                let sink_state = Arc::new(Mutex::new(CaptureState::default()));
+                let drop = runtime.nodes().register_internal(DropNode::new());
+                let punt =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let listen =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let reset =
+                    runtime
+                        .nodes()
+                        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+                            CaptureState::default(),
+                        ))));
+                let tcp_rcv_process_control =
+                    TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(
+                        runtime
+                            .nodes()
+                            .register_internal(CaptureNode::new(Arc::clone(&sink_state))),
+                    ));
+                tcp_rcv_process_control
+                    .publish_app_ingress([(
+                        ESTABLISHED_ID,
+                        AppIngressTarget::new(bridge_app.clone(), flow),
+                    )])
+                    .expect("publish tcp app ingress");
+                let established = runtime.nodes().register_internal(TcpEstablishedNode::new(
+                    TcpEstablishedNext::nodes(
+                        runtime
+                            .nodes()
+                            .register_internal(tcp_rcv_process_control.node()),
+                    ),
+                ));
+                let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+                    drop,
+                    punt,
+                    listen,
+                    drop,
+                    drop,
+                    established,
+                    reset,
+                ));
+                let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+                owner.insert_connection_v4(
+                    TcpV4ConnectionKey::new(
+                        0,
+                        Ipv4Addr::new(192, 0, 2, 43),
+                        LISTEN_PORT,
+                        Ipv4Addr::new(198, 51, 100, 43),
+                        40_043,
+                    ),
+                    ESTABLISHED_ID,
+                );
+                tcp_control
+                    .publish_lookup(owner.publish_snapshot())
+                    .expect("publish established lookup");
+                tcp_control
+                    .publish_app_ingress([ESTABLISHED_ID])
+                    .expect("publish app ingress");
+                let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+                let packet = ipv4_tcp_packet(
+                    Ipv4Addr::new(198, 51, 100, 43),
+                    40_043,
+                    Ipv4Addr::new(192, 0, 2, 43),
+                    LISTEN_PORT,
+                    tcp_flags(true, false, false, true),
+                    b"",
+                );
+                let metadata = tcp_metadata(
+                    Ipv4Addr::new(198, 51, 100, 43).into(),
+                    40_043,
+                    Ipv4Addr::new(192, 0, 2, 43).into(),
+                    LISTEN_PORT,
+                );
+                let frame = runtime.alloc_frame_index().expect("alloc frame");
+                let buffer = push_packet(&runtime, frame, &packet, metadata);
+                stamp_tcp_cursor(&runtime, buffer, &packet);
+
+                assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+                assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
+
+                let descriptor = backend
+                    .next_cqe_descriptor()
+                    .await
+                    .expect("next recv cqe descriptor");
+                std::mem::drop(recv_future);
+                let recv = backend
+                    .take_completion_buffer(match descriptor.payload() {
+                        AppCqeData::Recv { buffer, .. } => buffer,
+                        other => panic!("expected recv descriptor payload, got {other:?}"),
+                    })
+                    .expect("take completion buffer");
+                let payload = recv.lease().copy_current().expect("recv payload");
+                recv.release();
+
+                let sink_packets = sink_state.lock().unwrap().packets.clone();
+                let sink_errors = sink_state.lock().unwrap().node_errors.clone();
+                let buffers_after = runtime.in_use_buffers();
+                let frames_after = runtime.frames_in_use();
+
+                (
+                    descriptor,
+                    payload,
+                    sink_packets,
+                    sink_errors,
+                    buffers_after,
+                    frames_after,
+                )
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    let expected_packet = ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 43),
+        40_043,
+        Ipv4Addr::new(192, 0, 2, 43),
+        LISTEN_PORT,
+        tcp_flags(true, false, false, true),
+        b"",
+    );
+    assert!(result.0.flags().contains(AppCqeFlags::BUFFER));
+    assert!(result.0.flags().contains(AppCqeFlags::FIN));
+    assert_eq!(result.0.object(), AppObjectRef::Flow(flow));
+    match result.0.payload() {
+        AppCqeData::Recv {
+            flow: recv_flow, ..
+        } => assert_eq!(recv_flow, flow),
+        other => panic!("expected recv descriptor payload, got {other:?}"),
+    }
+    assert_eq!(result.0.result(), expected_packet.len() as i32);
+    assert_eq!(result.1, expected_packet);
+    assert!(result.2.is_empty());
+    assert!(result.3.is_empty());
+    assert_eq!(result.4, 0);
+    assert_eq!(result.5, 0);
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

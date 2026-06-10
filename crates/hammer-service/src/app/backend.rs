@@ -15,10 +15,21 @@ impl AppIngressBackend {
         index: BufferIndex,
         target: &AppIngressTarget,
     ) -> CoreResult<()> {
+        self.post_recv_cqe_with_fin(runtime, index, target, false)
+    }
+
+    #[inline]
+    pub fn post_recv_cqe_with_fin(
+        &self,
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+        target: &AppIngressTarget,
+        fin: bool,
+    ) -> CoreResult<()> {
         match target.object() {
             AppIngressObject::Flow(flow) => target
                 .app()
-                .try_complete_recv_buffer(flow, runtime.packet_buffers().clone(), index, false)
+                .try_complete_recv_buffer(flow, runtime.packet_buffers().clone(), index, fin)
                 .map_err(|err| {
                     CoreError::internal(format!("enqueue app ingress recv cqe: {err}"))
                 })?,

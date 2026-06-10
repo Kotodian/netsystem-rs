@@ -216,12 +216,12 @@ fn tcp_rcv_process_next_for_index(
     drop_next: hammer_adapter::NodeId,
     app_ingress: &AppIngressRegistry<TcpLookupId>,
 ) -> CoreResult<Option<hammer_adapter::NodeId>> {
-    let Some(connection_id) = take_pending_tcp_app_ingress(index)? else {
+    let Some(pending) = take_pending_tcp_app_ingress(index)? else {
         return Ok(Some(drop_next));
     };
-    let Some(target) = app_ingress.get(&connection_id) else {
+    let Some(target) = app_ingress.get(&pending.connection_id) else {
         return Ok(Some(drop_next));
     };
-    target.post_recv_cqe(runtime, index)?;
+    target.post_recv_cqe_with_fin(runtime, index, pending.fin)?;
     Ok(None)
 }

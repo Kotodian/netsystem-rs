@@ -214,20 +214,27 @@ fn tcp_established_next_for_index(
     connections: &TcpConnectionSnapshotPool,
     backend: Option<&dyn TcpEstablishedBackend>,
 ) -> CoreResult<Option<NodeId>> {
-    let Some(lookup_id) = take_pending_tcp_app_ingress(index)? else {
+    let Some(pending) = take_pending_tcp_app_ingress(index)? else {
         return Ok(Some(rcv_process));
     };
     if packet_has_rst(runtime, index)? {
         if let Some(backend) = backend
-            && let Some(observation) =
-                tcp_established_close_observation(runtime, index, lookup_id, connections)?
+            && let Some(observation) = tcp_established_close_observation(
+                runtime,
+                index,
+                pending.connection_id,
+                connections,
+            )?
         {
             backend.observe_close(observation)?;
         }
         runtime.free_index(index);
         return Ok(None);
     }
-    mark_pending_tcp_app_ingress(index, lookup_id)?;
+    let fin = packet_has_fin(runtime, index)?;
+    if fin || packet_has_payload(runtime, index)? {
+        mark_pending_tcp_app_ingress(index, pending.connection_id, fin)?;
+    }
     Ok(Some(rcv_process))
 }
 
@@ -269,13 +276,26 @@ fn tcp_established_close_observation(
 }
 
 fn packet_has_rst(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<bool> {
+    Ok(packet_flags(runtime, index)? & 0x04 != 0)
+}
+
+fn packet_has_fin(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<bool> {
+    Ok(packet_flags(runtime, index)? & 0x01 != 0)
+}
+
+fn packet_has_payload(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<bool> {
+    let cursor = runtime.get_buffer(index)?.packet_cursor();
+    Ok(cursor.packet_len() > cursor.transport_payload_offset())
+}
+
+fn packet_flags(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<u8> {
     let cursor = runtime.get_buffer(index)?.packet_cursor();
     let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index)?.into_iter().collect();
     let flags_offset = cursor.transport_header_offset() + 13;
     let Some(flags) = packet.get(flags_offset) else {
-        return Ok(false);
+        return Ok(0);
     };
-    Ok(flags & 0x04 != 0)
+    Ok(*flags)
 }
 
 #[cfg(test)]
@@ -446,7 +466,7 @@ mod tests {
         let frame = runtime.alloc_frame_index().expect("alloc frame");
         let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
         stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID).expect("mark pending app ingress");
+        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
 
         assert!(
             runtime
