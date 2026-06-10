@@ -12,10 +12,11 @@ use hammer_infra::vec::Vec;
 
 use crate::app::backend::{AppBackend, AppBackendRecvQueue, AppBackendSendQueue};
 use crate::app::ring::{
-    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv, AppRegisteredBuffer,
-    AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
+    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv,
+    AppRegisteredBuffer, AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
+    AppTcpShutdown, AppUserData,
 };
-use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
+use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local, with_data_plane_buffers};
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 
 static NEXT_APP_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -177,6 +178,38 @@ impl AppContext {
         Ok(flow)
     }
 
+    pub async fn send_on_flow(&self, flow: AppFlowId, send: AppSend) -> HammerResult<()> {
+        if self.current_worker_owns_flow(flow) {
+            let backend = self.local_backend_for_flow(flow)?;
+            return AppRuntime {
+                flow,
+                recv: backend.recv_queue(),
+                send: backend.send_queue(),
+            }
+            .send(send)
+            .await;
+        }
+
+        let payload = send.lease().copy_current()?;
+        let owner_worker = self.owner_for(flow)?;
+        let app_context_id = self.id;
+        let ring_capacity = self.ring_capacity;
+        self.data_context
+            .call_local_on_worker(owner_worker, move || async move {
+                let worker = AppWorkerContext {
+                    owner_worker,
+                    backend: worker_backend(app_context_id, flow, ring_capacity),
+                };
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let index = runtime.alloc_index_with_bytes(Default::default(), &payload)?;
+                worker
+                    .runtime()
+                    .send(AppSend::new(AppBufferLease::from_buffer(runtime, index)))
+                    .await
+            })
+            .await?
+    }
+
     pub fn bind_udp_socket(
         &self,
         bind: SocketAddr,
@@ -200,6 +233,13 @@ impl AppContext {
         self.unregister_flow_owner(flow)
     }
 
+    pub async fn shutdown_flow(&self, flow: AppFlowId, how: Shutdown) -> HammerResult<()> {
+        self.spawn_on_flow(flow, move |worker| async move {
+            worker.runtime().shutdown(how).await
+        })
+        .await?
+    }
+
     pub async fn spawn_on_flow<F, Fut, T>(&self, flow: AppFlowId, f: F) -> HammerResult<T>
     where
         F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
@@ -218,6 +258,38 @@ impl AppContext {
                 f(worker).await
             })
             .await
+    }
+
+    pub fn spawn_detached_on_flow<F, Fut>(&self, flow: AppFlowId, f: F) -> HammerResult<()>
+    where
+        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let owner_worker = self.owner_for(flow)?;
+        self.spawn_detached_on_flow_owner(flow, owner_worker, f)
+    }
+
+    pub fn spawn_detached_on_flow_owner<F, Fut>(
+        &self,
+        flow: AppFlowId,
+        owner_worker: usize,
+        f: F,
+    ) -> HammerResult<()>
+    where
+        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        self.validate_owner_worker(owner_worker)?;
+        let app_context_id = self.id;
+        let ring_capacity = self.ring_capacity;
+        self.data_context
+            .spawn_local_on_worker(owner_worker, move || async move {
+                let worker = AppWorkerContext {
+                    owner_worker,
+                    backend: worker_backend(app_context_id, flow, ring_capacity),
+                };
+                f(worker).await;
+            })
     }
 
     #[inline]
@@ -539,7 +611,7 @@ impl AppRuntime {
     pub async fn shutdown(&self, how: Shutdown) -> HammerResult<()> {
         self.send
             .ring()
-            .try_push_tcp_shutdown(crate::app::ring::AppTcpShutdown::new(self.flow, how))
+            .try_push_tcp_shutdown(AppTcpShutdown::new(self.flow, how))
     }
 
     #[inline]

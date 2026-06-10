@@ -57,6 +57,28 @@ struct TcpManagedConnection {
     close_reason: Option<TcpCloseReason>,
 }
 
+impl TcpManagedConnection {
+    #[inline]
+    fn timeout_close_reason(self, kind: TcpTimerKind) -> Option<TcpCloseReason> {
+        match kind.close_reason_on_expiry() {
+            Some(reason) => Some(reason),
+            None if kind == TcpTimerKind::TimeWait && self.state == TcpState::TimeWait => Some(
+                self.shutdown
+                    .map(|(_, reason)| reason)
+                    .unwrap_or(TcpCloseReason::RemoteFin),
+            ),
+            None => None,
+        }
+    }
+
+    #[inline]
+    fn closed_state_reason(self) -> TcpCloseReason {
+        self.close_reason
+            .or(self.shutdown.map(|(_, reason)| reason))
+            .unwrap_or(TcpCloseReason::RemoteFin)
+    }
+}
+
 #[derive(Default)]
 struct TcpTimerRegistryState {
     next_timer_id: u64,
@@ -136,6 +158,18 @@ unsafe impl Send for TcpControlPlaneCell {}
 // SAFETY: shared references may cross threads, but dereferences stay within
 // the single control-thread ownership model above.
 unsafe impl Sync for TcpControlPlaneCell {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpConnectionMutationOutcome {
+    Ignored,
+    StateChanged {
+        key: TcpConnectionKey,
+        state: TcpState,
+    },
+    Closed {
+        reason: TcpCloseReason,
+    },
+}
 
 #[derive(Clone)]
 pub struct TcpControlTimerSet {
@@ -352,9 +386,13 @@ impl TcpControlPlane {
                 capabilities,
                 negotiated,
             } => {
-                let should_emit = self.with_state_mut(move |state| {
+                let state = Arc::clone(&self.state);
+                let timer_state = Arc::clone(&self.timers.state);
+                let outcome = self.control_handle.call_blocking(move || {
+                    // SAFETY: both cells are owned by the single control thread.
+                    let state = unsafe { state.get_mut() };
                     if state.closed_connections.contains_key(&connection_id) {
-                        return Ok(false);
+                        return Ok(TcpConnectionMutationOutcome::Ignored);
                     }
                     match state.connections.get_mut(&connection_id) {
                         Some(connection) => {
@@ -377,42 +415,75 @@ impl TcpControlPlane {
                             );
                         }
                     }
-                    Ok(true)
-                })?;
-                if should_emit {
-                    self.events.emit(TcpWorkerEvent::StateChanged {
-                        connection_id,
+                    if tcp_state == TcpState::Closed {
+                        let reason = state
+                            .connections
+                            .get(&connection_id)
+                            .copied()
+                            .map(TcpManagedConnection::closed_state_reason)
+                            .unwrap_or(TcpCloseReason::RemoteFin);
+                        // SAFETY: the timer registry shares the same control-thread owner.
+                        let timer_state = unsafe { timer_state.get_mut() };
+                        Self::close_connection_on_control(
+                            state,
+                            timer_state,
+                            connection_id,
+                            reason,
+                        );
+                        return Ok(TcpConnectionMutationOutcome::Closed { reason });
+                    }
+                    Ok(TcpConnectionMutationOutcome::StateChanged {
                         key,
                         state: tcp_state,
-                    });
-                }
+                    })
+                })??;
+                self.emit_connection_mutation(connection_id, outcome);
                 Ok(())
             }
             TcpControlPlaneAction::TransitionConnection {
                 connection_id,
                 state: tcp_state,
             } => {
-                let key = self.with_state_mut(move |state| {
+                let state = Arc::clone(&self.state);
+                let timer_state = Arc::clone(&self.timers.state);
+                let outcome = self.control_handle.call_blocking(move || {
+                    // SAFETY: both cells are owned by the single control thread.
+                    let state = unsafe { state.get_mut() };
                     if state.closed_connections.contains_key(&connection_id) {
-                        return Ok(None);
+                        return Ok(TcpConnectionMutationOutcome::Ignored);
                     }
-                    let connection =
-                        state.connections.get_mut(&connection_id).ok_or_else(|| {
-                            HammerError::internal(format!(
-                                "tcp connection {} is not installed",
-                                connection_id.get()
-                            ))
-                        })?;
-                    connection.state = tcp_state;
-                    Ok(Some(connection.key))
-                })?;
-                if let Some(key) = key {
-                    self.events.emit(TcpWorkerEvent::StateChanged {
-                        connection_id,
-                        key,
+                    let (key, reason) = {
+                        let connection =
+                            state.connections.get_mut(&connection_id).ok_or_else(|| {
+                                HammerError::internal(format!(
+                                    "tcp connection {} is not installed",
+                                    connection_id.get()
+                                ))
+                            })?;
+                        if tcp_state == TcpState::Closed {
+                            (None, Some(connection.closed_state_reason()))
+                        } else {
+                            connection.state = tcp_state;
+                            (Some(connection.key), None)
+                        }
+                    };
+                    if let Some(reason) = reason {
+                        // SAFETY: the timer registry shares the same control-thread owner.
+                        let timer_state = unsafe { timer_state.get_mut() };
+                        Self::close_connection_on_control(
+                            state,
+                            timer_state,
+                            connection_id,
+                            reason,
+                        );
+                        return Ok(TcpConnectionMutationOutcome::Closed { reason });
+                    }
+                    Ok(TcpConnectionMutationOutcome::StateChanged {
+                        key: key.expect("non-closed transitions keep the connection installed"),
                         state: tcp_state,
-                    });
-                }
+                    })
+                })??;
+                self.emit_connection_mutation(connection_id, outcome);
                 Ok(())
             }
             TcpControlPlaneAction::ShutdownConnection {
@@ -504,16 +575,49 @@ impl TcpControlPlane {
         self.control_handle.call_blocking(move || {
             // SAFETY: both cells are owned by the single control thread.
             let state = unsafe { state.get_mut() };
-            state.closed_connections.insert(connection_id, reason);
-            if let Some(connection) = state.connections.get_mut(&connection_id) {
-                connection.close_reason = Some(reason);
-            }
-            state.connections.remove(&connection_id);
             // SAFETY: the timer registry shares the same control-thread owner.
             let timer_state = unsafe { timer_state.get_mut() };
-            TcpControlTimerSet::cancel_all_on_control(timer_state, connection_id);
+            Self::close_connection_on_control(state, timer_state, connection_id, reason);
             Ok(())
         })?
+    }
+
+    fn close_connection_on_control(
+        state: &mut TcpControlPlaneState,
+        timer_state: &mut TcpTimerRegistryState,
+        connection_id: TcpConnectionId,
+        reason: TcpCloseReason,
+    ) {
+        state.closed_connections.insert(connection_id, reason);
+        if let Some(connection) = state.connections.get_mut(&connection_id) {
+            connection.close_reason = Some(reason);
+        }
+        state.connections.remove(&connection_id);
+        TcpControlTimerSet::cancel_all_on_control(timer_state, connection_id);
+    }
+
+    #[inline]
+    fn emit_connection_mutation(
+        &self,
+        connection_id: TcpConnectionId,
+        outcome: TcpConnectionMutationOutcome,
+    ) {
+        match outcome {
+            TcpConnectionMutationOutcome::Ignored => {}
+            TcpConnectionMutationOutcome::StateChanged { key, state } => {
+                self.events.emit(TcpWorkerEvent::StateChanged {
+                    connection_id,
+                    key,
+                    state,
+                });
+            }
+            TcpConnectionMutationOutcome::Closed { reason } => {
+                self.events.emit(TcpWorkerEvent::Closed {
+                    connection_id,
+                    reason,
+                });
+            }
+        }
     }
 
     fn arm_timer(
@@ -559,27 +663,31 @@ impl TcpControlPlane {
                             timer_id,
                             kind,
                         });
-                        let Some(reason) = kind.close_reason_on_expiry() else {
-                            return;
-                        };
-
                         // SAFETY: timer callbacks run on the control thread runtime,
                         // sharing the same single-thread ownership as direct apply().
                         let tcp_state = unsafe { tcp_state_cell.get_mut() };
+                        let Some(reason) = tcp_state
+                            .connections
+                            .get(&connection_id)
+                            .and_then(|connection| connection.timeout_close_reason(kind))
+                        else {
+                            return;
+                        };
                         if tcp_state.closed_connections.contains_key(&connection_id) {
                             return;
                         }
-                        if let Some(connection) = tcp_state.connections.get_mut(&connection_id) {
-                            connection.close_reason = Some(reason);
-                        } else {
+                        if !tcp_state.connections.contains_key(&connection_id) {
                             return;
                         }
-                        tcp_state.closed_connections.insert(connection_id, reason);
-                        tcp_state.connections.remove(&connection_id);
 
                         // SAFETY: timer callbacks share control-thread ownership with the registry.
                         let timer_state = unsafe { timer_state_cell.get_mut() };
-                        TcpControlTimerSet::cancel_all_on_control(timer_state, connection_id);
+                        Self::close_connection_on_control(
+                            tcp_state,
+                            timer_state,
+                            connection_id,
+                            reason,
+                        );
 
                         events.emit(TcpWorkerEvent::Closed {
                             connection_id,

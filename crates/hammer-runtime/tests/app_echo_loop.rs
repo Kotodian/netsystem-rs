@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use hammer_runtime::app::{AppBufferLease, AppContext, AppFlowId};
+use hammer_runtime::app::{AppBufferLease, AppContext, AppFlowId, AppSend};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
@@ -75,6 +75,59 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
     assert_eq!(result.4, result.5);
     assert_eq!(result.6.opcode(), hammer_runtime::app::AppOpcode::Recv);
     assert_eq!(result.7.opcode(), hammer_runtime::app::AppOpcode::Send);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_context_send_on_flow_copies_payload_across_workers() {
+    let data_runtime =
+        DataRuntime::new(2, "app-send-on-flow", 512 * 1024, 2).expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
+    let source_flow = AppFlowId::new(10);
+    let target_flow = AppFlowId::new(11);
+
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let app_for_source = app.clone();
+            let source_ptr = app
+                .spawn_on_flow(source_flow, move |_worker| async move {
+                    let runtime = with_data_plane_buffers(Clone::clone);
+                    let index = runtime
+                        .alloc_index_with_bytes(Default::default(), b"cross-worker-send")
+                        .expect("alloc cross-worker send buffer");
+                    let send = AppSend::new(AppBufferLease::from_buffer(runtime, index));
+                    let source_ptr = send.lease().current_ptr().expect("source pointer") as usize;
+                    app_for_source
+                        .send_on_flow(target_flow, send)
+                        .await
+                        .expect("send on target flow");
+                    source_ptr
+                })
+                .await
+                .expect("spawn source flow");
+
+            let (payload, target_ptr) = app
+                .spawn_on_flow(target_flow, move |worker| async move {
+                    let send = worker.backend().next_send().await.expect("target send");
+                    let payload = send.lease().copy_current().expect("copy target payload");
+                    let ptr = send.lease().current_ptr().expect("target pointer") as usize;
+                    (payload, ptr)
+                })
+                .await
+                .expect("spawn target flow");
+
+            (source_ptr, payload, target_ptr)
+        });
+
+    assert_eq!(result.1, b"cross-worker-send");
+    assert_ne!(
+        result.0, result.2,
+        "cross-worker send must rebuild the lease on the target worker"
+    );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

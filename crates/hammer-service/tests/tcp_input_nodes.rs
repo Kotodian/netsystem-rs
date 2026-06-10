@@ -21,11 +21,12 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::tcp::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration,
-    TcpConnectionSnapshot, TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane,
-    TcpInputError, TcpInputHandoff, TcpInputNext, TcpInputNode, TcpListenNext, TcpListenNode,
-    TcpLookupId, TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode,
-    TcpState, TcpSynSentNext, TcpSynSentNode, TcpV4ConnectionKey, TcpV4ListenerKey,
-    TcpV4PendingConnectionKey, TcpWorkerOwnedConnectionState, TcpWorkerOwnedState,
+    TcpConnectionSnapshot, TcpEstablishedControlPlane, TcpEstablishedNext, TcpEstablishedNode,
+    TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpInputNode,
+    TcpListenNext, TcpListenNode, TcpLookupId, TcpRcvProcessControlPlane, TcpRcvProcessNext,
+    TcpResetNext, TcpResetNode, TcpState, TcpSynSentNext, TcpSynSentNode, TcpV4ConnectionKey,
+    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpWorkerOwnedConnectionState,
+    TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -693,6 +694,36 @@ fn tcp_input_uses_connection_snapshot_state_for_syn_rcvd_ack() {
     drop(state);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_input_routes_closing_ack_into_established_state_progression() {
+    assert_tcp_input_ack_advances_connection_state(TcpState::Closing, TcpState::TimeWait, 46);
+}
+
+#[test]
+fn tcp_input_routes_fin_wait1_ack_into_established_state_progression() {
+    assert_tcp_input_ack_advances_connection_state(TcpState::FinWait1, TcpState::FinWait2, 45);
+}
+
+#[test]
+fn tcp_input_routes_last_ack_into_established_state_progression() {
+    assert_tcp_input_ack_advances_connection_state(TcpState::LastAck, TcpState::Closed, 47);
+}
+
+#[test]
+fn tcp_input_partial_ack_keeps_fin_wait1_until_local_fin_is_fully_acked() {
+    assert_tcp_input_partial_ack_preserves_connection_state(TcpState::FinWait1, 49);
+}
+
+#[test]
+fn tcp_input_partial_ack_keeps_last_ack_until_local_fin_is_fully_acked() {
+    assert_tcp_input_partial_ack_preserves_connection_state(TcpState::LastAck, 50);
+}
+
+#[test]
+fn tcp_input_routes_close_wait_reset_into_established_close() {
+    assert_tcp_input_rst_advances_connection_state(TcpState::CloseWait, TcpState::Closed, 48);
 }
 
 #[test]
@@ -1659,6 +1690,310 @@ impl TcpGraph {
     }
 }
 
+fn assert_tcp_input_ack_advances_connection_state(
+    initial_state: TcpState,
+    expected_state: TcpState,
+    octet: u8,
+) {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let tcp_rcv_process = runtime
+        .nodes()
+        .register_internal(TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(drop)).node());
+    let established = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(tcp_rcv_process));
+    let established_node = runtime.nodes().register_internal(established.node());
+
+    let local = Ipv4Addr::new(192, 0, 2, octet);
+    let remote = Ipv4Addr::new(198, 51, 100, octet);
+    let remote_port = 50_000 + u16::from(octet);
+
+    let mut lookup_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    lookup_owner.insert_connection_v4(
+        TcpV4ConnectionKey::new(0, local, LISTEN_PORT, remote, remote_port),
+        ESTABLISHED_ID,
+    );
+
+    let mut connections = TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+    connections.insert(TcpConnectionSnapshot {
+        lookup_id: ESTABLISHED_ID,
+        connection_id: None,
+        owner_worker: DataWorkerId::new(0),
+        state: initial_state,
+        local_port: LISTEN_PORT,
+        local: Some(std::net::SocketAddr::new(IpAddr::V4(local), LISTEN_PORT)),
+        remote: std::net::SocketAddr::new(IpAddr::V4(remote), remote_port),
+        iss: 1_000,
+        irs: 2_000,
+        snd_una: 1_001,
+        snd_nxt: 1_002,
+        snd_wnd: 65_535,
+        rcv_nxt: 2_001,
+        rcv_wnd: 65_535,
+    });
+    let connection_snapshot = connections.publish_snapshot();
+    established
+        .publish_connections(connection_snapshot.clone())
+        .expect("publish established connection snapshot");
+
+    let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+        drop,
+        drop,
+        drop,
+        tcp_rcv_process,
+        drop,
+        established_node,
+        drop,
+    ));
+    tcp_control
+        .publish_lookup(lookup_owner.publish_snapshot())
+        .expect("publish lookup snapshot");
+    tcp_control
+        .publish_connections(connection_snapshot)
+        .expect("publish input connection snapshot");
+    tcp_control
+        .publish_app_ingress([ESTABLISHED_ID])
+        .expect("publish input app ingress");
+    let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+    let packet = ipv4_tcp_packet_with_seq_ack(
+        remote,
+        remote_port,
+        local,
+        LISTEN_PORT,
+        2_001,
+        1_002,
+        tcp_flags(false, false, false, true),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(
+            IpAddr::V4(remote),
+            remote_port,
+            IpAddr::V4(local),
+            LISTEN_PORT,
+        ),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(
+        established.connection_state_for_test(ESTABLISHED_ID),
+        Some(expected_state)
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+fn assert_tcp_input_rst_advances_connection_state(
+    initial_state: TcpState,
+    expected_state: TcpState,
+    octet: u8,
+) {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let tcp_rcv_process = runtime
+        .nodes()
+        .register_internal(TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(drop)).node());
+    let established = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(tcp_rcv_process));
+    let established_node = runtime.nodes().register_internal(established.node());
+
+    let local = Ipv4Addr::new(192, 0, 2, octet);
+    let remote = Ipv4Addr::new(198, 51, 100, octet);
+    let remote_port = 50_000 + u16::from(octet);
+
+    let mut lookup_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    lookup_owner.insert_connection_v4(
+        TcpV4ConnectionKey::new(0, local, LISTEN_PORT, remote, remote_port),
+        ESTABLISHED_ID,
+    );
+
+    let mut connections = TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+    connections.insert(TcpConnectionSnapshot {
+        lookup_id: ESTABLISHED_ID,
+        connection_id: None,
+        owner_worker: DataWorkerId::new(0),
+        state: initial_state,
+        local_port: LISTEN_PORT,
+        local: Some(std::net::SocketAddr::new(IpAddr::V4(local), LISTEN_PORT)),
+        remote: std::net::SocketAddr::new(IpAddr::V4(remote), remote_port),
+        iss: 1_000,
+        irs: 2_000,
+        snd_una: 1_001,
+        snd_nxt: 1_002,
+        snd_wnd: 65_535,
+        rcv_nxt: 2_001,
+        rcv_wnd: 65_535,
+    });
+    let connection_snapshot = connections.publish_snapshot();
+    established
+        .publish_connections(connection_snapshot.clone())
+        .expect("publish established connection snapshot");
+
+    let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+        drop,
+        drop,
+        drop,
+        tcp_rcv_process,
+        drop,
+        established_node,
+        drop,
+    ));
+    tcp_control
+        .publish_lookup(lookup_owner.publish_snapshot())
+        .expect("publish lookup snapshot");
+    tcp_control
+        .publish_connections(connection_snapshot)
+        .expect("publish input connection snapshot");
+    tcp_control
+        .publish_app_ingress([ESTABLISHED_ID])
+        .expect("publish input app ingress");
+    let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+    let packet = ipv4_tcp_packet_with_seq_ack(
+        remote,
+        remote_port,
+        local,
+        LISTEN_PORT,
+        2_001,
+        1_002,
+        tcp_flags(false, false, true, false),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(
+            IpAddr::V4(remote),
+            remote_port,
+            IpAddr::V4(local),
+            LISTEN_PORT,
+        ),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert_eq!(
+        established.connection_state_for_test(ESTABLISHED_ID),
+        Some(expected_state)
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+fn assert_tcp_input_partial_ack_preserves_connection_state(initial_state: TcpState, octet: u8) {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let tcp_rcv_process = runtime
+        .nodes()
+        .register_internal(TcpRcvProcessControlPlane::new(TcpRcvProcessNext::nodes(drop)).node());
+    let established = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(tcp_rcv_process));
+    let established_node = runtime.nodes().register_internal(established.node());
+
+    let local = Ipv4Addr::new(192, 0, 2, octet);
+    let remote = Ipv4Addr::new(198, 51, 100, octet);
+    let remote_port = 50_000 + u16::from(octet);
+
+    let mut lookup_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    lookup_owner.insert_connection_v4(
+        TcpV4ConnectionKey::new(0, local, LISTEN_PORT, remote, remote_port),
+        ESTABLISHED_ID,
+    );
+
+    let initial_snapshot = TcpConnectionSnapshot {
+        lookup_id: ESTABLISHED_ID,
+        connection_id: None,
+        owner_worker: DataWorkerId::new(0),
+        state: initial_state,
+        local_port: LISTEN_PORT,
+        local: Some(std::net::SocketAddr::new(IpAddr::V4(local), LISTEN_PORT)),
+        remote: std::net::SocketAddr::new(IpAddr::V4(remote), remote_port),
+        iss: 1_000,
+        irs: 2_000,
+        snd_una: 1_001,
+        snd_nxt: 1_008,
+        snd_wnd: 65_535,
+        rcv_nxt: 2_001,
+        rcv_wnd: 65_535,
+    };
+    let mut connections = TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+    connections.insert(initial_snapshot);
+    let connection_snapshot = connections.publish_snapshot();
+    established
+        .publish_connections(connection_snapshot.clone())
+        .expect("publish established connection snapshot");
+
+    let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+        drop,
+        drop,
+        drop,
+        tcp_rcv_process,
+        drop,
+        established_node,
+        drop,
+    ));
+    tcp_control
+        .publish_lookup(lookup_owner.publish_snapshot())
+        .expect("publish lookup snapshot");
+    tcp_control
+        .publish_connections(connection_snapshot)
+        .expect("publish input connection snapshot");
+    tcp_control
+        .publish_app_ingress([ESTABLISHED_ID])
+        .expect("publish input app ingress");
+    let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+
+    let packet = ipv4_tcp_packet_with_seq_ack(
+        remote,
+        remote_port,
+        local,
+        LISTEN_PORT,
+        2_001,
+        1_004,
+        tcp_flags(false, false, false, true),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(
+            IpAddr::V4(remote),
+            remote_port,
+            IpAddr::V4(local),
+            LISTEN_PORT,
+        ),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(
+        established.connection_state_for_test(ESTABLISHED_ID),
+        Some(initial_state)
+    );
+    let snapshot = established
+        .connection_snapshot_for_test(ESTABLISHED_ID)
+        .expect("snapshot after partial ack");
+    assert_eq!(snapshot.snd_una, 1_004);
+    assert_eq!(snapshot.snd_nxt, 1_008);
+    assert_eq!(snapshot.snd_wnd, 0);
+    assert_eq!(snapshot.rcv_nxt, 2_001);
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
 fn push_packet(
     runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
@@ -1767,11 +2102,35 @@ fn ipv4_tcp_packet(
     flags: u8,
     payload: &[u8],
 ) -> Vec<u8> {
+    ipv4_tcp_packet_with_seq_ack(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        0,
+        0,
+        flags,
+        payload,
+    )
+}
+
+fn ipv4_tcp_packet_with_seq_ack(
+    source: Ipv4Addr,
+    source_port: u16,
+    destination: Ipv4Addr,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
     let mut packet = ipv4_packet(source, destination, 6, 20 + payload.len());
     write_tcp_segment(
         &mut packet[20..],
         source_port,
         destination_port,
+        sequence,
+        acknowledgment,
         flags,
         payload,
     );
@@ -1803,11 +2162,15 @@ fn write_tcp_segment(
     segment: &mut [u8],
     source_port: u16,
     destination_port: u16,
+    sequence: u32,
+    acknowledgment: u32,
     flags: u8,
     payload: &[u8],
 ) {
     segment[0..2].copy_from_slice(&source_port.to_be_bytes());
     segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgment.to_be_bytes());
     segment[12] = 0x50;
     segment[13] = flags;
     segment[20..].copy_from_slice(payload);

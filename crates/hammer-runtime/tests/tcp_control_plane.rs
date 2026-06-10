@@ -761,3 +761,253 @@ fn tcp_control_plane_non_terminal_timer_expiry_keeps_connection_open() {
     assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
     join.join().expect("control thread join");
 }
+
+#[test]
+fn tcp_control_plane_time_wait_timer_expiry_closes_connection() {
+    let (control_handle, control_thread) = ControlThread::new(
+        Instant::now(),
+        Arc::new(DiscardWriter),
+        MetricsRegistry::new(),
+        Duration::from_secs(60),
+        Level::Info,
+    );
+    let join = run_control_thread(control_thread);
+    let (tx, rx) = mpsc::channel();
+    let plane = TcpControlPlane::new(Arc::clone(&control_handle), move |event| {
+        tx.send(event).expect("forward timer event");
+    });
+    let connection = TcpConnectionId::new(115);
+    let key = TcpConnectionKey::V4(TcpV4ConnectionKey::new(
+        0,
+        Ipv4Addr::new(127, 0, 0, 1),
+        7115,
+        Ipv4Addr::new(198, 51, 100, 115),
+        41_115,
+    ));
+
+    plane
+        .apply(TcpControlPlaneAction::InstallConnection {
+            connection_id: connection,
+            key,
+            state: TcpState::TimeWait,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("install time-wait connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive install state event"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::TimeWait,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::ArmTimer {
+            connection_id: connection,
+            timer_id: TcpTimerId::new(15),
+            kind: TcpTimerKind::TimeWait,
+            timeout: Duration::from_millis(20),
+        })
+        .expect("arm time-wait timer");
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive timer expiry event"),
+        TcpWorkerEvent::TimerExpired {
+            connection_id: connection,
+            timer_id: TcpTimerId::new(15),
+            kind: TcpTimerKind::TimeWait,
+        }
+    );
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive close event"),
+        TcpWorkerEvent::Closed {
+            connection_id: connection,
+            reason: TcpCloseReason::RemoteFin,
+        }
+    );
+    assert_eq!(plane.connection_state_for_test(connection), None);
+
+    assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+    join.join().expect("control thread join");
+}
+
+#[test]
+fn tcp_control_plane_upsert_closed_state_emits_close_with_shutdown_reason() {
+    let (control_handle, control_thread) = ControlThread::new(
+        Instant::now(),
+        Arc::new(DiscardWriter),
+        MetricsRegistry::new(),
+        Duration::from_secs(60),
+        Level::Info,
+    );
+    let join = run_control_thread(control_thread);
+    let (tx, rx) = mpsc::channel();
+    let plane = TcpControlPlane::new(Arc::clone(&control_handle), move |event| {
+        tx.send(event).expect("forward lifecycle event");
+    });
+    let connection = TcpConnectionId::new(116);
+    let key = TcpConnectionKey::V4(TcpV4ConnectionKey::new(
+        0,
+        Ipv4Addr::new(127, 0, 0, 1),
+        7116,
+        Ipv4Addr::new(198, 51, 100, 116),
+        41_116,
+    ));
+
+    plane
+        .apply(TcpControlPlaneAction::InstallConnection {
+            connection_id: connection,
+            key,
+            state: TcpState::LastAck,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("install last-ack connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive install state event"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::LastAck,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::ShutdownConnection {
+            connection_id: connection,
+            direction: hammer_core::protocol::tcp::TcpShutdownDirection::Write,
+            reason: TcpCloseReason::LocalShutdown,
+        })
+        .expect("remember shutdown reason");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive shutdown event"),
+        TcpWorkerEvent::ShutdownObserved {
+            connection_id: connection,
+            direction: hammer_core::protocol::tcp::TcpShutdownDirection::Write,
+            reason: TcpCloseReason::LocalShutdown,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::ArmTimer {
+            connection_id: connection,
+            timer_id: TcpTimerId::new(16),
+            kind: TcpTimerKind::Retransmit,
+            timeout: Duration::from_millis(80),
+        })
+        .expect("arm retransmit timer");
+    assert!(plane.has_timer_for_test(connection, TcpTimerKind::Retransmit));
+
+    plane
+        .apply(TcpControlPlaneAction::UpsertConnectionState {
+            connection_id: connection,
+            key,
+            state: TcpState::Closed,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("upsert closed state");
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive close event"),
+        TcpWorkerEvent::Closed {
+            connection_id: connection,
+            reason: TcpCloseReason::LocalShutdown,
+        }
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(120)).is_err(),
+        "closed-state upsert must not emit an extra state-change event"
+    );
+    assert_eq!(plane.connection_state_for_test(connection), None);
+    assert!(!plane.has_timer_for_test(connection, TcpTimerKind::Retransmit));
+
+    assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+    join.join().expect("control thread join");
+}
+
+#[test]
+fn tcp_control_plane_transition_closed_state_defaults_close_reason_and_cancels_timers() {
+    let (control_handle, control_thread) = ControlThread::new(
+        Instant::now(),
+        Arc::new(DiscardWriter),
+        MetricsRegistry::new(),
+        Duration::from_secs(60),
+        Level::Info,
+    );
+    let join = run_control_thread(control_thread);
+    let (tx, rx) = mpsc::channel();
+    let plane = TcpControlPlane::new(Arc::clone(&control_handle), move |event| {
+        tx.send(event).expect("forward lifecycle event");
+    });
+    let connection = TcpConnectionId::new(117);
+    let key = TcpConnectionKey::V4(TcpV4ConnectionKey::new(
+        0,
+        Ipv4Addr::new(127, 0, 0, 1),
+        7117,
+        Ipv4Addr::new(198, 51, 100, 117),
+        41_117,
+    ));
+
+    plane
+        .apply(TcpControlPlaneAction::InstallConnection {
+            connection_id: connection,
+            key,
+            state: TcpState::TimeWait,
+            capabilities: TcpCapabilities::default(),
+            negotiated: TcpNegotiatedOptions::default(),
+        })
+        .expect("install time-wait connection");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive install state event"),
+        TcpWorkerEvent::StateChanged {
+            connection_id: connection,
+            key,
+            state: TcpState::TimeWait,
+        }
+    );
+
+    plane
+        .apply(TcpControlPlaneAction::ArmTimer {
+            connection_id: connection,
+            timer_id: TcpTimerId::new(17),
+            kind: TcpTimerKind::TimeWait,
+            timeout: Duration::from_millis(80),
+        })
+        .expect("arm time-wait timer");
+    assert!(plane.has_timer_for_test(connection, TcpTimerKind::TimeWait));
+
+    plane
+        .apply(TcpControlPlaneAction::TransitionConnection {
+            connection_id: connection,
+            state: TcpState::Closed,
+        })
+        .expect("transition to closed state");
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("receive close event"),
+        TcpWorkerEvent::Closed {
+            connection_id: connection,
+            reason: TcpCloseReason::RemoteFin,
+        }
+    );
+    assert!(
+        rx.recv_timeout(Duration::from_millis(160)).is_err(),
+        "closed-state transition must cancel timers and avoid extra events"
+    );
+    assert_eq!(plane.connection_state_for_test(connection), None);
+    assert!(!plane.has_timer_for_test(connection, TcpTimerKind::TimeWait));
+
+    assert!(control_handle.shutdown_timeout(Duration::from_secs(1)));
+    join.join().expect("control thread join");
+}
