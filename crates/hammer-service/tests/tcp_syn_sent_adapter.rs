@@ -6,6 +6,7 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::TcpHandshakeObservation;
 use hammer_service::transport::tcp::syn_sent::{
     TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentObservation, TcpSynSentRegistration,
 };
@@ -136,6 +137,9 @@ fn tcp_syn_sent_node_observes_matching_syn_ack_via_backend() {
         443,
         Ipv4Addr::new(192, 0, 2, 44),
         40_144,
+        0x5566_7788,
+        Some(0x1020_3041),
+        0x3456,
         tcp_flags(false, true, false, true),
         b"syn-ack",
     );
@@ -164,6 +168,13 @@ fn tcp_syn_sent_node_observes_matching_syn_ack_via_backend() {
             "192.0.2.44:40144".parse().expect("local"),
             TcpState::SynSent,
             TcpState::Established,
+            TcpHandshakeObservation::new(
+                tcp_flags(false, true, false, true),
+                0x5566_7788,
+                Some(0x1020_3041),
+                0x3456,
+                0x5566_7790,
+            ),
         )]
     );
     let state = capture_state.lock().unwrap();
@@ -239,6 +250,9 @@ fn ipv4_tcp_packet(
     source_port: u16,
     destination: Ipv4Addr,
     destination_port: u16,
+    sequence: u32,
+    acknowledgment: Option<u32>,
+    advertised_window: u16,
     flags: u8,
     payload: &[u8],
 ) -> Vec<u8> {
@@ -247,6 +261,9 @@ fn ipv4_tcp_packet(
         &mut packet[20..],
         source_port,
         destination_port,
+        sequence,
+        acknowledgment,
+        advertised_window,
         flags,
         payload,
     );
@@ -278,13 +295,19 @@ fn write_tcp_segment(
     segment: &mut [u8],
     source_port: u16,
     destination_port: u16,
+    sequence: u32,
+    acknowledgment: Option<u32>,
+    advertised_window: u16,
     flags: u8,
     payload: &[u8],
 ) {
     segment[0..2].copy_from_slice(&source_port.to_be_bytes());
     segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgment.unwrap_or_default().to_be_bytes());
     segment[12] = 0x50;
     segment[13] = flags;
+    segment[14..16].copy_from_slice(&advertised_window.to_be_bytes());
     segment[20..].copy_from_slice(payload);
 }
 

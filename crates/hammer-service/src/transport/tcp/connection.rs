@@ -137,8 +137,10 @@ impl TcpConnectionSnapshotPool {
             connection.snd_nxt = tcp_seq_max(connection.snd_nxt, connection.snd_una);
             connection.snd_wnd = progress.advertised_window;
         }
-        if let Some(next_receive_sequence) = progress.next_receive_sequence {
-            connection.rcv_nxt = tcp_seq_max(connection.rcv_nxt, next_receive_sequence);
+        if let Some(next_receive_sequence) = progress.next_receive_sequence
+            && connection.rcv_nxt == progress.sequence
+        {
+            connection.rcv_nxt = next_receive_sequence;
         }
         if let Some(state) = progress.state {
             connection.state = state;

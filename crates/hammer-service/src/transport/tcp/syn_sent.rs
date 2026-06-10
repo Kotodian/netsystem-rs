@@ -8,7 +8,7 @@ use hammer_adapter::{
     NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::TcpState;
+use hammer_core::protocol::tcp::{TcpHandshakeObservation, TcpSeq, TcpState};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
 use super::{TcpLookupId, TcpV4PendingConnectionKey, TcpV6PendingConnectionKey};
@@ -29,6 +29,7 @@ pub struct TcpSynSentObservation {
     pub local: SocketAddr,
     pub previous_state: TcpState,
     pub next_state: TcpState,
+    pub transport: TcpHandshakeObservation,
 }
 
 impl TcpSynSentObservation {
@@ -39,6 +40,7 @@ impl TcpSynSentObservation {
         local: SocketAddr,
         previous_state: TcpState,
         next_state: TcpState,
+        transport: TcpHandshakeObservation,
     ) -> Self {
         Self {
             connection_id,
@@ -46,6 +48,7 @@ impl TcpSynSentObservation {
             local,
             previous_state,
             next_state,
+            transport,
         }
     }
 }
@@ -502,7 +505,8 @@ fn syn_sent_observation_for_index(
     index: BufferIndex,
     registry: &TcpSynSentRegistry,
 ) -> CoreResult<Option<TcpSynSentObservation>> {
-    if !packet_is_syn_ack(runtime, index)? {
+    let transport = tcp_handshake_observation(runtime, index)?;
+    if !packet_is_syn_ack(transport) {
         return Ok(None);
     }
     let metadata = runtime.metadata(index)?;
@@ -523,15 +527,52 @@ fn syn_sent_observation_for_index(
         local,
         TcpState::SynSent,
         TcpState::Established,
+        transport,
     )))
 }
 
-fn packet_is_syn_ack(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<bool> {
+fn packet_is_syn_ack(observation: TcpHandshakeObservation) -> bool {
+    observation.syn()
+        && observation.ack()
+        && observation.acknowledgment.is_some()
+        && !observation.fin()
+        && observation.flags & 0x04 == 0
+}
+
+fn tcp_handshake_observation(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+) -> CoreResult<TcpHandshakeObservation> {
     let cursor = runtime.get_buffer(index)?.packet_cursor();
     let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index)?.into_iter().collect();
+    let sequence_offset = cursor.transport_header_offset() + 4;
+    let acknowledgment_offset = cursor.transport_header_offset() + 8;
     let flags_offset = cursor.transport_header_offset() + 13;
-    let Some(flags) = packet.get(flags_offset) else {
-        return Ok(false);
-    };
-    Ok(flags & 0x12 == 0x12 && flags & 0x05 == 0)
+    let window_offset = cursor.transport_header_offset() + 14;
+    let flags = packet.get(flags_offset).copied().unwrap_or_default();
+    let sequence = packet
+        .get(sequence_offset..sequence_offset + 4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("sequence bytes")))
+        .unwrap_or_default();
+    let acknowledgment = packet
+        .get(acknowledgment_offset..acknowledgment_offset + 4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("ack bytes")))
+        .filter(|_| flags & 0x10 != 0);
+    let advertised_window = packet
+        .get(window_offset..window_offset + 2)
+        .map(|bytes| u16::from_be_bytes(bytes.try_into().expect("window bytes")) as u32)
+        .unwrap_or_default();
+    let payload_len = (cursor
+        .packet_len()
+        .saturating_sub(cursor.transport_payload_offset())) as u32;
+    let next_sequence = TcpSeq::new(sequence)
+        .advance(payload_len + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0))
+        .raw();
+    Ok(TcpHandshakeObservation::new(
+        flags,
+        sequence,
+        acknowledgment,
+        advertised_window,
+        next_sequence,
+    ))
 }

@@ -9,7 +9,8 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpConnectionKey, TcpListenerId, TcpListenerKey, TcpWorkerEvent,
+    TcpCapabilities, TcpConnectionKey, TcpHandshakeObservation, TcpListenerId, TcpListenerKey,
+    TcpSeq, TcpWorkerEvent,
 };
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 use hammer_runtime::app::{AppContext, AppSocketId};
@@ -31,6 +32,19 @@ pub trait TcpAcceptBackend: Send + Sync {
         local: SocketAddr,
         event: TcpWorkerEvent,
     ) -> CoreResult<()>;
+
+    #[inline]
+    fn observe_accept(
+        &self,
+        listener_id: TcpLookupId,
+        registration: &TcpAcceptRegistration,
+        remote: SocketAddr,
+        local: SocketAddr,
+        event: TcpWorkerEvent,
+        _observation: TcpHandshakeObservation,
+    ) -> CoreResult<()> {
+        self.accept(listener_id, registration, remote, local, event)
+    }
 }
 
 struct TcpAcceptBackendHandle {
@@ -44,6 +58,7 @@ struct TcpAcceptBackendHandle {
         SocketAddr,
         SocketAddr,
         TcpWorkerEvent,
+        TcpHandshakeObservation,
     ) -> CoreResult<()>,
 }
 
@@ -91,8 +106,17 @@ impl TcpAcceptBackendHandle {
         remote: SocketAddr,
         local: SocketAddr,
         event: TcpWorkerEvent,
+        observation: TcpHandshakeObservation,
     ) -> CoreResult<()> {
-        (self.accept)(self.raw, listener_id, registration, remote, local, event)
+        (self.accept)(
+            self.raw,
+            listener_id,
+            registration,
+            remote,
+            local,
+            event,
+            observation,
+        )
     }
 }
 
@@ -126,11 +150,21 @@ fn accept_with<O>(
     remote: SocketAddr,
     local: SocketAddr,
     event: TcpWorkerEvent,
+    observation: TcpHandshakeObservation,
 ) -> CoreResult<()>
 where
     O: TcpAcceptBackend + 'static,
 {
-    unsafe { (&*raw.cast::<O>()).accept(listener_id, registration, remote, local, event) }
+    unsafe {
+        (&*raw.cast::<O>()).observe_accept(
+            listener_id,
+            registration,
+            remote,
+            local,
+            event,
+            observation,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -409,8 +443,54 @@ fn tcp_accept_next_for_index(
     };
     let (remote, local) = tcp_accept_socket_addrs(runtime, index)?;
     let event = incoming_connection_event(listener_id, remote, local)?;
-    backend.accept(listener_id, registration, remote, local, event)?;
+    backend.accept(
+        listener_id,
+        registration,
+        remote,
+        local,
+        event,
+        tcp_handshake_observation(runtime, index)?,
+    )?;
     Ok(Some(drop_next))
+}
+
+fn tcp_handshake_observation(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+) -> CoreResult<TcpHandshakeObservation> {
+    let buffer = runtime.get_buffer(index)?;
+    let cursor = buffer.packet_cursor();
+    let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index)?.into_iter().collect();
+    let sequence_offset = cursor.transport_header_offset() + 4;
+    let acknowledgment_offset = cursor.transport_header_offset() + 8;
+    let flags_offset = cursor.transport_header_offset() + 13;
+    let window_offset = cursor.transport_header_offset() + 14;
+    let flags = packet.get(flags_offset).copied().unwrap_or_default();
+    let sequence = packet
+        .get(sequence_offset..sequence_offset + 4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("sequence bytes")))
+        .unwrap_or_default();
+    let acknowledgment = packet
+        .get(acknowledgment_offset..acknowledgment_offset + 4)
+        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("ack bytes")))
+        .filter(|_| flags & 0x10 != 0);
+    let advertised_window = packet
+        .get(window_offset..window_offset + 2)
+        .map(|bytes| u16::from_be_bytes(bytes.try_into().expect("window bytes")) as u32)
+        .unwrap_or_default();
+    let payload_len = (cursor
+        .packet_len()
+        .saturating_sub(cursor.transport_payload_offset())) as u32;
+    let next_sequence = TcpSeq::new(sequence)
+        .advance(payload_len + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0))
+        .raw();
+    Ok(TcpHandshakeObservation::new(
+        flags,
+        sequence,
+        acknowledgment,
+        advertised_window,
+        next_sequence,
+    ))
 }
 
 fn tcp_accept_socket_addrs(
@@ -582,6 +662,7 @@ mod tests {
                     "192.0.2.7:7443".parse().expect("local"),
                 )
                 .expect("incoming connection event"),
+                TcpHandshakeObservation::new(0, 0, None, 0, 0),
             )
             .expect("forward accept");
 
