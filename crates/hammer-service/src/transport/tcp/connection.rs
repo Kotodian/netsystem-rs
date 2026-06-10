@@ -7,7 +7,7 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpConnectionId;
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
-use super::{TcpEstablishedNext, TcpEstablishedNode, TcpLookupId, TcpState};
+use super::{TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpLookupId, TcpState};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 
@@ -144,8 +144,8 @@ impl TcpWorkerOwnedConnectionState {
 }
 
 #[derive(Clone)]
-struct TcpEstablishedSnapshot {
-    connections: TcpConnectionSnapshotPool,
+pub(crate) struct TcpEstablishedSnapshot {
+    pub(crate) connections: TcpConnectionSnapshotPool,
 }
 
 impl TcpEstablishedSnapshot {
@@ -169,7 +169,7 @@ impl TcpEstablishedSnapshotHandle {
     }
 
     #[inline]
-    fn load(&self) -> arc_swap::Guard<Arc<TcpEstablishedSnapshot>> {
+    pub(crate) fn load(&self) -> arc_swap::Guard<Arc<TcpEstablishedSnapshot>> {
         self.inner.load()
     }
 
@@ -191,6 +191,7 @@ fn default_tcp_established_snapshot() -> TcpEstablishedSnapshotHandle {
 
 pub struct TcpEstablishedControlPlane {
     inner: Arc<ArcSwap<TcpEstablishedSnapshot>>,
+    backend: Option<Arc<dyn TcpEstablishedBackend>>,
     next: [NodeId; TcpEstablishedNext::COUNT],
 }
 
@@ -199,8 +200,18 @@ impl TcpEstablishedControlPlane {
     pub fn new(next: [NodeId; TcpEstablishedNext::COUNT]) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(TcpEstablishedSnapshot::new())),
+            backend: None,
             next,
         }
+    }
+
+    #[inline]
+    pub fn with_backend<O>(mut self, backend: Arc<O>) -> Self
+    where
+        O: TcpEstablishedBackend + 'static,
+    {
+        self.backend = Some(backend);
+        self
     }
 
     #[inline]
@@ -211,14 +222,13 @@ impl TcpEstablishedControlPlane {
 
     #[inline]
     pub fn node(&self) -> TcpEstablishedNode {
-        TcpEstablishedNode::new(self.next)
+        TcpEstablishedNode::new(self.next).with_runtime(
+            TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)),
+            self.backend.clone(),
+        )
     }
 }
 
 pub(crate) fn default_established_snapshot_handle() -> TcpEstablishedSnapshotHandle {
     default_tcp_established_snapshot()
-}
-
-pub(crate) fn snapshot_is_loaded(handle: &TcpEstablishedSnapshotHandle) {
-    let _guard = handle.load();
 }

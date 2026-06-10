@@ -20,7 +20,9 @@ pub use connection::{
     TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpEstablishedControlPlane,
     TcpWorkerOwnedConnectionState,
 };
-pub use established::{TcpEstablishedNext, TcpEstablishedNode};
+pub use established::{
+    TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpEstablishedObservation,
+};
 pub use input::{TcpInputControlPlane, TcpInputHandoff, TcpInputNode, TcpInputTrace};
 pub use listen::{TcpListenNext, TcpListenNode};
 pub use lookup::{

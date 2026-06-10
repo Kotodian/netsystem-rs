@@ -260,6 +260,11 @@ impl Default for TcpDispatchTable {
         );
         table.set(
             TcpState::Established,
+            TcpInputFlags::RST,
+            TcpDispatchEntry::new(TcpInputNext::Established, None),
+        );
+        table.set(
+            TcpState::Established,
             TcpInputFlags::FIN | TcpInputFlags::ACK,
             TcpDispatchEntry::new(TcpInputNext::Established, None),
         );
