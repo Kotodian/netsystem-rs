@@ -1,5 +1,5 @@
 use super::{TcpInputError, TcpInputNext};
-use hammer_core::error::{HammerError, HammerResult};
+use hammer_core::error::HammerResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
     TcpListenerKey, TcpNegotiatedOptions, TcpState,
@@ -46,11 +46,6 @@ impl TcpCongestionRegistry {
         algorithm: Option<TcpCongestionAlgorithm>,
     ) -> HammerResult<TcpCongestionAlgorithm> {
         let selected = algorithm.unwrap_or(self.default_algorithm);
-        if !matches!(selected, TcpCongestionAlgorithm::Bbr) {
-            return Err(HammerError::config_validation(format!(
-                "tcp congestion algorithm {selected:?} is not implemented; only Bbr is currently supported"
-            )));
-        }
         Ok(selected)
     }
 }
