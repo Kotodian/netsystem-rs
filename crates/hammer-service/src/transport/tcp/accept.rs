@@ -443,15 +443,9 @@ fn tcp_accept_next_for_index(
         return Ok(Some(drop_next));
     };
     let (remote, local) = tcp_accept_socket_addrs(runtime, index)?;
-    let event = incoming_connection_event(listener_id, remote, local)?;
-    backend.accept(
-        listener_id,
-        registration,
-        remote,
-        local,
-        event,
-        tcp_handshake_observation(runtime, index)?,
-    )?;
+    let observation = tcp_handshake_observation(runtime, index)?;
+    let event = incoming_connection_event(listener_id, remote, local, observation.capabilities)?;
+    backend.accept(listener_id, registration, remote, local, event, observation)?;
     Ok(Some(drop_next))
 }
 
@@ -574,6 +568,7 @@ fn incoming_connection_event(
     listener_id: TcpLookupId,
     remote: SocketAddr,
     local: SocketAddr,
+    capabilities: TcpCapabilities,
 ) -> CoreResult<TcpWorkerEvent> {
     let listener = match local.ip() {
         std::net::IpAddr::V4(local_ip) => TcpListenerKey::v4(0, local_ip, local.port()),
@@ -596,7 +591,7 @@ fn incoming_connection_event(
         listener_id: TcpListenerId::new(listener_id as u64),
         listener,
         key,
-        capabilities: TcpCapabilities::default(),
+        capabilities,
     })
 }
 
@@ -666,6 +661,7 @@ mod tests {
                     7,
                     "198.51.100.7:40007".parse().expect("remote"),
                     "192.0.2.7:7443".parse().expect("local"),
+                    TcpCapabilities::default(),
                 )
                 .expect("incoming connection event"),
                 TcpHandshakeObservation::new(0, 0, None, 0, 0),
