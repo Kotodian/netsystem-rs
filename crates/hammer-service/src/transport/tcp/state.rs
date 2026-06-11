@@ -1,27 +1,15 @@
 use super::{TcpInputError, TcpInputNext};
-use hammer_core::error::HammerResult;
+use hammer_core::error::{HammerError, HammerResult};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
     TcpListenerKey, TcpNegotiatedOptions, TcpState,
 };
-use smoltcp::socket::tcp::CongestionControl as SmolTcpCongestionControl;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TcpCongestionAlgorithm {
     Bbr,
     Cubic,
     Reno,
-}
-
-impl TcpCongestionAlgorithm {
-    #[inline]
-    pub const fn smoltcp_fallback(self) -> Option<SmolTcpCongestionControl> {
-        match self {
-            Self::Bbr => None,
-            Self::Cubic => Some(SmolTcpCongestionControl::Cubic),
-            Self::Reno => Some(SmolTcpCongestionControl::Reno),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +34,11 @@ impl TcpCongestionRegistry {
         algorithm: Option<TcpCongestionAlgorithm>,
     ) -> HammerResult<TcpCongestionAlgorithm> {
         let selected = algorithm.unwrap_or(self.default_algorithm);
+        if !matches!(selected, TcpCongestionAlgorithm::Bbr) {
+            return Err(HammerError::config_validation(format!(
+                "tcp congestion algorithm {selected:?} is not implemented in Hammer TCP nodes; only the Hammer-owned congestion controller is currently supported"
+            )));
+        }
         Ok(selected)
     }
 }
@@ -75,11 +68,6 @@ impl TcpConnectionState {
     #[inline]
     pub fn selected_congestion_algorithm(&self) -> TcpCongestionAlgorithm {
         self.selected_algorithm
-    }
-
-    #[inline]
-    pub fn smoltcp_congestion_fallback(&self) -> Option<SmolTcpCongestionControl> {
-        self.selected_algorithm.smoltcp_fallback()
     }
 
     #[inline]

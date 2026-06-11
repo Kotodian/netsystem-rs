@@ -16,8 +16,8 @@ use hammer_core::error::{CoreError, HammerError, HammerResult};
 use hammer_core::lifecycle::{ALL_STAGES, LIFECYCLE_ORDER};
 use hammer_core::log::{DiscardWriter, Factory, LogWriter, Logger};
 use hammer_core::protocol::tcp::{
-    TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpHandshakeObservation, TcpListenerId,
-    TcpSeq, TcpShutdownDirection, TcpWorkerEvent,
+    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpHandshakeObservation,
+    TcpListenerId, TcpSeq, TcpShutdownDirection, TcpWorkerEvent,
 };
 use hammer_core::registry::RuntimeRegistry;
 use hammer_infra::{
@@ -56,16 +56,17 @@ use crate::ProbeManager;
 use crate::app::{AppHost, AppIngressTarget};
 use crate::transport::tcp::output::{tcp_available_send_window, tcp_payload_len_in_send_window};
 use crate::transport::tcp::{
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TcpAcceptControlPlane, TcpAcceptNext,
-    TcpAcceptRegistration, TcpCongestionRegistry, TcpConnectionSnapshot, TcpConnectionSnapshotPool,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
+    TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration, TcpCongestionAckSample,
+    TcpCongestionRegistry, TcpCongestionState, TcpConnectionSnapshot, TcpConnectionSnapshotPool,
     TcpConnectionState, TcpEstablishedAckObservation, TcpEstablishedBackend,
     TcpEstablishedControlPlane, TcpEstablishedNext, TcpEstablishedObservation,
     TcpInputControlPlane, TcpInputNext, TcpListenerConfig, TcpLookupId, TcpLookupKind,
     TcpLookupSnapshot, TcpLookupValue, TcpOutputBackend, TcpOutputBackendSlot,
-    TcpOutputRetransmitQueue, TcpOutputSegment, TcpRcvProcessControlPlane, TcpRcvProcessNext,
-    TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentNext, TcpSynSentObservation,
-    TcpSynSentRegistration, TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey,
-    TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
+    TcpOutputRetransmitQueue, TcpOutputSegment, TcpOutputSendView, TcpRcvProcessControlPlane,
+    TcpRcvProcessNext, TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentNext,
+    TcpSynSentObservation, TcpSynSentRegistration, TcpV4ConnectionKey, TcpV4ListenerKey,
+    TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey, TcpV6PendingConnectionKey,
     build_tcp_output_segment_with_flags,
 };
 use crate::transport::udp::input::UdpAppRegistration;
@@ -198,6 +199,8 @@ struct TcpConnectionRegistration {
     pending_send_payloads: InfraVec<std::vec::Vec<u8>>,
     retransmit_queue: TcpOutputRetransmitQueue,
     retransmit_pending: bool,
+    congestion: TcpCongestionState,
+    next_output_at: Option<Instant>,
     iss: u32,
     irs: u32,
     snd_una: u32,
@@ -222,6 +225,16 @@ struct TcpOutputWorkItem {
     payload_len: usize,
     include_fin: bool,
     retransmit: bool,
+}
+
+#[derive(Debug)]
+enum TcpOutputWorkDecision {
+    Work(TcpOutputWorkItem),
+    WaitUntil {
+        connection_id: TcpConnectionId,
+        deadline: Instant,
+    },
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +341,7 @@ struct RuntimeAppControlHandle {
     state: Arc<RuntimeAppControlCell>,
     tcp_output: TcpOutputBackendSlot,
     tcp_output_signals: TcpOutputSignalRegistry,
+    tcp_output_pacing_timers: TcpOutputRetransmitTimerRegistry,
     tcp_retransmit_timers: TcpOutputRetransmitTimerRegistry,
 }
 
@@ -805,6 +819,8 @@ impl RuntimeAppControlState {
             pending_send_payloads: InfraVec::new(),
             retransmit_queue: TcpOutputRetransmitQueue::new(),
             retransmit_pending: false,
+            congestion: TcpCongestionState::new(DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32),
+            next_output_at: None,
             iss: 0,
             irs: 0,
             snd_una: 0,
@@ -889,6 +905,8 @@ impl RuntimeAppControlState {
             pending_send_payloads: InfraVec::new(),
             retransmit_queue: TcpOutputRetransmitQueue::new(),
             retransmit_pending: false,
+            congestion: TcpCongestionState::new(DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32),
+            next_output_at: None,
             iss: 0,
             irs: 0,
             snd_una: 0,
@@ -1225,13 +1243,13 @@ impl RuntimeAppControlState {
     fn take_next_tcp_output_work_for_flow(
         &mut self,
         flow: AppFlowId,
-    ) -> HammerResult<Option<TcpOutputWorkItem>> {
+    ) -> HammerResult<TcpOutputWorkDecision> {
         let Some(connection_index) = self
             .tcp_connections
             .iter()
             .position(|registration| registration.flow == flow)
         else {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         };
         let (connection_id, state, local, pending_fin, retransmit_pending, retransmit_segment) = {
             let registration = self.tcp_connections.get(connection_index).ok_or_else(|| {
@@ -1250,19 +1268,19 @@ impl RuntimeAppControlState {
             )
         };
         if !tcp_state_allows_transport_output(state) {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         }
         let Some(connection_id) = connection_id else {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         };
         let Some(local) = local else {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         };
         if retransmit_pending {
             let Some(segment) = retransmit_segment else {
-                return Ok(None);
+                return Ok(TcpOutputWorkDecision::None);
             };
-            return Ok(Some(TcpOutputWorkItem {
+            return Ok(TcpOutputWorkDecision::Work(TcpOutputWorkItem {
                 connection_id,
                 payload_len: segment.payload.len(),
                 include_fin: segment.flags & TCP_FLAG_FIN != 0,
@@ -1275,7 +1293,7 @@ impl RuntimeAppControlState {
             .iter()
             .position(|queue| queue.connection_id == connection_id);
         if queue_index.is_none() && !pending_fin {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         }
         let registration = self
             .tcp_connections
@@ -1283,9 +1301,23 @@ impl RuntimeAppControlState {
             .cloned()
             .ok_or_else(|| HammerError::internal("tcp connection registration slot is invalid"))?;
         if !tcp_transport_state_ready(&registration) {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
+        }
+        if let Some(next_output_at) = registration.next_output_at
+            && next_output_at > Instant::now()
+        {
+            return Ok(TcpOutputWorkDecision::WaitUntil {
+                connection_id,
+                deadline: next_output_at,
+            });
         }
         let snapshot = tcp_connection_snapshot_from_registration(&registration);
+        let send_view = TcpOutputSendView {
+            snd_una: registration.snd_una,
+            snd_nxt: registration.snd_nxt,
+            snd_wnd: registration.snd_wnd,
+            congestion_window: registration.congestion.congestion_window(),
+        };
         let (payload, payload_len, include_fin) = if let Some(queue_index) = queue_index {
             let queue = self
                 .tcp_transport_send_queues
@@ -1298,7 +1330,7 @@ impl RuntimeAppControlState {
                 let can_drain_payload =
                     queue.payloads.len() == 1 && requested_payload_len == staged.len();
                 let payload_len_with_fin = if pending_fin && can_drain_payload {
-                    tcp_payload_len_in_send_window(snapshot, requested_payload_len, 1)
+                    tcp_payload_len_in_send_window(send_view, requested_payload_len, 1)
                 } else {
                     0
                 };
@@ -1308,7 +1340,7 @@ impl RuntimeAppControlState {
                 let payload_len = if include_fin {
                     payload_len_with_fin
                 } else {
-                    tcp_payload_len_in_send_window(snapshot, requested_payload_len, 0)
+                    tcp_payload_len_in_send_window(send_view, requested_payload_len, 0)
                 };
                 let payload = staged[..payload_len].to_vec();
                 (payload, payload_len, include_fin)
@@ -1319,11 +1351,11 @@ impl RuntimeAppControlState {
             (
                 Vec::new(),
                 0,
-                pending_fin && tcp_available_send_window(snapshot) != 0,
+                pending_fin && tcp_available_send_window(send_view) != 0,
             )
         };
         if payload.is_empty() && !include_fin {
-            return Ok(None);
+            return Ok(TcpOutputWorkDecision::None);
         }
         let flags = TCP_FLAG_ACK
             | if payload.is_empty() { 0 } else { TCP_FLAG_PSH }
@@ -1332,7 +1364,7 @@ impl RuntimeAppControlState {
             build_tcp_output_segment_with_flags(snapshot, local, &payload, flags)
                 .map_err(|err| HammerError::internal(format!("build tcp output segment: {err}")))?
         };
-        Ok(Some(TcpOutputWorkItem {
+        Ok(TcpOutputWorkDecision::Work(TcpOutputWorkItem {
             connection_id,
             payload_len,
             include_fin,
@@ -1371,8 +1403,20 @@ impl RuntimeAppControlState {
                     registration.pending_fin = false;
                 }
                 if work.segment.consumes_sequence_space() {
+                    let now = Instant::now();
+                    let bytes_in_flight =
+                        tcp_seq_distance(registration.snd_una, registration.snd_nxt);
                     registration.snd_nxt = work.segment.next_send_sequence();
-                    let _ = registration.retransmit_queue.track_segment(&work.segment);
+                    let _ = registration
+                        .retransmit_queue
+                        .track_segment_with_sent_at(&work.segment, now);
+                    registration
+                        .congestion
+                        .on_packet_sent(work.segment.sequence_len(), bytes_in_flight);
+                    registration.next_output_at = registration
+                        .congestion
+                        .next_send_delay(work.segment.sequence_len())
+                        .map(|delay| now + delay);
                 }
             }
         }
@@ -1435,6 +1479,12 @@ impl RuntimeAppControlState {
         if registration.retransmit_queue.is_empty() {
             registration.retransmit_pending = false;
             return Ok(None);
+        }
+        if let Some(segment) = registration.retransmit_queue.front() {
+            registration
+                .congestion
+                .on_loss(segment.segment.sequence_len());
+            registration.next_output_at = None;
         }
         registration.retransmit_pending = true;
         Ok(Some(registration.flow))
@@ -1588,9 +1638,21 @@ impl RuntimeAppControlState {
                 tcp_seq_max(registration.snd_una, observation.accepted_acknowledgment);
             registration.snd_nxt = tcp_seq_max(registration.snd_nxt, registration.snd_una);
             registration.snd_wnd = observation.advertised_window;
-            let released = registration
+            let now = Instant::now();
+            let ack_sample = registration
                 .retransmit_queue
-                .acknowledge_through(observation.accepted_acknowledgment);
+                .acknowledge_through_with_sample(observation.accepted_acknowledgment, now);
+            if let Some(rtt) = ack_sample.latest_rtt {
+                let bytes_in_flight =
+                    tcp_seq_distance(observation.accepted_acknowledgment, registration.snd_nxt);
+                registration.congestion.on_ack(TcpCongestionAckSample {
+                    bytes_acked: ack_sample.bytes_acked,
+                    rtt,
+                    now,
+                    bytes_in_flight,
+                });
+                registration.next_output_at = None;
+            }
             if let Some(next_state) = observation.ack_state_transition {
                 registration.state = next_state;
             }
@@ -1617,7 +1679,7 @@ impl RuntimeAppControlState {
             if registration.retransmit_queue.is_empty() {
                 registration.retransmit_pending = false;
                 TcpRetransmitTimerAction::Cancel
-            } else if released != 0 {
+            } else if ack_sample.released_segments != 0 {
                 registration.retransmit_pending = false;
                 TcpRetransmitTimerAction::Rearm
             } else {
@@ -2034,6 +2096,7 @@ impl RuntimeAppControlHandle {
             state: Arc::new(RuntimeAppControlCell::new(state)),
             tcp_output: TcpOutputBackendSlot::new(),
             tcp_output_signals: TcpOutputSignalRegistry::default(),
+            tcp_output_pacing_timers: TcpOutputRetransmitTimerRegistry::default(),
             tcp_retransmit_timers: TcpOutputRetransmitTimerRegistry::default(),
         }
     }
@@ -2162,14 +2225,28 @@ impl RuntimeAppControlHandle {
         loop {
             let next =
                 self.with_state_mut(move |state| state.take_next_tcp_output_work_for_flow(flow))?;
-            let Some(work) = next else {
-                return Ok(if emitted {
-                    TcpOutputDrainAction::Emit
-                } else if self.tcp_flow_exists(flow)? {
-                    TcpOutputDrainAction::Idle
-                } else {
-                    TcpOutputDrainAction::Closed
-                });
+            let work = match next {
+                TcpOutputWorkDecision::Work(work) => work,
+                TcpOutputWorkDecision::WaitUntil {
+                    connection_id,
+                    deadline,
+                } => {
+                    self.arm_tcp_output_pacing_timer(flow, connection_id, deadline)?;
+                    return Ok(if emitted {
+                        TcpOutputDrainAction::Emit
+                    } else {
+                        TcpOutputDrainAction::Idle
+                    });
+                }
+                TcpOutputWorkDecision::None => {
+                    return Ok(if emitted {
+                        TcpOutputDrainAction::Emit
+                    } else if self.tcp_flow_exists(flow)? {
+                        TcpOutputDrainAction::Idle
+                    } else {
+                        TcpOutputDrainAction::Closed
+                    });
+                }
             };
             let segment = work.segment.clone();
             self.tcp_output
@@ -2216,12 +2293,37 @@ impl RuntimeAppControlHandle {
         Ok(())
     }
 
+    fn arm_tcp_output_pacing_timer(
+        &self,
+        flow: AppFlowId,
+        connection_id: TcpConnectionId,
+        deadline: Instant,
+    ) -> HammerResult<()> {
+        let delay = deadline.saturating_duration_since(Instant::now());
+        let signals = self.tcp_output_signals.clone();
+        let timers = self.tcp_output_pacing_timers.clone();
+        let handle = self.control_handle.schedule_once(delay, move || {
+            let signals = signals.clone();
+            let timers = timers.clone();
+            async move {
+                timers.clear_fired(connection_id);
+                signals.signal(flow);
+            }
+        })?;
+        self.tcp_output_pacing_timers.replace(connection_id, handle);
+        Ok(())
+    }
+
     fn cancel_tcp_retransmit_timer(&self, connection_id: TcpConnectionId) {
         self.tcp_retransmit_timers.cancel(connection_id);
     }
 
     fn cancel_all_tcp_retransmit_timers(&self) {
         self.tcp_retransmit_timers.cancel_all();
+    }
+
+    fn cancel_all_tcp_output_pacing_timers(&self) {
+        self.tcp_output_pacing_timers.cancel_all();
     }
 
     fn bind_tcp_listener(
@@ -2955,6 +3057,7 @@ fn tcp_apply_syn_sent_observation(
     registration: &mut TcpConnectionRegistration,
     observation: TcpHandshakeObservation,
 ) -> HammerResult<()> {
+    tcp_apply_congestion_handshake_capabilities(registration, observation.capabilities);
     let acknowledgment = observation.acknowledgment.ok_or_else(|| {
         HammerError::internal("active-open SYN-ACK observation is missing acknowledgment")
     })?;
@@ -2974,6 +3077,7 @@ fn tcp_apply_passive_accept_observation(
     registration: &mut TcpConnectionRegistration,
     observation: TcpHandshakeObservation,
 ) -> HammerResult<()> {
+    tcp_apply_congestion_handshake_capabilities(registration, observation.capabilities);
     if observation.syn() {
         registration.irs = observation.sequence;
         registration.rcv_nxt = observation.next_sequence;
@@ -2995,6 +3099,16 @@ fn tcp_apply_passive_accept_observation(
         }
     }
     Ok(())
+}
+
+#[inline]
+fn tcp_apply_congestion_handshake_capabilities(
+    registration: &mut TcpConnectionRegistration,
+    capabilities: TcpCapabilities,
+) {
+    if let Some(max_segment_size) = capabilities.max_segment_size {
+        registration.congestion = TcpCongestionState::new(u32::from(max_segment_size));
+    }
 }
 
 #[inline]
@@ -3161,6 +3275,15 @@ fn tcp_seq_max(current: u32, candidate: u32) -> u32 {
     }
 }
 
+#[inline]
+fn tcp_seq_distance(start: u32, end: u32) -> u32 {
+    if start != 0 && end != 0 {
+        TcpSeq::new(start).distance_to(TcpSeq::new(end))
+    } else {
+        0
+    }
+}
+
 fn socket_addr_to_listener_key(
     bind: SocketAddr,
 ) -> HammerResult<hammer_core::protocol::tcp::TcpListenerKey> {
@@ -3257,6 +3380,10 @@ impl RuntimeService {
                     projected_state.clone(),
                     event,
                 );
+                let result = match result {
+                    Err(HammerError::ServiceClosed) => Ok(()),
+                    result => result,
+                };
                 debug_assert!(
                     result.is_ok(),
                     "runtime projected tcp control event failed: {result:?}"
@@ -3705,6 +3832,51 @@ impl RuntimeService {
     }
 
     #[doc(hidden)]
+    pub fn tcp_congestion_window_for_flow_for_test(&self, flow: AppFlowId) -> Option<u32> {
+        self.control_call(move |inner| {
+            // SAFETY: this helper already runs on the single control thread.
+            let state = unsafe { &*inner.app_control.state.inner.get() };
+            state
+                .tcp_connections
+                .iter()
+                .find(|registration| registration.flow == flow)
+                .map(|registration| registration.congestion.congestion_window())
+        })
+        .ok()
+        .flatten()
+    }
+
+    #[doc(hidden)]
+    pub fn tcp_congestion_delivered_for_flow_for_test(&self, flow: AppFlowId) -> Option<u64> {
+        self.control_call(move |inner| {
+            // SAFETY: this helper already runs on the single control thread.
+            let state = unsafe { &*inner.app_control.state.inner.get() };
+            state
+                .tcp_connections
+                .iter()
+                .find(|registration| registration.flow == flow)
+                .map(|registration| registration.congestion.delivered())
+        })
+        .ok()
+        .flatten()
+    }
+
+    #[doc(hidden)]
+    pub fn tcp_next_output_at_for_flow_for_test(&self, flow: AppFlowId) -> Option<Instant> {
+        self.control_call(move |inner| {
+            // SAFETY: this helper already runs on the single control thread.
+            let state = unsafe { &*inner.app_control.state.inner.get() };
+            state
+                .tcp_connections
+                .iter()
+                .find(|registration| registration.flow == flow)
+                .and_then(|registration| registration.next_output_at)
+        })
+        .ok()
+        .flatten()
+    }
+
+    #[doc(hidden)]
     pub fn tcp_take_transport_send_payload_for_flow_for_test(
         &self,
         flow: AppFlowId,
@@ -4054,6 +4226,7 @@ fn close_inner(inner: &mut ServiceInner) -> HammerResult<()> {
         Ok(())
     } else {
         inner.state = ServiceState::Closed;
+        inner.app_control.cancel_all_tcp_output_pacing_timers();
         inner.app_control.cancel_all_tcp_retransmit_timers();
         close_lifecycles(&inner.lifecycles)
     }
@@ -4355,6 +4528,29 @@ impl RuntimeService {
             .flatten();
         drop(inner);
         connection_id
+    }
+
+    fn tcp_flow_for_endpoints_for_test(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<AppFlowId> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        let flow = inner
+            .app_control
+            .with_state(move |state| {
+                Ok(state
+                    .tcp_connections
+                    .iter()
+                    .find(|registration| {
+                        registration.local == Some(local) && registration.remote == remote
+                    })
+                    .map(|registration| registration.flow))
+            })
+            .ok()
+            .flatten();
+        drop(inner);
+        flow
     }
 
     fn shared_tcp_has_timer_for_test(
@@ -5560,6 +5756,9 @@ interval = "5s"
                 == Some(crate::transport::tcp::TcpState::Established)
         });
 
+        let congestion_before_timeout = service
+            .tcp_congestion_window_for_flow_for_test(flow)
+            .expect("connection congestion window before retransmit timeout");
         request_tcp_send(&app, flow, b"retransmit-me");
 
         wait_for(Duration::from_secs(1), || {
@@ -5575,6 +5774,13 @@ interval = "5s"
         assert!(
             emitted.len() >= 2,
             "unacked payload should be retransmitted after timeout"
+        );
+        let congestion_after_timeout = service
+            .tcp_congestion_window_for_flow_for_test(flow)
+            .expect("connection congestion window after retransmit timeout");
+        assert!(
+            congestion_after_timeout < congestion_before_timeout,
+            "retransmit timeout must feed loss into the per-connection congestion controller"
         );
         let first = emitted.first().expect("first output segment");
         let second = emitted.get(1).expect("retransmitted output segment");
@@ -6878,6 +7084,335 @@ interval = "5s"
 
         let emitted = output.emitted.lock().expect("tcp output capture poisoned");
         assert_eq!(emitted[1].payload, b"owed".to_vec());
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_output_respects_owned_congestion_window() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.191:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.147:49152".parse().expect("local");
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        observe_active_syn_ack_for_test(&service, connection_id, peer, local);
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .map(|connection| connection.lookup_id)
+            .expect("lookup id for connected flow");
+        service
+            .handle_tcp_established_ack_progress_for_test(TcpEstablishedAckObservation {
+                lookup_id,
+                connection_id,
+                accepted_acknowledgment: 0x1020_3041,
+                advertised_window: 65_535,
+                previous_state: crate::transport::tcp::TcpState::Established,
+                ack_state_transition: None,
+                acknowledges_local_fin: false,
+            })
+            .expect("open peer send window");
+
+        let congestion_window = service
+            .tcp_congestion_window_for_flow_for_test(flow)
+            .expect("connection congestion window") as usize;
+        let payload = vec![0x55; crate::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN];
+        for _ in 0..20 {
+            request_tcp_send(&app, flow, &payload);
+        }
+
+        wait_for(Duration::from_secs(1), || {
+            output
+                .emitted
+                .lock()
+                .expect("tcp output capture poisoned")
+                .iter()
+                .map(|segment| segment.payload.len())
+                .sum::<usize>()
+                >= congestion_window
+        });
+
+        let emitted = output.emitted.lock().expect("tcp output capture poisoned");
+        let emitted_payload: usize = emitted.iter().map(|segment| segment.payload.len()).sum();
+        assert_eq!(
+            emitted_payload, congestion_window,
+            "initial send burst must be capped by the owned congestion window"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_active_handshake_mss_sets_owned_congestion_window() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.201:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.201:49152".parse().expect("local");
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .expect("active connect snapshot")
+            .lookup_id;
+        let peer_mss = 1_220;
+
+        service
+            .promote_pending_syn_sent_for_test(TcpSynSentObservation::new(
+                lookup_id,
+                peer,
+                local,
+                crate::transport::tcp::TcpState::SynSent,
+                crate::transport::tcp::TcpState::Established,
+                tcp_syn_ack_observation(0x5566_7788, 0x1020_3041, 0x3456).with_capabilities(
+                    TcpCapabilities {
+                        max_segment_size: Some(peer_mss),
+                        ..TcpCapabilities::default()
+                    },
+                ),
+            ))
+            .expect("observe active syn-ack");
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        assert_eq!(
+            service.tcp_congestion_window_for_flow_for_test(flow),
+            Some(10 * u32::from(peer_mss)),
+            "connection-owned congestion state must use the peer MSS from handshake"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_passive_handshake_mss_sets_owned_congestion_window() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let local: SocketAddr = "127.0.0.1:7443".parse().expect("listener");
+        let remote: SocketAddr = "198.51.100.202:40144".parse().expect("remote");
+        let peer_mss = 1_180;
+        let listener = app.bind_tcp_listener(local, 0).expect("bind tcp listener");
+
+        let listener_lookup_id = {
+            let state = service.app_control_snapshot_for_test();
+            state
+                .tcp_listeners
+                .iter()
+                .find(|registration| registration.socket == listener)
+                .expect("listener registration")
+                .lookup_id
+        };
+
+        service
+            .handle_tcp_accept_observation_for_test(
+                listener_lookup_id,
+                remote,
+                local,
+                tcp_syn_observation(0x5566_7788, 0x3456).with_capabilities(TcpCapabilities {
+                    max_segment_size: Some(peer_mss),
+                    ..TcpCapabilities::default()
+                }),
+            )
+            .expect("observe passive syn");
+
+        let flow = service
+            .tcp_flow_for_endpoints_for_test(local, remote)
+            .expect("passive connection flow");
+        assert_eq!(
+            service.tcp_congestion_window_for_flow_for_test(flow),
+            Some(10 * u32::from(peer_mss)),
+            "passive-open connection congestion state must use peer SYN MSS"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_ack_progress_updates_owned_congestion_state() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.192:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.148:49152".parse().expect("local");
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        observe_active_syn_ack_for_test(&service, connection_id, peer, local);
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        request_tcp_send(&app, flow, b"congestion-ack");
+
+        wait_for(Duration::from_secs(1), || {
+            !output
+                .emitted
+                .lock()
+                .expect("tcp output capture poisoned")
+                .is_empty()
+        });
+
+        let first = output
+            .emitted
+            .lock()
+            .expect("tcp output capture poisoned")
+            .first()
+            .cloned()
+            .expect("initial payload segment");
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .map(|connection| connection.lookup_id)
+            .expect("lookup id for connected flow");
+
+        assert_eq!(
+            service.tcp_congestion_delivered_for_flow_for_test(flow),
+            Some(0)
+        );
+
+        service
+            .handle_tcp_established_ack_progress_for_test(TcpEstablishedAckObservation {
+                lookup_id,
+                connection_id,
+                accepted_acknowledgment: first.next_send_sequence(),
+                advertised_window: 0x4321,
+                previous_state: crate::transport::tcp::TcpState::Established,
+                ack_state_transition: None,
+                acknowledges_local_fin: false,
+            })
+            .expect("observe payload ACK progress");
+
+        wait_for(Duration::from_secs(1), || {
+            service.tcp_congestion_delivered_for_flow_for_test(flow)
+                == Some(first.sequence_len() as u64)
+        });
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_output_honors_pacing_deadline() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.193:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.149:49152".parse().expect("local");
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        observe_active_syn_ack_for_test(&service, connection_id, peer, local);
+
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        request_tcp_send(
+            &app,
+            flow,
+            &[0x66; crate::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN],
+        );
+
+        wait_for(Duration::from_secs(1), || {
+            !output
+                .emitted
+                .lock()
+                .expect("tcp output capture poisoned")
+                .is_empty()
+        });
+
+        let first = output
+            .emitted
+            .lock()
+            .expect("tcp output capture poisoned")
+            .first()
+            .cloned()
+            .expect("first pacing seed segment");
+        std::thread::sleep(Duration::from_millis(100));
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .map(|connection| connection.lookup_id)
+            .expect("lookup id for connected flow");
+        service
+            .handle_tcp_established_ack_progress_for_test(TcpEstablishedAckObservation {
+                lookup_id,
+                connection_id,
+                accepted_acknowledgment: first.next_send_sequence(),
+                advertised_window: 65_535,
+                previous_state: crate::transport::tcp::TcpState::Established,
+                ack_state_transition: None,
+                acknowledges_local_fin: false,
+            })
+            .expect("seed pacing from ACK sample");
+
+        let emitted_before_second_send = output
+            .emitted
+            .lock()
+            .expect("tcp output capture poisoned")
+            .len();
+        request_tcp_send(
+            &app,
+            flow,
+            &[0x77; crate::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN * 2],
+        );
+
+        wait_for(Duration::from_secs(1), || {
+            service
+                .tcp_next_output_at_for_flow_for_test(flow)
+                .is_some_and(|deadline| deadline > Instant::now() + Duration::from_millis(10))
+        });
+
+        assert!(service.tcp_next_output_at_for_flow_for_test(flow).is_some());
+
+        let emitted_before_deadline = output
+            .emitted
+            .lock()
+            .expect("tcp output capture poisoned")
+            .len();
+        assert!(emitted_before_deadline > emitted_before_second_send);
+        std::thread::sleep(Duration::from_millis(1));
+        assert_eq!(
+            output
+                .emitted
+                .lock()
+                .expect("tcp output capture poisoned")
+                .len(),
+            emitted_before_deadline,
+            "output pump must not immediately emit more payload before pacing deadline"
+        );
 
         service.close().expect("close service");
     }

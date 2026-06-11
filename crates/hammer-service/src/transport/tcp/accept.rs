@@ -17,6 +17,7 @@ use hammer_runtime::app::{AppContext, AppSocketId};
 
 use super::TcpLookupId;
 use super::input::take_pending_tcp_accept;
+use super::options::tcp_capabilities_from_options;
 
 #[hammer_component_macros::node_next]
 pub enum TcpAcceptNext {
@@ -484,13 +485,18 @@ fn tcp_handshake_observation(
     let next_sequence = TcpSeq::new(sequence)
         .advance(payload_len + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0))
         .raw();
+    let capabilities = packet
+        .get(cursor.transport_header_offset() + 20..cursor.transport_payload_offset())
+        .map(tcp_capabilities_from_options)
+        .unwrap_or_default();
     Ok(TcpHandshakeObservation::new(
         flags,
         sequence,
         acknowledgment,
         advertised_window,
         next_sequence,
-    ))
+    )
+    .with_capabilities(capabilities))
 }
 
 fn tcp_accept_socket_addrs(

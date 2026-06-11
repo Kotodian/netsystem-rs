@@ -2,11 +2,14 @@ pub use hammer_core::protocol::tcp::TcpState;
 
 pub mod accept;
 pub mod app;
+pub mod congestion;
+pub mod congestion_control;
 pub mod connection;
 pub mod established;
 pub mod input;
 pub mod listen;
 pub mod lookup;
+mod options;
 pub mod output;
 pub mod rcv_process;
 pub mod reset;
@@ -17,9 +20,14 @@ pub use accept::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptNode, TcpAcceptRegistration,
 };
 pub use app::TcpAppIngress;
+pub use congestion::{TcpCongestionAckSample, TcpCongestionControl, TcpCongestionState};
+pub use congestion_control::{
+    TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
+    TcpCongestionSendObservation,
+};
 pub use connection::{
-    TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpEstablishedControlPlane,
-    TcpWorkerOwnedConnectionState,
+    TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpConnectionTable, TcpDataPlaneConnection,
+    TcpEstablishedControlPlane, TcpWorkerOwnedConnectionState,
 };
 pub use established::{
     TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode,
@@ -35,7 +43,7 @@ pub use lookup::{
 pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, NoopTcpOutputBackend, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
     TCP_FLAG_SYN, TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue,
-    TcpOutputRetransmitSegment, TcpOutputSegment, build_tcp_output_segment,
+    TcpOutputRetransmitSegment, TcpOutputSegment, TcpOutputSendView, build_tcp_output_segment,
     build_tcp_output_segment_with_flags,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
