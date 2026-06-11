@@ -5,11 +5,17 @@ use hammer_core::protocol::tcp::{
 use hammer_service::transport::tcp::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState, TcpListenerConfig,
 };
-use smoltcp::socket::tcp::CongestionControl as SmolTcpCongestionControl;
 
 #[test]
-fn tcp_connection_defaults_to_hammer_owned_bbr_without_smoltcp_fallback() {
-    let registry = TcpCongestionRegistry::default();
+fn tcp_connection_defaults_to_hammer_owned_bbr() {
+    let registry = TcpCongestionRegistry::new(TcpCongestionAlgorithm::Bbr);
+
+    assert_eq!(
+        registry
+            .selected_algorithm(None)
+            .expect("registry default bbr selection"),
+        registry.default_algorithm()
+    );
 
     let connection = TcpConnectionState::new(&registry, None).expect("default bbr selection");
 
@@ -17,7 +23,6 @@ fn tcp_connection_defaults_to_hammer_owned_bbr_without_smoltcp_fallback() {
         connection.selected_congestion_algorithm(),
         TcpCongestionAlgorithm::Bbr
     );
-    assert_eq!(connection.smoltcp_congestion_fallback(), None);
 }
 
 #[test]
@@ -41,108 +46,89 @@ fn tcp_listener_config_builds_shared_install_listener_action_after_bbr_validatio
 }
 
 #[test]
-fn tcp_connection_override_to_reno_uses_smoltcp_reno_fallback() {
+fn tcp_connection_override_to_reno_is_rejected_until_hammer_tcp_node_support_exists() {
     let registry = TcpCongestionRegistry::default();
-    let connection = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Reno))
-        .expect("reno selection should be accepted");
 
-    assert_eq!(
-        connection.selected_congestion_algorithm(),
-        TcpCongestionAlgorithm::Reno
-    );
-    assert_eq!(
-        connection.smoltcp_congestion_fallback(),
-        Some(SmolTcpCongestionControl::Reno)
+    let err = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Reno))
+        .expect_err("reno must wait for Hammer TCP node support");
+
+    assert!(
+        err.to_string()
+            .contains("Hammer-owned congestion controller"),
+        "unexpected err={err}"
     );
 }
 
 #[test]
-fn tcp_connection_override_to_cubic_uses_smoltcp_cubic_fallback() {
+fn tcp_connection_override_to_cubic_is_rejected_until_hammer_tcp_node_support_exists() {
     let registry = TcpCongestionRegistry::default();
-    let connection = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Cubic))
-        .expect("cubic selection should be accepted");
 
-    assert_eq!(
-        connection.selected_congestion_algorithm(),
-        TcpCongestionAlgorithm::Cubic
-    );
-    assert_eq!(
-        connection.smoltcp_congestion_fallback(),
-        Some(SmolTcpCongestionControl::Cubic)
+    let err = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Cubic))
+        .expect_err("cubic must wait for Hammer TCP node support");
+
+    assert!(
+        err.to_string()
+            .contains("Hammer-owned congestion controller"),
+        "unexpected err={err}"
     );
 }
 
 #[test]
-fn tcp_listener_override_to_reno_is_accepted_before_install_listener_action() {
+fn tcp_listener_override_to_reno_is_rejected_before_install_listener_action() {
     let registry = TcpCongestionRegistry::default();
     let listener = TcpListenerConfig::new().with_congestion_algorithm(TcpCongestionAlgorithm::Reno);
-    let listener_id = TcpListenerId::new(23);
     let listener_key = TcpListenerKey::v4(0, "192.0.2.20".parse().expect("listener addr"), 8443);
 
-    let action = listener
-        .install_listener_action(&registry, listener_id, listener_key)
-        .expect("reno must be accepted before installing listener");
+    let err = listener
+        .install_listener_action(&registry, TcpListenerId::new(23), listener_key)
+        .expect_err("reno must wait for Hammer TCP node support");
 
-    assert_eq!(
-        action,
-        TcpControlPlaneAction::InstallListener {
-            listener_id,
-            listener: listener_key,
-            capabilities: TcpCapabilities::default(),
-        }
+    assert!(
+        err.to_string()
+            .contains("Hammer-owned congestion controller"),
+        "unexpected err={err}"
     );
 }
 
 #[test]
-fn tcp_listener_override_to_cubic_is_accepted_before_install_listener_action() {
+fn tcp_listener_override_to_cubic_is_rejected_before_install_listener_action() {
     let registry = TcpCongestionRegistry::default();
     let listener =
         TcpListenerConfig::new().with_congestion_algorithm(TcpCongestionAlgorithm::Cubic);
-    let listener_id = TcpListenerId::new(29);
     let listener_key = TcpListenerKey::v4(0, "192.0.2.30".parse().expect("listener addr"), 9443);
 
-    let action = listener
-        .install_listener_action(&registry, listener_id, listener_key)
-        .expect("cubic must be accepted before installing listener");
+    let err = listener
+        .install_listener_action(&registry, TcpListenerId::new(29), listener_key)
+        .expect_err("cubic must wait for Hammer TCP node support");
 
-    assert_eq!(
-        action,
-        TcpControlPlaneAction::InstallListener {
-            listener_id,
-            listener: listener_key,
-            capabilities: TcpCapabilities::default(),
-        }
+    assert!(
+        err.to_string()
+            .contains("Hammer-owned congestion controller"),
+        "unexpected err={err}"
     );
 }
 
 #[test]
-fn tcp_connection_uses_registry_default_algorithm_for_smoltcp_backed_modes() {
+fn tcp_connection_rejects_registry_default_until_hammer_tcp_node_support_exists() {
     let reno = TcpConnectionState::new(
         &TcpCongestionRegistry::new(TcpCongestionAlgorithm::Reno),
         None,
     )
-    .expect("reno default should be accepted");
+    .expect_err("reno default must wait for Hammer TCP node support");
     let cubic = TcpConnectionState::new(
         &TcpCongestionRegistry::new(TcpCongestionAlgorithm::Cubic),
         None,
     )
-    .expect("cubic default should be accepted");
+    .expect_err("cubic default must wait for Hammer TCP node support");
 
-    assert_eq!(
-        reno.selected_congestion_algorithm(),
-        TcpCongestionAlgorithm::Reno
+    assert!(
+        reno.to_string()
+            .contains("Hammer-owned congestion controller")
     );
-    assert_eq!(
-        reno.smoltcp_congestion_fallback(),
-        Some(SmolTcpCongestionControl::Reno)
-    );
-    assert_eq!(
-        cubic.selected_congestion_algorithm(),
-        TcpCongestionAlgorithm::Cubic
-    );
-    assert_eq!(
-        cubic.smoltcp_congestion_fallback(),
-        Some(SmolTcpCongestionControl::Cubic)
+    assert!(
+        cubic
+            .to_string()
+            .contains("Hammer-owned congestion controller")
     );
 }
 

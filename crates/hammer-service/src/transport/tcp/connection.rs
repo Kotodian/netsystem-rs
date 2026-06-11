@@ -8,9 +8,12 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
+use super::congestion::TcpCongestionState;
+use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView};
 use super::{TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpLookupId, TcpState};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
+const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpConnectionSnapshot {
@@ -28,6 +31,177 @@ pub struct TcpConnectionSnapshot {
     pub snd_wnd: u32,
     pub rcv_nxt: u32,
     pub rcv_wnd: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpDataPlaneConnection {
+    lookup_id: TcpLookupId,
+    connection_id: Option<TcpConnectionId>,
+    owner_worker: DataWorkerId,
+    state: TcpState,
+    local_port: u16,
+    local: Option<SocketAddr>,
+    remote: SocketAddr,
+    iss: u32,
+    irs: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_wnd: u32,
+    rcv_nxt: u32,
+    rcv_wnd: u32,
+    retransmit_queue: TcpOutputRetransmitQueue,
+    congestion: TcpCongestionState,
+    next_output_at: Option<std::time::Instant>,
+}
+
+impl TcpDataPlaneConnection {
+    #[inline]
+    pub fn new(
+        lookup_id: TcpLookupId,
+        connection_id: Option<TcpConnectionId>,
+        owner_worker: DataWorkerId,
+        state: TcpState,
+        local_port: u16,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+    ) -> Self {
+        Self {
+            lookup_id,
+            connection_id,
+            owner_worker,
+            state,
+            local_port,
+            local,
+            remote,
+            iss: 0,
+            irs: 0,
+            snd_una: 0,
+            snd_nxt: 0,
+            snd_wnd: DEFAULT_TCP_WINDOW,
+            rcv_nxt: 0,
+            rcv_wnd: DEFAULT_TCP_WINDOW,
+            retransmit_queue: TcpOutputRetransmitQueue::new(),
+            congestion: TcpCongestionState::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
+            next_output_at: None,
+        }
+    }
+
+    #[inline]
+    pub fn lookup_id(&self) -> TcpLookupId {
+        self.lookup_id
+    }
+
+    #[inline]
+    pub fn connection_id(&self) -> Option<TcpConnectionId> {
+        self.connection_id
+    }
+
+    #[inline]
+    pub fn owner_worker(&self) -> DataWorkerId {
+        self.owner_worker
+    }
+
+    #[inline]
+    pub fn state(&self) -> TcpState {
+        self.state
+    }
+
+    #[inline]
+    pub fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    #[inline]
+    pub fn local(&self) -> Option<SocketAddr> {
+        self.local
+    }
+
+    #[inline]
+    pub fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+
+    #[inline]
+    pub fn iss(&self) -> u32 {
+        self.iss
+    }
+
+    #[inline]
+    pub fn irs(&self) -> u32 {
+        self.irs
+    }
+
+    #[inline]
+    pub fn snd_una(&self) -> u32 {
+        self.snd_una
+    }
+
+    #[inline]
+    pub fn snd_nxt(&self) -> u32 {
+        self.snd_nxt
+    }
+
+    #[inline]
+    pub fn snd_wnd(&self) -> u32 {
+        self.snd_wnd
+    }
+
+    #[inline]
+    pub fn rcv_nxt(&self) -> u32 {
+        self.rcv_nxt
+    }
+
+    #[inline]
+    pub fn rcv_wnd(&self) -> u32 {
+        self.rcv_wnd
+    }
+
+    #[inline]
+    pub fn congestion(&self) -> &TcpCongestionState {
+        &self.congestion
+    }
+
+    #[inline]
+    pub fn congestion_mut(&mut self) -> &mut TcpCongestionState {
+        &mut self.congestion
+    }
+
+    #[inline]
+    pub fn retransmit_queue(&self) -> &TcpOutputRetransmitQueue {
+        &self.retransmit_queue
+    }
+
+    #[inline]
+    pub fn retransmit_queue_mut(&mut self) -> &mut TcpOutputRetransmitQueue {
+        &mut self.retransmit_queue
+    }
+
+    #[inline]
+    pub fn output_send_view(&self) -> TcpOutputSendView {
+        TcpOutputSendView {
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+            snd_wnd: self.snd_wnd,
+            congestion_window: self.congestion.congestion_window(),
+        }
+    }
+
+    #[inline]
+    pub fn set_send_state(&mut self, snd_una: u32, snd_nxt: u32, snd_wnd: u32) {
+        self.snd_una = snd_una;
+        self.snd_nxt = snd_nxt;
+        self.snd_wnd = snd_wnd;
+    }
+
+    #[inline]
+    pub fn next_output_at(&self) -> Option<std::time::Instant> {
+        self.next_output_at
+    }
+
+    #[inline]
+    pub fn set_next_output_at(&mut self, deadline: Option<std::time::Instant>) {
+        self.next_output_at = deadline;
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +323,76 @@ impl TcpConnectionSnapshotPool {
 }
 
 impl Default for TcpConnectionSnapshotPool {
+    #[inline]
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpConnectionTable {
+    connections: InfraVec<TcpDataPlaneConnection>,
+    lookup_slots: FlatHashTable<TcpLookupId, usize>,
+    connection_slots: FlatHashTable<u64, usize>,
+}
+
+impl TcpConnectionTable {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            connections: InfraVec::new(),
+            lookup_slots: FlatHashTable::new(),
+            connection_slots: FlatHashTable::new(),
+        }
+    }
+
+    #[inline]
+    pub fn insert(&mut self, connection: TcpDataPlaneConnection) {
+        let slot = self.connections.len();
+        self.lookup_slots.insert(connection.lookup_id(), slot);
+        if let Some(connection_id) = connection.connection_id() {
+            self.connection_slots.insert(connection_id.get(), slot);
+        }
+        self.connections.push(connection);
+    }
+
+    #[inline]
+    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<&TcpDataPlaneConnection> {
+        self.lookup_slots
+            .lookup(&lookup_id)
+            .and_then(|slot| self.connections.get(slot))
+    }
+
+    #[inline]
+    pub fn lookup_by_lookup_id_mut(
+        &mut self,
+        lookup_id: TcpLookupId,
+    ) -> Option<&mut TcpDataPlaneConnection> {
+        let slot = self.lookup_slots.lookup(&lookup_id)?;
+        self.connections.get_mut(slot)
+    }
+
+    #[inline]
+    pub fn lookup_by_connection_id(
+        &self,
+        connection_id: TcpConnectionId,
+    ) -> Option<&TcpDataPlaneConnection> {
+        self.connection_slots
+            .lookup(&connection_id.get())
+            .and_then(|slot| self.connections.get(slot))
+    }
+
+    #[inline]
+    pub fn lookup_by_connection_id_mut(
+        &mut self,
+        connection_id: TcpConnectionId,
+    ) -> Option<&mut TcpDataPlaneConnection> {
+        let slot = self.connection_slots.lookup(&connection_id.get())?;
+        self.connections.get_mut(slot)
+    }
+}
+
+impl Default for TcpConnectionTable {
     #[inline]
     fn default() -> Self {
         Self::empty()

@@ -153,6 +153,7 @@ pub struct TcpHandshakeObservation {
     pub acknowledgment: Option<u32>,
     pub advertised_window: u32,
     pub next_sequence: u32,
+    pub capabilities: TcpCapabilities,
 }
 
 impl TcpHandshakeObservation {
@@ -170,7 +171,20 @@ impl TcpHandshakeObservation {
             acknowledgment,
             advertised_window,
             next_sequence,
+            capabilities: TcpCapabilities {
+                max_segment_size: None,
+                window_scale: None,
+                sack: false,
+                timestamps: false,
+                ecn: false,
+            },
         }
+    }
+
+    #[inline]
+    pub const fn with_capabilities(mut self, capabilities: TcpCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     #[inline]

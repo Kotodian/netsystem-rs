@@ -11,6 +11,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpHandshakeObservation, TcpSeq, TcpState};
 use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
 
+use super::options::tcp_capabilities_from_options;
 use super::{TcpLookupId, TcpV4PendingConnectionKey, TcpV6PendingConnectionKey};
 
 #[hammer_component_macros::node_next]
@@ -568,11 +569,16 @@ fn tcp_handshake_observation(
     let next_sequence = TcpSeq::new(sequence)
         .advance(payload_len + u32::from(flags & 0x02 != 0) + u32::from(flags & 0x01 != 0))
         .raw();
+    let capabilities = packet
+        .get(cursor.transport_header_offset() + 20..cursor.transport_payload_offset())
+        .map(tcp_capabilities_from_options)
+        .unwrap_or_default();
     Ok(TcpHandshakeObservation::new(
         flags,
         sequence,
         acknowledgment,
         advertised_window,
         next_sequence,
-    ))
+    )
+    .with_capabilities(capabilities))
 }

@@ -6,7 +6,8 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::TcpHandshakeObservation;
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpHandshakeObservation};
+use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::syn_sent::{
     TcpSynSentBackend, TcpSynSentControlPlane, TcpSynSentObservation, TcpSynSentRegistration,
 };
@@ -193,6 +194,74 @@ fn tcp_syn_sent_node_observes_matching_syn_ack_via_backend() {
     assert_eq!(runtime.in_use_buffers(), 0);
 }
 
+#[test]
+fn tcp_syn_sent_observation_parses_peer_mss_option() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let backend = Arc::new(RecordingTcpSynSentBackend::default());
+    let control = TcpSynSentControlPlane::new(backend.clone(), TcpSynSentNext::nodes(drop));
+    control
+        .publish_connections([TcpSynSentRegistration::v4(
+            CONNECTION_ID,
+            hammer_service::transport::tcp::TcpV4PendingConnectionKey::new(
+                0,
+                40_144,
+                Ipv4Addr::new(198, 51, 100, 44),
+                443,
+            ),
+        )])
+        .expect("publish syn-sent connection");
+    let syn_sent = runtime.nodes().register_internal(control.node());
+
+    let packet = ipv4_tcp_packet_with_options(
+        Ipv4Addr::new(198, 51, 100, 44),
+        443,
+        Ipv4Addr::new(192, 0, 2, 44),
+        40_144,
+        0x5566_7788,
+        Some(0x1020_3041),
+        0x3456,
+        tcp_flags(false, true, false, true),
+        &[2, 4, 0x04, 0xc4],
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let buffer = push_packet(
+        &runtime,
+        frame,
+        &packet,
+        tcp_metadata(
+            Ipv4Addr::new(198, 51, 100, 44).into(),
+            443,
+            Ipv4Addr::new(192, 0, 2, 44).into(),
+            40_144,
+        ),
+    );
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(runtime.schedule_frame(syn_sent, frame).expect("schedule"));
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+
+    let observations = backend.observations.lock().unwrap();
+    let observation = observations.first().expect("syn-ack observation");
+    assert_eq!(
+        observation.transport,
+        TcpHandshakeObservation::new(
+            tcp_flags(false, true, false, true),
+            0x5566_7788,
+            Some(0x1020_3041),
+            0x3456,
+            0x5566_7789,
+        )
+        .with_capabilities(TcpCapabilities {
+            max_segment_size: Some(1_220),
+            ..TcpCapabilities::default()
+        })
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
 fn push_packet(
     runtime: &DataPlaneRuntime,
     frame: hammer_adapter::FrameIndex,
@@ -273,6 +342,36 @@ fn ipv4_tcp_packet(
     packet
 }
 
+fn ipv4_tcp_packet_with_options(
+    source: Ipv4Addr,
+    source_port: u16,
+    destination: Ipv4Addr,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: Option<u32>,
+    advertised_window: u16,
+    flags: u8,
+    options: &[u8],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = ipv4_packet(source, destination, 6, 20 + options.len() + payload.len());
+    write_tcp_segment_with_options(
+        &mut packet[20..],
+        source_port,
+        destination_port,
+        sequence,
+        acknowledgment,
+        advertised_window,
+        flags,
+        options,
+        payload,
+    );
+    let checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
+    packet[36..38].copy_from_slice(&checksum.to_be_bytes());
+    update_ipv4_header_checksum(&mut packet);
+    packet
+}
+
 fn ipv4_packet(
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -309,6 +408,29 @@ fn write_tcp_segment(
     segment[13] = flags;
     segment[14..16].copy_from_slice(&advertised_window.to_be_bytes());
     segment[20..].copy_from_slice(payload);
+}
+
+fn write_tcp_segment_with_options(
+    segment: &mut [u8],
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgment: Option<u32>,
+    advertised_window: u16,
+    flags: u8,
+    options: &[u8],
+    payload: &[u8],
+) {
+    assert_eq!(options.len() % 4, 0, "tcp options must be word-aligned");
+    segment[0..2].copy_from_slice(&source_port.to_be_bytes());
+    segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    segment[4..8].copy_from_slice(&sequence.to_be_bytes());
+    segment[8..12].copy_from_slice(&acknowledgment.unwrap_or_default().to_be_bytes());
+    segment[12] = (((20 + options.len()) / 4) as u8) << 4;
+    segment[13] = flags;
+    segment[14..16].copy_from_slice(&advertised_window.to_be_bytes());
+    segment[20..20 + options.len()].copy_from_slice(options);
+    segment[20 + options.len()..].copy_from_slice(payload);
 }
 
 fn tcp_flags(fin: bool, syn: bool, rst: bool, ack: bool) -> u8 {

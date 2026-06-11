@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, Network, RouteMetadata, SocksAddr};
 use hammer_core::error::CoreResult;
@@ -9,8 +10,8 @@ use hammer_service::transport::tcp::output::{
 };
 use hammer_service::transport::tcp::{
     TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN, TcpConnectionSnapshot,
-    TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue, TcpOutputSegment, TcpState,
-    build_tcp_output_segment, build_tcp_output_segment_with_flags,
+    TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue, TcpOutputSegment,
+    TcpOutputSendView, TcpState, build_tcp_output_segment, build_tcp_output_segment_with_flags,
 };
 
 #[derive(Default)]
@@ -208,6 +209,42 @@ fn tcp_output_retransmit_queue_tracks_unacked_segments_and_prunes_on_ack() {
 }
 
 #[test]
+fn retransmit_queue_ack_sample_counts_acked_bytes_and_latest_rtt() {
+    let mut queue = TcpOutputRetransmitQueue::new();
+    let first = manual_segment(10, TCP_FLAG_ACK | TCP_FLAG_PSH, b"rust");
+    let second = manual_segment(14, TCP_FLAG_ACK | TCP_FLAG_PSH, b"rs");
+    let third = manual_segment(16, TCP_FLAG_ACK | TCP_FLAG_PSH, b"tcp");
+    let now = Instant::now();
+
+    assert!(
+        queue
+            .track_segment_with_sent_at(&first, now - Duration::from_millis(50))
+            .is_some()
+    );
+    assert!(
+        queue
+            .track_segment_with_sent_at(&second, now - Duration::from_millis(20))
+            .is_some()
+    );
+    assert!(
+        queue
+            .track_segment_with_sent_at(&third, now - Duration::from_millis(5))
+            .is_some()
+    );
+
+    let sample = queue.acknowledge_through_with_sample(16, now);
+
+    assert_eq!(sample.bytes_acked, 6);
+    assert_eq!(sample.latest_rtt, Some(Duration::from_millis(20)));
+    assert_eq!(sample.released_segments, 2);
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue.front().expect("third outstanding").segment.sequence,
+        16
+    );
+}
+
+#[test]
 fn tcp_output_retransmit_queue_ignores_duplicate_sequence_ranges() {
     let mut queue = TcpOutputRetransmitQueue::new();
     let original = manual_segment(10, TCP_FLAG_ACK | TCP_FLAG_PSH, b"rust");
@@ -227,6 +264,39 @@ fn tcp_output_retransmit_queue_ignores_duplicate_sequence_ranges() {
 }
 
 #[test]
+fn tcp_output_retransmit_queue_refreshes_duplicate_sent_at_without_duplicate_entry() {
+    let mut queue = TcpOutputRetransmitQueue::new();
+    let original = manual_segment(10, TCP_FLAG_ACK | TCP_FLAG_PSH, b"rust");
+    let retransmit = manual_segment(10, TCP_FLAG_ACK, b"rust");
+    let first_sent = Instant::now();
+    let latest_sent = first_sent + Duration::from_millis(25);
+
+    assert!(
+        queue
+            .track_segment_with_sent_at(&original, first_sent)
+            .is_some()
+    );
+    assert!(
+        queue
+            .track_segment_with_sent_at(&retransmit, latest_sent)
+            .is_some()
+    );
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue.front().expect("tracked segment").segment.sequence,
+        original.sequence
+    );
+    assert_eq!(
+        queue.front().expect("tracked segment").next_sequence,
+        original.next_send_sequence()
+    );
+    assert_eq!(
+        queue.front().expect("tracked segment").sent_at,
+        Some(latest_sent)
+    );
+}
+
+#[test]
 fn tcp_output_send_window_helpers_account_for_inflight_bytes_and_control_len() {
     let local: SocketAddr = "192.0.2.10:49152".parse().expect("local");
     let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote");
@@ -235,19 +305,51 @@ fn tcp_output_send_window_helpers_account_for_inflight_bytes_and_control_len() {
     snapshot.snd_nxt = 10_020;
     snapshot.snd_wnd = 40;
 
-    assert_eq!(tcp_available_send_window(snapshot), 20);
-    assert_eq!(tcp_payload_len_in_send_window(snapshot, 32, 0), 20);
-    assert_eq!(tcp_payload_len_in_send_window(snapshot, 32, 1), 19);
+    let mut view = TcpOutputSendView::from_snapshot(snapshot);
+
+    assert_eq!(tcp_available_send_window(view), 20);
+    assert_eq!(tcp_payload_len_in_send_window(view, 32, 0), 20);
+    assert_eq!(tcp_payload_len_in_send_window(view, 32, 1), 19);
 
     snapshot.snd_wnd = 20;
-    assert_eq!(tcp_available_send_window(snapshot), 0);
-    assert_eq!(tcp_payload_len_in_send_window(snapshot, 32, 0), 0);
+    view = TcpOutputSendView::from_snapshot(snapshot);
+    assert_eq!(tcp_available_send_window(view), 0);
+    assert_eq!(tcp_payload_len_in_send_window(view, 32, 0), 0);
 
     snapshot.snd_una = u32::MAX - 4;
     snapshot.snd_nxt = 7;
     snapshot.snd_wnd = 20;
-    assert_eq!(tcp_available_send_window(snapshot), 8);
-    assert_eq!(tcp_payload_len_in_send_window(snapshot, 32, 1), 7);
+    view = TcpOutputSendView::from_snapshot(snapshot);
+    assert_eq!(tcp_available_send_window(view), 8);
+    assert_eq!(tcp_payload_len_in_send_window(view, 32, 1), 7);
+}
+
+#[test]
+fn tcp_output_send_view_uses_min_of_peer_window_and_congestion_window() {
+    let mut view = TcpOutputSendView {
+        snd_una: 1000,
+        snd_nxt: 1200,
+        snd_wnd: 8000,
+        congestion_window: 1000,
+    };
+
+    assert_eq!(tcp_available_send_window(view), 800);
+
+    view.snd_wnd = 700;
+
+    assert_eq!(tcp_available_send_window(view), 500);
+}
+
+#[test]
+fn tcp_output_payload_len_is_zero_when_congestion_window_is_full() {
+    let view = TcpOutputSendView {
+        snd_una: 1000,
+        snd_nxt: 2000,
+        snd_wnd: 8000,
+        congestion_window: 1000,
+    };
+
+    assert_eq!(tcp_payload_len_in_send_window(view, 512, 0), 0);
 }
 
 #[test]

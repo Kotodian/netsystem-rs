@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use hammer_adapter::{Network, RouteMetadata, SocksAddr};
 use hammer_core::error::{CoreError, CoreResult};
@@ -59,6 +60,7 @@ impl TcpOutputSegment {
             .then(|| TcpOutputRetransmitSegment {
                 segment: self.clone(),
                 next_sequence: self.next_send_sequence(),
+                sent_at: None,
             })
     }
 }
@@ -67,12 +69,40 @@ impl TcpOutputSegment {
 pub struct TcpOutputRetransmitSegment {
     pub segment: TcpOutputSegment,
     pub next_sequence: u32,
+    pub sent_at: Option<Instant>,
 }
 
 impl TcpOutputRetransmitSegment {
     #[inline]
     pub fn is_fully_acked_by(&self, acknowledgment: u32) -> bool {
         !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.next_sequence))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TcpAckDeliverySample {
+    pub bytes_acked: u32,
+    pub latest_rtt: Option<Duration>,
+    pub released_segments: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpOutputSendView {
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub snd_wnd: u32,
+    pub congestion_window: u32,
+}
+
+impl TcpOutputSendView {
+    #[inline]
+    pub fn from_snapshot(snapshot: TcpConnectionSnapshot) -> Self {
+        Self {
+            snd_una: snapshot.snd_una,
+            snd_nxt: snapshot.snd_nxt,
+            snd_wnd: snapshot.snd_wnd,
+            congestion_window: snapshot.snd_wnd,
+        }
     }
 }
 
@@ -124,6 +154,28 @@ impl TcpOutputRetransmitQueue {
     }
 
     #[inline]
+    pub fn track_segment_with_sent_at(
+        &mut self,
+        segment: &TcpOutputSegment,
+        sent_at: Instant,
+    ) -> Option<&TcpOutputRetransmitSegment> {
+        let mut retransmit = segment.to_retransmit_segment()?;
+        retransmit.sent_at = Some(sent_at);
+        if let Some(existing) = self.segments.iter().position(|existing| {
+            existing.segment.sequence == retransmit.segment.sequence
+                && existing.next_sequence == retransmit.next_sequence
+        }) {
+            self.segments
+                .get_mut(existing)
+                .expect("tracked segment index should exist")
+                .sent_at = Some(sent_at);
+            return self.segments.get(existing);
+        }
+        self.segments.push_back(retransmit);
+        self.segments.back()
+    }
+
+    #[inline]
     pub fn acknowledge_through(&mut self, acknowledgment: u32) -> usize {
         let mut released = 0usize;
         while self
@@ -135,6 +187,31 @@ impl TcpOutputRetransmitQueue {
             released += 1;
         }
         released
+    }
+
+    #[inline]
+    pub fn acknowledge_through_with_sample(
+        &mut self,
+        acknowledgment: u32,
+        now: Instant,
+    ) -> TcpAckDeliverySample {
+        let mut sample = TcpAckDeliverySample::default();
+        while self
+            .segments
+            .front()
+            .is_some_and(|segment| segment.is_fully_acked_by(acknowledgment))
+        {
+            let segment = self
+                .segments
+                .pop_front()
+                .expect("front segment should be present after ACK check");
+            sample.bytes_acked += segment.segment.sequence_len();
+            if let Some(sent_at) = segment.sent_at {
+                sample.latest_rtt = Some(now.saturating_duration_since(sent_at));
+            }
+            sample.released_segments += 1;
+        }
+        sample
     }
 }
 
@@ -202,20 +279,20 @@ pub fn build_tcp_output_segment(
 }
 
 #[inline]
-pub fn tcp_available_send_window(snapshot: TcpConnectionSnapshot) -> u32 {
-    snapshot
-        .snd_wnd
-        .saturating_sub(tcp_inflight_sequence_len(snapshot))
+pub fn tcp_available_send_window(view: TcpOutputSendView) -> u32 {
+    view.snd_wnd
+        .min(view.congestion_window)
+        .saturating_sub(tcp_inflight_sequence_len(view.snd_una, view.snd_nxt))
 }
 
 #[inline]
 pub fn tcp_payload_len_in_send_window(
-    snapshot: TcpConnectionSnapshot,
+    view: TcpOutputSendView,
     requested_payload_len: usize,
     control_len: u32,
 ) -> usize {
     let available_payload_len =
-        tcp_available_send_window(snapshot).saturating_sub(control_len) as usize;
+        tcp_available_send_window(view).saturating_sub(control_len) as usize;
     available_payload_len.min(requested_payload_len)
 }
 
@@ -283,9 +360,9 @@ pub fn build_tcp_output_segment_with_flags(
 }
 
 #[inline]
-fn tcp_inflight_sequence_len(snapshot: TcpConnectionSnapshot) -> u32 {
-    if snapshot.snd_una != 0 && snapshot.snd_nxt != 0 {
-        TcpSeq::new(snapshot.snd_una).distance_to(TcpSeq::new(snapshot.snd_nxt))
+fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
+    if snd_una != 0 && snd_nxt != 0 {
+        TcpSeq::new(snd_una).distance_to(TcpSeq::new(snd_nxt))
     } else {
         0
     }
