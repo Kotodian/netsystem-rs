@@ -4405,11 +4405,13 @@ mod tests {
         AppSqeDescriptor, AppUserData,
     };
     use hammer_runtime::spawn::with_data_plane_buffers;
+    use std::future::Future;
     use std::net::SocketAddr;
     use std::net::{Ipv4Addr, Shutdown};
     use std::panic::{self, PanicHookInfo};
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
     use std::time::{Duration, Instant};
 
     struct NoopPlatform;
@@ -5946,6 +5948,62 @@ interval = "5s"
             .expect("published established tcp lookup");
         assert_eq!(established.kind, TcpLookupKind::EstablishedConnection);
         assert_eq!(established.owner_worker, DataWorkerId::new(1));
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_active_connect_established_state_does_not_post_app_cqe() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        service
+            .handle_tcp_worker_event_for_test(TcpWorkerEvent::StateChanged {
+                connection_id,
+                key: TcpConnectionKey::v4(
+                    0,
+                    Ipv4Addr::new(192, 0, 2, 44),
+                    49_152,
+                    Ipv4Addr::new(198, 51, 100, 88),
+                    443,
+                ),
+                state: crate::transport::tcp::TcpState::Established,
+            })
+            .expect("promote pending connect via state change");
+
+        service
+            .spawn_app_on_worker(1, {
+                let app = app.clone();
+                move || async move {
+                    let backend = app.local_backend_for_flow(flow).expect("flow backend");
+                    let mut future = std::pin::pin!(backend.next_cqe_descriptor());
+                    let waker = Waker::noop();
+                    let mut cx = Context::from_waker(waker);
+                    let observed = match future.as_mut().poll(&mut cx) {
+                        Poll::Ready(descriptor) => {
+                            descriptor.map(|descriptor| descriptor.payload())
+                        }
+                        Poll::Pending => None,
+                    };
+                    tx.send(observed).expect("send observed cqe");
+                }
+            })
+            .expect("spawn cqe probe");
+
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("receive observed cqe"),
+            None,
+            "active connect establishment updates TCP state, not app ring completions"
+        );
+        assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
 
         service.close().expect("close service");
     }
