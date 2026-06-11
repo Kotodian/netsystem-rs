@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
-    NodeRuntimeData, NodeVectorDispatch,
+    BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, NextFrame, Node, NodeId, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId, TcpSeq, TcpState};
@@ -16,6 +16,13 @@ use super::connection::{
     default_established_snapshot_handle,
 };
 use super::input::{mark_pending_tcp_app_ingress, take_pending_tcp_app_ingress};
+
+// Established receive keeps only a small per-worker reorder table: at most 64
+// active connections and 7 buffered payload segments per connection. One gap
+// fill can therefore expand into at most 8 app deliveries, matching the node
+// runtime's fixed next-frame fanout while avoiding unbounded hot-path growth.
+const TCP_ESTABLISHED_REORDER_CONNECTION_CAP: usize = 64;
+const TCP_ESTABLISHED_REORDER_SEGMENT_CAP: usize = 7;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -60,6 +67,8 @@ struct TcpEstablishedStateRuntime {
 thread_local! {
     static TCP_ESTABLISHED_RUNTIMES: RefCell<InfraVec<TcpEstablishedStateRuntime>> =
         const { RefCell::new(InfraVec::new()) };
+    static TCP_ESTABLISHED_REORDER: RefCell<TcpEstablishedReorderStore> =
+        RefCell::new(TcpEstablishedReorderStore::new());
 }
 
 #[inline]
@@ -169,20 +178,14 @@ impl Node for TcpEstablishedNode {
         )?;
         let next = Self::runtime_nexts(runtime)?;
         let rcv_process = next[TcpEstablishedNext::RcvProcess as usize];
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+        let result = tcp_established_route_frame(
             runtime,
             frame,
-            |index| {
-                tcp_established_next_for_index(
-                    runtime,
-                    index,
-                    rcv_process,
-                    &self.snapshot,
-                    self.backend.as_deref(),
-                )
-            },
+            rcv_process,
+            &self.snapshot,
+            self.backend.as_deref(),
         )?;
-        self.cached_next = cached_next;
+        self.cached_next = Some(rcv_process);
         Ok(result)
     }
 
@@ -210,37 +213,215 @@ fn tcp_established_process(
     let state = tcp_established_runtime(data)?;
     let next = TcpEstablishedNode::runtime_nexts(runtime)?;
     let rcv_process = next[TcpEstablishedNext::RcvProcess as usize];
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        tcp_established_next_for_index(
-            runtime,
-            index,
-            rcv_process,
-            &state.snapshot,
-            state.backend.as_deref(),
-        )
-    })?;
-    Ok(result)
+    tcp_established_route_frame(
+        runtime,
+        frame,
+        rcv_process,
+        &state.snapshot,
+        state.backend.as_deref(),
+    )
 }
 
-fn tcp_established_next_for_index(
+fn tcp_established_route_frame(
     runtime: &DataPlaneRuntime,
-    index: BufferIndex,
+    frame: &mut BufferFrame,
     rcv_process: NodeId,
     snapshot: &TcpEstablishedSnapshotHandle,
     backend: Option<&dyn TcpEstablishedBackend>,
-) -> CoreResult<Option<NodeId>> {
+) -> CoreResult<NodeResult> {
+    let original = frame.drain_pending().collect::<std::vec::Vec<_>>();
+    let mut output = TcpEstablishedRouteOutput::new(rcv_process);
+    for (offset, index) in original.iter().copied().enumerate() {
+        let action = match tcp_established_action_for_index(runtime, index, snapshot, backend) {
+            Ok(action) => action,
+            Err(err) => {
+                output.free(runtime);
+                runtime.free_index(index);
+                tcp_established_free_route_tail(runtime, &original, offset + 1);
+                return Err(err);
+            }
+        };
+        match action {
+            TcpEstablishedAction::Deliver {
+                connection_id,
+                segments,
+            } => {
+                for (segment_offset, segment) in segments.iter().copied().enumerate() {
+                    if let Err(err) = output.push_delivery(runtime, frame, segment, connection_id) {
+                        runtime.free_index(segment.index);
+                        tcp_established_free_deliveries(runtime, &segments, segment_offset + 1);
+                        output.free(runtime);
+                        tcp_established_free_route_tail(runtime, &original, offset + 1);
+                        return Err(err);
+                    }
+                }
+            }
+            TcpEstablishedAction::Consumed => {}
+            TcpEstablishedAction::Drop => runtime.free_index(index),
+            TcpEstablishedAction::PassThrough => {
+                if let Err(err) = output.push_index(runtime, frame, index) {
+                    output.free(runtime);
+                    runtime.free_index(index);
+                    tcp_established_free_route_tail(runtime, &original, offset + 1);
+                    return Err(err);
+                }
+            }
+        }
+    }
+    output.result(frame)
+}
+
+fn tcp_established_free_route_tail(
+    runtime: &DataPlaneRuntime,
+    indices: &[BufferIndex],
+    start: usize,
+) {
+    for index in indices[start.min(indices.len())..].iter().copied() {
+        runtime.free_index(index);
+    }
+}
+
+fn tcp_established_free_deliveries(
+    runtime: &DataPlaneRuntime,
+    deliveries: &[TcpEstablishedDelivery],
+    start: usize,
+) {
+    for delivery in deliveries[start.min(deliveries.len())..].iter().copied() {
+        runtime.free_index(delivery.index);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TcpEstablishedAction {
+    PassThrough,
+    Deliver {
+        connection_id: TcpLookupId,
+        segments: std::vec::Vec<TcpEstablishedDelivery>,
+    },
+    Consumed,
+    Drop,
+}
+
+struct TcpEstablishedRouteOutput {
+    rcv_process: NodeId,
+    frames: std::vec::Vec<FrameIndex>,
+}
+
+impl TcpEstablishedRouteOutput {
+    #[inline]
+    fn new(rcv_process: NodeId) -> Self {
+        Self {
+            rcv_process,
+            frames: std::vec::Vec::new(),
+        }
+    }
+
+    fn push_delivery(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        segment: TcpEstablishedDelivery,
+        connection_id: TcpLookupId,
+    ) -> CoreResult<()> {
+        let target = self.ensure_target(runtime, frame)?;
+        mark_pending_tcp_app_ingress(segment.index, connection_id, segment.fin)?;
+        self.push_index_to_target(runtime, frame, target, segment.index)
+    }
+
+    fn push_index(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        let target = self.ensure_target(runtime, frame)?;
+        self.push_index_to_target(runtime, frame, target, index)
+    }
+
+    fn ensure_target(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &BufferFrame,
+    ) -> CoreResult<TcpEstablishedRouteTarget> {
+        if frame.remaining_capacity() != 0 {
+            return Ok(TcpEstablishedRouteTarget::Current);
+        }
+        let frame_index = runtime.alloc_frame_index()?;
+        self.frames.push(frame_index);
+        Ok(TcpEstablishedRouteTarget::Extra(frame_index))
+    }
+
+    fn push_index_to_target(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+        target: TcpEstablishedRouteTarget,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        match target {
+            TcpEstablishedRouteTarget::Current => frame.push_index(index),
+            TcpEstablishedRouteTarget::Extra(frame_index) => {
+                runtime.get_frame_mut(frame_index)?.push_index(index)
+            }
+        }
+    }
+
+    fn result(self, frame: &BufferFrame) -> CoreResult<NodeResult> {
+        if frame.has_pending() && self.frames.is_empty() {
+            return Ok(NodeResult::next_current(self.rcv_process));
+        }
+        let mut nexts =
+            std::vec::Vec::with_capacity(usize::from(frame.has_pending()) + self.frames.len());
+        if frame.has_pending() {
+            nexts.push(NextFrame::Current(self.rcv_process));
+        }
+        for frame in self.frames {
+            nexts.push(NextFrame::Frame {
+                node: self.rcv_process,
+                frame,
+            });
+        }
+        NodeResult::try_next_frames(nexts)
+    }
+
+    fn free(&mut self, runtime: &DataPlaneRuntime) {
+        for frame in self.frames.drain(..) {
+            let _ = runtime.free_frame_index(frame);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpEstablishedRouteTarget {
+    Current,
+    Extra(FrameIndex),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpEstablishedDelivery {
+    index: BufferIndex,
+    fin: bool,
+}
+
+fn tcp_established_action_for_index(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    snapshot: &TcpEstablishedSnapshotHandle,
+    backend: Option<&dyn TcpEstablishedBackend>,
+) -> CoreResult<TcpEstablishedAction> {
     let Some(pending) = take_pending_tcp_app_ingress(index)? else {
-        return Ok(Some(rcv_process));
+        return Ok(TcpEstablishedAction::PassThrough);
     };
     let connection = snapshot.connection(pending.connection_id);
     let connection_state = connection.map(|connection| connection.state);
     let segment = tcp_observed_segment(runtime, index)?;
     if !tcp_segment_is_sequence_acceptable(connection, segment) {
-        return Ok(Some(rcv_process));
+        return Ok(TcpEstablishedAction::Drop);
     }
     let ack_validation = tcp_validate_acknowledgment(connection, segment);
     let ack_state_transition = tcp_state_after_remote_ack(connection_state, ack_validation);
     if segment.rst() {
+        tcp_established_reorder_remove_connection(pending.connection_id, runtime)?;
         snapshot.apply_receive_progress(
             pending.connection_id,
             TcpReceiveProgress {
@@ -262,13 +443,13 @@ fn tcp_established_next_for_index(
             backend.observe_close(observation)?;
         }
         runtime.free_index(index);
-        return Ok(None);
+        return Ok(TcpEstablishedAction::Consumed);
     }
     if segment.syn() {
-        return Ok(Some(rcv_process));
+        return Ok(TcpEstablishedAction::Drop);
     }
     if ack_validation.is_invalid() {
-        return Ok(Some(rcv_process));
+        return Ok(TcpEstablishedAction::Drop);
     }
     let starts_at_receive_next = tcp_segment_starts_at_receive_next(connection, segment);
     let next_state = tcp_state_after_receive_segment(
@@ -287,11 +468,60 @@ fn tcp_established_next_for_index(
     let should_apply_progress = deliver_to_app
         || next_state.is_some()
         || ack_validation.accepted_acknowledgment().is_some();
-    if !should_apply_progress {
-        return Ok(Some(rcv_process));
+    if tcp_segment_can_buffer_out_of_order(
+        connection,
+        connection_state,
+        segment,
+        ack_validation,
+        starts_at_receive_next,
+    ) {
+        tcp_established_reorder_buffer_segment(pending.connection_id, index, segment, runtime)?;
+        if should_apply_progress {
+            snapshot.apply_receive_progress(
+                pending.connection_id,
+                TcpReceiveProgress {
+                    state: next_state,
+                    sequence: segment.sequence,
+                    acknowledgment: ack_validation.accepted_acknowledgment(),
+                    advertised_window: segment.advertised_window,
+                    next_receive_sequence: None,
+                },
+            );
+            if let Some(backend) = backend
+                && let Some(observation) = tcp_established_ack_observation(
+                    connection,
+                    ack_validation,
+                    segment.advertised_window,
+                    ack_state_transition,
+                )
+            {
+                backend.observe_ack_progress(observation)?;
+            }
+        }
+        return Ok(TcpEstablishedAction::Consumed);
     }
-    if deliver_to_app {
-        mark_pending_tcp_app_ingress(index, pending.connection_id, segment.fin())?;
+    if !should_apply_progress {
+        runtime.free_index(index);
+        return Ok(TcpEstablishedAction::Consumed);
+    }
+    let mut next_receive_sequence = if deliver_to_app {
+        segment.next_receive_sequence()
+    } else {
+        None
+    };
+    let delivered_buffered = if deliver_to_app && !segment.fin() {
+        let receive_next_after_segment =
+            next_receive_sequence.expect("deliverable TCP segment advances receive sequence");
+        tcp_established_reorder_take_contiguous(
+            pending.connection_id,
+            receive_next_after_segment,
+            runtime,
+        )?
+    } else {
+        std::vec::Vec::new()
+    };
+    if let Some(last) = delivered_buffered.last() {
+        next_receive_sequence = Some(last.end_sequence);
     }
     snapshot.apply_receive_progress(
         pending.connection_id,
@@ -300,11 +530,7 @@ fn tcp_established_next_for_index(
             sequence: segment.sequence,
             acknowledgment: ack_validation.accepted_acknowledgment(),
             advertised_window: segment.advertised_window,
-            next_receive_sequence: if deliver_to_app {
-                segment.next_receive_sequence()
-            } else {
-                None
-            },
+            next_receive_sequence,
         },
     );
     if let Some(backend) = backend
@@ -335,7 +561,30 @@ fn tcp_established_next_for_index(
             backend.observe_close(observation)?;
         }
     }
-    Ok(Some(rcv_process))
+    if deliver_to_app && segment.fin() {
+        tcp_established_reorder_remove_connection(pending.connection_id, runtime)?;
+    }
+    Ok(if deliver_to_app {
+        let mut segments = std::vec::Vec::with_capacity(1 + delivered_buffered.len());
+        segments.push(TcpEstablishedDelivery {
+            index,
+            fin: segment.fin(),
+        });
+        segments.extend(
+            delivered_buffered
+                .into_iter()
+                .map(TcpEstablishedBufferedSegment::into_delivery),
+        );
+        TcpEstablishedAction::Deliver {
+            connection_id: pending.connection_id,
+            segments,
+        }
+    } else if segment.fin() || segment.has_payload() {
+        runtime.free_index(index);
+        TcpEstablishedAction::Consumed
+    } else {
+        TcpEstablishedAction::PassThrough
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,6 +864,240 @@ fn tcp_connection_has_initialized_send_state(connection: TcpConnectionSnapshot) 
 #[inline]
 fn tcp_sequence_in_window(sequence: u32, window_start: u32, window_len: u32) -> bool {
     TcpSeq::new(window_start).distance_to(TcpSeq::new(sequence)) < window_len
+}
+
+#[derive(Debug)]
+struct TcpEstablishedReorderStore {
+    connections: std::vec::Vec<TcpEstablishedReorderConnection>,
+}
+
+impl TcpEstablishedReorderStore {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            connections: std::vec::Vec::with_capacity(TCP_ESTABLISHED_REORDER_CONNECTION_CAP),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        connection_id: TcpLookupId,
+        segment: TcpEstablishedBufferedSegment,
+        runtime: &DataPlaneRuntime,
+    ) {
+        if let Some(connection) = self.connection_mut(connection_id) {
+            connection.insert(segment, runtime);
+            return;
+        }
+        if self.connections.len() == TCP_ESTABLISHED_REORDER_CONNECTION_CAP {
+            let mut removed = self.connections.remove(0);
+            removed.free(runtime);
+        }
+        let mut connection = TcpEstablishedReorderConnection::new(connection_id);
+        connection.insert(segment, runtime);
+        self.connections.push(connection);
+    }
+
+    fn take_contiguous(
+        &mut self,
+        connection_id: TcpLookupId,
+        receive_next: u32,
+    ) -> std::vec::Vec<TcpEstablishedBufferedSegment> {
+        let Some(position) = self.position(connection_id) else {
+            return std::vec::Vec::new();
+        };
+        let delivered = self.connections[position].take_contiguous(receive_next);
+        if self.connections[position].segments.is_empty() {
+            self.connections.remove(position);
+        }
+        delivered
+    }
+
+    fn remove_connection(&mut self, connection_id: TcpLookupId, runtime: &DataPlaneRuntime) {
+        let Some(position) = self.position(connection_id) else {
+            return;
+        };
+        let mut removed = self.connections.remove(position);
+        removed.free(runtime);
+    }
+
+    #[inline]
+    fn position(&self, connection_id: TcpLookupId) -> Option<usize> {
+        self.connections
+            .iter()
+            .position(|connection| connection.connection_id == connection_id)
+    }
+
+    #[inline]
+    fn connection_mut(
+        &mut self,
+        connection_id: TcpLookupId,
+    ) -> Option<&mut TcpEstablishedReorderConnection> {
+        self.connections
+            .iter_mut()
+            .find(|connection| connection.connection_id == connection_id)
+    }
+}
+
+#[derive(Debug)]
+struct TcpEstablishedReorderConnection {
+    connection_id: TcpLookupId,
+    segments: std::vec::Vec<TcpEstablishedBufferedSegment>,
+}
+
+impl TcpEstablishedReorderConnection {
+    #[inline]
+    fn new(connection_id: TcpLookupId) -> Self {
+        Self {
+            connection_id,
+            segments: std::vec::Vec::with_capacity(TCP_ESTABLISHED_REORDER_SEGMENT_CAP),
+        }
+    }
+
+    fn insert(&mut self, segment: TcpEstablishedBufferedSegment, runtime: &DataPlaneRuntime) {
+        let mut insert_at = self.segments.len();
+        let mut replace_at = None;
+        for (offset, existing) in self.segments.iter().enumerate() {
+            if existing.start_sequence == segment.start_sequence {
+                replace_at = Some(offset);
+                break;
+            }
+            if TcpSeq::new(segment.start_sequence).before(TcpSeq::new(existing.start_sequence)) {
+                insert_at = offset;
+                break;
+            }
+        }
+        if let Some(offset) = replace_at {
+            let replaced = self.segments.remove(offset);
+            runtime.free_index(replaced.index);
+            insert_at = offset;
+        } else if self.segments.len() == TCP_ESTABLISHED_REORDER_SEGMENT_CAP {
+            if insert_at == self.segments.len() {
+                runtime.free_index(segment.index);
+                return;
+            }
+            let evicted = self
+                .segments
+                .pop()
+                .expect("reorder segment cap reached with non-empty table");
+            runtime.free_index(evicted.index);
+        }
+        self.segments.insert(insert_at, segment);
+    }
+
+    fn take_contiguous(
+        &mut self,
+        receive_next: u32,
+    ) -> std::vec::Vec<TcpEstablishedBufferedSegment> {
+        let mut delivered = std::vec::Vec::new();
+        let mut current = receive_next;
+        while let Some(segment) = self.segments.first().copied() {
+            if segment.start_sequence != current {
+                break;
+            }
+            let segment = self.segments.remove(0);
+            current = segment.end_sequence;
+            delivered.push(segment);
+        }
+        delivered
+    }
+
+    fn free(&mut self, runtime: &DataPlaneRuntime) {
+        for segment in self.segments.drain(..) {
+            runtime.free_index(segment.index);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpEstablishedBufferedSegment {
+    index: BufferIndex,
+    start_sequence: u32,
+    end_sequence: u32,
+    fin: bool,
+}
+
+impl TcpEstablishedBufferedSegment {
+    #[inline]
+    fn into_delivery(self) -> TcpEstablishedDelivery {
+        TcpEstablishedDelivery {
+            index: self.index,
+            fin: self.fin,
+        }
+    }
+}
+
+#[inline]
+fn tcp_segment_can_buffer_out_of_order(
+    connection: Option<TcpConnectionSnapshot>,
+    state: Option<TcpState>,
+    segment: TcpObservedSegment,
+    acknowledgment: TcpAckValidation,
+    starts_at_receive_next: bool,
+) -> bool {
+    connection.is_some()
+        && !starts_at_receive_next
+        && segment.has_payload()
+        && !segment.fin()
+        && acknowledgment.is_accepted()
+        && state.is_none_or(tcp_state_allows_app_delivery)
+}
+
+fn tcp_established_reorder_buffer_segment(
+    connection_id: TcpLookupId,
+    index: BufferIndex,
+    segment: TcpObservedSegment,
+    runtime: &DataPlaneRuntime,
+) -> CoreResult<()> {
+    let Some(end_sequence) = segment.next_receive_sequence() else {
+        return Ok(());
+    };
+    TCP_ESTABLISHED_REORDER.with(|store| {
+        store
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP established reorder store borrowed"))?
+            .insert(
+                connection_id,
+                TcpEstablishedBufferedSegment {
+                    index,
+                    start_sequence: segment.sequence,
+                    end_sequence,
+                    fin: segment.fin(),
+                },
+                runtime,
+            );
+        Ok(())
+    })
+}
+
+fn tcp_established_reorder_take_contiguous(
+    connection_id: TcpLookupId,
+    receive_next: u32,
+    runtime: &DataPlaneRuntime,
+) -> CoreResult<std::vec::Vec<TcpEstablishedBufferedSegment>> {
+    let delivered = TCP_ESTABLISHED_REORDER.with(|store| {
+        Ok(store
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP established reorder store borrowed"))?
+            .take_contiguous(connection_id, receive_next))
+    })?;
+    for segment in &delivered {
+        runtime.prefetch_read(segment.index);
+    }
+    Ok(delivered)
+}
+
+fn tcp_established_reorder_remove_connection(
+    connection_id: TcpLookupId,
+    runtime: &DataPlaneRuntime,
+) -> CoreResult<()> {
+    TCP_ESTABLISHED_REORDER.with(|store| {
+        store
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("TCP established reorder store borrowed"))?
+            .remove_connection(connection_id, runtime);
+        Ok(())
+    })
 }
 
 #[inline]
@@ -1218,7 +1701,7 @@ mod tests {
                     .schedule_frame(established, frame)
                     .expect("schedule")
             );
-            assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+            assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
         }
 
         assert!(backend.ack_observations.lock().unwrap().is_empty());
@@ -1360,7 +1843,7 @@ mod tests {
                 .expect("schedule")
         );
 
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
         assert!(
             capture_state.lock().unwrap().packets.is_empty(),
             "close-wait FIN retransmits must not be delivered as repeated app EOF"
@@ -1425,7 +1908,7 @@ mod tests {
                 .expect("schedule")
         );
 
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
         assert!(
             capture_state.lock().unwrap().packets.is_empty(),
             "out-of-order payload must not be delivered to the app"
@@ -1435,6 +1918,141 @@ mod tests {
             .expect("snapshot after out-of-order payload");
         assert_eq!(snapshot.state, TcpState::Established);
         assert_eq!(snapshot.rcv_nxt, 0x0102_0304);
+        assert_eq!(runtime.frames_in_use(), 0);
+        assert_eq!(runtime.in_use_buffers(), 1);
+
+        let reset = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 95),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 95),
+            local.port(),
+            0x0102_0304,
+            0x1020_3040,
+            0x4000,
+            tcp_flags(false, false, true, true),
+            b"",
+        );
+        let reset_frame = runtime.alloc_frame_index().expect("alloc reset frame");
+        let reset_buffer = push_packet(&runtime, reset_frame, &reset, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, reset_buffer, &reset);
+        mark_pending_tcp_app_ingress(reset_buffer, LOOKUP_ID, false)
+            .expect("mark reset pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, reset_frame)
+                .expect("schedule reset")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run reset"), 1);
+        assert_eq!(runtime.frames_in_use(), 0);
+        assert_eq!(runtime.in_use_buffers(), 0);
+    }
+
+    #[test]
+    fn tcp_established_node_delivers_buffered_out_of_order_payload_after_gap_arrives() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
+        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
+
+        let local: SocketAddr = "192.0.2.96:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.96:40096".parse().expect("remote");
+        let mut connections =
+            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+        connections.insert(TcpConnectionSnapshot {
+            lookup_id: LOOKUP_ID,
+            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
+            owner_worker: DataWorkerId::new(0),
+            state: TcpState::Established,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            iss: 0x1020_303f,
+            irs: 0x0102_0303,
+            snd_una: 0x1020_3040,
+            snd_nxt: 0x1020_3048,
+            snd_wnd: 0x4000,
+            rcv_nxt: 0x0102_0304,
+            rcv_wnd: u16::MAX as u32,
+        });
+        control
+            .publish_connections(connections.publish_snapshot())
+            .expect("publish established connection snapshot");
+        let established = runtime.nodes().register_internal(control.node());
+
+        let late = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 96),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 96),
+            local.port(),
+            0x0102_0308,
+            0x1020_3040,
+            0x4000,
+            tcp_flags(false, false, false, true),
+            b"late",
+        );
+        let late_frame = runtime.alloc_frame_index().expect("alloc late frame");
+        let late_buffer = push_packet(&runtime, late_frame, &late, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, late_buffer, &late);
+        mark_pending_tcp_app_ingress(late_buffer, LOOKUP_ID, false)
+            .expect("mark late pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, late_frame)
+                .expect("schedule late")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run late packet"), 1);
+        assert!(
+            capture_state.lock().unwrap().packets.is_empty(),
+            "out-of-order payload must wait for the missing gap"
+        );
+        assert_eq!(
+            control
+                .connection_snapshot_for_test(LOOKUP_ID)
+                .expect("snapshot after late payload")
+                .rcv_nxt,
+            0x0102_0304
+        );
+        assert_eq!(runtime.in_use_buffers(), 1);
+
+        let gap = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 96),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 96),
+            local.port(),
+            0x0102_0304,
+            0x1020_3040,
+            0x4000,
+            tcp_flags(false, false, false, true),
+            b"gap!",
+        );
+        let gap_frame = runtime.alloc_frame_index().expect("alloc gap frame");
+        let gap_buffer = push_packet(&runtime, gap_frame, &gap, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, gap_buffer, &gap);
+        mark_pending_tcp_app_ingress(gap_buffer, LOOKUP_ID, false)
+            .expect("mark gap pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, gap_frame)
+                .expect("schedule gap")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run gap packet"), 2);
+        let captured = capture_state.lock().unwrap().packets.clone();
+        assert_eq!(captured, vec![gap, late]);
+        assert_eq!(
+            control
+                .connection_snapshot_for_test(LOOKUP_ID)
+                .expect("snapshot after gap fill")
+                .rcv_nxt,
+            0x0102_030c
+        );
         assert_eq!(runtime.frames_in_use(), 0);
         assert_eq!(runtime.in_use_buffers(), 0);
     }

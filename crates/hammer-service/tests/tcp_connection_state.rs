@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, RouteMetadata};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
-use hammer_service::transport::tcp::congestion::{TcpCongestionAckSample, TcpCongestionControl};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpState};
+use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpConnectionTable,
     TcpDataPlaneConnection, TcpLookupId, TcpOutputSegment,
@@ -49,7 +49,7 @@ fn output_segment(lookup_id: TcpLookupId, connection_id: TcpConnectionId) -> Tcp
     }
 }
 
-fn acknowledge<C: TcpCongestionControl>(control: &mut C, now: Instant) {
+fn acknowledge(control: &mut hammer_service::transport::tcp::TcpCongestionState, now: Instant) {
     control.on_ack(TcpCongestionAckSample {
         bytes_acked: TEST_SEGMENT_LEN,
         rtt: Duration::from_millis(20),
@@ -96,7 +96,7 @@ fn tcp_data_plane_connections_own_independent_congestion_state() {
 }
 
 #[test]
-fn tcp_data_plane_connection_exposes_trait_backed_congestion_control() {
+fn tcp_data_plane_connection_exposes_owned_congestion_control() {
     let now = Instant::now();
     let mut connection = connection(3, TcpConnectionId::new(3), 50_003);
 
@@ -124,6 +124,86 @@ fn tcp_data_plane_connection_output_view_uses_owned_congestion_window() {
         view.congestion_window,
         connection.congestion().congestion_window()
     );
+}
+
+#[test]
+fn tcp_data_plane_connections_negotiate_tcp_options_independently() {
+    let mut first = connection(5, TcpConnectionId::new(5), 50_005);
+    let mut second = connection(6, TcpConnectionId::new(6), 50_006);
+
+    first.set_local_capabilities(TcpCapabilities {
+        window_scale: Some(4),
+        sack: true,
+        timestamps: true,
+        ecn: true,
+        ..TcpCapabilities::default()
+    });
+    second.set_local_capabilities(TcpCapabilities {
+        window_scale: Some(1),
+        sack: false,
+        timestamps: true,
+        ecn: true,
+        ..TcpCapabilities::default()
+    });
+
+    let first_remote = TcpCapabilities {
+        window_scale: Some(6),
+        sack: true,
+        timestamps: true,
+        ecn: false,
+        ..TcpCapabilities::default()
+    };
+    let second_remote = TcpCapabilities {
+        window_scale: Some(12),
+        sack: true,
+        timestamps: false,
+        ecn: true,
+        ..TcpCapabilities::default()
+    };
+
+    let first_negotiated = first.apply_peer_handshake_capabilities(first_remote);
+    let second_negotiated = second.apply_peer_handshake_capabilities(second_remote);
+
+    assert_eq!(first.remote_capabilities(), Some(first_remote));
+    assert_eq!(second.remote_capabilities(), Some(second_remote));
+    assert_eq!(first.effective_send_window_scale(), 6);
+    assert_eq!(first.effective_receive_window_scale(), 4);
+    assert_eq!(second.effective_send_window_scale(), 12);
+    assert_eq!(second.effective_receive_window_scale(), 1);
+    assert!(first_negotiated.sack);
+    assert!(first_negotiated.timestamps);
+    assert!(!first_negotiated.ecn);
+    assert!(!second_negotiated.sack);
+    assert!(!second_negotiated.timestamps);
+    assert!(second_negotiated.ecn);
+    assert_eq!(first.negotiated_options(), first_negotiated);
+    assert_eq!(second.negotiated_options(), second_negotiated);
+}
+
+#[test]
+fn tcp_data_plane_connection_scales_advertised_windows_safely() {
+    let mut connection = connection(7, TcpConnectionId::new(7), 50_007);
+    connection.set_local_capabilities(TcpCapabilities {
+        window_scale: Some(20),
+        ..TcpCapabilities::default()
+    });
+    connection.apply_peer_handshake_capabilities(TcpCapabilities {
+        window_scale: Some(20),
+        ..TcpCapabilities::default()
+    });
+
+    assert_eq!(connection.effective_send_window_scale(), 14);
+    assert_eq!(connection.effective_receive_window_scale(), 14);
+    assert_eq!(
+        connection.effective_send_window(u32::from(u16::MAX)),
+        u32::from(u16::MAX) << 14
+    );
+    assert_eq!(connection.effective_send_window(u32::MAX), u32::MAX);
+    assert_eq!(
+        connection.advertised_receive_window(u32::from(u16::MAX) << 14),
+        u16::MAX
+    );
+    assert_eq!(connection.advertised_receive_window(u32::MAX), u16::MAX);
 }
 
 #[test]

@@ -7,7 +7,7 @@ use hammer_core::protocol::tcp::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TcpCongestionAlgorithm {
-    Bbr,
+    Hammer,
     Cubic,
     Reno,
 }
@@ -34,7 +34,7 @@ impl TcpCongestionRegistry {
         algorithm: Option<TcpCongestionAlgorithm>,
     ) -> HammerResult<TcpCongestionAlgorithm> {
         let selected = algorithm.unwrap_or(self.default_algorithm);
-        if !matches!(selected, TcpCongestionAlgorithm::Bbr) {
+        if !matches!(selected, TcpCongestionAlgorithm::Hammer) {
             return Err(HammerError::config_validation(format!(
                 "tcp congestion algorithm {selected:?} is not implemented in Hammer TCP nodes; only the Hammer-owned congestion controller is currently supported"
             )));
@@ -45,7 +45,7 @@ impl TcpCongestionRegistry {
 
 impl Default for TcpCongestionRegistry {
     fn default() -> Self {
-        Self::new(TcpCongestionAlgorithm::Bbr)
+        Self::new(TcpCongestionAlgorithm::Hammer)
     }
 }
 
@@ -283,15 +283,11 @@ impl Default for TcpDispatchTable {
         );
         table.set(
             TcpState::Established,
-            TcpInputFlags::RST,
-            TcpDispatchEntry::new(TcpInputNext::Established, None),
-        );
-        table.set(
-            TcpState::Established,
             TcpInputFlags::FIN | TcpInputFlags::ACK,
             TcpDispatchEntry::new(TcpInputNext::Established, None),
         );
         let established = TcpDispatchEntry::new(TcpInputNext::Established, None);
+        table.set_row_when_contains(TcpState::Established, TcpInputFlags::RST, established);
         let rcv_process = TcpDispatchEntry::new(TcpInputNext::RcvProcess, None);
         for state in [TcpState::FinWait1, TcpState::FinWait2] {
             table.fill_row(state, rcv_process);

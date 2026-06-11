@@ -19,6 +19,21 @@ pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_PSH: u8 = 0x08;
 pub const TCP_FLAG_ACK: u8 = 0x10;
 
+#[inline]
+pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>) -> usize {
+    match peer_max_segment_size {
+        Some(max_segment_size) if max_segment_size != 0 => {
+            let max_segment_size = max_segment_size as usize;
+            if max_segment_size < DEFAULT_TCP_OUTPUT_PAYLOAD_LEN {
+                max_segment_size
+            } else {
+                DEFAULT_TCP_OUTPUT_PAYLOAD_LEN
+            }
+        }
+        _ => DEFAULT_TCP_OUTPUT_PAYLOAD_LEN,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpOutputSegment {
     pub lookup_id: TcpLookupId,
@@ -302,10 +317,20 @@ pub fn build_tcp_output_segment_with_flags(
     payload: &[u8],
     flags: u8,
 ) -> CoreResult<TcpOutputSegment> {
+    build_segment(snapshot, local, payload, flags)
+}
+
+fn build_segment(
+    snapshot: TcpConnectionSnapshot,
+    local: SocketAddr,
+    payload: &[u8],
+    flags: u8,
+) -> CoreResult<TcpOutputSegment> {
     let connection_id = snapshot
         .connection_id
         .ok_or_else(|| CoreError::internal("tcp output requires an installed connection id"))?;
     let remote = snapshot.remote;
+    validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload.len())?;
     let sequence = tcp_output_sequence(snapshot);
     let acknowledgment = tcp_output_acknowledgment(snapshot);
     let advertised_window = snapshot.rcv_wnd.min(u32::from(u16::MAX)) as u16;
@@ -357,6 +382,29 @@ pub fn build_tcp_output_segment_with_flags(
         },
         packet,
     })
+}
+
+fn validate_tcp_output_lengths(
+    source: IpAddr,
+    tcp_header_len: usize,
+    payload_len: usize,
+) -> CoreResult<()> {
+    let transport_len = tcp_header_len
+        .checked_add(payload_len)
+        .ok_or_else(|| CoreError::internal("tcp output segment length overflows"))?;
+    let packet_len = match source {
+        IpAddr::V4(_) => IPV4_HEADER_LEN
+            .checked_add(transport_len)
+            .ok_or_else(|| CoreError::internal("tcp output ipv4 packet length overflows"))?,
+        IpAddr::V6(_) => transport_len,
+    };
+    if packet_len > usize::from(u16::MAX) {
+        return Err(CoreError::internal(format!(
+            "tcp output packet exceeds wire length field: len={packet_len}"
+        )));
+    }
+
+    Ok(())
 }
 
 #[inline]
@@ -486,10 +534,10 @@ fn write_tcp_segment(
     out[2..4].copy_from_slice(&destination_port.to_be_bytes());
     out[4..8].copy_from_slice(&sequence.to_be_bytes());
     out[8..12].copy_from_slice(&acknowledgment.to_be_bytes());
-    out[12] = 0x50;
+    out[12] = ((TCP_HEADER_LEN / 4) as u8) << 4;
     out[13] = flags;
     out[14..16].copy_from_slice(&advertised_window.to_be_bytes());
-    out[20..20 + payload.len()].copy_from_slice(payload);
+    out[TCP_HEADER_LEN..TCP_HEADER_LEN + payload.len()].copy_from_slice(payload);
 }
 
 fn ipv4_l4_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {

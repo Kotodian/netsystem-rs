@@ -19,7 +19,7 @@ fn tcp_remote_fin_transitions_established_flow_to_close_wait_once() {
     let result = run_fin_delivery_case(TcpState::Established, 41);
 
     assert_eq!(result.first_run_count, 4);
-    assert_eq!(result.second_run_count, 4);
+    assert_eq!(result.second_run_count, 2);
     assert_eq!(result.state_after_first, Some(TcpState::CloseWait));
     assert_eq!(result.state_after_second, Some(TcpState::CloseWait));
     assert_snapshot_progress(
@@ -70,7 +70,7 @@ fn tcp_remote_fin_with_partial_ack_transitions_fin_wait1_to_closing_once() {
     let result = run_snapshot_packet_case(snapshot, packet, octet);
 
     assert_eq!(result.first_run_count, 4);
-    assert_eq!(result.second_run_count, 4);
+    assert_eq!(result.second_run_count, 2);
     assert_eq!(result.state_after_first, Some(TcpState::Closing));
     assert_eq!(result.state_after_second, Some(TcpState::Closing));
     assert_snapshot_progress_with_ack(
@@ -98,7 +98,7 @@ fn tcp_remote_fin_transitions_fin_wait2_to_time_wait_once() {
     let result = run_fin_delivery_case(TcpState::FinWait2, 41);
 
     assert_eq!(result.first_run_count, 4);
-    assert_eq!(result.second_run_count, 4);
+    assert_eq!(result.second_run_count, 2);
     assert_eq!(result.state_after_first, Some(TcpState::TimeWait));
     assert_eq!(result.state_after_second, Some(TcpState::TimeWait));
     assert_snapshot_progress(
@@ -135,8 +135,8 @@ fn tcp_out_of_order_fin_does_not_transition_established_flow() {
     );
     let result = run_snapshot_packet_case(snapshot, packet, octet);
 
-    assert_eq!(result.first_run_count, 4);
-    assert_eq!(result.second_run_count, 4);
+    assert_eq!(result.first_run_count, 2);
+    assert_eq!(result.second_run_count, 2);
     assert_eq!(result.state_after_first, Some(TcpState::Established));
     assert_eq!(result.state_after_second, Some(TcpState::Established));
     assert_snapshot_progress_with_ack(
