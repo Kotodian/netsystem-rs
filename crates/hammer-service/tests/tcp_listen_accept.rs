@@ -174,12 +174,13 @@ fn tcp_listen_accept_recovers_socket_addrs_from_packet_when_route_metadata_is_mi
                         .expect("publish listener lookup");
                     let tcp_input = runtime.nodes().register_internal(tcp_control.node());
 
-                    let packet = ipv4_tcp_packet(
+                    let packet = ipv4_tcp_packet_with_options(
                         Ipv4Addr::new(198, 51, 100, 74),
                         40_743,
                         Ipv4Addr::new(127, 0, 0, 1),
                         7443,
                         tcp_flags(false, true, false, false),
+                        &[2, 4, 0x04, 0xc4, 3, 3, 7, 4, 2, 1, 1, 1],
                         b"accept",
                     );
                     let frame = runtime.alloc_frame_index().expect("alloc frame");
@@ -231,7 +232,13 @@ fn tcp_listen_accept_recovers_socket_addrs_from_packet_when_route_metadata_is_mi
                 Ipv4Addr::new(198, 51, 100, 74),
                 40_743,
             ),
-            capabilities: TcpCapabilities::default(),
+            capabilities: TcpCapabilities {
+                max_segment_size: Some(1_220),
+                window_scale: Some(7),
+                sack: true,
+                timestamps: false,
+                ecn: false,
+            },
         }]
     );
 
@@ -276,20 +283,24 @@ fn stamp_tcp_cursor(
         );
 }
 
-fn ipv4_tcp_packet(
+fn ipv4_tcp_packet_with_options(
     source: Ipv4Addr,
     source_port: u16,
     destination: Ipv4Addr,
     destination_port: u16,
     flags: u8,
+    options: &[u8],
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut packet = ipv4_packet(source, destination, 6, 20 + payload.len());
+    assert_eq!(options.len() % 4, 0, "TCP options must be 32-bit aligned");
+    let tcp_header_len = 20 + options.len();
+    let mut packet = ipv4_packet(source, destination, 6, tcp_header_len + payload.len());
     write_tcp_segment(
         &mut packet[20..],
         source_port,
         destination_port,
         flags,
+        options,
         payload,
     );
     let checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
@@ -321,13 +332,16 @@ fn write_tcp_segment(
     source_port: u16,
     destination_port: u16,
     flags: u8,
+    options: &[u8],
     payload: &[u8],
 ) {
+    let tcp_header_len = 20 + options.len();
     segment[0..2].copy_from_slice(&source_port.to_be_bytes());
     segment[2..4].copy_from_slice(&destination_port.to_be_bytes());
-    segment[12] = 0x50;
+    segment[12] = ((tcp_header_len / 4) as u8) << 4;
     segment[13] = flags;
-    segment[20..].copy_from_slice(payload);
+    segment[20..tcp_header_len].copy_from_slice(options);
+    segment[tcp_header_len..tcp_header_len + payload.len()].copy_from_slice(payload);
 }
 
 fn tcp_flags(fin: bool, syn: bool, rst: bool, ack: bool) -> u8 {

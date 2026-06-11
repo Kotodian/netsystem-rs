@@ -561,7 +561,7 @@ fn tcp_established_action_for_index(
             backend.observe_close(observation)?;
         }
     }
-    if deliver_to_app && segment.fin() {
+    if next_state == Some(TcpState::Closed) || (deliver_to_app && segment.fin()) {
         tcp_established_reorder_remove_connection(pending.connection_id, runtime)?;
     }
     Ok(if deliver_to_app {
@@ -2055,6 +2055,150 @@ mod tests {
         );
         assert_eq!(runtime.frames_in_use(), 0);
         assert_eq!(runtime.in_use_buffers(), 0);
+    }
+
+    #[test]
+    fn tcp_established_node_clears_reorder_buffer_on_ack_terminal_state() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
+        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
+        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
+            .with_backend(backend.clone());
+
+        let local: SocketAddr = "192.0.2.97:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.97:40097".parse().expect("remote");
+        let mut connections =
+            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+        connections.insert(TcpConnectionSnapshot {
+            lookup_id: LOOKUP_ID,
+            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
+            owner_worker: DataWorkerId::new(0),
+            state: TcpState::Established,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            iss: 0x1020_303f,
+            irs: 0x0102_0303,
+            snd_una: 0x1020_3040,
+            snd_nxt: 0x1020_3048,
+            snd_wnd: 0x4000,
+            rcv_nxt: 0x0102_0304,
+            rcv_wnd: u16::MAX as u32,
+        });
+        control
+            .publish_connections(connections.publish_snapshot())
+            .expect("publish established connection snapshot");
+        let established = runtime.nodes().register_internal(control.node());
+
+        let buffered = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 97),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 97),
+            local.port(),
+            0x0102_0308,
+            0x1020_3040,
+            0x4000,
+            tcp_flags(false, false, false, true),
+            b"late",
+        );
+        let buffered_frame = runtime.alloc_frame_index().expect("alloc buffered frame");
+        let buffered_index = push_packet(
+            &runtime,
+            buffered_frame,
+            &buffered,
+            tcp_metadata(remote, local),
+        );
+        stamp_tcp_cursor(&runtime, buffered_index, &buffered);
+        mark_pending_tcp_app_ingress(buffered_index, LOOKUP_ID, false)
+            .expect("mark buffered pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, buffered_frame)
+                .expect("schedule buffered")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run buffered"), 1);
+        assert_eq!(runtime.in_use_buffers(), 1);
+        backend
+            .ack_observations
+            .lock()
+            .expect("ack observations")
+            .clear();
+
+        let mut terminal_connections =
+            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+        terminal_connections.insert(TcpConnectionSnapshot {
+            lookup_id: LOOKUP_ID,
+            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
+            owner_worker: DataWorkerId::new(0),
+            state: TcpState::LastAck,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            iss: 0x1020_303f,
+            irs: 0x0102_0303,
+            snd_una: 0x1020_3040,
+            snd_nxt: 0x1020_3048,
+            snd_wnd: 0x4000,
+            rcv_nxt: 0x0102_0304,
+            rcv_wnd: u16::MAX as u32,
+        });
+        control
+            .publish_connections(terminal_connections.publish_snapshot())
+            .expect("publish last-ack connection snapshot");
+
+        let ack = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, 97),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, 97),
+            local.port(),
+            0x0102_0304,
+            0x1020_3048,
+            0x4000,
+            tcp_flags(false, false, false, true),
+            b"",
+        );
+        let ack_frame = runtime
+            .alloc_frame_index()
+            .expect("alloc terminal ack frame");
+        let ack_index = push_packet(&runtime, ack_frame, &ack, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, ack_index, &ack);
+        mark_pending_tcp_app_ingress(ack_index, LOOKUP_ID, false)
+            .expect("mark terminal ack pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, ack_frame)
+                .expect("schedule terminal ack")
+        );
+
+        assert_eq!(runtime.run_ready_nodes().expect("run terminal ack"), 2);
+        assert_eq!(
+            control.connection_state_for_test(LOOKUP_ID),
+            Some(TcpState::Closed)
+        );
+        assert_eq!(
+            *backend.ack_observations.lock().unwrap(),
+            vec![TcpEstablishedAckObservation {
+                lookup_id: LOOKUP_ID,
+                connection_id: TcpConnectionId::new(CONNECTION_ID),
+                accepted_acknowledgment: 0x1020_3048,
+                advertised_window: 0x4000,
+                previous_state: TcpState::LastAck,
+                ack_state_transition: Some(TcpState::Closed),
+                acknowledges_local_fin: true,
+            }]
+        );
+        assert_eq!(runtime.frames_in_use(), 0);
+        assert_eq!(
+            runtime.in_use_buffers(),
+            0,
+            "ACK-only terminal close must release buffered out-of-order payloads"
+        );
     }
 
     fn push_packet(
