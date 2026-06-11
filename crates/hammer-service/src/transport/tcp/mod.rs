@@ -20,7 +20,7 @@ pub use accept::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptNode, TcpAcceptRegistration,
 };
 pub use app::TcpAppIngress;
-pub use congestion::{TcpCongestionAckSample, TcpCongestionControl, TcpCongestionState};
+pub use congestion::{TcpCongestionAckSample, TcpCongestionState};
 pub use congestion_control::{
     TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
     TcpCongestionSendObservation,

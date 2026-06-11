@@ -7,33 +7,34 @@ use hammer_service::transport::tcp::{
 };
 
 #[test]
-fn tcp_connection_defaults_to_hammer_owned_bbr() {
-    let registry = TcpCongestionRegistry::new(TcpCongestionAlgorithm::Bbr);
+fn tcp_connection_defaults_to_hammer_owned_congestion_control() {
+    let registry = TcpCongestionRegistry::new(TcpCongestionAlgorithm::Hammer);
 
     assert_eq!(
         registry
             .selected_algorithm(None)
-            .expect("registry default bbr selection"),
+            .expect("registry default congestion control selection"),
         registry.default_algorithm()
     );
 
-    let connection = TcpConnectionState::new(&registry, None).expect("default bbr selection");
+    let connection =
+        TcpConnectionState::new(&registry, None).expect("default congestion control selection");
 
     assert_eq!(
         connection.selected_congestion_algorithm(),
-        TcpCongestionAlgorithm::Bbr
+        TcpCongestionAlgorithm::Hammer
     );
 }
 
 #[test]
-fn tcp_listener_config_builds_shared_install_listener_action_after_bbr_validation() {
+fn tcp_listener_config_builds_shared_install_listener_action_after_congestion_validation() {
     let registry = TcpCongestionRegistry::default();
     let listener_id = TcpListenerId::new(17);
     let listener = TcpListenerKey::v4(0, "192.0.2.10".parse().expect("listener addr"), 443);
 
     let action = TcpListenerConfig::new()
         .install_listener_action(&registry, listener_id, listener)
-        .expect("default listener config should install with BBR");
+        .expect("default listener config should install with congestion control");
 
     assert_eq!(
         action,
@@ -145,7 +146,7 @@ fn tcp_connection_state_builds_shared_install_connection_action() {
     );
 
     let action = TcpConnectionState::new(&registry, None)
-        .expect("default BBR connection state")
+        .expect("default congestion control connection state")
         .install_connection_action(connection_id, key, SharedTcpState::Established);
 
     assert_eq!(

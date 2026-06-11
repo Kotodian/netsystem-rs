@@ -179,11 +179,18 @@ fn tcp_in_window_out_of_order_payload_does_not_advance_receive_state() {
         tcp_flags(false, false, false, true),
         b"late",
     );
+    let reset = tcp_packet(
+        octet,
+        initial.rcv_nxt,
+        Some(initial.snd_una),
+        tcp_flags(false, false, true, true),
+        b"",
+    );
 
-    let result = run_receive_case(initial, &packet, octet);
+    let result = run_receive_cases(initial, &[(&packet, octet), (&reset, octet)]);
 
-    assert_eq!(result.state_after_packet, Some(TcpState::Established));
-    assert_eq!(result.snapshot_after_packet, initial);
+    assert_eq!(result.state_after_packet, Some(TcpState::Closed));
+    assert_eq!(result.snapshot_after_packet.rcv_nxt, initial.rcv_nxt);
 }
 
 #[test]
@@ -347,7 +354,7 @@ fn tcp_in_window_syn_does_not_advance_fin_wait1_or_update_window() {
 }
 
 #[test]
-fn tcp_in_window_out_of_order_payload_does_not_advance_receive_progress() {
+fn tcp_in_window_out_of_order_payload_advances_when_gap_arrives() {
     let octet = 71;
     let initial = established_snapshot(
         TcpState::Established,
@@ -365,11 +372,21 @@ fn tcp_in_window_out_of_order_payload_does_not_advance_receive_progress() {
         DEFAULT_WINDOW as u16,
         b"hole",
     );
+    let gap = tcp_packet_with_window(
+        octet,
+        initial.rcv_nxt,
+        Some(initial.snd_una),
+        tcp_flags(false, false, false, true),
+        DEFAULT_WINDOW as u16,
+        b"gap!",
+    );
 
-    let result = run_receive_case(initial, &packet, octet);
+    let result = run_receive_cases(initial, &[(&packet, octet), (&gap, octet)]);
 
     assert_eq!(result.state_after_packet, Some(TcpState::Established));
-    assert_eq!(result.snapshot_after_packet, initial);
+    assert_eq!(result.snapshot_after_packet.rcv_nxt, initial.rcv_nxt + 8);
+    assert_eq!(result.snapshot_after_packet.snd_una, initial.snd_una);
+    assert_eq!(result.snapshot_after_packet.snd_nxt, initial.snd_nxt);
 }
 
 #[derive(Debug)]
@@ -382,6 +399,13 @@ fn run_receive_case(
     initial_snapshot: TcpConnectionSnapshot,
     packet: &[u8],
     octet: u8,
+) -> ReceiveCaseResult {
+    run_receive_cases(initial_snapshot, &[(packet, octet)])
+}
+
+fn run_receive_cases(
+    initial_snapshot: TcpConnectionSnapshot,
+    packets: &[(&[u8], u8)],
 ) -> ReceiveCaseResult {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let drop = runtime.nodes().register_internal(DropNode::new());
@@ -400,10 +424,12 @@ fn run_receive_case(
         tcp_rcv_process,
         established_node,
         connections,
-        octet,
+        packets.first().map(|(_, octet)| *octet).unwrap_or_default(),
     );
 
-    schedule_tcp_packet(&runtime, tcp_input, packet, octet);
+    for (packet, octet) in packets {
+        schedule_tcp_packet(&runtime, tcp_input, packet, *octet);
+    }
 
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
