@@ -103,6 +103,14 @@ pub enum NodeKind {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum NodeState {
+    Disabled,
+    #[default]
+    Polling,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NodeRuntimeData {
     words: [u64; 4],
 }
@@ -441,6 +449,8 @@ impl NodeReadiness {
 
 struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
+    node_states: Vec<NodeState>,
+    interrupt_pending: Vec<bool>,
     error_counters: Vec<NodeErrorCounters>,
     runtime_stats: Vec<NodeRuntimeStats>,
     queue: VecDeque<ScheduledFrame>,
@@ -540,6 +550,8 @@ impl NodeRuntimeInner {
     fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
         self.nodes.push(slot);
+        self.node_states.push(NodeState::Polling);
+        self.interrupt_pending.push(false);
         self.error_counters.push(NodeErrorCounters::default());
         self.runtime_stats.push(NodeRuntimeStats::default());
         self.node_names.push(None);
@@ -685,6 +697,8 @@ impl Default for NodeRuntime {
         Self {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
                 nodes: Vec::new(),
+                node_states: Vec::new(),
+                interrupt_pending: Vec::new(),
                 error_counters: Vec::new(),
                 runtime_stats: Vec::new(),
                 queue: VecDeque::new(),
@@ -871,6 +885,55 @@ impl NodeRuntime {
     }
 
     #[inline]
+    pub fn node_kind(&self, node: NodeId) -> CoreResult<NodeKind> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.nodes[node.0 as usize].kind)
+    }
+
+    #[inline]
+    pub fn node_state(&self, node: NodeId) -> CoreResult<NodeState> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.node_states[node.0 as usize])
+    }
+
+    #[inline]
+    pub fn set_node_state(&self, node: NodeId, state: NodeState) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.node_states[node.0 as usize] = state;
+        Ok(())
+    }
+
+    pub(crate) fn mark_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        let slot = node.0 as usize;
+        if inner.nodes[slot].kind != NodeKind::Driver {
+            return Err(CoreError::internal("node is not a driver node"));
+        }
+        match inner.node_states[slot] {
+            NodeState::Disabled | NodeState::Polling => Ok(false),
+            NodeState::Interrupt => {
+                if inner.interrupt_pending[slot] {
+                    Ok(false)
+                } else {
+                    inner.interrupt_pending[slot] = true;
+                    Ok(true)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn clear_interrupt_pending(&self, node: NodeId) -> CoreResult<()> {
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        inner.interrupt_pending[node.0 as usize] = false;
+        Ok(())
+    }
+
+    #[inline]
     pub fn node_name(&self, node: NodeId) -> CoreResult<Option<&'static str>> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
@@ -990,10 +1053,16 @@ impl NodeRuntime {
         while let Some(scheduled) = self.pop_scheduled() {
             let slot = self.runtime_slot(scheduled.node)?;
             let mut frame = runtime.take_frame_index(scheduled.frame)?;
+            if self.node_state(scheduled.node)? == NodeState::Disabled {
+                self.clear_interrupt_pending(scheduled.node)?;
+                runtime.release_taken_frame_index(scheduled.frame, frame)?;
+                continue;
+            }
             if !scheduled.allow_empty && !frame.has_pending() {
                 runtime.release_taken_frame_index(scheduled.frame, frame)?;
                 continue;
             }
+            self.clear_interrupt_pending(scheduled.node)?;
 
             frame.clear_next_node();
             runtime.set_current_node(Some(scheduled.node));
