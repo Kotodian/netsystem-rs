@@ -59,17 +59,19 @@ use crate::transport::tcp::output::{
     tcp_effective_output_payload_len, tcp_output_decision,
 };
 use crate::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_SYN, TcpAcceptControlPlane, TcpAcceptNext,
-    TcpAcceptRegistration, TcpCongestionAckSample, TcpCongestionRegistry, TcpCongestionState,
-    TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpConnectionState,
-    TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedControlPlane,
-    TcpEstablishedNext, TcpEstablishedObservation, TcpInputControlPlane, TcpInputNext,
-    TcpListenerConfig, TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue,
-    TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue, TcpOutputSendView,
-    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpSynSentBackend, TcpSynSentControlPlane,
-    TcpSynSentNext, TcpSynSentObservation, TcpSynSentRegistration, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
-    TcpV6PendingConnectionKey,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_SYN, TcpAcceptControlPlane,
+    TcpAcceptNext, TcpAcceptRegistration, TcpCongestionAckSample, TcpCongestionRegistry,
+    TcpCongestionState, TcpConnectionSnapshot, TcpConnectionSnapshotPool, TcpConnectionState,
+    TcpControlFlags, TcpEstablishedAckObservation, TcpEstablishedBackend,
+    TcpEstablishedControlPlane, TcpEstablishedNext, TcpEstablishedObservation,
+    TcpInputControlPlane, TcpInputNext, TcpListenerConfig, TcpLookupId, TcpLookupKind,
+    TcpLookupSnapshot, TcpLookupValue, TcpOutputBackend, TcpOutputBackendSlot,
+    TcpOutputRetransmitQueue, TcpOutputSendView, TcpPassiveOpenObservation,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpReceiveAckObservation, TcpSynSentBackend,
+    TcpSynSentControlPlane, TcpSynSentNext, TcpSynSentObservation, TcpSynSentRegistration,
+    TcpV4ConnectionKey, TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey,
+    TcpV6ListenerKey, TcpV6PendingConnectionKey, emit_tcp_control_packet,
+    synthesize_ipv4_tcp_control, tcp_control_metadata,
 };
 use crate::transport::udp::input::UdpAppRegistration;
 use crate::transport::udp::{UdpInputControlPlane, UdpInputNext};
@@ -632,6 +634,16 @@ struct PromotePendingSynSentResult {
     ack_progress: Option<TcpEstablishedAckObservation>,
 }
 
+/// Fields needed to synthesize the `SYN-ACK` reply for a passive open.
+struct PassiveOpenSynAck {
+    local: SocketAddr,
+    remote: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    window: u16,
+    local_mss: u16,
+}
+
 impl TcpOutputSignalRegistry {
     fn signal(&self, flow: AppFlowId) -> Arc<Notify> {
         let notify = {
@@ -1110,6 +1122,125 @@ impl RuntimeAppControlState {
                 ))
             })?;
         self.handle_incoming_tcp_connection(listener_registration, remote, local, observation)
+    }
+
+    /// Register (or reuse) the half-open `SYN_RCVD` connection for a passive
+    /// open and return the data needed to emit its `SYN-ACK`. The final ACK is
+    /// promoted to `ESTABLISHED` later through the accept path
+    /// (`handle_incoming_tcp_connection`).
+    fn register_passive_open_connection(
+        &mut self,
+        observation: TcpPassiveOpenObservation,
+    ) -> HammerResult<Option<PassiveOpenSynAck>> {
+        let TcpPassiveOpenObservation {
+            listener_id,
+            local,
+            remote,
+            sequence,
+            next_sequence,
+            advertised_window,
+            capabilities,
+        } = observation;
+
+        let Some(listener_registration) = self
+            .tcp_listeners
+            .iter()
+            .find(|registration| registration.lookup_id == listener_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        // Reuse an existing half-open entry so a retransmitted SYN re-sends the
+        // same SYN-ACK instead of allocating a second connection.
+        if let Some(index) = self.tcp_connections.iter().position(|registration| {
+            registration.local == Some(local) && registration.remote == remote
+        }) {
+            let registration = self
+                .tcp_connections
+                .get(index)
+                .cloned()
+                .ok_or_else(|| HammerError::internal("tcp connection slot is invalid"))?;
+            if registration.state != hammer_core::protocol::tcp::TcpState::SynRcvd {
+                return Ok(None);
+            }
+            return Ok(Some(PassiveOpenSynAck {
+                local,
+                remote,
+                sequence: registration.iss,
+                acknowledgment: registration.rcv_nxt,
+                window: tcp_advertised_window_u16(registration.rcv_wnd),
+                local_mss: tcp_local_advertised_mss(),
+            }));
+        }
+
+        self.ensure_connection_absent(local, remote)?;
+        let flow = self.alloc_flow();
+        let lookup_id = self.alloc_tcp_lookup_id()?;
+        let connection_id = self.alloc_tcp_connection_id();
+        let iss = tcp_initial_active_send_sequence(connection_id);
+        let listener_app = listener_registration.app.clone();
+        self.tcp_connections.push(TcpConnectionRegistration {
+            flow,
+            connection_id: Some(connection_id),
+            lookup_id,
+            owner_worker: listener_registration.owner_worker,
+            state: hammer_core::protocol::tcp::TcpState::SynRcvd,
+            shutdown: None,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            listener: Some(listener_registration.socket),
+            target: AppIngressTarget::flow(listener_app, flow),
+            pending_fin: false,
+            pending_send_payloads: hammer_infra::vec::Vec::new(),
+            retransmit_queue: TcpOutputRetransmitQueue::new(),
+            retransmit_pending: false,
+            retransmit_timeout: TcpRetransmitTimeoutState::new(),
+            persist: TcpPersistState::new(),
+            congestion: TcpCongestionState::new(DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32),
+            output_payload_len: tcp_effective_output_payload_len(None),
+            next_output_at: None,
+            iss,
+            irs: sequence,
+            snd_una: iss,
+            snd_nxt: iss,
+            snd_wnd: advertised_window,
+            rcv_nxt: next_sequence,
+            rcv_wnd: DEFAULT_TCP_WINDOW,
+            send_state_initialized: false,
+            receive_state_initialized: true,
+        });
+        {
+            let registration = self
+                .tcp_connections
+                .last_mut()
+                .ok_or_else(|| HammerError::internal("missing passive-open registration"))?;
+            tcp_apply_handshake_capabilities(registration, capabilities);
+        }
+        self.publish_tcp_lookup()?;
+        self.publish_tcp_app_ingress()?;
+
+        if let Some(control) = self.shared_tcp_control.clone() {
+            let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
+            let action = congestion.install_connection_action(
+                connection_id,
+                socket_addrs_to_connection_key(local, remote)?,
+                hammer_core::protocol::tcp::TcpState::SynRcvd,
+            );
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("install shared tcp syn-rcvd connection: {err}"))
+            })?;
+        }
+
+        Ok(Some(PassiveOpenSynAck {
+            local,
+            remote,
+            sequence: iss,
+            acknowledgment: next_sequence,
+            window: tcp_advertised_window_u16(DEFAULT_TCP_WINDOW),
+            local_mss: tcp_local_advertised_mss(),
+        }))
     }
 
     fn connect_tcp_stream(
@@ -2821,6 +2952,37 @@ impl RuntimeAppControlHandle {
         Ok(())
     }
 
+    fn handle_tcp_passive_open(&self, observation: TcpPassiveOpenObservation) -> HammerResult<()> {
+        let Some(syn_ack) =
+            self.with_state_mut(move |state| state.register_passive_open_connection(observation))?
+        else {
+            return Ok(());
+        };
+        let mut options = [0u8; 4];
+        options[0] = 2; // MSS option kind
+        options[1] = 4; // MSS option length
+        options[2..4].copy_from_slice(&syn_ack.local_mss.to_be_bytes());
+        let packet = synthesize_ipv4_tcp_control(
+            syn_ack.local,
+            syn_ack.remote,
+            syn_ack.sequence,
+            syn_ack.acknowledgment,
+            syn_ack.window,
+            TcpControlFlags::from_bits(TCP_FLAG_SYN | TCP_FLAG_ACK),
+            &options,
+        )
+        .map_err(|err| HammerError::internal(format!("synthesize tcp syn-ack: {err}")))?;
+        let buffers = hammer_runtime::spawn::with_data_plane_buffers(Clone::clone);
+        emit_tcp_control_packet(
+            &buffers,
+            &self.tcp_output,
+            &packet,
+            tcp_control_metadata(syn_ack.local, syn_ack.remote),
+        )
+        .map_err(|err| HammerError::internal(format!("emit tcp syn-ack: {err}")))?;
+        Ok(())
+    }
+
     fn handle_tcp_accept_observation(
         &self,
         listener_id: TcpLookupId,
@@ -3379,6 +3541,16 @@ impl AppControlBackend for RuntimeAppControlHandle {
     }
 }
 
+impl crate::transport::tcp::TcpListenBackend for RuntimeAppControlHandle {
+    fn observe_passive_open(
+        &self,
+        observation: TcpPassiveOpenObservation,
+    ) -> Result<(), CoreError> {
+        self.handle_tcp_passive_open(observation)
+            .map_err(|err| CoreError::internal(format!("runtime tcp passive open: {err}")))
+    }
+}
+
 impl crate::transport::tcp::TcpAcceptBackend for RuntimeAppControlHandle {
     fn accept(
         &self,
@@ -3420,6 +3592,10 @@ impl TcpEstablishedBackend for RuntimeAppControlHandle {
     ) -> Result<(), CoreError> {
         self.handle_tcp_established_ack_progress(observation)
             .map_err(|err| CoreError::internal(format!("runtime tcp ACK progress: {err}")))
+    }
+
+    fn observe_receive_ack(&self, _observation: TcpReceiveAckObservation) -> Result<(), CoreError> {
+        Ok(())
     }
 
     fn observe_close(&self, observation: TcpEstablishedObservation) -> Result<(), CoreError> {
@@ -3644,6 +3820,16 @@ fn tcp_connection_snapshot_from_registration(
 #[inline]
 fn tcp_initial_active_send_sequence(connection_id: TcpConnectionId) -> u32 {
     TCP_INITIAL_ACTIVE_ISS_BASE.wrapping_add(connection_id.get() as u32)
+}
+
+#[inline]
+fn tcp_advertised_window_u16(window: u32) -> u16 {
+    window.min(u32::from(u16::MAX)) as u16
+}
+
+#[inline]
+fn tcp_local_advertised_mss() -> u16 {
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u16
 }
 
 #[inline]
@@ -5067,8 +5253,8 @@ mod tests {
         TcpWorkerEvent,
     };
     use hammer_runtime::app::{
-        AppBufferLease, AppCqeData, AppFlowId, AppObjectRef, AppOpcode, AppSend, AppSqeData,
-        AppSqeDescriptor, AppUserData,
+        AppBufferLease, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppFlowId, AppObjectRef,
+        AppOpcode, AppSend, AppSqeData, AppSqeDescriptor, AppUserData,
     };
     use hammer_runtime::spawn::with_data_plane_buffers;
     use std::future::Future;
@@ -5460,6 +5646,94 @@ final = "direct"
                 })
                 .await
                 .expect("spawn flow task");
+            });
+    }
+
+    fn spawn_next_flow_cqe_descriptor(
+        service: &Arc<RuntimeService>,
+        app: &AppContext,
+        flow: AppFlowId,
+    ) -> std::sync::mpsc::Receiver<AppCqeDescriptor> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        service
+            .spawn_app_on_worker(app.owner_worker_for_flow(flow).expect("flow owner"), {
+                let app = app.clone();
+                move || async move {
+                    let backend = app.local_backend_for_flow(flow).expect("flow backend");
+                    ready_tx.send(()).expect("signal cqe waiter ready");
+                    let cqe = backend
+                        .next_cqe_descriptor()
+                        .await
+                        .expect("flow cqe descriptor");
+                    tx.send(cqe).expect("send flow cqe descriptor");
+                }
+            })
+            .expect("spawn flow cqe waiter");
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait flow cqe waiter ready");
+        rx
+    }
+
+    fn spawn_pending_recv_cqe_descriptor(
+        service: &Arc<RuntimeService>,
+        app: &AppContext,
+        flow: AppFlowId,
+        user_data: u64,
+    ) -> std::sync::mpsc::Receiver<AppCqeDescriptor> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        service
+            .spawn_app_on_worker(app.owner_worker_for_flow(flow).expect("flow owner"), {
+                let app = app.clone();
+                move || async move {
+                    let backend = app.local_backend_for_flow(flow).expect("flow backend");
+                    backend
+                        .try_push_sqe_descriptor(AppSqeDescriptor::new(
+                            AppOpcode::Recv,
+                            AppUserData::new(user_data),
+                            AppObjectRef::Flow(flow),
+                            AppSqeData::Recv { max_len: u32::MAX },
+                        ))
+                        .expect("push pending recv sqe");
+                    ready_tx.send(()).expect("signal pending recv ready");
+                    let cqe = backend
+                        .next_cqe_descriptor()
+                        .await
+                        .expect("pending recv cqe descriptor");
+                    tx.send(cqe).expect("send pending recv cqe descriptor");
+                }
+            })
+            .expect("spawn pending recv cqe waiter");
+        ready_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("wait pending recv ready");
+        rx
+    }
+
+    fn complete_pending_recv_with_fin_for_test(app: &AppContext, flow: AppFlowId) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("driver runtime")
+            .block_on({
+                let app = app.clone();
+                async move {
+                    app.spawn_on_flow(flow, {
+                        let app = app.clone();
+                        move |_worker| async move {
+                            let buffers = with_data_plane_buffers(Clone::clone);
+                            let index = buffers
+                                .alloc_index_with_bytes(Default::default(), &[])
+                                .expect("alloc zero-length fin buffer");
+                            app.try_complete_recv_buffer(flow, buffers, index, true)
+                                .expect("complete pending recv with fin");
+                        }
+                    })
+                    .await
+                    .expect("spawn fin recv completion");
+                }
             });
     }
 
@@ -8636,6 +8910,202 @@ interval = "5s"
                 TcpCloseReason::LocalShutdown,
             ))
         );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_passive_close_completes_full_shutdown() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local");
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+
+        observe_active_syn_ack_for_test(&service, connection_id, peer, local);
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        let recv_rx = spawn_pending_recv_cqe_descriptor(&service, &app, flow, 0x601);
+        complete_pending_recv_with_fin_for_test(&app, flow);
+        let fin_cqe = recv_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive fin recv cqe");
+        assert_eq!(
+            fin_cqe.payload(),
+            AppCqeData::Recv {
+                flow,
+                buffer: match fin_cqe.payload() {
+                    AppCqeData::Recv { buffer, .. } => buffer,
+                    other => panic!("unexpected fin recv cqe: {other:?}"),
+                },
+            }
+        );
+        assert!(
+            fin_cqe.flags().contains(AppCqeFlags::FIN),
+            "remote FIN must complete pending recv with FIN"
+        );
+
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .map(|connection| connection.lookup_id)
+            .expect("lookup id for connected flow");
+        service
+            .handle_tcp_established_close_for_test(TcpEstablishedObservation {
+                lookup_id,
+                connection_id,
+                local,
+                remote: peer,
+                reason: TcpCloseReason::RemoteFin,
+            })
+            .expect("observe remote FIN");
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::CloseWait)
+        });
+        assert_eq!(
+            service.tcp_shutdown_for_flow_for_test(flow),
+            Some((TcpShutdownDirection::Read, TcpCloseReason::RemoteFin))
+        );
+
+        request_tcp_send(&app, flow, b"close-wait-drain");
+        request_tcp_shutdown(&app, flow, Shutdown::Write);
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::LastAck)
+                && output
+                    .emitted
+                    .lock()
+                    .expect("tcp output capture poisoned")
+                    .iter()
+                    .any(|segment| {
+                        segment.local() == local
+                            && segment.remote() == peer
+                            && segment.flags() & TCP_FLAG_FIN != 0
+                    })
+        });
+        let emitted = output.emitted.lock().expect("tcp output capture poisoned");
+        assert!(
+            emitted
+                .iter()
+                .any(|segment| segment.payload() == b"close-wait-drain"),
+            "CLOSE_WAIT must still allow queued app data before local FIN"
+        );
+        let fin = emitted
+            .iter()
+            .find(|segment| {
+                segment.local() == local
+                    && segment.remote() == peer
+                    && segment.flags() & TCP_FLAG_FIN != 0
+            })
+            .cloned()
+            .expect("FIN segment emitted for passive close");
+        drop(emitted);
+
+        let close_rx = spawn_next_flow_cqe_descriptor(&service, &app, flow);
+        service
+            .handle_tcp_established_ack_progress_for_test(TcpEstablishedAckObservation {
+                lookup_id,
+                connection_id,
+                accepted_acknowledgment: fin.next_sequence(),
+                advertised_window: 0x4321,
+                previous_state: crate::transport::tcp::TcpState::LastAck,
+                ack_state_transition: Some(crate::transport::tcp::TcpState::Closed),
+                acknowledges_local_fin: true,
+            })
+            .expect("observe final ACK for local FIN");
+
+        let closed_cqe = close_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive closed cqe after final ACK");
+        assert_eq!(closed_cqe.result(), 0);
+        assert_eq!(
+            closed_cqe.payload(),
+            AppCqeData::Closed {
+                flow: Some(flow),
+                socket: None,
+            }
+        );
+        wait_for(Duration::from_secs(1), || {
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+        });
+        assert!(
+            service
+                .app_control_snapshot_for_test()
+                .tcp_connections
+                .lookup_by_connection_id(connection_id)
+                .is_none(),
+            "final ACK must reclaim the closed connection"
+        );
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_reset_delivers_error_cqe_to_pending_ops() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let peer: SocketAddr = "198.51.100.88:443".parse().expect("tcp peer");
+        let local: SocketAddr = "192.0.2.44:49152".parse().expect("local");
+
+        let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+        let connection_id = service
+            .tcp_connection_id_for_flow_for_test(flow)
+            .expect("active connect connection id");
+        observe_active_syn_ack_for_test(&service, connection_id, peer, local);
+        wait_for(Duration::from_secs(1), || {
+            service.shared_tcp_connection_state_for_test(connection_id)
+                == Some(crate::transport::tcp::TcpState::Established)
+        });
+
+        let recv_rx = spawn_pending_recv_cqe_descriptor(&service, &app, flow, 0x602);
+        let lookup_id = service
+            .app_control_snapshot_for_test()
+            .tcp_connections
+            .lookup_by_connection_id(connection_id)
+            .map(|connection| connection.lookup_id)
+            .expect("lookup id for connected flow");
+        service
+            .handle_tcp_established_close_for_test(TcpEstablishedObservation {
+                lookup_id,
+                connection_id,
+                local,
+                remote: peer,
+                reason: TcpCloseReason::RemoteReset,
+            })
+            .expect("observe remote reset");
+
+        let error_cqe = recv_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("receive reset error cqe");
+        assert!(
+            error_cqe.result() != 0,
+            "reset must complete pending app ops with a nonzero result"
+        );
+        assert_eq!(
+            error_cqe.payload(),
+            AppCqeData::Closed {
+                flow: Some(flow),
+                socket: None,
+            }
+        );
+        wait_for(Duration::from_secs(1), || {
+            service
+                .shared_tcp_connection_state_for_test(connection_id)
+                .is_none()
+        });
 
         service.close().expect("close service");
     }

@@ -371,6 +371,13 @@ impl TcpOutputBackendSlot {
     }
 }
 
+impl TcpOutputBackend for TcpOutputBackendSlot {
+    #[inline]
+    fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()> {
+        TcpOutputBackendSlot::emit_buffer(self, buffers, index)
+    }
+}
+
 pub fn tcp_output_packet(
     snapshot: TcpConnectionSnapshot,
     local: SocketAddr,
