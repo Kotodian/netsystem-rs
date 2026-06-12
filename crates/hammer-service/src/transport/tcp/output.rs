@@ -3,9 +3,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{Network, RouteMetadata, SocksAddr};
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, Network, RouteMetadata, SocksAddr};
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq};
+use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq, TcpState};
 
 use super::TcpLookupId;
 use super::connection::TcpConnectionSnapshot;
@@ -35,7 +35,7 @@ pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpOutputSegment {
+pub struct TcpOutputRecord {
     pub lookup_id: TcpLookupId,
     pub connection_id: TcpConnectionId,
     pub local: SocketAddr,
@@ -44,17 +44,68 @@ pub struct TcpOutputSegment {
     pub acknowledgment: u32,
     pub flags: u8,
     pub advertised_window: u16,
-    pub payload: std::vec::Vec<u8>,
+    pub payload_len: usize,
     pub metadata: RouteMetadata,
-    pub packet: std::vec::Vec<u8>,
 }
 
-impl TcpOutputSegment {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpQueuedPayload {
+    pub id: u64,
+    pub len: usize,
+    pub offset: usize,
+    pub tail_queued: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpOutputConnectionView {
+    pub connection_id: Option<TcpConnectionId>,
+    pub state: TcpState,
+    pub local: Option<SocketAddr>,
+    pub local_port: u16,
+    pub remote: SocketAddr,
+    pub send_state_initialized: bool,
+    pub receive_state_initialized: bool,
+    pub pending_fin: bool,
+    pub output_payload_len: usize,
+    pub next_output_at: Option<Instant>,
+    pub persist_armed: bool,
+    pub persist_deadline: Option<Instant>,
+    pub send_view: TcpOutputSendView,
+    pub iss: u32,
+    pub snd_nxt: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpOutputWorkItem {
+    pub connection_id: TcpConnectionId,
+    pub record: TcpOutputRecord,
+    pub send_id: Option<u64>,
+    pub send_queue_offset: usize,
+    pub payload_len: usize,
+    pub include_fin: bool,
+    pub retransmit: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TcpOutputDecision {
+    Work(TcpOutputWorkItem),
+    WaitUntil {
+        connection_id: TcpConnectionId,
+        deadline: Instant,
+    },
+    PersistUntil {
+        connection_id: TcpConnectionId,
+        deadline: Instant,
+    },
+    None,
+}
+
+impl TcpOutputRecord {
     #[inline]
     pub fn sequence_len(&self) -> u32 {
         let control_len =
             u32::from(self.flags & TCP_FLAG_SYN != 0) + u32::from(self.flags & TCP_FLAG_FIN != 0);
-        self.payload.len() as u32 + control_len
+        self.payload_len as u32 + control_len
     }
 
     #[inline]
@@ -70,24 +121,59 @@ impl TcpOutputSegment {
     }
 
     #[inline]
-    pub fn to_retransmit_segment(&self) -> Option<TcpOutputRetransmitSegment> {
+    pub fn to_retransmit_record(&self) -> Option<TcpOutputRetransmitRecord> {
         self.consumes_sequence_space()
-            .then(|| TcpOutputRetransmitSegment {
-                segment: self.clone(),
+            .then(|| TcpOutputRetransmitRecord {
+                record: self.clone(),
                 next_sequence: self.next_send_sequence(),
                 sent_at: None,
             })
     }
+
+    #[inline]
+    pub fn alloc_header_buffer(&self, buffers: &DataPlaneBuffers) -> CoreResult<BufferIndex> {
+        let index = buffers.alloc_index(self.metadata.clone())?;
+        let result = (|| {
+            let mut buffer = buffers.get_buffer_mut(index)?;
+            let output = buffer.writable_tail_mut();
+            let written = write_packet_headers(
+                output,
+                self.local,
+                self.remote,
+                self.sequence,
+                self.acknowledgment,
+                self.flags,
+                self.advertised_window,
+                self.payload_len,
+            )?;
+            buffer.commit_writable_tail(written)?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            buffers.free_index(index);
+            return Err(err);
+        }
+        Ok(index)
+    }
+
+    #[inline]
+    pub fn finalize_buffer_checksums(
+        &self,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        finalize_packet_checksums(buffers, index, self.local, self.remote)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpOutputRetransmitSegment {
-    pub segment: TcpOutputSegment,
+pub struct TcpOutputRetransmitRecord {
+    pub record: TcpOutputRecord,
     pub next_sequence: u32,
     pub sent_at: Option<Instant>,
 }
 
-impl TcpOutputRetransmitSegment {
+impl TcpOutputRetransmitRecord {
     #[inline]
     pub fn is_fully_acked_by(&self, acknowledgment: u32) -> bool {
         !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.next_sequence))
@@ -123,7 +209,7 @@ impl TcpOutputSendView {
 
 #[derive(Debug, Clone, Default)]
 pub struct TcpOutputRetransmitQueue {
-    segments: VecDeque<TcpOutputRetransmitSegment>,
+    records: VecDeque<TcpOutputRetransmitRecord>,
 }
 
 impl TcpOutputRetransmitQueue {
@@ -134,71 +220,68 @@ impl TcpOutputRetransmitQueue {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.segments.len()
+        self.records.len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.segments.is_empty()
+        self.records.is_empty()
     }
 
     #[inline]
-    pub fn front(&self) -> Option<&TcpOutputRetransmitSegment> {
-        self.segments.front()
+    pub fn front(&self) -> Option<&TcpOutputRetransmitRecord> {
+        self.records.front()
     }
 
     #[inline]
-    pub fn iter(&self) -> impl Iterator<Item = &TcpOutputRetransmitSegment> {
-        self.segments.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &TcpOutputRetransmitRecord> {
+        self.records.iter()
     }
 
     #[inline]
-    pub fn track_segment(
-        &mut self,
-        segment: &TcpOutputSegment,
-    ) -> Option<&TcpOutputRetransmitSegment> {
-        let retransmit = segment.to_retransmit_segment()?;
-        if let Some(existing) = self.segments.iter().position(|existing| {
-            existing.segment.sequence == retransmit.segment.sequence
+    pub fn track_output(&mut self, record: &TcpOutputRecord) -> Option<&TcpOutputRetransmitRecord> {
+        let retransmit = record.to_retransmit_record()?;
+        if let Some(existing) = self.records.iter().position(|existing| {
+            existing.record.sequence == retransmit.record.sequence
                 && existing.next_sequence == retransmit.next_sequence
         }) {
-            return self.segments.get(existing);
+            return self.records.get(existing);
         }
-        self.segments.push_back(retransmit);
-        self.segments.back()
+        self.records.push_back(retransmit);
+        self.records.back()
     }
 
     #[inline]
-    pub fn track_segment_with_sent_at(
+    pub fn track_output_with_sent_at(
         &mut self,
-        segment: &TcpOutputSegment,
+        record: &TcpOutputRecord,
         sent_at: Instant,
-    ) -> Option<&TcpOutputRetransmitSegment> {
-        let mut retransmit = segment.to_retransmit_segment()?;
+    ) -> Option<&TcpOutputRetransmitRecord> {
+        let mut retransmit = record.to_retransmit_record()?;
         retransmit.sent_at = Some(sent_at);
-        if let Some(existing) = self.segments.iter().position(|existing| {
-            existing.segment.sequence == retransmit.segment.sequence
+        if let Some(existing) = self.records.iter().position(|existing| {
+            existing.record.sequence == retransmit.record.sequence
                 && existing.next_sequence == retransmit.next_sequence
         }) {
-            self.segments
+            self.records
                 .get_mut(existing)
-                .expect("tracked segment index should exist")
+                .expect("tracked output index should exist")
                 .sent_at = Some(sent_at);
-            return self.segments.get(existing);
+            return self.records.get(existing);
         }
-        self.segments.push_back(retransmit);
-        self.segments.back()
+        self.records.push_back(retransmit);
+        self.records.back()
     }
 
     #[inline]
     pub fn acknowledge_through(&mut self, acknowledgment: u32) -> usize {
         let mut released = 0usize;
         while self
-            .segments
+            .records
             .front()
-            .is_some_and(|segment| segment.is_fully_acked_by(acknowledgment))
+            .is_some_and(|record| record.is_fully_acked_by(acknowledgment))
         {
-            let _ = self.segments.pop_front();
+            let _ = self.records.pop_front();
             released += 1;
         }
         released
@@ -212,16 +295,16 @@ impl TcpOutputRetransmitQueue {
     ) -> TcpAckDeliverySample {
         let mut sample = TcpAckDeliverySample::default();
         while self
-            .segments
+            .records
             .front()
-            .is_some_and(|segment| segment.is_fully_acked_by(acknowledgment))
+            .is_some_and(|record| record.is_fully_acked_by(acknowledgment))
         {
-            let segment = self
-                .segments
+            let record = self
+                .records
                 .pop_front()
-                .expect("front segment should be present after ACK check");
-            sample.bytes_acked += segment.segment.sequence_len();
-            if let Some(sent_at) = segment.sent_at {
+                .expect("front output record should be present after ACK check");
+            sample.bytes_acked += record.record.sequence_len();
+            if let Some(sent_at) = record.sent_at {
                 sample.latest_rtt = Some(now.saturating_duration_since(sent_at));
             }
             sample.released_segments += 1;
@@ -231,7 +314,11 @@ impl TcpOutputRetransmitQueue {
 }
 
 pub trait TcpOutputBackend: Send + Sync {
-    fn emit_segment(&self, segment: TcpOutputSegment) -> CoreResult<()>;
+    /// Borrow an already-built TCP output buffer chain.
+    ///
+    /// Ownership stays with the caller so TCP can keep application buffers
+    /// alive for retransmission until ACK progress releases them.
+    fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()>;
 }
 
 #[derive(Debug, Default)]
@@ -239,7 +326,7 @@ pub struct NoopTcpOutputBackend;
 
 impl TcpOutputBackend for NoopTcpOutputBackend {
     #[inline]
-    fn emit_segment(&self, _segment: TcpOutputSegment) -> CoreResult<()> {
+    fn emit_buffer(&self, _buffers: &DataPlaneBuffers, _index: BufferIndex) -> CoreResult<()> {
         Ok(())
     }
 }
@@ -274,23 +361,141 @@ impl TcpOutputBackendSlot {
     }
 
     #[inline]
-    pub fn emit_segment(&self, segment: TcpOutputSegment) -> CoreResult<()> {
+    pub fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()> {
         let backend = self
             .inner
             .lock()
             .map_err(|_| CoreError::internal("tcp output backend poisoned"))?
             .clone();
-        backend.emit_segment(segment)
+        backend.emit_buffer(buffers, index)
     }
 }
 
-pub fn build_tcp_output_segment(
+pub fn tcp_output_packet(
     snapshot: TcpConnectionSnapshot,
     local: SocketAddr,
     payload: &[u8],
-) -> CoreResult<TcpOutputSegment> {
+) -> CoreResult<TcpOutputRecord> {
     let flags = TCP_FLAG_ACK | u8::from(!payload.is_empty()) * TCP_FLAG_PSH;
-    build_tcp_output_segment_with_flags(snapshot, local, payload, flags)
+    tcp_output_packet_flags(snapshot, local, payload, flags)
+}
+
+pub fn tcp_output_decision(
+    snapshot: TcpConnectionSnapshot,
+    view: TcpOutputConnectionView,
+    queued: Option<TcpQueuedPayload>,
+    retransmit_pending: bool,
+    retransmit_record: Option<TcpOutputRecord>,
+    now: Instant,
+) -> CoreResult<TcpOutputDecision> {
+    let Some(connection_id) = view.connection_id else {
+        return Ok(TcpOutputDecision::None);
+    };
+    if retransmit_pending {
+        let Some(record) = retransmit_record else {
+            return Ok(TcpOutputDecision::None);
+        };
+        return Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
+            connection_id,
+            payload_len: record.payload_len,
+            include_fin: record.flags & TCP_FLAG_FIN != 0,
+            retransmit: true,
+            send_id: None,
+            send_queue_offset: 0,
+            record,
+        }));
+    }
+    if view.state == TcpState::SynSent {
+        if !view.send_state_initialized || view.snd_nxt != view.iss {
+            return Ok(TcpOutputDecision::None);
+        }
+        let local = view.local.unwrap_or_else(|| {
+            SocketAddr::new(unspecified_ip_for_output(view.remote.ip()), view.local_port)
+        });
+        let record = tcp_output_packet_len(snapshot, local, 0, TCP_FLAG_SYN)?;
+        return Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
+            connection_id,
+            record,
+            send_id: None,
+            send_queue_offset: 0,
+            payload_len: 0,
+            include_fin: false,
+            retransmit: false,
+        }));
+    }
+    if !tcp_state_allows_output(view.state) {
+        return Ok(TcpOutputDecision::None);
+    }
+    let Some(local) = view.local else {
+        return Ok(TcpOutputDecision::None);
+    };
+    if queued.is_none() && !view.pending_fin {
+        return Ok(TcpOutputDecision::None);
+    }
+    if !(view.send_state_initialized && view.receive_state_initialized) {
+        return Ok(TcpOutputDecision::None);
+    }
+    if let Some(next_output_at) = view.next_output_at
+        && next_output_at > now
+    {
+        return Ok(TcpOutputDecision::WaitUntil {
+            connection_id,
+            deadline: next_output_at,
+        });
+    }
+    let has_queued_payload = queued.is_some();
+    if (has_queued_payload || view.pending_fin) && view.send_view.snd_wnd == 0 {
+        if view.persist_armed {
+            return Ok(TcpOutputDecision::None);
+        }
+        let Some(deadline) = view.persist_deadline else {
+            return Ok(TcpOutputDecision::None);
+        };
+        return Ok(TcpOutputDecision::PersistUntil {
+            connection_id,
+            deadline,
+        });
+    }
+    let (payload_len, include_fin, send_id, send_queue_offset) = if let Some(staged) = queued {
+        let requested_payload_len = staged.len.min(view.output_payload_len);
+        let can_drain_payload = requested_payload_len == staged.len && !staged.tail_queued;
+        let payload_len_with_fin = if view.pending_fin && can_drain_payload {
+            tcp_payload_len_in_send_window(view.send_view, requested_payload_len, 1)
+        } else {
+            0
+        };
+        let include_fin =
+            view.pending_fin && can_drain_payload && payload_len_with_fin == requested_payload_len;
+        let payload_len = if include_fin {
+            payload_len_with_fin
+        } else {
+            tcp_payload_len_in_send_window(view.send_view, requested_payload_len, 0)
+        };
+        (payload_len, include_fin, Some(staged.id), staged.offset)
+    } else {
+        (
+            0,
+            view.pending_fin && tcp_available_send_window(view.send_view) != 0,
+            None,
+            0,
+        )
+    };
+    if payload_len == 0 && !include_fin {
+        return Ok(TcpOutputDecision::None);
+    }
+    let flags = TCP_FLAG_ACK
+        | if payload_len == 0 { 0 } else { TCP_FLAG_PSH }
+        | if include_fin { TCP_FLAG_FIN } else { 0 };
+    let record = tcp_output_packet_len(snapshot, local, payload_len, flags)?;
+    Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
+        connection_id,
+        record,
+        send_id,
+        send_queue_offset,
+        payload_len,
+        include_fin,
+        retransmit: false,
+    }))
 }
 
 #[inline]
@@ -298,6 +503,24 @@ pub fn tcp_available_send_window(view: TcpOutputSendView) -> u32 {
     view.snd_wnd
         .min(view.congestion_window)
         .saturating_sub(tcp_inflight_sequence_len(view.snd_una, view.snd_nxt))
+}
+
+#[inline]
+fn tcp_state_allows_payload_send(state: TcpState) -> bool {
+    matches!(state, TcpState::Established | TcpState::CloseWait)
+}
+
+#[inline]
+fn tcp_state_allows_output(state: TcpState) -> bool {
+    tcp_state_allows_payload_send(state) || matches!(state, TcpState::FinWait1 | TcpState::LastAck)
+}
+
+#[inline]
+fn unspecified_ip_for_output(remote: IpAddr) -> IpAddr {
+    match remote {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
 }
 
 #[inline]
@@ -311,60 +534,42 @@ pub fn tcp_payload_len_in_send_window(
     available_payload_len.min(requested_payload_len)
 }
 
-pub fn build_tcp_output_segment_with_flags(
+pub fn tcp_output_packet_flags(
     snapshot: TcpConnectionSnapshot,
     local: SocketAddr,
     payload: &[u8],
     flags: u8,
-) -> CoreResult<TcpOutputSegment> {
-    build_segment(snapshot, local, payload, flags)
+) -> CoreResult<TcpOutputRecord> {
+    build_packet(snapshot, local, payload.len(), payload.is_empty(), flags)
 }
 
-fn build_segment(
+pub fn tcp_output_packet_len(
     snapshot: TcpConnectionSnapshot,
     local: SocketAddr,
-    payload: &[u8],
+    payload_len: usize,
     flags: u8,
-) -> CoreResult<TcpOutputSegment> {
+) -> CoreResult<TcpOutputRecord> {
+    build_packet(snapshot, local, payload_len, payload_len == 0, flags)
+}
+
+fn build_packet(
+    snapshot: TcpConnectionSnapshot,
+    local: SocketAddr,
+    payload_len: usize,
+    payload_empty: bool,
+    flags: u8,
+) -> CoreResult<TcpOutputRecord> {
     let connection_id = snapshot
         .connection_id
         .ok_or_else(|| CoreError::internal("tcp output requires an installed connection id"))?;
     let remote = snapshot.remote;
-    validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload.len())?;
+    validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload_len)?;
     let sequence = tcp_output_sequence(snapshot);
     let acknowledgment = tcp_output_acknowledgment(snapshot);
     let advertised_window = snapshot.rcv_wnd.min(u32::from(u16::MAX)) as u16;
-    let flags = normalize_tcp_output_flags(flags, payload);
-    let packet = match (local.ip(), remote.ip()) {
-        (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) => build_ipv4_segment(
-            local_ip,
-            local.port(),
-            remote_ip,
-            remote.port(),
-            sequence,
-            acknowledgment,
-            flags,
-            advertised_window,
-            payload,
-        ),
-        (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => build_ipv6_segment(
-            local_ip,
-            local.port(),
-            remote_ip,
-            remote.port(),
-            sequence,
-            acknowledgment,
-            flags,
-            advertised_window,
-            payload,
-        ),
-        _ => {
-            return Err(CoreError::internal(format!(
-                "tcp output mixes IP versions: local={local} remote={remote}"
-            )));
-        }
-    };
-    Ok(TcpOutputSegment {
+    let flags = normalize_tcp_output_flags(flags, payload_empty);
+    validate_tcp_output_address_family(local, remote)?;
+    Ok(TcpOutputRecord {
         lookup_id: snapshot.lookup_id,
         connection_id,
         local,
@@ -373,15 +578,23 @@ fn build_segment(
         acknowledgment,
         flags,
         advertised_window,
-        payload: payload.to_vec(),
+        payload_len,
         metadata: RouteMetadata {
             network: Network::Tcp,
             source: Some(SocksAddr::ip(local.ip(), local.port())),
             destination: Some(SocksAddr::ip(remote.ip(), remote.port())),
             ..RouteMetadata::default()
         },
-        packet,
     })
+}
+
+fn validate_tcp_output_address_family(local: SocketAddr, remote: SocketAddr) -> CoreResult<()> {
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => Ok(()),
+        _ => Err(CoreError::internal(format!(
+            "tcp output mixes IP versions: local={local} remote={remote}"
+        ))),
+    }
 }
 
 fn validate_tcp_output_lengths(
@@ -417,8 +630,8 @@ fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
 }
 
 #[inline]
-fn normalize_tcp_output_flags(flags: u8, payload: &[u8]) -> u8 {
-    if payload.is_empty() {
+fn normalize_tcp_output_flags(flags: u8, payload_empty: bool) -> u8 {
+    if payload_empty {
         flags & !TCP_FLAG_PSH
     } else {
         flags
@@ -449,7 +662,49 @@ fn tcp_output_acknowledgment(snapshot: TcpConnectionSnapshot) -> u32 {
     }
 }
 
-fn build_ipv4_segment(
+fn write_packet_headers(
+    output: &mut [u8],
+    local: SocketAddr,
+    remote: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: u8,
+    advertised_window: u16,
+    payload_len: usize,
+) -> CoreResult<usize> {
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => write_ipv4_headers(
+            output,
+            source,
+            local.port(),
+            destination,
+            remote.port(),
+            sequence,
+            acknowledgment,
+            flags,
+            advertised_window,
+            payload_len,
+        ),
+        (IpAddr::V6(source), IpAddr::V6(destination)) => write_ipv6_headers(
+            output,
+            source,
+            local.port(),
+            destination,
+            remote.port(),
+            sequence,
+            acknowledgment,
+            flags,
+            advertised_window,
+            payload_len,
+        ),
+        _ => Err(CoreError::internal(format!(
+            "tcp output mixes IP versions: local={local} remote={remote}"
+        ))),
+    }
+}
+
+fn write_ipv4_headers(
+    output: &mut [u8],
     source: Ipv4Addr,
     source_port: u16,
     destination: Ipv4Addr,
@@ -458,17 +713,25 @@ fn build_ipv4_segment(
     acknowledgment: u32,
     flags: u8,
     advertised_window: u16,
-    payload: &[u8],
-) -> std::vec::Vec<u8> {
-    let total_len = IPV4_HEADER_LEN + TCP_HEADER_LEN + payload.len();
-    let mut packet = vec![0u8; total_len];
+    payload_len: usize,
+) -> CoreResult<usize> {
+    let header_len = IPV4_HEADER_LEN + TCP_HEADER_LEN;
+    let total_len = header_len + payload_len;
+    if output.len() < header_len {
+        return Err(CoreError::internal(format!(
+            "tcp output buffer too small for ipv4 headers: {} < {}",
+            output.len(),
+            header_len
+        )));
+    }
+    let packet = &mut output[..header_len];
     packet[0] = 0x45;
     packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
     packet[8] = 64;
     packet[9] = 6;
     packet[12..16].copy_from_slice(&source.octets());
     packet[16..20].copy_from_slice(&destination.octets());
-    write_tcp_segment(
+    write_tcp_header(
         &mut packet[IPV4_HEADER_LEN..],
         source_port,
         destination_port,
@@ -476,16 +739,12 @@ fn build_ipv4_segment(
         acknowledgment,
         flags,
         advertised_window,
-        payload,
     );
-    let checksum = ipv4_l4_checksum(source, destination, 6, &packet[IPV4_HEADER_LEN..]);
-    packet[IPV4_HEADER_LEN + 16..IPV4_HEADER_LEN + 18].copy_from_slice(&checksum.to_be_bytes());
-    let header_checksum = internet_checksum(&packet[..IPV4_HEADER_LEN]);
-    packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
-    packet
+    Ok(header_len)
 }
 
-fn build_ipv6_segment(
+fn write_ipv6_headers(
+    output: &mut [u8],
     source: Ipv6Addr,
     source_port: u16,
     destination: Ipv6Addr,
@@ -494,18 +753,25 @@ fn build_ipv6_segment(
     acknowledgment: u32,
     flags: u8,
     advertised_window: u16,
-    payload: &[u8],
-) -> std::vec::Vec<u8> {
-    let payload_len = TCP_HEADER_LEN + payload.len();
-    let total_len = IPV6_HEADER_LEN + payload_len;
-    let mut packet = vec![0u8; total_len];
+    payload_len: usize,
+) -> CoreResult<usize> {
+    let header_len = IPV6_HEADER_LEN + TCP_HEADER_LEN;
+    let ipv6_payload_len = TCP_HEADER_LEN + payload_len;
+    if output.len() < header_len {
+        return Err(CoreError::internal(format!(
+            "tcp output buffer too small for ipv6 headers: {} < {}",
+            output.len(),
+            header_len
+        )));
+    }
+    let packet = &mut output[..header_len];
     packet[0] = 0x60;
-    packet[4..6].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    packet[4..6].copy_from_slice(&(ipv6_payload_len as u16).to_be_bytes());
     packet[6] = 6;
     packet[7] = 64;
     packet[8..24].copy_from_slice(&source.octets());
     packet[24..40].copy_from_slice(&destination.octets());
-    write_tcp_segment(
+    write_tcp_header(
         &mut packet[IPV6_HEADER_LEN..],
         source_port,
         destination_port,
@@ -513,14 +779,91 @@ fn build_ipv6_segment(
         acknowledgment,
         flags,
         advertised_window,
-        payload,
     );
-    let checksum = ipv6_l4_checksum(source, destination, 6, &packet[IPV6_HEADER_LEN..]);
-    packet[IPV6_HEADER_LEN + 16..IPV6_HEADER_LEN + 18].copy_from_slice(&checksum.to_be_bytes());
-    packet
+    Ok(header_len)
 }
 
-fn write_tcp_segment(
+fn finalize_packet_checksums(
+    buffers: &DataPlaneBuffers,
+    index: BufferIndex,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> CoreResult<()> {
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            {
+                let mut buffer = buffers.get_buffer_mut(index)?;
+                let packet = buffer.current_mut();
+                packet[10..12].fill(0);
+                packet[IPV4_HEADER_LEN + 16..IPV4_HEADER_LEN + 18].fill(0);
+            }
+            let checksum =
+                buffers.with_current_chain_io_segments(index, |segments, total_len| {
+                    let first = segments
+                        .first()
+                        .ok_or_else(|| CoreError::internal("tcp output chain is empty"))?;
+                    let transport = first.get(IPV4_HEADER_LEN..).ok_or_else(|| {
+                        CoreError::internal("tcp output ipv4 header is incomplete")
+                    })?;
+                    let transport_len = total_len
+                        .checked_sub(IPV4_HEADER_LEN)
+                        .ok_or_else(|| CoreError::internal("tcp output ipv4 length underflows"))?;
+                    Ok(ipv4_l4_checksum_chain(
+                        source,
+                        destination,
+                        6,
+                        transport,
+                        &segments[1..],
+                        transport_len,
+                    ))
+                })?;
+            let mut buffer = buffers.get_buffer_mut(index)?;
+            let packet = buffer.current_mut();
+            packet[IPV4_HEADER_LEN + 16..IPV4_HEADER_LEN + 18]
+                .copy_from_slice(&checksum.to_be_bytes());
+            let header_checksum = internet_checksum(&packet[..IPV4_HEADER_LEN]);
+            packet[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+            Ok(())
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            {
+                let mut buffer = buffers.get_buffer_mut(index)?;
+                let packet = buffer.current_mut();
+                packet[IPV6_HEADER_LEN + 16..IPV6_HEADER_LEN + 18].fill(0);
+            }
+            let checksum =
+                buffers.with_current_chain_io_segments(index, |segments, total_len| {
+                    let first = segments
+                        .first()
+                        .ok_or_else(|| CoreError::internal("tcp output chain is empty"))?;
+                    let transport = first.get(IPV6_HEADER_LEN..).ok_or_else(|| {
+                        CoreError::internal("tcp output ipv6 header is incomplete")
+                    })?;
+                    let transport_len = total_len
+                        .checked_sub(IPV6_HEADER_LEN)
+                        .ok_or_else(|| CoreError::internal("tcp output ipv6 length underflows"))?;
+                    Ok(ipv6_l4_checksum_chain(
+                        source,
+                        destination,
+                        6,
+                        transport,
+                        &segments[1..],
+                        transport_len,
+                    ))
+                })?;
+            let mut buffer = buffers.get_buffer_mut(index)?;
+            let packet = buffer.current_mut();
+            packet[IPV6_HEADER_LEN + 16..IPV6_HEADER_LEN + 18]
+                .copy_from_slice(&checksum.to_be_bytes());
+            Ok(())
+        }
+        _ => Err(CoreError::internal(format!(
+            "tcp output mixes IP versions: local={local} remote={remote}"
+        ))),
+    }
+}
+
+fn write_tcp_header(
     out: &mut [u8],
     source_port: u16,
     destination_port: u16,
@@ -528,7 +871,6 @@ fn write_tcp_segment(
     acknowledgment: u32,
     flags: u8,
     advertised_window: u16,
-    payload: &[u8],
 ) {
     out[..2].copy_from_slice(&source_port.to_be_bytes());
     out[2..4].copy_from_slice(&destination_port.to_be_bytes());
@@ -537,42 +879,100 @@ fn write_tcp_segment(
     out[12] = ((TCP_HEADER_LEN / 4) as u8) << 4;
     out[13] = flags;
     out[14..16].copy_from_slice(&advertised_window.to_be_bytes());
-    out[TCP_HEADER_LEN..TCP_HEADER_LEN + payload.len()].copy_from_slice(payload);
 }
 
-fn ipv4_l4_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.push(0);
-    pseudo.push(protocol);
-    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
+fn ipv4_l4_checksum_chain(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    protocol: u8,
+    first_transport: &[u8],
+    tail: &[&[u8]],
+    transport_len: usize,
+) -> u16 {
+    let mut checksum = InternetChecksum::new();
+    checksum.update(&source.octets());
+    checksum.update(&destination.octets());
+    checksum.update(&[0, protocol]);
+    checksum.update(&(transport_len as u16).to_be_bytes());
+    checksum.update(first_transport);
+    for segment in tail {
+        checksum.update(segment);
+    }
+    checksum.finish()
 }
 
-fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + segment.len() + (segment.len() & 1));
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, protocol]);
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
+fn ipv6_l4_checksum_chain(
+    source: Ipv6Addr,
+    destination: Ipv6Addr,
+    protocol: u8,
+    first_transport: &[u8],
+    tail: &[&[u8]],
+    transport_len: usize,
+) -> u16 {
+    let mut checksum = InternetChecksum::new();
+    checksum.update(&source.octets());
+    checksum.update(&destination.octets());
+    checksum.update(&(transport_len as u32).to_be_bytes());
+    checksum.update(&[0, 0, 0, protocol]);
+    checksum.update(first_transport);
+    for segment in tail {
+        checksum.update(segment);
+    }
+    checksum.finish()
 }
 
 fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            u16::from_be_bytes([chunk[0], 0])
-        };
-        sum = sum.wrapping_add(u32::from(word));
+    let mut checksum = InternetChecksum::new();
+    checksum.update(bytes);
+    checksum.finish()
+}
+
+#[derive(Debug, Default)]
+struct InternetChecksum {
+    sum: u32,
+    pending: Option<u8>,
+}
+
+impl InternetChecksum {
+    #[inline]
+    fn new() -> Self {
+        Self::default()
     }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
+
+    #[inline]
+    fn update(&mut self, mut bytes: &[u8]) {
+        if let Some(high) = self.pending.take() {
+            if let Some((&low, rest)) = bytes.split_first() {
+                self.sum = self
+                    .sum
+                    .wrapping_add(u32::from(u16::from_be_bytes([high, low])));
+                bytes = rest;
+            } else {
+                self.pending = Some(high);
+                return;
+            }
+        }
+        let mut chunks = bytes.chunks_exact(2);
+        for chunk in &mut chunks {
+            self.sum = self
+                .sum
+                .wrapping_add(u32::from(u16::from_be_bytes([chunk[0], chunk[1]])));
+        }
+        if let [byte] = chunks.remainder() {
+            self.pending = Some(*byte);
+        }
     }
-    !(sum as u16)
+
+    #[inline]
+    fn finish(mut self) -> u16 {
+        if let Some(high) = self.pending.take() {
+            self.sum = self
+                .sum
+                .wrapping_add(u32::from(u16::from_be_bytes([high, 0])));
+        }
+        while (self.sum >> 16) != 0 {
+            self.sum = (self.sum & 0xffff) + (self.sum >> 16);
+        }
+        !(self.sum as u16)
+    }
 }

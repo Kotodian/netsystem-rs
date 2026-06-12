@@ -456,7 +456,33 @@ impl TcpDataPlaneConnection {
     pub fn set_send_state(&mut self, snd_una: u32, snd_nxt: u32, snd_wnd: u32) {
         self.snd_una = snd_una;
         self.snd_nxt = snd_nxt;
-        self.snd_wnd = snd_wnd;
+        self.snd_wnd = self.effective_send_window(snd_wnd);
+    }
+
+    #[inline]
+    pub fn set_receive_state(&mut self, rcv_nxt: u32, rcv_wnd: u32) {
+        self.rcv_nxt = rcv_nxt;
+        self.rcv_wnd = rcv_wnd;
+    }
+
+    #[inline]
+    pub fn output_snapshot(&self) -> Option<TcpConnectionSnapshot> {
+        Some(TcpConnectionSnapshot {
+            lookup_id: self.lookup_id,
+            connection_id: self.connection_id,
+            owner_worker: self.owner_worker,
+            state: self.state,
+            local_port: self.local?.port(),
+            local: self.local,
+            remote: self.remote,
+            iss: self.iss,
+            irs: self.irs,
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+            snd_wnd: self.snd_wnd,
+            rcv_nxt: self.rcv_nxt,
+            rcv_wnd: u32::from(self.advertised_receive_window(self.rcv_wnd)),
+        })
     }
 
     #[inline]

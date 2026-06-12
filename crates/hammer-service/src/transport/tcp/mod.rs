@@ -42,9 +42,9 @@ pub use lookup::{
 };
 pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, NoopTcpOutputBackend, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
-    TCP_FLAG_SYN, TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRetransmitQueue,
-    TcpOutputRetransmitSegment, TcpOutputSegment, TcpOutputSendView, build_tcp_output_segment,
-    build_tcp_output_segment_with_flags,
+    TCP_FLAG_SYN, TcpOutputBackend, TcpOutputBackendSlot, TcpOutputRecord,
+    TcpOutputRetransmitQueue, TcpOutputRetransmitRecord, TcpOutputSendView, tcp_output_packet,
+    tcp_output_packet_flags, tcp_output_packet_len,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reset::{TcpResetNext, TcpResetNode};

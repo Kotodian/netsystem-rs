@@ -287,6 +287,37 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
 }
 
 #[test]
+fn buffer_chain_current_range_exposes_exact_subchain_and_restores_original() {
+    let pool = BufferPool::with_capacity(4, 8);
+    let packet = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .expect("alloc chained packet");
+
+    let head_range = pool
+        .with_current_chain_range(packet, 2, 7, |range| pool.copy_current_chain(range))
+        .expect("head-spanning range");
+    assert_eq!(head_range, b"cdefghi");
+    assert_eq!(
+        pool.copy_current_chain(packet).expect("restored packet"),
+        b"abcdefghijkl"
+    );
+
+    let tail_range = pool
+        .with_current_chain_range(packet, 5, 5, |range| pool.copy_current_chain(range))
+        .expect("tail-starting range");
+    assert_eq!(tail_range, b"fghij");
+    assert_eq!(
+        pool.copy_current_chain(packet)
+            .expect("restored packet after tail range"),
+        b"abcdefghijkl"
+    );
+    assert_eq!(pool.in_use(), 3);
+
+    pool.free_index(packet);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
