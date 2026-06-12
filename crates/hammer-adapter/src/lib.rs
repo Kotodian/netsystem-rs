@@ -55,7 +55,8 @@ pub use node::{
     DriverNode, InternalNode, NextFrame, Node, NodeDescriptor, NodeErrorCounters, NodeHandle,
     NodeId, NodeKind, NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage,
     NodeNextVectorEnqueue, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntime,
-    NodeRuntimeData, NodeRuntimeReady, NodeVectorDispatch, NoopNode, default_prefetch_indices,
+    NodeRuntimeData, NodeRuntimeReady, NodeState, NodeVectorDispatch, NoopNode,
+    default_prefetch_indices,
 };
 pub use outbound::{
     IcmpReply, Outbound, OutboundComponent, OutboundManager, ProxyIcmpConn, ProxyPacketConn,
