@@ -1248,6 +1248,35 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
+    pub fn schedule_empty_frame(&self, node: NodeId) -> CoreResult<()> {
+        let frame = self.alloc_frame_index()?;
+        if let Err(err) = self
+            .get_frame_mut(frame)
+            .map(|mut frame_ref| frame_ref.set_next_node(node))
+        {
+            let _ = self.free_frame_index(frame);
+            return Err(err);
+        }
+        if let Err(err) = self.nodes.schedule_frame(node, frame, true) {
+            let _ = self.free_frame_index(frame);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn set_node_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
+        if !self.nodes.mark_interrupt_pending(node)? {
+            return Ok(false);
+        }
+        if let Err(err) = self.schedule_empty_frame(node) {
+            let _ = self.nodes.clear_interrupt_pending(node);
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    #[inline]
     pub fn run_ready_nodes(&self) -> CoreResult<usize> {
         self.drain_handoff_frames()?;
         self.nodes.run_ready_function_nodes(self)

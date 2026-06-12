@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeDescriptor, NodeHandle,
-    NodeId, NodeNext, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, RouteMetadata,
-    TraceFormatter,
+    NodeId, NodeKind, NodeNext, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
+    NodeState, RouteMetadata, TraceFormatter,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -237,6 +237,132 @@ fn register_driver_preserves_old_spelling_for_descriptor_nodes() {
     assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
 
     assert_eq!(calls_for(7), 1);
+}
+
+#[test]
+fn runtime_exposes_node_kind_and_state() {
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let internal = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::empty(),
+    ));
+
+    assert_eq!(
+        runtime.nodes().node_kind(internal).unwrap(),
+        NodeKind::Internal
+    );
+    assert_eq!(runtime.nodes().node_kind(driver).unwrap(), NodeKind::Driver);
+    assert_eq!(
+        runtime.nodes().node_state(driver).unwrap(),
+        NodeState::Polling
+    );
+
+    runtime
+        .nodes()
+        .set_node_state(driver, NodeState::Interrupt)
+        .expect("set driver interrupt state");
+    assert_eq!(
+        runtime.nodes().node_state(driver).unwrap(),
+        NodeState::Interrupt
+    );
+}
+
+#[test]
+fn schedule_empty_frame_runs_driver_without_packet_vectors() {
+    reset_calls(21);
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 2);
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([21, 0, 0, 0]),
+    ));
+
+    runtime
+        .schedule_empty_frame(driver)
+        .expect("schedule empty frame");
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+
+    assert_eq!(calls_for(21), 1);
+    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
+}
+
+#[test]
+fn interrupt_pending_coalesces_empty_driver_dispatch() {
+    reset_calls(31);
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([31, 0, 0, 0]),
+    ));
+    runtime
+        .nodes()
+        .set_node_state(driver, NodeState::Interrupt)
+        .expect("set interrupt state");
+
+    assert!(
+        runtime
+            .set_node_interrupt_pending(driver)
+            .expect("first interrupt schedules")
+    );
+    assert!(
+        !runtime
+            .set_node_interrupt_pending(driver)
+            .expect("second interrupt coalesces")
+    );
+    assert_eq!(runtime.nodes().pending_len(), 1);
+
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+    assert_eq!(calls_for(31), 1);
+    assert_eq!(runtime.nodes().pending_len(), 0);
+    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
+}
+
+#[test]
+fn disabled_driver_interrupt_does_not_schedule() {
+    reset_calls(37);
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([37, 0, 0, 0]),
+    ));
+    runtime
+        .nodes()
+        .set_node_state(driver, NodeState::Disabled)
+        .expect("disable driver");
+
+    assert!(
+        !runtime
+            .set_node_interrupt_pending(driver)
+            .expect("disabled interrupt is ignored")
+    );
+    assert_eq!(runtime.nodes().pending_len(), 0);
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+    assert_eq!(calls_for(37), 0);
+}
+
+#[test]
+fn disabled_node_skips_already_queued_empty_frame() {
+    reset_calls(41);
+    let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+    let driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([41, 0, 0, 0]),
+    ));
+
+    runtime
+        .schedule_empty_frame(driver)
+        .expect("schedule empty frame before disable");
+    runtime
+        .nodes()
+        .set_node_state(driver, NodeState::Disabled)
+        .expect("disable queued node");
+
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 0);
+    assert_eq!(calls_for(41), 0);
+    assert_eq!(runtime.packet_buffers().frames_in_use(), 0);
 }
 
 #[test]
