@@ -10,6 +10,28 @@
 
 ---
 
+## ⚠️ 重大前提修正（2026-06-12，执行中发现）
+
+**生产环境 `RuntimeService` 根本没有装配 TCP 数据面 node graph。** 核查结论：
+- `RuntimeService::new` / `new_with_event_subscribers` 全程不 `register_internal` 任何 TCP/IP/TUN 包处理节点；`data_plane.rs` 只注册了一个 `DropNode`。
+- `TcpInputControlPlane`、accept/established/rcv_process 等控制面在 `RuntimeAppControlState::new` 里用 `unused_node_id()` 占位，**从未被赋予真实 NodeId 并接到 TUN/IP 入口**。
+- 唯一真正把 TCP 节点连成图的地方是**测试** `tests/tcp_input_nodes.rs` 的 `TcpGraph`。
+- `app_tcp_runtime` / `app_tcp_connect_runtime` 这类"端到端"测试是用 `*_for_test`（如 `promote_pending_syn_sent_for_test`、`tcp_shutdown_for_flow_for_test`）**模拟**节点观察来驱动 control/app 层，**绕过了真实包路径**。
+
+**影响：** 本计划 Task 2–6 的接收路径语义，全部假设"包能从 utun 流到 TCP 节点"。在生产图缺失的前提下，这些语义即使写对也跑不起来。原 spec/audit 说节点"已接通"，指的是**测试图**，不是生产图——这是计划的根本疏漏。
+
+**新增前置任务（必须先做，否则 echo 在真实 utun 上无法工作）：**
+- **Task 0a：生产 TCP 数据面图装配。** 在 `RuntimeService` 启动路径（或 `data_plane.rs` 的图构建）里，按 `TcpGraph` 的拓扑注册 TUN driver → IP input → TCP input → {listen, accept, established, rcv_process, reset} → app ingress，并用真实 NodeId 重新发布各控制面的 nexts；在此处 `TcpListenNode::with_backend(app_control)` 安装被动开后端、`TcpAcceptControlPlane`/`TcpSynSentControlPlane`/established 后端接 `app_control`、`tcp_output.install(...)` 接 TUN 输出。
+- **Task 0b：utun echo 示例**（仿 `examples/tun/host_ping.rs`）：打开真实 utun，组装上面的图 + app ring + echo 循环，宿主 nc 验证。
+
+**已完成（本会话已提交）：**
+- `d6ac142` 被动开 service 后端：`register_passive_open_connection`（注册 SYN_RCVD 半开、生成 ISS、应用对端 MSS）+ `handle_tcp_passive_open`（合成并经 `emit_tcp_control_packet` 上线 SYN-ACK）+ `TcpListenBackend` impl + `TcpOutputBackendSlot` 实现 `TcpOutputBackend`。`cargo build -p hammer-service` 通过。
+- `reply.rs` 控制包合成原语（`synthesize_ipv4_tcp_control` / `emit_tcp_control_packet` / `tcp_control_metadata`）+ `tcp_reply_nodes.rs` 测试通过。
+
+**修正后的执行顺序：** Task 0a → Task 0b（先让真实包路径跑通最小被动开）→ 再回到 Task 2–6 补齐接收语义细节。
+
+---
+
 ## 修正后的基线（执行前必读）
 
 阅读工作区**当前（含未提交改动）**代码后，spec 第 2 节描述的基线已过期。真实现状：
