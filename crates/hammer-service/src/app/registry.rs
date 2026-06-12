@@ -1,11 +1,11 @@
-use hammer_infra::{map::FlatHashKey, map::FlatHashTable, vec::Vec as InfraVec};
+use hammer_infra::map::{FlatHashKey, FlatHashTable};
 
 use crate::app::AppIngressTarget;
 
 #[derive(Clone, Debug, Default)]
 pub struct AppIngressRegistry<K: FlatHashKey> {
     slots: FlatHashTable<K, u32>,
-    targets: InfraVec<AppIngressTarget>,
+    targets: hammer_infra::vec::Vec<AppIngressTarget>,
 }
 
 impl<K: FlatHashKey> AppIngressRegistry<K> {
@@ -13,7 +13,7 @@ impl<K: FlatHashKey> AppIngressRegistry<K> {
     pub fn new() -> Self {
         Self {
             slots: FlatHashTable::new(),
-            targets: InfraVec::new(),
+            targets: hammer_infra::vec::Vec::new(),
         }
     }
 

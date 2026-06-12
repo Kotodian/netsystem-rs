@@ -290,6 +290,52 @@ fn schedule_empty_frame_runs_driver_without_packet_vectors() {
 }
 
 #[test]
+fn schedule_polling_driver_nodes_schedules_only_polling_drivers() {
+    reset_calls(31);
+    reset_calls(32);
+    reset_calls(33);
+
+    let runtime = DataPlaneRuntime::with_capacities(64, 8, 4, 8);
+    let polling_driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([31, 0, 0, 0]),
+    ));
+    let interrupt_driver = runtime.nodes().register_driver(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([32, 0, 0, 0]),
+    ));
+    let internal = runtime.nodes().register_internal(DescriptorNode::plain(
+        count_process,
+        NodeRuntimeData::from_words([33, 0, 0, 0]),
+    ));
+
+    runtime
+        .nodes()
+        .set_node_state(interrupt_driver, NodeState::Interrupt)
+        .expect("set interrupt driver state");
+    runtime
+        .nodes()
+        .set_node_state(internal, NodeState::Polling)
+        .expect("set internal polling state");
+
+    assert_eq!(
+        runtime
+            .schedule_polling_driver_nodes()
+            .expect("schedule polling drivers"),
+        1
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run ready nodes"), 1);
+
+    assert_eq!(calls_for(31), 1);
+    assert_eq!(calls_for(32), 0);
+    assert_eq!(calls_for(33), 0);
+    assert_eq!(
+        runtime.nodes().node_state(polling_driver).unwrap(),
+        NodeState::Polling
+    );
+}
+
+#[test]
 fn interrupt_pending_coalesces_empty_driver_dispatch() {
     reset_calls(31);
     let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);

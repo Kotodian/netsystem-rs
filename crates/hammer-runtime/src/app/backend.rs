@@ -128,6 +128,11 @@ impl AppBackend {
     }
 
     #[inline]
+    pub fn try_pop_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.ring.pop_tcp_shutdown()
+    }
+
+    #[inline]
     pub fn try_push_sqe_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
         self.ring.try_push_submission_descriptor(sqe)
     }
@@ -143,6 +148,11 @@ impl AppBackend {
     }
 
     #[inline]
+    pub fn try_pop_sqe_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.ring.pop_submission_descriptor()
+    }
+
+    #[inline]
     pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
         self.ring.take_send_buffer(index)
     }
@@ -150,6 +160,11 @@ impl AppBackend {
     #[inline]
     pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
         self.ring.next_submission_entry().await
+    }
+
+    #[inline]
+    pub fn try_pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.ring.pop_submission_entry()
     }
 
     #[inline]

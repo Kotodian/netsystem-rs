@@ -12,11 +12,11 @@ use hammer_infra::vec::Vec;
 
 use crate::app::backend::{AppBackend, AppBackendRecvQueue, AppBackendSendQueue};
 use crate::app::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv,
-    AppRegisteredBuffer, AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
-    AppTcpShutdown, AppUserData,
+    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv, AppRegisteredBuffer,
+    AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppTcpShutdown,
+    AppUserData,
 };
-use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local, with_data_plane_buffers};
+use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 
 static NEXT_APP_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -190,22 +190,17 @@ impl AppContext {
             .await;
         }
 
-        let payload = send.lease().copy_current()?;
+        let registered = CrossWorkerAppRegisteredBuffer::new(app_send_registered_buffer(send)?);
+        let descriptor = app_send_descriptor(flow, registered.index());
         let owner_worker = self.owner_for(flow)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
-                let worker = AppWorkerContext {
-                    owner_worker,
-                    backend: worker_backend(app_context_id, flow, ring_capacity),
-                };
-                let runtime = with_data_plane_buffers(Clone::clone);
-                let index = runtime.alloc_index_with_bytes(Default::default(), &payload)?;
-                worker
-                    .runtime()
-                    .send(AppSend::new(AppBufferLease::from_buffer(runtime, index)))
-                    .await
+                let registered = registered.into_inner();
+                worker_backend(app_context_id, flow, ring_capacity).try_push_submission_entry(
+                    AppSubmissionEntry::with_attachment(descriptor, registered),
+                )
             })
             .await?
     }
@@ -565,6 +560,34 @@ impl AppWorkerContext {
     }
 }
 
+struct CrossWorkerAppRegisteredBuffer {
+    inner: AppRegisteredBuffer,
+}
+
+impl CrossWorkerAppRegisteredBuffer {
+    #[inline]
+    fn new(inner: AppRegisteredBuffer) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    fn index(&self) -> BufferIndex {
+        self.inner.index()
+    }
+
+    #[inline]
+    fn into_inner(self) -> AppRegisteredBuffer {
+        self.inner
+    }
+}
+
+// SAFETY: this wrapper is only used by AppContext::send_on_flow after the
+// caller gives up ownership of AppSend. The remote-local closure immediately
+// unwraps the registered buffer and attaches it to the owner worker's
+// submission ring; no references to the lease are shared or accessed while the
+// wrapper is in transit.
+unsafe impl Send for CrossWorkerAppRegisteredBuffer {}
+
 #[derive(Clone)]
 pub struct AppRuntime {
     flow: AppFlowId,
@@ -592,19 +615,9 @@ impl AppRuntime {
 
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        let lease = send.into_lease();
-        let registered = AppRegisteredBuffer::from_lease(lease)?;
-        let descriptor = AppSqeDescriptor::new(
-            crate::app::ring::AppOpcode::Send,
-            AppUserData::new(0),
-            AppObjectRef::Flow(self.flow),
-            AppSqeData::Send {
-                buffer: registered.index(),
-            },
-        );
         self.send
             .ring()
-            .try_push_submission_entry(AppSubmissionEntry::with_attachment(descriptor, registered))
+            .try_push_submission_entry(app_send_submission_entry(self.flow, send)?)
     }
 
     #[inline]
@@ -663,6 +676,28 @@ impl AppRuntime {
     pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
         self.recv.ring().take_recv_buffer(index)
     }
+}
+
+#[inline]
+fn app_send_submission_entry(flow: AppFlowId, send: AppSend) -> HammerResult<AppSubmissionEntry> {
+    let registered = app_send_registered_buffer(send)?;
+    let descriptor = app_send_descriptor(flow, registered.index());
+    Ok(AppSubmissionEntry::with_attachment(descriptor, registered))
+}
+
+#[inline]
+fn app_send_registered_buffer(send: AppSend) -> HammerResult<AppRegisteredBuffer> {
+    AppRegisteredBuffer::from_lease(send.into_lease())
+}
+
+#[inline]
+fn app_send_descriptor(flow: AppFlowId, buffer: BufferIndex) -> AppSqeDescriptor {
+    AppSqeDescriptor::new(
+        crate::app::ring::AppOpcode::Send,
+        AppUserData::new(0),
+        AppObjectRef::Flow(flow),
+        AppSqeData::Send { buffer },
+    )
 }
 
 pub type AppTaskContext = AppWorkerContext;

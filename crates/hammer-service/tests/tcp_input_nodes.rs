@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -23,10 +23,10 @@ use hammer_service::transport::tcp::{
     TcpAcceptBackend, TcpAcceptControlPlane, TcpAcceptNext, TcpAcceptRegistration,
     TcpConnectionSnapshot, TcpEstablishedControlPlane, TcpEstablishedNext, TcpEstablishedNode,
     TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpInputNode,
-    TcpListenNext, TcpListenNode, TcpLookupId, TcpRcvProcessControlPlane, TcpRcvProcessNext,
-    TcpResetNext, TcpResetNode, TcpState, TcpSynSentNext, TcpSynSentNode, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpWorkerOwnedConnectionState,
-    TcpWorkerOwnedState,
+    TcpListenBackend, TcpListenNext, TcpListenNode, TcpLookupId, TcpPassiveOpenObservation,
+    TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpResetNext, TcpResetNode, TcpState,
+    TcpSynSentNext, TcpSynSentNode, TcpV4ConnectionKey, TcpV4ListenerKey,
+    TcpV4PendingConnectionKey, TcpWorkerOwnedConnectionState, TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -219,6 +219,21 @@ impl TcpAcceptBackend for RecordingTcpAcceptBackend {
     }
 }
 
+#[derive(Default)]
+struct RecordingTcpListenBackend {
+    passive_open: Arc<Mutex<Vec<TcpPassiveOpenObservation>>>,
+}
+
+impl TcpListenBackend for RecordingTcpListenBackend {
+    fn observe_passive_open(&self, observation: TcpPassiveOpenObservation) -> CoreResult<()> {
+        self.passive_open
+            .lock()
+            .map_err(|_| CoreError::internal("passive open observations poisoned"))?
+            .push(observation);
+        Ok(())
+    }
+}
+
 #[test]
 fn ip_local_routes_tcp_packets_into_tcp_input_listen_next() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
@@ -319,6 +334,82 @@ fn tcp_input_routes_listen_ack_to_reset_node() {
             .node_error_count(graph.tcp_input, TcpInputError::AckInvalid.code())
             .expect("ack invalid counter"),
         1
+    );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn tcp_listen_node_observes_pure_syn_without_forwarding_to_accept() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let accept_state = Arc::new(Mutex::new(CaptureState::default()));
+    let accept = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&accept_state)));
+    let backend = Arc::new(RecordingTcpListenBackend::default());
+    let observations = Arc::clone(&backend.passive_open);
+    let listen = runtime
+        .nodes()
+        .register_internal(TcpListenNode::new(TcpListenNext::nodes(accept)).with_backend(backend));
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let punt = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::new(Mutex::new(
+            CaptureState::default(),
+        ))));
+    let established = runtime
+        .nodes()
+        .register_internal(TcpEstablishedNode::new(TcpEstablishedNext::nodes(drop)));
+    let reset = runtime
+        .nodes()
+        .register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, drop)));
+    let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
+        drop,
+        punt,
+        listen,
+        drop,
+        drop,
+        established,
+        reset,
+    ));
+    let local = Ipv4Addr::new(192, 0, 2, 21);
+    let remote = Ipv4Addr::new(198, 51, 100, 21);
+    let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    owner.insert_listener_v4(TcpV4ListenerKey::new(0, local, LISTEN_PORT), LISTENER_ID);
+    tcp_control
+        .publish_lookup(owner.publish_snapshot())
+        .expect("publish listener lookup");
+    let tcp_input = runtime.nodes().register_internal(tcp_control.node());
+    let packet = ipv4_tcp_packet_with_seq_ack(
+        remote,
+        50_021,
+        local,
+        LISTEN_PORT,
+        12_345,
+        0,
+        tcp_flags(false, true, false, false),
+        b"",
+    );
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let metadata = tcp_metadata(IpAddr::V4(remote), 50_021, IpAddr::V4(local), LISTEN_PORT);
+    let buffer = push_packet(&runtime, frame, &packet, metadata);
+    stamp_tcp_cursor(&runtime, buffer, &packet);
+
+    assert!(runtime.schedule_frame(tcp_input, frame).expect("schedule"));
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    assert!(accept_state.lock().unwrap().packets.is_empty());
+    assert_eq!(
+        *observations.lock().unwrap(),
+        vec![TcpPassiveOpenObservation {
+            listener_id: LISTENER_ID,
+            local: SocketAddr::new(IpAddr::V4(local), LISTEN_PORT),
+            remote: SocketAddr::new(IpAddr::V4(remote), 50_021),
+            sequence: 12_345,
+            next_sequence: 12_346,
+            advertised_window: 0,
+            capabilities: TcpCapabilities::default(),
+        }]
     );
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);

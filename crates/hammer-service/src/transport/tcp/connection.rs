@@ -1,20 +1,22 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{DataWorkerId, NodeId};
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
-use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
+use hammer_infra::map::FlatHashTable;
 
 use super::congestion::TcpCongestionState;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
     tcp_effective_output_payload_len,
 };
-use super::{TcpEstablishedBackend, TcpEstablishedNext, TcpEstablishedNode, TcpLookupId, TcpState};
+use super::{
+    TcpEstablishedBackend, TcpEstablishedBackendSlot, TcpEstablishedNext, TcpEstablishedNode,
+    TcpLookupId, TcpState,
+};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -537,7 +539,7 @@ impl TcpConnectionSnapshot {
 
 #[derive(Debug, Clone)]
 pub struct TcpConnectionSnapshotPool {
-    connections: InfraVec<TcpConnectionSnapshot>,
+    connections: hammer_infra::vec::Vec<TcpConnectionSnapshot>,
     lookup_slots: FlatHashTable<TcpLookupId, usize>,
     connection_slots: FlatHashTable<u64, usize>,
 }
@@ -546,7 +548,7 @@ impl TcpConnectionSnapshotPool {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            connections: InfraVec::new(),
+            connections: hammer_infra::vec::Vec::new(),
             lookup_slots: FlatHashTable::new(),
             connection_slots: FlatHashTable::new(),
         }
@@ -623,7 +625,7 @@ impl Default for TcpConnectionSnapshotPool {
 
 #[derive(Debug, Clone)]
 pub struct TcpConnectionTable {
-    connections: InfraVec<TcpDataPlaneConnection>,
+    connections: hammer_infra::vec::Vec<TcpDataPlaneConnection>,
     lookup_slots: FlatHashTable<TcpLookupId, usize>,
     connection_slots: FlatHashTable<u64, usize>,
 }
@@ -632,7 +634,7 @@ impl TcpConnectionTable {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            connections: InfraVec::new(),
+            connections: hammer_infra::vec::Vec::new(),
             lookup_slots: FlatHashTable::new(),
             connection_slots: FlatHashTable::new(),
         }
@@ -797,7 +799,7 @@ fn default_tcp_established_snapshot() -> TcpEstablishedSnapshotHandle {
 
 pub struct TcpEstablishedControlPlane {
     inner: Arc<ArcSwap<TcpEstablishedSnapshot>>,
-    backend: Arc<RwLock<Option<Arc<dyn TcpEstablishedBackend>>>>,
+    backend: TcpEstablishedBackendSlot,
     next: [NodeId; TcpEstablishedNext::COUNT],
 }
 
@@ -806,7 +808,7 @@ impl TcpEstablishedControlPlane {
     pub fn new(next: [NodeId; TcpEstablishedNext::COUNT]) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(TcpEstablishedSnapshot::new())),
-            backend: Arc::new(RwLock::new(None)),
+            backend: TcpEstablishedBackendSlot::new(),
             next,
         }
     }
@@ -825,10 +827,7 @@ impl TcpEstablishedControlPlane {
     where
         O: TcpEstablishedBackend + 'static,
     {
-        *self
-            .backend
-            .write()
-            .expect("tcp established backend lock poisoned") = Some(backend);
+        self.backend.install(backend);
     }
 
     #[inline]
@@ -841,10 +840,7 @@ impl TcpEstablishedControlPlane {
     pub fn node(&self) -> TcpEstablishedNode {
         TcpEstablishedNode::new(self.next).with_runtime(
             TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)),
-            self.backend
-                .read()
-                .expect("tcp established backend lock poisoned")
-                .clone(),
+            self.backend.clone(),
         )
     }
 

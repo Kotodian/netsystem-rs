@@ -12,7 +12,7 @@ use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionKey, TcpHandshakeObservation, TcpListenerId, TcpListenerKey,
     TcpSeq, TcpWorkerEvent,
 };
-use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
+use hammer_infra::map::FlatHashTable;
 use hammer_runtime::app::{AppContext, AppSocketId};
 
 use super::TcpLookupId;
@@ -202,7 +202,7 @@ impl std::fmt::Debug for TcpAcceptRegistration {
 #[derive(Clone, Default)]
 struct TcpAcceptRegistry {
     slots: FlatHashTable<TcpLookupId, u32>,
-    registrations: InfraVec<TcpAcceptRegistration>,
+    registrations: hammer_infra::vec::Vec<TcpAcceptRegistration>,
 }
 
 impl TcpAcceptRegistry {
@@ -212,7 +212,7 @@ impl TcpAcceptRegistry {
         listeners: impl IntoIterator<Item = (TcpLookupId, TcpAcceptRegistration)>,
     ) {
         self.slots = FlatHashTable::new();
-        self.registrations = InfraVec::new();
+        self.registrations = hammer_infra::vec::Vec::new();
         for (listener_id, registration) in listeners {
             let slot = self.registrations.len() as u32;
             self.registrations.push(registration);
@@ -321,8 +321,8 @@ struct TcpAcceptRuntime {
 }
 
 thread_local! {
-    static TCP_ACCEPT_RUNTIMES: RefCell<InfraVec<TcpAcceptRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_ACCEPT_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpAcceptRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
 }
 
 fn register_tcp_accept_runtime(

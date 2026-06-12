@@ -141,12 +141,7 @@ fn set_ipv4_tcp_cursor(
     Ok(())
 }
 
-fn ipv4_l4_checksum(
-    source: Ipv4Addr,
-    destination: Ipv4Addr,
-    protocol: u8,
-    segment: &[u8],
-) -> u16 {
+fn ipv4_l4_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
     pseudo.extend_from_slice(&source.octets());
     pseudo.extend_from_slice(&destination.octets());

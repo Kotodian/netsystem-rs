@@ -898,6 +898,20 @@ impl NodeRuntime {
         Ok(inner.node_states[node.0 as usize])
     }
 
+    pub fn polling_driver_nodes(&self) -> CoreResult<std::vec::Vec<NodeId>> {
+        let inner = self.inner.borrow();
+        let mut nodes = std::vec::Vec::new();
+        for (slot, node) in inner.nodes.iter().enumerate() {
+            if node.kind == NodeKind::Driver && inner.node_states[slot] == NodeState::Polling {
+                let id = u32::try_from(slot)
+                    .map(NodeId::new)
+                    .map_err(|_| CoreError::internal("node id overflow"))?;
+                nodes.push(id);
+            }
+        }
+        Ok(nodes)
+    }
+
     #[inline]
     pub fn set_node_state(&self, node: NodeId, state: NodeState) -> CoreResult<()> {
         let mut inner = self.inner.borrow_mut();

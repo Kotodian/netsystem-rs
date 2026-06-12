@@ -102,6 +102,7 @@ const CONTROL_ASYNC_BUFFER: Duration = Duration::from_secs(5);
 const CLOSED_TCP_CONNECTION_TOMBSTONE_LIMIT: usize = 1024;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_INITIAL_PERSIST_TIMEOUT: Duration = Duration::from_millis(200);
+#[allow(dead_code)]
 const TCP_MAX_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const TCP_INITIAL_ACTIVE_ISS_BASE: u32 = 0x1020_303f;
@@ -236,21 +237,25 @@ impl TcpPersistState {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn timeout(&self) -> Duration {
         self.timeout
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn is_armed(&self) -> bool {
         self.armed
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn arm(&mut self) {
         self.armed = true;
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn on_timeout(&mut self) {
         self.armed = false;
@@ -280,12 +285,14 @@ type TcpLocalSendId = u64;
 
 #[derive(Debug, Clone, Copy)]
 struct TcpTransportSendEntry {
+    #[allow(dead_code)]
     id: TcpLocalSendId,
     len: usize,
     offset: usize,
 }
 
 impl TcpTransportSendEntry {
+    #[allow(dead_code)]
     #[inline]
     fn new(id: TcpLocalSendId, len: usize) -> Self {
         Self { id, len, offset: 0 }
@@ -296,6 +303,7 @@ impl TcpTransportSendEntry {
         self.len.saturating_sub(self.offset)
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn advance(&mut self, len: usize) {
         self.offset = self.offset.saturating_add(len).min(self.len);
@@ -307,6 +315,7 @@ impl TcpTransportSendEntry {
     }
 }
 
+#[allow(dead_code)]
 struct TcpLocalSendEntry {
     id: TcpLocalSendId,
     send: hammer_runtime::app::AppSend,
@@ -314,6 +323,7 @@ struct TcpLocalSendEntry {
 }
 
 impl TcpLocalSendEntry {
+    #[allow(dead_code)]
     #[inline]
     fn new(id: TcpLocalSendId, send: hammer_runtime::app::AppSend) -> Self {
         Self {
@@ -323,22 +333,26 @@ impl TcpLocalSendEntry {
         }
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn advance(&mut self, len: usize) {
         self.offset = self.offset.saturating_add(len);
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn len(&self) -> HammerResult<usize> {
         tcp_app_send_current_chain_len(&self.send)
     }
 
+    #[allow(dead_code)]
     #[inline]
     fn remaining_len(&self) -> HammerResult<usize> {
         self.len().map(|len| len.saturating_sub(self.offset))
     }
 }
 
+#[allow(dead_code)]
 #[inline]
 fn tcp_app_send_current_chain_len(send: &hammer_runtime::app::AppSend) -> HammerResult<usize> {
     let lease = send.lease();
@@ -357,6 +371,7 @@ fn tcp_app_send_current_chain_len(send: &hammer_runtime::app::AppSend) -> Hammer
         .ok_or_else(|| HammerError::internal("tcp app send chain length overflow"))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct TcpLocalOutstandingSend {
     sequence: u32,
@@ -365,6 +380,7 @@ struct TcpLocalOutstandingSend {
     len: usize,
 }
 
+#[allow(dead_code)]
 fn emit_tcp_output_buffer(
     buffers: &DataPlaneBuffers,
     output: &TcpOutputBackendSlot,
@@ -413,6 +429,7 @@ fn emit_tcp_output_buffer(
         .map_err(|err| HammerError::internal(format!("emit tcp output buffer: {err}")))
 }
 
+#[allow(dead_code)]
 fn tcp_output_payload_source(
     work: &TcpOutputWorkItem,
     sends: &VecDeque<TcpLocalSendEntry>,
@@ -458,6 +475,7 @@ fn tcp_output_payload_source(
     Ok(Some((send.send.lease().index(), offset)))
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpOutputDrainAction {
     Emit,
@@ -642,6 +660,7 @@ struct PassiveOpenSynAck {
     acknowledgment: u32,
     window: u16,
     local_mss: u16,
+    shared_action: Option<hammer_core::protocol::tcp::TcpControlPlaneAction>,
 }
 
 impl TcpOutputSignalRegistry {
@@ -658,6 +677,7 @@ impl TcpOutputSignalRegistry {
         notify
     }
 
+    #[allow(dead_code)]
     fn subscribe(&self, flow: AppFlowId) -> Arc<Notify> {
         let mut signals = self.inner.lock().expect("tcp output signals poisoned");
         Arc::clone(
@@ -1171,6 +1191,7 @@ impl RuntimeAppControlState {
                 acknowledgment: registration.rcv_nxt,
                 window: tcp_advertised_window_u16(registration.rcv_wnd),
                 local_mss: tcp_local_advertised_mss(),
+                shared_action: None,
             }));
         }
 
@@ -1221,17 +1242,16 @@ impl RuntimeAppControlState {
         self.publish_tcp_lookup()?;
         self.publish_tcp_app_ingress()?;
 
-        if let Some(control) = self.shared_tcp_control.clone() {
+        let shared_action = if self.shared_tcp_control.is_some() {
             let congestion = TcpConnectionState::new(&self.tcp_congestion, None)?;
-            let action = congestion.install_connection_action(
+            Some(congestion.install_connection_action(
                 connection_id,
                 socket_addrs_to_connection_key(local, remote)?,
                 hammer_core::protocol::tcp::TcpState::SynRcvd,
-            );
-            control.apply(action).map_err(|err| {
-                HammerError::internal(format!("install shared tcp syn-rcvd connection: {err}"))
-            })?;
-        }
+            ))
+        } else {
+            None
+        };
 
         Ok(Some(PassiveOpenSynAck {
             local,
@@ -1240,6 +1260,7 @@ impl RuntimeAppControlState {
             acknowledgment: next_sequence,
             window: tcp_advertised_window_u16(DEFAULT_TCP_WINDOW),
             local_mss: tcp_local_advertised_mss(),
+            shared_action,
         }))
     }
 
@@ -1581,6 +1602,7 @@ impl RuntimeAppControlState {
             .state)
     }
 
+    #[allow(dead_code)]
     fn enqueue_tcp_transport_send(
         &mut self,
         connection_id: TcpConnectionId,
@@ -1631,6 +1653,7 @@ impl RuntimeAppControlState {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn dequeue_tcp_output(&mut self, flow: AppFlowId) -> HammerResult<TcpOutputDecision> {
         let Some(connection_index) = self
             .tcp_connections
@@ -1695,6 +1718,7 @@ impl RuntimeAppControlState {
         .map_err(|err| HammerError::internal(format!("plan tcp output: {err}")))
     }
 
+    #[allow(dead_code)]
     fn observe_tcp_output_emitted(
         &mut self,
         work: &TcpOutputWorkItem,
@@ -1818,6 +1842,7 @@ impl RuntimeAppControlState {
         Ok(Some(registration.flow))
     }
 
+    #[allow(dead_code)]
     fn observe_tcp_persist_timeout(
         &mut self,
         connection_id: TcpConnectionId,
@@ -1876,6 +1901,7 @@ impl RuntimeAppControlState {
         Ok(Some((flow, next_state)))
     }
 
+    #[allow(dead_code)]
     fn observe_tcp_flow_shutdown(
         &mut self,
         flow: AppFlowId,
@@ -1917,6 +1943,7 @@ impl RuntimeAppControlState {
         Ok(connection_id.map(|connection_id| (connection_id, next_state)))
     }
 
+    #[allow(dead_code)]
     fn observe_tcp_flow_send(
         &mut self,
         flow: AppFlowId,
@@ -2518,9 +2545,6 @@ impl RuntimeAppControlHandle {
         let result = self.with_state_mut(move |state| {
             state.connect_tcp_stream(&connect_app, peer, owner_worker)
         })?;
-        self.start_tcp_flow_pump(&app, result.flow, owner_worker)?;
-        self.start_tcp_shutdown_pump(&app, result.flow, owner_worker)?;
-        self.tcp_output_signals.signal(result.flow);
         let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))? else {
             return Ok(result.flow);
         };
@@ -2532,73 +2556,7 @@ impl RuntimeAppControlHandle {
         Ok(result.flow)
     }
 
-    fn start_tcp_shutdown_pump(
-        &self,
-        app: &AppContext,
-        flow: AppFlowId,
-        owner_worker: usize,
-    ) -> HammerResult<()> {
-        let app = app.clone();
-        let handle = self.clone();
-        app.spawn_detached_on_flow_owner(flow, owner_worker, move |worker| async move {
-            let backend = worker.backend();
-            while let Some(shutdown) = backend.next_tcp_shutdown().await {
-                if handle
-                    .shutdown_tcp_flow(shutdown.flow(), shutdown.how())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-    }
-
-    fn start_tcp_flow_pump(
-        &self,
-        app: &AppContext,
-        flow: AppFlowId,
-        owner_worker: usize,
-    ) -> HammerResult<()> {
-        let app = app.clone();
-        let handle = self.clone();
-        let notify = self.tcp_output_signals.subscribe(flow);
-        app.spawn_detached_on_flow_owner(flow, owner_worker, move |worker| async move {
-            let backend = worker.backend();
-            let mut sends = VecDeque::new();
-            let mut outstanding = VecDeque::new();
-            let mut next_send_id = 1u64;
-            loop {
-                tokio::select! {
-                    send = backend.next_send() => {
-                        let Some(send) = send else {
-                            break;
-                        };
-                        let payload_len = match tcp_app_send_current_chain_len(&send) {
-                            Ok(len) => len,
-                            Err(_) => break,
-                        };
-                        let send_id = next_send_id;
-                        next_send_id = next_send_id.wrapping_add(1).max(1);
-                        if handle.record_tcp_flow_send(flow, send_id, payload_len).is_err() {
-                            break;
-                        }
-                        sends.push_back(TcpLocalSendEntry::new(send_id, send));
-                        match handle.drive_tcp_output(flow, &mut sends, &mut outstanding) {
-                            Ok(TcpOutputDrainAction::Closed) | Err(_) => break,
-                            Ok(TcpOutputDrainAction::Emit | TcpOutputDrainAction::Idle) => {}
-                        }
-                    }
-                    _ = notify.notified() => {
-                        match handle.drive_tcp_output(flow, &mut sends, &mut outstanding) {
-                            Ok(TcpOutputDrainAction::Closed) | Err(_) => break,
-                            Ok(TcpOutputDrainAction::Emit | TcpOutputDrainAction::Idle) => {}
-                        }
-                    }
-                }
-            }
-        })
-    }
-
+    #[allow(dead_code)]
     fn drive_tcp_output(
         &self,
         flow: AppFlowId,
@@ -2677,6 +2635,7 @@ impl RuntimeAppControlHandle {
         }
     }
 
+    #[allow(dead_code)]
     fn release_acked_tcp_sends(
         &self,
         flow: AppFlowId,
@@ -2755,6 +2714,7 @@ impl RuntimeAppControlHandle {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn arm_tcp_output_pacing_timer(
         &self,
         flow: AppFlowId,
@@ -2776,6 +2736,7 @@ impl RuntimeAppControlHandle {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn arm_tcp_persist_timer(
         &self,
         connection_id: TcpConnectionId,
@@ -2958,6 +2919,13 @@ impl RuntimeAppControlHandle {
         else {
             return Ok(());
         };
+        if let Some(action) = syn_ack.shared_action
+            && let Some(control) = self.with_state(|state| Ok(state.shared_tcp_control.clone()))?
+        {
+            control.apply(action).map_err(|err| {
+                HammerError::internal(format!("install shared tcp syn-rcvd connection: {err}"))
+            })?;
+        }
         let mut options = [0u8; 4];
         options[0] = 2; // MSS option kind
         options[1] = 4; // MSS option length
@@ -3007,16 +2975,13 @@ impl RuntimeAppControlHandle {
                 })?;
             }
         }
-        if let Some((app, flow, owner_worker)) = result.accepted_flow {
-            self.start_tcp_flow_pump(&app, flow, owner_worker)?;
-            self.start_tcp_shutdown_pump(&app, flow, owner_worker)?;
-        }
         if let Some(flow) = result.wake_output_flow {
             self.tcp_output_signals.signal(flow);
         }
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn shutdown_tcp_flow(&self, flow: AppFlowId, how: std::net::Shutdown) -> HammerResult<()> {
         let direction = tcp_shutdown_direction(how);
         let reason = TcpCloseReason::LocalShutdown;
@@ -3062,6 +3027,7 @@ impl RuntimeAppControlHandle {
         }
     }
 
+    #[allow(dead_code)]
     fn record_tcp_flow_send(
         &self,
         flow: AppFlowId,
@@ -3112,6 +3078,36 @@ impl RuntimeAppControlHandle {
         control.apply(action).map_err(|err| {
             HammerError::internal(format!("upsert shared tcp ACK state progress: {err}"))
         })
+    }
+
+    fn emit_tcp_receive_ack(&self, observation: TcpReceiveAckObservation) -> HammerResult<()> {
+        let TcpReceiveAckObservation {
+            local,
+            remote,
+            send_sequence,
+            receive_acknowledgment,
+            advertised_window,
+            ..
+        } = observation;
+        let packet = synthesize_ipv4_tcp_control(
+            local,
+            remote,
+            send_sequence,
+            receive_acknowledgment,
+            tcp_advertised_window_u16(advertised_window),
+            TcpControlFlags::from_bits(TCP_FLAG_ACK),
+            &[],
+        )
+        .map_err(|err| HammerError::internal(format!("synthesize tcp receive ack: {err}")))?;
+        let buffers = hammer_runtime::spawn::with_data_plane_buffers(Clone::clone);
+        emit_tcp_control_packet(
+            &buffers,
+            &self.tcp_output,
+            &packet,
+            tcp_control_metadata(local, remote),
+        )
+        .map_err(|err| HammerError::internal(format!("emit tcp receive ack: {err}")))?;
+        Ok(())
     }
 
     fn handle_tcp_established_close(
@@ -3297,10 +3293,6 @@ impl RuntimeAppControlHandle {
                         })?;
                     }
                 }
-                if let Some((app, flow, owner_worker)) = result.accepted_flow {
-                    self.start_tcp_flow_pump(&app, flow, owner_worker)?;
-                    self.start_tcp_shutdown_pump(&app, flow, owner_worker)?;
-                }
                 if let Some(flow) = result.wake_output_flow {
                     self.tcp_output_signals.signal(flow);
                 }
@@ -3467,6 +3459,7 @@ impl RuntimeAppControlHandle {
         })?
     }
 
+    #[allow(dead_code)]
     fn tcp_flow_exists(&self, flow: AppFlowId) -> HammerResult<bool> {
         self.with_state(move |state| {
             Ok(state
@@ -3594,8 +3587,9 @@ impl TcpEstablishedBackend for RuntimeAppControlHandle {
             .map_err(|err| CoreError::internal(format!("runtime tcp ACK progress: {err}")))
     }
 
-    fn observe_receive_ack(&self, _observation: TcpReceiveAckObservation) -> Result<(), CoreError> {
-        Ok(())
+    fn observe_receive_ack(&self, observation: TcpReceiveAckObservation) -> Result<(), CoreError> {
+        self.emit_tcp_receive_ack(observation)
+            .map_err(|err| CoreError::internal(format!("runtime tcp receive ack: {err}")))
     }
 
     fn observe_close(&self, observation: TcpEstablishedObservation) -> Result<(), CoreError> {
@@ -3645,6 +3639,7 @@ fn unspecified_ip_for(remote: IpAddr) -> IpAddr {
 }
 
 #[inline]
+#[allow(dead_code)]
 fn tcp_shutdown_direction(how: std::net::Shutdown) -> TcpShutdownDirection {
     match how {
         std::net::Shutdown::Read => TcpShutdownDirection::Read,
@@ -5132,6 +5127,62 @@ impl RuntimeService {
             .handle_tcp_accept_observation(listener_id, remote, local, observation)
     }
 
+    fn handle_tcp_passive_open_for_test(
+        &self,
+        observation: TcpPassiveOpenObservation,
+    ) -> HammerResult<()> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner.app_control.handle_tcp_passive_open(observation)
+    }
+
+    fn observe_tcp_receive_ack_for_test(
+        &self,
+        observation: TcpReceiveAckObservation,
+    ) -> HammerResult<()> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        <RuntimeAppControlHandle as TcpEstablishedBackend>::observe_receive_ack(
+            &inner.app_control,
+            observation,
+        )
+        .map_err(|err| HammerError::internal(format!("observe tcp receive ack: {err}")))
+    }
+
+    fn tcp_listener_lookup_id_for_bind_for_test(&self, bind: SocketAddr) -> Option<TcpLookupId> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner
+            .app_control
+            .with_state(move |state| {
+                Ok(state
+                    .tcp_listeners
+                    .iter()
+                    .find(|registration| registration.bind == bind)
+                    .map(|registration| registration.lookup_id))
+            })
+            .ok()
+            .flatten()
+    }
+
+    fn tcp_connection_state_for_endpoints_for_test(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<hammer_core::protocol::tcp::TcpState> {
+        let inner = self.inner.lock().expect("service mutex poisoned");
+        inner
+            .app_control
+            .with_state(move |state| {
+                Ok(state
+                    .tcp_connections
+                    .iter()
+                    .find(|registration| {
+                        registration.local == Some(local) && registration.remote == remote
+                    })
+                    .map(|registration| registration.state))
+            })
+            .ok()
+            .flatten()
+    }
+
     fn shared_tcp_listener_installed_for_test(&self, listener_id: TcpListenerId) -> bool {
         let inner = self.inner.lock().expect("service mutex poisoned");
         let control = inner
@@ -6463,6 +6514,95 @@ interval = "5s"
         assert_eq!(syn.local().port(), 49_152);
         assert!(syn.payload().is_empty());
         assert_eq!(syn.flags() & crate::transport::tcp::TCP_FLAG_ACK, 0);
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_passive_open_emits_syn_ack_and_registers_syn_rcvd() {
+        let service = new_test_service("");
+        let app = service.app_context();
+        let bind: SocketAddr = "192.0.2.10:443".parse().expect("listener bind");
+        app.bind_tcp_listener(bind, 1).expect("bind tcp listener");
+        let listener_id = service
+            .tcp_listener_lookup_id_for_bind_for_test(bind)
+            .expect("listener lookup id");
+
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let remote: SocketAddr = "198.51.100.7:50007".parse().expect("remote");
+        let observation = TcpPassiveOpenObservation {
+            listener_id,
+            local: bind,
+            remote,
+            sequence: 12_345,
+            next_sequence: 12_346,
+            advertised_window: 64_000,
+            capabilities: hammer_core::protocol::tcp::TcpCapabilities::default(),
+        };
+        service
+            .handle_tcp_passive_open_for_test(observation)
+            .expect("handle passive open");
+
+        // A half-open SYN_RCVD connection is registered (accept is NOT completed yet).
+        assert_eq!(
+            service.tcp_connection_state_for_endpoints_for_test(bind, remote),
+            Some(crate::transport::tcp::TcpState::SynRcvd),
+        );
+
+        // A SYN-ACK is emitted with the reversed tuple and ack = syn_seq + 1.
+        let emitted = output.emitted.lock().expect("tcp output capture poisoned");
+        let syn_ack = emitted
+            .iter()
+            .find(|segment| {
+                segment.flags() & TCP_FLAG_SYN != 0
+                    && segment.flags() & crate::transport::tcp::TCP_FLAG_ACK != 0
+            })
+            .expect("syn-ack emitted");
+        assert_eq!(syn_ack.local(), bind);
+        assert_eq!(syn_ack.remote(), remote);
+        assert_eq!(syn_ack.acknowledgment(), 12_346);
+        drop(emitted);
+
+        service.close().expect("close service");
+    }
+
+    #[test]
+    fn runtime_service_receive_ack_observation_emits_ack_segment() {
+        let service = new_test_service("");
+        let output = Arc::new(RecordingTcpOutputBackend::default());
+        service.install_tcp_output_backend_for_test(Arc::clone(&output));
+
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.7:50007".parse().expect("remote");
+        service
+            .observe_tcp_receive_ack_for_test(TcpReceiveAckObservation {
+                lookup_id: 11,
+                connection_id: TcpConnectionId::new(17),
+                local,
+                remote,
+                send_sequence: 0x0102_0304,
+                receive_acknowledgment: 0x0506_0708,
+                advertised_window: 70_000,
+                kind: crate::transport::tcp::established::TcpReceiveAckKind::Challenge,
+                reason: crate::transport::tcp::established::TcpReceiveAckReason::NotAcceptable,
+            })
+            .expect("emit receive ack");
+
+        let emitted = output.emitted.lock().expect("tcp output capture poisoned");
+        let ack = emitted.last().expect("ack emitted");
+        assert_eq!(ack.local(), local);
+        assert_eq!(ack.remote(), remote);
+        assert_eq!(ack.sequence(), 0x0102_0304);
+        assert_eq!(ack.acknowledgment(), 0x0506_0708);
+        assert_eq!(ack.flags() & TCP_FLAG_ACK, TCP_FLAG_ACK);
+        assert_eq!(ack.payload(), &[]);
+        assert_eq!(
+            u16::from_be_bytes([ack.packet[34], ack.packet[35]]),
+            u16::MAX
+        );
+        drop(emitted);
 
         service.close().expect("close service");
     }

@@ -2,14 +2,12 @@ use std::cell::RefCell;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
+use super::TcpInputError;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Network, Node, NodeId,
     NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::vec::Vec as InfraVec;
-
-use super::TcpInputError;
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -184,8 +182,8 @@ struct TcpResetRuntime {
 }
 
 thread_local! {
-    static TCP_RESET_RUNTIMES: RefCell<InfraVec<TcpResetRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_RESET_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpResetRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
 }
 
 #[inline]

@@ -1399,16 +1399,22 @@ fn next_data_runtime_context_id() -> usize {
 mod tests {
     use super::*;
     use hammer_adapter::{
-        NodeId, TraceControlPlane, TraceEntry, TraceInputPolicy, TracePolicy, TraceRecord,
+        BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeId, NodeProcessFn, NodeRegistration,
+        NodeResult, NodeRuntimeData, NodeState, TraceControlPlane, TraceEntry, TraceInputPolicy,
+        TracePolicy, TraceRecord,
     };
     use hammer_core::log::{Factory, Level, LogWriter};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::{
+        Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
     use std::thread;
     use std::time::Duration;
     use std::time::Instant as StdInstant;
     use tokio::sync::oneshot;
 
     static TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    static POLLING_DRIVER_CALLS: AtomicU64 = AtomicU64::new(0);
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK
@@ -1428,6 +1434,39 @@ mod tests {
                 .expect("capture writer poisoned")
                 .push((level, message));
         }
+    }
+
+    struct PollingDriverNode;
+
+    impl Node for PollingDriverNode {
+        fn process(
+            &mut self,
+            _runtime: &DataPlaneRuntime,
+            frame: &mut BufferFrame,
+        ) -> hammer_core::error::CoreResult<NodeResult> {
+            frame.clear();
+            Ok(NodeResult::drop())
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            polling_driver_process
+        }
+    }
+
+    impl DriverNode for PollingDriverNode {
+        fn node_registration(&self) -> NodeRegistration {
+            NodeRegistration::next("spawn-test-polling-driver", 0)
+        }
+    }
+
+    fn polling_driver_process(
+        _runtime: &DataPlaneRuntime,
+        _data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> hammer_core::error::CoreResult<NodeResult> {
+        POLLING_DRIVER_CALLS.fetch_add(1, Ordering::SeqCst);
+        frame.clear();
+        Ok(NodeResult::drop())
     }
 
     #[test]
@@ -1651,6 +1690,43 @@ mod tests {
         assert!(async_stats[1].1.is_empty());
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    #[test]
+    fn data_worker_schedules_polling_driver_after_worker_local_progress() {
+        let _guard = test_lock();
+        POLLING_DRIVER_CALLS.store(0, Ordering::SeqCst);
+        let data_runtime =
+            DataRuntime::new(1, "spawn-test-poll-driver", 512 * 1024, 2).expect("data runtime");
+        let context = data_runtime.context();
+
+        context
+            .for_each_worker(|_| {
+                DATA_PLANE_RUNTIME.with(|runtime| {
+                    let node = runtime.nodes().register_driver(PollingDriverNode);
+                    runtime
+                        .nodes()
+                        .set_node_state(node, NodeState::Polling)
+                        .expect("set polling driver state");
+                });
+            })
+            .expect("register polling driver on worker");
+
+        context
+            .spawn_local_on_worker(0, || async {})
+            .expect("schedule worker-local progress");
+
+        let deadline = StdInstant::now() + Duration::from_secs(1);
+        while StdInstant::now() < deadline {
+            if POLLING_DRIVER_CALLS.load(Ordering::SeqCst) > 0 {
+                data_runtime.shutdown_timeout(Duration::from_secs(1));
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        data_runtime.shutdown_timeout(Duration::from_secs(1));
+        assert_eq!(POLLING_DRIVER_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[test]

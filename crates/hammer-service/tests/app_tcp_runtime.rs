@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::HammerResult;
 use hammer_core::log::DiscardWriter;
-use hammer_runtime::app::AppFlowId;
+use hammer_runtime::app::{AppBufferLease, AppFlowId, AppObjectRef, AppOpcode, AppSend};
 use hammer_runtime::spawn::with_data_plane_buffers;
 use hammer_service::RuntimeService;
 use hammer_service::app::AppIngressTarget;
@@ -329,6 +330,73 @@ fn service_tcp_app_target_enqueues_recv_cqe_descriptor_into_runtime_backend() {
         other => panic!("expected recv descriptor payload, got {other:?}"),
     }
     assert_eq!(received.1, expected_payload.len() as i32);
+
+    service.close().expect("close service");
+}
+
+#[test]
+fn service_tcp_app_send_stays_in_owner_ring_for_session_node_polling() {
+    let service = new_test_service();
+    let app = service.app_context();
+    let peer: SocketAddr = "198.51.100.42:443".parse().expect("tcp peer");
+    let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
+    let _owner = app.owner_worker_for_flow(flow).expect("flow owner");
+
+    let payload = b"session-node-owned-send".to_vec();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let buffers = with_data_plane_buffers(Clone::clone);
+                let index = buffers
+                    .alloc_index_with_bytes(Default::default(), &payload)
+                    .expect("alloc app send buffer");
+                worker
+                    .runtime()
+                    .send(AppSend::new(AppBufferLease::from_buffer(buffers, index)))
+                    .await
+                    .expect("submit app send");
+            })
+            .await
+            .expect("spawn flow send task");
+        });
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        service
+            .tcp_pending_send_payload_lens_for_flow_for_test(flow)
+            .is_empty(),
+        "service pump must not consume app SQEs"
+    );
+
+    let descriptor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let app_runtime = worker.runtime();
+                let backend = worker.backend();
+                let buffers = with_data_plane_buffers(Clone::clone);
+                let index = buffers
+                    .alloc_index_with_bytes(Default::default(), b"session-node-owned-send")
+                    .expect("alloc app send buffer");
+                app_runtime
+                    .send(AppSend::new(AppBufferLease::from_buffer(buffers, index)))
+                    .await
+                    .expect("submit app send");
+                backend
+                    .try_pop_sqe_descriptor()
+                    .expect("session node visible sqe descriptor")
+            })
+            .await
+            .expect("spawn on flow owner")
+        });
+
+    assert_eq!(descriptor.opcode(), AppOpcode::Send);
+    assert_eq!(descriptor.object(), AppObjectRef::Flow(flow));
 
     service.close().expect("close service");
 }

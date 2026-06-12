@@ -345,6 +345,100 @@ fn app_runtime_send_remains_observable_before_shutdown_request() {
 }
 
 #[test]
+fn app_backend_try_pop_submission_entry_without_awaiting() {
+    let data_runtime = DataRuntime::new(1, "app-backend-sync-entry-pop-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let flow = AppFlowId::new(101);
+
+    let round_trip = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                let runtime = worker.runtime();
+                let buffers = with_data_plane_buffers(Clone::clone);
+                let index = buffers
+                    .alloc_index_with_bytes(Default::default(), b"sync-entry-send")
+                    .expect("alloc sync entry send buffer");
+                let registered =
+                    AppRegisteredBuffer::from_lease(AppBufferLease::from_buffer(buffers, index))
+                        .expect("registered buffer");
+                let descriptor = AppSqeDescriptor::new(
+                    AppOpcode::Send,
+                    AppUserData::new(101),
+                    AppObjectRef::Flow(flow),
+                    AppSqeData::Send {
+                        buffer: registered.index(),
+                    },
+                );
+
+                runtime
+                    .try_push_submission_entry(AppSubmissionEntry::with_attachment(
+                        descriptor, registered,
+                    ))
+                    .expect("push submission entry");
+
+                let entry = backend
+                    .try_pop_submission_entry()
+                    .expect("pop submission entry");
+                assert!(backend.try_pop_submission_entry().is_none());
+                let (descriptor_round_trip, registered) = entry.into_parts();
+                let (_buffer_index, lease) = registered
+                    .expect("submission entry attachment")
+                    .into_parts();
+                let payload = lease.copy_current().expect("copy send payload");
+                lease.release();
+                (descriptor_round_trip, payload)
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(round_trip.0.user_data(), AppUserData::new(101));
+    assert_eq!(round_trip.0.object(), AppObjectRef::Flow(flow));
+    assert_eq!(round_trip.1, b"sync-entry-send");
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
+fn app_backend_try_pop_tcp_shutdown_without_awaiting() {
+    let data_runtime = DataRuntime::new(1, "app-backend-sync-shutdown-pop-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let flow = AppFlowId::new(102);
+
+    let shutdown = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            app.spawn_on_flow(flow, move |worker| async move {
+                let backend = worker.backend();
+                worker
+                    .runtime()
+                    .shutdown(Shutdown::Write)
+                    .await
+                    .expect("submit shutdown");
+
+                let shutdown = backend.try_pop_tcp_shutdown().expect("pop tcp shutdown");
+                assert!(backend.try_pop_tcp_shutdown().is_none());
+                shutdown
+            })
+            .await
+            .expect("spawn flow task")
+        });
+
+    assert_eq!(shutdown.flow(), flow);
+    assert_eq!(shutdown.how(), Shutdown::Write);
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
 fn app_send_descriptor_uses_buffer_handle_not_payload_object() {
     let data_runtime =
         DataRuntime::new(1, "app-ring-descriptor-test", 512 * 1024, 2).expect("data runtime");

@@ -9,7 +9,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpHandshakeObservation, TcpSeq, TcpState};
-use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
+use hammer_infra::map::FlatHashTable;
 
 use super::options::tcp_capabilities_from_options;
 use super::{TcpLookupId, TcpV4PendingConnectionKey, TcpV6PendingConnectionKey};
@@ -331,8 +331,8 @@ struct TcpSynSentRuntime {
 }
 
 thread_local! {
-    static TCP_SYN_SENT_RUNTIMES: RefCell<InfraVec<TcpSynSentRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_SYN_SENT_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpSynSentRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
 }
 
 #[inline]

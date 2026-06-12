@@ -1015,6 +1015,11 @@ impl AppRingHandle {
     }
 
     #[inline]
+    pub fn pop_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.tcp_shutdowns.borrow_mut().pop()
+    }
+
+    #[inline]
     pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
         self.submissions
             .borrow_mut()
@@ -1193,8 +1198,19 @@ impl AppRingHandle {
     }
 
     #[inline]
+    pub fn pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        let descriptor = self.pop_submission_descriptor()?;
+        Some(submission_entry_from_descriptor(descriptor, &self.buffers))
+    }
+
+    #[inline]
     pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
         poll_fn(|cx| self.submissions.borrow_mut().poll_pop(cx)).await
+    }
+
+    #[inline]
+    pub fn pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.submissions.borrow_mut().pop()
     }
 
     #[inline]

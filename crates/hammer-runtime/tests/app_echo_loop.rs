@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use hammer_runtime::app::{AppBufferLease, AppContext, AppFlowId, AppSend};
+use hammer_runtime::app::{
+    AppBufferLease, AppContext, AppFlowId, AppObjectRef, AppOpcode, AppSend, AppSqeData,
+};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
@@ -80,7 +82,7 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
 }
 
 #[test]
-fn app_context_send_on_flow_copies_payload_across_workers() {
+fn app_context_send_on_flow_forwards_registered_buffer_across_workers() {
     let data_runtime =
         DataRuntime::new(2, "app-send-on-flow", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
@@ -110,23 +112,38 @@ fn app_context_send_on_flow_copies_payload_across_workers() {
                 .await
                 .expect("spawn source flow");
 
-            let (payload, target_ptr) = app
+            let (descriptor, payload, target_ptr) = app
                 .spawn_on_flow(target_flow, move |worker| async move {
-                    let send = worker.backend().next_send().await.expect("target send");
-                    let payload = send.lease().copy_current().expect("copy target payload");
-                    let ptr = send.lease().current_ptr().expect("target pointer") as usize;
-                    (payload, ptr)
+                    let entry = worker
+                        .backend()
+                        .next_submission_entry()
+                        .await
+                        .expect("target send entry");
+                    let descriptor = *entry.descriptor();
+                    let attachment = entry.attachment().expect("target send attachment");
+                    let payload = attachment
+                        .lease()
+                        .copy_current()
+                        .expect("copy target payload");
+                    let ptr = attachment.lease().current_ptr().expect("target pointer") as usize;
+                    (descriptor, payload, ptr)
                 })
                 .await
                 .expect("spawn target flow");
 
-            (source_ptr, payload, target_ptr)
+            (source_ptr, descriptor, payload, target_ptr)
         });
 
-    assert_eq!(result.1, b"cross-worker-send");
-    assert_ne!(
-        result.0, result.2,
-        "cross-worker send must rebuild the lease on the target worker"
+    assert_eq!(result.1.opcode(), AppOpcode::Send);
+    assert_eq!(result.1.object(), AppObjectRef::Flow(target_flow));
+    match result.1.payload() {
+        AppSqeData::Send { .. } => {}
+        other => panic!("unexpected sqe data: {other:?}"),
+    }
+    assert_eq!(result.2, b"cross-worker-send");
+    assert_eq!(
+        result.0, result.3,
+        "cross-worker send must preserve the registered buffer lease"
     );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));

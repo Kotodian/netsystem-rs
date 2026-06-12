@@ -14,6 +14,7 @@ pub mod output;
 pub mod rcv_process;
 pub mod reply;
 pub mod reset;
+pub mod session;
 pub mod state;
 pub mod syn_sent;
 
@@ -52,6 +53,10 @@ pub use reply::{
     TcpControlFlags, emit_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
 };
 pub use reset::{TcpResetNext, TcpResetNode};
+pub use session::{
+    TcpAppClose, TcpAppCommand, TcpAppRecv, TcpAppSend, TcpAppShutdownCommand, TcpSessionNode,
+    TcpSessionRuntime, TcpSessionStep, TcpSessionTimerKind,
+};
 pub use state::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState, TcpDispatchEntry,
     TcpDispatchTable, TcpInputFlags, TcpListenerConfig,

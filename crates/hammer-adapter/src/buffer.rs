@@ -1265,6 +1265,16 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
+    pub fn schedule_polling_driver_nodes(&self) -> CoreResult<usize> {
+        let nodes = self.nodes.polling_driver_nodes()?;
+        let scheduled = nodes.len();
+        for node in nodes {
+            self.schedule_empty_frame(node)?;
+        }
+        Ok(scheduled)
+    }
+
+    #[inline]
     pub fn set_node_interrupt_pending(&self, node: NodeId) -> CoreResult<bool> {
         if !self.nodes.mark_interrupt_pending(node)? {
             return Ok(false);

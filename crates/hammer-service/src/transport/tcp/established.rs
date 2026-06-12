@@ -2,13 +2,13 @@ use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, FrameIndex, NextFrame, Node, NodeId, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId, TcpSeq, TcpState};
-use hammer_infra::vec::Vec as InfraVec;
 
 use super::TcpLookupId;
 use super::connection::{
@@ -41,6 +41,218 @@ pub trait TcpEstablishedBackend: Send + Sync {
     }
 
     fn observe_close(&self, observation: TcpEstablishedObservation) -> CoreResult<()>;
+}
+
+struct TcpEstablishedBackendHandle {
+    raw: *const (),
+    clone_raw: fn(*const ()) -> *const (),
+    drop_raw: fn(*const ()),
+    observe_ack_progress: fn(*const (), TcpEstablishedAckObservation) -> CoreResult<()>,
+    observe_receive_ack: fn(*const (), TcpReceiveAckObservation) -> CoreResult<()>,
+    observe_close: fn(*const (), TcpEstablishedObservation) -> CoreResult<()>,
+}
+
+unsafe impl Send for TcpEstablishedBackendHandle {}
+unsafe impl Sync for TcpEstablishedBackendHandle {}
+
+impl Default for TcpEstablishedBackendHandle {
+    #[inline]
+    fn default() -> Self {
+        Self::noop()
+    }
+}
+
+impl Clone for TcpEstablishedBackendHandle {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            raw: (self.clone_raw)(self.raw),
+            clone_raw: self.clone_raw,
+            drop_raw: self.drop_raw,
+            observe_ack_progress: self.observe_ack_progress,
+            observe_receive_ack: self.observe_receive_ack,
+            observe_close: self.observe_close,
+        }
+    }
+}
+
+impl Drop for TcpEstablishedBackendHandle {
+    #[inline]
+    fn drop(&mut self) {
+        (self.drop_raw)(self.raw);
+    }
+}
+
+impl TcpEstablishedBackendHandle {
+    #[inline]
+    fn noop() -> Self {
+        Self {
+            raw: std::ptr::null(),
+            clone_raw: clone_noop_established_backend,
+            drop_raw: drop_noop_established_backend,
+            observe_ack_progress: observe_noop_ack_progress,
+            observe_receive_ack: observe_noop_receive_ack,
+            observe_close: observe_noop_close,
+        }
+    }
+
+    #[inline]
+    fn new<O>(backend: Arc<O>) -> Self
+    where
+        O: TcpEstablishedBackend + 'static,
+    {
+        Self {
+            raw: Arc::into_raw(backend) as *const (),
+            clone_raw: clone_established_backend_arc::<O>,
+            drop_raw: drop_established_backend_arc::<O>,
+            observe_ack_progress: observe_ack_progress_with::<O>,
+            observe_receive_ack: observe_receive_ack_with::<O>,
+            observe_close: observe_close_with::<O>,
+        }
+    }
+
+    #[inline]
+    fn observe_ack_progress(&self, observation: TcpEstablishedAckObservation) -> CoreResult<()> {
+        (self.observe_ack_progress)(self.raw, observation)
+    }
+
+    #[inline]
+    fn observe_receive_ack(&self, observation: TcpReceiveAckObservation) -> CoreResult<()> {
+        (self.observe_receive_ack)(self.raw, observation)
+    }
+
+    #[inline]
+    fn observe_close(&self, observation: TcpEstablishedObservation) -> CoreResult<()> {
+        (self.observe_close)(self.raw, observation)
+    }
+}
+
+#[inline]
+fn clone_noop_established_backend(_raw: *const ()) -> *const () {
+    std::ptr::null()
+}
+
+#[inline]
+fn drop_noop_established_backend(_raw: *const ()) {}
+
+#[inline]
+fn observe_noop_ack_progress(
+    _raw: *const (),
+    _observation: TcpEstablishedAckObservation,
+) -> CoreResult<()> {
+    Ok(())
+}
+
+#[inline]
+fn observe_noop_receive_ack(
+    _raw: *const (),
+    _observation: TcpReceiveAckObservation,
+) -> CoreResult<()> {
+    Ok(())
+}
+
+#[inline]
+fn observe_noop_close(_raw: *const (), _observation: TcpEstablishedObservation) -> CoreResult<()> {
+    Ok(())
+}
+
+#[inline]
+fn clone_established_backend_arc<O>(raw: *const ()) -> *const ()
+where
+    O: TcpEstablishedBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    if !raw.is_null() {
+        unsafe {
+            Arc::increment_strong_count(raw);
+        }
+    }
+    raw.cast()
+}
+
+#[inline]
+fn drop_established_backend_arc<O>(raw: *const ())
+where
+    O: TcpEstablishedBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    if !raw.is_null() {
+        unsafe {
+            drop(Arc::from_raw(raw));
+        }
+    }
+}
+
+#[inline]
+fn observe_ack_progress_with<O>(
+    raw: *const (),
+    observation: TcpEstablishedAckObservation,
+) -> CoreResult<()>
+where
+    O: TcpEstablishedBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(());
+    }
+    unsafe { (&*raw).observe_ack_progress(observation) }
+}
+
+#[inline]
+fn observe_receive_ack_with<O>(
+    raw: *const (),
+    observation: TcpReceiveAckObservation,
+) -> CoreResult<()>
+where
+    O: TcpEstablishedBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(());
+    }
+    unsafe { (&*raw).observe_receive_ack(observation) }
+}
+
+#[inline]
+fn observe_close_with<O>(raw: *const (), observation: TcpEstablishedObservation) -> CoreResult<()>
+where
+    O: TcpEstablishedBackend + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(());
+    }
+    unsafe { (&*raw).observe_close(observation) }
+}
+
+#[derive(Clone, Default)]
+pub struct TcpEstablishedBackendSlot {
+    inner: Arc<ArcSwapOption<TcpEstablishedBackendHandle>>,
+}
+
+impl TcpEstablishedBackendSlot {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn install<O>(&self, backend: Arc<O>)
+    where
+        O: TcpEstablishedBackend + 'static,
+    {
+        self.inner
+            .store(Some(Arc::new(TcpEstablishedBackendHandle::new(backend))));
+    }
+
+    #[inline]
+    fn load(&self) -> TcpEstablishedBackendHandle {
+        self.inner
+            .load_full()
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,12 +306,12 @@ pub struct TcpEstablishedObservation {
 #[derive(Clone)]
 struct TcpEstablishedStateRuntime {
     snapshot: TcpEstablishedSnapshotHandle,
-    backend: Option<Arc<dyn TcpEstablishedBackend>>,
+    backend: TcpEstablishedBackendSlot,
 }
 
 thread_local! {
-    static TCP_ESTABLISHED_RUNTIMES: RefCell<InfraVec<TcpEstablishedStateRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_ESTABLISHED_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpEstablishedStateRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
     static TCP_ESTABLISHED_REORDER: RefCell<TcpEstablishedReorderStore> =
         RefCell::new(TcpEstablishedReorderStore::new());
 }
@@ -111,7 +323,7 @@ fn has_tcp_established_runtime(data: NodeRuntimeData) -> bool {
 
 fn register_tcp_established_runtime(
     snapshot: TcpEstablishedSnapshotHandle,
-    backend: Option<Arc<dyn TcpEstablishedBackend>>,
+    backend: TcpEstablishedBackendSlot,
 ) -> CoreResult<NodeRuntimeData> {
     TCP_ESTABLISHED_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
@@ -131,7 +343,7 @@ fn tcp_established_runtime(data: NodeRuntimeData) -> CoreResult<TcpEstablishedSt
     if !has_tcp_established_runtime(data) {
         return Ok(TcpEstablishedStateRuntime {
             snapshot: default_established_snapshot_handle(),
-            backend: None,
+            backend: TcpEstablishedBackendSlot::new(),
         });
     }
     let slot = data.usize_word(0)?;
@@ -147,7 +359,7 @@ fn tcp_established_runtime(data: NodeRuntimeData) -> CoreResult<TcpEstablishedSt
 fn sync_tcp_established_runtime(
     data: NodeRuntimeData,
     snapshot: TcpEstablishedSnapshotHandle,
-    backend: Option<Arc<dyn TcpEstablishedBackend>>,
+    backend: TcpEstablishedBackendSlot,
 ) -> CoreResult<()> {
     if !has_tcp_established_runtime(data) {
         return Ok(());
@@ -171,7 +383,7 @@ pub struct TcpEstablishedNode {
     #[node(default = default_established_snapshot_handle())]
     snapshot: TcpEstablishedSnapshotHandle,
     #[node(default)]
-    backend: Option<Arc<dyn TcpEstablishedBackend>>,
+    backend: TcpEstablishedBackendSlot,
     #[node(default)]
     cached_next: Option<hammer_adapter::NodeId>,
 }
@@ -181,7 +393,7 @@ impl TcpEstablishedNode {
     pub(crate) fn with_runtime(
         mut self,
         snapshot: TcpEstablishedSnapshotHandle,
-        backend: Option<Arc<dyn TcpEstablishedBackend>>,
+        backend: TcpEstablishedBackendSlot,
     ) -> Self {
         if has_tcp_established_runtime(self.runtime_data) {
             let _ =
@@ -216,7 +428,7 @@ impl Node for TcpEstablishedNode {
             frame,
             rcv_process,
             &self.snapshot,
-            self.backend.as_deref(),
+            &self.backend.load(),
         )?;
         self.cached_next = Some(rcv_process);
         Ok(result)
@@ -251,7 +463,7 @@ fn tcp_established_process(
         frame,
         rcv_process,
         &state.snapshot,
-        state.backend.as_deref(),
+        &state.backend.load(),
     )
 }
 
@@ -260,9 +472,9 @@ fn tcp_established_route_frame(
     frame: &mut BufferFrame,
     rcv_process: NodeId,
     snapshot: &TcpEstablishedSnapshotHandle,
-    backend: Option<&dyn TcpEstablishedBackend>,
+    backend: &TcpEstablishedBackendHandle,
 ) -> CoreResult<NodeResult> {
-    let original = frame.drain_pending().collect::<std::vec::Vec<_>>();
+    let original = frame.drain_pending().collect::<hammer_infra::vec::Vec<_>>();
     let mut output = TcpEstablishedRouteOutput::new(rcv_process);
     for (offset, index) in original.iter().copied().enumerate() {
         let action = match tcp_established_action_for_index(runtime, index, snapshot, backend) {
@@ -329,7 +541,7 @@ enum TcpEstablishedAction {
     PassThrough,
     Deliver {
         connection_id: TcpLookupId,
-        segments: std::vec::Vec<TcpEstablishedDelivery>,
+        segments: hammer_infra::vec::Vec<TcpEstablishedDelivery>,
     },
     Consumed,
     Drop,
@@ -337,7 +549,7 @@ enum TcpEstablishedAction {
 
 struct TcpEstablishedRouteOutput {
     rcv_process: NodeId,
-    frames: std::vec::Vec<FrameIndex>,
+    frames: hammer_infra::vec::Vec<FrameIndex>,
 }
 
 impl TcpEstablishedRouteOutput {
@@ -345,7 +557,7 @@ impl TcpEstablishedRouteOutput {
     fn new(rcv_process: NodeId) -> Self {
         Self {
             rcv_process,
-            frames: std::vec::Vec::new(),
+            frames: hammer_infra::vec::Vec::new(),
         }
     }
 
@@ -403,8 +615,9 @@ impl TcpEstablishedRouteOutput {
         if frame.has_pending() && self.frames.is_empty() {
             return Ok(NodeResult::next_current(self.rcv_process));
         }
-        let mut nexts =
-            std::vec::Vec::with_capacity(usize::from(frame.has_pending()) + self.frames.len());
+        let mut nexts = hammer_infra::vec::Vec::with_capacity(
+            usize::from(frame.has_pending()) + self.frames.len(),
+        );
         if frame.has_pending() {
             nexts.push(NextFrame::Current(self.rcv_process));
         }
@@ -440,7 +653,7 @@ fn tcp_established_action_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     snapshot: &TcpEstablishedSnapshotHandle,
-    backend: Option<&dyn TcpEstablishedBackend>,
+    backend: &TcpEstablishedBackendHandle,
 ) -> CoreResult<TcpEstablishedAction> {
     let Some(pending) = take_pending_tcp_app_ingress(index)? else {
         return Ok(TcpEstablishedAction::PassThrough);
@@ -476,14 +689,12 @@ fn tcp_established_action_for_index(
                 next_receive_sequence: None,
             },
         );
-        if let Some(backend) = backend
-            && let Some(observation) = tcp_established_close_observation(
-                runtime,
-                index,
-                connection,
-                TcpCloseReason::RemoteReset,
-            )?
-        {
+        if let Some(observation) = tcp_established_close_observation(
+            runtime,
+            index,
+            connection,
+            TcpCloseReason::RemoteReset,
+        )? {
             backend.observe_close(observation)?;
         }
         runtime.free_index(index);
@@ -553,14 +764,12 @@ fn tcp_established_action_for_index(
                     next_receive_sequence: None,
                 },
             );
-            if let Some(backend) = backend
-                && let Some(observation) = tcp_established_ack_observation(
-                    connection,
-                    ack_validation,
-                    segment.advertised_window,
-                    ack_state_transition,
-                )
-            {
+            if let Some(observation) = tcp_established_ack_observation(
+                connection,
+                ack_validation,
+                segment.advertised_window,
+                ack_state_transition,
+            ) {
                 backend.observe_ack_progress(observation)?;
             }
         }
@@ -584,7 +793,7 @@ fn tcp_established_action_for_index(
             runtime,
         )?
     } else {
-        std::vec::Vec::new()
+        hammer_infra::vec::Vec::new()
     };
     if let Some(last) = delivered_buffered.last() {
         next_receive_sequence = Some(last.end_sequence);
@@ -616,14 +825,12 @@ fn tcp_established_action_for_index(
             next_receive_sequence,
         },
     );
-    if let Some(backend) = backend
-        && let Some(observation) = tcp_established_ack_observation(
-            connection,
-            ack_validation,
-            segment.advertised_window,
-            ack_state_transition,
-        )
-    {
+    if let Some(observation) = tcp_established_ack_observation(
+        connection,
+        ack_validation,
+        segment.advertised_window,
+        ack_state_transition,
+    ) {
         backend.observe_ack_progress(observation)?;
     }
     if tcp_should_observe_remote_fin(
@@ -633,14 +840,12 @@ fn tcp_established_action_for_index(
         ack_validation,
         starts_at_receive_next,
     ) {
-        if let Some(backend) = backend
-            && let Some(observation) = tcp_established_close_observation(
-                runtime,
-                index,
-                connection,
-                TcpCloseReason::RemoteFin,
-            )?
-        {
+        if let Some(observation) = tcp_established_close_observation(
+            runtime,
+            index,
+            connection,
+            TcpCloseReason::RemoteFin,
+        )? {
             backend.observe_close(observation)?;
         }
     }
@@ -648,7 +853,7 @@ fn tcp_established_action_for_index(
         tcp_established_reorder_remove_connection(pending.connection_id, runtime)?;
     }
     Ok(if deliver_to_app {
-        let mut segments = std::vec::Vec::with_capacity(1 + delivered_buffered.len());
+        let mut segments = hammer_infra::vec::Vec::with_capacity(1 + delivered_buffered.len());
         segments.push(TcpEstablishedDelivery {
             index,
             fin: segment.fin(),
@@ -752,22 +957,20 @@ fn tcp_established_close_observation(
 fn tcp_observe_receive_ack(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    backend: Option<&dyn TcpEstablishedBackend>,
+    backend: &TcpEstablishedBackendHandle,
     connection: Option<TcpConnectionSnapshot>,
     kind: TcpReceiveAckKind,
     reason: TcpReceiveAckReason,
     receive_acknowledgment: u32,
 ) -> CoreResult<()> {
-    if let Some(backend) = backend
-        && let Some(observation) = tcp_receive_ack_observation(
-            runtime,
-            index,
-            connection,
-            kind,
-            reason,
-            receive_acknowledgment,
-        )?
-    {
+    if let Some(observation) = tcp_receive_ack_observation(
+        runtime,
+        index,
+        connection,
+        kind,
+        reason,
+        receive_acknowledgment,
+    )? {
         backend.observe_receive_ack(observation)?;
     }
     Ok(())
@@ -1086,14 +1289,16 @@ fn tcp_sequence_in_window(sequence: u32, window_start: u32, window_len: u32) -> 
 
 #[derive(Debug)]
 struct TcpEstablishedReorderStore {
-    connections: std::vec::Vec<TcpEstablishedReorderConnection>,
+    connections: hammer_infra::vec::Vec<TcpEstablishedReorderConnection>,
 }
 
 impl TcpEstablishedReorderStore {
     #[inline]
     fn new() -> Self {
         Self {
-            connections: std::vec::Vec::with_capacity(TCP_ESTABLISHED_REORDER_CONNECTION_CAP),
+            connections: hammer_infra::vec::Vec::with_capacity(
+                TCP_ESTABLISHED_REORDER_CONNECTION_CAP,
+            ),
         }
     }
 
@@ -1108,7 +1313,8 @@ impl TcpEstablishedReorderStore {
             return;
         }
         if self.connections.len() == TCP_ESTABLISHED_REORDER_CONNECTION_CAP {
-            let mut removed = self.connections.remove(0);
+            let mut removed = tcp_established_vec_remove(&mut self.connections, 0)
+                .expect("reorder connection cap reached with non-empty table");
             removed.free(runtime);
         }
         let mut connection = TcpEstablishedReorderConnection::new(connection_id);
@@ -1120,13 +1326,13 @@ impl TcpEstablishedReorderStore {
         &mut self,
         connection_id: TcpLookupId,
         receive_next: u32,
-    ) -> std::vec::Vec<TcpEstablishedBufferedSegment> {
+    ) -> hammer_infra::vec::Vec<TcpEstablishedBufferedSegment> {
         let Some(position) = self.position(connection_id) else {
-            return std::vec::Vec::new();
+            return hammer_infra::vec::Vec::new();
         };
         let delivered = self.connections[position].take_contiguous(receive_next);
         if self.connections[position].segments.is_empty() {
-            self.connections.remove(position);
+            let _ = tcp_established_vec_remove(&mut self.connections, position);
         }
         delivered
     }
@@ -1135,7 +1341,8 @@ impl TcpEstablishedReorderStore {
         let Some(position) = self.position(connection_id) else {
             return;
         };
-        let mut removed = self.connections.remove(position);
+        let mut removed = tcp_established_vec_remove(&mut self.connections, position)
+            .expect("reorder connection position should be valid");
         removed.free(runtime);
     }
 
@@ -1160,7 +1367,7 @@ impl TcpEstablishedReorderStore {
 #[derive(Debug)]
 struct TcpEstablishedReorderConnection {
     connection_id: TcpLookupId,
-    segments: std::vec::Vec<TcpEstablishedBufferedSegment>,
+    segments: hammer_infra::vec::Vec<TcpEstablishedBufferedSegment>,
 }
 
 impl TcpEstablishedReorderConnection {
@@ -1168,7 +1375,7 @@ impl TcpEstablishedReorderConnection {
     fn new(connection_id: TcpLookupId) -> Self {
         Self {
             connection_id,
-            segments: std::vec::Vec::with_capacity(TCP_ESTABLISHED_REORDER_SEGMENT_CAP),
+            segments: hammer_infra::vec::Vec::with_capacity(TCP_ESTABLISHED_REORDER_SEGMENT_CAP),
         }
     }
 
@@ -1186,7 +1393,8 @@ impl TcpEstablishedReorderConnection {
             }
         }
         if let Some(offset) = replace_at {
-            let replaced = self.segments.remove(offset);
+            let replaced = tcp_established_vec_remove(&mut self.segments, offset)
+                .expect("replace offset should be valid");
             runtime.free_index(replaced.index);
             insert_at = offset;
         } else if self.segments.len() == TCP_ESTABLISHED_REORDER_SEGMENT_CAP {
@@ -1200,20 +1408,21 @@ impl TcpEstablishedReorderConnection {
                 .expect("reorder segment cap reached with non-empty table");
             runtime.free_index(evicted.index);
         }
-        self.segments.insert(insert_at, segment);
+        tcp_established_vec_insert(&mut self.segments, insert_at, segment);
     }
 
     fn take_contiguous(
         &mut self,
         receive_next: u32,
-    ) -> std::vec::Vec<TcpEstablishedBufferedSegment> {
-        let mut delivered = std::vec::Vec::new();
+    ) -> hammer_infra::vec::Vec<TcpEstablishedBufferedSegment> {
+        let mut delivered = hammer_infra::vec::Vec::new();
         let mut current = receive_next;
         while let Some(segment) = self.segments.first().copied() {
             if segment.start_sequence != current {
                 break;
             }
-            let segment = self.segments.remove(0);
+            let segment = tcp_established_vec_remove(&mut self.segments, 0)
+                .expect("first reorder segment should be removable");
             current = segment.end_sequence;
             delivered.push(segment);
         }
@@ -1292,7 +1501,7 @@ fn tcp_established_reorder_take_contiguous(
     connection_id: TcpLookupId,
     receive_next: u32,
     runtime: &DataPlaneRuntime,
-) -> CoreResult<std::vec::Vec<TcpEstablishedBufferedSegment>> {
+) -> CoreResult<hammer_infra::vec::Vec<TcpEstablishedBufferedSegment>> {
     let delivered = TCP_ESTABLISHED_REORDER.with(|store| {
         Ok(store
             .try_borrow_mut()
@@ -1303,6 +1512,30 @@ fn tcp_established_reorder_take_contiguous(
         runtime.prefetch_read(segment.index);
     }
     Ok(delivered)
+}
+
+fn tcp_established_vec_remove<T>(
+    values: &mut hammer_infra::vec::Vec<T>,
+    index: usize,
+) -> Option<T> {
+    if index >= values.len() {
+        return None;
+    }
+    let mut tail = values.drain(index..);
+    let removed = tail.next()?;
+    let mut kept = hammer_infra::vec::Vec::with_capacity(tail.len());
+    kept.extend(tail);
+    values.extend(kept);
+    Some(removed)
+}
+
+fn tcp_established_vec_insert<T>(values: &mut hammer_infra::vec::Vec<T>, index: usize, value: T) {
+    debug_assert!(index <= values.len());
+    let tail = values.drain(index..);
+    let mut kept = hammer_infra::vec::Vec::with_capacity(tail.len());
+    kept.extend(tail);
+    values.push(value);
+    values.extend(kept);
 }
 
 fn tcp_established_reorder_remove_connection(
@@ -1420,7 +1653,6 @@ mod tests {
     };
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId};
-    use hammer_infra::vec::Vec as InfraVec;
 
     use super::{
         TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedObservation,
@@ -2808,7 +3040,7 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
-        let mut words = InfraVec::new();
+        let mut words = hammer_infra::vec::Vec::new();
         words.push(u16::from_be_bytes([source.octets()[0], source.octets()[1]]));
         words.push(u16::from_be_bytes([source.octets()[2], source.octets()[3]]));
         words.push(u16::from_be_bytes([
@@ -2835,7 +3067,7 @@ mod tests {
     fn update_ipv4_header_checksum(packet: &mut [u8]) {
         packet[10] = 0;
         packet[11] = 0;
-        let mut words = InfraVec::new();
+        let mut words = hammer_infra::vec::Vec::new();
         for chunk in packet[..20].chunks(2) {
             words.push(u16::from_be_bytes([chunk[0], chunk[1]]));
         }

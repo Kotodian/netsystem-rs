@@ -1,17 +1,15 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
+use super::TcpLookupId;
+use super::input::take_pending_tcp_app_ingress;
+use crate::app::{AppIngressRegistry, AppIngressTarget};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeProcessFn, NodeResult,
     NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::vec::Vec as InfraVec;
-
-use super::TcpLookupId;
-use super::input::take_pending_tcp_app_ingress;
-use crate::app::{AppIngressRegistry, AppIngressTarget};
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -106,8 +104,8 @@ struct TcpRcvProcessRuntime {
 }
 
 thread_local! {
-    static TCP_RCV_PROCESS_RUNTIMES: RefCell<InfraVec<TcpRcvProcessRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_RCV_PROCESS_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpRcvProcessRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
 }
 
 fn register_tcp_rcv_process_runtime(snapshot: TcpRcvProcessSnapshotHandle) -> NodeRuntimeData {

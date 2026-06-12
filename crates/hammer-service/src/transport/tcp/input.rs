@@ -15,7 +15,7 @@ use hammer_adapter::{
     PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::{map::FlatHashTable, vec::Vec as InfraVec};
+use hammer_infra::map::FlatHashTable;
 
 use super::{
     TcpConnectionSnapshotPool, TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext,
@@ -259,8 +259,8 @@ struct TcpInputRuntime {
 }
 
 thread_local! {
-    static TCP_INPUT_RUNTIMES: RefCell<InfraVec<TcpInputRuntime>> =
-        const { RefCell::new(InfraVec::new()) };
+    static TCP_INPUT_RUNTIMES: RefCell<hammer_infra::vec::Vec<TcpInputRuntime>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
 }
 
 fn register_tcp_input_runtime(snapshot: TcpInputSnapshotHandle) -> NodeRuntimeData {
@@ -331,7 +331,7 @@ struct PendingTcpAppIngressEntry {
 #[derive(Debug, Clone, Default)]
 struct PendingTcpAppIngressPool {
     pool_id: u64,
-    entries: InfraVec<PendingTcpAppIngressEntry>,
+    entries: hammer_infra::vec::Vec<PendingTcpAppIngressEntry>,
 }
 
 impl PendingTcpAppIngressPool {
@@ -339,14 +339,14 @@ impl PendingTcpAppIngressPool {
     const fn new(pool_id: u64) -> Self {
         Self {
             pool_id,
-            entries: InfraVec::new(),
+            entries: hammer_infra::vec::Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 struct PendingTcpAppIngressStore {
-    pools: InfraVec<PendingTcpAppIngressPool>,
+    pools: hammer_infra::vec::Vec<PendingTcpAppIngressPool>,
 }
 
 thread_local! {
@@ -360,7 +360,7 @@ impl PendingTcpAppIngressStore {
     #[inline]
     const fn new() -> Self {
         Self {
-            pools: InfraVec::new(),
+            pools: hammer_infra::vec::Vec::new(),
         }
     }
 
@@ -445,7 +445,7 @@ struct PendingTcpAcceptEntry {
 #[derive(Debug, Clone, Default)]
 struct PendingTcpAcceptPool {
     pool_id: u64,
-    entries: InfraVec<PendingTcpAcceptEntry>,
+    entries: hammer_infra::vec::Vec<PendingTcpAcceptEntry>,
 }
 
 impl PendingTcpAcceptPool {
@@ -453,21 +453,21 @@ impl PendingTcpAcceptPool {
     const fn new(pool_id: u64) -> Self {
         Self {
             pool_id,
-            entries: InfraVec::new(),
+            entries: hammer_infra::vec::Vec::new(),
         }
     }
 }
 
 #[derive(Debug, Clone, Default)]
 struct PendingTcpAcceptStore {
-    pools: InfraVec<PendingTcpAcceptPool>,
+    pools: hammer_infra::vec::Vec<PendingTcpAcceptPool>,
 }
 
 impl PendingTcpAcceptStore {
     #[inline]
     const fn new() -> Self {
         Self {
-            pools: InfraVec::new(),
+            pools: hammer_infra::vec::Vec::new(),
         }
     }
 
