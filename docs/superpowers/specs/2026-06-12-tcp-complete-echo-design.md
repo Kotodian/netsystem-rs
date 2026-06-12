@@ -75,7 +75,11 @@ SYN 到达 → TcpInputNode（lookup 命中 listener）
 - SYN_RCVD 收 RST：回收半开条目。
 - 校验失败/backlog 满：走 `TcpResetNode` 现有 RST 合成。
 
-**1.2 established 入口校验（VPP `tcp_segment_validate` 等价）**
+**1.2 主动打开 `SYN_SENT → ESTABLISHED` 补全**
+
+现有 `TcpSynSentNode` 仅观察不处理，升级为真实处理：校验 SYN-ACK 的 ack 号与窗口、拒绝非法 SYN-ACK/杂散 ACK/RST（RST 经序号校验后终止连接并投递错误 CQE）、升级 ESTABLISHED、经 `TcpOutputBackend` 发最终 ACK、取消 `Connect` 定时器。保持现有 phase-1 app 语义：不新增 connect 完成 CQE。
+
+**1.3 established 入口校验（VPP `tcp_segment_validate` 等价）**
 
 所有 ESTABLISHED 及之后状态的包的公共入口，处理顺序：
 1. 序号校验：段落在接收窗口内（含 payload 部分重叠判断）。失败 → challenge ACK 后丢；带 RST 则静默丢。
@@ -88,7 +92,7 @@ SYN 到达 → TcpInputNode（lookup 命中 listener）
 5. payload：Phase 1 仅有序段（seq==rcv_nxt）推进 rcv_nxt、回 ACK、转 TcpRcvProcessNode；乱序段回 ACK 后丢（Phase 2 改为缓冲）。
 6. FIN：转关闭状态机。
 
-**1.3 关闭全状态机**
+**1.4 关闭全状态机**
 
 对端先关（echo server 常见）：
 ```
@@ -112,16 +116,16 @@ TIME_WAIT：注册 2MSL 定时器；重复 FIN 重发 ACK；到期回收（全�
 - Close SQE 语义 = 优雅关闭（排空再 FIN），不是 abort。
 - dispatch table 为 FinWait1/FinWait2/CloseWait/Closing/LastAck/TimeWait 补 `(state, flags)` 条目，全部路由到 `TcpEstablishedNode`。
 
-**1.4 定时器端到端联通**
+**1.5 定时器端到端联通**
 
 service 侧 `TimerExpired` 真实处理（替换现有空操作）：
 - `Retransmit`：触发队首重传，喂拥塞 loss 反馈，RTO 指数退避；超过最大重传次数 → 连接判死。
 - `Connect`：主动打开超时 → 清理 + app 错误 CQE。
-- SYN_RCVD 超时（复用 Connect 或 Retransmit 类别，重发 SYN-ACK 上限后回收半开条目）。
+- SYN_RCVD 超时：使用 `Retransmit` 类别（重发 SYN-ACK 本质是重传），重发达到上限后回收半开条目。
 - `TimeWait`：2MSL 到期回收。
 - `DelayedAck`/`Persist`/`KeepAlive`：Phase 1 维持非终结 no-op，分别在 Phase 3/2/4 联通。
 
-**1.5 app 生命周期联通**
+**1.6 app 生命周期联通**
 
 - Close SQE → 排空 → FIN 全链路。
 - Closed/RST 时 pending SQE 的错误 CQE 投递。
