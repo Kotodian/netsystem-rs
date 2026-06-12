@@ -10,7 +10,7 @@ use hammer_service::transport::tcp::congestion_control::{
 };
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpConnectionTable,
-    TcpDataPlaneConnection, TcpOutputSegment,
+    TcpDataPlaneConnection, TcpOutputRecord,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -31,10 +31,10 @@ fn connection() -> TcpDataPlaneConnection {
     connection
 }
 
-fn segment(sequence: u32, payload: &[u8]) -> TcpOutputSegment {
+fn record(sequence: u32, payload: &[u8]) -> TcpOutputRecord {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-    TcpOutputSegment {
+    TcpOutputRecord {
         lookup_id: 7,
         connection_id: TcpConnectionId::new(7001),
         local,
@@ -43,9 +43,8 @@ fn segment(sequence: u32, payload: &[u8]) -> TcpOutputSegment {
         acknowledgment: 2000,
         flags: TCP_FLAG_ACK | TCP_FLAG_PSH,
         advertised_window: 4096,
-        payload: payload.to_vec(),
+        payload_len: payload.len(),
         metadata: RouteMetadata::default(),
-        packet: payload.to_vec(),
     }
 }
 
@@ -54,10 +53,10 @@ fn tcp_congestion_node_updates_one_connection_from_ack_sample() {
     let now = Instant::now();
     let mut table = TcpConnectionTable::empty();
     let mut connection = connection();
-    let sent = segment(1000, &[1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN]);
+    let sent = record(1000, &[1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN]);
     connection
         .retransmit_queue_mut()
-        .track_segment_with_sent_at(&sent, now - Duration::from_millis(20));
+        .track_output_with_sent_at(&sent, now - Duration::from_millis(20));
     connection.set_send_state(1000, sent.next_send_sequence(), 65_535);
     table.insert(connection);
 

@@ -427,6 +427,27 @@ struct BufferPoolInner {
     in_use: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct BufferChainRangeSnapshot {
+    index: BufferIndex,
+    current_data: usize,
+    current_len: usize,
+    next_buffer: Option<BufferIndex>,
+    flags: BufferFlags,
+    total_len_not_including_first: usize,
+}
+
+#[derive(Debug)]
+struct BufferChainRangeRestore {
+    snapshots: Vec<BufferChainRangeSnapshot>,
+}
+
+#[derive(Debug)]
+struct BufferChainRange {
+    head: BufferIndex,
+    restore: BufferChainRangeRestore,
+}
+
 #[derive(Debug, Clone)]
 pub struct BufferPoolArena {
     inner: Rc<RefCell<BufferPoolInner>>,
@@ -880,6 +901,28 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn append_existing_chain(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         self.buffers.append_existing_chain(head, tail)
+    }
+
+    #[inline]
+    pub fn with_current_range<R>(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce() -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        self.buffers.with_current_range(index, offset, len, f)
+    }
+
+    #[inline]
+    pub fn with_current_chain_range<R>(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(BufferIndex) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        self.buffers.with_current_chain_range(index, offset, len, f)
     }
 
     #[inline]
@@ -1656,6 +1699,58 @@ impl BufferPool {
     }
 
     #[inline]
+    pub fn with_current_range<R>(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce() -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        let original = self
+            .arena
+            .inner
+            .borrow_mut()
+            .set_current_range(index, offset, len)?;
+        let result = f();
+        let restore = self
+            .arena
+            .inner
+            .borrow_mut()
+            .restore_current_range(index, original);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    #[inline]
+    pub fn with_current_chain_range<R>(
+        &self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+        f: impl FnOnce(BufferIndex) -> CoreResult<R>,
+    ) -> CoreResult<R> {
+        let range = self
+            .arena
+            .inner
+            .borrow_mut()
+            .set_current_chain_range(index, offset, len)?;
+        let result = f(range.head);
+        let restore = self
+            .arena
+            .inner
+            .borrow_mut()
+            .restore_current_chain_range(range.restore);
+        match (result, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(err), _) => Err(err),
+            (Ok(_), Err(err)) => Err(err),
+        }
+    }
+
+    #[inline]
     pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena
@@ -2260,6 +2355,180 @@ impl BufferPoolInner {
             current_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
         }
         self.refresh_chain_lengths(head)
+    }
+
+    #[inline]
+    fn set_current_range(
+        &mut self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+    ) -> CoreResult<(usize, usize)> {
+        let buffer = self.buffer_mut(index)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CoreError::internal("buffer current range overflow"))?;
+        if end > buffer.current_len {
+            return Err(CoreError::internal("buffer current range exceeds length"));
+        }
+        let original = (buffer.current_data, buffer.current_len);
+        buffer.current_data += offset;
+        buffer.current_len = len;
+        Ok(original)
+    }
+
+    #[inline]
+    fn restore_current_range(
+        &mut self,
+        index: BufferIndex,
+        original: (usize, usize),
+    ) -> CoreResult<()> {
+        let buffer = self.buffer_mut(index)?;
+        buffer.current_data = original.0;
+        buffer.current_len = original.1;
+        Ok(())
+    }
+
+    #[inline]
+    fn set_current_chain_range(
+        &mut self,
+        index: BufferIndex,
+        offset: usize,
+        len: usize,
+    ) -> CoreResult<BufferChainRange> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| CoreError::internal("buffer current chain range overflow"))?;
+        let mut snapshots = Vec::new();
+        let mut total_len = 0usize;
+        let mut next = Some(index);
+        while let Some(current) = next {
+            let buffer = self.buffer(current)?;
+            total_len = total_len
+                .checked_add(buffer.current_len)
+                .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
+            snapshots.push(BufferChainRangeSnapshot {
+                index: current,
+                current_data: buffer.current_data,
+                current_len: buffer.current_len,
+                next_buffer: buffer.next_buffer,
+                flags: buffer.flags,
+                total_len_not_including_first: buffer.total_len_not_including_first,
+            });
+            next = buffer.next_buffer;
+        }
+        if end > total_len {
+            return Err(CoreError::internal(
+                "buffer current chain range exceeds length",
+            ));
+        }
+        if snapshots.is_empty() {
+            return Err(CoreError::internal("buffer chain range source is empty"));
+        }
+
+        let mut range_head = None;
+        let mut range_start_offset = 0usize;
+        let mut cursor = 0usize;
+        for snapshot in &snapshots {
+            let next_cursor = cursor
+                .checked_add(snapshot.current_len)
+                .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
+            if offset < next_cursor {
+                range_head = Some(snapshot.index);
+                range_start_offset = offset - cursor;
+                break;
+            }
+            cursor = next_cursor;
+        }
+        if range_head.is_none() && len == 0 && end == total_len {
+            let last = snapshots
+                .last()
+                .ok_or_else(|| CoreError::internal("buffer chain range source is empty"))?;
+            range_head = Some(last.index);
+            range_start_offset = last.current_len;
+        }
+        let range_head =
+            range_head.ok_or_else(|| CoreError::internal("buffer current chain range is empty"))?;
+
+        let restore = BufferChainRangeRestore { snapshots };
+        if len == 0 {
+            let buffer = self.buffer_mut(range_head)?;
+            buffer.current_data += range_start_offset;
+            buffer.current_len = 0;
+            buffer.next_buffer = None;
+            buffer.flags.remove(BufferFlags::NEXT_PRESENT);
+            buffer.total_len_not_including_first = 0;
+            return Ok(BufferChainRange {
+                head: range_head,
+                restore,
+            });
+        }
+
+        let mut in_range = false;
+        let mut remaining = len;
+        for snapshot in restore.snapshots.iter() {
+            if snapshot.index == range_head {
+                in_range = true;
+            }
+            if !in_range {
+                continue;
+            }
+
+            let start_offset = if snapshot.index == range_head {
+                range_start_offset
+            } else {
+                0
+            };
+            let available = snapshot
+                .current_len
+                .checked_sub(start_offset)
+                .ok_or_else(|| {
+                    CoreError::internal("buffer current chain range start exceeds buffer length")
+                })?;
+            let take = available.min(remaining);
+            let finishes_range = take == remaining;
+            {
+                let buffer = self.buffer_mut(snapshot.index)?;
+                buffer.current_data = snapshot.current_data + start_offset;
+                buffer.current_len = take;
+                if finishes_range {
+                    buffer.next_buffer = None;
+                    buffer.flags.remove(BufferFlags::NEXT_PRESENT);
+                    buffer.total_len_not_including_first = 0;
+                }
+            }
+            remaining -= take;
+            if finishes_range {
+                break;
+            }
+        }
+        if remaining != 0 {
+            self.restore_current_chain_range(restore)?;
+            return Err(CoreError::internal(
+                "buffer current chain range exceeds length",
+            ));
+        }
+        if let Err(err) = self.refresh_chain_lengths(range_head) {
+            self.restore_current_chain_range(restore)?;
+            return Err(err);
+        }
+        Ok(BufferChainRange {
+            head: range_head,
+            restore,
+        })
+    }
+
+    #[inline]
+    fn restore_current_chain_range(&mut self, restore: BufferChainRangeRestore) -> CoreResult<()> {
+        for snapshot in restore.snapshots {
+            let buffer = self.buffer_mut(snapshot.index)?;
+            buffer.current_data = snapshot.current_data;
+            buffer.current_len = snapshot.current_len;
+            buffer.next_buffer = snapshot.next_buffer;
+            buffer.flags = snapshot.flags;
+            buffer.total_len_not_including_first = snapshot.total_len_not_including_first;
+        }
+        Ok(())
     }
 
     #[inline]

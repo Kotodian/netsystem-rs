@@ -6,7 +6,7 @@ use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpState};
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpConnectionTable,
-    TcpDataPlaneConnection, TcpLookupId, TcpOutputSegment,
+    TcpDataPlaneConnection, TcpLookupId, TcpOutputRecord, tcp_output_packet,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -31,10 +31,10 @@ fn connection(
     )
 }
 
-fn output_segment(lookup_id: TcpLookupId, connection_id: TcpConnectionId) -> TcpOutputSegment {
+fn output_record(lookup_id: TcpLookupId, connection_id: TcpConnectionId) -> TcpOutputRecord {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("test local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("test remote");
-    TcpOutputSegment {
+    TcpOutputRecord {
         lookup_id,
         connection_id,
         local,
@@ -43,9 +43,8 @@ fn output_segment(lookup_id: TcpLookupId, connection_id: TcpConnectionId) -> Tcp
         acknowledgment: 2_000,
         flags: TCP_FLAG_ACK | TCP_FLAG_PSH,
         advertised_window: 4_096,
-        payload: vec![1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN],
+        payload_len: DEFAULT_TCP_OUTPUT_PAYLOAD_LEN,
         metadata: RouteMetadata::default(),
-        packet: vec![1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN],
     }
 }
 
@@ -207,6 +206,53 @@ fn tcp_data_plane_connection_scales_advertised_windows_safely() {
 }
 
 #[test]
+fn tcp_data_plane_connection_scales_peer_window_into_send_view() {
+    let mut connection = connection(8, TcpConnectionId::new(8), 50_008);
+    connection.set_local_capabilities(TcpCapabilities {
+        window_scale: Some(2),
+        ..TcpCapabilities::default()
+    });
+    connection.apply_peer_handshake_capabilities(TcpCapabilities {
+        window_scale: Some(5),
+        ..TcpCapabilities::default()
+    });
+
+    connection.set_send_state(1_000, 1_200, 32);
+
+    assert_eq!(connection.snd_wnd(), 32 << 5);
+    assert_eq!(connection.output_send_view().snd_wnd, 32 << 5);
+}
+
+#[test]
+fn tcp_data_plane_connection_output_snapshot_advertises_scaled_receive_window() {
+    let local: SocketAddr = "192.0.2.10:50008".parse().expect("test local");
+    let remote: SocketAddr = "198.51.100.10:443".parse().expect("test remote");
+    let mut connection = TcpDataPlaneConnection::new(
+        9,
+        Some(TcpConnectionId::new(9)),
+        DataWorkerId::new(0),
+        TcpState::Established,
+        local.port(),
+        Some(local),
+        remote,
+    );
+    connection.set_local_capabilities(TcpCapabilities {
+        window_scale: Some(4),
+        ..TcpCapabilities::default()
+    });
+    connection.apply_peer_handshake_capabilities(TcpCapabilities {
+        window_scale: Some(2),
+        ..TcpCapabilities::default()
+    });
+    connection.set_receive_state(9_000, 8_192);
+
+    let snapshot = connection.output_snapshot().expect("output snapshot");
+    let record = tcp_output_packet(snapshot, local, &[]).expect("output packet");
+
+    assert_eq!(record.advertised_window, 512);
+}
+
+#[test]
 fn tcp_connection_table_resolves_by_lookup_and_connection_id() {
     let first = connection(11, TcpConnectionId::new(101), 50_011);
     let second = connection(12, TcpConnectionId::new(102), 50_012);
@@ -231,13 +277,13 @@ fn tcp_connection_table_resolves_by_lookup_and_connection_id() {
     );
 
     let next_output_at = Instant::now() + Duration::from_millis(10);
-    let segment = output_segment(11, TcpConnectionId::new(101));
+    let record = output_record(11, TcpConnectionId::new(101));
     let by_lookup = table
         .lookup_by_lookup_id_mut(11)
         .expect("mutable lookup connection");
     by_lookup.set_send_state(1_000, 2_440, 32_768);
     by_lookup.set_next_output_at(Some(next_output_at));
-    by_lookup.retransmit_queue_mut().track_segment(&segment);
+    by_lookup.retransmit_queue_mut().track_output(&record);
 
     let by_id = table
         .lookup_by_connection_id_mut(TcpConnectionId::new(102))

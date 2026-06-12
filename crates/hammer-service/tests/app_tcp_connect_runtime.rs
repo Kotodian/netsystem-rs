@@ -259,11 +259,12 @@ fn service_tcp_connect_send_and_shutdown_requests_are_consumed_without_late_writ
     request_send(&app, flow, b"first-payload");
 
     wait_for(|| {
-        service.tcp_pending_send_payloads_for_flow_for_test(flow) == vec![b"first-payload".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow)
+            == vec![b"first-payload".len()]
     });
     assert_eq!(
-        service.tcp_pending_send_payloads_for_flow_for_test(flow),
-        vec![b"first-payload".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow),
+        vec![b"first-payload".len()]
     );
 
     request_shutdown(&app, flow, Shutdown::Write);
@@ -276,12 +277,12 @@ fn service_tcp_connect_send_and_shutdown_requests_are_consumed_without_late_writ
     std::thread::sleep(Duration::from_millis(50));
 
     assert_eq!(
-        service.tcp_pending_send_payloads_for_flow_for_test(flow),
-        vec![b"first-payload".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow),
+        vec![b"first-payload".len()]
     );
     assert_eq!(
-        service.tcp_transport_send_payloads_for_flow_for_test(flow),
-        vec![b"first-payload".to_vec()]
+        service.tcp_transport_send_payload_lens_for_flow_for_test(flow),
+        vec![b"first-payload".len()]
     );
     assert_eq!(
         service.tcp_shutdown_for_flow_for_test(flow),
@@ -302,21 +303,22 @@ fn service_tcp_connect_send_is_staged_for_transport_but_not_dequeued_before_esta
     request_send(&app, flow, b"first-payload");
 
     wait_for(|| {
-        service.tcp_pending_send_payloads_for_flow_for_test(flow) == vec![b"first-payload".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow)
+            == vec![b"first-payload".len()]
     });
     wait_for(|| {
-        service.tcp_transport_send_payloads_for_flow_for_test(flow)
-            == vec![b"first-payload".to_vec()]
+        service.tcp_transport_send_payload_lens_for_flow_for_test(flow)
+            == vec![b"first-payload".len()]
     });
 
     assert_eq!(
-        service.tcp_take_transport_send_payload_for_flow_for_test(flow),
+        service.tcp_take_transport_send_payload_len_for_flow_for_test(flow),
         None,
         "transport dequeue must stay gated until the connection becomes send-ready"
     );
     assert_eq!(
-        service.tcp_transport_send_payloads_for_flow_for_test(flow),
-        vec![b"first-payload".to_vec()]
+        service.tcp_transport_send_payload_lens_for_flow_for_test(flow),
+        vec![b"first-payload".len()]
     );
 
     service.close().expect("close service");
@@ -338,8 +340,8 @@ fn service_tcp_connect_read_shutdown_keeps_send_path_open_until_write_shutdown()
 
     request_send(&app, flow, b"send-after-read-shutdown");
     wait_for(|| {
-        service.tcp_pending_send_payloads_for_flow_for_test(flow)
-            == vec![b"send-after-read-shutdown".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow)
+            == vec![b"send-after-read-shutdown".len()]
     });
 
     request_shutdown(&app, flow, Shutdown::Write);
@@ -352,8 +354,8 @@ fn service_tcp_connect_read_shutdown_keeps_send_path_open_until_write_shutdown()
     std::thread::sleep(Duration::from_millis(50));
 
     assert_eq!(
-        service.tcp_pending_send_payloads_for_flow_for_test(flow),
-        vec![b"send-after-read-shutdown".to_vec()]
+        service.tcp_pending_send_payload_lens_for_flow_for_test(flow),
+        vec![b"send-after-read-shutdown".len()]
     );
     assert_eq!(
         service.tcp_shutdown_for_flow_for_test(flow),
@@ -388,7 +390,7 @@ fn service_tcp_connect_write_shutdown_remains_sticky_after_later_read_shutdown()
 
     assert!(
         service
-            .tcp_pending_send_payloads_for_flow_for_test(flow)
+            .tcp_pending_send_payload_lens_for_flow_for_test(flow)
             .is_empty(),
         "write-close must remain terminal for buffered sends"
     );

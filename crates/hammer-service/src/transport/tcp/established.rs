@@ -35,6 +35,11 @@ pub trait TcpEstablishedBackend: Send + Sync {
         Ok(())
     }
 
+    #[inline]
+    fn observe_receive_ack(&self, _observation: TcpReceiveAckObservation) -> CoreResult<()> {
+        Ok(())
+    }
+
     fn observe_close(&self, observation: TcpEstablishedObservation) -> CoreResult<()>;
 }
 
@@ -47,6 +52,34 @@ pub struct TcpEstablishedAckObservation {
     pub previous_state: TcpState,
     pub ack_state_transition: Option<TcpState>,
     pub acknowledges_local_fin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpReceiveAckKind {
+    Ack,
+    Challenge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpReceiveAckReason {
+    Data,
+    Fin,
+    Gap,
+    InvalidAck,
+    NotAcceptable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpReceiveAckObservation {
+    pub lookup_id: TcpLookupId,
+    pub connection_id: TcpConnectionId,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub send_sequence: u32,
+    pub receive_acknowledgment: u32,
+    pub advertised_window: u32,
+    pub kind: TcpReceiveAckKind,
+    pub reason: TcpReceiveAckReason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,6 +449,17 @@ fn tcp_established_action_for_index(
     let connection_state = connection.map(|connection| connection.state);
     let segment = tcp_observed_segment(runtime, index)?;
     if !tcp_segment_is_sequence_acceptable(connection, segment) {
+        tcp_observe_receive_ack(
+            runtime,
+            index,
+            backend,
+            connection,
+            TcpReceiveAckKind::Challenge,
+            TcpReceiveAckReason::NotAcceptable,
+            connection
+                .map(|connection| connection.rcv_nxt)
+                .unwrap_or_default(),
+        )?;
         return Ok(TcpEstablishedAction::Drop);
     }
     let ack_validation = tcp_validate_acknowledgment(connection, segment);
@@ -449,6 +493,17 @@ fn tcp_established_action_for_index(
         return Ok(TcpEstablishedAction::Drop);
     }
     if ack_validation.is_invalid() {
+        tcp_observe_receive_ack(
+            runtime,
+            index,
+            backend,
+            connection,
+            TcpReceiveAckKind::Challenge,
+            TcpReceiveAckReason::InvalidAck,
+            connection
+                .map(|connection| connection.rcv_nxt)
+                .unwrap_or_default(),
+        )?;
         return Ok(TcpEstablishedAction::Drop);
     }
     let starts_at_receive_next = tcp_segment_starts_at_receive_next(connection, segment);
@@ -475,6 +530,17 @@ fn tcp_established_action_for_index(
         ack_validation,
         starts_at_receive_next,
     ) {
+        tcp_observe_receive_ack(
+            runtime,
+            index,
+            backend,
+            connection,
+            TcpReceiveAckKind::Ack,
+            TcpReceiveAckReason::Gap,
+            connection
+                .map(|connection| connection.rcv_nxt)
+                .unwrap_or_default(),
+        )?;
         tcp_established_reorder_buffer_segment(pending.connection_id, index, segment, runtime)?;
         if should_apply_progress {
             snapshot.apply_receive_progress(
@@ -522,6 +588,23 @@ fn tcp_established_action_for_index(
     };
     if let Some(last) = delivered_buffered.last() {
         next_receive_sequence = Some(last.end_sequence);
+    }
+    if let Some(receive_acknowledgment) = tcp_receive_ack_for_segment(
+        connection,
+        segment,
+        starts_at_receive_next,
+        next_receive_sequence,
+    ) {
+        let reason = tcp_receive_ack_reason(segment, starts_at_receive_next);
+        tcp_observe_receive_ack(
+            runtime,
+            index,
+            backend,
+            connection,
+            TcpReceiveAckKind::Ack,
+            reason,
+            receive_acknowledgment,
+        )?;
     }
     snapshot.apply_receive_progress(
         pending.connection_id,
@@ -649,6 +732,87 @@ fn tcp_established_close_observation(
     let Some(connection_id) = connection.connection_id else {
         return Ok(None);
     };
+    Ok(
+        if let Some((local, remote)) =
+            tcp_established_observation_endpoints(runtime, index, connection)?
+        {
+            Some(TcpEstablishedObservation {
+                lookup_id: connection.lookup_id,
+                connection_id,
+                local,
+                remote,
+                reason,
+            })
+        } else {
+            None
+        },
+    )
+}
+
+fn tcp_observe_receive_ack(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    backend: Option<&dyn TcpEstablishedBackend>,
+    connection: Option<TcpConnectionSnapshot>,
+    kind: TcpReceiveAckKind,
+    reason: TcpReceiveAckReason,
+    receive_acknowledgment: u32,
+) -> CoreResult<()> {
+    if let Some(backend) = backend
+        && let Some(observation) = tcp_receive_ack_observation(
+            runtime,
+            index,
+            connection,
+            kind,
+            reason,
+            receive_acknowledgment,
+        )?
+    {
+        backend.observe_receive_ack(observation)?;
+    }
+    Ok(())
+}
+
+fn tcp_receive_ack_observation(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    connection: Option<TcpConnectionSnapshot>,
+    kind: TcpReceiveAckKind,
+    reason: TcpReceiveAckReason,
+    receive_acknowledgment: u32,
+) -> CoreResult<Option<TcpReceiveAckObservation>> {
+    let Some(connection) = connection else {
+        return Ok(None);
+    };
+    let Some(connection_id) = connection.connection_id else {
+        return Ok(None);
+    };
+    Ok(
+        if let Some((local, remote)) =
+            tcp_established_observation_endpoints(runtime, index, connection)?
+        {
+            Some(TcpReceiveAckObservation {
+                lookup_id: connection.lookup_id,
+                connection_id,
+                local,
+                remote,
+                send_sequence: connection.snd_nxt,
+                receive_acknowledgment,
+                advertised_window: connection.rcv_wnd,
+                kind,
+                reason,
+            })
+        } else {
+            None
+        },
+    )
+}
+
+fn tcp_established_observation_endpoints(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    connection: TcpConnectionSnapshot,
+) -> CoreResult<Option<(SocketAddr, SocketAddr)>> {
     let metadata = runtime.metadata(index)?;
     let local = connection.local.or_else(|| {
         metadata
@@ -663,15 +827,39 @@ fn tcp_established_close_observation(
             .map(|source| SocketAddr::new(source.host, source.port))
     });
     Ok(match (local, remote) {
-        (Some(local), Some(remote)) => Some(TcpEstablishedObservation {
-            lookup_id: connection.lookup_id,
-            connection_id,
-            local,
-            remote,
-            reason,
-        }),
+        (Some(local), Some(remote)) => Some((local, remote)),
         _ => None,
     })
+}
+
+#[inline]
+fn tcp_receive_ack_for_segment(
+    connection: Option<TcpConnectionSnapshot>,
+    segment: TcpObservedSegment,
+    starts_at_receive_next: bool,
+    next_receive_sequence: Option<u32>,
+) -> Option<u32> {
+    if !segment.fin() && !segment.has_payload() {
+        return None;
+    }
+    if starts_at_receive_next {
+        return next_receive_sequence;
+    }
+    connection.map(|connection| connection.rcv_nxt)
+}
+
+#[inline]
+fn tcp_receive_ack_reason(
+    segment: TcpObservedSegment,
+    starts_at_receive_next: bool,
+) -> TcpReceiveAckReason {
+    if !starts_at_receive_next {
+        TcpReceiveAckReason::Gap
+    } else if segment.fin() {
+        TcpReceiveAckReason::Fin
+    } else {
+        TcpReceiveAckReason::Data
+    }
 }
 
 fn tcp_established_ack_observation(
@@ -741,42 +929,72 @@ fn tcp_observed_segment(
     index: BufferIndex,
 ) -> CoreResult<TcpObservedSegment> {
     let cursor = runtime.get_buffer(index)?.packet_cursor();
-    let packet: std::vec::Vec<u8> = runtime.copy_current_chain(index)?.into_iter().collect();
-    let flags_offset = cursor.transport_header_offset() + 13;
-    let sequence_offset = cursor.transport_header_offset() + 4;
-    let acknowledgment_offset = cursor.transport_header_offset() + 8;
-    let window_offset = cursor.transport_header_offset() + 14;
-    let Some(flags) = packet.get(flags_offset) else {
-        return Ok(TcpObservedSegment {
-            flags: 0,
-            sequence: 0,
-            acknowledgment: None,
-            advertised_window: 0,
-            payload_len: 0,
-        });
-    };
-    let sequence = packet
-        .get(sequence_offset..sequence_offset + 4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("sequence bytes")))
-        .unwrap_or_default();
-    let acknowledgment = packet
-        .get(acknowledgment_offset..acknowledgment_offset + 4)
-        .map(|bytes| u32::from_be_bytes(bytes.try_into().expect("ack bytes")))
-        .filter(|_| *flags & 0x10 != 0);
-    let advertised_window = packet
-        .get(window_offset..window_offset + 2)
-        .map(|bytes| u16::from_be_bytes(bytes.try_into().expect("window bytes")) as u32)
-        .unwrap_or_default();
-    let payload_len = (cursor
-        .packet_len()
-        .saturating_sub(cursor.transport_payload_offset())) as u32;
-    Ok(TcpObservedSegment {
-        flags: *flags,
-        sequence,
-        acknowledgment,
-        advertised_window,
-        payload_len,
+    runtime.with_current_chain_io_segments(index, |segments, _total_len| {
+        let flags_offset = cursor.transport_header_offset() + 13;
+        let sequence_offset = cursor.transport_header_offset() + 4;
+        let acknowledgment_offset = cursor.transport_header_offset() + 8;
+        let window_offset = cursor.transport_header_offset() + 14;
+        let Some(flags) = tcp_chain_byte(segments, flags_offset) else {
+            return Ok(TcpObservedSegment {
+                flags: 0,
+                sequence: 0,
+                acknowledgment: None,
+                advertised_window: 0,
+                payload_len: 0,
+            });
+        };
+        let sequence = tcp_chain_u32(segments, sequence_offset)?.unwrap_or_default();
+        let acknowledgment =
+            tcp_chain_u32(segments, acknowledgment_offset)?.filter(|_| flags & 0x10 != 0);
+        let advertised_window = tcp_chain_u16(segments, window_offset)?
+            .map(u32::from)
+            .unwrap_or_default();
+        let payload_len = (cursor
+            .packet_len()
+            .saturating_sub(cursor.transport_payload_offset())) as u32;
+        Ok(TcpObservedSegment {
+            flags,
+            sequence,
+            acknowledgment,
+            advertised_window,
+            payload_len,
+        })
     })
+}
+
+fn tcp_chain_byte(segments: &[&[u8]], offset: usize) -> Option<u8> {
+    let mut remaining = offset;
+    for segment in segments {
+        if remaining < segment.len() {
+            return Some(segment[remaining]);
+        }
+        remaining -= segment.len();
+    }
+    None
+}
+
+fn tcp_chain_array<const N: usize>(
+    segments: &[&[u8]],
+    offset: usize,
+) -> CoreResult<Option<[u8; N]>> {
+    let mut bytes = [0u8; N];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        let Some(value) = tcp_chain_byte(segments, offset + i) else {
+            return Ok(None);
+        };
+        *byte = value;
+    }
+    Ok(Some(bytes))
+}
+
+#[inline]
+fn tcp_chain_u16(segments: &[&[u8]], offset: usize) -> CoreResult<Option<u16>> {
+    Ok(tcp_chain_array::<2>(segments, offset)?.map(u16::from_be_bytes))
+}
+
+#[inline]
+fn tcp_chain_u32(segments: &[&[u8]], offset: usize) -> CoreResult<Option<u32>> {
+    Ok(tcp_chain_array::<4>(segments, offset)?.map(u32::from_be_bytes))
 }
 
 fn tcp_segment_is_sequence_acceptable(
@@ -1204,7 +1422,10 @@ mod tests {
     use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId};
     use hammer_infra::vec::Vec as InfraVec;
 
-    use super::{TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedObservation};
+    use super::{
+        TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedObservation,
+        TcpReceiveAckKind, TcpReceiveAckObservation, TcpReceiveAckReason,
+    };
     use crate::transport::tcp::input::{
         mark_pending_tcp_app_ingress, take_pending_tcp_app_ingress,
     };
@@ -1300,6 +1521,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTcpEstablishedBackend {
         ack_observations: Arc<Mutex<Vec<TcpEstablishedAckObservation>>>,
+        receive_ack_observations: Arc<Mutex<Vec<TcpReceiveAckObservation>>>,
         observations: Arc<Mutex<Vec<TcpEstablishedObservation>>>,
     }
 
@@ -1311,6 +1533,14 @@ mod tests {
             self.ack_observations
                 .lock()
                 .map_err(|_| CoreError::internal("ack observations poisoned"))?
+                .push(observation);
+            Ok(())
+        }
+
+        fn observe_receive_ack(&self, observation: TcpReceiveAckObservation) -> CoreResult<()> {
+            self.receive_ack_observations
+                .lock()
+                .map_err(|_| CoreError::internal("receive ack observations poisoned"))?
                 .push(observation);
             Ok(())
         }
@@ -1714,6 +1944,158 @@ mod tests {
         assert_eq!(snapshot.state, TcpState::FinWait1);
         assert_eq!(runtime.frames_in_use(), 0);
         assert_eq!(runtime.in_use_buffers(), 0);
+    }
+
+    #[test]
+    fn tcp_established_node_observes_receive_ack_for_in_order_payload() {
+        let octet = 98;
+        let local: SocketAddr = "192.0.2.98:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.98:40098".parse().expect("remote");
+        let snapshot = connected_snapshot(local, remote, TcpState::Established);
+        let packet = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, octet),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, octet),
+            local.port(),
+            snapshot.rcv_nxt,
+            snapshot.snd_una,
+            0x2000,
+            tcp_flags(false, false, false, true),
+            b"data",
+        );
+
+        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
+
+        assert_eq!(
+            result.receive_acks,
+            vec![TcpReceiveAckObservation {
+                lookup_id: LOOKUP_ID,
+                connection_id: TcpConnectionId::new(CONNECTION_ID),
+                local,
+                remote,
+                send_sequence: snapshot.snd_nxt,
+                receive_acknowledgment: snapshot.rcv_nxt + 4,
+                advertised_window: snapshot.rcv_wnd,
+                kind: TcpReceiveAckKind::Ack,
+                reason: TcpReceiveAckReason::Data,
+            }]
+        );
+        assert_eq!(result.snapshot.rcv_nxt, snapshot.rcv_nxt + 4);
+        assert_eq!(result.in_use_buffers, 0);
+    }
+
+    #[test]
+    fn tcp_established_node_observes_receive_ack_for_in_order_fin() {
+        let octet = 99;
+        let local: SocketAddr = "192.0.2.99:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.99:40099".parse().expect("remote");
+        let snapshot = connected_snapshot(local, remote, TcpState::Established);
+        let packet = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, octet),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, octet),
+            local.port(),
+            snapshot.rcv_nxt,
+            snapshot.snd_una,
+            0x2000,
+            tcp_flags(true, false, false, true),
+            b"",
+        );
+
+        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
+
+        assert_eq!(
+            result.receive_acks,
+            vec![TcpReceiveAckObservation {
+                lookup_id: LOOKUP_ID,
+                connection_id: TcpConnectionId::new(CONNECTION_ID),
+                local,
+                remote,
+                send_sequence: snapshot.snd_nxt,
+                receive_acknowledgment: snapshot.rcv_nxt + 1,
+                advertised_window: snapshot.rcv_wnd,
+                kind: TcpReceiveAckKind::Ack,
+                reason: TcpReceiveAckReason::Fin,
+            }]
+        );
+        assert_eq!(result.state, Some(TcpState::CloseWait));
+        assert_eq!(result.in_use_buffers, 0);
+    }
+
+    #[test]
+    fn tcp_established_node_observes_receive_ack_for_in_window_gap() {
+        let octet = 100;
+        let local: SocketAddr = "192.0.2.100:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.100:40100".parse().expect("remote");
+        let snapshot = connected_snapshot(local, remote, TcpState::Established);
+        let packet = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, octet),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, octet),
+            local.port(),
+            snapshot.rcv_nxt + 4,
+            snapshot.snd_una,
+            0x2000,
+            tcp_flags(false, false, false, true),
+            b"late",
+        );
+
+        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
+
+        assert_eq!(
+            result.receive_acks,
+            vec![TcpReceiveAckObservation {
+                lookup_id: LOOKUP_ID,
+                connection_id: TcpConnectionId::new(CONNECTION_ID),
+                local,
+                remote,
+                send_sequence: snapshot.snd_nxt,
+                receive_acknowledgment: snapshot.rcv_nxt,
+                advertised_window: snapshot.rcv_wnd,
+                kind: TcpReceiveAckKind::Ack,
+                reason: TcpReceiveAckReason::Gap,
+            }]
+        );
+        assert_eq!(result.snapshot.rcv_nxt, snapshot.rcv_nxt);
+        assert_eq!(result.in_use_buffers, 1);
+    }
+
+    #[test]
+    fn tcp_established_node_observes_challenge_ack_for_invalid_ack() {
+        let octet = 101;
+        let local: SocketAddr = "192.0.2.101:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.101:40101".parse().expect("remote");
+        let snapshot = connected_snapshot(local, remote, TcpState::Established);
+        let packet = ipv4_tcp_packet_with_seq_ack_window(
+            Ipv4Addr::new(198, 51, 100, octet),
+            remote.port(),
+            Ipv4Addr::new(192, 0, 2, octet),
+            local.port(),
+            snapshot.rcv_nxt,
+            snapshot.snd_nxt + 1,
+            0x2000,
+            tcp_flags(false, false, false, true),
+            b"",
+        );
+
+        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
+
+        assert_eq!(
+            result.receive_acks,
+            vec![TcpReceiveAckObservation {
+                lookup_id: LOOKUP_ID,
+                connection_id: TcpConnectionId::new(CONNECTION_ID),
+                local,
+                remote,
+                send_sequence: snapshot.snd_nxt,
+                receive_acknowledgment: snapshot.rcv_nxt,
+                advertised_window: snapshot.rcv_wnd,
+                kind: TcpReceiveAckKind::Challenge,
+                reason: TcpReceiveAckReason::InvalidAck,
+            }]
+        );
+        assert_eq!(result.snapshot, snapshot);
+        assert_eq!(result.in_use_buffers, 0);
     }
 
     #[test]
@@ -2199,6 +2581,93 @@ mod tests {
             0,
             "ACK-only terminal close must release buffered out-of-order payloads"
         );
+    }
+
+    #[derive(Debug)]
+    struct ReceiveAckCaseResult {
+        receive_acks: Vec<TcpReceiveAckObservation>,
+        snapshot: TcpConnectionSnapshot,
+        state: Option<TcpState>,
+        in_use_buffers: usize,
+    }
+
+    fn run_receive_ack_observation_case(
+        snapshot: TcpConnectionSnapshot,
+        packet: Vec<u8>,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> ReceiveAckCaseResult {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
+        let capture = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
+        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
+        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
+            .with_backend(backend.clone());
+        let mut connections =
+            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
+        connections.insert(snapshot);
+        control
+            .publish_connections(connections.publish_snapshot())
+            .expect("publish established connection snapshot");
+        let established = runtime.nodes().register_internal(control.node());
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
+        stamp_tcp_cursor(&runtime, buffer, &packet);
+        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
+
+        assert!(
+            runtime
+                .schedule_frame(established, frame)
+                .expect("schedule")
+        );
+        let _ = runtime.run_ready_nodes().expect("run nodes");
+
+        let receive_acks = backend
+            .receive_ack_observations
+            .lock()
+            .expect("receive ack observations")
+            .clone();
+        let snapshot = control
+            .connection_snapshot_for_test(LOOKUP_ID)
+            .expect("snapshot after packet");
+        let state = control.connection_state_for_test(LOOKUP_ID);
+        let in_use_buffers = runtime.in_use_buffers();
+        super::tcp_established_reorder_remove_connection(LOOKUP_ID, &runtime)
+            .expect("clear reorder buffer after observation test");
+        assert_eq!(runtime.frames_in_use(), 0);
+        assert_eq!(runtime.in_use_buffers(), 0);
+
+        ReceiveAckCaseResult {
+            receive_acks,
+            snapshot,
+            state,
+            in_use_buffers,
+        }
+    }
+
+    fn connected_snapshot(
+        local: SocketAddr,
+        remote: SocketAddr,
+        state: TcpState,
+    ) -> TcpConnectionSnapshot {
+        TcpConnectionSnapshot {
+            lookup_id: LOOKUP_ID,
+            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
+            owner_worker: DataWorkerId::new(0),
+            state,
+            local_port: local.port(),
+            local: Some(local),
+            remote,
+            iss: 0x1020_303f,
+            irs: 0x0102_0303,
+            snd_una: 0x1020_3040,
+            snd_nxt: 0x1020_3048,
+            snd_wnd: 0x4000,
+            rcv_nxt: 0x0102_0304,
+            rcv_wnd: 0x4000,
+        }
     }
 
     fn push_packet(
