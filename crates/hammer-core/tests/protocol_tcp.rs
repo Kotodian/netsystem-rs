@@ -1,11 +1,9 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
 
 use hammer_core::ds::FlatHashTable;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpConnectionKey, TcpControlPlaneAction,
-    TcpListenerId, TcpListenerKey, TcpNegotiatedOptions, TcpSeq, TcpShutdownDirection, TcpState,
-    TcpTimerId, TcpTimerKind, TcpV4ConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
+    TcpCapabilities, TcpCloseReason, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
+    TcpListenerKey, TcpSeq, TcpV4ConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
     TcpWorkerEvent,
 };
 
@@ -64,73 +62,34 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         timestamps: true,
         ecn: false,
     };
-    let negotiated = TcpNegotiatedOptions {
-        send_max_segment_size: Some(1440),
-        receive_max_segment_size: Some(1380),
-        send_window_scale: Some(7),
-        receive_window_scale: Some(5),
-        sack: true,
-        timestamps: true,
-        ecn: false,
-    };
-
-    let install = TcpControlPlaneAction::InstallConnection {
-        connection_id: TcpConnectionId::new(42),
-        key,
-        state: TcpState::SynSent,
+    let install = TcpControlPlaneAction::InstallListener {
+        listener_id: TcpListenerId::new(42),
+        listener,
         capabilities,
-        negotiated,
     };
     match install {
-        TcpControlPlaneAction::InstallConnection {
-            connection_id,
-            key: action_key,
-            state,
+        TcpControlPlaneAction::InstallListener {
+            listener_id,
+            listener: action_listener,
             capabilities: action_capabilities,
-            negotiated: action_negotiated,
         } => {
-            assert_eq!(connection_id.get(), 42);
-            assert_eq!(action_key, key);
-            assert_eq!(state, TcpState::SynSent);
+            assert_eq!(listener_id.get(), 42);
+            assert_eq!(action_listener, listener);
             assert_eq!(action_capabilities, capabilities);
-            assert_eq!(action_negotiated, negotiated);
         }
         other => panic!("unexpected action: {other:?}"),
     }
 
-    let timer = TcpControlPlaneAction::ArmTimer {
-        connection_id: TcpConnectionId::new(42),
-        timer_id: TcpTimerId::new(9),
-        kind: TcpTimerKind::Retransmit,
-        timeout: Duration::from_millis(250),
-    };
-    match timer {
-        TcpControlPlaneAction::ArmTimer {
-            connection_id,
-            timer_id,
-            kind,
-            timeout,
-        } => {
-            assert_eq!(connection_id.get(), 42);
-            assert_eq!(timer_id.get(), 9);
-            assert_eq!(kind, TcpTimerKind::Retransmit);
-            assert_eq!(timeout, Duration::from_millis(250));
-        }
-        other => panic!("unexpected timer action: {other:?}"),
-    }
-
-    let shutdown = TcpControlPlaneAction::ShutdownConnection {
-        connection_id: TcpConnectionId::new(42),
-        direction: TcpShutdownDirection::Write,
-        reason: TcpCloseReason::LocalShutdown,
+    let remove = TcpControlPlaneAction::RemoveListener {
+        listener_id: TcpListenerId::new(42),
+        reason: TcpCloseReason::LocalRequest,
     };
     assert!(matches!(
-        shutdown,
-        TcpControlPlaneAction::ShutdownConnection {
-            direction: TcpShutdownDirection::Write,
-            reason: TcpCloseReason::LocalShutdown,
-            ..
-        }
+        remove,
+        TcpControlPlaneAction::RemoveListener {
+            listener_id,
+            reason: TcpCloseReason::LocalRequest,
+        } if listener_id.get() == 42
     ));
 
     let incoming = TcpWorkerEvent::IncomingConnection {
@@ -154,47 +113,5 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         other => panic!("unexpected event: {other:?}"),
     }
 
-    let state_changed = TcpWorkerEvent::StateChanged {
-        connection_id: TcpConnectionId::new(42),
-        key,
-        state: TcpState::Established,
-    };
-    match state_changed {
-        TcpWorkerEvent::StateChanged {
-            connection_id,
-            key: changed_key,
-            state,
-        } => {
-            assert_eq!(connection_id.get(), 42);
-            assert_eq!(changed_key, key);
-            assert_eq!(state, TcpState::Established);
-        }
-        other => panic!("unexpected state event: {other:?}"),
-    }
-
-    let closed = TcpWorkerEvent::Closed {
-        connection_id: TcpConnectionId::new(42),
-        reason: TcpCloseReason::RemoteReset,
-    };
-    assert!(matches!(
-        closed,
-        TcpWorkerEvent::Closed {
-            reason: TcpCloseReason::RemoteReset,
-            ..
-        }
-    ));
-
-    let expired = TcpWorkerEvent::TimerExpired {
-        connection_id: TcpConnectionId::new(42),
-        timer_id: TcpTimerId::new(9),
-        kind: TcpTimerKind::Retransmit,
-    };
-    assert!(matches!(
-        expired,
-        TcpWorkerEvent::TimerExpired {
-            timer_id,
-            kind: TcpTimerKind::Retransmit,
-            ..
-        } if timer_id.get() == 9
-    ));
+    let _ = key;
 }

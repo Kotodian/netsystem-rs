@@ -1,5 +1,4 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::time::Duration;
 
 use crate::ds::FlatHashKey;
 
@@ -581,7 +580,7 @@ impl TcpConnectionKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpControlPlaneAction {
-    // These actions intentionally stop at shared state/timer contracts.
+    // The shared TCP control plane only owns listener registrations.
     InstallListener {
         listener_id: TcpListenerId,
         listener: TcpListenerKey,
@@ -590,43 +589,6 @@ pub enum TcpControlPlaneAction {
     RemoveListener {
         listener_id: TcpListenerId,
         reason: TcpCloseReason,
-    },
-    InstallConnection {
-        connection_id: TcpConnectionId,
-        key: TcpConnectionKey,
-        state: TcpState,
-        capabilities: TcpCapabilities,
-        negotiated: TcpNegotiatedOptions,
-    },
-    UpsertConnectionState {
-        connection_id: TcpConnectionId,
-        key: TcpConnectionKey,
-        state: TcpState,
-        capabilities: TcpCapabilities,
-        negotiated: TcpNegotiatedOptions,
-    },
-    TransitionConnection {
-        connection_id: TcpConnectionId,
-        state: TcpState,
-    },
-    ShutdownConnection {
-        connection_id: TcpConnectionId,
-        direction: TcpShutdownDirection,
-        reason: TcpCloseReason,
-    },
-    CloseConnection {
-        connection_id: TcpConnectionId,
-        reason: TcpCloseReason,
-    },
-    ArmTimer {
-        connection_id: TcpConnectionId,
-        timer_id: TcpTimerId,
-        kind: TcpTimerKind,
-        timeout: Duration,
-    },
-    CancelTimer {
-        connection_id: TcpConnectionId,
-        kind: TcpTimerKind,
     },
 }
 
@@ -637,25 +599,6 @@ pub enum TcpWorkerEvent {
         listener: TcpListenerKey,
         key: TcpConnectionKey,
         capabilities: TcpCapabilities,
-    },
-    StateChanged {
-        connection_id: TcpConnectionId,
-        key: TcpConnectionKey,
-        state: TcpState,
-    },
-    TimerExpired {
-        connection_id: TcpConnectionId,
-        timer_id: TcpTimerId,
-        kind: TcpTimerKind,
-    },
-    ShutdownObserved {
-        connection_id: TcpConnectionId,
-        direction: TcpShutdownDirection,
-        reason: TcpCloseReason,
-    },
-    Closed {
-        connection_id: TcpConnectionId,
-        reason: TcpCloseReason,
     },
 }
 
