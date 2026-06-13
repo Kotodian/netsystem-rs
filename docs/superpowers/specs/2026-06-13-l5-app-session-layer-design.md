@@ -154,6 +154,7 @@ pub enum AppSessionSubmission {
 
 pub struct AppSessionCompletion {
     session_id: AppSessionId,
+    user_data: AppUserData,
     result: i32,
     flags: AppCqeFlags,
     data: AppCqeData,
@@ -201,10 +202,14 @@ pub struct SessionQueueNode {
     worker: DataWorkerId,
 }
 
+pub struct SessionQueueRuntime {
+    sessions: WorkerSessionRuntime,
+    protocols: SessionProtocolRegistry,
+}
+
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
     app: AppSessionAppIngress,
-    protocols: SessionProtocolRegistry,
     ready: AppSessionReadyQueue,
     timers: AppSessionTimerWheel,
 }
@@ -394,7 +399,8 @@ Verification commands:
 ```bash
 cargo fmt --all
 cargo test -p hammer-service --test session_runtime
-cargo test -p hammer-service --test tcp_session_node
+cargo test -p hammer-service --test session_queue_node
+cargo test -p hammer-service --test tcp_session_protocol
 git diff --check
 ```
 
@@ -417,5 +423,6 @@ git diff --check
 5. `transport::tcp` 不 re-export `TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 这类 app session wrapper。
 6. App ring polling、ready queue、timer wheel 从 TCP 文件中移到 L5 session 文件。
 7. `cargo test -p hammer-service --test session_runtime` 通过。
-8. `cargo test -p hammer-service --test tcp_session_node` 通过。
-9. `git diff --check` 通过。
+8. `cargo test -p hammer-service --test session_queue_node` 通过。
+9. `cargo test -p hammer-service --test tcp_session_protocol` 通过。
+10. `git diff --check` 通过。
