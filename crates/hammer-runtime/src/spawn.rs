@@ -42,6 +42,7 @@ use hammer_adapter::{DataPlaneBuffers, TraceControlHandle, TraceRecordSink};
 use hammer_core::log::Logger;
 
 use crate::data_plane::{RuntimeDataPlaneRuntime, new_worker_runtime};
+use hammer_adapter::DataPlaneRuntime;
 use hammer_core::error::{HammerError, HammerResult};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle as TokioJoinHandle;
@@ -384,6 +385,14 @@ impl DataRuntimeContext {
                 })
             })
             .collect()
+    }
+
+    pub fn install_on_workers<F, R>(&self, f: F) -> HammerResult<Vec<R>>
+    where
+        F: Fn(usize, &DataPlaneRuntime) -> R + Send + Sync + 'static,
+        R: Send + 'static,
+    {
+        self.for_each_worker(move |worker| DATA_PLANE_RUNTIME.with(|runtime| f(worker, runtime)))
     }
 
     pub fn set_trace_control_on_workers(

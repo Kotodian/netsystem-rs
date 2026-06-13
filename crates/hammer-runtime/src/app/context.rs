@@ -1,121 +1,27 @@
 use std::cell::RefCell;
 use std::future::Future;
-use std::net::{Shutdown, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
-use hammer_infra::descriptor::Descriptor;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
 use crate::app::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv,
-    AppRegisteredBuffer, AppRingHandle, AppSend, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor,
-    AppSubmissionEntry, AppTcpShutdown, AppUserData,
+    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppOpId, AppRecv,
+    AppRegisteredBuffer, AppRingHandle, AppSend, AppSqe, AppSqeData, AppSqeDescriptor,
+    AppSubmissionEntry,
 };
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
-use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 
 static NEXT_APP_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const CLOSED_OWNER_WORKER: usize = usize::MAX;
 
 thread_local! {
-    static APP_FLOW_BACKENDS: RefCell<AppWorkerFlowRegistry> =
-        RefCell::new(AppWorkerFlowRegistry::new());
-    static APP_SOCKET_BACKENDS: RefCell<AppWorkerSocketRegistry> =
-        RefCell::new(AppWorkerSocketRegistry::new());
-}
-
-pub enum AppFlowTag {}
-pub type AppFlowId = Descriptor<AppFlowTag>;
-
-pub trait AppControlBackend: Send + Sync {
-    fn bind_tcp_listener(
-        &self,
-        app: &AppContext,
-        bind: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId>;
-
-    fn connect_tcp_stream(
-        &self,
-        _app: &AppContext,
-        _peer: SocketAddr,
-        _owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
-        Err(HammerError::internal(
-            "app tcp connect is not implemented by the control backend",
-        ))
-    }
-
-    fn bind_udp_socket(
-        &self,
-        app: &AppContext,
-        bind: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId>;
-
-    fn close_tcp_flow(&self, _app: &AppContext, _flow: AppFlowId) -> HammerResult<()> {
-        Err(HammerError::internal(
-            "app tcp flow close is not implemented by the control backend",
-        ))
-    }
-
-    fn close_socket(&self, app: &AppContext, socket: AppSocketId) -> HammerResult<()>;
-}
-
-#[derive(Clone)]
-pub struct AppControl {
-    backend: Arc<dyn AppControlBackend>,
-}
-
-impl AppControl {
-    #[inline]
-    pub fn new(backend: Arc<dyn AppControlBackend>) -> Self {
-        Self { backend }
-    }
-
-    #[inline]
-    pub fn bind_tcp_listener(
-        &self,
-        app: &AppContext,
-        bind: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.backend.bind_tcp_listener(app, bind, owner_worker)
-    }
-
-    #[inline]
-    pub fn connect_tcp_stream(
-        &self,
-        app: &AppContext,
-        peer: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
-        self.backend.connect_tcp_stream(app, peer, owner_worker)
-    }
-
-    #[inline]
-    pub fn bind_udp_socket(
-        &self,
-        app: &AppContext,
-        bind: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.backend.bind_udp_socket(app, bind, owner_worker)
-    }
-
-    #[inline]
-    pub fn close_tcp_flow(&self, app: &AppContext, flow: AppFlowId) -> HammerResult<()> {
-        self.backend.close_tcp_flow(app, flow)
-    }
-
-    #[inline]
-    pub fn close_socket(&self, app: &AppContext, socket: AppSocketId) -> HammerResult<()> {
-        self.backend.close_socket(app, socket)
-    }
+    static APP_OP_RINGS: RefCell<AppWorkerOpRegistry> =
+        RefCell::new(AppWorkerOpRegistry::new());
 }
 
 #[derive(Clone)]
@@ -123,9 +29,7 @@ pub struct AppContext {
     id: usize,
     data_context: DataRuntimeContext,
     ring_capacity: usize,
-    control: Arc<Mutex<Option<AppControl>>>,
-    owners: Arc<Mutex<FlatHashTable<u64, usize>>>,
-    socket_owners: Arc<Mutex<FlatHashTable<u64, usize>>>,
+    op_owners: Arc<Mutex<FlatHashTable<u64, usize>>>,
 }
 
 impl AppContext {
@@ -135,158 +39,60 @@ impl AppContext {
             id: next_app_context_id(),
             data_context,
             ring_capacity,
-            control: Arc::new(Mutex::new(None)),
-            owners: Arc::new(Mutex::new(FlatHashTable::new())),
-            socket_owners: Arc::new(Mutex::new(FlatHashTable::new())),
+            op_owners: Arc::new(Mutex::new(FlatHashTable::new())),
         }
     }
 
-    #[inline]
-    pub fn install_control(&self, control: AppControl) -> HammerResult<()> {
-        let mut slot = self
-            .control
-            .lock()
-            .map_err(|_| HammerError::internal("app control backend poisoned"))?;
-        *slot = Some(control);
-        Ok(())
-    }
-
-    pub fn bind_tcp_listener(
-        &self,
-        bind: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.validate_owner_worker(owner_worker)?;
-        let socket = self
-            .control()?
-            .bind_tcp_listener(self, bind, owner_worker)?;
-        self.register_socket_owner(socket, owner_worker)?;
-        Ok(socket)
-    }
-
-    pub fn connect_tcp_stream(
-        &self,
-        peer: SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
-        self.validate_owner_worker(owner_worker)?;
-        let flow = self
-            .control()?
-            .connect_tcp_stream(self, peer, owner_worker)?;
-        self.register_flow_owner(flow, owner_worker)?;
-        Ok(flow)
-    }
-
-    pub async fn send_on_flow(&self, flow: AppFlowId, send: AppSend) -> HammerResult<()> {
-        if self.current_worker_owns_flow(flow) {
-            let ring = self.local_ring_for_flow(flow)?;
-            return AppRuntime {
-                object: AppObjectRef::Flow(flow),
-                ring,
-            }
-            .send(send)
-            .await;
+    pub async fn send_on_op(&self, op: AppOpId, send: AppSend) -> HammerResult<()> {
+        if self.current_worker_owns_op(op) {
+            let ring = self.local_ring_for_op(op)?;
+            return AppRuntime { op, ring }.send(send).await;
         }
 
         let registered = CrossWorkerAppRegisteredBuffer::new(app_send_registered_buffer(send)?);
-        let descriptor = app_send_descriptor(flow, registered.index());
-        let owner_worker = self.owner_for(flow)?;
+        let descriptor = app_send_descriptor(op, registered.index());
+        let owner_worker = self.owner_for_op(op)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
                 let registered = registered.into_inner();
-                worker_flow_ring(app_context_id, flow, ring_capacity).try_push_submission_entry(
+                worker_op_ring(app_context_id, op, ring_capacity).try_push_submission_entry(
                     AppSubmissionEntry::with_attachment(descriptor, registered),
                 )
             })
             .await?
     }
 
-    pub fn bind_udp_socket(
+    pub async fn spawn_on_op<F, Fut, T>(
         &self,
-        bind: SocketAddr,
+        op: AppOpId,
         owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.validate_owner_worker(owner_worker)?;
-        let socket = self.control()?.bind_udp_socket(self, bind, owner_worker)?;
-        self.register_socket_owner(socket, owner_worker)?;
-        Ok(socket)
-    }
-
-    #[inline]
-    pub fn close_socket(&self, socket: AppSocketId) -> HammerResult<()> {
-        self.control()?.close_socket(self, socket)?;
-        self.unregister_socket_owner(socket)
-    }
-
-    #[inline]
-    pub fn close_tcp_flow(&self, flow: AppFlowId) -> HammerResult<()> {
-        self.control()?.close_tcp_flow(self, flow)?;
-        self.unregister_flow_owner(flow)
-    }
-
-    pub async fn shutdown_flow(&self, flow: AppFlowId, how: Shutdown) -> HammerResult<()> {
-        self.spawn_on_flow(flow, move |worker| async move {
-            worker.runtime().shutdown(how).await
-        })
-        .await?
-    }
-
-    pub async fn spawn_on_flow<F, Fut, T>(&self, flow: AppFlowId, f: F) -> HammerResult<T>
+        f: F,
+    ) -> HammerResult<T>
     where
         F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
         T: Send + 'static,
     {
-        let owner_worker = self.owner_for(flow)?;
+        self.register_op_owner(op, owner_worker)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
                 let worker = AppWorkerContext {
                     owner_worker,
-                    object: AppObjectRef::Flow(flow),
-                    ring: worker_flow_ring(app_context_id, flow, ring_capacity),
+                    op,
+                    ring: worker_op_ring(app_context_id, op, ring_capacity),
                 };
                 f(worker).await
             })
             .await
     }
 
-    pub async fn spawn_on_socket<F, Fut, T>(&self, socket: AppSocketId, f: F) -> HammerResult<T>
-    where
-        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
-        Fut: Future<Output = T> + 'static,
-        T: Send + 'static,
-    {
-        let owner_worker = self.owner_for_socket(socket)?;
-        let app_context_id = self.id;
-        let ring_capacity = self.ring_capacity;
-        self.data_context
-            .call_local_on_worker(owner_worker, move || async move {
-                let worker = AppWorkerContext {
-                    owner_worker,
-                    object: AppObjectRef::Socket(socket),
-                    ring: worker_socket_ring(app_context_id, socket, ring_capacity),
-                };
-                f(worker).await
-            })
-            .await
-    }
-
-    pub fn spawn_detached_on_flow<F, Fut>(&self, flow: AppFlowId, f: F) -> HammerResult<()>
-    where
-        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        let owner_worker = self.owner_for(flow)?;
-        self.spawn_detached_on_flow_owner(flow, owner_worker, f)
-    }
-
-    pub fn spawn_detached_on_flow_owner<F, Fut>(
+    pub fn spawn_detached_on_op<F, Fut>(
         &self,
-        flow: AppFlowId,
+        op: AppOpId,
         owner_worker: usize,
         f: F,
     ) -> HammerResult<()>
@@ -294,28 +100,23 @@ impl AppContext {
         F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        self.validate_owner_worker(owner_worker)?;
+        self.register_op_owner(op, owner_worker)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .spawn_local_on_worker(owner_worker, move || async move {
                 let worker = AppWorkerContext {
                     owner_worker,
-                    object: AppObjectRef::Flow(flow),
-                    ring: worker_flow_ring(app_context_id, flow, ring_capacity),
+                    op,
+                    ring: worker_op_ring(app_context_id, op, ring_capacity),
                 };
                 f(worker).await;
             })
     }
 
     #[inline]
-    pub fn owner_worker_for_flow(&self, flow: AppFlowId) -> HammerResult<usize> {
-        self.owner_for(flow)
-    }
-
-    #[inline]
-    pub fn owner_worker_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
-        self.owner_for_socket(socket)
+    pub fn owner_worker_for_op(&self, op: AppOpId) -> HammerResult<usize> {
+        self.owner_for_op(op)
     }
 
     #[inline]
@@ -324,124 +125,63 @@ impl AppContext {
     }
 
     #[inline]
-    pub fn current_worker_owns_flow(&self, flow: AppFlowId) -> bool {
+    pub fn current_worker_owns_op(&self, op: AppOpId) -> bool {
         self.data_context
             .current_worker_index()
-            .is_some_and(|current| self.owner_for(flow).is_ok_and(|owner| current == owner))
+            .is_some_and(|current| self.owner_for_op(op).is_ok_and(|owner| current == owner))
     }
 
     #[inline]
-    pub fn current_worker_owns_socket(&self, socket: AppSocketId) -> bool {
-        self.data_context
-            .current_worker_index()
-            .is_some_and(|current| {
-                self.owner_for_socket(socket)
-                    .is_ok_and(|owner| current == owner)
-            })
-    }
-
-    #[inline]
-    fn local_ring_for_flow(&self, flow: AppFlowId) -> HammerResult<AppRingHandle> {
-        let owner_worker = self.owner_for(flow)?;
+    fn local_ring_for_op(&self, op: AppOpId) -> HammerResult<AppRingHandle> {
+        let owner_worker = self.owner_for_op(op)?;
         let current_worker = self.current_worker_index()?;
         if current_worker != owner_worker {
             return Err(HammerError::internal(format!(
-                "app flow {} is owned by worker {owner_worker}, not worker {current_worker}",
-                flow.value()
+                "app op {} is owned by worker {owner_worker}, not worker {current_worker}",
+                op.value()
             )));
         }
-        Ok(worker_flow_ring(self.id, flow, self.ring_capacity))
-    }
-
-    #[inline]
-    fn local_ring_for_socket(&self, socket: AppSocketId) -> HammerResult<AppRingHandle> {
-        let owner_worker = self.owner_for_socket(socket)?;
-        let current_worker = self.current_worker_index()?;
-        if current_worker != owner_worker {
-            return Err(HammerError::internal(format!(
-                "app socket {} is owned by worker {owner_worker}, not worker {current_worker}",
-                socket.value()
-            )));
-        }
-        Ok(worker_socket_ring(self.id, socket, self.ring_capacity))
+        Ok(worker_op_ring(self.id, op, self.ring_capacity))
     }
 
     #[inline]
     pub fn try_complete_recv_buffer(
         &self,
-        flow: AppFlowId,
+        op: AppOpId,
         buffers: DataPlaneBuffers,
         index: BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        let ring = self.local_ring_for_flow(flow)?;
-        ring.try_complete_recv_buffer(flow, buffers, index, fin)
+        let ring = self.local_ring_for_op(op)?;
+        ring.try_complete_recv_buffer(op, buffers, index, fin)
     }
 
     #[inline]
-    pub fn try_complete_recv_from_buffer(
-        &self,
-        socket: AppSocketId,
-        source: SocketAddr,
-        buffers: DataPlaneBuffers,
-        index: BufferIndex,
-        truncated: bool,
-    ) -> HammerResult<()> {
-        let ring = self.local_ring_for_socket(socket)?;
-        ring.try_complete_recv_from_buffer(socket, source, buffers, index, truncated)
-    }
-
-    #[inline]
-    pub fn try_complete_accept(&self, listener: AppSocketId, flow: AppFlowId) -> HammerResult<()> {
-        let owner_worker = self.owner_for_socket(listener)?;
-        self.register_flow_owner(flow, owner_worker)?;
-        if self.current_worker_index().ok() == Some(owner_worker) {
-            let ring = self.local_ring_for_socket(listener)?;
-            return ring.try_complete_accept(listener, flow);
-        }
-        let app_context_id = self.id;
-        let ring_capacity = self.ring_capacity;
-        self.data_context
-            .call_blocking_on_worker(owner_worker, move || {
-                worker_socket_ring(app_context_id, listener, ring_capacity)
-                    .try_complete_accept(listener, flow)
-            })
-    }
-
-    #[inline]
-    pub fn try_complete_closed_flow(&self, flow: AppFlowId) -> HammerResult<bool> {
-        let Some(owner_worker) = self.registered_flow_owner(flow)? else {
+    pub fn try_complete_closed_op(&self, op: AppOpId) -> HammerResult<bool> {
+        let Some(owner_worker) = self.registered_op_owner(op)? else {
             return Ok(false);
         };
         if self.current_worker_index().ok() == Some(owner_worker) {
-            let ring = self.local_ring_for_flow(flow)?;
-            ring.try_push_completion(AppCqe::closed(AppUserData::new(0), Some(flow)))?;
+            let ring = self.local_ring_for_op(op)?;
+            ring.try_push_completion(AppCqe::closed(None, Some(op)))?;
         } else {
             let app_context_id = self.id;
             let ring_capacity = self.ring_capacity;
             self.data_context
                 .call_blocking_on_worker(owner_worker, move || {
-                    worker_flow_ring(app_context_id, flow, ring_capacity)
-                        .try_push_completion(AppCqe::closed(AppUserData::new(0), Some(flow)))
+                    worker_op_ring(app_context_id, op, ring_capacity)
+                        .try_push_completion(AppCqe::closed(None, Some(op)))
                 })?;
         }
-        self.unregister_flow_owner(flow)?;
+        self.unregister_op_owner(op)?;
         Ok(true)
     }
 
     #[inline]
     fn current_worker_index(&self) -> HammerResult<usize> {
         self.data_context.current_worker_index().ok_or_else(|| {
-            HammerError::internal("local app backend lookup requires a data worker thread")
+            HammerError::internal("local app op lookup requires a data worker thread")
         })
-    }
-
-    fn control(&self) -> HammerResult<AppControl> {
-        self.control
-            .lock()
-            .map_err(|_| HammerError::internal("app control backend poisoned"))?
-            .clone()
-            .ok_or_else(|| HammerError::internal("app control backend is not installed"))
     }
 
     fn validate_owner_worker(&self, owner_worker: usize) -> HammerResult<()> {
@@ -454,95 +194,62 @@ impl AppContext {
         )))
     }
 
-    fn owner_for(&self, flow: AppFlowId) -> HammerResult<usize> {
-        if let Some(owner) = self.registered_flow_owner(flow)? {
+    fn owner_for_op(&self, op: AppOpId) -> HammerResult<usize> {
+        if let Some(owner) = self.registered_op_owner(op)? {
             return Ok(owner);
         }
         let mut owners = self
-            .owners
+            .op_owners
             .lock()
-            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
-        if let Some(owner) = owners.lookup(&flow.value()) {
+            .map_err(|_| HammerError::internal("app op owner map poisoned"))?;
+        if let Some(owner) = owners.lookup(&op.value()) {
             if owner != CLOSED_OWNER_WORKER {
                 return Ok(owner);
             }
             return Err(HammerError::internal(format!(
-                "app flow {} owner is not registered",
-                flow.value()
+                "app op {} owner is not registered",
+                op.value()
             )));
         }
-        let owner = (flow.value() as usize) % self.data_context.worker_count();
-        owners.insert(flow.value(), owner);
+        let owner = (op.value() as usize) % self.data_context.worker_count();
+        owners.insert(op.value(), owner);
         Ok(owner)
     }
 
-    fn register_socket_owner(&self, socket: AppSocketId, owner_worker: usize) -> HammerResult<()> {
+    fn register_op_owner(&self, op: AppOpId, owner_worker: usize) -> HammerResult<()> {
         self.validate_owner_worker(owner_worker)?;
         let mut owners = self
-            .socket_owners
+            .op_owners
             .lock()
-            .map_err(|_| HammerError::internal("app socket owner map poisoned"))?;
-        owners.insert(socket.value(), owner_worker);
+            .map_err(|_| HammerError::internal("app op owner map poisoned"))?;
+        owners.insert(op.value(), owner_worker);
         Ok(())
     }
 
-    fn unregister_socket_owner(&self, socket: AppSocketId) -> HammerResult<()> {
+    fn unregister_op_owner(&self, op: AppOpId) -> HammerResult<()> {
         let mut owners = self
-            .socket_owners
+            .op_owners
             .lock()
-            .map_err(|_| HammerError::internal("app socket owner map poisoned"))?;
-        owners.insert(socket.value(), CLOSED_OWNER_WORKER);
+            .map_err(|_| HammerError::internal("app op owner map poisoned"))?;
+        owners.insert(op.value(), CLOSED_OWNER_WORKER);
         Ok(())
     }
 
-    fn register_flow_owner(&self, flow: AppFlowId, owner_worker: usize) -> HammerResult<()> {
-        self.validate_owner_worker(owner_worker)?;
-        let mut owners = self
-            .owners
-            .lock()
-            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
-        owners.insert(flow.value(), owner_worker);
-        Ok(())
-    }
-
-    fn unregister_flow_owner(&self, flow: AppFlowId) -> HammerResult<()> {
-        let mut owners = self
-            .owners
-            .lock()
-            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
-        owners.insert(flow.value(), CLOSED_OWNER_WORKER);
-        Ok(())
-    }
-
-    fn registered_flow_owner(&self, flow: AppFlowId) -> HammerResult<Option<usize>> {
+    fn registered_op_owner(&self, op: AppOpId) -> HammerResult<Option<usize>> {
         let owners = self
-            .owners
+            .op_owners
             .lock()
-            .map_err(|_| HammerError::internal("app owner map poisoned"))?;
+            .map_err(|_| HammerError::internal("app op owner map poisoned"))?;
         Ok(owners
-            .lookup(&flow.value())
+            .lookup(&op.value())
             .filter(|owner| *owner != CLOSED_OWNER_WORKER))
-    }
-
-    fn owner_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
-        self.socket_owners
-            .lock()
-            .map_err(|_| HammerError::internal("app socket owner map poisoned"))?
-            .lookup(&socket.value())
-            .filter(|owner| *owner != CLOSED_OWNER_WORKER)
-            .ok_or_else(|| {
-                HammerError::internal(format!(
-                    "app socket {} owner is not registered",
-                    socket.value()
-                ))
-            })
     }
 }
 
 #[derive(Clone)]
 pub struct AppWorkerContext {
     owner_worker: usize,
-    object: AppObjectRef,
+    op: AppOpId,
     ring: AppRingHandle,
 }
 
@@ -553,9 +260,14 @@ impl AppWorkerContext {
     }
 
     #[inline]
+    pub fn op(&self) -> AppOpId {
+        self.op
+    }
+
+    #[inline]
     pub fn runtime(&self) -> AppRuntime {
         AppRuntime {
-            object: self.object,
+            op: self.op,
             ring: self.ring.clone(),
         }
     }
@@ -592,31 +304,28 @@ impl CrossWorkerAppRegisteredBuffer {
     }
 }
 
-// SAFETY: this wrapper is only used by AppContext::send_on_flow after the
-// caller gives up ownership of AppSend. The remote-local closure immediately
-// unwraps the registered buffer and attaches it to the owner worker's
-// submission ring; no references to the lease are shared or accessed while the
-// wrapper is in transit.
+// SAFETY: this wrapper is used after the caller gives up ownership of AppSend.
+// The remote-local closure immediately unwraps the registered buffer and
+// attaches it to the owner worker's submission ring.
 unsafe impl Send for CrossWorkerAppRegisteredBuffer {}
 
 #[derive(Clone)]
 pub struct AppRuntime {
-    object: AppObjectRef,
+    op: AppOpId,
     ring: AppRingHandle,
 }
 
 impl AppRuntime {
     #[inline]
     pub fn recv(&self) -> AppRecvFuture {
-        let submit = self.flow().and_then(|flow| {
-            self.ring
-                .try_push_submission_descriptor(AppSqeDescriptor::new(
-                    crate::app::ring::AppOpcode::Recv,
-                    AppUserData::new(0),
-                    AppObjectRef::Flow(flow),
-                    AppSqeData::Recv { max_len: u32::MAX },
-                ))
-        });
+        let submit = self
+            .ring
+            .try_push_submission_descriptor(AppSqeDescriptor::new(
+                crate::app::ring::AppOpcode::Recv,
+                None,
+                AppObjectRef::Operation(self.op),
+                AppSqeData::Recv { max_len: u32::MAX },
+            ));
         AppRecvFuture {
             ring: self.ring.clone(),
             submit: Some(submit),
@@ -625,16 +334,19 @@ impl AppRuntime {
 
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        let flow = self.flow()?;
         self.ring
-            .try_push_submission_entry(app_send_submission_entry(flow, send)?)
+            .try_push_submission_entry(app_send_submission_entry(self.op, send)?)
     }
 
     #[inline]
-    pub async fn shutdown(&self, how: Shutdown) -> HammerResult<()> {
-        let flow = self.flow()?;
+    pub async fn shutdown(&self) -> HammerResult<()> {
         self.ring
-            .try_push_tcp_shutdown(AppTcpShutdown::new(flow, how))
+            .try_push_submission_descriptor(AppSqeDescriptor::new(
+                crate::app::ring::AppOpcode::Close,
+                None,
+                AppObjectRef::Operation(self.op),
+                AppSqeData::Close,
+            ))
     }
 
     #[inline]
@@ -676,16 +388,6 @@ impl AppRuntime {
     }
 
     #[inline]
-    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
-        self.ring.next_tcp_shutdown().await
-    }
-
-    #[inline]
-    pub fn try_pop_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
-        self.ring.pop_tcp_shutdown()
-    }
-
-    #[inline]
     pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
         self.ring.take_send_buffer(index)
     }
@@ -717,34 +419,19 @@ impl AppRuntime {
 
     #[inline]
     pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
-        self.ring
-            .try_complete_recv_lease(self.flow()?, lease, false)
+        self.ring.try_complete_recv_lease(self.op, lease, false)
     }
 
     #[inline]
     pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
         self.ring.take_recv_buffer(index)
     }
-
-    #[inline]
-    fn flow(&self) -> HammerResult<AppFlowId> {
-        match self.object {
-            AppObjectRef::Flow(flow) => Ok(flow),
-            AppObjectRef::Socket(socket) => Err(HammerError::internal(format!(
-                "flow runtime operation called for app socket {}",
-                socket.value()
-            ))),
-            AppObjectRef::None => Err(HammerError::internal(
-                "flow runtime operation called without an app flow",
-            )),
-        }
-    }
 }
 
 #[inline]
-fn app_send_submission_entry(flow: AppFlowId, send: AppSend) -> HammerResult<AppSubmissionEntry> {
+fn app_send_submission_entry(op: AppOpId, send: AppSend) -> HammerResult<AppSubmissionEntry> {
     let registered = app_send_registered_buffer(send)?;
-    let descriptor = app_send_descriptor(flow, registered.index());
+    let descriptor = app_send_descriptor(op, registered.index());
     Ok(AppSubmissionEntry::with_attachment(descriptor, registered))
 }
 
@@ -754,11 +441,11 @@ fn app_send_registered_buffer(send: AppSend) -> HammerResult<AppRegisteredBuffer
 }
 
 #[inline]
-fn app_send_descriptor(flow: AppFlowId, buffer: BufferIndex) -> AppSqeDescriptor {
+fn app_send_descriptor(op: AppOpId, buffer: BufferIndex) -> AppSqeDescriptor {
     AppSqeDescriptor::new(
         crate::app::ring::AppOpcode::Send,
-        AppUserData::new(0),
-        AppObjectRef::Flow(flow),
+        None,
+        AppObjectRef::Operation(op),
         AppSqeData::Send { buffer },
     )
 }
@@ -798,87 +485,35 @@ fn next_app_context_id() -> usize {
 }
 
 #[inline]
-fn worker_flow_ring(app_context_id: usize, flow: AppFlowId, ring_capacity: usize) -> AppRingHandle {
-    APP_FLOW_BACKENDS.with(|slot| {
+fn worker_op_ring(app_context_id: usize, op: AppOpId, ring_capacity: usize) -> AppRingHandle {
+    APP_OP_RINGS.with(|slot| {
         slot.borrow_mut()
-            .get_or_insert(app_flow_key(app_context_id, flow), flow, ring_capacity)
+            .get_or_insert(app_op_key(app_context_id, op), ring_capacity)
     })
 }
 
 #[inline]
-fn app_flow_key(app_context_id: usize, flow: AppFlowId) -> u128 {
-    ((app_context_id as u128) << 64) | u128::from(flow.value())
+fn app_op_key(app_context_id: usize, op: AppOpId) -> u128 {
+    ((app_context_id as u128) << 64) | u128::from(op.value())
 }
 
-#[inline]
-fn worker_socket_ring(
-    app_context_id: usize,
-    socket: AppSocketId,
-    ring_capacity: usize,
-) -> AppRingHandle {
-    APP_SOCKET_BACKENDS.with(|slot| {
-        slot.borrow_mut()
-            .get_or_insert(app_socket_key(app_context_id, socket), ring_capacity)
-    })
-}
-
-#[inline]
-fn app_socket_key(app_context_id: usize, socket: AppSocketId) -> u128 {
-    (1u128 << 127) | ((app_context_id as u128) << 64) | u128::from(socket.value())
-}
-
-struct AppWorkerFlowRegistry {
-    index_by_flow: FlatHashTable<u128, usize>,
+struct AppWorkerOpRegistry {
+    index_by_op: FlatHashTable<u128, usize>,
     rings: Vec<AppRingHandle>,
 }
 
-impl AppWorkerFlowRegistry {
+impl AppWorkerOpRegistry {
     #[inline]
     fn new() -> Self {
         Self {
-            index_by_flow: FlatHashTable::new(),
-            rings: Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn get_or_insert(
-        &mut self,
-        key: u128,
-        _flow: AppFlowId,
-        ring_capacity: usize,
-    ) -> AppRingHandle {
-        if let Some(index) = self.index_by_flow.lookup(&key)
-            && let Some(ring) = self.rings.get(index).cloned()
-        {
-            return ring;
-        }
-
-        let index = self.rings.len();
-        let ring = AppRingHandle::new(ring_capacity, ring_capacity);
-        self.rings.push(ring.clone());
-        self.index_by_flow.insert(key, index);
-        ring
-    }
-}
-
-struct AppWorkerSocketRegistry {
-    index_by_socket: FlatHashTable<u128, usize>,
-    rings: Vec<AppRingHandle>,
-}
-
-impl AppWorkerSocketRegistry {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            index_by_socket: FlatHashTable::new(),
+            index_by_op: FlatHashTable::new(),
             rings: Vec::new(),
         }
     }
 
     #[inline]
     fn get_or_insert(&mut self, key: u128, ring_capacity: usize) -> AppRingHandle {
-        if let Some(index) = self.index_by_socket.lookup(&key)
+        if let Some(index) = self.index_by_op.lookup(&key)
             && let Some(ring) = self.rings.get(index).cloned()
         {
             return ring;
@@ -887,7 +522,7 @@ impl AppWorkerSocketRegistry {
         let index = self.rings.len();
         let ring = AppRingHandle::new(ring_capacity, ring_capacity);
         self.rings.push(ring.clone());
-        self.index_by_socket.insert(key, index);
+        self.index_by_op.insert(key, index);
         ring
     }
 }
