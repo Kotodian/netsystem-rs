@@ -3,22 +3,22 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, RouteMetadata};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
+use hammer_service::session::protocol::tcp::state::{TcpSessionState, TcpSessionTable};
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::congestion_control::{
     TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
     TcpCongestionSendObservation,
 };
 use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpConnectionTable,
-    TcpDataPlaneConnection, TcpOutputRecord,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpOutputRecord,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
-fn connection() -> TcpDataPlaneConnection {
+fn connection() -> TcpSessionState {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-    let mut connection = TcpDataPlaneConnection::new(
+    let mut connection = TcpSessionState::new(
         7,
         Some(TcpConnectionId::new(7001)),
         DataWorkerId::new(0),
@@ -51,7 +51,7 @@ fn record(sequence: u32, payload: &[u8]) -> TcpOutputRecord {
 #[test]
 fn tcp_congestion_node_updates_one_connection_from_ack_sample() {
     let now = Instant::now();
-    let mut table = TcpConnectionTable::empty();
+    let mut table = TcpSessionTable::empty();
     let mut connection = connection();
     let sent = record(1000, &[1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN]);
     connection
@@ -88,7 +88,7 @@ fn tcp_congestion_node_updates_one_connection_from_ack_sample() {
 #[test]
 fn tcp_congestion_node_send_observation_sets_pacing_deadline_on_connection() {
     let now = Instant::now();
-    let mut table = TcpConnectionTable::empty();
+    let mut table = TcpSessionTable::empty();
     let mut connection = connection();
     connection.congestion_mut().on_ack(TcpCongestionAckSample {
         bytes_acked: TEST_SEGMENT_LEN,
@@ -120,7 +120,7 @@ fn tcp_congestion_node_send_observation_sets_pacing_deadline_on_connection() {
 
 #[test]
 fn tcp_congestion_node_loss_reduces_only_target_connection() {
-    let mut table = TcpConnectionTable::empty();
+    let mut table = TcpSessionTable::empty();
     table.insert(connection());
     let before = table
         .lookup_by_lookup_id(7)

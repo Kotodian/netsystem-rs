@@ -1,10 +1,10 @@
-use hammer_service::session::{AppSessionId, AppSessionReadyQueue};
+use hammer_service::session::{SessionId, SessionReadyQueue};
 
 #[test]
-fn app_session_ready_queue_dedupes_session_ids() {
-    let mut ready = AppSessionReadyQueue::new();
-    let first = AppSessionId::new(7);
-    let second = AppSessionId::new(8);
+fn session_ready_queue_dedupes_session_ids() {
+    let mut ready = SessionReadyQueue::new();
+    let first = SessionId::new(7);
+    let second = SessionId::new(8);
 
     ready.mark_ready(first);
     ready.mark_ready(first);

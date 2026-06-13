@@ -1,21 +1,16 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwapOption;
 use hammer_adapter::DataWorkerId;
-use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
 use hammer_infra::map::FlatHashTable;
 
-use crate::app::AppIngressTarget;
-
-use super::congestion::TcpCongestionState;
-use super::output::{
+use crate::transport::tcp::congestion::TcpCongestionState;
+use crate::transport::tcp::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
     tcp_effective_output_payload_len,
 };
-use super::{TcpLookupId, TcpState};
+use crate::transport::tcp::{TcpLookupId, TcpState};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -101,13 +96,13 @@ impl Default for TcpRetransmitTimeoutState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpConnectionOptionState {
+pub struct TcpSessionOptionState {
     local_capabilities: TcpCapabilities,
     remote_capabilities: Option<TcpCapabilities>,
     negotiated: TcpNegotiatedOptions,
 }
 
-impl TcpConnectionOptionState {
+impl TcpSessionOptionState {
     #[inline]
     pub fn new(local_capabilities: TcpCapabilities) -> Self {
         Self {
@@ -181,7 +176,7 @@ impl TcpConnectionOptionState {
     }
 }
 
-impl Default for TcpConnectionOptionState {
+impl Default for TcpSessionOptionState {
     #[inline]
     fn default() -> Self {
         Self::new(TcpCapabilities::default())
@@ -189,7 +184,7 @@ impl Default for TcpConnectionOptionState {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpDataPlaneConnection {
+pub struct TcpSessionState {
     lookup_id: TcpLookupId,
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
@@ -204,7 +199,7 @@ pub struct TcpDataPlaneConnection {
     snd_wnd: u32,
     rcv_nxt: u32,
     rcv_wnd: u32,
-    options: TcpConnectionOptionState,
+    options: TcpSessionOptionState,
     output_payload_len: usize,
     retransmit_queue: TcpOutputRetransmitQueue,
     retransmit_timeout: TcpRetransmitTimeoutState,
@@ -213,7 +208,7 @@ pub struct TcpDataPlaneConnection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpConnectionView {
+pub struct TcpSessionView {
     pub lookup_id: TcpLookupId,
     pub connection_id: Option<TcpConnectionId>,
     pub owner_worker: DataWorkerId,
@@ -230,7 +225,7 @@ pub struct TcpConnectionView {
     pub rcv_wnd: u32,
 }
 
-impl TcpDataPlaneConnection {
+impl TcpSessionState {
     #[inline]
     pub fn new(
         lookup_id: TcpLookupId,
@@ -256,7 +251,7 @@ impl TcpDataPlaneConnection {
             snd_wnd: DEFAULT_TCP_WINDOW,
             rcv_nxt: 0,
             rcv_wnd: DEFAULT_TCP_WINDOW,
-            options: TcpConnectionOptionState::default(),
+            options: TcpSessionOptionState::default(),
             output_payload_len: tcp_effective_output_payload_len(None),
             retransmit_queue: TcpOutputRetransmitQueue::new(),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
@@ -351,12 +346,12 @@ impl TcpDataPlaneConnection {
     }
 
     #[inline]
-    pub fn option_state(&self) -> &TcpConnectionOptionState {
+    pub fn option_state(&self) -> &TcpSessionOptionState {
         &self.options
     }
 
     #[inline]
-    pub fn option_state_mut(&mut self) -> &mut TcpConnectionOptionState {
+    pub fn option_state_mut(&mut self) -> &mut TcpSessionOptionState {
         &mut self.options
     }
 
@@ -454,8 +449,8 @@ impl TcpDataPlaneConnection {
     }
 
     #[inline]
-    pub fn view(&self) -> TcpConnectionView {
-        TcpConnectionView {
+    pub fn view(&self) -> TcpSessionView {
+        TcpSessionView {
             lookup_id: self.lookup_id,
             connection_id: self.connection_id,
             owner_worker: self.owner_worker,
@@ -555,328 +550,82 @@ pub(crate) struct TcpReceiveProgress {
     pub(crate) next_receive_sequence: Option<u32>,
 }
 
-pub trait TcpSessionAccess: Send + Sync {
-    #[inline]
-    fn connection_view(&self, _lookup_id: TcpLookupId) -> CoreResult<Option<TcpConnectionView>> {
-        Ok(None)
-    }
-
-    #[inline]
-    fn apply_receive_progress(
-        &self,
-        _lookup_id: TcpLookupId,
-        _progress: TcpReceiveProgress,
-    ) -> CoreResult<()> {
-        Ok(())
-    }
-
-    #[inline]
-    fn target_for_lookup(&self, _lookup_id: TcpLookupId) -> CoreResult<Option<AppIngressTarget>> {
-        Ok(None)
-    }
-}
-
-struct TcpSessionAccessHandle {
-    raw: *const (),
-    clone_raw: fn(*const ()) -> *const (),
-    drop_raw: fn(*const ()),
-    connection_view: fn(*const (), TcpLookupId) -> CoreResult<Option<TcpConnectionView>>,
-    apply_receive_progress: fn(*const (), TcpLookupId, TcpReceiveProgress) -> CoreResult<()>,
-    target_for_lookup: fn(*const (), TcpLookupId) -> CoreResult<Option<AppIngressTarget>>,
-}
-
-unsafe impl Send for TcpSessionAccessHandle {}
-unsafe impl Sync for TcpSessionAccessHandle {}
-
-impl Default for TcpSessionAccessHandle {
-    #[inline]
-    fn default() -> Self {
-        Self {
-            raw: std::ptr::null(),
-            clone_raw: clone_noop_session_access,
-            drop_raw: drop_noop_session_access,
-            connection_view: noop_session_connection_view,
-            apply_receive_progress: noop_session_apply_receive_progress,
-            target_for_lookup: noop_session_target_for_lookup,
-        }
-    }
-}
-
-impl Clone for TcpSessionAccessHandle {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            raw: (self.clone_raw)(self.raw),
-            clone_raw: self.clone_raw,
-            drop_raw: self.drop_raw,
-            connection_view: self.connection_view,
-            apply_receive_progress: self.apply_receive_progress,
-            target_for_lookup: self.target_for_lookup,
-        }
-    }
-}
-
-impl Drop for TcpSessionAccessHandle {
-    #[inline]
-    fn drop(&mut self) {
-        (self.drop_raw)(self.raw);
-    }
-}
-
-impl TcpSessionAccessHandle {
-    #[inline]
-    fn new<O>(access: Arc<O>) -> Self
-    where
-        O: TcpSessionAccess + 'static,
-    {
-        Self {
-            raw: Arc::into_raw(access) as *const (),
-            clone_raw: clone_session_access_arc::<O>,
-            drop_raw: drop_session_access_arc::<O>,
-            connection_view: session_connection_view_with::<O>,
-            apply_receive_progress: session_apply_receive_progress_with::<O>,
-            target_for_lookup: session_target_for_lookup_with::<O>,
-        }
-    }
-}
-
-#[inline]
-fn clone_noop_session_access(_raw: *const ()) -> *const () {
-    std::ptr::null()
-}
-
-#[inline]
-fn drop_noop_session_access(_raw: *const ()) {}
-
-#[inline]
-fn noop_session_connection_view(
-    _raw: *const (),
-    _lookup_id: TcpLookupId,
-) -> CoreResult<Option<TcpConnectionView>> {
-    Ok(None)
-}
-
-#[inline]
-fn noop_session_apply_receive_progress(
-    _raw: *const (),
-    _lookup_id: TcpLookupId,
-    _progress: TcpReceiveProgress,
-) -> CoreResult<()> {
-    Ok(())
-}
-
-#[inline]
-fn noop_session_target_for_lookup(
-    _raw: *const (),
-    _lookup_id: TcpLookupId,
-) -> CoreResult<Option<AppIngressTarget>> {
-    Ok(None)
-}
-
-#[inline]
-fn clone_session_access_arc<O>(raw: *const ()) -> *const ()
-where
-    O: TcpSessionAccess + 'static,
-{
-    let raw = raw.cast::<O>();
-    if !raw.is_null() {
-        unsafe {
-            Arc::increment_strong_count(raw);
-        }
-    }
-    raw.cast()
-}
-
-#[inline]
-fn drop_session_access_arc<O>(raw: *const ())
-where
-    O: TcpSessionAccess + 'static,
-{
-    let raw = raw.cast::<O>();
-    if !raw.is_null() {
-        unsafe {
-            drop(Arc::from_raw(raw));
-        }
-    }
-}
-
-#[inline]
-fn session_connection_view_with<O>(
-    raw: *const (),
-    lookup_id: TcpLookupId,
-) -> CoreResult<Option<TcpConnectionView>>
-where
-    O: TcpSessionAccess + 'static,
-{
-    let raw = raw.cast::<O>();
-    if raw.is_null() {
-        return Ok(None);
-    }
-    unsafe { (&*raw).connection_view(lookup_id) }
-}
-
-#[inline]
-fn session_apply_receive_progress_with<O>(
-    raw: *const (),
-    lookup_id: TcpLookupId,
-    progress: TcpReceiveProgress,
-) -> CoreResult<()>
-where
-    O: TcpSessionAccess + 'static,
-{
-    let raw = raw.cast::<O>();
-    if raw.is_null() {
-        return Ok(());
-    }
-    unsafe { (&*raw).apply_receive_progress(lookup_id, progress) }
-}
-
-#[inline]
-fn session_target_for_lookup_with<O>(
-    raw: *const (),
-    lookup_id: TcpLookupId,
-) -> CoreResult<Option<AppIngressTarget>>
-where
-    O: TcpSessionAccess + 'static,
-{
-    let raw = raw.cast::<O>();
-    if raw.is_null() {
-        return Ok(None);
-    }
-    unsafe { (&*raw).target_for_lookup(lookup_id) }
-}
-
-#[derive(Clone, Default)]
-pub struct TcpSessionAccessSlot {
-    inner: Arc<ArcSwapOption<TcpSessionAccessHandle>>,
-}
-
-impl TcpSessionAccessSlot {
-    #[inline]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[inline]
-    pub fn install<O>(&self, access: Arc<O>)
-    where
-        O: TcpSessionAccess + 'static,
-    {
-        self.inner
-            .store(Some(Arc::new(TcpSessionAccessHandle::new(access))));
-    }
-
-    #[inline]
-    pub fn connection_view(&self, lookup_id: TcpLookupId) -> CoreResult<Option<TcpConnectionView>> {
-        let access = self.load();
-        (access.connection_view)(access.raw, lookup_id)
-    }
-
-    #[inline]
-    pub(crate) fn apply_receive_progress(
-        &self,
-        lookup_id: TcpLookupId,
-        progress: TcpReceiveProgress,
-    ) -> CoreResult<()> {
-        let access = self.load();
-        (access.apply_receive_progress)(access.raw, lookup_id, progress)
-    }
-
-    #[inline]
-    pub fn target_for_lookup(
-        &self,
-        lookup_id: TcpLookupId,
-    ) -> CoreResult<Option<AppIngressTarget>> {
-        let access = self.load();
-        (access.target_for_lookup)(access.raw, lookup_id)
-    }
-
-    #[inline]
-    fn load(&self) -> TcpSessionAccessHandle {
-        self.inner
-            .load_full()
-            .as_deref()
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct TcpConnectionTable {
-    connections: hammer_infra::vec::Vec<TcpDataPlaneConnection>,
+pub struct TcpSessionTable {
+    sessions: hammer_infra::vec::Vec<TcpSessionState>,
     lookup_slots: FlatHashTable<TcpLookupId, usize>,
     connection_slots: FlatHashTable<u64, usize>,
 }
 
-impl TcpConnectionTable {
+impl TcpSessionTable {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            connections: hammer_infra::vec::Vec::new(),
+            sessions: hammer_infra::vec::Vec::new(),
             lookup_slots: FlatHashTable::new(),
             connection_slots: FlatHashTable::new(),
         }
     }
 
     #[inline]
-    pub fn insert(&mut self, connection: TcpDataPlaneConnection) {
-        let slot = self.connections.len();
-        self.lookup_slots.insert(connection.lookup_id(), slot);
-        if let Some(connection_id) = connection.connection_id() {
+    pub fn insert(&mut self, session: TcpSessionState) {
+        let slot = self.sessions.len();
+        self.lookup_slots.insert(session.lookup_id(), slot);
+        if let Some(connection_id) = session.connection_id() {
             self.connection_slots.insert(connection_id.get(), slot);
         }
-        self.connections.push(connection);
+        self.sessions.push(session);
     }
 
     #[inline]
-    pub fn upsert(&mut self, connection: TcpDataPlaneConnection) {
-        if let Some(slot) = self.lookup_slots.lookup(&connection.lookup_id()) {
-            self.connections[slot] = connection.clone();
-            if let Some(connection_id) = connection.connection_id() {
+    pub fn upsert(&mut self, session: TcpSessionState) {
+        if let Some(slot) = self.lookup_slots.lookup(&session.lookup_id()) {
+            self.sessions[slot] = session.clone();
+            if let Some(connection_id) = session.connection_id() {
                 self.connection_slots.insert(connection_id.get(), slot);
             }
             return;
         }
-        self.insert(connection);
+        self.insert(session);
     }
 
     #[inline]
-    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<&TcpDataPlaneConnection> {
+    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<&TcpSessionState> {
         self.lookup_slots
             .lookup(&lookup_id)
-            .and_then(|slot| self.connections.get(slot))
+            .and_then(|slot| self.sessions.get(slot))
     }
 
     #[inline]
     pub fn lookup_by_lookup_id_mut(
         &mut self,
         lookup_id: TcpLookupId,
-    ) -> Option<&mut TcpDataPlaneConnection> {
+    ) -> Option<&mut TcpSessionState> {
         let slot = self.lookup_slots.lookup(&lookup_id)?;
-        self.connections.get_mut(slot)
+        self.sessions.get_mut(slot)
     }
 
     #[inline]
     pub fn lookup_by_connection_id(
         &self,
         connection_id: TcpConnectionId,
-    ) -> Option<&TcpDataPlaneConnection> {
+    ) -> Option<&TcpSessionState> {
         self.connection_slots
             .lookup(&connection_id.get())
-            .and_then(|slot| self.connections.get(slot))
+            .and_then(|slot| self.sessions.get(slot))
     }
 
     #[inline]
     pub fn lookup_by_connection_id_mut(
         &mut self,
         connection_id: TcpConnectionId,
-    ) -> Option<&mut TcpDataPlaneConnection> {
+    ) -> Option<&mut TcpSessionState> {
         let slot = self.connection_slots.lookup(&connection_id.get())?;
-        self.connections.get_mut(slot)
+        self.sessions.get_mut(slot)
     }
 }
 
-impl Default for TcpConnectionTable {
+impl Default for TcpSessionTable {
     #[inline]
     fn default() -> Self {
         Self::empty()

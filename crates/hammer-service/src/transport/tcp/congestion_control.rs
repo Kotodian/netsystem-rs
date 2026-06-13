@@ -3,9 +3,10 @@ use std::time::Instant;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
 
+use crate::session::protocol::tcp::state::TcpSessionTable;
+
 use super::TcpLookupId;
 use super::congestion::TcpCongestionAckSample;
-use super::connection::TcpConnectionTable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionAckObservation {
@@ -33,19 +34,19 @@ pub struct TcpCongestionControlNode;
 
 impl TcpCongestionControlNode {
     pub fn observe_ack(
-        connections: &mut TcpConnectionTable,
+        sessions: &mut TcpSessionTable,
         observation: TcpCongestionAckObservation,
     ) -> CoreResult<()> {
-        let connection = connections
+        let session = sessions
             .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion ack connection not found"))?;
-        let sample = connection
+            .ok_or_else(|| CoreError::internal("tcp congestion ack session not found"))?;
+        let sample = session
             .retransmit_queue_mut()
             .acknowledge_through_with_sample(observation.accepted_acknowledgment, observation.now);
         if let Some(rtt) = sample.latest_rtt {
             let bytes_in_flight =
-                tcp_seq_distance(observation.accepted_acknowledgment, connection.snd_nxt());
-            connection.congestion_mut().on_ack(TcpCongestionAckSample {
+                tcp_seq_distance(observation.accepted_acknowledgment, session.snd_nxt());
+            session.congestion_mut().on_ack(TcpCongestionAckSample {
                 bytes_acked: sample.bytes_acked,
                 rtt,
                 now: observation.now,
@@ -56,32 +57,32 @@ impl TcpCongestionControlNode {
     }
 
     pub fn observe_send(
-        connections: &mut TcpConnectionTable,
+        sessions: &mut TcpSessionTable,
         observation: TcpCongestionSendObservation,
     ) -> CoreResult<()> {
-        let connection = connections
+        let session = sessions
             .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion send connection not found"))?;
-        connection
+            .ok_or_else(|| CoreError::internal("tcp congestion send session not found"))?;
+        session
             .congestion_mut()
             .on_packet_sent(observation.bytes_sent, observation.bytes_in_flight);
-        let next_output_at = connection
+        let next_output_at = session
             .congestion()
             .next_send_delay(observation.bytes_sent)
             .map(|delay| observation.now + delay);
-        connection.set_next_output_at(next_output_at);
+        session.set_next_output_at(next_output_at);
         Ok(())
     }
 
     pub fn observe_loss(
-        connections: &mut TcpConnectionTable,
+        sessions: &mut TcpSessionTable,
         observation: TcpCongestionLossObservation,
     ) -> CoreResult<()> {
-        let connection = connections
+        let session = sessions
             .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion loss connection not found"))?;
-        connection.congestion_mut().on_loss(observation.bytes_lost);
-        connection.set_next_output_at(None);
+            .ok_or_else(|| CoreError::internal("tcp congestion loss session not found"))?;
+        session.congestion_mut().on_loss(observation.bytes_lost);
+        session.set_next_output_at(None);
         Ok(())
     }
 }

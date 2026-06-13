@@ -1,11 +1,11 @@
-use crate::session::AppSessionId;
+use crate::session::SessionId;
 
-pub struct AppSessionReadyQueue {
-    ready: hammer_infra::vec::Vec<AppSessionId>,
+pub struct SessionReadyQueue {
+    ready: hammer_infra::vec::Vec<SessionId>,
     slots: hammer_infra::map::FlatHashTable<u64, usize>,
 }
 
-impl AppSessionReadyQueue {
+impl SessionReadyQueue {
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -14,7 +14,7 @@ impl AppSessionReadyQueue {
         }
     }
 
-    pub fn mark_ready(&mut self, session_id: AppSessionId) {
+    pub fn mark_ready(&mut self, session_id: SessionId) {
         if self.slots.lookup(&session_id.get()).is_some() {
             return;
         }
@@ -33,7 +33,7 @@ impl AppSessionReadyQueue {
         self.ready.is_empty()
     }
 
-    pub fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<AppSessionId> {
+    pub fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
         let ready = self.ready.iter().copied().collect();
         self.ready.clear();
         self.slots = hammer_infra::map::FlatHashTable::new();

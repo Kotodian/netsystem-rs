@@ -1,14 +1,13 @@
-use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers, Network, RouteMetadata, SocksAddr};
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq, TcpState};
+use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq};
+use hammer_infra::vec::Vec;
 
 use super::TcpLookupId;
-use super::connection::TcpDataPlaneConnection;
+use crate::session::protocol::tcp::state::TcpSessionState;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const IPV4_HEADER_LEN: usize = 20;
@@ -46,90 +45,6 @@ pub struct TcpOutputRecord {
     pub advertised_window: u16,
     pub payload_len: usize,
     pub metadata: RouteMetadata,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpOutputConnectionState {
-    pub lookup_id: TcpLookupId,
-    pub connection_id: Option<TcpConnectionId>,
-    pub remote: SocketAddr,
-    pub iss: u32,
-    pub irs: u32,
-    pub snd_una: u32,
-    pub snd_nxt: u32,
-    pub rcv_nxt: u32,
-    pub advertised_rcv_wnd: u32,
-}
-
-impl TcpOutputConnectionState {
-    #[inline]
-    pub fn from_connection(connection: &TcpDataPlaneConnection) -> Self {
-        Self {
-            lookup_id: connection.lookup_id(),
-            connection_id: connection.connection_id(),
-            remote: connection.remote(),
-            iss: connection.iss(),
-            irs: connection.irs(),
-            snd_una: connection.snd_una(),
-            snd_nxt: connection.snd_nxt(),
-            rcv_nxt: connection.rcv_nxt(),
-            advertised_rcv_wnd: u32::from(
-                connection.advertised_receive_window(connection.rcv_wnd()),
-            ),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpQueuedPayload {
-    pub id: u64,
-    pub len: usize,
-    pub offset: usize,
-    pub tail_queued: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpOutputConnectionView {
-    pub connection_id: Option<TcpConnectionId>,
-    pub state: TcpState,
-    pub local: Option<SocketAddr>,
-    pub local_port: u16,
-    pub remote: SocketAddr,
-    pub send_state_initialized: bool,
-    pub receive_state_initialized: bool,
-    pub pending_fin: bool,
-    pub output_payload_len: usize,
-    pub next_output_at: Option<Instant>,
-    pub persist_armed: bool,
-    pub persist_deadline: Option<Instant>,
-    pub send_view: TcpOutputSendView,
-    pub iss: u32,
-    pub snd_nxt: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpOutputWorkItem {
-    pub connection_id: TcpConnectionId,
-    pub record: TcpOutputRecord,
-    pub send_id: Option<u64>,
-    pub send_queue_offset: usize,
-    pub payload_len: usize,
-    pub include_fin: bool,
-    pub retransmit: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TcpOutputDecision {
-    Work(TcpOutputWorkItem),
-    WaitUntil {
-        connection_id: TcpConnectionId,
-        deadline: Instant,
-    },
-    PersistUntil {
-        connection_id: TcpConnectionId,
-        deadline: Instant,
-    },
-    None,
 }
 
 impl TcpOutputRecord {
@@ -229,19 +144,30 @@ pub struct TcpOutputSendView {
 
 impl TcpOutputSendView {
     #[inline]
-    pub fn from_connection(connection: &TcpDataPlaneConnection) -> Self {
+    pub fn from_session(session: &TcpSessionState) -> Self {
         Self {
-            snd_una: connection.snd_una(),
-            snd_nxt: connection.snd_nxt(),
-            snd_wnd: connection.snd_wnd(),
-            congestion_window: connection.congestion().congestion_window(),
+            snd_una: session.snd_una(),
+            snd_nxt: session.snd_nxt(),
+            snd_wnd: session.snd_wnd(),
+            congestion_window: session.congestion().congestion_window(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct TcpOutputRetransmitQueue {
-    records: VecDeque<TcpOutputRetransmitRecord>,
+    records: Vec<TcpOutputRetransmitRecord>,
+    head: usize,
+}
+
+impl Clone for TcpOutputRetransmitQueue {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            records: self.active_records().iter().cloned().collect(),
+            head: 0,
+        }
+    }
 }
 
 impl TcpOutputRetransmitQueue {
@@ -252,35 +178,35 @@ impl TcpOutputRetransmitQueue {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.active_records().len()
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.len() == 0
     }
 
     #[inline]
     pub fn front(&self) -> Option<&TcpOutputRetransmitRecord> {
-        self.records.front()
+        self.active_records().first()
     }
 
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &TcpOutputRetransmitRecord> {
-        self.records.iter()
+        self.active_records().iter()
     }
 
     #[inline]
     pub fn track_output(&mut self, record: &TcpOutputRecord) -> Option<&TcpOutputRetransmitRecord> {
         let retransmit = record.to_retransmit_record()?;
-        if let Some(existing) = self.records.iter().position(|existing| {
+        if let Some(existing) = self.active_records().iter().position(|existing| {
             existing.record.sequence == retransmit.record.sequence
                 && existing.next_sequence == retransmit.next_sequence
         }) {
-            return self.records.get(existing);
+            return self.records.get(self.head + existing);
         }
-        self.records.push_back(retransmit);
-        self.records.back()
+        self.records.push(retransmit);
+        self.records.last()
     }
 
     #[inline]
@@ -291,31 +217,32 @@ impl TcpOutputRetransmitQueue {
     ) -> Option<&TcpOutputRetransmitRecord> {
         let mut retransmit = record.to_retransmit_record()?;
         retransmit.sent_at = Some(sent_at);
-        if let Some(existing) = self.records.iter().position(|existing| {
+        if let Some(existing) = self.active_records().iter().position(|existing| {
             existing.record.sequence == retransmit.record.sequence
                 && existing.next_sequence == retransmit.next_sequence
         }) {
+            let index = self.head + existing;
             self.records
-                .get_mut(existing)
+                .get_mut(index)
                 .expect("tracked output index should exist")
                 .sent_at = Some(sent_at);
-            return self.records.get(existing);
+            return self.records.get(index);
         }
-        self.records.push_back(retransmit);
-        self.records.back()
+        self.records.push(retransmit);
+        self.records.last()
     }
 
     #[inline]
     pub fn acknowledge_through(&mut self, acknowledgment: u32) -> usize {
         let mut released = 0usize;
         while self
-            .records
             .front()
             .is_some_and(|record| record.is_fully_acked_by(acknowledgment))
         {
-            let _ = self.records.pop_front();
+            self.head += 1;
             released += 1;
         }
+        self.compact_if_needed();
         released
     }
 
@@ -327,214 +254,58 @@ impl TcpOutputRetransmitQueue {
     ) -> TcpAckDeliverySample {
         let mut sample = TcpAckDeliverySample::default();
         while self
-            .records
             .front()
             .is_some_and(|record| record.is_fully_acked_by(acknowledgment))
         {
             let record = self
                 .records
-                .pop_front()
+                .get(self.head)
                 .expect("front output record should be present after ACK check");
             sample.bytes_acked += record.record.sequence_len();
             if let Some(sent_at) = record.sent_at {
                 sample.latest_rtt = Some(now.saturating_duration_since(sent_at));
             }
+            self.head += 1;
             sample.released_segments += 1;
         }
+        self.compact_if_needed();
         sample
     }
-}
 
-pub trait TcpOutputBackend: Send + Sync {
-    /// Borrow an already-built TCP output buffer chain.
-    ///
-    /// Ownership stays with the caller so TCP can keep application buffers
-    /// alive for retransmission until ACK progress releases them.
-    fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()>;
-}
-
-#[derive(Debug, Default)]
-pub struct NoopTcpOutputBackend;
-
-impl TcpOutputBackend for NoopTcpOutputBackend {
     #[inline]
-    fn emit_buffer(&self, _buffers: &DataPlaneBuffers, _index: BufferIndex) -> CoreResult<()> {
-        Ok(())
+    fn active_records(&self) -> &[TcpOutputRetransmitRecord] {
+        &self.records[self.head..]
     }
-}
 
-#[derive(Clone)]
-pub struct TcpOutputBackendSlot {
-    inner: Arc<Mutex<Arc<dyn TcpOutputBackend>>>,
-}
-
-impl Default for TcpOutputBackendSlot {
     #[inline]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TcpOutputBackendSlot {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Arc::new(NoopTcpOutputBackend))),
+    fn compact_if_needed(&mut self) {
+        if self.head == 0 {
+            return;
         }
-    }
-
-    #[inline]
-    pub fn install<O>(&self, backend: Arc<O>)
-    where
-        O: TcpOutputBackend + 'static,
-    {
-        let mut slot = self.inner.lock().expect("tcp output backend poisoned");
-        *slot = backend;
-    }
-
-    #[inline]
-    pub fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()> {
-        let backend = self
-            .inner
-            .lock()
-            .map_err(|_| CoreError::internal("tcp output backend poisoned"))?
-            .clone();
-        backend.emit_buffer(buffers, index)
-    }
-}
-
-impl TcpOutputBackend for TcpOutputBackendSlot {
-    #[inline]
-    fn emit_buffer(&self, buffers: &DataPlaneBuffers, index: BufferIndex) -> CoreResult<()> {
-        TcpOutputBackendSlot::emit_buffer(self, buffers, index)
+        if self.head == self.records.len() {
+            self.records.clear();
+            self.head = 0;
+            return;
+        }
+        if self.head < self.records.len() / 2 {
+            return;
+        }
+        let tail = self.records.drain(self.head..);
+        let mut kept = Vec::with_capacity(tail.len());
+        kept.extend(tail);
+        self.records.clear();
+        self.records.extend(kept);
+        self.head = 0;
     }
 }
 
 pub fn tcp_output_packet(
-    connection: TcpOutputConnectionState,
+    session: &TcpSessionState,
     local: SocketAddr,
     payload: &[u8],
 ) -> CoreResult<TcpOutputRecord> {
     let flags = TCP_FLAG_ACK | u8::from(!payload.is_empty()) * TCP_FLAG_PSH;
-    tcp_output_packet_flags(connection, local, payload, flags)
-}
-
-pub fn tcp_output_decision(
-    connection: TcpOutputConnectionState,
-    view: TcpOutputConnectionView,
-    queued: Option<TcpQueuedPayload>,
-    retransmit_pending: bool,
-    retransmit_record: Option<TcpOutputRecord>,
-    now: Instant,
-) -> CoreResult<TcpOutputDecision> {
-    let Some(connection_id) = view.connection_id else {
-        return Ok(TcpOutputDecision::None);
-    };
-    if retransmit_pending {
-        let Some(record) = retransmit_record else {
-            return Ok(TcpOutputDecision::None);
-        };
-        return Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
-            connection_id,
-            payload_len: record.payload_len,
-            include_fin: record.flags & TCP_FLAG_FIN != 0,
-            retransmit: true,
-            send_id: None,
-            send_queue_offset: 0,
-            record,
-        }));
-    }
-    if view.state == TcpState::SynSent {
-        if !view.send_state_initialized || view.snd_nxt != view.iss {
-            return Ok(TcpOutputDecision::None);
-        }
-        let local = view.local.unwrap_or_else(|| {
-            SocketAddr::new(unspecified_ip_for_output(view.remote.ip()), view.local_port)
-        });
-        let record = tcp_output_packet_len(connection, local, 0, TCP_FLAG_SYN)?;
-        return Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
-            connection_id,
-            record,
-            send_id: None,
-            send_queue_offset: 0,
-            payload_len: 0,
-            include_fin: false,
-            retransmit: false,
-        }));
-    }
-    if !tcp_state_allows_output(view.state) {
-        return Ok(TcpOutputDecision::None);
-    }
-    let Some(local) = view.local else {
-        return Ok(TcpOutputDecision::None);
-    };
-    if queued.is_none() && !view.pending_fin {
-        return Ok(TcpOutputDecision::None);
-    }
-    if !(view.send_state_initialized && view.receive_state_initialized) {
-        return Ok(TcpOutputDecision::None);
-    }
-    if let Some(next_output_at) = view.next_output_at
-        && next_output_at > now
-    {
-        return Ok(TcpOutputDecision::WaitUntil {
-            connection_id,
-            deadline: next_output_at,
-        });
-    }
-    let has_queued_payload = queued.is_some();
-    if (has_queued_payload || view.pending_fin) && view.send_view.snd_wnd == 0 {
-        if view.persist_armed {
-            return Ok(TcpOutputDecision::None);
-        }
-        let Some(deadline) = view.persist_deadline else {
-            return Ok(TcpOutputDecision::None);
-        };
-        return Ok(TcpOutputDecision::PersistUntil {
-            connection_id,
-            deadline,
-        });
-    }
-    let (payload_len, include_fin, send_id, send_queue_offset) = if let Some(staged) = queued {
-        let requested_payload_len = staged.len.min(view.output_payload_len);
-        let can_drain_payload = requested_payload_len == staged.len && !staged.tail_queued;
-        let payload_len_with_fin = if view.pending_fin && can_drain_payload {
-            tcp_payload_len_in_send_window(view.send_view, requested_payload_len, 1)
-        } else {
-            0
-        };
-        let include_fin =
-            view.pending_fin && can_drain_payload && payload_len_with_fin == requested_payload_len;
-        let payload_len = if include_fin {
-            payload_len_with_fin
-        } else {
-            tcp_payload_len_in_send_window(view.send_view, requested_payload_len, 0)
-        };
-        (payload_len, include_fin, Some(staged.id), staged.offset)
-    } else {
-        (
-            0,
-            view.pending_fin && tcp_available_send_window(view.send_view) != 0,
-            None,
-            0,
-        )
-    };
-    if payload_len == 0 && !include_fin {
-        return Ok(TcpOutputDecision::None);
-    }
-    let flags = TCP_FLAG_ACK
-        | if payload_len == 0 { 0 } else { TCP_FLAG_PSH }
-        | if include_fin { TCP_FLAG_FIN } else { 0 };
-    let record = tcp_output_packet_len(connection, local, payload_len, flags)?;
-    Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
-        connection_id,
-        record,
-        send_id,
-        send_queue_offset,
-        payload_len,
-        include_fin,
-        retransmit: false,
-    }))
+    tcp_output_packet_flags(session, local, payload, flags)
 }
 
 #[inline]
@@ -542,24 +313,6 @@ pub fn tcp_available_send_window(view: TcpOutputSendView) -> u32 {
     view.snd_wnd
         .min(view.congestion_window)
         .saturating_sub(tcp_inflight_sequence_len(view.snd_una, view.snd_nxt))
-}
-
-#[inline]
-fn tcp_state_allows_payload_send(state: TcpState) -> bool {
-    matches!(state, TcpState::Established | TcpState::CloseWait)
-}
-
-#[inline]
-fn tcp_state_allows_output(state: TcpState) -> bool {
-    tcp_state_allows_payload_send(state) || matches!(state, TcpState::FinWait1 | TcpState::LastAck)
-}
-
-#[inline]
-fn unspecified_ip_for_output(remote: IpAddr) -> IpAddr {
-    match remote {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-    }
 }
 
 #[inline]
@@ -574,42 +327,42 @@ pub fn tcp_payload_len_in_send_window(
 }
 
 pub fn tcp_output_packet_flags(
-    connection: TcpOutputConnectionState,
+    session: &TcpSessionState,
     local: SocketAddr,
     payload: &[u8],
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(connection, local, payload.len(), payload.is_empty(), flags)
+    build_packet(session, local, payload.len(), payload.is_empty(), flags)
 }
 
 pub fn tcp_output_packet_len(
-    connection: TcpOutputConnectionState,
+    session: &TcpSessionState,
     local: SocketAddr,
     payload_len: usize,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(connection, local, payload_len, payload_len == 0, flags)
+    build_packet(session, local, payload_len, payload_len == 0, flags)
 }
 
 fn build_packet(
-    connection: TcpOutputConnectionState,
+    session: &TcpSessionState,
     local: SocketAddr,
     payload_len: usize,
     payload_empty: bool,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    let connection_id = connection
-        .connection_id
+    let connection_id = session
+        .connection_id()
         .ok_or_else(|| CoreError::internal("tcp output requires an installed connection id"))?;
-    let remote = connection.remote;
+    let remote = session.remote();
     validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload_len)?;
-    let sequence = tcp_output_sequence(connection);
-    let acknowledgment = tcp_output_acknowledgment(connection);
-    let advertised_window = connection.advertised_rcv_wnd.min(u32::from(u16::MAX)) as u16;
+    let sequence = tcp_output_sequence(session);
+    let acknowledgment = tcp_output_acknowledgment(session);
+    let advertised_window = session.advertised_receive_window(session.rcv_wnd());
     let flags = normalize_tcp_output_flags(flags, payload_empty);
     validate_tcp_output_address_family(local, remote)?;
     Ok(TcpOutputRecord {
-        lookup_id: connection.lookup_id,
+        lookup_id: session.lookup_id(),
         connection_id,
         local,
         remote,
@@ -678,24 +431,24 @@ fn normalize_tcp_output_flags(flags: u8, payload_empty: bool) -> u8 {
 }
 
 #[inline]
-fn tcp_output_sequence(connection: TcpOutputConnectionState) -> u32 {
-    if connection.snd_nxt != 0 {
-        connection.snd_nxt
-    } else if connection.snd_una != 0 {
-        connection.snd_una
-    } else if connection.iss != 0 {
-        TcpSeq::new(connection.iss).advance(1).raw()
+fn tcp_output_sequence(session: &TcpSessionState) -> u32 {
+    if session.snd_nxt() != 0 {
+        session.snd_nxt()
+    } else if session.snd_una() != 0 {
+        session.snd_una()
+    } else if session.iss() != 0 {
+        TcpSeq::new(session.iss()).advance(1).raw()
     } else {
         1
     }
 }
 
 #[inline]
-fn tcp_output_acknowledgment(connection: TcpOutputConnectionState) -> u32 {
-    if connection.rcv_nxt != 0 {
-        connection.rcv_nxt
-    } else if connection.irs != 0 {
-        TcpSeq::new(connection.irs).advance(1).raw()
+fn tcp_output_acknowledgment(session: &TcpSessionState) -> u32 {
+    if session.rcv_nxt() != 0 {
+        session.rcv_nxt()
+    } else if session.irs() != 0 {
+        TcpSeq::new(session.irs()).advance(1).raw()
     } else {
         1
     }

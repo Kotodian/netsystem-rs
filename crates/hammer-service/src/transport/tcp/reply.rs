@@ -5,8 +5,6 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use super::output::TcpOutputBackend;
-
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_RST: u8 = 0x04;
@@ -94,14 +92,14 @@ pub fn tcp_control_metadata(local: SocketAddr, remote: SocketAddr) -> RouteMetad
 
 pub fn emit_tcp_control_packet(
     buffers: &DataPlaneBuffers,
-    output: &dyn TcpOutputBackend,
     packet: &[u8],
     metadata: RouteMetadata,
+    emit: impl FnOnce(&DataPlaneBuffers, BufferIndex) -> CoreResult<()>,
 ) -> CoreResult<()> {
     let index = buffers.alloc_index_with_bytes(metadata, packet)?;
     let result = (|| {
         set_ipv4_tcp_cursor(buffers, index, packet)?;
-        output.emit_buffer(buffers, index)
+        emit(buffers, index)
     })();
     buffers.free_index(index);
     result

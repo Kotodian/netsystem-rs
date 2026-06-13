@@ -15,13 +15,10 @@ use hammer_adapter::{
     PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::map::FlatHashTable;
 
 use super::{
-    TcpConnectionSnapshotPool, TcpDispatchTable, TcpInputError, TcpInputFlags, TcpInputNext,
-    TcpLookupId, TcpLookupKind, TcpLookupSnapshot, TcpLookupValue, TcpState, TcpV4ConnectionKey,
-    TcpV4ListenerKey, TcpV4PendingConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
-    TcpV6PendingConnectionKey,
+    TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
+    TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -93,9 +90,6 @@ fn format_tcp_input_trace(bytes: &[u8]) -> String {
 #[derive(Debug, Clone)]
 struct TcpInputSnapshot {
     lookup: TcpLookupSnapshot,
-    connections: TcpConnectionSnapshotPool,
-    dispatch: TcpDispatchTable,
-    app_ingress: Arc<FlatHashTable<TcpLookupId, ()>>,
 }
 
 impl TcpInputSnapshot {
@@ -103,9 +97,6 @@ impl TcpInputSnapshot {
     fn new() -> Self {
         Self {
             lookup: TcpLookupSnapshot::default(),
-            connections: TcpConnectionSnapshotPool::empty(),
-            dispatch: TcpDispatchTable::default(),
-            app_ingress: Arc::new(FlatHashTable::new()),
         }
     }
 }
@@ -146,44 +137,6 @@ impl TcpInputControlPlane {
         self.inner.rcu(|current| {
             let mut next = TcpInputSnapshot::clone(current);
             next.lookup = lookup.clone();
-            next
-        });
-        Ok(())
-    }
-
-    #[inline]
-    pub fn publish_dispatch(&self, dispatch: TcpDispatchTable) -> CoreResult<()> {
-        self.inner.rcu(|current| {
-            let mut next = TcpInputSnapshot::clone(current);
-            next.dispatch = dispatch.clone();
-            next
-        });
-        Ok(())
-    }
-
-    #[inline]
-    pub fn publish_connections(&self, connections: TcpConnectionSnapshotPool) -> CoreResult<()> {
-        self.inner.rcu(|current| {
-            let mut next = TcpInputSnapshot::clone(current);
-            next.connections = connections.clone();
-            next
-        });
-        Ok(())
-    }
-
-    #[inline]
-    pub fn publish_app_ingress(
-        &self,
-        app_ingress: impl IntoIterator<Item = TcpLookupId>,
-    ) -> CoreResult<()> {
-        let app_ingress = Arc::new(FlatHashTable::from_entries(
-            app_ingress
-                .into_iter()
-                .map(|connection_id| (connection_id, ())),
-        ));
-        self.inner.rcu(|current| {
-            let mut next = TcpInputSnapshot::clone(current);
-            next.app_ingress = Arc::clone(&app_ingress);
             next
         });
         Ok(())
@@ -315,230 +268,6 @@ fn tcp_input_process(
     Ok(result)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PendingTcpAppIngress {
-    pub(crate) connection_id: TcpLookupId,
-    pub(crate) fin: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PendingTcpAppIngressEntry {
-    generation: u32,
-    pending: PendingTcpAppIngress,
-    occupied: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PendingTcpAppIngressPool {
-    pool_id: u64,
-    entries: hammer_infra::vec::Vec<PendingTcpAppIngressEntry>,
-}
-
-impl PendingTcpAppIngressPool {
-    #[inline]
-    const fn new(pool_id: u64) -> Self {
-        Self {
-            pool_id,
-            entries: hammer_infra::vec::Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct PendingTcpAppIngressStore {
-    pools: hammer_infra::vec::Vec<PendingTcpAppIngressPool>,
-}
-
-thread_local! {
-    static TCP_APP_INGRESS_PENDING: RefCell<PendingTcpAppIngressStore> =
-        const { RefCell::new(PendingTcpAppIngressStore::new()) };
-    static TCP_ACCEPT_PENDING: RefCell<PendingTcpAcceptStore> =
-        const { RefCell::new(PendingTcpAcceptStore::new()) };
-}
-
-impl PendingTcpAppIngressStore {
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            pools: hammer_infra::vec::Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn mark(&mut self, index: BufferIndex, pending: PendingTcpAppIngress) {
-        let pool = self.pool_mut(index.pool_id());
-        let slot = index.slot() as usize;
-        while pool.entries.len() <= slot {
-            pool.entries.push(PendingTcpAppIngressEntry::default());
-        }
-        pool.entries[slot] = PendingTcpAppIngressEntry {
-            generation: index.generation(),
-            pending,
-            occupied: true,
-        };
-    }
-
-    #[inline]
-    fn take(&mut self, index: BufferIndex) -> Option<PendingTcpAppIngress> {
-        let pool = self
-            .pools
-            .iter_mut()
-            .find(|pool| pool.pool_id == index.pool_id())?;
-        let entry = pool.entries.get_mut(index.slot() as usize)?;
-        if !entry.occupied {
-            return None;
-        }
-        if entry.generation != index.generation() {
-            *entry = PendingTcpAppIngressEntry::default();
-            return None;
-        }
-        let pending = entry.pending;
-        *entry = PendingTcpAppIngressEntry::default();
-        Some(pending)
-    }
-
-    #[inline]
-    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAppIngressPool {
-        if let Some(position) = self.pools.iter().position(|pool| pool.pool_id == pool_id) {
-            return &mut self.pools[position];
-        }
-        self.pools.push(PendingTcpAppIngressPool::new(pool_id));
-        let position = self.pools.len() - 1;
-        &mut self.pools[position]
-    }
-}
-
-#[inline]
-pub(crate) fn mark_pending_tcp_app_ingress(
-    index: BufferIndex,
-    connection_id: TcpLookupId,
-    fin: bool,
-) -> CoreResult<()> {
-    TCP_APP_INGRESS_PENDING.with(|pending| {
-        pending
-            .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP app ingress pending store borrowed"))?
-            .mark(index, PendingTcpAppIngress { connection_id, fin });
-        Ok(())
-    })
-}
-
-#[inline]
-pub(crate) fn take_pending_tcp_app_ingress(
-    index: BufferIndex,
-) -> CoreResult<Option<PendingTcpAppIngress>> {
-    TCP_APP_INGRESS_PENDING.with(|pending| {
-        Ok(pending
-            .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP app ingress pending store borrowed"))?
-            .take(index))
-    })
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PendingTcpAcceptEntry {
-    generation: u32,
-    listener_id: TcpLookupId,
-    occupied: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct PendingTcpAcceptPool {
-    pool_id: u64,
-    entries: hammer_infra::vec::Vec<PendingTcpAcceptEntry>,
-}
-
-impl PendingTcpAcceptPool {
-    #[inline]
-    const fn new(pool_id: u64) -> Self {
-        Self {
-            pool_id,
-            entries: hammer_infra::vec::Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct PendingTcpAcceptStore {
-    pools: hammer_infra::vec::Vec<PendingTcpAcceptPool>,
-}
-
-impl PendingTcpAcceptStore {
-    #[inline]
-    const fn new() -> Self {
-        Self {
-            pools: hammer_infra::vec::Vec::new(),
-        }
-    }
-
-    #[inline]
-    fn mark(&mut self, index: BufferIndex, listener_id: TcpLookupId) {
-        let pool = self.pool_mut(index.pool_id());
-        let slot = index.slot() as usize;
-        while pool.entries.len() <= slot {
-            pool.entries.push(PendingTcpAcceptEntry::default());
-        }
-        pool.entries[slot] = PendingTcpAcceptEntry {
-            generation: index.generation(),
-            listener_id,
-            occupied: true,
-        };
-    }
-
-    #[inline]
-    fn take(&mut self, index: BufferIndex) -> Option<TcpLookupId> {
-        let pool = self
-            .pools
-            .iter_mut()
-            .find(|pool| pool.pool_id == index.pool_id())?;
-        let entry = pool.entries.get_mut(index.slot() as usize)?;
-        if !entry.occupied {
-            return None;
-        }
-        if entry.generation != index.generation() {
-            *entry = PendingTcpAcceptEntry::default();
-            return None;
-        }
-        let listener_id = entry.listener_id;
-        *entry = PendingTcpAcceptEntry::default();
-        Some(listener_id)
-    }
-
-    #[inline]
-    fn pool_mut(&mut self, pool_id: u64) -> &mut PendingTcpAcceptPool {
-        if let Some(position) = self.pools.iter().position(|pool| pool.pool_id == pool_id) {
-            return &mut self.pools[position];
-        }
-        self.pools.push(PendingTcpAcceptPool::new(pool_id));
-        let position = self.pools.len() - 1;
-        &mut self.pools[position]
-    }
-}
-
-#[inline]
-pub(crate) fn mark_pending_tcp_accept(
-    index: BufferIndex,
-    listener_id: TcpLookupId,
-) -> CoreResult<()> {
-    TCP_ACCEPT_PENDING.with(|pending| {
-        pending
-            .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP accept pending store borrowed"))?
-            .mark(index, listener_id);
-        Ok(())
-    })
-}
-
-#[inline]
-pub(crate) fn take_pending_tcp_accept(index: BufferIndex) -> CoreResult<Option<TcpLookupId>> {
-    TCP_ACCEPT_PENDING.with(|pending| {
-        Ok(pending
-            .try_borrow_mut()
-            .map_err(|_| CoreError::internal("TCP accept pending store borrowed"))?
-            .take(index))
-    })
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ParsedTcpInput {
     version: IpVersion,
@@ -604,17 +333,7 @@ fn next_node_for_index(
         runtime.handoff_index(owner, handoff.tcp_input, index)?;
         return Ok(None);
     }
-    let state = tcp_state_for_lookup(lookup, &snapshot.connections);
-    let app_ingress_connection = match lookup {
-        Some(value)
-            if value.kind == TcpLookupKind::EstablishedConnection
-                && snapshot.app_ingress.lookup(&value.id).is_some() =>
-        {
-            Some(value.id)
-        }
-        _ => None,
-    };
-    let entry = snapshot.dispatch.entry(state, parsed.flags);
+    let entry = tcp_listener_input_entry(parsed.flags);
     if let Some(error) = entry.error {
         return resolve_error_next(
             runtime,
@@ -626,17 +345,6 @@ fn next_node_for_index(
             Some(parsed.protocol),
             parsed.flags.bits(),
         );
-    }
-    if entry.next == TcpInputNext::Established
-        && let Some(connection_id) = app_ingress_connection
-    {
-        mark_pending_tcp_app_ingress(index, connection_id, false)?;
-    }
-    if entry.next == TcpInputNext::Listen
-        && let Some(listener_id) =
-            pending_tcp_accept_listener_id(&metadata, lookup, &snapshot.lookup, &parsed, state)
-    {
-        mark_pending_tcp_accept(index, listener_id)?;
     }
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, entry.next);
@@ -687,52 +395,32 @@ fn resolve_error_next(
 
 #[inline(always)]
 fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
-    match lookup {
-        Some(value)
-            if matches!(
-                value.kind,
-                TcpLookupKind::EstablishedConnection
-                    | TcpLookupKind::SynSentConnection
-                    | TcpLookupKind::Listener
-            ) =>
-        {
-            Some(value.owner_worker)
-        }
-        _ => None,
-    }
+    lookup.map(|value| value.owner_worker)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpInputEntry {
+    next: TcpInputNext,
+    error: Option<TcpInputError>,
 }
 
 #[inline(always)]
-fn pending_tcp_accept_listener_id(
-    metadata: &RouteMetadata,
-    lookup: Option<TcpLookupValue>,
-    snapshot: &TcpLookupSnapshot,
-    parsed: &ParsedTcpInput,
-    state: TcpState,
-) -> Option<TcpLookupId> {
-    match lookup {
-        Some(value) if value.kind == TcpLookupKind::Listener => Some(value.id),
-        Some(_) if state == TcpState::SynRcvd => {
-            listener_lookup_for_packet(metadata, snapshot, parsed)
-                .filter(|value| value.kind == TcpLookupKind::Listener)
-                .map(|value| value.id)
-        }
-        _ => None,
+fn tcp_listener_input_entry(flags: TcpInputFlags) -> TcpInputEntry {
+    if flags == TcpInputFlags::SYN {
+        return TcpInputEntry {
+            next: TcpInputNext::Listen,
+            error: None,
+        };
     }
-}
-
-#[inline(always)]
-fn tcp_state_for_lookup(
-    lookup: Option<TcpLookupValue>,
-    connections: &TcpConnectionSnapshotPool,
-) -> TcpState {
-    match lookup {
-        Some(value) if value.kind == TcpLookupKind::SynSentConnection => TcpState::SynSent,
-        Some(value) if value.kind == TcpLookupKind::EstablishedConnection => connections
-            .lookup_by_lookup_id(value.id)
-            .map(|snapshot| snapshot.state)
-            .unwrap_or(TcpState::Established),
-        _ => TcpState::Listen,
+    if flags == TcpInputFlags::ACK {
+        return TcpInputEntry {
+            next: TcpInputNext::Reset,
+            error: Some(TcpInputError::AckInvalid),
+        };
+    }
+    TcpInputEntry {
+        next: TcpInputNext::Punt,
+        error: None,
     }
 }
 
@@ -741,59 +429,8 @@ mod tests {
     use std::sync::Arc;
 
     use arc_swap::ArcSwap;
-    use hammer_adapter::{DataPlaneRuntime, RouteMetadata};
 
-    use super::{
-        PendingTcpAppIngress, PendingTcpAppIngressStore, TcpInputSnapshot, TcpInputSnapshotHandle,
-        register_tcp_input_runtime,
-    };
-
-    #[test]
-    fn pending_tcp_app_ingress_store_consumes_once_and_ignores_reused_slots() {
-        let runtime = DataPlaneRuntime::with_capacities(64, 2, 1, 1);
-        let mut pending = PendingTcpAppIngressStore::new();
-
-        let first = runtime
-            .alloc_index(RouteMetadata::default())
-            .expect("allocate first buffer");
-        pending.mark(
-            first,
-            PendingTcpAppIngress {
-                connection_id: 11,
-                fin: false,
-            },
-        );
-        assert_eq!(
-            pending.take(first),
-            Some(PendingTcpAppIngress {
-                connection_id: 11,
-                fin: false,
-            })
-        );
-        assert_eq!(pending.take(first), None);
-        runtime.free_index(first);
-
-        let stale = runtime
-            .alloc_index(RouteMetadata::default())
-            .expect("allocate stale buffer");
-        pending.mark(
-            stale,
-            PendingTcpAppIngress {
-                connection_id: 37,
-                fin: true,
-            },
-        );
-        runtime.free_index(stale);
-
-        let reused = runtime
-            .alloc_index(RouteMetadata::default())
-            .expect("allocate reused buffer");
-        assert_eq!(reused.slot(), stale.slot());
-        assert_ne!(reused.generation(), stale.generation());
-        assert_eq!(pending.take(reused), None);
-
-        runtime.free_index(reused);
-    }
+    use super::{TcpInputSnapshot, TcpInputSnapshotHandle, register_tcp_input_runtime};
 
     #[test]
     fn tcp_input_runtime_registry_is_isolated_per_thread() {
@@ -968,38 +605,14 @@ fn lookup_for_packet(
         .map(|addr| (addr.host, addr.port))
         .unwrap_or((parsed.source_ip, parsed.source_port));
     match (local.0, remote.0, parsed.version) {
-        (IpAddr::V4(local_addr), IpAddr::V4(remote_addr), IpVersion::V4) => snapshot.lookup_v4(
-            TcpV4ConnectionKey::new(0, local_addr, local.1, remote_addr, remote.1),
-            TcpV4PendingConnectionKey::new(0, local.1, remote_addr, remote.1),
+        (IpAddr::V4(local_addr), IpAddr::V4(_remote_addr), IpVersion::V4) => snapshot
+            .lookup_listener::<TcpIpv4ListenerAddress>(
             TcpV4ListenerKey::new(0, local_addr, local.1),
         ),
-        (IpAddr::V6(local_addr), IpAddr::V6(remote_addr), IpVersion::V6) => snapshot.lookup_v6(
-            TcpV6ConnectionKey::new(0, local_addr, local.1, remote_addr, remote.1),
-            TcpV6PendingConnectionKey::new(0, local.1, remote_addr, remote.1),
+        (IpAddr::V6(local_addr), IpAddr::V6(_remote_addr), IpVersion::V6) => snapshot
+            .lookup_listener::<TcpIpv6ListenerAddress>(
             TcpV6ListenerKey::new(0, local_addr, local.1),
         ),
-        _ => None,
-    }
-}
-
-#[inline(always)]
-fn listener_lookup_for_packet(
-    metadata: &RouteMetadata,
-    snapshot: &TcpLookupSnapshot,
-    parsed: &ParsedTcpInput,
-) -> Option<TcpLookupValue> {
-    let local = metadata
-        .destination
-        .as_ref()
-        .map(|addr| (addr.host, addr.port))
-        .unwrap_or((parsed.destination_ip, parsed.destination_port));
-    match (local.0, parsed.version) {
-        (IpAddr::V4(local_addr), IpVersion::V4) => {
-            snapshot.lookup_listener_v4(TcpV4ListenerKey::new(0, local_addr, local.1))
-        }
-        (IpAddr::V6(local_addr), IpVersion::V6) => {
-            snapshot.lookup_listener_v6(TcpV6ListenerKey::new(0, local_addr, local.1))
-        }
         _ => None,
     }
 }

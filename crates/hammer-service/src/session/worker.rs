@@ -3,28 +3,24 @@ use std::time::{Duration, Instant};
 use hammer_adapter::DataWorkerId;
 use hammer_core::error::CoreResult;
 
+use crate::session::protocol::SessionProtocolContext;
 use crate::session::{
-    AppSessionAppIngress, AppSessionCompletion, AppSessionId, AppSessionReadyQueue,
-    AppSessionSubmission, AppSessionTimerExpiry, AppSessionTimerToken, AppSessionTimerWheel,
-    SessionProtocolRegistry,
+    SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken, SessionTimerWheel,
 };
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionQueueStep {
-    pub(crate) app_submissions: usize,
     pub(crate) expired_timers: usize,
     pub(crate) ready_sessions: usize,
 }
 
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
-    app: AppSessionAppIngress,
-    ready: AppSessionReadyQueue,
-    timers: AppSessionTimerWheel,
-    pending_submissions: hammer_infra::vec::Vec<AppSessionSubmission>,
-    pending_timer_expiries: hammer_infra::vec::Vec<AppSessionTimerExpiry>,
+    ready: SessionReadyQueue,
+    timers: SessionTimerWheel,
+    pending_timer_expiries: hammer_infra::vec::Vec<SessionTimerExpiry>,
     timer_tick_duration: Duration,
     last_timer_tick: Instant,
 }
@@ -42,10 +38,8 @@ impl WorkerSessionRuntime {
     ) -> Self {
         Self {
             worker,
-            app: AppSessionAppIngress::new(),
-            ready: AppSessionReadyQueue::new(),
-            timers: AppSessionTimerWheel::new(),
-            pending_submissions: hammer_infra::vec::Vec::new(),
+            ready: SessionReadyQueue::new(),
+            timers: SessionTimerWheel::new(),
             pending_timer_expiries: hammer_infra::vec::Vec::new(),
             timer_tick_duration,
             last_timer_tick,
@@ -58,46 +52,28 @@ impl WorkerSessionRuntime {
     }
 
     #[inline]
-    pub fn attach_app_backend(
-        &mut self,
-        session_id: AppSessionId,
-        backend: hammer_runtime::app::AppBackend,
-    ) -> CoreResult<()> {
-        self.app.attach_backend(session_id, backend)
-    }
-
-    #[inline]
-    pub fn mark_ready(&mut self, session_id: AppSessionId) {
+    pub fn mark_ready(&mut self, session_id: SessionId) {
         self.ready.mark_ready(session_id);
     }
 
     #[inline]
-    pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<AppSessionId> {
+    pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
         self.ready.take_ready_sessions()
     }
 
     #[inline]
     pub fn arm_timer_ticks(
         &mut self,
-        session_id: AppSessionId,
-        token: AppSessionTimerToken,
+        session_id: SessionId,
+        token: SessionTimerToken,
         ticks: u64,
     ) -> CoreResult<()> {
         self.timers.arm_ticks(session_id, token, ticks)
     }
 
     #[inline]
-    pub fn cancel_timer(&mut self, session_id: AppSessionId, token: AppSessionTimerToken) -> bool {
+    pub fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
         self.timers.cancel(session_id, token)
-    }
-
-    #[inline]
-    pub fn complete(&mut self, completion: AppSessionCompletion) -> CoreResult<()> {
-        self.app.complete(completion)
-    }
-
-    pub(crate) fn poll_app_submissions(&mut self) -> CoreResult<usize> {
-        self.app.poll_submissions(&mut self.pending_submissions)
     }
 
     pub(crate) fn expire_timers(&mut self, ticks: u32) -> CoreResult<usize> {
@@ -107,19 +83,13 @@ impl WorkerSessionRuntime {
         Ok(expired)
     }
 
-    pub(crate) fn take_submissions(&mut self) -> hammer_infra::vec::Vec<AppSessionSubmission> {
-        self.pending_submissions.drain(..).collect()
-    }
-
-    pub(crate) fn take_timer_expiries(&mut self) -> hammer_infra::vec::Vec<AppSessionTimerExpiry> {
+    pub(crate) fn take_timer_expiries(&mut self) -> hammer_infra::vec::Vec<SessionTimerExpiry> {
         self.pending_timer_expiries.drain(..).collect()
     }
 
     pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
-        let app_submissions = self.poll_app_submissions()?;
         let expired_timers = self.expire_timers(timer_ticks)?;
         Ok(SessionQueueStep {
-            app_submissions,
             expired_timers,
             ready_sessions: self.ready.len(),
         })
@@ -146,26 +116,31 @@ impl WorkerSessionRuntime {
     }
 }
 
-pub(crate) struct SessionQueueRuntime {
-    sessions: WorkerSessionRuntime,
-    protocols: SessionProtocolRegistry,
+pub(crate) trait SessionQueueProgram: 'static {
+    fn handle_timer_expiry(
+        &mut self,
+        context: &mut SessionProtocolContext<'_>,
+        expiry: SessionTimerExpiry,
+    ) -> CoreResult<()>;
+
+    fn handle_ready(
+        &mut self,
+        context: &mut SessionProtocolContext<'_>,
+        session_id: SessionId,
+    ) -> CoreResult<()>;
 }
 
-impl SessionQueueRuntime {
-    #[inline]
-    pub(crate) fn new(worker: DataWorkerId) -> Self {
-        Self {
-            sessions: WorkerSessionRuntime::new(worker),
-            protocols: SessionProtocolRegistry::new(),
-        }
-    }
+pub(crate) struct SessionQueueRuntime<P> {
+    sessions: WorkerSessionRuntime,
+    program: P,
+}
 
+impl<P> SessionQueueRuntime<P> {
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn with_protocols(worker: DataWorkerId, protocols: SessionProtocolRegistry) -> Self {
+    pub(crate) fn new(worker: DataWorkerId, protocol: P) -> Self {
         Self {
             sessions: WorkerSessionRuntime::new(worker),
-            protocols,
+            program: protocol,
         }
     }
 
@@ -173,7 +148,7 @@ impl SessionQueueRuntime {
     #[cfg(test)]
     pub(crate) fn with_timer_clock(
         worker: DataWorkerId,
-        protocols: SessionProtocolRegistry,
+        protocol: P,
         timer_tick_duration: Duration,
         last_timer_tick: Instant,
     ) -> Self {
@@ -183,7 +158,7 @@ impl SessionQueueRuntime {
                 timer_tick_duration,
                 last_timer_tick,
             ),
-            protocols,
+            program: protocol,
         }
     }
 
@@ -193,27 +168,33 @@ impl SessionQueueRuntime {
         &mut self.sessions
     }
 
+    #[inline]
+    pub(crate) fn program_mut(&mut self) -> &mut P {
+        &mut self.program
+    }
+}
+
+impl<P> SessionQueueRuntime<P>
+where
+    P: SessionQueueProgram,
+{
     pub(crate) fn run_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
         let mut step = self.sessions.poll_once_for_ticks(timer_ticks)?;
-        let submissions = self.sessions.take_submissions();
         let expiries = self.sessions.take_timer_expiries();
         let worker = self.sessions.worker();
 
-        for submission in submissions {
-            self.protocols
-                .dispatch_submission(worker, &mut self.sessions, submission)?;
-        }
-
         for expiry in expiries {
-            self.protocols
-                .dispatch_timer_expiry(worker, &mut self.sessions, expiry)?;
+            let mut context =
+                crate::session::SessionProtocolContext::new(worker, &mut self.sessions);
+            self.program.handle_timer_expiry(&mut context, expiry)?;
         }
 
         let ready_sessions = self.sessions.take_ready_sessions();
         step.ready_sessions = ready_sessions.len();
         for session_id in ready_sessions {
-            self.protocols
-                .dispatch_ready(worker, &mut self.sessions, session_id)?;
+            let mut context =
+                crate::session::SessionProtocolContext::new(worker, &mut self.sessions);
+            self.program.handle_ready(&mut context, session_id)?;
         }
 
         Ok(step)
@@ -227,15 +208,6 @@ impl SessionQueueRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Shutdown;
-
-    use hammer_runtime::app::{
-        AppBackend, AppBufferLease, AppCqeData, AppCqeFlags, AppObjectRef, AppOpcode,
-        AppRegisteredBuffer, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppTcpShutdown,
-        AppUserData,
-    };
-    use hammer_runtime::spawn::with_data_plane_buffers;
-
     use super::*;
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
@@ -249,13 +221,13 @@ mod tests {
     #[test]
     fn worker_session_runtime_expires_timer_into_expiry_and_ready_session() {
         let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(9);
-        let token = AppSessionTimerToken::new(17);
+        let session_id = SessionId::new(9);
+        let token = SessionTimerToken::new(17);
         let mut runtime = WorkerSessionRuntime::new(worker);
 
         runtime
             .arm_timer_ticks(session_id, token, 3)
-            .expect("arm app session timer");
+            .expect("arm session timer");
 
         assert_eq!(runtime.expire_timers(2).expect("expire before deadline"), 0);
         assert!(runtime.take_timer_expiries().is_empty());
@@ -264,7 +236,7 @@ mod tests {
         assert_eq!(runtime.expire_timers(1).expect("expire at deadline"), 1);
         assert_eq!(
             runtime.take_timer_expiries(),
-            infra_vec([AppSessionTimerExpiry::new(session_id, token)])
+            infra_vec([SessionTimerExpiry::new(session_id, token)])
         );
         assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
     }
@@ -272,8 +244,8 @@ mod tests {
     #[test]
     fn worker_session_runtime_rearming_same_timer_suppresses_stale_expiry() {
         let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(10);
-        let token = AppSessionTimerToken::new(3);
+        let session_id = SessionId::new(10);
+        let token = SessionTimerToken::new(3);
         let mut runtime = WorkerSessionRuntime::new(worker);
 
         runtime
@@ -294,8 +266,8 @@ mod tests {
     #[test]
     fn worker_session_runtime_cancel_timer_suppresses_expiry() {
         let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(11);
-        let token = AppSessionTimerToken::new(4);
+        let session_id = SessionId::new(11);
+        let token = SessionTimerToken::new(4);
         let mut runtime = WorkerSessionRuntime::new(worker);
 
         runtime
@@ -309,123 +281,10 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_runtime_polls_app_send_submission() {
-        let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(21);
-        let mut runtime = WorkerSessionRuntime::new(worker);
-        let backend = AppBackend::new(4);
-        let flow = backend.flow();
-        runtime
-            .attach_app_backend(session_id, backend.clone())
-            .expect("attach app backend");
-
-        let buffers = with_data_plane_buffers(Clone::clone);
-        let index = buffers
-            .alloc_index_with_bytes(Default::default(), b"l5-session-send")
-            .expect("alloc app send buffer");
-        let registered =
-            AppRegisteredBuffer::from_lease(AppBufferLease::from_buffer(buffers, index))
-                .expect("registered buffer");
-        let descriptor = AppSqeDescriptor::new(
-            AppOpcode::Send,
-            AppUserData::new(21),
-            AppObjectRef::Flow(flow),
-            AppSqeData::Send {
-                buffer: registered.index(),
-            },
-        );
-
-        backend
-            .try_push_submission_entry(AppSubmissionEntry::with_attachment(descriptor, registered))
-            .expect("push app send entry");
-
-        assert_eq!(runtime.poll_app_submissions().expect("poll app ring"), 1);
-        let submissions = runtime.take_submissions();
-        assert_eq!(submissions.len(), 1);
-
-        match &submissions[0] {
-            AppSessionSubmission::Send(send) => {
-                assert_eq!(send.session_id(), session_id);
-                assert_eq!(send.descriptor().user_data(), AppUserData::new(21));
-                assert_eq!(
-                    send.registered()
-                        .lease()
-                        .copy_current()
-                        .expect("copy send payload"),
-                    b"l5-session-send"
-                );
-            }
-            other => panic!("unexpected submission: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn worker_session_runtime_polls_app_shutdown_submission() {
-        let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(22);
-        let mut runtime = WorkerSessionRuntime::new(worker);
-        let backend = AppBackend::new(4);
-        let flow = backend.flow();
-        runtime
-            .attach_app_backend(session_id, backend.clone())
-            .expect("attach app backend");
-
-        backend
-            .try_push_tcp_shutdown(AppTcpShutdown::new(flow, Shutdown::Write))
-            .expect("push app shutdown");
-
-        assert_eq!(runtime.poll_app_submissions().expect("poll app ring"), 1);
-        let submissions = runtime.take_submissions();
-        assert_eq!(submissions.len(), 1);
-
-        match submissions[0] {
-            AppSessionSubmission::Shutdown(shutdown) => {
-                assert_eq!(shutdown.session_id(), session_id);
-                assert_eq!(shutdown.shutdown().flow(), flow);
-                assert_eq!(shutdown.how(), Shutdown::Write);
-            }
-            ref other => panic!("unexpected submission: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn worker_session_runtime_completion_writes_cqe_descriptor() {
-        let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(31);
-        let mut runtime = WorkerSessionRuntime::new(worker);
-        let backend = AppBackend::new(4);
-        let flow = backend.flow();
-        runtime
-            .attach_app_backend(session_id, backend.clone())
-            .expect("attach app backend");
-
-        runtime
-            .complete(AppSessionCompletion::new(
-                session_id,
-                AppUserData::new(31),
-                7,
-                AppCqeFlags::NONE,
-                AppCqeData::None,
-            ))
-            .expect("complete app session");
-
-        let descriptor = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime")
-            .block_on(async { backend.next_cqe_descriptor().await.expect("cqe descriptor") });
-
-        assert_eq!(descriptor.user_data(), AppUserData::new(31));
-        assert_eq!(descriptor.result(), 7);
-        assert_eq!(descriptor.object(), AppObjectRef::Flow(flow));
-        assert_eq!(descriptor.payload(), AppCqeData::None);
-    }
-
-    #[test]
     fn worker_session_runtime_advances_timer_wheel_from_elapsed_clock_ticks() {
         let worker = DataWorkerId::new(0);
-        let session_id = AppSessionId::new(32);
-        let token = AppSessionTimerToken::new(5);
+        let session_id = SessionId::new(32);
+        let token = SessionTimerToken::new(5);
         let start = Instant::now();
         let mut runtime =
             WorkerSessionRuntime::with_timer_clock(worker, Duration::from_millis(10), start);
@@ -448,7 +307,7 @@ mod tests {
         assert_eq!(second.expired_timers, 1);
         assert_eq!(
             runtime.take_timer_expiries(),
-            infra_vec([AppSessionTimerExpiry::new(session_id, token)])
+            infra_vec([SessionTimerExpiry::new(session_id, token)])
         );
     }
 }

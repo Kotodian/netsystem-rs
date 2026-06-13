@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, RouteMetadata};
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpState};
+use hammer_service::session::protocol::tcp::state::{TcpSessionState, TcpSessionTable};
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpConnectionTable,
-    TcpDataPlaneConnection, TcpLookupId, TcpOutputRecord, tcp_output_packet,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpLookupId, TcpOutputRecord,
+    tcp_output_packet,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -15,12 +16,12 @@ fn connection(
     lookup_id: TcpLookupId,
     connection_id: TcpConnectionId,
     local_port: u16,
-) -> TcpDataPlaneConnection {
+) -> TcpSessionState {
     let local: SocketAddr = format!("192.0.2.10:{local_port}")
         .parse()
         .expect("test local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("test remote");
-    TcpDataPlaneConnection::new(
+    TcpSessionState::new(
         lookup_id,
         Some(connection_id),
         DataWorkerId::new(0),
@@ -75,7 +76,7 @@ fn tcp_congestion_state_uses_connection_max_segment_size_for_initial_windows() {
 }
 
 #[test]
-fn tcp_data_plane_connections_own_independent_congestion_state() {
+fn tcp_session_states_own_independent_congestion_state() {
     let now = Instant::now();
     let mut first = connection(1, TcpConnectionId::new(1), 50_001);
     let second = connection(2, TcpConnectionId::new(2), 50_002);
@@ -95,7 +96,7 @@ fn tcp_data_plane_connections_own_independent_congestion_state() {
 }
 
 #[test]
-fn tcp_data_plane_connection_exposes_owned_congestion_control() {
+fn tcp_session_state_exposes_owned_congestion_control() {
     let now = Instant::now();
     let mut connection = connection(3, TcpConnectionId::new(3), 50_003);
 
@@ -109,7 +110,7 @@ fn tcp_data_plane_connection_exposes_owned_congestion_control() {
 }
 
 #[test]
-fn tcp_data_plane_connection_output_view_uses_owned_congestion_window() {
+fn tcp_session_state_output_view_uses_owned_congestion_window() {
     let mut connection = connection(4, TcpConnectionId::new(4), 50_004);
     connection.set_send_state(1_000, 2_000, 65_535);
     connection.congestion_mut().on_loss(u32::MAX);
@@ -126,7 +127,7 @@ fn tcp_data_plane_connection_output_view_uses_owned_congestion_window() {
 }
 
 #[test]
-fn tcp_data_plane_connections_negotiate_tcp_options_independently() {
+fn tcp_session_states_negotiate_tcp_options_independently() {
     let mut first = connection(5, TcpConnectionId::new(5), 50_005);
     let mut second = connection(6, TcpConnectionId::new(6), 50_006);
 
@@ -180,7 +181,7 @@ fn tcp_data_plane_connections_negotiate_tcp_options_independently() {
 }
 
 #[test]
-fn tcp_data_plane_connection_scales_advertised_windows_safely() {
+fn tcp_session_state_scales_advertised_windows_safely() {
     let mut connection = connection(7, TcpConnectionId::new(7), 50_007);
     connection.set_local_capabilities(TcpCapabilities {
         window_scale: Some(20),
@@ -206,7 +207,7 @@ fn tcp_data_plane_connection_scales_advertised_windows_safely() {
 }
 
 #[test]
-fn tcp_data_plane_connection_scales_peer_window_into_send_view() {
+fn tcp_session_state_scales_peer_window_into_send_view() {
     let mut connection = connection(8, TcpConnectionId::new(8), 50_008);
     connection.set_local_capabilities(TcpCapabilities {
         window_scale: Some(2),
@@ -224,10 +225,10 @@ fn tcp_data_plane_connection_scales_peer_window_into_send_view() {
 }
 
 #[test]
-fn tcp_data_plane_connection_output_snapshot_advertises_scaled_receive_window() {
+fn tcp_session_state_output_state_advertises_scaled_receive_window() {
     let local: SocketAddr = "192.0.2.10:50008".parse().expect("test local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("test remote");
-    let mut connection = TcpDataPlaneConnection::new(
+    let mut connection = TcpSessionState::new(
         9,
         Some(TcpConnectionId::new(9)),
         DataWorkerId::new(0),
@@ -246,8 +247,7 @@ fn tcp_data_plane_connection_output_snapshot_advertises_scaled_receive_window() 
     });
     connection.set_receive_state(9_000, 8_192);
 
-    let snapshot = connection.output_snapshot().expect("output snapshot");
-    let record = tcp_output_packet(snapshot, local, &[]).expect("output packet");
+    let record = tcp_output_packet(&connection, local, &[]).expect("output packet");
 
     assert_eq!(record.advertised_window, 512);
 }
@@ -256,7 +256,7 @@ fn tcp_data_plane_connection_output_snapshot_advertises_scaled_receive_window() 
 fn tcp_connection_table_resolves_by_lookup_and_connection_id() {
     let first = connection(11, TcpConnectionId::new(101), 50_011);
     let second = connection(12, TcpConnectionId::new(102), 50_012);
-    let mut table = TcpConnectionTable::empty();
+    let mut table = TcpSessionTable::empty();
 
     table.insert(first);
     table.insert(second);
