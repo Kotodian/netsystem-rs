@@ -8,7 +8,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq, TcpState};
 
 use super::TcpLookupId;
-use super::connection::TcpConnectionSnapshot;
+use super::connection::TcpDataPlaneConnection;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const IPV4_HEADER_LEN: usize = 20;
@@ -46,6 +46,38 @@ pub struct TcpOutputRecord {
     pub advertised_window: u16,
     pub payload_len: usize,
     pub metadata: RouteMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpOutputConnectionState {
+    pub lookup_id: TcpLookupId,
+    pub connection_id: Option<TcpConnectionId>,
+    pub remote: SocketAddr,
+    pub iss: u32,
+    pub irs: u32,
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub rcv_nxt: u32,
+    pub advertised_rcv_wnd: u32,
+}
+
+impl TcpOutputConnectionState {
+    #[inline]
+    pub fn from_connection(connection: &TcpDataPlaneConnection) -> Self {
+        Self {
+            lookup_id: connection.lookup_id(),
+            connection_id: connection.connection_id(),
+            remote: connection.remote(),
+            iss: connection.iss(),
+            irs: connection.irs(),
+            snd_una: connection.snd_una(),
+            snd_nxt: connection.snd_nxt(),
+            rcv_nxt: connection.rcv_nxt(),
+            advertised_rcv_wnd: u32::from(
+                connection.advertised_receive_window(connection.rcv_wnd()),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,12 +229,12 @@ pub struct TcpOutputSendView {
 
 impl TcpOutputSendView {
     #[inline]
-    pub fn from_snapshot(snapshot: TcpConnectionSnapshot) -> Self {
+    pub fn from_connection(connection: &TcpDataPlaneConnection) -> Self {
         Self {
-            snd_una: snapshot.snd_una,
-            snd_nxt: snapshot.snd_nxt,
-            snd_wnd: snapshot.snd_wnd,
-            congestion_window: snapshot.snd_wnd,
+            snd_una: connection.snd_una(),
+            snd_nxt: connection.snd_nxt(),
+            snd_wnd: connection.snd_wnd(),
+            congestion_window: connection.congestion().congestion_window(),
         }
     }
 }
@@ -379,16 +411,16 @@ impl TcpOutputBackend for TcpOutputBackendSlot {
 }
 
 pub fn tcp_output_packet(
-    snapshot: TcpConnectionSnapshot,
+    connection: TcpOutputConnectionState,
     local: SocketAddr,
     payload: &[u8],
 ) -> CoreResult<TcpOutputRecord> {
     let flags = TCP_FLAG_ACK | u8::from(!payload.is_empty()) * TCP_FLAG_PSH;
-    tcp_output_packet_flags(snapshot, local, payload, flags)
+    tcp_output_packet_flags(connection, local, payload, flags)
 }
 
 pub fn tcp_output_decision(
-    snapshot: TcpConnectionSnapshot,
+    connection: TcpOutputConnectionState,
     view: TcpOutputConnectionView,
     queued: Option<TcpQueuedPayload>,
     retransmit_pending: bool,
@@ -419,7 +451,7 @@ pub fn tcp_output_decision(
         let local = view.local.unwrap_or_else(|| {
             SocketAddr::new(unspecified_ip_for_output(view.remote.ip()), view.local_port)
         });
-        let record = tcp_output_packet_len(snapshot, local, 0, TCP_FLAG_SYN)?;
+        let record = tcp_output_packet_len(connection, local, 0, TCP_FLAG_SYN)?;
         return Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
             connection_id,
             record,
@@ -493,7 +525,7 @@ pub fn tcp_output_decision(
     let flags = TCP_FLAG_ACK
         | if payload_len == 0 { 0 } else { TCP_FLAG_PSH }
         | if include_fin { TCP_FLAG_FIN } else { 0 };
-    let record = tcp_output_packet_len(snapshot, local, payload_len, flags)?;
+    let record = tcp_output_packet_len(connection, local, payload_len, flags)?;
     Ok(TcpOutputDecision::Work(TcpOutputWorkItem {
         connection_id,
         record,
@@ -542,42 +574,42 @@ pub fn tcp_payload_len_in_send_window(
 }
 
 pub fn tcp_output_packet_flags(
-    snapshot: TcpConnectionSnapshot,
+    connection: TcpOutputConnectionState,
     local: SocketAddr,
     payload: &[u8],
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(snapshot, local, payload.len(), payload.is_empty(), flags)
+    build_packet(connection, local, payload.len(), payload.is_empty(), flags)
 }
 
 pub fn tcp_output_packet_len(
-    snapshot: TcpConnectionSnapshot,
+    connection: TcpOutputConnectionState,
     local: SocketAddr,
     payload_len: usize,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(snapshot, local, payload_len, payload_len == 0, flags)
+    build_packet(connection, local, payload_len, payload_len == 0, flags)
 }
 
 fn build_packet(
-    snapshot: TcpConnectionSnapshot,
+    connection: TcpOutputConnectionState,
     local: SocketAddr,
     payload_len: usize,
     payload_empty: bool,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    let connection_id = snapshot
+    let connection_id = connection
         .connection_id
         .ok_or_else(|| CoreError::internal("tcp output requires an installed connection id"))?;
-    let remote = snapshot.remote;
+    let remote = connection.remote;
     validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload_len)?;
-    let sequence = tcp_output_sequence(snapshot);
-    let acknowledgment = tcp_output_acknowledgment(snapshot);
-    let advertised_window = snapshot.rcv_wnd.min(u32::from(u16::MAX)) as u16;
+    let sequence = tcp_output_sequence(connection);
+    let acknowledgment = tcp_output_acknowledgment(connection);
+    let advertised_window = connection.advertised_rcv_wnd.min(u32::from(u16::MAX)) as u16;
     let flags = normalize_tcp_output_flags(flags, payload_empty);
     validate_tcp_output_address_family(local, remote)?;
     Ok(TcpOutputRecord {
-        lookup_id: snapshot.lookup_id,
+        lookup_id: connection.lookup_id,
         connection_id,
         local,
         remote,
@@ -646,24 +678,24 @@ fn normalize_tcp_output_flags(flags: u8, payload_empty: bool) -> u8 {
 }
 
 #[inline]
-fn tcp_output_sequence(snapshot: TcpConnectionSnapshot) -> u32 {
-    if snapshot.snd_nxt != 0 {
-        snapshot.snd_nxt
-    } else if snapshot.snd_una != 0 {
-        snapshot.snd_una
-    } else if snapshot.iss != 0 {
-        TcpSeq::new(snapshot.iss).advance(1).raw()
+fn tcp_output_sequence(connection: TcpOutputConnectionState) -> u32 {
+    if connection.snd_nxt != 0 {
+        connection.snd_nxt
+    } else if connection.snd_una != 0 {
+        connection.snd_una
+    } else if connection.iss != 0 {
+        TcpSeq::new(connection.iss).advance(1).raw()
     } else {
         1
     }
 }
 
 #[inline]
-fn tcp_output_acknowledgment(snapshot: TcpConnectionSnapshot) -> u32 {
-    if snapshot.rcv_nxt != 0 {
-        snapshot.rcv_nxt
-    } else if snapshot.irs != 0 {
-        TcpSeq::new(snapshot.irs).advance(1).raw()
+fn tcp_output_acknowledgment(connection: TcpOutputConnectionState) -> u32 {
+    if connection.rcv_nxt != 0 {
+        connection.rcv_nxt
+    } else if connection.irs != 0 {
+        TcpSeq::new(connection.irs).advance(1).raw()
     } else {
         1
     }

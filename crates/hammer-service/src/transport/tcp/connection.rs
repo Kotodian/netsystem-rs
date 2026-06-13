@@ -2,21 +2,20 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
-use hammer_adapter::{DataWorkerId, NodeId};
+use arc_swap::ArcSwapOption;
+use hammer_adapter::DataWorkerId;
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
 use hammer_infra::map::FlatHashTable;
+
+use crate::app::AppIngressTarget;
 
 use super::congestion::TcpCongestionState;
 use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
     tcp_effective_output_payload_len,
 };
-use super::{
-    TcpEstablishedBackend, TcpEstablishedBackendSlot, TcpEstablishedNext, TcpEstablishedNode,
-    TcpLookupId, TcpState,
-};
+use super::{TcpLookupId, TcpState};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -189,24 +188,6 @@ impl Default for TcpConnectionOptionState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpConnectionSnapshot {
-    pub lookup_id: TcpLookupId,
-    pub connection_id: Option<TcpConnectionId>,
-    pub owner_worker: DataWorkerId,
-    pub state: TcpState,
-    pub local_port: u16,
-    pub local: Option<SocketAddr>,
-    pub remote: SocketAddr,
-    pub iss: u32,
-    pub irs: u32,
-    pub snd_una: u32,
-    pub snd_nxt: u32,
-    pub snd_wnd: u32,
-    pub rcv_nxt: u32,
-    pub rcv_wnd: u32,
-}
-
 #[derive(Debug, Clone)]
 pub struct TcpDataPlaneConnection {
     lookup_id: TcpLookupId,
@@ -229,6 +210,24 @@ pub struct TcpDataPlaneConnection {
     retransmit_timeout: TcpRetransmitTimeoutState,
     congestion: TcpCongestionState,
     next_output_at: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpConnectionView {
+    pub lookup_id: TcpLookupId,
+    pub connection_id: Option<TcpConnectionId>,
+    pub owner_worker: DataWorkerId,
+    pub state: TcpState,
+    pub local_port: u16,
+    pub local: Option<SocketAddr>,
+    pub remote: SocketAddr,
+    pub iss: u32,
+    pub irs: u32,
+    pub snd_una: u32,
+    pub snd_nxt: u32,
+    pub snd_wnd: u32,
+    pub rcv_nxt: u32,
+    pub rcv_wnd: u32,
 }
 
 impl TcpDataPlaneConnection {
@@ -455,6 +454,26 @@ impl TcpDataPlaneConnection {
     }
 
     #[inline]
+    pub fn view(&self) -> TcpConnectionView {
+        TcpConnectionView {
+            lookup_id: self.lookup_id,
+            connection_id: self.connection_id,
+            owner_worker: self.owner_worker,
+            state: self.state,
+            local_port: self.local_port,
+            local: self.local,
+            remote: self.remote,
+            iss: self.iss,
+            irs: self.irs,
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+            snd_wnd: self.snd_wnd,
+            rcv_nxt: self.rcv_nxt,
+            rcv_wnd: self.rcv_wnd,
+        }
+    }
+
+    #[inline]
     pub fn set_send_state(&mut self, snd_una: u32, snd_nxt: u32, snd_wnd: u32) {
         self.snd_una = snd_una;
         self.snd_nxt = snd_nxt;
@@ -468,23 +487,52 @@ impl TcpDataPlaneConnection {
     }
 
     #[inline]
-    pub fn output_snapshot(&self) -> Option<TcpConnectionSnapshot> {
-        Some(TcpConnectionSnapshot {
-            lookup_id: self.lookup_id,
-            connection_id: self.connection_id,
-            owner_worker: self.owner_worker,
-            state: self.state,
-            local_port: self.local?.port(),
-            local: self.local,
-            remote: self.remote,
-            iss: self.iss,
-            irs: self.irs,
-            snd_una: self.snd_una,
-            snd_nxt: self.snd_nxt,
-            snd_wnd: self.snd_wnd,
-            rcv_nxt: self.rcv_nxt,
-            rcv_wnd: u32::from(self.advertised_receive_window(self.rcv_wnd)),
-        })
+    pub fn set_sequence_state(
+        &mut self,
+        iss: u32,
+        irs: u32,
+        snd_una: u32,
+        snd_nxt: u32,
+        snd_wnd: u32,
+        rcv_nxt: u32,
+        rcv_wnd: u32,
+    ) {
+        self.iss = iss;
+        self.irs = irs;
+        self.snd_una = snd_una;
+        self.snd_nxt = snd_nxt;
+        self.snd_wnd = snd_wnd;
+        self.rcv_nxt = rcv_nxt;
+        self.rcv_wnd = rcv_wnd;
+    }
+
+    #[inline]
+    pub fn set_state(&mut self, state: TcpState) {
+        self.state = state;
+    }
+
+    #[inline]
+    pub(crate) fn apply_receive_progress(&mut self, progress: TcpReceiveProgress) {
+        if self.irs == 0 && self.rcv_nxt == 0 {
+            self.irs = progress.sequence.wrapping_sub(1);
+            self.rcv_nxt = progress.sequence;
+        }
+        if let Some(acknowledgment) = progress.acknowledgment {
+            if self.iss == 0 && self.snd_una == 0 && self.snd_nxt == 0 {
+                self.iss = acknowledgment.wrapping_sub(1);
+            }
+            self.snd_una = tcp_seq_max(self.snd_una, acknowledgment);
+            self.snd_nxt = tcp_seq_max(self.snd_nxt, self.snd_una);
+            self.snd_wnd = self.effective_send_window(progress.advertised_window);
+        }
+        if let Some(next_receive_sequence) = progress.next_receive_sequence
+            && self.rcv_nxt == progress.sequence
+        {
+            self.rcv_nxt = next_receive_sequence;
+        }
+        if let Some(state) = progress.state {
+            self.state = state;
+        }
     }
 
     #[inline]
@@ -507,119 +555,249 @@ pub(crate) struct TcpReceiveProgress {
     pub(crate) next_receive_sequence: Option<u32>,
 }
 
-impl TcpConnectionSnapshot {
+pub trait TcpSessionAccess: Send + Sync {
     #[inline]
-    pub fn with_default_windows(
-        lookup_id: TcpLookupId,
-        connection_id: Option<TcpConnectionId>,
-        owner_worker: DataWorkerId,
-        state: TcpState,
-        local_port: u16,
-        local: Option<SocketAddr>,
-        remote: SocketAddr,
-    ) -> Self {
-        Self {
-            lookup_id,
-            connection_id,
-            owner_worker,
-            state,
-            local_port,
-            local,
-            remote,
-            iss: 0,
-            irs: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_wnd: DEFAULT_TCP_WINDOW,
-            rcv_nxt: 0,
-            rcv_wnd: DEFAULT_TCP_WINDOW,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpConnectionSnapshotPool {
-    connections: hammer_infra::vec::Vec<TcpConnectionSnapshot>,
-    lookup_slots: FlatHashTable<TcpLookupId, usize>,
-    connection_slots: FlatHashTable<u64, usize>,
-}
-
-impl TcpConnectionSnapshotPool {
-    #[inline]
-    pub fn empty() -> Self {
-        Self {
-            connections: hammer_infra::vec::Vec::new(),
-            lookup_slots: FlatHashTable::new(),
-            connection_slots: FlatHashTable::new(),
-        }
+    fn connection_view(&self, _lookup_id: TcpLookupId) -> CoreResult<Option<TcpConnectionView>> {
+        Ok(None)
     }
 
     #[inline]
-    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<TcpConnectionSnapshot> {
-        self.lookup_slots
-            .lookup(&lookup_id)
-            .and_then(|slot| self.connections.get(slot).copied())
-    }
-
-    #[inline]
-    pub fn lookup_by_connection_id(
+    fn apply_receive_progress(
         &self,
-        connection_id: TcpConnectionId,
-    ) -> Option<TcpConnectionSnapshot> {
-        self.connection_slots
-            .lookup(&connection_id.get())
-            .and_then(|slot| self.connections.get(slot).copied())
+        _lookup_id: TcpLookupId,
+        _progress: TcpReceiveProgress,
+    ) -> CoreResult<()> {
+        Ok(())
     }
 
     #[inline]
-    pub(crate) fn insert(&mut self, snapshot: TcpConnectionSnapshot) {
-        let slot = self.connections.len();
-        self.lookup_slots.insert(snapshot.lookup_id, slot);
-        if let Some(connection_id) = snapshot.connection_id {
-            self.connection_slots.insert(connection_id.get(), slot);
+    fn target_for_lookup(&self, _lookup_id: TcpLookupId) -> CoreResult<Option<AppIngressTarget>> {
+        Ok(None)
+    }
+}
+
+struct TcpSessionAccessHandle {
+    raw: *const (),
+    clone_raw: fn(*const ()) -> *const (),
+    drop_raw: fn(*const ()),
+    connection_view: fn(*const (), TcpLookupId) -> CoreResult<Option<TcpConnectionView>>,
+    apply_receive_progress: fn(*const (), TcpLookupId, TcpReceiveProgress) -> CoreResult<()>,
+    target_for_lookup: fn(*const (), TcpLookupId) -> CoreResult<Option<AppIngressTarget>>,
+}
+
+unsafe impl Send for TcpSessionAccessHandle {}
+unsafe impl Sync for TcpSessionAccessHandle {}
+
+impl Default for TcpSessionAccessHandle {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            raw: std::ptr::null(),
+            clone_raw: clone_noop_session_access,
+            drop_raw: drop_noop_session_access,
+            connection_view: noop_session_connection_view,
+            apply_receive_progress: noop_session_apply_receive_progress,
+            target_for_lookup: noop_session_target_for_lookup,
         }
-        self.connections.push(snapshot);
+    }
+}
+
+impl Clone for TcpSessionAccessHandle {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            raw: (self.clone_raw)(self.raw),
+            clone_raw: self.clone_raw,
+            drop_raw: self.drop_raw,
+            connection_view: self.connection_view,
+            apply_receive_progress: self.apply_receive_progress,
+            target_for_lookup: self.target_for_lookup,
+        }
+    }
+}
+
+impl Drop for TcpSessionAccessHandle {
+    #[inline]
+    fn drop(&mut self) {
+        (self.drop_raw)(self.raw);
+    }
+}
+
+impl TcpSessionAccessHandle {
+    #[inline]
+    fn new<O>(access: Arc<O>) -> Self
+    where
+        O: TcpSessionAccess + 'static,
+    {
+        Self {
+            raw: Arc::into_raw(access) as *const (),
+            clone_raw: clone_session_access_arc::<O>,
+            drop_raw: drop_session_access_arc::<O>,
+            connection_view: session_connection_view_with::<O>,
+            apply_receive_progress: session_apply_receive_progress_with::<O>,
+            target_for_lookup: session_target_for_lookup_with::<O>,
+        }
+    }
+}
+
+#[inline]
+fn clone_noop_session_access(_raw: *const ()) -> *const () {
+    std::ptr::null()
+}
+
+#[inline]
+fn drop_noop_session_access(_raw: *const ()) {}
+
+#[inline]
+fn noop_session_connection_view(
+    _raw: *const (),
+    _lookup_id: TcpLookupId,
+) -> CoreResult<Option<TcpConnectionView>> {
+    Ok(None)
+}
+
+#[inline]
+fn noop_session_apply_receive_progress(
+    _raw: *const (),
+    _lookup_id: TcpLookupId,
+    _progress: TcpReceiveProgress,
+) -> CoreResult<()> {
+    Ok(())
+}
+
+#[inline]
+fn noop_session_target_for_lookup(
+    _raw: *const (),
+    _lookup_id: TcpLookupId,
+) -> CoreResult<Option<AppIngressTarget>> {
+    Ok(None)
+}
+
+#[inline]
+fn clone_session_access_arc<O>(raw: *const ()) -> *const ()
+where
+    O: TcpSessionAccess + 'static,
+{
+    let raw = raw.cast::<O>();
+    if !raw.is_null() {
+        unsafe {
+            Arc::increment_strong_count(raw);
+        }
+    }
+    raw.cast()
+}
+
+#[inline]
+fn drop_session_access_arc<O>(raw: *const ())
+where
+    O: TcpSessionAccess + 'static,
+{
+    let raw = raw.cast::<O>();
+    if !raw.is_null() {
+        unsafe {
+            drop(Arc::from_raw(raw));
+        }
+    }
+}
+
+#[inline]
+fn session_connection_view_with<O>(
+    raw: *const (),
+    lookup_id: TcpLookupId,
+) -> CoreResult<Option<TcpConnectionView>>
+where
+    O: TcpSessionAccess + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(None);
+    }
+    unsafe { (&*raw).connection_view(lookup_id) }
+}
+
+#[inline]
+fn session_apply_receive_progress_with<O>(
+    raw: *const (),
+    lookup_id: TcpLookupId,
+    progress: TcpReceiveProgress,
+) -> CoreResult<()>
+where
+    O: TcpSessionAccess + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(());
+    }
+    unsafe { (&*raw).apply_receive_progress(lookup_id, progress) }
+}
+
+#[inline]
+fn session_target_for_lookup_with<O>(
+    raw: *const (),
+    lookup_id: TcpLookupId,
+) -> CoreResult<Option<AppIngressTarget>>
+where
+    O: TcpSessionAccess + 'static,
+{
+    let raw = raw.cast::<O>();
+    if raw.is_null() {
+        return Ok(None);
+    }
+    unsafe { (&*raw).target_for_lookup(lookup_id) }
+}
+
+#[derive(Clone, Default)]
+pub struct TcpSessionAccessSlot {
+    inner: Arc<ArcSwapOption<TcpSessionAccessHandle>>,
+}
+
+impl TcpSessionAccessSlot {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn install<O>(&self, access: Arc<O>)
+    where
+        O: TcpSessionAccess + 'static,
+    {
+        self.inner
+            .store(Some(Arc::new(TcpSessionAccessHandle::new(access))));
+    }
+
+    #[inline]
+    pub fn connection_view(&self, lookup_id: TcpLookupId) -> CoreResult<Option<TcpConnectionView>> {
+        let access = self.load();
+        (access.connection_view)(access.raw, lookup_id)
     }
 
     #[inline]
     pub(crate) fn apply_receive_progress(
-        &mut self,
+        &self,
         lookup_id: TcpLookupId,
         progress: TcpReceiveProgress,
-    ) {
-        let Some(slot) = self.lookup_slots.lookup(&lookup_id) else {
-            return;
-        };
-        let Some(connection) = self.connections.get_mut(slot) else {
-            return;
-        };
-        if connection.irs == 0 && connection.rcv_nxt == 0 {
-            connection.irs = progress.sequence.wrapping_sub(1);
-            connection.rcv_nxt = progress.sequence;
-        }
-        if let Some(acknowledgment) = progress.acknowledgment {
-            if connection.iss == 0 && connection.snd_una == 0 && connection.snd_nxt == 0 {
-                connection.iss = acknowledgment.wrapping_sub(1);
-            }
-            connection.snd_una = tcp_seq_max(connection.snd_una, acknowledgment);
-            connection.snd_nxt = tcp_seq_max(connection.snd_nxt, connection.snd_una);
-            connection.snd_wnd = progress.advertised_window;
-        }
-        if let Some(next_receive_sequence) = progress.next_receive_sequence
-            && connection.rcv_nxt == progress.sequence
-        {
-            connection.rcv_nxt = next_receive_sequence;
-        }
-        if let Some(state) = progress.state {
-            connection.state = state;
-        }
+    ) -> CoreResult<()> {
+        let access = self.load();
+        (access.apply_receive_progress)(access.raw, lookup_id, progress)
     }
-}
 
-impl Default for TcpConnectionSnapshotPool {
     #[inline]
-    fn default() -> Self {
-        Self::empty()
+    pub fn target_for_lookup(
+        &self,
+        lookup_id: TcpLookupId,
+    ) -> CoreResult<Option<AppIngressTarget>> {
+        let access = self.load();
+        (access.target_for_lookup)(access.raw, lookup_id)
+    }
+
+    #[inline]
+    fn load(&self) -> TcpSessionAccessHandle {
+        self.inner
+            .load_full()
+            .as_deref()
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -648,6 +826,18 @@ impl TcpConnectionTable {
             self.connection_slots.insert(connection_id.get(), slot);
         }
         self.connections.push(connection);
+    }
+
+    #[inline]
+    pub fn upsert(&mut self, connection: TcpDataPlaneConnection) {
+        if let Some(slot) = self.lookup_slots.lookup(&connection.lookup_id()) {
+            self.connections[slot] = connection.clone();
+            if let Some(connection_id) = connection.connection_id() {
+                self.connection_slots.insert(connection_id.get(), slot);
+            }
+            return;
+        }
+        self.insert(connection);
     }
 
     #[inline]
@@ -690,173 +880,6 @@ impl Default for TcpConnectionTable {
     #[inline]
     fn default() -> Self {
         Self::empty()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpWorkerOwnedConnectionState {
-    owner_worker: DataWorkerId,
-    pool: TcpConnectionSnapshotPool,
-}
-
-impl TcpWorkerOwnedConnectionState {
-    #[inline]
-    pub fn new(owner_worker: DataWorkerId) -> Self {
-        Self {
-            owner_worker,
-            pool: TcpConnectionSnapshotPool::empty(),
-        }
-    }
-
-    #[inline]
-    pub fn owner_worker(&self) -> DataWorkerId {
-        self.owner_worker
-    }
-
-    #[inline]
-    pub fn insert(&mut self, snapshot: TcpConnectionSnapshot) {
-        debug_assert_eq!(snapshot.owner_worker, self.owner_worker);
-        self.pool.insert(snapshot);
-    }
-
-    #[inline]
-    pub fn publish_snapshot(&self) -> TcpConnectionSnapshotPool {
-        self.pool.clone()
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TcpEstablishedSnapshot {
-    pub(crate) connections: TcpConnectionSnapshotPool,
-}
-
-impl TcpEstablishedSnapshot {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            connections: TcpConnectionSnapshotPool::empty(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct TcpEstablishedSnapshotHandle {
-    inner: Arc<ArcSwap<TcpEstablishedSnapshot>>,
-}
-
-impl TcpEstablishedSnapshotHandle {
-    #[inline]
-    fn new(inner: Arc<ArcSwap<TcpEstablishedSnapshot>>) -> Self {
-        Self { inner }
-    }
-
-    #[inline]
-    pub(crate) fn load(&self) -> arc_swap::Guard<Arc<TcpEstablishedSnapshot>> {
-        self.inner.load()
-    }
-
-    #[inline]
-    fn publish_connections(&self, connections: TcpConnectionSnapshotPool) {
-        self.inner.rcu(|current| {
-            let mut next = TcpEstablishedSnapshot::clone(current);
-            next.connections = connections.clone();
-            next
-        });
-    }
-
-    #[inline]
-    pub(crate) fn connection_state(&self, lookup_id: TcpLookupId) -> Option<TcpState> {
-        self.load()
-            .connections
-            .lookup_by_lookup_id(lookup_id)
-            .map(|connection| connection.state)
-    }
-
-    #[inline]
-    pub(crate) fn connection(&self, lookup_id: TcpLookupId) -> Option<TcpConnectionSnapshot> {
-        self.load().connections.lookup_by_lookup_id(lookup_id)
-    }
-
-    #[inline]
-    pub(crate) fn apply_receive_progress(
-        &self,
-        lookup_id: TcpLookupId,
-        progress: TcpReceiveProgress,
-    ) {
-        self.inner.rcu(|current| {
-            let mut next = TcpEstablishedSnapshot::clone(current);
-            next.connections.apply_receive_progress(lookup_id, progress);
-            next
-        });
-    }
-}
-
-fn default_tcp_established_snapshot() -> TcpEstablishedSnapshotHandle {
-    TcpEstablishedSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
-        TcpEstablishedSnapshot::new(),
-    )))
-}
-
-pub struct TcpEstablishedControlPlane {
-    inner: Arc<ArcSwap<TcpEstablishedSnapshot>>,
-    backend: TcpEstablishedBackendSlot,
-    next: [NodeId; TcpEstablishedNext::COUNT],
-}
-
-impl TcpEstablishedControlPlane {
-    #[inline]
-    pub fn new(next: [NodeId; TcpEstablishedNext::COUNT]) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(TcpEstablishedSnapshot::new())),
-            backend: TcpEstablishedBackendSlot::new(),
-            next,
-        }
-    }
-
-    #[inline]
-    pub fn with_backend<O>(self, backend: Arc<O>) -> Self
-    where
-        O: TcpEstablishedBackend + 'static,
-    {
-        self.install_backend(backend);
-        self
-    }
-
-    #[inline]
-    pub fn install_backend<O>(&self, backend: Arc<O>)
-    where
-        O: TcpEstablishedBackend + 'static,
-    {
-        self.backend.install(backend);
-    }
-
-    #[inline]
-    pub fn publish_connections(&self, connections: TcpConnectionSnapshotPool) -> CoreResult<()> {
-        TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)).publish_connections(connections);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn node(&self) -> TcpEstablishedNode {
-        TcpEstablishedNode::new(self.next).with_runtime(
-            TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)),
-            self.backend.clone(),
-        )
-    }
-
-    #[doc(hidden)]
-    #[inline]
-    pub fn connection_state_for_test(&self, lookup_id: TcpLookupId) -> Option<TcpState> {
-        TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)).connection_state(lookup_id)
-    }
-
-    #[doc(hidden)]
-    #[inline]
-    pub fn connection_snapshot_for_test(
-        &self,
-        lookup_id: TcpLookupId,
-    ) -> Option<TcpConnectionSnapshot> {
-        TcpEstablishedSnapshotHandle::new(Arc::clone(&self.inner)).connection(lookup_id)
     }
 }
 
@@ -983,8 +1006,4 @@ fn duration_from_nanos_saturating(nanos: u128) -> Duration {
     } else {
         Duration::new(seconds as u64, subsecond_nanos)
     }
-}
-
-pub(crate) fn default_established_snapshot_handle() -> TcpEstablishedSnapshotHandle {
-    default_tcp_established_snapshot()
 }

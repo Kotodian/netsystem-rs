@@ -11,10 +11,7 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId, TcpSeq, TcpState};
 
 use super::TcpLookupId;
-use super::connection::{
-    TcpConnectionSnapshot, TcpEstablishedSnapshotHandle, TcpReceiveProgress,
-    default_established_snapshot_handle,
-};
+use super::connection::{TcpConnectionView, TcpReceiveProgress, TcpSessionAccessSlot};
 use super::input::{mark_pending_tcp_app_ingress, take_pending_tcp_app_ingress};
 
 // Established receive keeps only a small per-worker reorder table: at most 64
@@ -305,7 +302,7 @@ pub struct TcpEstablishedObservation {
 
 #[derive(Clone)]
 struct TcpEstablishedStateRuntime {
-    snapshot: TcpEstablishedSnapshotHandle,
+    access: TcpSessionAccessSlot,
     backend: TcpEstablishedBackendSlot,
 }
 
@@ -322,13 +319,13 @@ fn has_tcp_established_runtime(data: NodeRuntimeData) -> bool {
 }
 
 fn register_tcp_established_runtime(
-    snapshot: TcpEstablishedSnapshotHandle,
+    access: TcpSessionAccessSlot,
     backend: TcpEstablishedBackendSlot,
 ) -> CoreResult<NodeRuntimeData> {
     TCP_ESTABLISHED_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
         let slot = runtimes.len();
-        runtimes.push(TcpEstablishedStateRuntime { snapshot, backend });
+        runtimes.push(TcpEstablishedStateRuntime { access, backend });
         Ok(NodeRuntimeData::from_words([
             u64::try_from(slot)
                 .map_err(|_| CoreError::internal("TCP established runtime slot overflow"))?,
@@ -342,7 +339,7 @@ fn register_tcp_established_runtime(
 fn tcp_established_runtime(data: NodeRuntimeData) -> CoreResult<TcpEstablishedStateRuntime> {
     if !has_tcp_established_runtime(data) {
         return Ok(TcpEstablishedStateRuntime {
-            snapshot: default_established_snapshot_handle(),
+            access: TcpSessionAccessSlot::new(),
             backend: TcpEstablishedBackendSlot::new(),
         });
     }
@@ -358,7 +355,7 @@ fn tcp_established_runtime(data: NodeRuntimeData) -> CoreResult<TcpEstablishedSt
 
 fn sync_tcp_established_runtime(
     data: NodeRuntimeData,
-    snapshot: TcpEstablishedSnapshotHandle,
+    access: TcpSessionAccessSlot,
     backend: TcpEstablishedBackendSlot,
 ) -> CoreResult<()> {
     if !has_tcp_established_runtime(data) {
@@ -370,7 +367,7 @@ fn sync_tcp_established_runtime(
         let runtime = runtimes
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("TCP established runtime slot is invalid"))?;
-        runtime.snapshot = snapshot;
+        runtime.access = access;
         runtime.backend = backend;
         Ok(())
     })
@@ -380,8 +377,8 @@ fn sync_tcp_established_runtime(
 pub struct TcpEstablishedNode {
     #[node(default)]
     runtime_data: NodeRuntimeData,
-    #[node(default = default_established_snapshot_handle())]
-    snapshot: TcpEstablishedSnapshotHandle,
+    #[node(default)]
+    access: TcpSessionAccessSlot,
     #[node(default)]
     backend: TcpEstablishedBackendSlot,
     #[node(default)]
@@ -392,18 +389,18 @@ impl TcpEstablishedNode {
     #[inline]
     pub(crate) fn with_runtime(
         mut self,
-        snapshot: TcpEstablishedSnapshotHandle,
+        access: TcpSessionAccessSlot,
         backend: TcpEstablishedBackendSlot,
     ) -> Self {
         if has_tcp_established_runtime(self.runtime_data) {
             let _ =
-                sync_tcp_established_runtime(self.runtime_data, snapshot.clone(), backend.clone());
+                sync_tcp_established_runtime(self.runtime_data, access.clone(), backend.clone());
         } else if let Ok(runtime_data) =
-            register_tcp_established_runtime(snapshot.clone(), backend.clone())
+            register_tcp_established_runtime(access.clone(), backend.clone())
         {
             self.runtime_data = runtime_data;
         }
-        self.snapshot = snapshot;
+        self.access = access;
         self.backend = backend;
         self
     }
@@ -416,18 +413,14 @@ impl Node for TcpEstablishedNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        sync_tcp_established_runtime(
-            self.runtime_data,
-            self.snapshot.clone(),
-            self.backend.clone(),
-        )?;
+        sync_tcp_established_runtime(self.runtime_data, self.access.clone(), self.backend.clone())?;
         let next = Self::runtime_nexts(runtime)?;
         let rcv_process = next[TcpEstablishedNext::RcvProcess as usize];
         let result = tcp_established_route_frame(
             runtime,
             frame,
             rcv_process,
-            &self.snapshot,
+            &self.access,
             &self.backend.load(),
         )?;
         self.cached_next = Some(rcv_process);
@@ -441,11 +434,7 @@ impl Node for TcpEstablishedNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_tcp_established_runtime(
-            self.runtime_data,
-            self.snapshot.clone(),
-            self.backend.clone(),
-        )?;
+        sync_tcp_established_runtime(self.runtime_data, self.access.clone(), self.backend.clone())?;
         Ok(self.runtime_data)
     }
 }
@@ -462,7 +451,7 @@ fn tcp_established_process(
         runtime,
         frame,
         rcv_process,
-        &state.snapshot,
+        &state.access,
         &state.backend.load(),
     )
 }
@@ -471,13 +460,13 @@ fn tcp_established_route_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     rcv_process: NodeId,
-    snapshot: &TcpEstablishedSnapshotHandle,
+    access: &TcpSessionAccessSlot,
     backend: &TcpEstablishedBackendHandle,
 ) -> CoreResult<NodeResult> {
     let original = frame.drain_pending().collect::<hammer_infra::vec::Vec<_>>();
     let mut output = TcpEstablishedRouteOutput::new(rcv_process);
     for (offset, index) in original.iter().copied().enumerate() {
-        let action = match tcp_established_action_for_index(runtime, index, snapshot, backend) {
+        let action = match tcp_established_action_for_index(runtime, index, access, backend) {
             Ok(action) => action,
             Err(err) => {
                 output.free(runtime);
@@ -652,13 +641,13 @@ struct TcpEstablishedDelivery {
 fn tcp_established_action_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    snapshot: &TcpEstablishedSnapshotHandle,
+    access: &TcpSessionAccessSlot,
     backend: &TcpEstablishedBackendHandle,
 ) -> CoreResult<TcpEstablishedAction> {
     let Some(pending) = take_pending_tcp_app_ingress(index)? else {
         return Ok(TcpEstablishedAction::PassThrough);
     };
-    let connection = snapshot.connection(pending.connection_id);
+    let connection = access.connection_view(pending.connection_id)?;
     let connection_state = connection.map(|connection| connection.state);
     let segment = tcp_observed_segment(runtime, index)?;
     if !tcp_segment_is_sequence_acceptable(connection, segment) {
@@ -679,7 +668,7 @@ fn tcp_established_action_for_index(
     let ack_state_transition = tcp_state_after_remote_ack(connection_state, ack_validation);
     if segment.rst() {
         tcp_established_reorder_remove_connection(pending.connection_id, runtime)?;
-        snapshot.apply_receive_progress(
+        access.apply_receive_progress(
             pending.connection_id,
             TcpReceiveProgress {
                 state: Some(TcpState::Closed),
@@ -754,7 +743,7 @@ fn tcp_established_action_for_index(
         )?;
         tcp_established_reorder_buffer_segment(pending.connection_id, index, segment, runtime)?;
         if should_apply_progress {
-            snapshot.apply_receive_progress(
+            access.apply_receive_progress(
                 pending.connection_id,
                 TcpReceiveProgress {
                     state: next_state,
@@ -815,7 +804,7 @@ fn tcp_established_action_for_index(
             receive_acknowledgment,
         )?;
     }
-    snapshot.apply_receive_progress(
+    access.apply_receive_progress(
         pending.connection_id,
         TcpReceiveProgress {
             state: next_state,
@@ -928,7 +917,7 @@ fn tcp_state_allows_app_delivery(state: TcpState) -> bool {
 fn tcp_established_close_observation(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     reason: TcpCloseReason,
 ) -> CoreResult<Option<TcpEstablishedObservation>> {
     let Some(connection) = connection else {
@@ -958,7 +947,7 @@ fn tcp_observe_receive_ack(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     backend: &TcpEstablishedBackendHandle,
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     kind: TcpReceiveAckKind,
     reason: TcpReceiveAckReason,
     receive_acknowledgment: u32,
@@ -979,7 +968,7 @@ fn tcp_observe_receive_ack(
 fn tcp_receive_ack_observation(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     kind: TcpReceiveAckKind,
     reason: TcpReceiveAckReason,
     receive_acknowledgment: u32,
@@ -1014,7 +1003,7 @@ fn tcp_receive_ack_observation(
 fn tcp_established_observation_endpoints(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    connection: TcpConnectionSnapshot,
+    connection: TcpConnectionView,
 ) -> CoreResult<Option<(SocketAddr, SocketAddr)>> {
     let metadata = runtime.metadata(index)?;
     let local = connection.local.or_else(|| {
@@ -1037,7 +1026,7 @@ fn tcp_established_observation_endpoints(
 
 #[inline]
 fn tcp_receive_ack_for_segment(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     segment: TcpObservedSegment,
     starts_at_receive_next: bool,
     next_receive_sequence: Option<u32>,
@@ -1066,7 +1055,7 @@ fn tcp_receive_ack_reason(
 }
 
 fn tcp_established_ack_observation(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     acknowledgment: TcpAckValidation,
     advertised_window: u32,
     ack_state_transition: Option<TcpState>,
@@ -1201,7 +1190,7 @@ fn tcp_chain_u32(segments: &[&[u8]], offset: usize) -> CoreResult<Option<u32>> {
 }
 
 fn tcp_segment_is_sequence_acceptable(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     segment: TcpObservedSegment,
 ) -> bool {
     let Some(connection) = connection else {
@@ -1227,7 +1216,7 @@ fn tcp_segment_is_sequence_acceptable(
 }
 
 fn tcp_validate_acknowledgment(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     segment: TcpObservedSegment,
 ) -> TcpAckValidation {
     let Some(acknowledgment) = segment.acknowledgment else {
@@ -1261,13 +1250,13 @@ fn tcp_validate_acknowledgment(
 }
 
 #[inline]
-fn tcp_connection_has_initialized_receive_state(connection: TcpConnectionSnapshot) -> bool {
+fn tcp_connection_has_initialized_receive_state(connection: TcpConnectionView) -> bool {
     connection.irs != 0 || connection.rcv_nxt != 0
 }
 
 #[inline]
 fn tcp_segment_starts_at_receive_next(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     segment: TcpObservedSegment,
 ) -> bool {
     let Some(connection) = connection else {
@@ -1278,7 +1267,7 @@ fn tcp_segment_starts_at_receive_next(
 }
 
 #[inline]
-fn tcp_connection_has_initialized_send_state(connection: TcpConnectionSnapshot) -> bool {
+fn tcp_connection_has_initialized_send_state(connection: TcpConnectionView) -> bool {
     connection.iss != 0 || connection.snd_una != 0 || connection.snd_nxt != 0
 }
 
@@ -1456,7 +1445,7 @@ impl TcpEstablishedBufferedSegment {
 
 #[inline]
 fn tcp_segment_can_buffer_out_of_order(
-    connection: Option<TcpConnectionSnapshot>,
+    connection: Option<TcpConnectionView>,
     state: Option<TcpState>,
     segment: TcpObservedSegment,
     acknowledgment: TcpAckValidation,
@@ -1640,1449 +1629,4 @@ fn tcp_should_observe_remote_fin(
             state,
             Some(TcpState::Established | TcpState::FinWait1 | TcpState::FinWait2)
         )
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use hammer_adapter::{
-        BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId,
-        NodeProcessFn, NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr,
-    };
-    use hammer_core::error::{CoreError, CoreResult};
-    use hammer_core::protocol::tcp::{TcpCloseReason, TcpConnectionId};
-
-    use super::{
-        TcpEstablishedAckObservation, TcpEstablishedBackend, TcpEstablishedObservation,
-        TcpReceiveAckKind, TcpReceiveAckObservation, TcpReceiveAckReason,
-    };
-    use crate::transport::tcp::input::{
-        mark_pending_tcp_app_ingress, take_pending_tcp_app_ingress,
-    };
-    use crate::transport::tcp::{
-        TcpConnectionSnapshot, TcpEstablishedControlPlane, TcpEstablishedNext, TcpState,
-    };
-
-    const LOOKUP_ID: u32 = 37;
-    const CONNECTION_ID: u64 = 73;
-
-    #[derive(Default)]
-    struct CaptureState {
-        packets: Vec<Vec<u8>>,
-    }
-
-    struct CaptureNode {
-        runtime_data: NodeRuntimeData,
-    }
-
-    impl CaptureNode {
-        fn new(state: Arc<Mutex<CaptureState>>) -> Self {
-            let mut states = capture_states()
-                .lock()
-                .expect("capture state registry poisoned");
-            let slot = states.len();
-            states.push(state);
-            Self {
-                runtime_data: NodeRuntimeData::from_usize(slot).expect("capture state slot"),
-            }
-        }
-    }
-
-    impl hammer_adapter::Node for CaptureNode {
-        #[inline(always)]
-        fn process(
-            &mut self,
-            _runtime: &DataPlaneRuntime,
-            _frame: &mut BufferFrame,
-        ) -> CoreResult<NodeResult> {
-            Err(CoreError::internal(
-                "capture node must run through descriptor process",
-            ))
-        }
-
-        #[inline]
-        fn node_process(&self) -> NodeProcessFn {
-            capture_process
-        }
-
-        #[inline]
-        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-            Ok(self.runtime_data)
-        }
-    }
-
-    impl hammer_adapter::InternalNode for CaptureNode {}
-
-    fn capture_states() -> &'static Mutex<Vec<Arc<Mutex<CaptureState>>>> {
-        static STATES: OnceLock<Mutex<Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
-        STATES.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    fn capture_process(
-        runtime: &DataPlaneRuntime,
-        data: NodeRuntimeData,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let state = {
-            let states = capture_states()
-                .lock()
-                .map_err(|_| CoreError::internal("capture state registry poisoned"))?;
-            Arc::clone(
-                states
-                    .get(data.usize_word(0)?)
-                    .ok_or_else(|| CoreError::internal("capture state slot is invalid"))?,
-            )
-        };
-        for index in frame.drain_pending() {
-            let pending = take_pending_tcp_app_ingress(index)?;
-            if pending.is_some() {
-                let packet = runtime.copy_current_chain(index)?;
-                state
-                    .lock()
-                    .map_err(|_| CoreError::internal("capture state poisoned"))?
-                    .packets
-                    .push(packet.into_iter().collect());
-            }
-            runtime.free_index(index);
-        }
-        Ok(NodeResult::drop())
-    }
-
-    #[derive(Default)]
-    struct RecordingTcpEstablishedBackend {
-        ack_observations: Arc<Mutex<Vec<TcpEstablishedAckObservation>>>,
-        receive_ack_observations: Arc<Mutex<Vec<TcpReceiveAckObservation>>>,
-        observations: Arc<Mutex<Vec<TcpEstablishedObservation>>>,
-    }
-
-    impl TcpEstablishedBackend for RecordingTcpEstablishedBackend {
-        fn observe_ack_progress(
-            &self,
-            observation: TcpEstablishedAckObservation,
-        ) -> CoreResult<()> {
-            self.ack_observations
-                .lock()
-                .map_err(|_| CoreError::internal("ack observations poisoned"))?
-                .push(observation);
-            Ok(())
-        }
-
-        fn observe_receive_ack(&self, observation: TcpReceiveAckObservation) -> CoreResult<()> {
-            self.receive_ack_observations
-                .lock()
-                .map_err(|_| CoreError::internal("receive ack observations poisoned"))?
-                .push(observation);
-            Ok(())
-        }
-
-        fn observe_close(&self, observation: TcpEstablishedObservation) -> CoreResult<()> {
-            self.observations
-                .lock()
-                .map_err(|_| CoreError::internal("established observations poisoned"))?
-                .push(observation);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn tcp_established_control_plane_installs_backend_after_construction() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        control.install_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.90:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.90:40090".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::FinWait1,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 90),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 90),
-            local.port(),
-            0x0102_0304,
-            0x1020_3044,
-            0x2000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-        assert_eq!(backend.ack_observations.lock().unwrap().len(), 1);
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_control_plane_replaces_backend_before_node_construction() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
-        let stale_backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let active_backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        control.install_backend(stale_backend.clone());
-        control.install_backend(active_backend.clone());
-
-        let local: SocketAddr = "192.0.2.94:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.94:40094".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::FinWait1,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 94),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 94),
-            local.port(),
-            0x0102_0304,
-            0x1020_3048,
-            0x1000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-        assert!(stale_backend.ack_observations.lock().unwrap().is_empty());
-        assert_eq!(active_backend.ack_observations.lock().unwrap().len(), 1);
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_partial_ack_progress_without_ack_state_transition() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.91:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.91:40091".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::FinWait1,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 91),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 91),
-            local.port(),
-            0x0102_0304,
-            0x1020_3044,
-            0x2000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-        assert_eq!(
-            *backend.ack_observations.lock().unwrap(),
-            vec![TcpEstablishedAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                accepted_acknowledgment: 0x1020_3044,
-                advertised_window: 0x2000,
-                previous_state: TcpState::FinWait1,
-                ack_state_transition: None,
-                acknowledges_local_fin: false,
-            }]
-        );
-        assert!(backend.observations.lock().unwrap().is_empty());
-        assert_eq!(
-            control
-                .connection_snapshot_for_test(LOOKUP_ID)
-                .expect("snapshot")
-                .snd_una,
-            0x1020_3044
-        );
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_ack_driven_state_transition_when_fin_is_fully_acked() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.92:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.92:40092".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::FinWait1,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 92),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 92),
-            local.port(),
-            0x0102_0304,
-            0x1020_3048,
-            0x1000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
-        assert_eq!(
-            *backend.ack_observations.lock().unwrap(),
-            vec![TcpEstablishedAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                accepted_acknowledgment: 0x1020_3048,
-                advertised_window: 0x1000,
-                previous_state: TcpState::FinWait1,
-                ack_state_transition: Some(TcpState::FinWait2),
-                acknowledges_local_fin: true,
-            }]
-        );
-        assert_eq!(
-            control.connection_state_for_test(LOOKUP_ID),
-            Some(TcpState::FinWait2)
-        );
-        assert!(backend.observations.lock().unwrap().is_empty());
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_suppresses_ack_progress_observation_for_stale_invalid_and_missing_ack()
-    {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.93:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.93:40093".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::FinWait1,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        for packet in [
-            ipv4_tcp_packet_with_seq_ack_window(
-                Ipv4Addr::new(198, 51, 100, 93),
-                remote.port(),
-                Ipv4Addr::new(192, 0, 2, 93),
-                local.port(),
-                0x0102_0304,
-                0x1020_303f,
-                0x2000,
-                tcp_flags(false, false, false, true),
-                b"",
-            ),
-            ipv4_tcp_packet_with_seq_ack_window(
-                Ipv4Addr::new(198, 51, 100, 93),
-                remote.port(),
-                Ipv4Addr::new(192, 0, 2, 93),
-                local.port(),
-                0x0102_0304,
-                0x1020_3049,
-                0x2000,
-                tcp_flags(false, false, false, true),
-                b"",
-            ),
-            ipv4_tcp_packet_with_seq_ack_window(
-                Ipv4Addr::new(198, 51, 100, 93),
-                remote.port(),
-                Ipv4Addr::new(192, 0, 2, 93),
-                local.port(),
-                0x0102_0304,
-                0,
-                0x2000,
-                tcp_flags(false, false, false, false),
-                b"",
-            ),
-        ] {
-            let frame = runtime.alloc_frame_index().expect("alloc frame");
-            let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-            stamp_tcp_cursor(&runtime, buffer, &packet);
-            mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false)
-                .expect("mark pending app ingress");
-
-            assert!(
-                runtime
-                    .schedule_frame(established, frame)
-                    .expect("schedule")
-            );
-            assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
-        }
-
-        assert!(backend.ack_observations.lock().unwrap().is_empty());
-        assert!(backend.observations.lock().unwrap().is_empty());
-        let snapshot = control
-            .connection_snapshot_for_test(LOOKUP_ID)
-            .expect("snapshot after invalid ack traffic");
-        assert_eq!(snapshot.snd_una, 0x1020_3040);
-        assert_eq!(snapshot.snd_nxt, 0x1020_3048);
-        assert_eq!(snapshot.state, TcpState::FinWait1);
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_receive_ack_for_in_order_payload() {
-        let octet = 98;
-        let local: SocketAddr = "192.0.2.98:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.98:40098".parse().expect("remote");
-        let snapshot = connected_snapshot(local, remote, TcpState::Established);
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, octet),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, octet),
-            local.port(),
-            snapshot.rcv_nxt,
-            snapshot.snd_una,
-            0x2000,
-            tcp_flags(false, false, false, true),
-            b"data",
-        );
-
-        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
-
-        assert_eq!(
-            result.receive_acks,
-            vec![TcpReceiveAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                local,
-                remote,
-                send_sequence: snapshot.snd_nxt,
-                receive_acknowledgment: snapshot.rcv_nxt + 4,
-                advertised_window: snapshot.rcv_wnd,
-                kind: TcpReceiveAckKind::Ack,
-                reason: TcpReceiveAckReason::Data,
-            }]
-        );
-        assert_eq!(result.snapshot.rcv_nxt, snapshot.rcv_nxt + 4);
-        assert_eq!(result.in_use_buffers, 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_receive_ack_for_in_order_fin() {
-        let octet = 99;
-        let local: SocketAddr = "192.0.2.99:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.99:40099".parse().expect("remote");
-        let snapshot = connected_snapshot(local, remote, TcpState::Established);
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, octet),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, octet),
-            local.port(),
-            snapshot.rcv_nxt,
-            snapshot.snd_una,
-            0x2000,
-            tcp_flags(true, false, false, true),
-            b"",
-        );
-
-        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
-
-        assert_eq!(
-            result.receive_acks,
-            vec![TcpReceiveAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                local,
-                remote,
-                send_sequence: snapshot.snd_nxt,
-                receive_acknowledgment: snapshot.rcv_nxt + 1,
-                advertised_window: snapshot.rcv_wnd,
-                kind: TcpReceiveAckKind::Ack,
-                reason: TcpReceiveAckReason::Fin,
-            }]
-        );
-        assert_eq!(result.state, Some(TcpState::CloseWait));
-        assert_eq!(result.in_use_buffers, 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_receive_ack_for_in_window_gap() {
-        let octet = 100;
-        let local: SocketAddr = "192.0.2.100:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.100:40100".parse().expect("remote");
-        let snapshot = connected_snapshot(local, remote, TcpState::Established);
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, octet),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, octet),
-            local.port(),
-            snapshot.rcv_nxt + 4,
-            snapshot.snd_una,
-            0x2000,
-            tcp_flags(false, false, false, true),
-            b"late",
-        );
-
-        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
-
-        assert_eq!(
-            result.receive_acks,
-            vec![TcpReceiveAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                local,
-                remote,
-                send_sequence: snapshot.snd_nxt,
-                receive_acknowledgment: snapshot.rcv_nxt,
-                advertised_window: snapshot.rcv_wnd,
-                kind: TcpReceiveAckKind::Ack,
-                reason: TcpReceiveAckReason::Gap,
-            }]
-        );
-        assert_eq!(result.snapshot.rcv_nxt, snapshot.rcv_nxt);
-        assert_eq!(result.in_use_buffers, 1);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_challenge_ack_for_invalid_ack() {
-        let octet = 101;
-        let local: SocketAddr = "192.0.2.101:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.101:40101".parse().expect("remote");
-        let snapshot = connected_snapshot(local, remote, TcpState::Established);
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, octet),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, octet),
-            local.port(),
-            snapshot.rcv_nxt,
-            snapshot.snd_nxt + 1,
-            0x2000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-
-        let result = run_receive_ack_observation_case(snapshot, packet, local, remote);
-
-        assert_eq!(
-            result.receive_acks,
-            vec![TcpReceiveAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                local,
-                remote,
-                send_sequence: snapshot.snd_nxt,
-                receive_acknowledgment: snapshot.rcv_nxt,
-                advertised_window: snapshot.rcv_wnd,
-                kind: TcpReceiveAckKind::Challenge,
-                reason: TcpReceiveAckReason::InvalidAck,
-            }]
-        );
-        assert_eq!(result.snapshot, snapshot);
-        assert_eq!(result.in_use_buffers, 0);
-    }
-
-    #[test]
-    fn tcp_established_node_observes_remote_reset_and_skips_rcv_process_delivery() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.73:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.73:40073".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::Established,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0,
-            irs: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet(
-            Ipv4Addr::new(198, 51, 100, 73),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 73),
-            local.port(),
-            tcp_flags(false, false, true, false),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
-        assert_eq!(
-            *backend.observations.lock().unwrap(),
-            vec![TcpEstablishedObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                local,
-                remote,
-                reason: TcpCloseReason::RemoteReset,
-            }]
-        );
-        assert!(
-            capture_state.lock().unwrap().packets.is_empty(),
-            "remote reset must not continue into rcv-process delivery"
-        );
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_suppresses_retransmitted_fin_delivery_after_remote_half_close() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
-
-        let local: SocketAddr = "192.0.2.81:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.81:40081".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::CloseWait,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0,
-            irs: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_wnd: u16::MAX as u32,
-            rcv_nxt: 0,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet(
-            Ipv4Addr::new(198, 51, 100, 81),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 81),
-            local.port(),
-            tcp_flags(true, false, false, true),
-            b"",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
-        assert!(
-            capture_state.lock().unwrap().packets.is_empty(),
-            "close-wait FIN retransmits must not be delivered as repeated app EOF"
-        );
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_withholds_out_of_order_payload_from_app_delivery() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
-
-        let local: SocketAddr = "192.0.2.95:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.95:40095".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::Established,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: 0x4000,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let packet = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 95),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 95),
-            local.port(),
-            0x0102_0308,
-            0x1020_3040,
-            0x4000,
-            tcp_flags(false, false, false, true),
-            b"hole",
-        );
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 1);
-        assert!(
-            capture_state.lock().unwrap().packets.is_empty(),
-            "out-of-order payload must not be delivered to the app"
-        );
-        let snapshot = control
-            .connection_snapshot_for_test(LOOKUP_ID)
-            .expect("snapshot after out-of-order payload");
-        assert_eq!(snapshot.state, TcpState::Established);
-        assert_eq!(snapshot.rcv_nxt, 0x0102_0304);
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 1);
-
-        let reset = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 95),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 95),
-            local.port(),
-            0x0102_0304,
-            0x1020_3040,
-            0x4000,
-            tcp_flags(false, false, true, true),
-            b"",
-        );
-        let reset_frame = runtime.alloc_frame_index().expect("alloc reset frame");
-        let reset_buffer = push_packet(&runtime, reset_frame, &reset, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, reset_buffer, &reset);
-        mark_pending_tcp_app_ingress(reset_buffer, LOOKUP_ID, false)
-            .expect("mark reset pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, reset_frame)
-                .expect("schedule reset")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run reset"), 1);
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_delivers_buffered_out_of_order_payload_after_gap_arrives() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture));
-
-        let local: SocketAddr = "192.0.2.96:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.96:40096".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::Established,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: 0x4000,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let late = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 96),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 96),
-            local.port(),
-            0x0102_0308,
-            0x1020_3040,
-            0x4000,
-            tcp_flags(false, false, false, true),
-            b"late",
-        );
-        let late_frame = runtime.alloc_frame_index().expect("alloc late frame");
-        let late_buffer = push_packet(&runtime, late_frame, &late, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, late_buffer, &late);
-        mark_pending_tcp_app_ingress(late_buffer, LOOKUP_ID, false)
-            .expect("mark late pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, late_frame)
-                .expect("schedule late")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run late packet"), 1);
-        assert!(
-            capture_state.lock().unwrap().packets.is_empty(),
-            "out-of-order payload must wait for the missing gap"
-        );
-        assert_eq!(
-            control
-                .connection_snapshot_for_test(LOOKUP_ID)
-                .expect("snapshot after late payload")
-                .rcv_nxt,
-            0x0102_0304
-        );
-        assert_eq!(runtime.in_use_buffers(), 1);
-
-        let gap = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 96),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 96),
-            local.port(),
-            0x0102_0304,
-            0x1020_3040,
-            0x4000,
-            tcp_flags(false, false, false, true),
-            b"gap!",
-        );
-        let gap_frame = runtime.alloc_frame_index().expect("alloc gap frame");
-        let gap_buffer = push_packet(&runtime, gap_frame, &gap, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, gap_buffer, &gap);
-        mark_pending_tcp_app_ingress(gap_buffer, LOOKUP_ID, false)
-            .expect("mark gap pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, gap_frame)
-                .expect("schedule gap")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run gap packet"), 2);
-        let captured = capture_state.lock().unwrap().packets.clone();
-        assert_eq!(captured, vec![gap, late]);
-        assert_eq!(
-            control
-                .connection_snapshot_for_test(LOOKUP_ID)
-                .expect("snapshot after gap fill")
-                .rcv_nxt,
-            0x0102_030c
-        );
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-    }
-
-    #[test]
-    fn tcp_established_node_clears_reorder_buffer_on_ack_terminal_state() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-
-        let local: SocketAddr = "192.0.2.97:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.97:40097".parse().expect("remote");
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::Established,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: 0x4000,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-
-        let buffered = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 97),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 97),
-            local.port(),
-            0x0102_0308,
-            0x1020_3040,
-            0x4000,
-            tcp_flags(false, false, false, true),
-            b"late",
-        );
-        let buffered_frame = runtime.alloc_frame_index().expect("alloc buffered frame");
-        let buffered_index = push_packet(
-            &runtime,
-            buffered_frame,
-            &buffered,
-            tcp_metadata(remote, local),
-        );
-        stamp_tcp_cursor(&runtime, buffered_index, &buffered);
-        mark_pending_tcp_app_ingress(buffered_index, LOOKUP_ID, false)
-            .expect("mark buffered pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, buffered_frame)
-                .expect("schedule buffered")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run buffered"), 1);
-        assert_eq!(runtime.in_use_buffers(), 1);
-        backend
-            .ack_observations
-            .lock()
-            .expect("ack observations")
-            .clear();
-
-        let mut terminal_connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        terminal_connections.insert(TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state: TcpState::LastAck,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: 0x4000,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: u16::MAX as u32,
-        });
-        control
-            .publish_connections(terminal_connections.publish_snapshot())
-            .expect("publish last-ack connection snapshot");
-
-        let ack = ipv4_tcp_packet_with_seq_ack_window(
-            Ipv4Addr::new(198, 51, 100, 97),
-            remote.port(),
-            Ipv4Addr::new(192, 0, 2, 97),
-            local.port(),
-            0x0102_0304,
-            0x1020_3048,
-            0x4000,
-            tcp_flags(false, false, false, true),
-            b"",
-        );
-        let ack_frame = runtime
-            .alloc_frame_index()
-            .expect("alloc terminal ack frame");
-        let ack_index = push_packet(&runtime, ack_frame, &ack, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, ack_index, &ack);
-        mark_pending_tcp_app_ingress(ack_index, LOOKUP_ID, false)
-            .expect("mark terminal ack pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, ack_frame)
-                .expect("schedule terminal ack")
-        );
-
-        assert_eq!(runtime.run_ready_nodes().expect("run terminal ack"), 2);
-        assert_eq!(
-            control.connection_state_for_test(LOOKUP_ID),
-            Some(TcpState::Closed)
-        );
-        assert_eq!(
-            *backend.ack_observations.lock().unwrap(),
-            vec![TcpEstablishedAckObservation {
-                lookup_id: LOOKUP_ID,
-                connection_id: TcpConnectionId::new(CONNECTION_ID),
-                accepted_acknowledgment: 0x1020_3048,
-                advertised_window: 0x4000,
-                previous_state: TcpState::LastAck,
-                ack_state_transition: Some(TcpState::Closed),
-                acknowledges_local_fin: true,
-            }]
-        );
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(
-            runtime.in_use_buffers(),
-            0,
-            "ACK-only terminal close must release buffered out-of-order payloads"
-        );
-    }
-
-    #[derive(Debug)]
-    struct ReceiveAckCaseResult {
-        receive_acks: Vec<TcpReceiveAckObservation>,
-        snapshot: TcpConnectionSnapshot,
-        state: Option<TcpState>,
-        in_use_buffers: usize,
-    }
-
-    fn run_receive_ack_observation_case(
-        snapshot: TcpConnectionSnapshot,
-        packet: Vec<u8>,
-        local: SocketAddr,
-        remote: SocketAddr,
-    ) -> ReceiveAckCaseResult {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let capture_state = Arc::new(Mutex::new(CaptureState::default()));
-        let capture = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&capture_state)));
-        let backend = Arc::new(RecordingTcpEstablishedBackend::default());
-        let control = TcpEstablishedControlPlane::new(TcpEstablishedNext::nodes(capture))
-            .with_backend(backend.clone());
-        let mut connections =
-            crate::transport::tcp::TcpWorkerOwnedConnectionState::new(DataWorkerId::new(0));
-        connections.insert(snapshot);
-        control
-            .publish_connections(connections.publish_snapshot())
-            .expect("publish established connection snapshot");
-        let established = runtime.nodes().register_internal(control.node());
-        let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let buffer = push_packet(&runtime, frame, &packet, tcp_metadata(remote, local));
-        stamp_tcp_cursor(&runtime, buffer, &packet);
-        mark_pending_tcp_app_ingress(buffer, LOOKUP_ID, false).expect("mark pending app ingress");
-
-        assert!(
-            runtime
-                .schedule_frame(established, frame)
-                .expect("schedule")
-        );
-        let _ = runtime.run_ready_nodes().expect("run nodes");
-
-        let receive_acks = backend
-            .receive_ack_observations
-            .lock()
-            .expect("receive ack observations")
-            .clone();
-        let snapshot = control
-            .connection_snapshot_for_test(LOOKUP_ID)
-            .expect("snapshot after packet");
-        let state = control.connection_state_for_test(LOOKUP_ID);
-        let in_use_buffers = runtime.in_use_buffers();
-        super::tcp_established_reorder_remove_connection(LOOKUP_ID, &runtime)
-            .expect("clear reorder buffer after observation test");
-        assert_eq!(runtime.frames_in_use(), 0);
-        assert_eq!(runtime.in_use_buffers(), 0);
-
-        ReceiveAckCaseResult {
-            receive_acks,
-            snapshot,
-            state,
-            in_use_buffers,
-        }
-    }
-
-    fn connected_snapshot(
-        local: SocketAddr,
-        remote: SocketAddr,
-        state: TcpState,
-    ) -> TcpConnectionSnapshot {
-        TcpConnectionSnapshot {
-            lookup_id: LOOKUP_ID,
-            connection_id: Some(TcpConnectionId::new(CONNECTION_ID)),
-            owner_worker: DataWorkerId::new(0),
-            state,
-            local_port: local.port(),
-            local: Some(local),
-            remote,
-            iss: 0x1020_303f,
-            irs: 0x0102_0303,
-            snd_una: 0x1020_3040,
-            snd_nxt: 0x1020_3048,
-            snd_wnd: 0x4000,
-            rcv_nxt: 0x0102_0304,
-            rcv_wnd: 0x4000,
-        }
-    }
-
-    fn push_packet(
-        runtime: &DataPlaneRuntime,
-        frame: hammer_adapter::FrameIndex,
-        packet: &[u8],
-        metadata: RouteMetadata,
-    ) -> BufferIndex {
-        let buffer = runtime
-            .alloc_index_with_bytes(metadata, packet)
-            .expect("alloc packet");
-        runtime
-            .get_frame_mut(frame)
-            .expect("mutate frame")
-            .push_index(buffer)
-            .expect("push packet");
-        buffer
-    }
-
-    fn stamp_tcp_cursor(runtime: &DataPlaneRuntime, buffer: BufferIndex, packet: &[u8]) {
-        let header_len = ((*packet.first().expect("ipv4 header") & 0x0f) as usize) * 4;
-        let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-        let tcp_offset = header_len;
-        let tcp_header_len = ((packet[tcp_offset + 12] >> 4) as usize) * 4;
-        runtime
-            .get_buffer_mut(buffer)
-            .expect("buffer mut")
-            .set_packet_cursor(
-                BufferPacketCursor::new()
-                    .with_packet_len(packet_len)
-                    .with_network_header(0, header_len)
-                    .with_transport_header(tcp_offset, tcp_header_len)
-                    .with_transport_payload_offset(tcp_offset + tcp_header_len),
-            );
-    }
-
-    fn tcp_metadata(remote: SocketAddr, local: SocketAddr) -> RouteMetadata {
-        RouteMetadata {
-            source: Some(SocksAddr::ip(remote.ip(), remote.port())),
-            destination: Some(SocksAddr::ip(local.ip(), local.port())),
-            ..RouteMetadata::default()
-        }
-    }
-
-    fn ipv4_tcp_packet(
-        source: Ipv4Addr,
-        source_port: u16,
-        destination: Ipv4Addr,
-        destination_port: u16,
-        flags: u8,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        ipv4_tcp_packet_with_seq_ack_window(
-            source,
-            source_port,
-            destination,
-            destination_port,
-            0x0102_0304,
-            0x1020_3040,
-            u16::MAX,
-            flags,
-            payload,
-        )
-    }
-
-    fn ipv4_tcp_packet_with_seq_ack_window(
-        source: Ipv4Addr,
-        source_port: u16,
-        destination: Ipv4Addr,
-        destination_port: u16,
-        sequence: u32,
-        acknowledgment: u32,
-        window: u16,
-        flags: u8,
-        payload: &[u8],
-    ) -> Vec<u8> {
-        let mut packet = ipv4_packet(source, destination, 6, 20 + payload.len());
-        write_tcp_segment(
-            &mut packet[20..],
-            source_port,
-            destination_port,
-            sequence,
-            acknowledgment,
-            window,
-            flags,
-            payload,
-        );
-        let checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&checksum.to_be_bytes());
-        update_ipv4_header_checksum(&mut packet);
-        packet
-    }
-
-    fn ipv4_packet(
-        source: Ipv4Addr,
-        destination: Ipv4Addr,
-        protocol: u8,
-        transport_len: usize,
-    ) -> Vec<u8> {
-        let total_len = 20 + transport_len;
-        let mut packet = vec![0u8; total_len];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-        packet[8] = 64;
-        packet[9] = protocol;
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
-        packet
-    }
-
-    fn write_tcp_segment(
-        out: &mut [u8],
-        source_port: u16,
-        destination_port: u16,
-        sequence: u32,
-        acknowledgment: u32,
-        window: u16,
-        flags: u8,
-        payload: &[u8],
-    ) {
-        out[..2].copy_from_slice(&source_port.to_be_bytes());
-        out[2..4].copy_from_slice(&destination_port.to_be_bytes());
-        out[4..8].copy_from_slice(&sequence.to_be_bytes());
-        out[8..12].copy_from_slice(&acknowledgment.to_be_bytes());
-        out[12] = 0x50;
-        out[13] = flags;
-        out[14..16].copy_from_slice(&window.to_be_bytes());
-        out[20..20 + payload.len()].copy_from_slice(payload);
-    }
-
-    fn tcp_flags(fin: bool, syn: bool, rst: bool, ack: bool) -> u8 {
-        u8::from(fin) | (u8::from(syn) << 1) | (u8::from(rst) << 2) | (u8::from(ack) << 4)
-    }
-
-    fn ipv4_l4_checksum(
-        source: Ipv4Addr,
-        destination: Ipv4Addr,
-        protocol: u8,
-        segment: &[u8],
-    ) -> u16 {
-        let mut words = hammer_infra::vec::Vec::new();
-        words.push(u16::from_be_bytes([source.octets()[0], source.octets()[1]]));
-        words.push(u16::from_be_bytes([source.octets()[2], source.octets()[3]]));
-        words.push(u16::from_be_bytes([
-            destination.octets()[0],
-            destination.octets()[1],
-        ]));
-        words.push(u16::from_be_bytes([
-            destination.octets()[2],
-            destination.octets()[3],
-        ]));
-        words.push(u16::from(protocol));
-        words.push(segment.len() as u16);
-        for chunk in segment.chunks(2) {
-            let word = if chunk.len() == 2 {
-                u16::from_be_bytes([chunk[0], chunk[1]])
-            } else {
-                u16::from_be_bytes([chunk[0], 0])
-            };
-            words.push(word);
-        }
-        internet_checksum(&words)
-    }
-
-    fn update_ipv4_header_checksum(packet: &mut [u8]) {
-        packet[10] = 0;
-        packet[11] = 0;
-        let mut words = hammer_infra::vec::Vec::new();
-        for chunk in packet[..20].chunks(2) {
-            words.push(u16::from_be_bytes([chunk[0], chunk[1]]));
-        }
-        let checksum = internet_checksum(&words);
-        packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-    }
-
-    fn internet_checksum(words: &[u16]) -> u16 {
-        let mut sum = 0u32;
-        for word in words {
-            sum = sum.wrapping_add(u32::from(*word));
-        }
-        while (sum >> 16) != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        !(sum as u16)
-    }
 }
