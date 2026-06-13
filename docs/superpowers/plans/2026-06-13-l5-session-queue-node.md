@@ -49,7 +49,7 @@
   - Define `AppSessionTimerToken`, `AppSessionTimerExpiry`, `AppSessionTimerWheel`.
   - Encode only opaque protocol timer tokens; do not define TCP or QUIC timer enums.
 
-- Create `crates/hammer-service/src/session/protocol.rs`
+- Create `crates/hammer-service/src/session/protocol/mod.rs`
   - Define `SessionProtocolId`, `SessionProtocolContext`, `SessionProtocolOps`, `SessionProtocolRegistry`.
   - Bind `AppSessionId` to allocated protocol ids without hard-coded `Tcp` or `Quic` enum variants.
 
@@ -65,15 +65,17 @@
 - Modify `crates/hammer-service/src/lib.rs`
   - Add `pub mod session;`.
 
-- Replace `crates/hammer-service/src/transport/tcp/session.rs` with `crates/hammer-service/src/transport/tcp/session_protocol.rs`
+- Replace `crates/hammer-service/src/transport/tcp/session.rs` with `crates/hammer-service/src/session/protocol/tcp.rs`
   - Keep TCP connection table ownership and TCP protocol glue.
   - Remove public app wrappers and public TCP session node.
   - Keep TCP timer kind private and encode it as `AppSessionTimerToken`.
 
 - Modify `crates/hammer-service/src/transport/tcp/mod.rs`
-  - Change `pub mod session;` to `pub mod session_protocol;`.
-  - Re-export `TcpSessionProtocol`.
+  - Remove TCP session protocol module/export.
   - Stop re-exporting `TcpSessionNode`, `TcpSessionRuntime`, `TcpSessionStep`, `TcpAppCommand`, `TcpAppSend`, `TcpAppRecv`, `TcpAppClose`, `TcpAppShutdownCommand`, and `TcpSessionTimerKind`.
+
+- Modify `crates/hammer-service/src/session/protocol/mod.rs`
+  - Add `pub mod tcp;` for TCP-specific L5 session protocol glue.
 
 - Create `crates/hammer-service/tests/session_runtime.rs`
   - Cover L5 app ingress, completion, ready queue, timer wheel, and deterministic worker runtime behavior.
@@ -96,7 +98,7 @@
 - Create: `crates/hammer-service/src/session/app.rs`
 - Create: `crates/hammer-service/src/session/ready.rs`
 - Create: `crates/hammer-service/src/session/timer.rs`
-- Create: `crates/hammer-service/src/session/protocol.rs`
+- Create: `crates/hammer-service/src/session/protocol/mod.rs`
 - Create: `crates/hammer-service/src/session/worker.rs`
 - Create: `crates/hammer-service/src/session/node.rs`
 - Modify: `crates/hammer-service/src/lib.rs`
@@ -123,7 +125,7 @@ pub use protocol::{
 };
 pub use ready::AppSessionReadyQueue;
 pub use timer::{AppSessionTimerExpiry, AppSessionTimerToken, AppSessionTimerWheel};
-pub use worker::{SessionQueueRuntime, SessionQueueStep, WorkerSessionRuntime};
+pub use worker::WorkerSessionRuntime;
 ```
 
 - [ ] **Step 2: Add the public service module**
@@ -384,7 +386,8 @@ impl AppSessionAppIngress {
         &mut self,
         submissions: &mut hammer_infra::vec::Vec<AppSessionSubmission>,
     ) -> CoreResult<usize> {
-        let backends: std::vec::Vec<AppSessionBackend> = self.backends.iter().cloned().collect();
+        let backends: hammer_infra::vec::Vec<AppSessionBackend> =
+            self.backends.iter().cloned().collect();
         let mut polled = 0usize;
         for app_backend in backends {
             while let Some(entry) = app_backend.backend.try_pop_submission_entry() {
@@ -548,7 +551,7 @@ impl AppSessionReadyQueue {
         self.ready.is_empty()
     }
 
-    pub fn take_ready_sessions(&mut self) -> std::vec::Vec<AppSessionId> {
+    pub fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<AppSessionId> {
         let ready = self.ready.iter().copied().collect();
         self.ready.clear();
         self.slots = hammer_infra::map::FlatHashTable::new();
@@ -667,7 +670,8 @@ impl AppSessionTimerWheel {
     ) -> CoreResult<usize> {
         self.expired_slots.clear();
         let expired = self.wheel.expire(ticks, &mut self.expired_slots);
-        let expired_slots: std::vec::Vec<u32> = self.expired_slots.iter().copied().collect();
+        let expired_slots: hammer_infra::vec::Vec<u32> =
+            self.expired_slots.iter().copied().collect();
         for slot in expired_slots {
             let Some(timer) = self.slots.get_mut(slot as usize) else {
                 return Err(CoreError::internal("app session timer slot is invalid"));
@@ -683,7 +687,7 @@ impl AppSessionTimerWheel {
         Ok(expired)
     }
 
-    pub fn take_expiries(&mut self) -> std::vec::Vec<AppSessionTimerExpiry> {
+    pub fn take_expiries(&mut self) -> hammer_infra::vec::Vec<AppSessionTimerExpiry> {
         self.pending.drain(..).collect()
     }
 
@@ -710,14 +714,15 @@ fn timer_start_error(error: TimerStartError) -> CoreError {
 }
 ```
 
-Create `crates/hammer-service/src/session/protocol.rs`:
+Create `crates/hammer-service/src/session/protocol/mod.rs`:
 
 ```rust
 use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::session::{
-    AppSessionId, AppSessionSubmission, AppSessionTimerExpiry, WorkerSessionRuntime,
+    AppSessionCompletion, AppSessionId, AppSessionSubmission, AppSessionTimerExpiry,
+    AppSessionTimerToken, WorkerSessionRuntime,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -752,8 +757,37 @@ impl<'a> SessionProtocolContext<'a> {
     }
 
     #[inline]
-    pub fn runtime(&mut self) -> &mut WorkerSessionRuntime {
-        self.runtime
+    pub fn attach_app_backend(
+        &mut self,
+        session_id: AppSessionId,
+        backend: hammer_runtime::app::AppBackend,
+    ) -> CoreResult<()> {
+        self.runtime.attach_app_backend(session_id, backend)
+    }
+
+    #[inline]
+    pub fn mark_ready(&mut self, session_id: AppSessionId) {
+        self.runtime.mark_ready(session_id);
+    }
+
+    #[inline]
+    pub fn arm_timer_ticks(
+        &mut self,
+        session_id: AppSessionId,
+        token: AppSessionTimerToken,
+        ticks: u64,
+    ) -> CoreResult<()> {
+        self.runtime.arm_timer_ticks(session_id, token, ticks)
+    }
+
+    #[inline]
+    pub fn cancel_timer(&mut self, session_id: AppSessionId, token: AppSessionTimerToken) -> bool {
+        self.runtime.cancel_timer(session_id, token)
+    }
+
+    #[inline]
+    pub fn complete(&mut self, completion: AppSessionCompletion) -> CoreResult<()> {
+        self.runtime.complete(completion)
     }
 }
 
@@ -969,7 +1003,7 @@ impl WorkerSessionRuntime {
     }
 
     #[inline]
-    pub fn take_ready_sessions(&mut self) -> std::vec::Vec<AppSessionId> {
+    pub fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<AppSessionId> {
         self.ready.take_ready_sessions()
     }
 
@@ -1004,11 +1038,11 @@ impl WorkerSessionRuntime {
         Ok(expired)
     }
 
-    pub fn take_submissions(&mut self) -> std::vec::Vec<AppSessionSubmission> {
+    pub fn take_submissions(&mut self) -> hammer_infra::vec::Vec<AppSessionSubmission> {
         self.pending_submissions.drain(..).collect()
     }
 
-    pub fn take_timer_expiries(&mut self) -> std::vec::Vec<AppSessionTimerExpiry> {
+    pub fn take_timer_expiries(&mut self) -> hammer_infra::vec::Vec<AppSessionTimerExpiry> {
         self.pending_timer_expiries.drain(..).collect()
     }
 
@@ -1133,7 +1167,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::session::SessionQueueRuntime;
+use crate::session::worker::SessionQueueRuntime;
 
 #[derive(Clone, Debug)]
 pub struct SessionQueueNode {
@@ -1551,7 +1585,7 @@ Expected: one test commit.
 
 **Files:**
 - Create: `crates/hammer-service/tests/session_queue_node.rs`
-- Modify: `crates/hammer-service/src/session/protocol.rs`
+- Modify: `crates/hammer-service/src/session/protocol/mod.rs`
 - Modify: `crates/hammer-service/src/session/worker.rs`
 - Modify: `crates/hammer-service/src/session/node.rs`
 
@@ -1595,7 +1629,7 @@ impl SessionProtocolOps for RecordingProtocol {
     ) -> CoreResult<()> {
         let session_id = submission.session_id();
         self.state.borrow_mut().submissions.push(session_id);
-        context.runtime().mark_ready(session_id);
+        context.mark_ready(session_id);
         Ok(())
     }
 
@@ -1746,8 +1780,9 @@ Expected: one commit containing protocol registry dispatch and node tests.
 ### Task 4: Move TCP Session Runtime Behind Protocol Ops
 
 **Files:**
-- Move: `crates/hammer-service/src/transport/tcp/session.rs` -> `crates/hammer-service/src/transport/tcp/session_protocol.rs`
-- Modify: `crates/hammer-service/src/transport/tcp/session_protocol.rs`
+- Move: `crates/hammer-service/src/transport/tcp/session.rs` -> `crates/hammer-service/src/session/protocol/tcp.rs`
+- Modify: `crates/hammer-service/src/session/protocol/tcp.rs`
+- Modify: `crates/hammer-service/src/session/protocol/mod.rs`
 - Modify: `crates/hammer-service/src/transport/tcp/mod.rs`
 - Create: `crates/hammer-service/tests/tcp_session_protocol.rs`
 
@@ -1756,14 +1791,14 @@ Expected: one commit containing protocol registry dispatch and node tests.
 Run:
 
 ```bash
-git mv crates/hammer-service/src/transport/tcp/session.rs crates/hammer-service/src/transport/tcp/session_protocol.rs
+git mv crates/hammer-service/src/transport/tcp/session.rs crates/hammer-service/src/session/protocol/tcp.rs
 ```
 
 Expected: git records a rename.
 
 - [ ] **Step 2: Replace TCP public app wrappers with protocol-private pending work**
 
-In `crates/hammer-service/src/transport/tcp/session_protocol.rs`:
+In `crates/hammer-service/src/session/protocol/tcp.rs`:
 
 1. Remove imports for `BufferFrame`, `DataPlaneRuntime`, `DriverNode`, `Node`, `NodeProcessFn`, `NodeRegistration`, `NodeResult`, and `NodeRuntimeData`.
 2. Remove `TcpSessionNode`, `register_tcp_session_runtime`, `with_tcp_session_runtime`, and `tcp_session_process`.
@@ -1885,7 +1920,7 @@ pub fn output_pacing_timer_token() -> crate::session::AppSessionTimerToken {
 
 pub fn take_pending_app_submissions_for_test(
     &mut self,
-) -> std::vec::Vec<(TcpConnectionId, hammer_runtime::app::AppUserData)> {
+) -> hammer_infra::vec::Vec<(TcpConnectionId, hammer_runtime::app::AppUserData)> {
     self.pending_app_submissions
         .drain(..)
         .map(|submission| match submission {
@@ -1911,7 +1946,7 @@ pub fn take_pending_app_submissions_for_test(
 
 pub fn take_pending_timers_for_test(
     &mut self,
-) -> std::vec::Vec<(TcpConnectionId, crate::session::AppSessionTimerToken)> {
+) -> hammer_infra::vec::Vec<(TcpConnectionId, crate::session::AppSessionTimerToken)> {
     self.pending_timers
         .drain(..)
         .map(|(connection_id, kind)| (connection_id, kind.token()))
@@ -1921,7 +1956,7 @@ pub fn take_pending_timers_for_test(
 
 - [ ] **Step 4: Implement `SessionProtocolOps` for TCP**
 
-Add this impl in `crates/hammer-service/src/transport/tcp/session_protocol.rs`:
+Add this impl in `crates/hammer-service/src/session/protocol/tcp.rs`:
 
 ```rust
 impl crate::session::SessionProtocolOps for TcpSessionProtocol {
@@ -1967,7 +2002,7 @@ impl crate::session::SessionProtocolOps for TcpSessionProtocol {
         }
 
         self.mark_connection_ready(connection_id);
-        context.runtime().mark_ready(session_id);
+        context.mark_ready(session_id);
         Ok(())
     }
 
@@ -1985,7 +2020,7 @@ impl crate::session::SessionProtocolOps for TcpSessionProtocol {
         let kind = TcpSessionTimerKind::from_token(expiry.token())?;
         self.pending_timers.push((connection_id, kind));
         self.mark_connection_ready(connection_id);
-        context.runtime().mark_ready(expiry.session_id());
+        context.mark_ready(expiry.session_id());
         Ok(())
     }
 
@@ -2006,25 +2041,18 @@ impl crate::session::SessionProtocolOps for TcpSessionProtocol {
 }
 ```
 
-- [ ] **Step 5: Update TCP module exports**
+- [ ] **Step 5: Update session and TCP module exports**
 
-In `crates/hammer-service/src/transport/tcp/mod.rs`:
-
-Replace:
+In `crates/hammer-service/src/session/protocol/mod.rs`, add:
 
 ```rust
-pub mod session;
+pub mod tcp;
 ```
 
-with:
+In `crates/hammer-service/src/transport/tcp/mod.rs`, remove:
 
 ```rust
 pub mod session_protocol;
-```
-
-Replace the `pub use session::{ ... }` block with:
-
-```rust
 pub use session_protocol::TcpSessionProtocol;
 ```
 
@@ -2038,11 +2066,12 @@ use std::net::SocketAddr;
 use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
 use hammer_runtime::app::{AppObjectRef, AppOpcode, AppSqeData, AppSqeDescriptor, AppUserData};
+use hammer_service::session::protocol::tcp::TcpSessionProtocol;
 use hammer_service::session::{
     AppSessionClose, AppSessionId, AppSessionSubmission, AppSessionTimerExpiry,
     SessionProtocolContext, SessionProtocolOps, WorkerSessionRuntime,
 };
-use hammer_service::transport::tcp::{TcpDataPlaneConnection, TcpLookupId, TcpSessionProtocol};
+use hammer_service::transport::tcp::{TcpDataPlaneConnection, TcpLookupId};
 
 fn connection(
     lookup_id: TcpLookupId,
@@ -2169,7 +2198,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add crates/hammer-service/src/transport/tcp crates/hammer-service/tests/tcp_session_protocol.rs
+git add crates/hammer-service/src/session/protocol crates/hammer-service/src/transport/tcp crates/hammer-service/tests/tcp_session_protocol.rs
 git commit -m "hammer-service(Refactor): move tcp session behind l5 protocol ops"
 ```
 
@@ -2224,7 +2253,7 @@ Expected: one commit deleting `tcp_session_node.rs` and keeping replacement cove
 
 **Files:**
 - Modify: `crates/hammer-service/src/transport/tcp/mod.rs`
-- Modify: `crates/hammer-service/src/transport/tcp/session_protocol.rs`
+- Modify: `crates/hammer-service/src/session/protocol/tcp.rs`
 - Search: `crates/hammer-service/src`
 - Search: `crates/hammer-service/tests`
 
@@ -2238,15 +2267,15 @@ rg -n "TcpSessionNode|TcpSessionRuntime|TcpSessionStep|TcpAppCommand|TcpAppSend|
 
 Expected: no matches.
 
-- [ ] **Step 2: Verify L5 session API does not depend on TCP**
+- [ ] **Step 2: Verify generic L5 session API does not depend on TCP**
 
 Run:
 
 ```bash
-rg -n "tcp|Tcp|quic|Quic" crates/hammer-service/src/session
+rg -n "tcp|Tcp|quic|Quic" crates/hammer-service/src/session -g '!protocol/tcp.rs'
 ```
 
-Expected: no matches except `AppTcpShutdown` imports in `session/app.rs`. The `AppTcpShutdown` match is allowed because it is the existing app ring shutdown type; do not introduce new TCP names in L5.
+Expected: no matches except `AppTcpShutdown` imports in `session/app.rs`. `session/protocol/tcp.rs` is the TCP-specific protocol glue and is intentionally excluded from this generic API scan.
 
 - [ ] **Step 3: Verify old plan is no longer the execution target**
 
@@ -2327,7 +2356,7 @@ Run:
 
 ```bash
 rg -n "TcpSessionNode|TcpSessionRuntime|TcpSessionStep|TcpAppCommand|TcpAppSend|TcpAppRecv|TcpAppClose|TcpAppShutdownCommand|pub enum TcpSessionTimerKind|pub use session::" crates/hammer-service/src crates/hammer-service/tests
-rg -n "pub mod session;|SessionQueueNode|SessionProtocolOps|SessionQueueRuntime" crates/hammer-service/src/lib.rs crates/hammer-service/src/session crates/hammer-service/tests
+rg -n "pub mod session;|SessionQueueNode|SessionProtocolOps|pub\\(crate\\) struct SessionQueueRuntime" crates/hammer-service/src/lib.rs crates/hammer-service/src/session crates/hammer-service/tests
 ```
 
 Expected:
@@ -2351,13 +2380,13 @@ Expected: if there are staged source/test changes after verification, one final 
 
 ## Acceptance Checklist
 
-- [ ] `crates/hammer-service/src/session/` exists and does not depend on `transport::tcp`.
-- [ ] Public L5 API exports `SessionQueueNode`, `SessionQueueRuntime`, `WorkerSessionRuntime`, `SessionProtocolOps`, `AppSessionSubmission`, `AppSessionCompletion`, `AppSessionTimerToken`, and `AppSessionTimerExpiry`.
+- [ ] `crates/hammer-service/src/session/` exists and the generic L5 session API does not depend on `transport::tcp`; TCP-specific glue is under `session/protocol/tcp.rs`.
+- [ ] Public L5 API exports `SessionQueueNode`, `WorkerSessionRuntime`, `SessionProtocolOps`, `SessionProtocolContext`, `AppSessionSubmission`, `AppSessionCompletion`, `AppSessionTimerToken`, and `AppSessionTimerExpiry`; `SessionQueueRuntime` and `SessionQueueStep` remain crate-private node runtime details.
 - [ ] L5 protocol registry allocates `SessionProtocolId`; it does not expose `Tcp` or `Quic` enum variants.
 - [ ] `SessionQueueNode` registers as `NodeRegistration::next("session-queue", 0)` and runs as an empty-frame DriverNode.
 - [ ] TCP registers through `TcpSessionProtocol: SessionProtocolOps`.
 - [ ] `transport::tcp` no longer re-exports public TCP app session wrappers or a TCP session node.
-- [ ] TCP timer kind is private to `session_protocol.rs`; public callers use `AppSessionTimerToken`.
+- [ ] TCP timer kind is private to `session/protocol/tcp.rs`; public callers use `AppSessionTimerToken`.
 - [ ] `cargo test -p hammer-service --test session_runtime` passes.
 - [ ] `cargo test -p hammer-service --test session_queue_node` passes.
 - [ ] `cargo test -p hammer-service --test tcp_session_protocol` passes.

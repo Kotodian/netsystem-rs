@@ -91,7 +91,9 @@ crates/hammer-service/src/session/
   mod.rs
   app.rs
   node.rs
-  protocol.rs
+  protocol/
+    mod.rs
+    tcp.rs
   ready.rs
   timer.rs
   worker.rs
@@ -116,10 +118,14 @@ crates/hammer-service/src/session/
   - 作为独立 input/DriverNode 通过 empty frame poll；
   - process 时 drain L5 runtime，并按 session protocol 调用 `SessionProtocolOps`。
 
-- `protocol.rs`
+- `protocol/mod.rs`
   - 定义 `SessionProtocolId`, `SessionProtocolOps`, `SessionProtocolRegistry`；
   - 协议实现注册 callbacks，不让 L5 依赖 TCP/QUIC 类型；
   - 记录 protocol-private next/output scheduling 入口。
+
+- `protocol/tcp.rs`
+  - 实现 TCP-specific `TcpSessionProtocol: SessionProtocolOps`；
+  - 保持 TCP session state protocol-private，不放在 `transport/tcp`。
 
 - `ready.rs`
   - worker-local ready session queue；
@@ -202,7 +208,7 @@ pub struct SessionQueueNode {
     worker: DataWorkerId,
 }
 
-pub struct SessionQueueRuntime {
+pub(crate) struct SessionQueueRuntime {
     sessions: WorkerSessionRuntime,
     protocols: SessionProtocolRegistry,
 }
@@ -256,7 +262,7 @@ Timer token 只作为协议私有值保存。TCP 可以把 token 编码为 retra
 TCP 通过 `SessionProtocolOps` 注册到 L5 session registry，而不是暴露 `TcpSessionNode` 或 `TcpAppCommand*`：
 
 ```text
-TcpSessionProtocol
+session::protocol::tcp::TcpSessionProtocol
   - connections: TcpConnectionTable
   - app_session_to_connection: FlatHashTable<u64, TcpConnectionId>
   - connection_to_app_session: FlatHashTable<u64, AppSessionId>
@@ -264,7 +270,9 @@ TcpSessionProtocol
   - tcp_private_output_next
 ```
 
-TCP 侧只保留 protocol-private 的实现细节：
+TCP session glue lives under `crates/hammer-service/src/session/protocol/tcp.rs`;
+`transport/tcp` keeps TCP dataplane connection, lookup, and packet-processing types
+only. TCP session state stays protocol-private:
 
 - `AppSessionId` 与 `TcpConnectionId` 的映射；
 - TCP connection table；
@@ -410,14 +418,14 @@ git diff --check
 2. 给公共层引入 `AppSessionId` 和 token 化 timer，不带 TCP 命名。
 3. 新增 `SessionQueueNode`，作为独立 empty-frame DriverNode。
 4. 新增 `SessionProtocolOps` registry。
-5. 将 TCP session runtime 改成 TCP protocol ops 注册到 `SessionQueueNode`，不要保留 `TcpAppCommand*` public API。
+5. 将 TCP session runtime 改成 `session/protocol/tcp.rs` 里的 TCP protocol ops 注册到 `SessionQueueNode`，不要保留 `TcpAppCommand*` public API。
 6. 跑 L5 session tests 和 TCP session tests，保证行为不变。
 7. 后续实现 TCP progression 时，TCP 只通过 protocol ops 消费 L5 submissions、timer expiries 和 ready ids，不再把 app ring polling 留在 TCP 文件里。
 
 ## 15. Acceptance Criteria
 
-1. `crates/hammer-service/src/session/` 存在，并且不依赖 `transport::tcp`。
-2. L5 session public API 暴露 `SessionQueueNode` 和 protocol registration，但不暴露 TCP/QUIC 协议类型。
+1. `crates/hammer-service/src/session/` 存在，generic L5 session API 不依赖 `transport::tcp`。
+2. L5 session public API 暴露 `SessionQueueNode` 和 protocol registration；TCP-specific glue 只在 `session::protocol::tcp` 下暴露。
 3. `SessionQueueNode` 是独立 empty-frame DriverNode，对标 VPP `session-queue` input node。
 4. TCP 通过 `SessionProtocolOps` 接入，而不是通过 public `TcpSessionNode` 或 `TcpAppCommand*`。
 5. `transport::tcp` 不 re-export `TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 这类 app session wrapper。

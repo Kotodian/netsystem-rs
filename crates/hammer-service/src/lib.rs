@@ -11,6 +11,7 @@ pub mod net;
 mod probe;
 pub mod route;
 mod service;
+pub mod session;
 mod trace;
 pub mod transport;
 pub mod tun;
