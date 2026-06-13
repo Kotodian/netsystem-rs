@@ -22,17 +22,11 @@ const ASYNC_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Default)]
 struct MockControlBackend {
     next_socket: AtomicU64,
-    next_flow: AtomicU64,
-    tcp_connects: Mutex<Vec<(SocketAddr, usize, u64)>>,
 }
 
 impl MockControlBackend {
     fn alloc_socket(&self) -> AppSocketId {
         AppSocketId::new(self.next_socket.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-
-    fn alloc_flow(&self) -> AppFlowId {
-        AppFlowId::new(self.next_flow.fetch_add(1, Ordering::Relaxed) + 1)
     }
 }
 
@@ -55,32 +49,10 @@ impl AppControlBackend for MockControlBackend {
         Ok(self.alloc_socket())
     }
 
-    fn connect_tcp_stream(
-        &self,
-        _app: &AppContext,
-        peer: SocketAddr,
-        owner_worker: usize,
-    ) -> hammer_core::error::HammerResult<AppFlowId> {
-        let flow = self.alloc_flow();
-        self.tcp_connects
-            .lock()
-            .expect("tcp connects poisoned")
-            .push((peer, owner_worker, flow.value()));
-        Ok(flow)
-    }
-
     fn close_socket(
         &self,
         _app: &AppContext,
         _socket: AppSocketId,
-    ) -> hammer_core::error::HammerResult<()> {
-        Ok(())
-    }
-
-    fn close_tcp_flow(
-        &self,
-        _app: &AppContext,
-        _flow: AppFlowId,
     ) -> hammer_core::error::HammerResult<()> {
         Ok(())
     }
@@ -144,209 +116,8 @@ fn app_ring_handle_batches_submissions_and_completions() {
 }
 
 #[test]
-fn app_context_connect_tcp_stream_registers_owner_via_control_backend() {
-    let data_runtime =
-        DataRuntime::new(2, "app-connect-control-test", 512 * 1024, 2).expect("data runtime");
-    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
-    let control_backend = Arc::new(MockControlBackend::default());
-    let control: Arc<dyn AppControlBackend> = control_backend.clone();
-    app.install_control(AppControl::new(control))
-        .expect("install control");
-
-    let peer: SocketAddr = "198.51.100.42:443".parse().expect("tcp peer");
-    let flow = app.connect_tcp_stream(peer, 1).expect("connect tcp stream");
-
-    assert_eq!(app.owner_worker_for_flow(flow).expect("flow owner"), 1);
-    let connects = control_backend
-        .tcp_connects
-        .lock()
-        .expect("tcp connects poisoned");
-    assert_eq!(connects.as_slice(), &[(peer, 1, flow.value())]);
-
-    data_runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-#[test]
-fn app_runtime_shutdown_enqueues_flow_owned_tcp_shutdown_request() {
-    let data_runtime =
-        DataRuntime::new(1, "app-runtime-shutdown-test", 512 * 1024, 2).expect("data runtime");
-    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
-    let control_backend = Arc::new(MockControlBackend::default());
-    let control: Arc<dyn AppControlBackend> = control_backend.clone();
-    app.install_control(AppControl::new(control))
-        .expect("install control");
-    let peer: SocketAddr = "198.51.100.43:443".parse().expect("tcp peer");
-    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
-
-    let shutdown = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("driver runtime")
-        .block_on(async {
-            app.spawn_on_flow(flow, move |worker| async move {
-                let app_runtime = worker.runtime();
-
-                app_runtime
-                    .shutdown(Shutdown::Write)
-                    .await
-                    .expect("enqueue shutdown");
-
-                worker
-                    .backend()
-                    .next_tcp_shutdown()
-                    .await
-                    .expect("shutdown request")
-            })
-            .await
-            .expect("spawn flow task")
-        });
-
-    assert_eq!(shutdown.flow(), flow);
-    assert_eq!(shutdown.how(), Shutdown::Write);
-
-    data_runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-#[test]
-fn app_runtime_shutdown_preserves_read_write_and_both_directions() {
-    let data_runtime = DataRuntime::new(1, "app-runtime-shutdown-directions-test", 512 * 1024, 2)
-        .expect("data runtime");
-    let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
-    let control_backend = Arc::new(MockControlBackend::default());
-    let control: Arc<dyn AppControlBackend> = control_backend.clone();
-    app.install_control(AppControl::new(control))
-        .expect("install control");
-    let peer: SocketAddr = "198.51.100.44:443".parse().expect("tcp peer");
-    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
-
-    let shutdowns = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("driver runtime")
-        .block_on(async {
-            app.spawn_on_flow(flow, move |worker| async move {
-                let app_runtime = worker.runtime();
-
-                app_runtime
-                    .shutdown(Shutdown::Read)
-                    .await
-                    .expect("enqueue read shutdown");
-                app_runtime
-                    .shutdown(Shutdown::Write)
-                    .await
-                    .expect("enqueue write shutdown");
-                app_runtime
-                    .shutdown(Shutdown::Both)
-                    .await
-                    .expect("enqueue both shutdown");
-
-                let backend = worker.backend();
-                [
-                    backend
-                        .next_tcp_shutdown()
-                        .await
-                        .expect("read shutdown request"),
-                    backend
-                        .next_tcp_shutdown()
-                        .await
-                        .expect("write shutdown request"),
-                    backend
-                        .next_tcp_shutdown()
-                        .await
-                        .expect("both shutdown request"),
-                ]
-            })
-            .await
-            .expect("spawn flow task")
-        });
-
-    assert_eq!(
-        shutdowns.map(|shutdown| (shutdown.flow().value(), shutdown.how())),
-        [
-            (flow.value(), Shutdown::Read),
-            (flow.value(), Shutdown::Write),
-            (flow.value(), Shutdown::Both),
-        ]
-    );
-
-    data_runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-#[test]
-fn app_runtime_send_remains_observable_before_shutdown_request() {
-    let data_runtime =
-        DataRuntime::new(1, "app-runtime-send-shutdown-test", 512 * 1024, 2).expect("data runtime");
-    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
-    let control_backend = Arc::new(MockControlBackend::default());
-    let control: Arc<dyn AppControlBackend> = control_backend.clone();
-    app.install_control(AppControl::new(control))
-        .expect("install control");
-    let peer: SocketAddr = "198.51.100.45:443".parse().expect("tcp peer");
-    let flow = app.connect_tcp_stream(peer, 0).expect("connect tcp stream");
-
-    let result = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("driver runtime")
-        .block_on(async {
-            app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
-                let app_runtime = worker.runtime();
-                let runtime = with_data_plane_buffers(Clone::clone);
-                let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"send-before-shutdown")
-                    .expect("alloc send buffer");
-                let expected_ptr = runtime.current_ptr(index).expect("send pointer") as usize;
-
-                app_runtime
-                    .send(AppSend::new(AppBufferLease::from_buffer(runtime, index)))
-                    .await
-                    .expect("enqueue send");
-                app_runtime
-                    .shutdown(Shutdown::Write)
-                    .await
-                    .expect("enqueue shutdown");
-
-                let entry = backend
-                    .next_submission_entry()
-                    .await
-                    .expect("send submission entry");
-                let descriptor = *entry.descriptor();
-                let (send_ptr, send_payload) = {
-                    let attachment = entry.attachment().expect("send attachment");
-                    let send_ptr =
-                        attachment.lease().current_ptr().expect("attachment ptr") as usize;
-                    let send_payload = attachment
-                        .lease()
-                        .copy_current()
-                        .expect("attachment payload");
-                    (send_ptr, send_payload)
-                };
-                let shutdown = backend.next_tcp_shutdown().await.expect("shutdown request");
-
-                (descriptor, expected_ptr, send_ptr, send_payload, shutdown)
-            })
-            .await
-            .expect("spawn flow task")
-        });
-
-    assert_eq!(result.0.opcode(), AppOpcode::Send);
-    assert_eq!(result.0.object(), AppObjectRef::Flow(flow));
-    match result.0.payload() {
-        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
-        other => panic!("unexpected sqe data: {other:?}"),
-    }
-    assert_eq!(result.1, result.2);
-    assert_eq!(result.3, b"send-before-shutdown");
-    assert_eq!(result.4.flow(), flow);
-    assert_eq!(result.4.how(), Shutdown::Write);
-
-    data_runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-#[test]
-fn app_backend_try_pop_submission_entry_without_awaiting() {
-    let data_runtime = DataRuntime::new(1, "app-backend-sync-entry-pop-test", 512 * 1024, 2)
+fn app_runtime_try_pop_submission_entry_without_awaiting() {
+    let data_runtime = DataRuntime::new(1, "app-runtime-sync-entry-pop-test", 512 * 1024, 2)
         .expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let flow = AppFlowId::new(101);
@@ -357,7 +128,6 @@ fn app_backend_try_pop_submission_entry_without_awaiting() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let runtime = worker.runtime();
                 let buffers = with_data_plane_buffers(Clone::clone);
                 let index = buffers
@@ -381,10 +151,10 @@ fn app_backend_try_pop_submission_entry_without_awaiting() {
                     ))
                     .expect("push submission entry");
 
-                let entry = backend
+                let entry = runtime
                     .try_pop_submission_entry()
                     .expect("pop submission entry");
-                assert!(backend.try_pop_submission_entry().is_none());
+                assert!(runtime.try_pop_submission_entry().is_none());
                 let (descriptor_round_trip, registered) = entry.into_parts();
                 let (_buffer_index, lease) = registered
                     .expect("submission entry attachment")
@@ -405,8 +175,8 @@ fn app_backend_try_pop_submission_entry_without_awaiting() {
 }
 
 #[test]
-fn app_backend_try_pop_tcp_shutdown_without_awaiting() {
-    let data_runtime = DataRuntime::new(1, "app-backend-sync-shutdown-pop-test", 512 * 1024, 2)
+fn app_runtime_try_pop_tcp_shutdown_without_awaiting() {
+    let data_runtime = DataRuntime::new(1, "app-runtime-sync-shutdown-pop-test", 512 * 1024, 2)
         .expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let flow = AppFlowId::new(102);
@@ -417,15 +187,14 @@ fn app_backend_try_pop_tcp_shutdown_without_awaiting() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
-                worker
-                    .runtime()
+                let runtime = worker.runtime();
+                runtime
                     .shutdown(Shutdown::Write)
                     .await
                     .expect("submit shutdown");
 
-                let shutdown = backend.try_pop_tcp_shutdown().expect("pop tcp shutdown");
-                assert!(backend.try_pop_tcp_shutdown().is_none());
+                let shutdown = runtime.try_pop_tcp_shutdown().expect("pop tcp shutdown");
+                assert!(runtime.try_pop_tcp_shutdown().is_none());
                 shutdown
             })
             .await
@@ -486,19 +255,18 @@ fn app_runtime_send_enqueues_flow_owned_send_sqe_descriptor() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(AppFlowId::new(61), move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let recv_future = app_runtime.recv();
-                let recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 let index = runtime
                     .alloc_index_with_bytes(Default::default(), b"runtime-send-sqe")
                     .expect("alloc app send buffer");
 
-                backend
+                app_runtime
                     .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
                     .expect("complete recv cqe");
@@ -508,8 +276,8 @@ fn app_runtime_send_enqueues_flow_owned_send_sqe_descriptor() {
 
                 (
                     recv_sqe,
-                    backend
-                        .next_sqe()
+                    app_runtime
+                        .next_send()
                         .await
                         .expect("send sqe")
                         .descriptor()
@@ -552,11 +320,10 @@ fn app_context_try_complete_recv_buffer_enqueues_flow_owned_cqe() {
         .block_on(async {
             let app_for_worker = app.clone();
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
@@ -673,17 +440,16 @@ fn app_context_try_complete_recv_from_buffer_enqueues_socket_owned_cqe() {
         .expect("bind udp socket");
     let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 40007);
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    data_runtime
-        .context()
-        .spawn_local_on_worker(0, {
-            let app = app.clone();
-            move || async move {
-                let backend = app
-                    .local_backend_for_socket(socket)
-                    .expect("socket backend");
-                backend
-                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let app_for_worker = app.clone();
+            app.spawn_on_socket(socket, move |worker| async move {
+                let app_runtime = worker.runtime();
+                app_runtime
+                    .try_push_submission_descriptor(AppSqeDescriptor::new(
                         AppOpcode::RecvFrom,
                         AppUserData::new(17),
                         AppObjectRef::Socket(socket),
@@ -704,14 +470,15 @@ fn app_context_try_complete_recv_from_buffer_enqueues_socket_owned_cqe() {
                     .expect("alloc recv_from buffer");
                 let expected_ptr = runtime.current_ptr(index).expect("buffer pointer") as usize;
 
-                app.try_complete_recv_from_buffer(socket, source, runtime.clone(), index, false)
+                app_for_worker
+                    .try_complete_recv_from_buffer(socket, source, runtime.clone(), index, false)
                     .expect("enqueue recv_from cqe");
 
-                let descriptor = backend
-                    .next_cqe_descriptor()
+                let descriptor = app_runtime
+                    .next_completion_descriptor()
                     .await
                     .expect("recv_from cqe descriptor");
-                let recv = backend
+                let recv = app_runtime
                     .take_completion_buffer(match descriptor.payload() {
                         AppCqeData::RecvFrom { buffer, .. } => buffer,
                         other => panic!("unexpected cqe payload: {other:?}"),
@@ -722,22 +489,18 @@ fn app_context_try_complete_recv_from_buffer_enqueues_socket_owned_cqe() {
                 recv.release();
                 let after_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
 
-                tx.send((
+                (
                     descriptor,
                     expected_ptr,
                     recv_ptr,
                     recv_payload,
                     before_in_use,
                     after_in_use,
-                ))
-                .expect("send recv_from result");
-            }
-        })
-        .expect("spawn recv_from worker");
-
-    let result = rx
-        .recv_timeout(ASYNC_TEST_TIMEOUT)
-        .expect("receive recv_from result");
+                )
+            })
+            .await
+            .expect("spawn socket task")
+        });
 
     assert_eq!(result.0.user_data(), AppUserData::new(17));
     assert_eq!(result.0.object(), AppObjectRef::Socket(socket));
@@ -774,17 +537,16 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe() {
         .expect("bind tcp listener");
     let accepted_flow = AppFlowId::new(0x7001);
 
-    let (tx, rx) = std::sync::mpsc::channel();
-    data_runtime
-        .context()
-        .spawn_local_on_worker(0, {
-            let app = app.clone();
-            move || async move {
-                let backend = app
-                    .local_backend_for_socket(listener)
-                    .expect("listener backend");
-                backend
-                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
+    let result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let app_for_worker = app.clone();
+            app.spawn_on_socket(listener, move |worker| async move {
+                let app_runtime = worker.runtime();
+                app_runtime
+                    .try_push_submission_descriptor(AppSqeDescriptor::new(
                         AppOpcode::Accept,
                         AppUserData::new(23),
                         AppObjectRef::Socket(listener),
@@ -792,25 +554,23 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe() {
                     ))
                     .expect("push accept sqe");
 
-                app.try_complete_accept(listener, accepted_flow)
+                app_for_worker
+                    .try_complete_accept(listener, accepted_flow)
                     .expect("enqueue accept cqe");
 
-                tx.send((
-                    backend
-                        .next_cqe_descriptor()
+                (
+                    app_runtime
+                        .next_completion_descriptor()
                         .await
                         .expect("accept cqe descriptor"),
-                    app.owner_worker_for_flow(accepted_flow)
+                    app_for_worker
+                        .owner_worker_for_flow(accepted_flow)
                         .expect("accepted flow owner"),
-                ))
-                .expect("send accept result");
-            }
-        })
-        .expect("spawn accept worker");
-
-    let result = rx
-        .recv_timeout(ASYNC_TEST_TIMEOUT)
-        .expect("receive accept result");
+                )
+            })
+            .await
+            .expect("spawn listener task")
+        });
 
     assert_eq!(result.0.user_data(), AppUserData::new(23));
     assert_eq!(result.0.object(), AppObjectRef::Socket(listener));
@@ -848,26 +608,28 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe_from_non_worker_t
         .spawn_local_on_worker(0, {
             let app = app.clone();
             move || async move {
-                let backend = app
-                    .local_backend_for_socket(listener)
-                    .expect("listener backend");
-                backend
-                    .try_push_sqe_descriptor(AppSqeDescriptor::new(
-                        AppOpcode::Accept,
-                        AppUserData::new(24),
-                        AppObjectRef::Socket(listener),
-                        AppSqeData::Accept,
-                    ))
-                    .expect("push accept sqe");
-                ready_tx.send(()).expect("signal ready");
-                result_tx
-                    .send(
-                        backend
-                            .next_cqe_descriptor()
-                            .await
-                            .expect("accept cqe descriptor"),
-                    )
-                    .expect("send accept cqe");
+                app.spawn_on_socket(listener, move |worker| async move {
+                    let app_runtime = worker.runtime();
+                    app_runtime
+                        .try_push_submission_descriptor(AppSqeDescriptor::new(
+                            AppOpcode::Accept,
+                            AppUserData::new(24),
+                            AppObjectRef::Socket(listener),
+                            AppSqeData::Accept,
+                        ))
+                        .expect("push accept sqe");
+                    ready_tx.send(()).expect("signal ready");
+                    result_tx
+                        .send(
+                            app_runtime
+                                .next_completion_descriptor()
+                                .await
+                                .expect("accept cqe descriptor"),
+                        )
+                        .expect("send accept cqe");
+                })
+                .await
+                .expect("spawn listener task");
             }
         })
         .expect("spawn accept worker");
@@ -904,7 +666,7 @@ fn app_context_try_complete_accept_enqueues_listener_owned_cqe_from_non_worker_t
 }
 
 #[test]
-fn app_backend_and_runtime_share_one_ring_handle_for_sq_and_cq() {
+fn app_runtime_reuses_one_ring_handle_for_sq_and_cq() {
     let data_runtime =
         DataRuntime::new(1, "app-shared-ring-handle-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
@@ -917,11 +679,9 @@ fn app_backend_and_runtime_share_one_ring_handle_for_sq_and_cq() {
         .block_on(async {
             let app_for_worker = app.clone();
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
-                let ring = backend.ring_handle();
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = ring
+                let recv_sqe = app_runtime
                     .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
@@ -942,7 +702,7 @@ fn app_backend_and_runtime_share_one_ring_handle_for_sq_and_cq() {
                     .await
                     .expect("enqueue send sqe");
 
-                let sqe = ring.next_submission().await.expect("ring submission");
+                let sqe = app_runtime.next_send().await.expect("ring submission");
                 let descriptor = sqe.descriptor().expect("sqe descriptor");
 
                 (recv_payload, descriptor)
@@ -1223,11 +983,10 @@ fn app_ring_zero_copy_recv_and_stable_flow_owner() {
                     .name()
                     .map(ToOwned::to_owned)
                     .unwrap_or_default();
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
@@ -1237,7 +996,7 @@ fn app_ring_zero_copy_recv_and_stable_flow_owner() {
                     .expect("alloc app recv buffer");
                 let expected_ptr = runtime.current_ptr(index).expect("buffer pointer");
 
-                backend
+                app_runtime
                     .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
                     .expect("complete recv cqe");
@@ -1249,7 +1008,7 @@ fn app_ring_zero_copy_recv_and_stable_flow_owner() {
 
                 app_runtime.send(recv.into_send()).await.expect("send sqe");
 
-                let send = backend.next_send().await.expect("send sqe");
+                let send = app_runtime.next_send().await.expect("send sqe");
                 let send_ptr = send.lease().current_ptr().expect("send lease pointer");
                 let send_payload = send.lease().copy_current().expect("send payload");
                 drop(send);
@@ -1313,11 +1072,10 @@ fn app_recv_drop_releases_buffer_lease() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(AppFlowId::new(19), move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
@@ -1326,7 +1084,7 @@ fn app_recv_drop_releases_buffer_lease() {
                     .alloc_index_with_bytes(Default::default(), b"drop-recv")
                     .expect("alloc app recv buffer");
 
-                backend
+                app_runtime
                     .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
                     .expect("complete recv cqe");
@@ -1351,9 +1109,9 @@ fn app_recv_drop_releases_buffer_lease() {
 }
 
 #[test]
-fn same_flow_reuses_backend_across_spawn_calls() {
+fn same_flow_reuses_runtime_ring_across_spawn_calls() {
     let data_runtime =
-        DataRuntime::new(1, "app-ring-backend-test", 512 * 1024, 2).expect("data runtime");
+        DataRuntime::new(1, "app-ring-runtime-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let flow = AppFlowId::new(29);
 
@@ -1363,19 +1121,18 @@ fn same_flow_reuses_backend_across_spawn_calls() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = backend
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"persisted-backend")
+                    .alloc_index_with_bytes(Default::default(), b"persisted-runtime")
                     .expect("alloc app recv buffer");
 
-                backend
+                app_runtime
                     .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
                     .expect("complete recv cqe");
@@ -1383,14 +1140,13 @@ fn same_flow_reuses_backend_across_spawn_calls() {
                 recv_future.await.expect("recv cqe").release();
             })
             .await
-            .expect("prime flow backend");
+            .expect("prime flow runtime ring");
 
             app.spawn_on_flow(flow, move |worker| async move {
                 let app_runtime = worker.runtime();
                 let recv_future = app_runtime.recv();
-                let recv_sqe = worker
-                    .backend()
-                    .next_sqe_descriptor()
+                let recv_sqe = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("recv sqe descriptor");
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
@@ -1404,15 +1160,15 @@ fn same_flow_reuses_backend_across_spawn_calls() {
                 assert!(still_pending, "recv should wait for a future completion");
             })
             .await
-            .expect("reuse flow backend")
+            .expect("reuse flow runtime ring")
         });
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_backend_round_trips_send_descriptor_without_app_send_wrapper() {
-    let data_runtime = DataRuntime::new(1, "app-backend-send-descriptor-test", 512 * 1024, 2)
+fn app_runtime_round_trips_send_descriptor_without_app_send_wrapper() {
+    let data_runtime = DataRuntime::new(1, "app-runtime-send-descriptor-test", 512 * 1024, 2)
         .expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let flow = AppFlowId::new(93);
@@ -1431,12 +1187,12 @@ fn app_backend_round_trips_send_descriptor_without_app_send_wrapper() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
-                backend
-                    .try_push_sqe_descriptor(descriptor)
+                let runtime = worker.runtime();
+                runtime
+                    .try_push_submission_descriptor(descriptor)
                     .expect("push sqe descriptor");
-                backend
-                    .next_sqe_descriptor()
+                runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("next sqe descriptor")
             })
@@ -1450,8 +1206,8 @@ fn app_backend_round_trips_send_descriptor_without_app_send_wrapper() {
 }
 
 #[test]
-fn app_backend_round_trips_recv_cqe_descriptor_without_app_recv_wrapper() {
-    let data_runtime = DataRuntime::new(1, "app-backend-cqe-descriptor-test", 512 * 1024, 2)
+fn app_runtime_round_trips_recv_cqe_descriptor_without_app_recv_wrapper() {
+    let data_runtime = DataRuntime::new(1, "app-runtime-cqe-descriptor-test", 512 * 1024, 2)
         .expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let flow = AppFlowId::new(95);
@@ -1472,12 +1228,12 @@ fn app_backend_round_trips_recv_cqe_descriptor_without_app_recv_wrapper() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
-                backend
-                    .try_push_cqe_descriptor(descriptor)
+                let runtime = worker.runtime();
+                runtime
+                    .try_push_completion_descriptor(descriptor)
                     .expect("push cqe descriptor");
-                backend
-                    .next_cqe_descriptor()
+                runtime
+                    .next_completion_descriptor()
                     .await
                     .expect("next cqe descriptor")
             })
@@ -1525,28 +1281,27 @@ fn app_runtime_exposes_descriptor_first_submission_and_completion_paths() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let runtime = worker.runtime();
 
                 runtime
                     .try_push_submission_descriptor(pushed_submission)
                     .expect("push runtime submission descriptor");
-                let pushed_round_trip = backend
-                    .next_sqe_descriptor()
+                let pushed_round_trip = runtime
+                    .next_submission_descriptor()
                     .await
-                    .expect("backend next sqe descriptor");
+                    .expect("runtime next sqe descriptor");
 
-                backend
-                    .try_push_sqe_descriptor(queued_submission)
-                    .expect("queue backend submission descriptor");
+                runtime
+                    .try_push_submission_descriptor(queued_submission)
+                    .expect("queue runtime submission descriptor");
                 let queued_submission_round_trip = runtime
                     .next_submission_descriptor()
                     .await
                     .expect("runtime next submission descriptor");
 
-                backend
-                    .try_push_cqe_descriptor(queued_completion)
-                    .expect("queue backend completion descriptor");
+                runtime
+                    .try_push_completion_descriptor(queued_completion)
+                    .expect("queue runtime completion descriptor");
                 let queued_completion_round_trip = runtime
                     .next_completion_descriptor()
                     .await
@@ -1582,7 +1337,6 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
         .expect("driver runtime")
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
-                let backend = worker.backend();
                 let runtime = worker.runtime();
                 let buffers = with_data_plane_buffers(Clone::clone);
                 let index = buffers
@@ -1606,10 +1360,10 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
                     ))
                     .expect("push runtime submission entry");
 
-                let sqe = backend
+                let sqe = runtime
                     .next_submission_entry()
                     .await
-                    .expect("backend next submission entry");
+                    .expect("runtime next submission entry");
                 let (descriptor_round_trip, registered) = sqe.into_parts();
                 let (_handle, lease) = registered.expect("submission attachment").into_parts();
                 let payload = lease.copy_current().expect("send payload");
@@ -1633,7 +1387,7 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
 }
 
 #[test]
-fn non_owner_worker_cannot_access_local_backend_for_foreign_flow() {
+fn non_owner_worker_does_not_own_foreign_flow_runtime() {
     let data_runtime =
         DataRuntime::new(2, "app-ring-owner-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
@@ -1648,23 +1402,16 @@ fn non_owner_worker_cannot_access_local_backend_for_foreign_flow() {
         .block_on(async move {
             let probe = app.clone();
             app.spawn_on_flow(AppFlowId::new(non_owner as u64), move |_| async move {
-                (
-                    probe.current_worker_owns_flow(flow),
-                    probe.local_backend_for_flow(flow).map(|_| ()),
-                )
+                probe.current_worker_owns_flow(flow)
             })
             .await
             .expect("non-owner worker task")
         });
 
-    assert!(!result.0);
-    let err = result
-        .1
-        .expect_err("non-owner worker must reject backend lookup");
-    assert!(err.to_string().contains(&format!(
-        "app flow {} is owned by worker {owner}",
-        flow.value()
-    )));
+    assert!(
+        !result,
+        "worker {non_owner} must not own worker {owner}'s flow"
+    );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

@@ -18,7 +18,6 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
         .block_on(async {
             app.spawn_on_flow(flow, move |worker| async move {
                 let app_runtime = worker.runtime();
-                let backend = worker.backend();
                 let owner_thread = std::thread::current()
                     .name()
                     .map(ToOwned::to_owned)
@@ -30,14 +29,14 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                 let recv_future = app_runtime.recv();
 
                 let runtime = with_data_plane_buffers(Clone::clone);
-                let recv_descriptor = backend
-                    .next_sqe_descriptor()
+                let recv_descriptor = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("collect recv descriptor");
                 let index = runtime
                     .alloc_index_with_bytes(Default::default(), b"echo-from-app")
                     .expect("alloc app echo buffer");
-                backend
+                app_runtime
                     .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
                     .await
                     .expect("complete recv");
@@ -51,8 +50,8 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                     .name()
                     .map(ToOwned::to_owned)
                     .unwrap_or_default();
-                let send_descriptor = backend
-                    .next_sqe_descriptor()
+                let send_descriptor = app_runtime
+                    .next_submission_descriptor()
                     .await
                     .expect("collect echo send descriptor");
 
@@ -115,7 +114,7 @@ fn app_context_send_on_flow_forwards_registered_buffer_across_workers() {
             let (descriptor, payload, target_ptr) = app
                 .spawn_on_flow(target_flow, move |worker| async move {
                     let entry = worker
-                        .backend()
+                        .runtime()
                         .next_submission_entry()
                         .await
                         .expect("target send entry");

@@ -1,8 +1,6 @@
-mod backend;
 mod context;
 mod ring;
 
-pub use backend::{AppBackend, AppBackendRecvQueue, AppBackendSendQueue};
 pub use context::{
     AppContext, AppControl, AppControlBackend, AppFlowId, AppRecvFuture, AppRuntime,
     AppTaskContext, AppWorkerContext, AppWorkerLocalExecutor,

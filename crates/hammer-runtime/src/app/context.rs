@@ -10,11 +10,10 @@ use hammer_infra::descriptor::Descriptor;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
-use crate::app::backend::{AppBackend, AppBackendRecvQueue, AppBackendSendQueue};
 use crate::app::ring::{
-    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv, AppRegisteredBuffer,
-    AppSend, AppSocketId, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppTcpShutdown,
-    AppUserData,
+    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppRecv,
+    AppRegisteredBuffer, AppRingHandle, AppSend, AppSocketId, AppSqe, AppSqeData, AppSqeDescriptor,
+    AppSubmissionEntry, AppTcpShutdown, AppUserData,
 };
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
@@ -180,11 +179,10 @@ impl AppContext {
 
     pub async fn send_on_flow(&self, flow: AppFlowId, send: AppSend) -> HammerResult<()> {
         if self.current_worker_owns_flow(flow) {
-            let backend = self.local_backend_for_flow(flow)?;
+            let ring = self.local_ring_for_flow(flow)?;
             return AppRuntime {
-                flow,
-                recv: backend.recv_queue(),
-                send: backend.send_queue(),
+                object: AppObjectRef::Flow(flow),
+                ring,
             }
             .send(send)
             .await;
@@ -198,7 +196,7 @@ impl AppContext {
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
                 let registered = registered.into_inner();
-                worker_backend(app_context_id, flow, ring_capacity).try_push_submission_entry(
+                worker_flow_ring(app_context_id, flow, ring_capacity).try_push_submission_entry(
                     AppSubmissionEntry::with_attachment(descriptor, registered),
                 )
             })
@@ -248,7 +246,29 @@ impl AppContext {
             .call_local_on_worker(owner_worker, move || async move {
                 let worker = AppWorkerContext {
                     owner_worker,
-                    backend: worker_backend(app_context_id, flow, ring_capacity),
+                    object: AppObjectRef::Flow(flow),
+                    ring: worker_flow_ring(app_context_id, flow, ring_capacity),
+                };
+                f(worker).await
+            })
+            .await
+    }
+
+    pub async fn spawn_on_socket<F, Fut, T>(&self, socket: AppSocketId, f: F) -> HammerResult<T>
+    where
+        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let owner_worker = self.owner_for_socket(socket)?;
+        let app_context_id = self.id;
+        let ring_capacity = self.ring_capacity;
+        self.data_context
+            .call_local_on_worker(owner_worker, move || async move {
+                let worker = AppWorkerContext {
+                    owner_worker,
+                    object: AppObjectRef::Socket(socket),
+                    ring: worker_socket_ring(app_context_id, socket, ring_capacity),
                 };
                 f(worker).await
             })
@@ -281,7 +301,8 @@ impl AppContext {
             .spawn_local_on_worker(owner_worker, move || async move {
                 let worker = AppWorkerContext {
                     owner_worker,
-                    backend: worker_backend(app_context_id, flow, ring_capacity),
+                    object: AppObjectRef::Flow(flow),
+                    ring: worker_flow_ring(app_context_id, flow, ring_capacity),
                 };
                 f(worker).await;
             })
@@ -320,7 +341,7 @@ impl AppContext {
     }
 
     #[inline]
-    pub fn local_backend_for_flow(&self, flow: AppFlowId) -> HammerResult<AppBackend> {
+    fn local_ring_for_flow(&self, flow: AppFlowId) -> HammerResult<AppRingHandle> {
         let owner_worker = self.owner_for(flow)?;
         let current_worker = self.current_worker_index()?;
         if current_worker != owner_worker {
@@ -329,11 +350,11 @@ impl AppContext {
                 flow.value()
             )));
         }
-        Ok(worker_backend(self.id, flow, self.ring_capacity))
+        Ok(worker_flow_ring(self.id, flow, self.ring_capacity))
     }
 
     #[inline]
-    pub fn local_backend_for_socket(&self, socket: AppSocketId) -> HammerResult<AppBackend> {
+    fn local_ring_for_socket(&self, socket: AppSocketId) -> HammerResult<AppRingHandle> {
         let owner_worker = self.owner_for_socket(socket)?;
         let current_worker = self.current_worker_index()?;
         if current_worker != owner_worker {
@@ -342,7 +363,7 @@ impl AppContext {
                 socket.value()
             )));
         }
-        Ok(worker_socket_backend(self.id, socket, self.ring_capacity))
+        Ok(worker_socket_ring(self.id, socket, self.ring_capacity))
     }
 
     #[inline]
@@ -353,10 +374,8 @@ impl AppContext {
         index: BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        let backend = self.local_backend_for_flow(flow)?;
-        backend
-            .ring_handle()
-            .try_complete_recv_buffer(flow, buffers, index, fin)
+        let ring = self.local_ring_for_flow(flow)?;
+        ring.try_complete_recv_buffer(flow, buffers, index, fin)
     }
 
     #[inline]
@@ -368,10 +387,8 @@ impl AppContext {
         index: BufferIndex,
         truncated: bool,
     ) -> HammerResult<()> {
-        let backend = self.local_backend_for_socket(socket)?;
-        backend
-            .ring_handle()
-            .try_complete_recv_from_buffer(socket, source, buffers, index, truncated)
+        let ring = self.local_ring_for_socket(socket)?;
+        ring.try_complete_recv_from_buffer(socket, source, buffers, index, truncated)
     }
 
     #[inline]
@@ -379,15 +396,14 @@ impl AppContext {
         let owner_worker = self.owner_for_socket(listener)?;
         self.register_flow_owner(flow, owner_worker)?;
         if self.current_worker_index().ok() == Some(owner_worker) {
-            let backend = self.local_backend_for_socket(listener)?;
-            return backend.ring_handle().try_complete_accept(listener, flow);
+            let ring = self.local_ring_for_socket(listener)?;
+            return ring.try_complete_accept(listener, flow);
         }
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .call_blocking_on_worker(owner_worker, move || {
-                worker_socket_backend(app_context_id, listener, ring_capacity)
-                    .ring_handle()
+                worker_socket_ring(app_context_id, listener, ring_capacity)
                     .try_complete_accept(listener, flow)
             })
     }
@@ -398,15 +414,15 @@ impl AppContext {
             return Ok(false);
         };
         if self.current_worker_index().ok() == Some(owner_worker) {
-            let backend = self.local_backend_for_flow(flow)?;
-            backend.try_push_cqe(AppCqe::closed(AppUserData::new(0), Some(flow)))?;
+            let ring = self.local_ring_for_flow(flow)?;
+            ring.try_push_completion(AppCqe::closed(AppUserData::new(0), Some(flow)))?;
         } else {
             let app_context_id = self.id;
             let ring_capacity = self.ring_capacity;
             self.data_context
                 .call_blocking_on_worker(owner_worker, move || {
-                    worker_backend(app_context_id, flow, ring_capacity)
-                        .try_push_cqe(AppCqe::closed(AppUserData::new(0), Some(flow)))
+                    worker_flow_ring(app_context_id, flow, ring_capacity)
+                        .try_push_completion(AppCqe::closed(AppUserData::new(0), Some(flow)))
                 })?;
         }
         self.unregister_flow_owner(flow)?;
@@ -526,7 +542,8 @@ impl AppContext {
 #[derive(Clone)]
 pub struct AppWorkerContext {
     owner_worker: usize,
-    backend: AppBackend,
+    object: AppObjectRef,
+    ring: AppRingHandle,
 }
 
 impl AppWorkerContext {
@@ -536,16 +553,10 @@ impl AppWorkerContext {
     }
 
     #[inline]
-    pub fn backend(&self) -> AppBackend {
-        self.backend.clone()
-    }
-
-    #[inline]
     pub fn runtime(&self) -> AppRuntime {
         AppRuntime {
-            flow: self.backend.flow(),
-            recv: self.backend.recv_queue(),
-            send: self.backend.send_queue(),
+            object: self.object,
+            ring: self.ring.clone(),
         }
     }
 
@@ -590,91 +601,143 @@ unsafe impl Send for CrossWorkerAppRegisteredBuffer {}
 
 #[derive(Clone)]
 pub struct AppRuntime {
-    flow: AppFlowId,
-    recv: AppBackendRecvQueue,
-    send: AppBackendSendQueue,
+    object: AppObjectRef,
+    ring: AppRingHandle,
 }
 
 impl AppRuntime {
     #[inline]
     pub fn recv(&self) -> AppRecvFuture {
-        let submit = self
-            .send
-            .ring()
-            .try_push_submission_descriptor(AppSqeDescriptor::new(
-                crate::app::ring::AppOpcode::Recv,
-                AppUserData::new(0),
-                AppObjectRef::Flow(self.flow),
-                AppSqeData::Recv { max_len: u32::MAX },
-            ));
+        let submit = self.flow().and_then(|flow| {
+            self.ring
+                .try_push_submission_descriptor(AppSqeDescriptor::new(
+                    crate::app::ring::AppOpcode::Recv,
+                    AppUserData::new(0),
+                    AppObjectRef::Flow(flow),
+                    AppSqeData::Recv { max_len: u32::MAX },
+                ))
+        });
         AppRecvFuture {
-            ring: self.recv.ring(),
+            ring: self.ring.clone(),
             submit: Some(submit),
         }
     }
 
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        self.send
-            .ring()
-            .try_push_submission_entry(app_send_submission_entry(self.flow, send)?)
+        let flow = self.flow()?;
+        self.ring
+            .try_push_submission_entry(app_send_submission_entry(flow, send)?)
     }
 
     #[inline]
     pub async fn shutdown(&self, how: Shutdown) -> HammerResult<()> {
-        self.send
-            .ring()
-            .try_push_tcp_shutdown(AppTcpShutdown::new(self.flow, how))
+        let flow = self.flow()?;
+        self.ring
+            .try_push_tcp_shutdown(AppTcpShutdown::new(flow, how))
     }
 
     #[inline]
     pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
-        self.send.ring().try_push_submission_descriptor(sqe)
+        self.ring.try_push_submission_descriptor(sqe)
     }
 
     #[inline]
     pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.send.ring().try_push_submission_entry(entry)
+        self.ring.try_push_submission_entry(entry)
     }
 
     #[inline]
     pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.send.ring().next_submission_entry().await
+        self.ring.next_submission_entry().await
+    }
+
+    #[inline]
+    pub fn try_pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.ring.pop_submission_entry()
     }
 
     #[inline]
     pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.send.ring().next_submission_descriptor().await
+        self.ring.next_submission_descriptor().await
+    }
+
+    #[inline]
+    pub fn try_pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.ring.pop_submission_descriptor()
+    }
+
+    #[inline]
+    pub async fn next_send(&self) -> Option<AppSend> {
+        self.ring
+            .next_submission()
+            .await
+            .and_then(AppSqe::into_send)
+    }
+
+    #[inline]
+    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.ring.next_tcp_shutdown().await
+    }
+
+    #[inline]
+    pub fn try_pop_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
+        self.ring.pop_tcp_shutdown()
     }
 
     #[inline]
     pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
-        self.send.ring().take_send_buffer(index)
+        self.ring.take_send_buffer(index)
     }
 
     #[inline]
     pub fn try_push_completion_descriptor(&self, cqe: AppCqeDescriptor) -> HammerResult<()> {
-        self.recv.ring().try_push_completion_descriptor(cqe)
+        self.ring.try_push_completion_descriptor(cqe)
     }
 
     #[inline]
     pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
-        self.recv.ring().try_push_completion_entry(entry)
+        self.ring.try_push_completion_entry(entry)
     }
 
     #[inline]
     pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        self.recv.ring().next_completion_entry().await
+        self.ring.next_completion_entry().await
     }
 
     #[inline]
     pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
-        self.recv.ring().next_completion_descriptor().await
+        self.ring.next_completion_descriptor().await
+    }
+
+    #[inline]
+    pub async fn next_completion(&self) -> Option<AppCqe> {
+        self.ring.next_completion().await
+    }
+
+    #[inline]
+    pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
+        self.ring
+            .try_complete_recv_lease(self.flow()?, lease, false)
     }
 
     #[inline]
     pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
-        self.recv.ring().take_recv_buffer(index)
+        self.ring.take_recv_buffer(index)
+    }
+
+    #[inline]
+    fn flow(&self) -> HammerResult<AppFlowId> {
+        match self.object {
+            AppObjectRef::Flow(flow) => Ok(flow),
+            AppObjectRef::Socket(socket) => Err(HammerError::internal(format!(
+                "flow runtime operation called for app socket {}",
+                socket.value()
+            ))),
+            AppObjectRef::None => Err(HammerError::internal(
+                "flow runtime operation called without an app flow",
+            )),
+        }
     }
 }
 
@@ -735,7 +798,7 @@ fn next_app_context_id() -> usize {
 }
 
 #[inline]
-fn worker_backend(app_context_id: usize, flow: AppFlowId, ring_capacity: usize) -> AppBackend {
+fn worker_flow_ring(app_context_id: usize, flow: AppFlowId, ring_capacity: usize) -> AppRingHandle {
     APP_FLOW_BACKENDS.with(|slot| {
         slot.borrow_mut()
             .get_or_insert(app_flow_key(app_context_id, flow), flow, ring_capacity)
@@ -748,11 +811,11 @@ fn app_flow_key(app_context_id: usize, flow: AppFlowId) -> u128 {
 }
 
 #[inline]
-fn worker_socket_backend(
+fn worker_socket_ring(
     app_context_id: usize,
     socket: AppSocketId,
     ring_capacity: usize,
-) -> AppBackend {
+) -> AppRingHandle {
     APP_SOCKET_BACKENDS.with(|slot| {
         slot.borrow_mut()
             .get_or_insert(app_socket_key(app_context_id, socket), ring_capacity)
@@ -766,7 +829,7 @@ fn app_socket_key(app_context_id: usize, socket: AppSocketId) -> u128 {
 
 struct AppWorkerFlowRegistry {
     index_by_flow: FlatHashTable<u128, usize>,
-    backends: Vec<AppBackend>,
+    rings: Vec<AppRingHandle>,
 }
 
 impl AppWorkerFlowRegistry {
@@ -774,29 +837,34 @@ impl AppWorkerFlowRegistry {
     fn new() -> Self {
         Self {
             index_by_flow: FlatHashTable::new(),
-            backends: Vec::new(),
+            rings: Vec::new(),
         }
     }
 
     #[inline]
-    fn get_or_insert(&mut self, key: u128, flow: AppFlowId, ring_capacity: usize) -> AppBackend {
+    fn get_or_insert(
+        &mut self,
+        key: u128,
+        _flow: AppFlowId,
+        ring_capacity: usize,
+    ) -> AppRingHandle {
         if let Some(index) = self.index_by_flow.lookup(&key)
-            && let Some(backend) = self.backends.get(index).cloned()
+            && let Some(ring) = self.rings.get(index).cloned()
         {
-            return backend;
+            return ring;
         }
 
-        let index = self.backends.len();
-        let backend = AppBackend::with_flow(ring_capacity, flow);
-        self.backends.push(backend.clone());
+        let index = self.rings.len();
+        let ring = AppRingHandle::new(ring_capacity, ring_capacity);
+        self.rings.push(ring.clone());
         self.index_by_flow.insert(key, index);
-        backend
+        ring
     }
 }
 
 struct AppWorkerSocketRegistry {
     index_by_socket: FlatHashTable<u128, usize>,
-    backends: Vec<AppBackend>,
+    rings: Vec<AppRingHandle>,
 }
 
 impl AppWorkerSocketRegistry {
@@ -804,22 +872,22 @@ impl AppWorkerSocketRegistry {
     fn new() -> Self {
         Self {
             index_by_socket: FlatHashTable::new(),
-            backends: Vec::new(),
+            rings: Vec::new(),
         }
     }
 
     #[inline]
-    fn get_or_insert(&mut self, key: u128, ring_capacity: usize) -> AppBackend {
+    fn get_or_insert(&mut self, key: u128, ring_capacity: usize) -> AppRingHandle {
         if let Some(index) = self.index_by_socket.lookup(&key)
-            && let Some(backend) = self.backends.get(index).cloned()
+            && let Some(ring) = self.rings.get(index).cloned()
         {
-            return backend;
+            return ring;
         }
 
-        let index = self.backends.len();
-        let backend = AppBackend::new(ring_capacity);
-        self.backends.push(backend.clone());
+        let index = self.rings.len();
+        let ring = AppRingHandle::new(ring_capacity, ring_capacity);
+        self.rings.push(ring.clone());
         self.index_by_socket.insert(key, index);
-        backend
+        ring
     }
 }
