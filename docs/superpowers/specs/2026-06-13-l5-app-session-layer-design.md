@@ -20,7 +20,7 @@
    - app shutdown queue 同步 polling；
    - worker-local ready queue；
    - worker-local timer wheel；
-   - empty-frame DriverNode poll；
+   - `session-queue` style input/DriverNode poll；
    - worker-local runtime registry。
 
 如果把这些公共职责继续放在 `transport/tcp`，后续接 QUIC 时会自然复制第二套 app ring、ready queue、timer wheel 和 worker poll 机制。用户要求按 7 层分层，所以公共 session 管理不应放在 `transport/` 下。
@@ -45,20 +45,31 @@ QUIC 的工程落点可以在后续单独讨论。无论 QUIC 代码放在 `tran
 
 ## 3. VPP 与 io_uring 对标
 
-VPP 的 session layer 把 application/message queue、session worker、transport protocol 分开。`src/vnet/session/session_node.c` 中 session worker drain app/session message queue，并通过 transport protocol 字段把 listen/connect/shutdown/disconnect 等操作交给对应 transport。这个形状说明：公共 session worker 层应当存在，但 TCP/QUIC 的传输状态机不应上移到 session 层。
+VPP 的 session layer 把 application/message queue、session worker、transport protocol 分开。`src/vnet/session/session_node.c` 注册了独立 input node：
+
+```text
+VLIB_REGISTER_NODE (session_queue_node)
+  .name = "session-queue"
+  .type = VLIB_NODE_TYPE_INPUT
+  .function = session_queue_node_fn
+```
+
+`session_queue_node_fn` drain app/session message queue，dispatch control events，dispatch new/old IO events，flush pending TX buffers，并按 session 的 transport protocol / session type 调 transport callbacks 或 output next。这个形状说明：公共 session queue node 应当存在，但 TCP/QUIC 的传输状态机不应上移到 session 层。
 
 Hammer 的映射是：
 
-- VPP session worker/app queue handling -> Hammer `session/` worker-local app polling 和 ready/timer 原语；
-- VPP transport protocol callbacks -> Hammer `transport/tcp`、后续 `transport/quic` 的协议专属推进；
-- VPP worker thread affinity -> Hammer `DataWorkerId` owner worker 和 DriverNode empty-frame polling。
+- VPP `session-queue` input node -> Hammer `SessionQueueNode`；
+- VPP session worker/app queue handling -> Hammer `WorkerSessionRuntime` 的 app polling、ready queue、timer expiry；
+- VPP transport protocol callbacks/vft -> Hammer `SessionProtocolOps` registry；
+- VPP transport output node registration -> Hammer protocol ops 记录 protocol-private output/next scheduling；
+- VPP worker thread affinity -> Hammer `DataWorkerId` owner worker 和 empty-frame polling。
 
 Hammer 的偏离点是 app ring 已经存在于 `hammer-runtime::app`，而且它更接近 io_uring 的 request/completion 模型：app 提交 SQE，worker-local session runtime poll submission，协议层最终产出 completion。Linux io_uring 的主语义是 SQE/CQE，不是通用 event bus。因此 L5 session 不引入泛泛的 `Event` API；它只暴露 submission/command、completion、timer expiry 和 ready id 这些具体队列项。
 
 ## 4. 设计目标
 
-1. 把 app-facing session 管理从 `transport/tcp/session.rs` 中移出，形成 `crates/hammer-service/src/session/`。
-2. 让 TCP 的 session node 变薄，只把 L5 submissions、timer expiries 和 ready ids 映射到 TCP connection state。
+1. 把 app-facing session queue 从 `transport/tcp/session.rs` 中移出，形成 `crates/hammer-service/src/session/SessionQueueNode`。
+2. 让 `SessionQueueNode` 成为 L5 独立 input/DriverNode，负责 app SQ polling、timer expiry、ready dispatch 和 protocol ops 调用。
 3. 为 QUIC 预留复用点，避免复制 app ring polling、ready queue、timer wheel 和 worker-local runtime registry。
 4. 保持现有 TCP 行为不变。本轮是边界拆分，不做 TCP progression 新语义。
 5. 遵守 data-plane 约束：hot path 容器优先使用 `hammer-infra`，worker-local 状态不放到 control-plane task 中推进。
@@ -79,6 +90,8 @@ Hammer 的偏离点是 app ring 已经存在于 `hammer-runtime::app`，而且�
 crates/hammer-service/src/session/
   mod.rs
   app.rs
+  node.rs
+  protocol.rs
   ready.rs
   timer.rs
   worker.rs
@@ -88,8 +101,8 @@ crates/hammer-service/src/session/
 
 - `mod.rs`
   - 对外导出 L5 session 原语；
-  - 不导出 TCP/QUIC 类型；
-  - 不注册具体 TCP/QUIC node。
+  - 对外导出 `SessionQueueNode` 和 protocol registration；
+  - 不导出 TCP/QUIC 类型。
 
 - `app.rs`
   - 保存 app backend attachment；
@@ -98,10 +111,20 @@ crates/hammer-service/src/session/
   - 把协议层 completion 写回 app backend；
   - 校验 flow/object ref 与绑定 flow 一致。
 
+- `node.rs`
+  - 定义 `SessionQueueNode`；
+  - 作为独立 input/DriverNode 通过 empty frame poll；
+  - process 时 drain L5 runtime，并按 session protocol 调用 `SessionProtocolOps`。
+
+- `protocol.rs`
+  - 定义 `SessionProtocolId`, `SessionProtocolOps`, `SessionProtocolRegistry`；
+  - 协议实现注册 callbacks，不让 L5 依赖 TCP/QUIC 类型；
+  - 记录 protocol-private next/output scheduling 入口。
+
 - `ready.rs`
   - worker-local ready session queue；
   - 以 session id 去重；
-  - 支持 drain/take，供协议层逐个推进。
+  - 支持 drain/take，供 `SessionQueueNode` 按 protocol 分派。
 
 - `timer.rs`
   - worker-local timer wheel wrapper；
@@ -143,15 +166,53 @@ pub struct AppSessionTimerExpiry {
     token: AppSessionTimerToken,
 }
 
+pub struct SessionProtocolId(u16);
+
+pub struct SessionProtocolContext<'a> {
+    worker: DataWorkerId,
+    runtime: &'a mut WorkerSessionRuntime,
+}
+
+pub trait SessionProtocolOps {
+    fn handle_submission(
+        &mut self,
+        context: &mut SessionProtocolContext<'_>,
+        submission: AppSessionSubmission,
+    ) -> CoreResult<()>;
+
+    fn handle_timer_expiry(
+        &mut self,
+        context: &mut SessionProtocolContext<'_>,
+        expiry: AppSessionTimerExpiry,
+    ) -> CoreResult<()>;
+
+    fn handle_ready(
+        &mut self,
+        context: &mut SessionProtocolContext<'_>,
+        session_id: AppSessionId,
+    ) -> CoreResult<()>;
+}
+
+pub struct SessionProtocolRegistry {
+    protocols: hammer_infra::vec::Vec<SessionProtocolSlot>,
+}
+
+pub struct SessionQueueNode {
+    worker: DataWorkerId,
+}
+
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
     app: AppSessionAppIngress,
+    protocols: SessionProtocolRegistry,
     ready: AppSessionReadyQueue,
     timers: AppSessionTimerWheel,
 }
 ```
 
-`AppSessionId` 是 L5 stable id，不等于 TCP `TcpConnectionId`，也不等于 QUIC connection id。TCP glue 可以维护：
+`SessionProtocolId` 是 L5 分派键，不定义 `Tcp`/`Quic` enum variant。TCP、QUIC 或后续协议通过 registry 获得自己的 id，并把该 id 绑定到 `AppSessionId`。
+
+`AppSessionId` 是 L5 stable id，不等于 TCP `TcpConnectionId`，也不等于 QUIC connection id。协议实现可以在自己的 state 中维护映射：
 
 ```text
 AppSessionId -> TcpConnectionId
@@ -167,46 +228,65 @@ Quic stream id -> AppSessionId
 
 Timer token 只作为协议私有值保存。TCP 可以把 token 编码为 retransmit/persist/output pacing；QUIC 可以编码为 PTO、idle timeout、ACK delay 或 stream timer。
 
-## 8. TCP 适配方式
+## 8. SessionQueueNode 运行模型
 
-`crates/hammer-service/src/transport/tcp/session.rs` 首轮降级为 TCP-private adapter/glue。它组合 L5 原语和 TCP connection table，但不再定义一套 public `TcpAppCommand*` API：
+`SessionQueueNode` 是 L5 独立 input/DriverNode，对标 VPP `session-queue`。它不属于 `transport/tcp`，也不属于 `transport/quic`。
+
+每次被 empty-frame poll 时，它按固定顺序推进：
+
+1. 从 app backend ring drain submissions 和 shutdowns。
+2. 根据 `AppSessionId` 查 session 绑定的 `SessionProtocol`。
+3. 调用对应 `SessionProtocolOps::handle_submission`。
+4. 推进 L5 timer wheel，得到 `AppSessionTimerExpiry`。
+5. 调用对应 `SessionProtocolOps::handle_timer_expiry`。
+6. drain ready session ids。
+7. 调用对应 `SessionProtocolOps::handle_ready`。
+8. flush protocol ops 暂存的 output/next scheduling。
+9. 如果还有 pending L5 work，则 schedule 自己。
+
+这个 node 可以是 Hammer 的 `DriverNode`，因为 Hammer 当前用 driver role 表示外部输入边界和 runtime polling。它在语义上对标 VPP `VLIB_NODE_TYPE_INPUT`，在 Hammer 实现上使用 empty-frame DriverNode。
+
+## 9. TCP 接入方式
+
+TCP 通过 `SessionProtocolOps` 注册到 L5 session registry，而不是暴露 `TcpSessionNode` 或 `TcpAppCommand*`：
 
 ```text
-TcpSessionAdapter
-  - worker: DataWorkerId
-  - sessions: WorkerSessionRuntime
+TcpSessionProtocol
   - connections: TcpConnectionTable
   - app_session_to_connection: FlatHashTable<u64, TcpConnectionId>
   - connection_to_app_session: FlatHashTable<u64, AppSessionId>
   - tcp_private_timer_tokens
+  - tcp_private_output_next
 ```
 
 TCP 侧只保留 protocol-private 的实现细节：
 
-- protocol driver node 或 handler 注册逻辑；
 - `AppSessionId` 与 `TcpConnectionId` 的映射；
 - TCP connection table；
 - TCP timer token 编码/解码；
-- TCP send/recv/close/shutdown 状态推进。
+- TCP send/recv/close/shutdown 状态推进；
+- TCP output/next scheduling。
 
-这些类型不从 `transport::tcp` 作为公共 session API re-export。`TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 不再是目标设计的一部分；如果迁移中短暂存在，只能是文件内 private 过渡实现，并应在首轮拆分结束前删除。
+`TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 不再是目标设计的一部分；如果迁移中短暂存在，只能是文件内 private 过渡实现，并应在首轮拆分结束前删除。
 
 App submission 转换流程：
 
 1. L5 `WorkerSessionRuntime::poll_app_submissions` 产出 `AppSessionSubmission`。
-2. TCP glue 根据 `AppSessionId` 找到 `TcpConnectionId`。
-3. TCP glue 直接把 submission 应用到 TCP connection state 或 TCP-private pending work。
-4. TCP progression 消费 TCP-private pending work，更新 TCP state 并发出 output。
+2. `SessionQueueNode` 根据 session protocol 选择 TCP ops。
+3. TCP ops 根据 `AppSessionId` 找到 `TcpConnectionId`。
+4. TCP ops 直接把 submission 应用到 TCP connection state 或 TCP-private pending work。
+5. TCP progression 消费 TCP-private pending work，更新 TCP state 并发出 output。
 
 Timer/ready 转换流程：
 
 1. L5 timer wheel 产出 `AppSessionTimerExpiry`，同时 ready queue 记录对应 `AppSessionId`。
-2. TCP glue 根据 timer token 还原 TCP-private timer kind。
-3. TCP glue 根据 `AppSessionId` 找到 `TcpConnectionId` 并运行 TCP 专属 timer handler。
+2. `SessionQueueNode` 根据 session protocol 选择 TCP ops。
+3. TCP ops 根据 timer token 还原 TCP-private timer kind。
+4. TCP ops 根据 `AppSessionId` 找到 `TcpConnectionId` 并运行 TCP 专属 timer handler。
 
 这样可以把公共 app/timer/ready 机制移到 L5，同时避免 TCP 类型泄漏成未来 QUIC 也必须兼容的公共 API。
 
-## 9. QUIC 预留方式
+## 10. QUIC 预留方式
 
 QUIC 后续接入时复用：
 
@@ -216,7 +296,8 @@ QUIC 后续接入时复用：
 - completion 写回；
 - ready session queue；
 - timer wheel；
-- worker-local DriverNode poll 模式。
+- `SessionQueueNode` worker-local input/DriverNode poll 模式；
+- `SessionProtocolOps` registration。
 
 QUIC 自己实现：
 
@@ -231,16 +312,17 @@ QUIC 自己实现：
 
 因此 L5 session 层不需要提前包含 QUIC-specific enum，也不需要为 QUIC 设计 trait object 状态机。
 
-## 10. Data Flow
+## 11. Data Flow
 
 App send/shutdown 路径：
 
 ```text
 AppContext
   -> owner worker AppBackend ring
-  -> session::WorkerSessionRuntime::poll_app_submissions
+  -> SessionQueueNode
+  -> WorkerSessionRuntime::poll_app_submissions
   -> AppSessionSubmission
-  -> transport/tcp or transport/quic glue
+  -> SessionProtocolOps::handle_submission
   -> protocol-specific ready connection/session
   -> protocol-specific output
   -> AppSessionCompletion
@@ -250,10 +332,10 @@ AppContext
 Timer 路径：
 
 ```text
-protocol glue arms L5 timer with AppSessionId + protocol token
+SessionProtocolOps arms L5 timer with AppSessionId + protocol token
   -> session::timer expires on owner worker
-  -> WorkerSessionRuntime marks AppSessionId ready
-  -> protocol glue decodes token
+  -> SessionQueueNode dispatches AppSessionTimerExpiry
+  -> SessionProtocolOps::handle_timer_expiry
   -> protocol-specific timer handler
 ```
 
@@ -261,12 +343,13 @@ Ready 路径：
 
 ```text
 session::ready dedupes AppSessionId
-  -> protocol glue drains ready ids
+  -> SessionQueueNode drains ready ids
+  -> SessionProtocolOps::handle_ready
   -> protocol-specific table lookup
   -> protocol-specific step
 ```
 
-## 11. Error Handling
+## 12. Error Handling
 
 L5 session returns `CoreResult` and uses `CoreError::internal` for invariant violations already present in the current TCP session runtime:
 
@@ -284,23 +367,25 @@ Protocol glue owns protocol-specific errors:
 - QUIC stream lookup failures；
 - QUIC crypto/loss recovery failures。
 
-## 12. Testing Strategy
+## 13. Testing Strategy
 
 首轮测试按 TDD 做结构迁移：
 
 1. 新增 `crates/hammer-service/tests/session_runtime.rs`，覆盖 L5 原语：
+   - `SessionQueueNode` runs as empty-frame DriverNode；
    - app send SQE polling produces `AppSessionSubmission::Send`；
    - shutdown polling produces `AppSessionSubmission::Shutdown`；
+   - registered protocol ops receive submissions by `AppSessionId`；
    - completion helper writes CQE back to the attached app backend；
    - ready queue dedupes session ids；
-   - timer expiry marks a session ready and returns token；
+   - timer expiry dispatches `AppSessionTimerExpiry` to protocol ops；
    - deterministic clock advances timer wheel。
 
-2. 保留并调整 `crates/hammer-service/tests/tcp_session_node.rs`：
-   - TCP-private adapter 仍能 install connection；
-   - TCP-private adapter 仍能 bind `AppSessionId` 到 `TcpConnectionId`；
-   - app send/shutdown submission 能 mark 对应 TCP connection ready；
-   - empty-frame TCP protocol driver/handler 仍能 poll L5 worker runtime。
+2. 保留并调整 TCP session tests：
+   - TCP protocol ops 仍能 install connection；
+   - TCP protocol ops 仍能 bind `AppSessionId` 到 `TcpConnectionId`；
+   - app send/shutdown submission 能通过 `SessionQueueNode` mark 对应 TCP connection ready；
+   - TCP 不再需要 public `TcpSessionNode` 或 `TcpAppCommand*`。
 
 3. 不新增 QUIC 测试。QUIC 还没有实现，首轮只保证 L5 API 不含 TCP 名称。
 
@@ -313,21 +398,24 @@ cargo test -p hammer-service --test tcp_session_node
 git diff --check
 ```
 
-## 13. Migration Plan
+## 14. Migration Plan
 
 1. 建 `crates/hammer-service/src/session/`，先复制当前 TCP session runtime 中的 app/ready/timer 公共逻辑。
 2. 给公共层引入 `AppSessionId` 和 token 化 timer，不带 TCP 命名。
-3. 修改 TCP-private adapter 组合 `WorkerSessionRuntime`，不要保留 `TcpAppCommand*` public API。
-4. 移动 thread-local registry helper，使 TCP protocol driver/handler 仍能注册 worker-local runtime。
-5. 跑现有 TCP session tests，保证行为不变。
-6. 后续实现 TCP progression 时，TCP 只消费 L5 submissions、timer expiries 和 ready ids，不再把 app ring polling 留在 TCP 文件里。
+3. 新增 `SessionQueueNode`，作为独立 empty-frame DriverNode。
+4. 新增 `SessionProtocolOps` registry。
+5. 将 TCP session runtime 改成 TCP protocol ops 注册到 `SessionQueueNode`，不要保留 `TcpAppCommand*` public API。
+6. 跑 L5 session tests 和 TCP session tests，保证行为不变。
+7. 后续实现 TCP progression 时，TCP 只通过 protocol ops 消费 L5 submissions、timer expiries 和 ready ids，不再把 app ring polling 留在 TCP 文件里。
 
-## 14. Acceptance Criteria
+## 15. Acceptance Criteria
 
 1. `crates/hammer-service/src/session/` 存在，并且不依赖 `transport::tcp`。
-2. L5 session public API 不暴露 TCP/QUIC 协议类型。
-3. `transport::tcp` 不 re-export `TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 这类 app session wrapper。
-4. App ring polling、ready queue、timer wheel 从 TCP 文件中移到 L5 session 文件。
-5. `cargo test -p hammer-service --test session_runtime` 通过。
-6. `cargo test -p hammer-service --test tcp_session_node` 通过。
-7. `git diff --check` 通过。
+2. L5 session public API 暴露 `SessionQueueNode` 和 protocol registration，但不暴露 TCP/QUIC 协议类型。
+3. `SessionQueueNode` 是独立 empty-frame DriverNode，对标 VPP `session-queue` input node。
+4. TCP 通过 `SessionProtocolOps` 接入，而不是通过 public `TcpSessionNode` 或 `TcpAppCommand*`。
+5. `transport::tcp` 不 re-export `TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 这类 app session wrapper。
+6. App ring polling、ready queue、timer wheel 从 TCP 文件中移到 L5 session 文件。
+7. `cargo test -p hammer-service --test session_runtime` 通过。
+8. `cargo test -p hammer-service --test tcp_session_node` 通过。
+9. `git diff --check` 通过。
