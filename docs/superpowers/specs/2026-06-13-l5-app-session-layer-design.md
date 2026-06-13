@@ -169,41 +169,42 @@ Timer token 只作为协议私有值保存。TCP 可以把 token 编码为 retra
 
 ## 8. TCP 适配方式
 
-`crates/hammer-service/src/transport/tcp/session.rs` 首轮保留 TCP 对外 API，但内部改为组合 L5 原语：
+`crates/hammer-service/src/transport/tcp/session.rs` 首轮降级为 TCP-private adapter/glue。它组合 L5 原语和 TCP connection table，但不再定义一套 public `TcpAppCommand*` API：
 
 ```text
-TcpSessionRuntime
+TcpSessionAdapter
   - worker: DataWorkerId
   - sessions: WorkerSessionRuntime
   - connections: TcpConnectionTable
   - app_session_to_connection: FlatHashTable<u64, TcpConnectionId>
   - connection_to_app_session: FlatHashTable<u64, AppSessionId>
+  - tcp_private_timer_tokens
 ```
 
-TCP 专属类型仍留在 TCP 模块：
+TCP 侧只保留 protocol-private 的实现细节：
 
-- `TcpSessionNode`
-- `TcpAppCommand`
-- `TcpAppSend`
-- `TcpAppRecv`
-- `TcpAppClose`
-- `TcpAppShutdownCommand`
-- `TcpSessionTimerKind`
+- protocol driver node 或 handler 注册逻辑；
+- `AppSessionId` 与 `TcpConnectionId` 的映射；
+- TCP connection table；
+- TCP timer token 编码/解码；
+- TCP send/recv/close/shutdown 状态推进。
+
+这些类型不从 `transport::tcp` 作为公共 session API re-export。`TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 不再是目标设计的一部分；如果迁移中短暂存在，只能是文件内 private 过渡实现，并应在首轮拆分结束前删除。
 
 App submission 转换流程：
 
 1. L5 `WorkerSessionRuntime::poll_app_submissions` 产出 `AppSessionSubmission`。
 2. TCP glue 根据 `AppSessionId` 找到 `TcpConnectionId`。
-3. TCP glue 转成现有 `TcpAppCommand`，并 mark TCP connection ready。
-4. 后续 TCP progression 再消费 `TcpAppCommand`，更新 TCP state 并发出 output。
+3. TCP glue 直接把 submission 应用到 TCP connection state 或 TCP-private pending work。
+4. TCP progression 消费 TCP-private pending work，更新 TCP state 并发出 output。
 
 Timer/ready 转换流程：
 
 1. L5 timer wheel 产出 `AppSessionTimerExpiry`，同时 ready queue 记录对应 `AppSessionId`。
-2. TCP glue 根据 timer token 还原 `TcpSessionTimerKind`。
+2. TCP glue 根据 timer token 还原 TCP-private timer kind。
 3. TCP glue 根据 `AppSessionId` 找到 `TcpConnectionId` 并运行 TCP 专属 timer handler。
 
-这样可以保持现有测试中的 TCP API 表面稳定，同时把公共 app/timer/ready 机制移到 L5。
+这样可以把公共 app/timer/ready 机制移到 L5，同时避免 TCP 类型泄漏成未来 QUIC 也必须兼容的公共 API。
 
 ## 9. QUIC 预留方式
 
@@ -296,10 +297,10 @@ Protocol glue owns protocol-specific errors:
    - deterministic clock advances timer wheel。
 
 2. 保留并调整 `crates/hammer-service/tests/tcp_session_node.rs`：
-   - TCP API 仍能 install connection；
-   - TCP session runtime 仍能 attach app backend；
-   - app send/shutdown 仍转为 `TcpAppCommand`；
-   - empty-frame `TcpSessionNode` 仍能 poll。
+   - TCP-private adapter 仍能 install connection；
+   - TCP-private adapter 仍能 bind `AppSessionId` 到 `TcpConnectionId`；
+   - app send/shutdown submission 能 mark 对应 TCP connection ready；
+   - empty-frame TCP protocol driver/handler 仍能 poll L5 worker runtime。
 
 3. 不新增 QUIC 测试。QUIC 还没有实现，首轮只保证 L5 API 不含 TCP 名称。
 
@@ -316,8 +317,8 @@ git diff --check
 
 1. 建 `crates/hammer-service/src/session/`，先复制当前 TCP session runtime 中的 app/ready/timer 公共逻辑。
 2. 给公共层引入 `AppSessionId` 和 token 化 timer，不带 TCP 命名。
-3. 修改 `TcpSessionRuntime` 组合 `WorkerSessionRuntime`，保留 TCP-facing public API。
-4. 移动 thread-local registry helper，使 `TcpSessionNode` 仍能注册 worker-local runtime。
+3. 修改 TCP-private adapter 组合 `WorkerSessionRuntime`，不要保留 `TcpAppCommand*` public API。
+4. 移动 thread-local registry helper，使 TCP protocol driver/handler 仍能注册 worker-local runtime。
 5. 跑现有 TCP session tests，保证行为不变。
 6. 后续实现 TCP progression 时，TCP 只消费 L5 submissions、timer expiries 和 ready ids，不再把 app ring polling 留在 TCP 文件里。
 
@@ -325,7 +326,7 @@ git diff --check
 
 1. `crates/hammer-service/src/session/` 存在，并且不依赖 `transport::tcp`。
 2. L5 session public API 不暴露 TCP/QUIC 协议类型。
-3. TCP session runtime 保持现有测试语义。
+3. `transport::tcp` 不 re-export `TcpAppCommand`、`TcpAppSend`、`TcpAppRecv`、`TcpAppClose`、`TcpAppShutdownCommand` 这类 app session wrapper。
 4. App ring polling、ready queue、timer wheel 从 TCP 文件中移到 L5 session 文件。
 5. `cargo test -p hammer-service --test session_runtime` 通过。
 6. `cargo test -p hammer-service --test tcp_session_node` 通过。
