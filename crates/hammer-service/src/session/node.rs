@@ -4,7 +4,7 @@ use std::thread::LocalKey;
 use hammer_adapter::NodeRuntimeData;
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::session::worker::SessionQueueRuntime;
+use crate::session::worker::{SessionQueueProgram, SessionQueueRuntime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionQueueHandle {
@@ -26,7 +26,10 @@ impl SessionQueueHandle {
 pub(crate) fn register_session_queue_runtime<P>(
     store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<SessionQueueRuntime<P>>>>,
     runtime: SessionQueueRuntime<P>,
-) -> CoreResult<SessionQueueHandle> {
+) -> CoreResult<SessionQueueHandle>
+where
+    P: SessionQueueProgram,
+{
     store.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
         let slot = runtimes.len();
@@ -40,7 +43,10 @@ pub(crate) fn with_session_queue_runtime<P, R>(
     store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<SessionQueueRuntime<P>>>>,
     handle: SessionQueueHandle,
     f: impl FnOnce(&mut SessionQueueRuntime<P>) -> CoreResult<R>,
-) -> CoreResult<R> {
+) -> CoreResult<R>
+where
+    P: SessionQueueProgram,
+{
     let slot = handle.runtime_data().usize_word(0)?;
     store.with(|runtimes| {
         let mut runtimes = runtimes

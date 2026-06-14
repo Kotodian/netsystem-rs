@@ -1,23 +1,20 @@
 use std::time::Instant;
 
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpSeq;
 
-use crate::session::protocol::tcp::state::TcpSessionTable;
+use crate::session::protocol::tcp::state::TcpSessionState;
 
-use super::TcpLookupId;
 use super::congestion::TcpCongestionAckSample;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionAckObservation {
-    pub lookup_id: TcpLookupId,
     pub accepted_acknowledgment: u32,
     pub now: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionSendObservation {
-    pub lookup_id: TcpLookupId,
     pub bytes_sent: u32,
     pub bytes_in_flight: u32,
     pub now: Instant,
@@ -25,7 +22,6 @@ pub struct TcpCongestionSendObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionLossObservation {
-    pub lookup_id: TcpLookupId,
     pub bytes_lost: u32,
 }
 
@@ -34,12 +30,9 @@ pub struct TcpCongestionControlNode;
 
 impl TcpCongestionControlNode {
     pub fn observe_ack(
-        sessions: &mut TcpSessionTable,
+        session: &mut TcpSessionState,
         observation: TcpCongestionAckObservation,
     ) -> CoreResult<()> {
-        let session = sessions
-            .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion ack session not found"))?;
         let sample = session
             .retransmit_queue_mut()
             .acknowledge_through_with_sample(observation.accepted_acknowledgment, observation.now);
@@ -57,12 +50,9 @@ impl TcpCongestionControlNode {
     }
 
     pub fn observe_send(
-        sessions: &mut TcpSessionTable,
+        session: &mut TcpSessionState,
         observation: TcpCongestionSendObservation,
     ) -> CoreResult<()> {
-        let session = sessions
-            .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion send session not found"))?;
         session
             .congestion_mut()
             .on_packet_sent(observation.bytes_sent, observation.bytes_in_flight);
@@ -75,12 +65,9 @@ impl TcpCongestionControlNode {
     }
 
     pub fn observe_loss(
-        sessions: &mut TcpSessionTable,
+        session: &mut TcpSessionState,
         observation: TcpCongestionLossObservation,
     ) -> CoreResult<()> {
-        let session = sessions
-            .lookup_by_lookup_id_mut(observation.lookup_id)
-            .ok_or_else(|| CoreError::internal("tcp congestion loss session not found"))?;
         session.congestion_mut().on_loss(observation.bytes_lost);
         session.set_next_output_at(None);
         Ok(())

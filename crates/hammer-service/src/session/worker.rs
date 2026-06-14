@@ -2,13 +2,17 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::DataWorkerId;
 use hammer_core::error::CoreResult;
+use hammer_infra::pool::Pool;
+use hammer_runtime::app::{AppOpId, AppRingHandle};
 
 use crate::session::protocol::SessionProtocolContext;
 use crate::session::{
-    SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken, SessionTimerWheel,
+    SessionAppRuntime, SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken,
+    SessionTimerWheel,
 };
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
+const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionQueueStep {
@@ -117,29 +121,84 @@ impl WorkerSessionRuntime {
 }
 
 pub(crate) trait SessionQueueProgram: 'static {
+    type Session: 'static;
+
     fn handle_timer_expiry(
         &mut self,
-        context: &mut SessionProtocolContext<'_>,
+        context: &mut SessionProtocolContext<'_, Self::Session>,
         expiry: SessionTimerExpiry,
     ) -> CoreResult<()>;
 
     fn handle_ready(
         &mut self,
-        context: &mut SessionProtocolContext<'_>,
+        context: &mut SessionProtocolContext<'_, Self::Session>,
         session_id: SessionId,
     ) -> CoreResult<()>;
 }
 
-pub(crate) struct SessionQueueRuntime<P> {
+pub(crate) struct SessionQueueRuntime<P: SessionQueueProgram> {
     sessions: WorkerSessionRuntime,
+    entries: Pool<SessionEntry<P::Session>>,
+    app: SessionAppRuntime,
     program: P,
 }
 
-impl<P> SessionQueueRuntime<P> {
+#[derive(Debug)]
+pub(crate) struct SessionEntry<S> {
+    app_op: Option<AppOpId>,
+    state: S,
+}
+
+impl<S> SessionEntry<S> {
+    #[inline]
+    pub(crate) fn new(state: S) -> Self {
+        Self {
+            app_op: None,
+            state,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn app_op(&self) -> Option<AppOpId> {
+        self.app_op
+    }
+
+    #[inline]
+    pub(crate) fn bind_app_op(&mut self, op: AppOpId) {
+        self.app_op = Some(op);
+    }
+
+    #[inline]
+    pub(crate) fn clear_app_op(&mut self) -> Option<AppOpId> {
+        self.app_op.take()
+    }
+
+    #[inline]
+    pub(crate) fn state(&self) -> &S {
+        &self.state
+    }
+
+    #[inline]
+    pub(crate) fn state_mut(&mut self) -> &mut S {
+        &mut self.state
+    }
+
+    #[inline]
+    pub(crate) fn into_state(self) -> S {
+        self.state
+    }
+}
+
+impl<P> SessionQueueRuntime<P>
+where
+    P: SessionQueueProgram,
+{
     #[inline]
     pub(crate) fn new(worker: DataWorkerId, protocol: P) -> Self {
         Self {
             sessions: WorkerSessionRuntime::new(worker),
+            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app: SessionAppRuntime::new(),
             program: protocol,
         }
     }
@@ -158,6 +217,8 @@ impl<P> SessionQueueRuntime<P> {
                 timer_tick_duration,
                 last_timer_tick,
             ),
+            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            app: SessionAppRuntime::new(),
             program: protocol,
         }
     }
@@ -169,8 +230,75 @@ impl<P> SessionQueueRuntime<P> {
     }
 
     #[inline]
+    pub(crate) fn insert_session(&mut self, state: P::Session) -> SessionId {
+        let index = self
+            .entries
+            .insert(SessionEntry::new(state))
+            .expect("session pool capacity exhausted");
+        SessionId::from_pool_index(index)
+    }
+
+    #[inline]
+    pub(crate) fn session(&self, id: SessionId) -> Option<&SessionEntry<P::Session>> {
+        self.entries.get(id.pool_index())
+    }
+
+    #[inline]
+    pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut SessionEntry<P::Session>> {
+        self.entries.get_mut(id.pool_index())
+    }
+
+    #[inline]
+    pub(crate) fn session_state(&self, id: SessionId) -> Option<&P::Session> {
+        self.session(id).map(SessionEntry::state)
+    }
+
+    #[inline]
+    pub(crate) fn session_state_mut(&mut self, id: SessionId) -> Option<&mut P::Session> {
+        self.session_mut(id).map(SessionEntry::state_mut)
+    }
+
+    pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<SessionEntry<P::Session>> {
+        let removed = self.entries.remove(id.pool_index())?;
+        if let Some(op) = removed.app_op() {
+            self.app.unbind_ring(op);
+        }
+        Some(removed)
+    }
+
+    #[inline]
+    pub(crate) fn bind_session_app_ring(
+        &mut self,
+        id: SessionId,
+        op: AppOpId,
+        ring: AppRingHandle,
+    ) -> bool {
+        let Some(entry) = self.session_mut(id) else {
+            return false;
+        };
+        entry.bind_app_op(op);
+        self.app.bind_ring(id, op, ring);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn app(&self) -> &SessionAppRuntime {
+        &self.app
+    }
+
+    #[inline]
+    pub(crate) fn app_mut(&mut self) -> &mut SessionAppRuntime {
+        &mut self.app
+    }
+
+    #[inline]
     pub(crate) fn program_mut(&mut self) -> &mut P {
         &mut self.program
+    }
+
+    #[inline]
+    pub(crate) fn program(&self) -> &P {
+        &self.program
     }
 }
 
@@ -184,16 +312,24 @@ where
         let worker = self.sessions.worker();
 
         for expiry in expiries {
-            let mut context =
-                crate::session::SessionProtocolContext::new(worker, &mut self.sessions);
+            let mut context = crate::session::SessionProtocolContext::new(
+                worker,
+                &mut self.sessions,
+                &mut self.entries,
+                &mut self.app,
+            );
             self.program.handle_timer_expiry(&mut context, expiry)?;
         }
 
         let ready_sessions = self.sessions.take_ready_sessions();
         step.ready_sessions = ready_sessions.len();
         for session_id in ready_sessions {
-            let mut context =
-                crate::session::SessionProtocolContext::new(worker, &mut self.sessions);
+            let mut context = crate::session::SessionProtocolContext::new(
+                worker,
+                &mut self.sessions,
+                &mut self.entries,
+                &mut self.app,
+            );
             self.program.handle_ready(&mut context, session_id)?;
         }
 

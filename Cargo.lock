@@ -1155,9 +1155,11 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
+ "bitflags 2.11.1",
  "blake2",
  "boringtun",
  "bytes",
+ "etherparse",
  "hammer-infra",
  "hickory-proto",
  "http",

@@ -1,10 +1,14 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use hammer_adapter::DataWorkerId;
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq, TcpV4ConnectionKey,
+    TcpV6ConnectionKey,
+};
 use hammer_infra::map::FlatHashTable;
 
+use crate::session::SessionId;
 use crate::transport::tcp::congestion::TcpCongestionState;
 use crate::transport::tcp::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
@@ -551,81 +555,163 @@ pub(crate) struct TcpReceiveProgress {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpSessionTable {
-    sessions: hammer_infra::vec::Vec<TcpSessionState>,
-    lookup_slots: FlatHashTable<TcpLookupId, usize>,
-    connection_slots: FlatHashTable<u64, usize>,
+pub struct TcpSessionIndex {
+    entries: hammer_infra::vec::Vec<TcpSessionIndexEntry>,
+    lookup_slots: FlatHashTable<TcpLookupId, SessionId>,
+    connection_slots: FlatHashTable<u64, SessionId>,
+    tuple_v4_slots: FlatHashTable<TcpV4ConnectionKey, SessionId>,
+    tuple_v6_slots: FlatHashTable<TcpV6ConnectionKey, SessionId>,
 }
 
-impl TcpSessionTable {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpSessionIndexEntry {
+    session_id: SessionId,
+    lookup_id: TcpLookupId,
+    connection_id: Option<TcpConnectionId>,
+    local: Option<SocketAddr>,
+    remote: SocketAddr,
+}
+
+impl TcpSessionIndexEntry {
+    #[inline]
+    fn new(session_id: SessionId, session: &TcpSessionState) -> Self {
+        Self {
+            session_id,
+            lookup_id: session.lookup_id(),
+            connection_id: session.connection_id(),
+            local: session.local(),
+            remote: session.remote(),
+        }
+    }
+
+    #[inline]
+    fn tuple_key(self) -> Option<TcpSocketTupleKey> {
+        self.local
+            .and_then(|local| tcp_socket_tuple_key(local, self.remote))
+    }
+}
+
+impl TcpSessionIndex {
     #[inline]
     pub fn empty() -> Self {
         Self {
-            sessions: hammer_infra::vec::Vec::new(),
+            entries: hammer_infra::vec::Vec::new(),
             lookup_slots: FlatHashTable::new(),
             connection_slots: FlatHashTable::new(),
+            tuple_v4_slots: FlatHashTable::new(),
+            tuple_v6_slots: FlatHashTable::new(),
         }
     }
 
     #[inline]
-    pub fn insert(&mut self, session: TcpSessionState) {
-        let slot = self.sessions.len();
-        self.lookup_slots.insert(session.lookup_id(), slot);
-        if let Some(connection_id) = session.connection_id() {
-            self.connection_slots.insert(connection_id.get(), slot);
-        }
-        self.sessions.push(session);
+    pub fn insert(&mut self, session_id: SessionId, session: &TcpSessionState) {
+        let entry = TcpSessionIndexEntry::new(session_id, session);
+        self.entries.push(entry);
+        self.index_entry(entry);
     }
 
     #[inline]
-    pub fn upsert(&mut self, session: TcpSessionState) {
-        if let Some(slot) = self.lookup_slots.lookup(&session.lookup_id()) {
-            self.sessions[slot] = session.clone();
-            if let Some(connection_id) = session.connection_id() {
-                self.connection_slots.insert(connection_id.get(), slot);
+    fn index_entry(&mut self, entry: TcpSessionIndexEntry) {
+        self.lookup_slots.insert(entry.lookup_id, entry.session_id);
+        if let Some(connection_id) = entry.connection_id {
+            self.connection_slots
+                .insert(connection_id.get(), entry.session_id);
+        }
+        match entry.tuple_key() {
+            Some(TcpSocketTupleKey::V4(key)) => {
+                self.tuple_v4_slots.insert(key, entry.session_id);
             }
-            return;
+            Some(TcpSocketTupleKey::V6(key)) => {
+                self.tuple_v6_slots.insert(key, entry.session_id);
+            }
+            None => {}
         }
-        self.insert(session);
     }
 
     #[inline]
-    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<&TcpSessionState> {
-        self.lookup_slots
-            .lookup(&lookup_id)
-            .and_then(|slot| self.sessions.get(slot))
+    pub fn upsert(&mut self, session_id: SessionId, session: &TcpSessionState) {
+        let entry = TcpSessionIndexEntry::new(session_id, session);
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|existing| existing.session_id == session_id)
+        {
+            *existing = entry;
+        } else {
+            self.entries.push(entry);
+        }
+        self.rebuild_indexes();
     }
 
     #[inline]
-    pub fn lookup_by_lookup_id_mut(
-        &mut self,
-        lookup_id: TcpLookupId,
-    ) -> Option<&mut TcpSessionState> {
-        let slot = self.lookup_slots.lookup(&lookup_id)?;
-        self.sessions.get_mut(slot)
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     #[inline]
-    pub fn lookup_by_connection_id(
-        &self,
-        connection_id: TcpConnectionId,
-    ) -> Option<&TcpSessionState> {
-        self.connection_slots
-            .lookup(&connection_id.get())
-            .and_then(|slot| self.sessions.get(slot))
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     #[inline]
-    pub fn lookup_by_connection_id_mut(
-        &mut self,
-        connection_id: TcpConnectionId,
-    ) -> Option<&mut TcpSessionState> {
-        let slot = self.connection_slots.lookup(&connection_id.get())?;
-        self.sessions.get_mut(slot)
+    pub fn iter_session_ids(&self) -> impl Iterator<Item = SessionId> + '_ {
+        self.entries.iter().map(|entry| entry.session_id)
+    }
+
+    #[inline]
+    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<SessionId> {
+        self.lookup_slots.lookup(&lookup_id)
+    }
+
+    #[inline]
+    pub fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<SessionId> {
+        self.connection_slots.lookup(&connection_id.get())
+    }
+
+    #[inline]
+    pub fn lookup_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
+        match tcp_socket_tuple_key(local, remote)? {
+            TcpSocketTupleKey::V4(key) => self.tuple_v4_slots.lookup(&key),
+            TcpSocketTupleKey::V6(key) => self.tuple_v6_slots.lookup(&key),
+        }
+    }
+
+    pub fn remove_session(&mut self, session_id: SessionId) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.session_id == session_id)
+        {
+            let last = self
+                .entries
+                .pop()
+                .expect("session index entry exists at computed index");
+            if index != self.entries.len() {
+                self.entries[index] = last;
+            }
+        }
+        self.rebuild_indexes();
+    }
+
+    pub fn remove_lookup_id(&mut self, lookup_id: TcpLookupId) -> Option<SessionId> {
+        let session_id = self.lookup_slots.lookup(&lookup_id)?;
+        self.remove_session(session_id);
+        Some(session_id)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.lookup_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
+        self.connection_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
+        self.tuple_v4_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
+        self.tuple_v6_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
+        for index in 0..self.entries.len() {
+            let entry = self.entries[index];
+            self.index_entry(entry);
+        }
     }
 }
 
-impl Default for TcpSessionTable {
+impl Default for TcpSessionIndex {
     #[inline]
     fn default() -> Self {
         Self::empty()
@@ -754,5 +840,36 @@ fn duration_from_nanos_saturating(nanos: u128) -> Duration {
         Duration::new(u64::MAX, 999_999_999)
     } else {
         Duration::new(seconds as u64, subsecond_nanos)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TcpSocketTupleKey {
+    V4(TcpV4ConnectionKey),
+    V6(TcpV6ConnectionKey),
+}
+
+#[inline]
+fn tcp_socket_tuple_key(local: SocketAddr, remote: SocketAddr) -> Option<TcpSocketTupleKey> {
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(local_addr), IpAddr::V4(remote_addr)) => {
+            Some(TcpSocketTupleKey::V4(TcpV4ConnectionKey::new(
+                0,
+                local_addr,
+                local.port(),
+                remote_addr,
+                remote.port(),
+            )))
+        }
+        (IpAddr::V6(local_addr), IpAddr::V6(remote_addr)) => {
+            Some(TcpSocketTupleKey::V6(TcpV6ConnectionKey::new(
+                0,
+                local_addr,
+                local.port(),
+                remote_addr,
+                remote.port(),
+            )))
+        }
+        _ => None,
     }
 }

@@ -2,6 +2,29 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ds::FlatHashKey;
 
+pub mod options;
+pub mod segment;
+
+pub use options::{
+    ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
+    tcp_options_from_bytes,
+};
+pub use segment::{TcpSegmentParseError, TcpSegmentView};
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TcpSegmentFlags: u8 {
+        const FIN = 0x01;
+        const SYN = 0x02;
+        const RST = 0x04;
+        const PSH = 0x08;
+        const ACK = 0x10;
+        const URG = 0x20;
+        const ECE = 0x40;
+        const CWR = 0x80;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TcpState {

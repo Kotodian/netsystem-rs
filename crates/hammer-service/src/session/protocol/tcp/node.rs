@@ -24,7 +24,7 @@ impl TcpSessionQueueNode {
     }
 
     #[inline]
-    pub(crate) fn handle(&self) -> SessionQueueHandle {
+    pub fn handle(&self) -> SessionQueueHandle {
         self.handle
     }
 }

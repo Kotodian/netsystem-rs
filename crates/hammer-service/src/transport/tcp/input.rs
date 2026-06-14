@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::data_plane::set_index_node_error_code;
@@ -15,13 +15,17 @@ use hammer_adapter::{
     PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView, TcpState,
+};
+
+use crate::session::SessionQueueHandle;
+use crate::session::protocol::tcp::TcpSessionProtocol;
 
 use super::{
     TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-
-const TCP_HEADER_MIN_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpInputHandoff {
@@ -159,6 +163,8 @@ pub struct TcpInputNode {
     #[node(default)]
     handoff: Option<TcpInputHandoff>,
     #[node(default)]
+    session_queue: Option<SessionQueueHandle>,
+    #[node(default)]
     cached_next: Option<NodeId>,
 }
 
@@ -166,6 +172,12 @@ impl TcpInputNode {
     #[inline]
     pub fn with_handoff(mut self, handoff: TcpInputHandoff) -> Self {
         self.handoff = Some(handoff);
+        self
+    }
+
+    #[inline]
+    pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
+        self.session_queue = Some(handle);
         self
     }
 }
@@ -182,7 +194,16 @@ impl Node for TcpInputNode {
         let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
             runtime,
             frame,
-            |index| next_node_for_index(runtime, index, &snapshot, &next, self.handoff),
+            |index| {
+                next_node_for_index(
+                    runtime,
+                    index,
+                    &snapshot,
+                    &next,
+                    self.handoff,
+                    self.session_queue,
+                )
+            },
         )?;
         self.cached_next = cached_next;
         Ok(result)
@@ -200,7 +221,7 @@ impl Node for TcpInputNode {
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_tcp_input_runtime(self.runtime_data, self.handoff)?;
+        sync_tcp_input_runtime(self.runtime_data, self.handoff, self.session_queue)?;
         Ok(self.runtime_data)
     }
 }
@@ -209,6 +230,7 @@ impl Node for TcpInputNode {
 struct TcpInputRuntime {
     snapshot: TcpInputSnapshotHandle,
     handoff: Option<TcpInputHandoff>,
+    session_queue: Option<SessionQueueHandle>,
 }
 
 thread_local! {
@@ -223,6 +245,7 @@ fn register_tcp_input_runtime(snapshot: TcpInputSnapshotHandle) -> NodeRuntimeDa
         runtimes.push(TcpInputRuntime {
             snapshot,
             handoff: None,
+            session_queue: None,
         });
         NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
     })
@@ -242,6 +265,7 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
 fn sync_tcp_input_runtime(
     data: NodeRuntimeData,
     handoff: Option<TcpInputHandoff>,
+    session_queue: Option<SessionQueueHandle>,
 ) -> CoreResult<()> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
@@ -250,6 +274,7 @@ fn sync_tcp_input_runtime(
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
+        runtime.session_queue = session_queue;
         Ok(())
     })
 }
@@ -263,7 +288,14 @@ fn tcp_input_process(
     let snapshot = state.snapshot.load();
     let next = TcpInputNode::runtime_nexts(runtime)?;
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        next_node_for_index(runtime, index, &snapshot, &next, state.handoff)
+        next_node_for_index(
+            runtime,
+            index,
+            &snapshot,
+            &next,
+            state.handoff,
+            state.session_queue,
+        )
     })?;
     Ok(result)
 }
@@ -295,6 +327,7 @@ fn next_node_for_index(
     snapshot: &TcpInputSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<TcpInputHandoff>,
+    session_queue: Option<SessionQueueHandle>,
 ) -> CoreResult<Option<NodeId>> {
     let parsed = match parse_tcp_input(runtime, index)? {
         Ok(parsed) => parsed,
@@ -324,15 +357,28 @@ fn next_node_for_index(
         }
     };
 
+    if let Some(session) = session_input_entry(session_queue, &parsed)? {
+        if let Some(handoff) = handoff
+            && session.owner != handoff.current_worker()
+        {
+            runtime.handoff_index(session.owner, handoff.tcp_input, index)?;
+            return Ok(None);
+        }
+        return resolve_success_next(
+            runtime,
+            index,
+            next,
+            session.next,
+            parsed.version,
+            parsed.protocol,
+            parsed.source_port,
+            parsed.destination_port,
+            parsed.flags.bits(),
+        );
+    }
+
     let metadata = runtime.metadata(index)?;
     let lookup = lookup_for_packet(&metadata, &snapshot.lookup, &parsed);
-    if let Some(owner) = lookup_owner(lookup)
-        && let Some(handoff) = handoff
-        && owner != handoff.current_worker()
-    {
-        runtime.handoff_index(owner, handoff.tcp_input, index)?;
-        return Ok(None);
-    }
     let entry = tcp_listener_input_entry(parsed.flags);
     if let Some(error) = entry.error {
         return resolve_error_next(
@@ -346,17 +392,54 @@ fn next_node_for_index(
             parsed.flags.bits(),
         );
     }
+    let Some(_listener) = lookup else {
+        return resolve_error_next(
+            runtime,
+            index,
+            next,
+            TcpInputNext::Punt,
+            TcpInputError::ConnectionClosed,
+            Some(parsed.version),
+            Some(parsed.protocol),
+            parsed.flags.bits(),
+        );
+    };
+    resolve_success_next(
+        runtime,
+        index,
+        next,
+        entry.next,
+        parsed.version,
+        parsed.protocol,
+        parsed.source_port,
+        parsed.destination_port,
+        parsed.flags.bits(),
+    )
+}
+
+#[inline(always)]
+fn resolve_success_next(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    next: &[NodeId; TcpInputNext::COUNT],
+    next_key: TcpInputNext,
+    version: IpVersion,
+    protocol: IpProtocol,
+    source_port: u16,
+    destination_port: u16,
+    flags: u8,
+) -> CoreResult<Option<NodeId>> {
     clear_success_metadata(runtime, index)?;
-    let resolved = NodeNextStorage::next(next, entry.next);
+    let resolved = NodeNextStorage::next(next, next_key);
     add_packet_trace!(
         runtime,
         index,
         TcpInputTrace {
-            version: Some(parsed.version),
-            protocol: Some(parsed.protocol),
-            source_port: Some(parsed.source_port),
-            destination_port: Some(parsed.destination_port),
-            flags: parsed.flags.bits(),
+            version: Some(version),
+            protocol: Some(protocol),
+            source_port: Some(source_port),
+            destination_port: Some(destination_port),
+            flags,
             error: None,
             next: resolved,
         },
@@ -393,15 +476,55 @@ fn resolve_error_next(
     Ok(Some(resolved))
 }
 
-#[inline(always)]
-fn lookup_owner(lookup: Option<TcpLookupValue>) -> Option<DataWorkerId> {
-    lookup.map(|value| value.owner_worker)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpInputEntry {
     next: TcpInputNext,
     error: Option<TcpInputError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpSessionInputEntry {
+    owner: DataWorkerId,
+    next: TcpInputNext,
+}
+
+fn session_input_entry(
+    session_queue: Option<SessionQueueHandle>,
+    parsed: &ParsedTcpInput,
+) -> CoreResult<Option<TcpSessionInputEntry>> {
+    let Some(handle) = session_queue else {
+        return Ok(None);
+    };
+    let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
+    let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
+    TcpSessionProtocol::with_queue(handle, |runtime| {
+        let Some(session_id) = runtime.program().session_id_by_tuple(local, remote) else {
+            return Ok(None);
+        };
+        let Some(session) = runtime.session_state(session_id) else {
+            return Ok(None);
+        };
+        Ok(Some(TcpSessionInputEntry {
+            owner: session.owner_worker(),
+            next: tcp_session_input_next(session.state()),
+        }))
+    })
+}
+
+#[inline(always)]
+fn tcp_session_input_next(state: TcpState) -> TcpInputNext {
+    match state {
+        TcpState::SynSent => TcpInputNext::SynSent,
+        TcpState::SynRcvd
+        | TcpState::FinWait1
+        | TcpState::FinWait2
+        | TcpState::CloseWait
+        | TcpState::Closing
+        | TcpState::LastAck
+        | TcpState::TimeWait => TcpInputNext::RcvProcess,
+        TcpState::Established => TcpInputNext::Established,
+        TcpState::Closed | TcpState::Listen => TcpInputNext::Drop,
+    }
 }
 
 #[inline(always)]
@@ -491,50 +614,46 @@ fn parse_tcp_input(
         .ok_or_else(|| CoreError::internal("invalid TCP packet length"))?;
     let source_ip = source_ip(parsed.version, packet)?;
     let destination_ip = destination_ip(parsed.version, packet)?;
-    let header = packet
+    let transport = packet
         .get(cursor.transport_header_offset()..)
         .ok_or_else(|| CoreError::internal("missing TCP header"))?;
-    if header.len() < TCP_HEADER_MIN_LEN {
-        return Ok(Err(TcpInputParseError::BadLength));
-    }
-    let source_port = u16::from_be_bytes([header[0], header[1]]);
-    let destination_port = u16::from_be_bytes([header[2], header[3]]);
-    let header_len = ((header[12] >> 4) as usize) * 4;
-    if header_len < TCP_HEADER_MIN_LEN
-        || cursor.transport_header_offset() + header_len > cursor.packet_len()
-    {
-        return Ok(Err(TcpInputParseError::BadLength));
-    }
-    let flags = tcp_flags_from_byte(header[13]);
+    let segment = match TcpSegmentView::parse(transport) {
+        Ok(segment) => segment,
+        Err(
+            TcpSegmentParseError::ShortHeader
+            | TcpSegmentParseError::BadDataOffset
+            | TcpSegmentParseError::InvalidSlice,
+        ) => return Ok(Err(TcpInputParseError::BadLength)),
+    };
     Ok(Ok(ParsedTcpInput {
         version: parsed.version,
         protocol: parsed.protocol,
         source_ip,
         destination_ip,
-        source_port,
-        destination_port,
-        flags,
+        source_port: segment.source_port(),
+        destination_port: segment.destination_port(),
+        flags: tcp_input_flags(segment.flags()),
     }))
 }
 
 #[inline(always)]
 fn valid_tcp_cursor(cursor: BufferPacketCursor) -> bool {
-    cursor.packet_len() >= cursor.transport_header_offset() + TCP_HEADER_MIN_LEN
+    cursor.packet_len() >= cursor.transport_header_offset()
 }
 
 #[inline(always)]
-fn tcp_flags_from_byte(flags: u8) -> TcpInputFlags {
+fn tcp_input_flags(flags: TcpSegmentFlags) -> TcpInputFlags {
     let mut parsed = TcpInputFlags::empty();
-    if flags & 0x01 != 0 {
+    if flags.contains(TcpSegmentFlags::FIN) {
         parsed |= TcpInputFlags::FIN;
     }
-    if flags & 0x02 != 0 {
+    if flags.contains(TcpSegmentFlags::SYN) {
         parsed |= TcpInputFlags::SYN;
     }
-    if flags & 0x04 != 0 {
+    if flags.contains(TcpSegmentFlags::RST) {
         parsed |= TcpInputFlags::RST;
     }
-    if flags & 0x10 != 0 {
+    if flags.contains(TcpSegmentFlags::ACK) {
         parsed |= TcpInputFlags::ACK;
     }
     parsed

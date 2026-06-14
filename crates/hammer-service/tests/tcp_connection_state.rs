@@ -1,9 +1,10 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, RouteMetadata};
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpState};
-use hammer_service::session::protocol::tcp::state::{TcpSessionState, TcpSessionTable};
+use hammer_service::session::SessionId;
+use hammer_service::session::protocol::tcp::state::{TcpSessionIndex, TcpSessionState};
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpLookupId, TcpOutputRecord,
@@ -253,58 +254,85 @@ fn tcp_session_state_output_state_advertises_scaled_receive_window() {
 }
 
 #[test]
-fn tcp_connection_table_resolves_by_lookup_and_connection_id() {
+fn tcp_session_index_resolves_lookup_id_connection_id_and_tuple_to_session_id() {
     let first = connection(11, TcpConnectionId::new(101), 50_011);
     let second = connection(12, TcpConnectionId::new(102), 50_012);
-    let mut table = TcpSessionTable::empty();
+    let first_session = SessionId::new(1_011);
+    let second_session = SessionId::new(1_012);
+    let first_local = first.local().expect("first local socket");
+    let first_remote = first.remote();
+    let second_local = second.local().expect("second local socket");
+    let second_remote = second.remote();
+    let mut index = TcpSessionIndex::empty();
 
-    table.insert(first);
-    table.insert(second);
+    index.insert(first_session, &first);
+    index.insert(second_session, &second);
 
     assert_eq!(
-        table
-            .lookup_by_lookup_id(11)
-            .expect("lookup connection")
-            .local_port(),
-        50_011
+        index.lookup_by_lookup_id(11).expect("lookup connection"),
+        first_session
     );
     assert_eq!(
-        table
+        index
             .lookup_by_connection_id(TcpConnectionId::new(102))
-            .expect("id connection")
-            .local_port(),
-        50_012
+            .expect("id connection"),
+        second_session
+    );
+    assert_eq!(
+        index
+            .lookup_by_tuple(first_local, first_remote)
+            .expect("tuple connection"),
+        first_session
     );
 
-    let next_output_at = Instant::now() + Duration::from_millis(10);
-    let record = output_record(11, TcpConnectionId::new(101));
-    let by_lookup = table
-        .lookup_by_lookup_id_mut(11)
-        .expect("mutable lookup connection");
-    by_lookup.set_send_state(1_000, 2_440, 32_768);
-    by_lookup.set_next_output_at(Some(next_output_at));
-    by_lookup.retransmit_queue_mut().track_output(&record);
+    index.remove_session(first_session);
+    assert!(index.lookup_by_lookup_id(11).is_none());
+    assert!(index
+        .lookup_by_connection_id(TcpConnectionId::new(101))
+        .is_none());
+    assert!(index.lookup_by_tuple(first_local, first_remote).is_none());
+    assert_eq!(
+        index
+            .lookup_by_tuple(second_local, second_remote)
+            .expect("second tuple remains"),
+        second_session
+    );
+}
 
-    let by_id = table
-        .lookup_by_connection_id_mut(TcpConnectionId::new(102))
-        .expect("mutable id connection");
-    by_id.set_send_state(2_000, 3_000, 16_384);
+#[test]
+fn tcp_session_index_resolves_ipv6_tuple_without_compressing_key() {
+    let local = SocketAddr::new(
+        IpAddr::V6("2001:db8:200::10".parse::<Ipv6Addr>().expect("local")),
+        50_123,
+    );
+    let remote = SocketAddr::new(
+        IpAddr::V6("2001:db8:100::20".parse::<Ipv6Addr>().expect("remote")),
+        443,
+    );
+    let session = TcpSessionState::new(
+        22,
+        Some(TcpConnectionId::new(202)),
+        DataWorkerId::new(0),
+        TcpState::Established,
+        local.port(),
+        Some(local),
+        remote,
+    );
+    let session_id = SessionId::new(2_022);
+    let mut index = TcpSessionIndex::empty();
 
-    let resolved = table
-        .lookup_by_lookup_id(11)
-        .expect("updated lookup connection");
-    assert_eq!(resolved.lookup_id(), 11);
-    assert_eq!(resolved.connection_id(), Some(TcpConnectionId::new(101)));
-    assert_eq!(resolved.snd_una(), 1_000);
-    assert_eq!(resolved.snd_nxt(), 2_440);
-    assert_eq!(resolved.snd_wnd(), 32_768);
-    assert_eq!(resolved.next_output_at(), Some(next_output_at));
-    assert_eq!(resolved.retransmit_queue().len(), 1);
+    index.insert(session_id, &session);
 
-    let resolved_by_id = table
-        .lookup_by_connection_id(TcpConnectionId::new(102))
-        .expect("updated id connection");
-    assert_eq!(resolved_by_id.snd_una(), 2_000);
-    assert_eq!(resolved_by_id.snd_nxt(), 3_000);
-    assert_eq!(resolved_by_id.snd_wnd(), 16_384);
+    assert_eq!(
+        index
+            .lookup_by_tuple(local, remote)
+            .expect("IPv6 tuple lookup"),
+        session_id
+    );
+    assert!(index
+        .lookup_by_tuple(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)), local.port()),
+            remote
+        )
+        .is_none());
 }

@@ -10,9 +10,9 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::tcp::{
-    TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpInputNode,
-    TcpIpv4ListenerAddress, TcpListenNext, TcpListenNode, TcpResetNext, TcpResetNode,
-    TcpV4ListenerKey, TcpWorkerOwnedState,
+    TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpIpv4ListenerAddress,
+    TcpListenNext, TcpListenNode, TcpResetNext, TcpResetNode, TcpV4ListenerKey,
+    TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -131,6 +131,15 @@ fn ip_local_routes_tcp_packets_into_tcp_input_listen_next() {
         graph.drop,
     ));
     let local = runtime.nodes().register_internal(local_control.node());
+    let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    owner.insert_listener::<TcpIpv4ListenerAddress>(
+        TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), LISTEN_PORT),
+        LISTENER_ID,
+    );
+    graph
+        .tcp_control
+        .publish_lookup(owner.publish_snapshot())
+        .expect("publish listener snapshot");
     let packet = ipv4_tcp_packet(
         Ipv4Addr::new(10, 0, 0, 1),
         50_001,
@@ -222,7 +231,7 @@ fn tcp_input_routes_listen_ack_to_reset_node() {
 }
 
 #[test]
-fn tcp_input_handoffs_listener_packets_to_listener_owner_worker() {
+fn tcp_input_routes_listener_syn_locally_without_handoff() {
     const TCP_INPUT_HANDLE: NodeHandle = NodeHandle::new(42);
 
     let handoff = DataPlaneHandoff::new(2, 8);
@@ -280,17 +289,14 @@ fn tcp_input_handoffs_listener_packets_to_listener_owner_worker() {
             .expect("schedule first")
     );
 
-    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 1);
-    assert_eq!(second_runtime.run_ready_nodes().expect("run second"), 3);
-    assert!(
-        first_graph.listen_state.lock().unwrap().packets.is_empty(),
-        "listener packet must not be processed on non-owner worker"
-    );
-    assert_capture_packets(&second_graph.listen_state, &[packet]);
-    let state = second_graph.listen_state.lock().unwrap();
+    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 3);
+    assert_eq!(second_runtime.run_ready_nodes().expect("run second"), 0);
+    assert_capture_packets(&first_graph.listen_state, &[packet]);
+    assert!(second_graph.listen_state.lock().unwrap().packets.is_empty());
+    let state = first_graph.listen_state.lock().unwrap();
     assert_eq!(
         state.handoff_source_workers,
-        vec![Some(DataWorkerId::new(0))]
+        vec![None]
     );
     assert_metadata(
         &state.metadata[0],
@@ -352,12 +358,10 @@ impl TcpGraph {
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
             drop, punt, listen, drop, drop, drop, reset,
         ));
-        let tcp_node: TcpInputNode = match handoff {
-            Some((handle, worker)) => tcp_control
-                .node()
-                .with_handoff(TcpInputHandoff::new(handle, worker)),
-            None => tcp_control.node(),
-        };
+        let mut tcp_node = tcp_control.node();
+        if let Some((handle, worker)) = handoff {
+            tcp_node = tcp_node.with_handoff(TcpInputHandoff::new(handle, worker));
+        }
         assert_internal_node(&tcp_node);
         let tcp_input = match handoff {
             Some((handle, _)) => runtime

@@ -14,6 +14,11 @@ pub struct Index {
 
 impl Index {
     #[inline(always)]
+    pub const fn new(slot: u32, generation: u32) -> Self {
+        Self { slot, generation }
+    }
+
+    #[inline(always)]
     pub const fn slot(self) -> u32 {
         self.slot
     }
@@ -137,6 +142,14 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     }
 
     #[inline]
+    pub fn iter(&self) -> PoolIter<'_, T, ALIGN> {
+        PoolIter {
+            pool: self,
+            next_slot: 0,
+        }
+    }
+
+    #[inline]
     pub fn slot_ptr(&self, index: Index) -> Option<*const T> {
         self.validate(index)
             .map(|slot| self.slot_ptr_unchecked(slot).cast_const())
@@ -153,6 +166,29 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     fn slot_ptr_unchecked(&self, slot: usize) -> *mut T {
         debug_assert!(slot < self.capacity);
         unsafe { self.ptr.as_ptr().add(slot * self.stride).cast::<T>() }
+    }
+}
+
+pub struct PoolIter<'a, T, const ALIGN: usize = CACHE_LINE> {
+    pool: &'a Pool<T, ALIGN>,
+    next_slot: usize,
+}
+
+impl<'a, T, const ALIGN: usize> Iterator for PoolIter<'a, T, ALIGN> {
+    type Item = (Index, &'a T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next_slot < self.pool.capacity {
+            let slot = self.next_slot;
+            self.next_slot += 1;
+            if !self.pool.allocated[slot] {
+                continue;
+            }
+            let index = Index::new(slot as u32, self.pool.generations[slot]);
+            let value = unsafe { &*self.pool.slot_ptr_unchecked(slot) };
+            return Some((index, value));
+        }
+        None
     }
 }
 
