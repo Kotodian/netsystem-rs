@@ -8,8 +8,7 @@ use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpState};
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::output::{TCP_FLAG_ACK, tcp_output_packet_flags};
-use super::segment::parse_tcp_packet;
+use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -133,8 +132,13 @@ fn tcp_established_index(
             connection.set_state(TcpState::CloseWait);
         }
         if ack {
-            let record = tcp_output_packet_flags(connection, packet.local, &[], TCP_FLAG_ACK)?;
-            let allocated = record.alloc_finalized_header_buffer(runtime)?;
+            let (allocated, _, _) = alloc_tcp_segment_for_connection(
+                runtime.packet_buffers(),
+                connection,
+                packet.local,
+                TcpSegmentFlags::ACK,
+                0,
+            )?;
             output_index = Some(allocated);
         }
         let indexed = connection.clone();

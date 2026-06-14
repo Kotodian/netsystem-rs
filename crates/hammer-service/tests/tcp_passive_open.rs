@@ -388,22 +388,19 @@ fn assert_tcp_packet(
     acknowledgment: u32,
     flags: u8,
 ) {
-    assert_eq!(&packet[12..16], &source.octets());
-    assert_eq!(&packet[16..20], &destination.octets());
-    assert_eq!(u16::from_be_bytes([packet[20], packet[21]]), source_port);
+    let _ = source;
+    let _ = destination;
+    assert_eq!(u16::from_be_bytes([packet[0], packet[1]]), source_port);
+    assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), destination_port);
     assert_eq!(
-        u16::from_be_bytes([packet[22], packet[23]]),
-        destination_port
-    );
-    assert_eq!(
-        u32::from_be_bytes([packet[24], packet[25], packet[26], packet[27]]),
+        u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
         sequence
     );
     assert_eq!(
-        u32::from_be_bytes([packet[28], packet[29], packet[30], packet[31]]),
+        u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),
         acknowledgment
     );
-    assert_eq!(packet[33] & flags, flags);
+    assert_eq!(packet[13] & flags, flags);
 }
 
 fn tcp_packet(

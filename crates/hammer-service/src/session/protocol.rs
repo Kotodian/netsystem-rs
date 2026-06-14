@@ -1,4 +1,4 @@
-use hammer_adapter::DataWorkerId;
+use hammer_adapter::{DataPlaneBuffers, DataWorkerId};
 use hammer_core::error::CoreResult;
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
@@ -76,5 +76,10 @@ impl<'a, S> SessionProtocolContext<'a, S> {
     #[inline]
     pub fn app_mut(&mut self) -> &mut SessionAppRuntime {
         self.driver.app_mut()
+    }
+
+    #[inline]
+    pub fn buffers(&self) -> &DataPlaneBuffers {
+        self.driver.buffers()
     }
 }

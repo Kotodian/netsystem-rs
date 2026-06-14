@@ -1,17 +1,15 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{DataWorkerId, RouteMetadata};
+use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
+use hammer_service::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::congestion_control::{
     TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
     TcpCongestionSendObservation,
 };
 use hammer_service::transport::tcp::connection::TcpConnectionState;
-use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpOutputRecord,
-};
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
@@ -30,38 +28,21 @@ fn connection() -> TcpConnectionState {
     connection
 }
 
-fn record(sequence: u32, payload: &[u8]) -> TcpOutputRecord {
-    let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
-    let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-    TcpOutputRecord {
-        connection_id: TcpConnectionId::new(7001),
-        local,
-        remote,
-        sequence,
-        acknowledgment: 2000,
-        flags: TCP_FLAG_ACK | TCP_FLAG_PSH,
-        advertised_window: 4096,
-        payload_len: payload.len(),
-        metadata: RouteMetadata::default(),
-    }
-}
-
 #[test]
 fn tcp_congestion_node_updates_one_connection_from_ack_sample() {
     let now = Instant::now();
     let mut connection = connection();
-    let sent = record(1000, &[1; DEFAULT_TCP_OUTPUT_PAYLOAD_LEN]);
-    connection
-        .retransmit_queue_mut()
-        .track_output_with_sent_at(&sent, now - Duration::from_millis(20));
-    connection.set_send_state(1000, sent.next_send_sequence(), 65_535);
+    let accepted_acknowledgment = 1000 + TEST_SEGMENT_LEN;
+    connection.set_send_state(1000, accepted_acknowledgment, 65_535);
 
     let before = connection.congestion().congestion_window();
 
     TcpCongestionControlNode::observe_ack(
         &mut connection,
         TcpCongestionAckObservation {
-            accepted_acknowledgment: sent.next_send_sequence(),
+            accepted_acknowledgment,
+            bytes_acked: TEST_SEGMENT_LEN,
+            rtt: Duration::from_millis(20),
             now,
         },
     )

@@ -8,7 +8,6 @@ use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::connection::TcpConnectionState;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpConnectionTimerKind, TcpSessionConnectionIndex,
-    tcp_output_packet,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -225,9 +224,10 @@ fn tcp_connection_state_output_state_advertises_scaled_receive_window() {
     });
     connection.set_receive_state(9_000, 8_192);
 
-    let record = tcp_output_packet(&connection, local, &[]).expect("output packet");
-
-    assert_eq!(record.advertised_window, 512);
+    assert_eq!(
+        connection.advertised_receive_window(connection.rcv_wnd()),
+        512
+    );
 }
 
 #[test]

@@ -1,13 +1,22 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hammer_adapter::{BufferIndex, DataPlaneRuntime};
+use hammer_adapter::{
+    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, Network, RouteMetadata, SocksAddr,
+};
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView,
+    TcpCapabilities, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError, TcpSegmentView,
     tcp_capabilities_from_options,
 };
 
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
+
+use super::connection::TcpConnectionState;
+use super::output::{
+    tcp_output_acknowledgment, tcp_output_next_sequence, tcp_output_sequence,
+    tcp_output_sequence_len,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct TcpPacket {
@@ -83,6 +92,65 @@ pub(crate) fn parse_tcp_packet(
         payload_offset,
         payload_len,
     })
+}
+
+pub(crate) fn alloc_tcp_segment(
+    buffers: &DataPlaneBuffers,
+    metadata: RouteMetadata,
+    header: TcpSegmentHeader,
+) -> CoreResult<BufferIndex> {
+    let index = buffers.alloc_index(metadata)?;
+    let result = (|| {
+        let mut buffer = buffers.get_buffer_mut(index)?;
+        let output = buffer.writable_tail_mut();
+        let written = write_tcp_segment_header(output, header)?;
+        buffer.commit_writable_tail(written)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    Ok(index)
+}
+
+pub(crate) fn alloc_tcp_segment_for_connection(
+    buffers: &DataPlaneBuffers,
+    connection: &TcpConnectionState,
+    local: SocketAddr,
+    flags: TcpSegmentFlags,
+    payload_len: usize,
+) -> CoreResult<(BufferIndex, u32, u32)> {
+    let flags_bits = flags.bits();
+    let sequence = tcp_output_sequence(connection, flags_bits);
+    let sequence_len = tcp_output_sequence_len(flags_bits, payload_len);
+    let index = alloc_tcp_segment(
+        buffers,
+        tcp_segment_metadata(local, connection.remote()),
+        TcpSegmentHeader {
+            source_port: local.port(),
+            destination_port: connection.remote().port(),
+            sequence_number: sequence,
+            acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
+            flags,
+            advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
+            capabilities: connection.local_capabilities(),
+        },
+    )?;
+    Ok((
+        index,
+        sequence,
+        tcp_output_next_sequence(sequence, sequence_len),
+    ))
+}
+
+pub(crate) fn tcp_segment_metadata(local: SocketAddr, remote: SocketAddr) -> RouteMetadata {
+    RouteMetadata {
+        network: Network::Tcp,
+        source: Some(SocksAddr::ip(local.ip(), local.port())),
+        destination: Some(SocksAddr::ip(remote.ip(), remote.port())),
+        ..RouteMetadata::default()
+    }
 }
 
 fn source_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {

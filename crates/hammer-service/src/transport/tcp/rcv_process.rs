@@ -8,8 +8,7 @@ use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpState};
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::output::{TCP_FLAG_ACK, tcp_output_packet_flags};
-use super::segment::parse_tcp_packet;
+use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -135,8 +134,13 @@ fn tcp_rcv_process_index(
             }
             connection.apply_ack(acknowledgment, packet.advertised_window);
             connection.set_state(TcpState::Established);
-            let record = tcp_output_packet_flags(connection, packet.local, &[], TCP_FLAG_ACK)?;
-            let allocated = record.alloc_finalized_header_buffer(runtime)?;
+            let (allocated, _, _) = alloc_tcp_segment_for_connection(
+                runtime.packet_buffers(),
+                connection,
+                packet.local,
+                TcpSegmentFlags::ACK,
+                0,
+            )?;
             output_index = Some(allocated);
             let indexed = connection.clone();
             queue.index_session(session_id, &indexed);
@@ -152,8 +156,13 @@ fn tcp_rcv_process_index(
                     return Err(CoreError::internal("tcp FIN sequence is unacceptable"));
                 }
                 connection.set_state(TcpState::CloseWait);
-                let record = tcp_output_packet_flags(connection, packet.local, &[], TCP_FLAG_ACK)?;
-                let allocated = record.alloc_finalized_header_buffer(runtime)?;
+                let (allocated, _, _) = alloc_tcp_segment_for_connection(
+                    runtime.packet_buffers(),
+                    connection,
+                    packet.local,
+                    TcpSegmentFlags::ACK,
+                    0,
+                )?;
                 output_index = Some(allocated);
                 let indexed = connection.clone();
                 queue.index_session(session_id, &indexed);

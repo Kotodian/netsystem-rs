@@ -39,8 +39,7 @@ pub use lookup::{
 };
 pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
-    TcpOutputNode, TcpOutputRecord, TcpOutputRetransmitQueue, TcpOutputRetransmitRecord,
-    TcpOutputSendView, tcp_output_packet, tcp_output_packet_flags, tcp_output_packet_len,
+    TcpOutputNext, TcpOutputNode, TcpOutputSendView,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reply::{

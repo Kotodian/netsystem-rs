@@ -3,8 +3,8 @@ use std::thread::LocalKey;
 use std::time::Instant;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeRegistration, NodeResult,
-    NodeRuntimeData,
+    BufferFrame, BufferIndex, DataPlaneRuntime, DriverNode, Node, NodeId, NodeNextFrames,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -26,22 +26,44 @@ impl SessionQueueHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionQueueNext(usize);
+pub struct SessionQueueNext(NodeId);
 
 impl SessionQueueNext {
     #[inline]
-    pub const fn from_slot(slot: usize) -> Self {
-        Self(slot)
+    pub const fn from_node(node: NodeId) -> Self {
+        Self(node)
     }
 
     #[inline]
-    pub const fn slot(self) -> usize {
+    pub const fn node(self) -> NodeId {
         self.0
     }
 }
 
 pub type SessionQueueDispatchFn =
-    fn(SessionQueueHandle, SessionQueueNext, Instant) -> CoreResult<()>;
+    fn(&DataPlaneRuntime, SessionQueueHandle, SessionQueueNext, Instant) -> CoreResult<()>;
+
+#[derive(Default)]
+pub(crate) struct SessionQueueOutput {
+    frames: NodeNextFrames,
+}
+
+impl SessionQueueOutput {
+    #[inline]
+    pub(crate) fn enqueue(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        node: NodeId,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        self.frames.enqueue(runtime, node, index)
+    }
+
+    #[inline]
+    pub(crate) fn schedule(self, runtime: &DataPlaneRuntime) -> CoreResult<()> {
+        self.frames.schedule(runtime)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct SessionQueueAttachment {
@@ -126,7 +148,7 @@ impl DriverNode for SessionQueueNode {
 }
 
 fn session_queue_node_process(
-    _runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
@@ -143,7 +165,7 @@ fn session_queue_node_process(
     })?;
     let now = Instant::now();
     for attachment in attachments {
-        (attachment.dispatch)(attachment.handle, attachment.output_next, now)?;
+        (attachment.dispatch)(runtime, attachment.handle, attachment.output_next, now)?;
     }
     Ok(NodeResult::drop())
 }

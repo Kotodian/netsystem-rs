@@ -113,6 +113,46 @@ pub fn tcp_options_from_bytes(options: &[u8]) -> ParsedTcpOptions {
     parsed
 }
 
+pub(crate) fn tcp_syn_options_from_capabilities(
+    capabilities: TcpCapabilities,
+) -> std::vec::Vec<u8> {
+    let mut options = std::vec::Vec::new();
+    if let Some(max_segment_size) = capabilities.max_segment_size {
+        options.extend([TCP_OPTION_MSS, TCP_OPTION_MSS_LEN as u8]);
+        options.extend(max_segment_size.to_be_bytes());
+    }
+    if let Some(window_scale) = capabilities.window_scale {
+        options.extend([
+            TCP_OPTION_NOP,
+            TCP_OPTION_WINDOW_SCALE,
+            TCP_OPTION_WINDOW_SCALE_LEN as u8,
+            window_scale.min(TCP_MAX_WINDOW_SCALE),
+        ]);
+    }
+    if capabilities.sack {
+        options.extend([
+            TCP_OPTION_NOP,
+            TCP_OPTION_NOP,
+            TCP_OPTION_SACK_PERMITTED,
+            TCP_OPTION_SACK_PERMITTED_LEN as u8,
+        ]);
+    }
+    if capabilities.timestamps {
+        options.extend([
+            TCP_OPTION_NOP,
+            TCP_OPTION_NOP,
+            TCP_OPTION_TIMESTAMPS,
+            TCP_OPTION_TIMESTAMPS_LEN as u8,
+        ]);
+        options.extend(0u32.to_be_bytes());
+        options.extend(0u32.to_be_bytes());
+    }
+    while options.len() % 4 != 0 {
+        options.push(TCP_OPTION_EOL);
+    }
+    options
+}
+
 #[inline]
 fn is_valid_sack_option_len(len: usize) -> bool {
     len > 2 && (len - 2) % TCP_OPTION_SACK_BLOCK_BYTES == 0

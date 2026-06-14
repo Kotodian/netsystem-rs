@@ -9,8 +9,7 @@ use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
 use super::connection::TcpConnectionState;
-use super::output::{TCP_FLAG_ACK, TCP_FLAG_SYN, tcp_output_packet_flags};
-use super::segment::parse_tcp_packet;
+use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
@@ -124,15 +123,14 @@ fn tcp_listen_index(
             .session_state_mut(session_id)
             .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?;
         connection.set_connection_id(connection_id);
-        let record =
-            tcp_output_packet_flags(connection, packet.local, &[], TCP_FLAG_SYN | TCP_FLAG_ACK)?;
-        connection.retransmit_queue_mut().track_output(&record);
-        connection.set_send_state(
-            connection.snd_una(),
-            record.next_send_sequence(),
-            connection.snd_wnd(),
-        );
-        let allocated = record.alloc_finalized_header_buffer(runtime)?;
+        let (allocated, _sequence, next_sequence) = alloc_tcp_segment_for_connection(
+            runtime.packet_buffers(),
+            connection,
+            packet.local,
+            TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+            0,
+        )?;
+        connection.set_send_state(connection.snd_una(), next_sequence, connection.snd_wnd());
         output_index = Some(allocated);
         let indexed = connection.clone();
         queue.index_session(session_id, &indexed);

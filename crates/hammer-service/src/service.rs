@@ -44,11 +44,13 @@ use std::time::Duration;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 use crate::app::AppHost;
+use crate::data_plane::DropNode;
+use crate::net::{FibTableBuilder, IpLookupControlPlane};
 use crate::session::{SessionQueueNext, SessionQueueNode};
 use crate::transport::tcp::{
     TcpInputControlPlane, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpListenerAddress, TcpListenerLookupAccess, TcpLookupId, TcpLookupSnapshot, TcpLookupValue,
-    TcpOutputNode, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
+    TcpOutputNext, TcpOutputNode, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 use crate::{DnsRouter, DnsTransportManager, Router};
 
@@ -1017,9 +1019,19 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
     data_context
         .install_on_workers(|worker, runtime| {
             let worker = worker_id(worker)?;
+            let drop = runtime
+                .nodes()
+                .try_register_internal(DropNode::new())
+                .map_err(HammerError::from)?;
+            let lookup = runtime
+                .nodes()
+                .try_register_internal(
+                    IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node(),
+                )
+                .map_err(HammerError::from)?;
             let tcp_output = runtime
                 .nodes()
-                .try_register_internal(TcpOutputNode::new())
+                .try_register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)))
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
             let queue =
@@ -1029,14 +1041,10 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .nodes()
                 .try_register_driver(session_queue_node.clone())
                 .map_err(HammerError::from)?;
-            let tcp_output_next = runtime
-                .nodes()
-                .add_node_next_slot(node, tcp_output)
-                .map_err(HammerError::from)?;
             session_queue_node
                 .attach_queue(
                     queue,
-                    SessionQueueNext::from_slot(tcp_output_next),
+                    SessionQueueNext::from_node(tcp_output),
                     TcpSessionProtocol::session_queue_dispatch_fn(),
                 )
                 .map_err(HammerError::from)?;

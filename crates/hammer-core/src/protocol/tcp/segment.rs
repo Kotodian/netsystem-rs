@@ -1,4 +1,5 @@
-use super::TcpSegmentFlags;
+use super::{TcpCapabilities, TcpSegmentFlags};
+use crate::error::{CoreError, CoreResult};
 
 const TCP_HEADER_MIN_LEN: usize = 20;
 
@@ -20,6 +21,17 @@ pub struct TcpSegmentView<'a> {
     header_len: usize,
     options: &'a [u8],
     payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpSegmentHeader {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub sequence_number: u32,
+    pub acknowledgment_number: u32,
+    pub flags: TcpSegmentFlags,
+    pub advertised_window: u16,
+    pub capabilities: TcpCapabilities,
 }
 
 impl<'a> TcpSegmentView<'a> {
@@ -89,6 +101,32 @@ impl<'a> TcpSegmentView<'a> {
     pub const fn payload(self) -> &'a [u8] {
         self.payload
     }
+}
+
+pub fn write_tcp_segment_header(output: &mut [u8], header: TcpSegmentHeader) -> CoreResult<usize> {
+    let options = if header.flags.contains(TcpSegmentFlags::SYN) {
+        super::options::tcp_syn_options_from_capabilities(header.capabilities)
+    } else {
+        std::vec::Vec::new()
+    };
+    let header_len = TCP_HEADER_MIN_LEN + options.len();
+    if output.len() < header_len {
+        return Err(CoreError::internal(format!(
+            "tcp segment output too small: {} < {}",
+            output.len(),
+            header_len
+        )));
+    }
+    output[..header_len].fill(0);
+    output[0..2].copy_from_slice(&header.source_port.to_be_bytes());
+    output[2..4].copy_from_slice(&header.destination_port.to_be_bytes());
+    output[4..8].copy_from_slice(&header.sequence_number.to_be_bytes());
+    output[8..12].copy_from_slice(&header.acknowledgment_number.to_be_bytes());
+    output[12] = ((header_len / 4) as u8) << 4;
+    output[13] = header.flags.bits();
+    output[14..16].copy_from_slice(&header.advertised_window.to_be_bytes());
+    output[TCP_HEADER_MIN_LEN..header_len].copy_from_slice(&options);
+    Ok(header_len)
 }
 
 fn tcp_segment_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpSegmentParseError {

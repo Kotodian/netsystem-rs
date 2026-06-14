@@ -7,8 +7,7 @@ use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiated
 use super::TcpState;
 use super::congestion::TcpCongestionState;
 use super::output::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
-    tcp_effective_output_payload_len,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputSendView, tcp_effective_output_payload_len,
 };
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
@@ -214,7 +213,6 @@ pub struct TcpConnectionState {
     rcv_wnd: u32,
     options: TcpConnectionOptionState,
     output_payload_len: usize,
-    retransmit_queue: TcpOutputRetransmitQueue,
     retransmit_timeout: TcpRetransmitTimeoutState,
     congestion: TcpCongestionState,
     active_timers: u8,
@@ -265,7 +263,6 @@ impl TcpConnectionState {
             rcv_wnd: DEFAULT_TCP_WINDOW,
             options: TcpConnectionOptionState::default(),
             output_payload_len: tcp_effective_output_payload_len(None),
-            retransmit_queue: TcpOutputRetransmitQueue::new(),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
             congestion: TcpCongestionState::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
             active_timers: 0,
@@ -433,16 +430,6 @@ impl TcpConnectionState {
     }
 
     #[inline]
-    pub fn retransmit_queue(&self) -> &TcpOutputRetransmitQueue {
-        &self.retransmit_queue
-    }
-
-    #[inline]
-    pub fn retransmit_queue_mut(&mut self) -> &mut TcpOutputRetransmitQueue {
-        &mut self.retransmit_queue
-    }
-
-    #[inline]
     pub fn retransmit_timeout(&self) -> &TcpRetransmitTimeoutState {
         &self.retransmit_timeout
     }
@@ -596,7 +583,6 @@ impl TcpConnectionState {
             self.snd_una = acknowledgment;
         }
         self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
-        self.retransmit_queue.acknowledge_through(acknowledgment);
     }
 
     #[inline]

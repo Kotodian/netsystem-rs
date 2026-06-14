@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataWorkerId};
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId};
 use hammer_core::error::CoreResult;
 use hammer_infra::pool::Pool;
 use hammer_runtime::app::{AppOpId, AppRingHandle};
@@ -149,9 +149,11 @@ pub(crate) trait SessionQueueProtocol<S> {
 
     fn handle_ready_session(
         &mut self,
+        runtime: &DataPlaneRuntime,
         driver: &mut SessionDriverRuntime<S>,
         session_id: SessionId,
         output_next: crate::session::SessionQueueNext,
+        output: &mut crate::session::node::SessionQueueOutput,
     ) -> CoreResult<()>;
 }
 
@@ -305,6 +307,11 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
+    pub(crate) fn buffers(&self) -> &DataPlaneBuffers {
+        &self.buffers
+    }
+
+    #[inline]
     pub(crate) fn enqueue_rx(
         &self,
         session_id: SessionId,
@@ -353,6 +360,7 @@ impl<S> SessionDriverRuntime<S> {
 
 #[cfg(test)]
 pub(crate) fn dispatch_session_queue_for_ticks<S, P>(
+    runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<S>,
     protocol: &mut P,
     timer_ticks: u32,
@@ -362,11 +370,12 @@ where
     P: SessionQueueProtocol<S>,
 {
     let mut step = driver.poll_once_for_ticks(timer_ticks)?;
-    dispatch_session_queue_pending(driver, protocol, output_next, &mut step)?;
+    dispatch_session_queue_pending(runtime, driver, protocol, output_next, &mut step)?;
     Ok(step)
 }
 
 pub(crate) fn dispatch_session_queue_once_at<S, P>(
+    runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<S>,
     protocol: &mut P,
     now: Instant,
@@ -376,11 +385,12 @@ where
     P: SessionQueueProtocol<S>,
 {
     let mut step = driver.poll_once_at(now)?;
-    dispatch_session_queue_pending(driver, protocol, output_next, &mut step)?;
+    dispatch_session_queue_pending(runtime, driver, protocol, output_next, &mut step)?;
     Ok(step)
 }
 
 fn dispatch_session_queue_pending<S, P>(
+    runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<S>,
     protocol: &mut P,
     output_next: crate::session::SessionQueueNext,
@@ -395,9 +405,11 @@ where
     }
     let ready_sessions = driver.take_ready_sessions();
     step.ready_sessions = ready_sessions.len();
+    let mut output = crate::session::node::SessionQueueOutput::default();
     for session_id in ready_sessions {
-        protocol.handle_ready_session(driver, session_id, output_next)?;
+        protocol.handle_ready_session(runtime, driver, session_id, output_next, &mut output)?;
     }
+    output.schedule(runtime)?;
     Ok(())
 }
 

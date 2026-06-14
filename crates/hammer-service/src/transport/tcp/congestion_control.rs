@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpSeq;
@@ -9,6 +9,8 @@ use super::connection::TcpConnectionState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionAckObservation {
     pub accepted_acknowledgment: u32,
+    pub bytes_acked: u32,
+    pub rtt: Duration,
     pub now: Instant,
 }
 
@@ -32,19 +34,14 @@ impl TcpCongestionControlNode {
         connection: &mut TcpConnectionState,
         observation: TcpCongestionAckObservation,
     ) -> CoreResult<()> {
-        let sample = connection
-            .retransmit_queue_mut()
-            .acknowledge_through_with_sample(observation.accepted_acknowledgment, observation.now);
-        if let Some(rtt) = sample.latest_rtt {
-            let bytes_in_flight =
-                tcp_seq_distance(observation.accepted_acknowledgment, connection.snd_nxt());
-            connection.congestion_mut().on_ack(TcpCongestionAckSample {
-                bytes_acked: sample.bytes_acked,
-                rtt,
-                now: observation.now,
-                bytes_in_flight,
-            });
-        }
+        let bytes_in_flight =
+            tcp_seq_distance(observation.accepted_acknowledgment, connection.snd_nxt());
+        connection.congestion_mut().on_ack(TcpCongestionAckSample {
+            bytes_acked: observation.bytes_acked,
+            rtt: observation.rtt,
+            now: observation.now,
+            bytes_in_flight,
+        });
         Ok(())
     }
 
