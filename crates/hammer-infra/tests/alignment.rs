@@ -101,3 +101,26 @@ fn flat_hash_map_keeps_bucket_storage_aligned_after_rehash() {
     assert_eq!(table.get(&64).copied(), Some(999));
     assert_eq!(table.len(), 128);
 }
+
+#[test]
+fn flat_hash_map_remove_preserves_probe_cluster_lookup() {
+    let mut table = map::FlatHashTable::<u64, u32>::with_capacity(1);
+
+    for key in 0..64 {
+        table.insert(key, key as u32 + 100);
+    }
+
+    assert_eq!(table.remove(&17), Some(117));
+    assert_eq!(table.lookup(&17), None);
+    assert_eq!(table.len(), 63);
+
+    for key in 0..64 {
+        if key == 17 {
+            continue;
+        }
+        assert_eq!(table.lookup(&key), Some(key as u32 + 100));
+    }
+
+    assert_eq!(table.remove(&99), None);
+    assert_eq!(table.len(), 63);
+}

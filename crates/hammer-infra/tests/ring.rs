@@ -1,5 +1,7 @@
+use hammer_infra::align::CACHE_LINE;
 use hammer_infra::ring::{
-    CompletionDescriptor, IndexedRing, LocalRing, RingEntry, SubmissionDescriptor,
+    CompletionDescriptor, IndexedRing, LocalRing, LockFreeRing, LockFreeRingCursors,
+    LockFreeRingHeadTail, RingEntry, RingError, SubmissionDescriptor,
 };
 
 #[test]
@@ -142,4 +144,49 @@ fn indexed_ring_reuses_released_slots_after_pop() {
     assert_eq!(recycled, first);
     assert_eq!(ring.entry(recycled), Some(&"third"));
     assert_eq!(ring.entry(second), Some(&"second"));
+}
+
+#[test]
+fn lock_free_ring_sp_sc_tracks_capacity_and_wraparound() {
+    let ring = LockFreeRing::with_capacity(4).expect("ring");
+
+    assert_eq!(ring.capacity(), 3);
+    assert_eq!(ring.available_to_read(), 0);
+    assert_eq!(ring.available_to_write(), 3);
+
+    assert_eq!(ring.enqueue_sp(10), Ok(()));
+    assert_eq!(ring.enqueue_sp(11), Ok(()));
+    assert_eq!(ring.enqueue_sp(12), Ok(()));
+    assert_eq!(ring.enqueue_sp(13), Err(RingError::Full(13)));
+    assert_eq!(ring.available_to_read(), 3);
+    assert_eq!(ring.available_to_write(), 0);
+
+    assert_eq!(ring.dequeue_sc(), Some(10));
+    assert_eq!(ring.dequeue_sc(), Some(11));
+    assert_eq!(ring.available_to_read(), 1);
+    assert_eq!(ring.available_to_write(), 2);
+
+    assert_eq!(ring.enqueue_sp(13), Ok(()));
+    assert_eq!(ring.enqueue_sp(14), Ok(()));
+    assert_eq!(ring.dequeue_sc(), Some(12));
+    assert_eq!(ring.dequeue_sc(), Some(13));
+    assert_eq!(ring.dequeue_sc(), Some(14));
+    assert_eq!(ring.dequeue_sc(), None);
+}
+
+#[test]
+fn lock_free_ring_rejects_non_power_of_two_size() {
+    assert!(matches!(
+        LockFreeRing::<u64>::with_capacity(3),
+        Err(RingError::InvalidCapacity)
+    ));
+}
+
+#[test]
+fn lock_free_ring_cursors_are_split_by_cacheline() {
+    assert_eq!(std::mem::align_of::<LockFreeRingHeadTail>(), CACHE_LINE);
+    assert_eq!(std::mem::size_of::<LockFreeRingHeadTail>(), CACHE_LINE);
+    assert_eq!(std::mem::align_of::<LockFreeRingCursors>(), CACHE_LINE);
+    assert_eq!(LockFreeRingCursors::PRODUCER_CACHELINE_OFFSET, 0);
+    assert_eq!(LockFreeRingCursors::CONSUMER_CACHELINE_OFFSET, CACHE_LINE);
 }

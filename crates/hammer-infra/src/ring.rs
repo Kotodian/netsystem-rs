@@ -1,5 +1,10 @@
+use std::cell::UnsafeCell;
 use std::fmt;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::align::{CACHE_LINE, CacheLine};
+use crate::boxed::Slice;
 use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -431,6 +436,228 @@ impl<T: fmt::Debug> fmt::Debug for IndexedRing<T> {
         f.debug_struct("IndexedRing")
             .field("len", &self.len())
             .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingError<T = ()> {
+    InvalidCapacity,
+    Full(T),
+}
+
+#[repr(C, align(64))]
+pub struct LockFreeRingHeadTail {
+    head: AtomicU32,
+    tail: AtomicU32,
+    _reserved: [u8; CACHE_LINE - 8],
+}
+
+impl LockFreeRingHeadTail {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            head: AtomicU32::new(0),
+            tail: AtomicU32::new(0),
+            _reserved: [0; CACHE_LINE - 8],
+        }
+    }
+
+    #[inline]
+    pub fn head(&self) -> u32 {
+        self.head.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn tail(&self) -> u32 {
+        self.tail.load(Ordering::Acquire)
+    }
+}
+
+impl Default for LockFreeRingHeadTail {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for LockFreeRingHeadTail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockFreeRingHeadTail")
+            .field("head", &self.head())
+            .field("tail", &self.tail())
+            .finish()
+    }
+}
+
+#[repr(C)]
+pub struct LockFreeRingCursors {
+    producer: CacheLine<LockFreeRingHeadTail>,
+    consumer: CacheLine<LockFreeRingHeadTail>,
+}
+
+impl LockFreeRingCursors {
+    pub const PRODUCER_CACHELINE_OFFSET: usize = 0;
+    pub const CONSUMER_CACHELINE_OFFSET: usize = CACHE_LINE;
+
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            producer: CacheLine::new(LockFreeRingHeadTail::new()),
+            consumer: CacheLine::new(LockFreeRingHeadTail::new()),
+        }
+    }
+}
+
+impl Default for LockFreeRingCursors {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for LockFreeRingCursors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockFreeRingCursors")
+            .field("producer", &self.producer)
+            .field("consumer", &self.consumer)
+            .finish()
+    }
+}
+
+struct LockFreeRingSlot<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> LockFreeRingSlot<T> {
+    #[inline]
+    const fn uninit() -> Self {
+        Self {
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+}
+
+pub struct LockFreeRing<T: Copy> {
+    size: u32,
+    mask: u32,
+    capacity: u32,
+    cursors: LockFreeRingCursors,
+    slots: Slice<LockFreeRingSlot<T>>,
+}
+
+unsafe impl<T: Copy + Send> Send for LockFreeRing<T> {}
+unsafe impl<T: Copy + Send> Sync for LockFreeRing<T> {}
+
+impl<T: Copy> LockFreeRing<T> {
+    pub fn with_capacity(size: usize) -> Result<Self, RingError> {
+        if size < 2 || !size.is_power_of_two() || size > u32::MAX as usize {
+            return Err(RingError::InvalidCapacity);
+        }
+        let slots = Slice::from_fn(size, |_| LockFreeRingSlot::uninit());
+        Ok(Self {
+            size: size as u32,
+            mask: size as u32 - 1,
+            capacity: size as u32 - 1,
+            cursors: LockFreeRingCursors::new(),
+            slots,
+        })
+    }
+
+    #[inline]
+    pub fn ring_size(&self) -> usize {
+        self.size as usize
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.capacity as usize
+    }
+
+    #[inline]
+    pub fn available_to_read(&self) -> usize {
+        let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
+        let cons_head = self.cursors.consumer.head.load(Ordering::Relaxed);
+        prod_tail.wrapping_sub(cons_head) as usize
+    }
+
+    #[inline]
+    pub fn available_to_write(&self) -> usize {
+        let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
+        let prod_head = self.cursors.producer.head.load(Ordering::Relaxed);
+        self.mask.wrapping_add(cons_tail).wrapping_sub(prod_head) as usize
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.available_to_read() == 0
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.available_to_write() == 0
+    }
+
+    #[inline]
+    pub fn enqueue_sp(&self, value: T) -> Result<(), RingError<T>> {
+        let prod_head = self.cursors.producer.head.load(Ordering::Relaxed);
+        let cons_tail = self.cursors.consumer.tail.load(Ordering::Acquire);
+        let free_entries = self.mask.wrapping_add(cons_tail).wrapping_sub(prod_head);
+        if free_entries == 0 {
+            return Err(RingError::Full(value));
+        }
+
+        let prod_next = prod_head.wrapping_add(1);
+        self.cursors
+            .producer
+            .head
+            .store(prod_next, Ordering::Relaxed);
+        let slot = (prod_head & self.mask) as usize;
+        // SAFETY: This is the single-producer API. `free_entries > 0` reserves
+        // the slot indexed by the current producer head until producer tail is
+        // published below. The slot is inside the power-of-two ring table.
+        unsafe { (*self.slots[slot].value.get()).write(value) };
+        self.cursors
+            .producer
+            .tail
+            .store(prod_next, Ordering::Release);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn dequeue_sc(&self) -> Option<T> {
+        let cons_head = self.cursors.consumer.head.load(Ordering::Relaxed);
+        let prod_tail = self.cursors.producer.tail.load(Ordering::Acquire);
+        let entries = prod_tail.wrapping_sub(cons_head);
+        if entries == 0 {
+            return None;
+        }
+
+        let cons_next = cons_head.wrapping_add(1);
+        self.cursors
+            .consumer
+            .head
+            .store(cons_next, Ordering::Relaxed);
+        let slot = (cons_head & self.mask) as usize;
+        // SAFETY: This is the single-consumer API. `entries > 0` proves the
+        // producer published this slot before the acquire load of producer
+        // tail. `T: Copy`, so reading does not leave ownership to drop.
+        let value = unsafe { (*self.slots[slot].value.get()).assume_init_read() };
+        self.cursors
+            .consumer
+            .tail
+            .store(cons_next, Ordering::Release);
+        Some(value)
+    }
+}
+
+impl<T: Copy> fmt::Debug for LockFreeRing<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LockFreeRing")
+            .field("ring_size", &self.ring_size())
+            .field("capacity", &self.capacity())
+            .field("available_to_read", &self.available_to_read())
+            .field("available_to_write", &self.available_to_write())
             .finish()
     }
 }

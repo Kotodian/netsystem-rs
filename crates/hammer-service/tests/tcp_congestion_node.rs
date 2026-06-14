@@ -3,23 +3,22 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::{DataWorkerId, RouteMetadata};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
-use hammer_service::session::protocol::tcp::state::TcpSessionState;
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::congestion_control::{
     TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
     TcpCongestionSendObservation,
 };
+use hammer_service::transport::tcp::connection::TcpConnectionState;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_PSH, TcpOutputRecord,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
-fn connection() -> TcpSessionState {
+fn connection() -> TcpConnectionState {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-    let mut connection = TcpSessionState::new(
-        7,
+    let mut connection = TcpConnectionState::new(
         Some(TcpConnectionId::new(7001)),
         DataWorkerId::new(0),
         TcpState::Established,
@@ -35,7 +34,6 @@ fn record(sequence: u32, payload: &[u8]) -> TcpOutputRecord {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
     TcpOutputRecord {
-        lookup_id: 7,
         connection_id: TcpConnectionId::new(7001),
         local,
         remote,

@@ -1,13 +1,15 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, Network, RouteMetadata, SocksAddr};
+use hammer_adapter::{
+    BufferFrame, BufferIndex, DataPlaneBuffers, DataPlaneRuntime, InternalNode, Network, Node,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, RouteMetadata, SocksAddr,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpSeq};
 use hammer_infra::vec::Vec;
 
-use super::TcpLookupId;
-use crate::session::protocol::tcp::state::TcpSessionState;
+use super::connection::TcpConnectionState;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const IPV4_HEADER_LEN: usize = 20;
@@ -17,6 +19,54 @@ pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
 pub const TCP_FLAG_PSH: u8 = 0x08;
 pub const TCP_FLAG_ACK: u8 = 0x10;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TcpOutputNode;
+
+impl TcpOutputNode {
+    pub const NODE_NAME: &'static str = "tcp-output-node";
+
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Node for TcpOutputNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        tcp_output_node_process(runtime, NodeRuntimeData::empty(), frame)
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        tcp_output_node_process
+    }
+}
+
+impl InternalNode for TcpOutputNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next(Self::NODE_NAME, 0)
+    }
+}
+
+fn tcp_output_node_process(
+    runtime: &DataPlaneRuntime,
+    _data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let _ = runtime;
+    frame.clear();
+    Ok(NodeResult::drop())
+}
 
 #[inline]
 pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>) -> usize {
@@ -35,7 +85,6 @@ pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpOutputRecord {
-    pub lookup_id: TcpLookupId,
     pub connection_id: TcpConnectionId,
     pub local: SocketAddr,
     pub remote: SocketAddr,
@@ -111,6 +160,19 @@ impl TcpOutputRecord {
     ) -> CoreResult<()> {
         finalize_packet_checksums(buffers, index, self.local, self.remote)
     }
+
+    #[inline]
+    pub fn alloc_finalized_header_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+    ) -> CoreResult<BufferIndex> {
+        let index = self.alloc_header_buffer(buffers)?;
+        if let Err(err) = self.finalize_buffer_checksums(buffers, index) {
+            buffers.free_index(index);
+            return Err(err);
+        }
+        Ok(index)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,12 +206,12 @@ pub struct TcpOutputSendView {
 
 impl TcpOutputSendView {
     #[inline]
-    pub fn from_session(session: &TcpSessionState) -> Self {
+    pub fn from_connection(connection: &TcpConnectionState) -> Self {
         Self {
-            snd_una: session.snd_una(),
-            snd_nxt: session.snd_nxt(),
-            snd_wnd: session.snd_wnd(),
-            congestion_window: session.congestion().congestion_window(),
+            snd_una: connection.snd_una(),
+            snd_nxt: connection.snd_nxt(),
+            snd_wnd: connection.snd_wnd(),
+            congestion_window: connection.congestion().congestion_window(),
         }
     }
 }
@@ -300,12 +362,12 @@ impl TcpOutputRetransmitQueue {
 }
 
 pub fn tcp_output_packet(
-    session: &TcpSessionState,
+    connection: &TcpConnectionState,
     local: SocketAddr,
     payload: &[u8],
 ) -> CoreResult<TcpOutputRecord> {
     let flags = TCP_FLAG_ACK | u8::from(!payload.is_empty()) * TCP_FLAG_PSH;
-    tcp_output_packet_flags(session, local, payload, flags)
+    tcp_output_packet_flags(connection, local, payload, flags)
 }
 
 #[inline]
@@ -327,42 +389,41 @@ pub fn tcp_payload_len_in_send_window(
 }
 
 pub fn tcp_output_packet_flags(
-    session: &TcpSessionState,
+    connection: &TcpConnectionState,
     local: SocketAddr,
     payload: &[u8],
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(session, local, payload.len(), payload.is_empty(), flags)
+    build_packet(connection, local, payload.len(), payload.is_empty(), flags)
 }
 
 pub fn tcp_output_packet_len(
-    session: &TcpSessionState,
+    connection: &TcpConnectionState,
     local: SocketAddr,
     payload_len: usize,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    build_packet(session, local, payload_len, payload_len == 0, flags)
+    build_packet(connection, local, payload_len, payload_len == 0, flags)
 }
 
 fn build_packet(
-    session: &TcpSessionState,
+    connection: &TcpConnectionState,
     local: SocketAddr,
     payload_len: usize,
     payload_empty: bool,
     flags: u8,
 ) -> CoreResult<TcpOutputRecord> {
-    let connection_id = session
+    let connection_id = connection
         .connection_id()
         .ok_or_else(|| CoreError::internal("tcp output requires an installed connection id"))?;
-    let remote = session.remote();
+    let remote = connection.remote();
     validate_tcp_output_lengths(local.ip(), TCP_HEADER_LEN, payload_len)?;
-    let sequence = tcp_output_sequence(session);
-    let acknowledgment = tcp_output_acknowledgment(session);
-    let advertised_window = session.advertised_receive_window(session.rcv_wnd());
+    let sequence = tcp_output_sequence(connection, flags);
+    let acknowledgment = tcp_output_acknowledgment(connection);
+    let advertised_window = connection.advertised_receive_window(connection.rcv_wnd());
     let flags = normalize_tcp_output_flags(flags, payload_empty);
     validate_tcp_output_address_family(local, remote)?;
     Ok(TcpOutputRecord {
-        lookup_id: session.lookup_id(),
         connection_id,
         local,
         remote,
@@ -431,24 +492,26 @@ fn normalize_tcp_output_flags(flags: u8, payload_empty: bool) -> u8 {
 }
 
 #[inline]
-fn tcp_output_sequence(session: &TcpSessionState) -> u32 {
-    if session.snd_nxt() != 0 {
-        session.snd_nxt()
-    } else if session.snd_una() != 0 {
-        session.snd_una()
-    } else if session.iss() != 0 {
-        TcpSeq::new(session.iss()).advance(1).raw()
+fn tcp_output_sequence(connection: &TcpConnectionState, flags: u8) -> u32 {
+    if flags & TCP_FLAG_SYN != 0 && connection.iss() != 0 {
+        connection.iss()
+    } else if connection.snd_nxt() != 0 {
+        connection.snd_nxt()
+    } else if connection.snd_una() != 0 {
+        connection.snd_una()
+    } else if connection.iss() != 0 {
+        TcpSeq::new(connection.iss()).advance(1).raw()
     } else {
         1
     }
 }
 
 #[inline]
-fn tcp_output_acknowledgment(session: &TcpSessionState) -> u32 {
-    if session.rcv_nxt() != 0 {
-        session.rcv_nxt()
-    } else if session.irs() != 0 {
-        TcpSeq::new(session.irs()).advance(1).raw()
+fn tcp_output_acknowledgment(connection: &TcpConnectionState) -> u32 {
+    if connection.rcv_nxt() != 0 {
+        connection.rcv_nxt()
+    } else if connection.irs() != 0 {
+        TcpSeq::new(connection.irs()).advance(1).raw()
     } else {
         1
     }

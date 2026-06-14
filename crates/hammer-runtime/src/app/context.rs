@@ -9,10 +9,10 @@ use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
+use crate::app::data::AppDataAddr;
 use crate::app::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppOpId, AppRecv,
-    AppRegisteredBuffer, AppRingHandle, AppSend, AppSqe, AppSqeData, AppSqeDescriptor,
-    AppSubmissionEntry,
+    AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppOpId, AppRecv, AppRingHandle,
+    AppSend, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
 };
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
 
@@ -20,8 +20,8 @@ static NEXT_APP_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const CLOSED_OWNER_WORKER: usize = usize::MAX;
 
 thread_local! {
-    static APP_OP_RINGS: RefCell<AppWorkerOpRegistry> =
-        RefCell::new(AppWorkerOpRegistry::new());
+    static APP_WORKER_RINGS: RefCell<AppWorkerRingRegistry> =
+        RefCell::new(AppWorkerRingRegistry::new());
 }
 
 #[derive(Clone)]
@@ -49,17 +49,21 @@ impl AppContext {
             return AppRuntime { op, ring }.send(send).await;
         }
 
-        let registered = CrossWorkerAppRegisteredBuffer::new(app_send_registered_buffer(send)?);
-        let descriptor = app_send_descriptor(op, registered.index());
+        let send = send.into_transfer_data()?;
         let owner_worker = self.owner_for_op(op)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
         self.data_context
             .call_local_on_worker(owner_worker, move || async move {
-                let registered = registered.into_inner();
-                worker_op_ring(app_context_id, op, ring_capacity).try_push_submission_entry(
-                    AppSubmissionEntry::with_attachment(descriptor, registered),
-                )
+                let ring = worker_app_ring(app_context_id, ring_capacity);
+                let data = ring.copy_data_from_send(&send)?;
+                send.release();
+                ring.try_push_submission_descriptor(AppSqeDescriptor::new(
+                    crate::app::ring::AppOpcode::Send,
+                    None,
+                    AppObjectRef::Operation(op),
+                    AppSqeData::Send { data },
+                ))
             })
             .await?
     }
@@ -83,7 +87,7 @@ impl AppContext {
                 let worker = AppWorkerContext {
                     owner_worker,
                     op,
-                    ring: worker_op_ring(app_context_id, op, ring_capacity),
+                    ring: worker_app_ring(app_context_id, ring_capacity),
                 };
                 f(worker).await
             })
@@ -108,7 +112,7 @@ impl AppContext {
                 let worker = AppWorkerContext {
                     owner_worker,
                     op,
-                    ring: worker_op_ring(app_context_id, op, ring_capacity),
+                    ring: worker_app_ring(app_context_id, ring_capacity),
                 };
                 f(worker).await;
             })
@@ -141,7 +145,7 @@ impl AppContext {
                 op.value()
             )));
         }
-        Ok(worker_op_ring(self.id, op, self.ring_capacity))
+        Ok(worker_app_ring(self.id, self.ring_capacity))
     }
 
     #[inline]
@@ -169,7 +173,7 @@ impl AppContext {
             let ring_capacity = self.ring_capacity;
             self.data_context
                 .call_blocking_on_worker(owner_worker, move || {
-                    worker_op_ring(app_context_id, op, ring_capacity)
+                    worker_app_ring(app_context_id, ring_capacity)
                         .try_push_completion(AppCqe::closed(None, Some(op)))
                 })?;
         }
@@ -283,32 +287,6 @@ impl AppWorkerContext {
     }
 }
 
-struct CrossWorkerAppRegisteredBuffer {
-    inner: AppRegisteredBuffer,
-}
-
-impl CrossWorkerAppRegisteredBuffer {
-    #[inline]
-    fn new(inner: AppRegisteredBuffer) -> Self {
-        Self { inner }
-    }
-
-    #[inline]
-    fn index(&self) -> BufferIndex {
-        self.inner.index()
-    }
-
-    #[inline]
-    fn into_inner(self) -> AppRegisteredBuffer {
-        self.inner
-    }
-}
-
-// SAFETY: this wrapper is used after the caller gives up ownership of AppSend.
-// The remote-local closure immediately unwraps the registered buffer and
-// attaches it to the owner worker's submission ring.
-unsafe impl Send for CrossWorkerAppRegisteredBuffer {}
-
 #[derive(Clone)]
 pub struct AppRuntime {
     op: AppOpId,
@@ -335,7 +313,13 @@ impl AppRuntime {
     #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
         self.ring
-            .try_push_submission_entry(app_send_submission_entry(self.op, send)?)
+            .try_push_submission(AppSqe::send(None, self.op, send))
+    }
+
+    #[inline]
+    pub fn send_from_bytes(&self, bytes: &[u8]) -> HammerResult<AppSend> {
+        let data = self.ring.alloc_data_for_bytes(bytes)?;
+        Ok(self.ring.send_from_data(data))
     }
 
     #[inline]
@@ -352,6 +336,11 @@ impl AppRuntime {
     #[inline]
     pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
         self.ring.try_push_submission_descriptor(sqe)
+    }
+
+    #[inline]
+    pub fn try_push_submission(&self, sqe: AppSqe) -> HammerResult<()> {
+        self.ring.try_push_submission(sqe)
     }
 
     #[inline]
@@ -388,8 +377,8 @@ impl AppRuntime {
     }
 
     #[inline]
-    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
-        self.ring.take_send_buffer(index)
+    pub fn read_data(&self, data: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
+        self.ring.read_data(data)
     }
 
     #[inline]
@@ -418,36 +407,25 @@ impl AppRuntime {
     }
 
     #[inline]
-    pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
-        self.ring.try_complete_recv_lease(self.op, lease, false)
+    pub async fn complete_recv_buffer(
+        &self,
+        buffers: DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> HammerResult<()> {
+        self.ring
+            .try_complete_recv_buffer(self.op, buffers, index, false)
     }
 
     #[inline]
-    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
-        self.ring.take_recv_buffer(index)
+    pub async fn complete_recv_buffer_with_fin(
+        &self,
+        buffers: DataPlaneBuffers,
+        index: BufferIndex,
+        fin: bool,
+    ) -> HammerResult<()> {
+        self.ring
+            .try_complete_recv_buffer(self.op, buffers, index, fin)
     }
-}
-
-#[inline]
-fn app_send_submission_entry(op: AppOpId, send: AppSend) -> HammerResult<AppSubmissionEntry> {
-    let registered = app_send_registered_buffer(send)?;
-    let descriptor = app_send_descriptor(op, registered.index());
-    Ok(AppSubmissionEntry::with_attachment(descriptor, registered))
-}
-
-#[inline]
-fn app_send_registered_buffer(send: AppSend) -> HammerResult<AppRegisteredBuffer> {
-    AppRegisteredBuffer::from_lease(send.into_lease())
-}
-
-#[inline]
-fn app_send_descriptor(op: AppOpId, buffer: BufferIndex) -> AppSqeDescriptor {
-    AppSqeDescriptor::new(
-        crate::app::ring::AppOpcode::Send,
-        None,
-        AppObjectRef::Operation(op),
-        AppSqeData::Send { buffer },
-    )
 }
 
 pub type AppTaskContext = AppWorkerContext;
@@ -485,35 +463,30 @@ fn next_app_context_id() -> usize {
 }
 
 #[inline]
-fn worker_op_ring(app_context_id: usize, op: AppOpId, ring_capacity: usize) -> AppRingHandle {
-    APP_OP_RINGS.with(|slot| {
+fn worker_app_ring(app_context_id: usize, ring_capacity: usize) -> AppRingHandle {
+    APP_WORKER_RINGS.with(|slot| {
         slot.borrow_mut()
-            .get_or_insert(app_op_key(app_context_id, op), ring_capacity)
+            .get_or_insert(app_context_id as u64, ring_capacity)
     })
 }
 
-#[inline]
-fn app_op_key(app_context_id: usize, op: AppOpId) -> u128 {
-    ((app_context_id as u128) << 64) | u128::from(op.value())
-}
-
-struct AppWorkerOpRegistry {
-    index_by_op: FlatHashTable<u128, usize>,
+struct AppWorkerRingRegistry {
+    index_by_context: FlatHashTable<u64, usize>,
     rings: Vec<AppRingHandle>,
 }
 
-impl AppWorkerOpRegistry {
+impl AppWorkerRingRegistry {
     #[inline]
     fn new() -> Self {
         Self {
-            index_by_op: FlatHashTable::new(),
+            index_by_context: FlatHashTable::new(),
             rings: Vec::new(),
         }
     }
 
     #[inline]
-    fn get_or_insert(&mut self, key: u128, ring_capacity: usize) -> AppRingHandle {
-        if let Some(index) = self.index_by_op.lookup(&key)
+    fn get_or_insert(&mut self, key: u64, ring_capacity: usize) -> AppRingHandle {
+        if let Some(index) = self.index_by_context.lookup(&key)
             && let Some(ring) = self.rings.get(index).cloned()
         {
             return ring;
@@ -522,7 +495,7 @@ impl AppWorkerOpRegistry {
         let index = self.rings.len();
         let ring = AppRingHandle::new(ring_capacity, ring_capacity);
         self.rings.push(ring.clone());
-        self.index_by_op.insert(key, index);
+        self.index_by_context.insert(key, index);
         ring
     }
 }

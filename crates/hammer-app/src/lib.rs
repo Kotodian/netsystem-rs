@@ -1,22 +1,10 @@
-//! `hammer-app` keeps the low-level app ring surface thin and runtime-shaped.
+//! Thin application-facing wrapper around Hammer's op-owned app ring runtime.
 //!
-//! Legacy queue wrappers and standalone backend construction are intentionally
-//! not part of the public API:
-//!
-//! ```compile_fail
-//! use hammer_app::AppBackendRecvQueue;
-//! let _ = std::any::type_name::<AppBackendRecvQueue>();
-//! ```
-//!
-//! ```compile_fail
-//! use hammer_app::AppBackendSendQueue;
-//! let _ = std::any::type_name::<AppBackendSendQueue>();
-//! ```
-//!
-//! ```compile_fail
-//! let _ = hammer_app::AppBackend::new(4);
-//! ```
-//!
+//! `hammer-app` intentionally exposes the same operation-descriptor model as
+//! `hammer-runtime::app`: app workers submit SQEs/CQEs on an app-worker ring,
+//! descriptors identify opaque operations, and payloads reference app data-area
+//! addresses rather than dataplane packet buffers.
+
 pub mod echo;
 pub mod ring;
 pub mod tcp;
@@ -28,410 +16,253 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use hammer_adapter::BufferIndex;
 use hammer_core::error::{HammerError, HammerResult};
-pub use hammer_runtime::app::AppTcpShutdown;
-pub use hammer_runtime::app::{AppControl, AppControlBackend};
+use hammer_runtime::app as runtime_app;
 pub use hammer_runtime::spawn::DataRuntimeContext;
 
 pub use crate::ring::{
-    AppBufferLease, AppCompletionEntry, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppObjectRef,
-    AppOpcode, AppRecv, AppRegisteredBuffer, AppRing, AppSend, AppSocketId, AppSqeData,
-    AppSqeDescriptor, AppSubmissionEntry, AppUserData, TransportKind,
+    AppCompletionEntry, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppCqeKind, AppDataAddr,
+    AppDataArea, AppDataAreaConfig, AppObjectRef, AppOpId, AppOpcode, AppRecv, AppRing,
+    AppRingExport, AppRingHandle, AppRingIpcReservation, AppRingLayout, AppRingMemoryKind, AppSend,
+    AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AppFlowId {
-    inner: hammer_runtime::app::AppFlowId,
-}
-
-impl AppFlowId {
-    #[inline]
-    pub const fn new(value: u64) -> Self {
-        Self {
-            inner: hammer_runtime::app::AppFlowId::new(value),
-        }
-    }
-
-    #[inline]
-    pub const fn value(self) -> u64 {
-        self.inner.value()
-    }
-
-    #[inline]
-    pub const fn slot(self) -> u32 {
-        self.inner.slot()
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        self.inner.generation()
-    }
-
-    #[inline]
-    pub(crate) const fn into_inner(self) -> hammer_runtime::app::AppFlowId {
-        self.inner
-    }
-}
 
 #[derive(Clone)]
 pub struct AppContext {
-    inner: hammer_runtime::app::AppContext,
+    inner: runtime_app::AppContext,
 }
 
 impl AppContext {
     #[inline]
     pub fn with_ring_capacity(data_context: DataRuntimeContext, ring_capacity: usize) -> Self {
         Self {
-            inner: hammer_runtime::app::AppContext::with_ring_capacity(data_context, ring_capacity),
+            inner: runtime_app::AppContext::with_ring_capacity(data_context, ring_capacity),
         }
     }
 
-    pub async fn spawn_on_flow<F, Fut, T>(&self, flow: AppFlowId, f: F) -> HammerResult<T>
+    #[inline]
+    pub async fn spawn_on_op<F, Fut, T>(
+        &self,
+        op: AppOpId,
+        owner_worker: usize,
+        f: F,
+    ) -> HammerResult<T>
     where
         F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
         Fut: Future<Output = T> + 'static,
         T: Send + 'static,
     {
         self.inner
-            .spawn_on_flow(flow.into_inner(), move |worker| {
+            .spawn_on_op(op, owner_worker, move |worker| {
                 f(AppWorkerContext::from_inner(worker))
             })
             .await
     }
 
     #[inline]
-    pub fn install_control(&self, control: AppControl) -> HammerResult<()> {
-        self.inner.install_control(control)
-    }
-
-    #[inline]
-    pub fn connect_tcp_stream(
+    pub fn spawn_detached_on_op<F, Fut>(
         &self,
-        peer: std::net::SocketAddr,
+        op: AppOpId,
         owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
+        f: F,
+    ) -> HammerResult<()>
+    where
+        F: FnOnce(AppWorkerContext) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
         self.inner
-            .connect_tcp_stream(peer, owner_worker)
-            .map(|flow| AppFlowId::new(flow.value()))
+            .spawn_detached_on_op(op, owner_worker, move |worker| {
+                f(AppWorkerContext::from_inner(worker))
+            })
     }
 
     #[inline]
-    pub fn bind_tcp_listener(
-        &self,
-        bind: std::net::SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.inner
-            .bind_tcp_listener(bind, owner_worker)
-            .map(|socket| AppSocketId::new(socket.value()))
+    pub async fn send_on_op(&self, op: AppOpId, send: AppSend) -> HammerResult<()> {
+        self.inner.send_on_op(op, send).await
     }
 
     #[inline]
-    pub fn bind_udp_socket(
-        &self,
-        bind: std::net::SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppSocketId> {
-        self.inner
-            .bind_udp_socket(bind, owner_worker)
-            .map(|socket| AppSocketId::new(socket.value()))
+    pub fn owner_worker_for_op(&self, op: AppOpId) -> HammerResult<usize> {
+        self.inner.owner_worker_for_op(op)
     }
 
     #[inline]
-    pub fn close_socket(&self, socket: AppSocketId) -> HammerResult<()> {
-        self.inner.close_socket(socket.into_inner())
+    pub fn worker_count(&self) -> usize {
+        self.inner.worker_count()
     }
 
     #[inline]
-    pub fn close_tcp_flow(&self, flow: AppFlowId) -> HammerResult<()> {
-        self.inner.close_tcp_flow(flow.into_inner())
-    }
-
-    #[inline]
-    pub async fn send_on_flow(&self, flow: AppFlowId, send: AppSend) -> HammerResult<()> {
-        self.inner
-            .send_on_flow(flow.into_inner(), send.into_inner())
-            .await
-    }
-
-    #[inline]
-    pub async fn shutdown_flow(
-        &self,
-        flow: AppFlowId,
-        how: std::net::Shutdown,
-    ) -> HammerResult<()> {
-        self.inner.shutdown_flow(flow.into_inner(), how).await
-    }
-
-    #[inline]
-    pub fn owner_worker_for_socket(&self, socket: AppSocketId) -> HammerResult<usize> {
-        self.inner.owner_worker_for_socket(socket.into_inner())
-    }
-
-    #[inline]
-    pub fn owner_worker_for_flow(&self, flow: AppFlowId) -> HammerResult<usize> {
-        self.inner.owner_worker_for_flow(flow.into_inner())
-    }
-
-    #[inline]
-    pub fn local_backend_for_socket(&self, socket: AppSocketId) -> HammerResult<AppBackend> {
-        self.inner
-            .local_backend_for_socket(socket.into_inner())
-            .map(AppBackend::from_inner)
-    }
-
-    #[inline]
-    pub fn local_backend_for_flow(&self, flow: AppFlowId) -> HammerResult<AppBackend> {
-        self.inner
-            .local_backend_for_flow(flow.into_inner())
-            .map(AppBackend::from_inner)
+    pub fn current_worker_owns_op(&self, op: AppOpId) -> bool {
+        self.inner.current_worker_owns_op(op)
     }
 
     #[inline]
     pub fn try_complete_recv_buffer(
         &self,
-        flow: AppFlowId,
+        op: AppOpId,
         buffers: hammer_adapter::DataPlaneBuffers,
-        index: BufferIndex,
+        index: hammer_adapter::BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        self.inner
-            .try_complete_recv_buffer(flow.into_inner(), buffers, index, fin)
+        self.inner.try_complete_recv_buffer(op, buffers, index, fin)
     }
 
     #[inline]
-    pub fn try_complete_recv_from_buffer(
-        &self,
-        socket: AppSocketId,
-        source: std::net::SocketAddr,
-        buffers: hammer_adapter::DataPlaneBuffers,
-        index: BufferIndex,
-        truncated: bool,
-    ) -> HammerResult<()> {
-        self.inner.try_complete_recv_from_buffer(
-            socket.into_inner(),
-            source,
-            buffers,
-            index,
-            truncated,
-        )
-    }
-
-    #[inline]
-    pub fn try_complete_accept(&self, listener: AppSocketId, flow: AppFlowId) -> HammerResult<()> {
-        self.inner
-            .try_complete_accept(listener.into_inner(), flow.into_inner())
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AppBackend {
-    inner: hammer_runtime::app::AppBackend,
-}
-
-impl AppBackend {
-    #[inline]
-    pub async fn complete_recv(&self, lease: AppBufferLease) -> HammerResult<()> {
-        self.inner.complete_recv(lease.into_inner()).await
-    }
-
-    #[inline]
-    pub async fn next_send(&self) -> Option<AppSend> {
-        self.inner.next_send().await.map(AppSend::from_inner)
-    }
-
-    #[inline]
-    pub fn try_push_sqe_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
-        self.inner.try_push_sqe_descriptor(descriptor.into_inner())
-    }
-
-    #[inline]
-    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.inner.try_push_submission_entry(entry.into_inner())
-    }
-
-    #[inline]
-    pub async fn next_sqe_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.inner
-            .next_sqe_descriptor()
-            .await
-            .map(AppSqeDescriptor::from_inner)
-    }
-
-    #[inline]
-    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
-        self.inner
-            .take_submission_buffer(index)
-            .map(AppSend::from_inner)
-    }
-
-    #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.inner
-            .next_submission_entry()
-            .await
-            .map(crate::ring::AppSubmissionEntry::from_inner)
-    }
-
-    #[inline]
-    pub async fn next_tcp_shutdown(&self) -> Option<AppTcpShutdown> {
-        self.inner.next_tcp_shutdown().await
-    }
-
-    #[inline]
-    pub fn try_push_cqe_descriptor(&self, descriptor: AppCqeDescriptor) -> HammerResult<()> {
-        self.inner.try_push_cqe_descriptor(descriptor.into_inner())
-    }
-
-    #[inline]
-    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
-        self.inner.try_push_completion_entry(entry.into_inner())
-    }
-
-    #[inline]
-    pub async fn next_cqe_descriptor(&self) -> Option<AppCqeDescriptor> {
-        self.inner
-            .next_cqe_descriptor()
-            .await
-            .map(crate::ring::AppCqeDescriptor::from_inner)
-    }
-
-    #[inline]
-    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
-        self.inner
-            .take_completion_buffer(index)
-            .map(AppRecv::from_inner)
-    }
-
-    #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        self.inner
-            .next_completion_entry()
-            .await
-            .map(crate::ring::AppCompletionEntry::from_inner)
-    }
-
-    #[inline]
-    pub(crate) fn from_inner(inner: hammer_runtime::app::AppBackend) -> Self {
-        Self { inner }
+    pub fn try_complete_closed_op(&self, op: AppOpId) -> HammerResult<bool> {
+        self.inner.try_complete_closed_op(op)
     }
 }
 
 #[derive(Clone)]
-pub struct AppRuntime {
-    inner: hammer_runtime::app::AppRuntime,
+pub struct App {
+    context: AppContext,
 }
 
-impl AppRuntime {
+impl App {
     #[inline]
-    pub fn recv(&self) -> AppRecvFuture {
-        AppRecvFuture {
-            inner: self.inner.recv(),
+    pub fn new(data_context: DataRuntimeContext) -> Self {
+        Self::with_ring_capacity(data_context, 256)
+    }
+
+    #[inline]
+    pub fn with_ring_capacity(data_context: DataRuntimeContext, ring_capacity: usize) -> Self {
+        Self {
+            context: AppContext::with_ring_capacity(data_context, ring_capacity),
         }
     }
 
     #[inline]
+    pub fn context(&self) -> &AppContext {
+        &self.context
+    }
+
+    #[inline]
+    pub async fn spawn_on_op<F, Fut, T>(
+        &self,
+        op: AppOpId,
+        owner_worker: usize,
+        f: F,
+    ) -> HammerResult<T>
+    where
+        F: FnOnce(AppOp) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        let app = self.clone();
+        self.context
+            .spawn_on_op(op, owner_worker, move |worker| {
+                f(AppOp {
+                    app,
+                    op,
+                    worker: Some(worker),
+                })
+            })
+            .await
+    }
+
+    #[inline]
+    pub fn op(&self, op: AppOpId) -> AppOp {
+        AppOp {
+            app: self.clone(),
+            op,
+            worker: None,
+        }
+    }
+}
+
+impl From<AppContext> for App {
+    #[inline]
+    fn from(context: AppContext) -> Self {
+        Self { context }
+    }
+}
+
+#[derive(Clone)]
+pub struct AppOp {
+    app: App,
+    op: AppOpId,
+    worker: Option<AppWorkerContext>,
+}
+
+impl AppOp {
+    #[inline]
+    pub fn id(&self) -> AppOpId {
+        self.op
+    }
+
+    #[inline]
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    #[inline]
+    pub async fn owner(&self) -> HammerResult<usize> {
+        self.app.context.owner_worker_for_op(self.op)
+    }
+
+    #[inline]
+    pub async fn run<F, Fut, T>(&self, owner_worker: usize, f: F) -> HammerResult<T>
+    where
+        F: FnOnce(AppOp) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        self.app.spawn_on_op(self.op, owner_worker, f).await
+    }
+
+    #[inline]
+    pub fn owner_worker(&self) -> usize {
+        self.worker
+            .as_ref()
+            .expect("app op owner_worker requires worker context")
+            .owner_worker()
+    }
+
+    #[inline]
+    pub fn runtime(&self) -> AppRuntime {
+        self.worker
+            .as_ref()
+            .expect("app op runtime requires worker context")
+            .runtime()
+    }
+
+    #[inline]
+    pub fn ring(&self) -> AppRing {
+        AppRing::new(self.runtime().into_inner())
+    }
+
+    #[inline]
+    pub fn recv(&self) -> runtime_app::AppRecvFuture {
+        self.runtime().recv()
+    }
+
+    #[inline]
     pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        self.inner.send(send.into_inner()).await
+        self.runtime().send(send).await
     }
 
     #[inline]
-    pub async fn shutdown(&self, how: std::net::Shutdown) -> HammerResult<()> {
-        self.inner.shutdown(how).await
+    pub async fn shutdown(&self) -> HammerResult<()> {
+        self.runtime().shutdown().await
     }
 
     #[inline]
-    pub fn try_push_submission_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
-        self.inner
-            .try_push_submission_descriptor(descriptor.into_inner())
-    }
-
-    #[inline]
-    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        self.inner.try_push_submission_entry(entry.into_inner())
-    }
-
-    #[inline]
-    pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.inner
-            .next_submission_descriptor()
-            .await
-            .map(crate::ring::AppSqeDescriptor::from_inner)
-    }
-
-    #[inline]
-    pub fn take_submission_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
-        self.inner
-            .take_submission_buffer(index)
-            .map(AppSend::from_inner)
-    }
-
-    #[inline]
-    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        self.inner
-            .next_submission_entry()
-            .await
-            .map(crate::ring::AppSubmissionEntry::from_inner)
-    }
-
-    #[inline]
-    pub fn try_push_completion_descriptor(&self, descriptor: AppCqeDescriptor) -> HammerResult<()> {
-        self.inner
-            .try_push_completion_descriptor(descriptor.into_inner())
-    }
-
-    #[inline]
-    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
-        self.inner.try_push_completion_entry(entry.into_inner())
-    }
-
-    #[inline]
-    pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
-        self.inner
-            .next_completion_descriptor()
-            .await
-            .map(crate::ring::AppCqeDescriptor::from_inner)
-    }
-
-    #[inline]
-    pub fn take_completion_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
-        self.inner
-            .take_completion_buffer(index)
-            .map(AppRecv::from_inner)
-    }
-
-    #[inline]
-    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        self.inner
-            .next_completion_entry()
-            .await
-            .map(crate::ring::AppCompletionEntry::from_inner)
-    }
-
-    #[inline]
-    pub(crate) fn from_inner(inner: hammer_runtime::app::AppRuntime) -> Self {
-        Self { inner }
-    }
-}
-
-pub struct AppRecvFuture {
-    inner: hammer_runtime::app::AppRecvFuture,
-}
-
-impl Future for AppRecvFuture {
-    type Output = HammerResult<AppRecv>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.inner)
-            .poll(cx)
-            .map(|result| result.map(AppRecv::from_inner))
+    pub fn spawn_local<F, Fut, T>(&self, factory: F) -> AppLocalJoinHandle<T>
+    where
+        F: FnOnce() -> Fut + 'static,
+        Fut: Future<Output = T> + 'static,
+        T: Send + 'static,
+    {
+        self.worker
+            .as_ref()
+            .expect("app op spawn_local requires worker context")
+            .spawn_local(factory)
     }
 }
 
 #[derive(Clone)]
 pub struct AppWorkerContext {
-    inner: hammer_runtime::app::AppWorkerContext,
+    inner: runtime_app::AppWorkerContext,
 }
 
 impl AppWorkerContext {
@@ -441,13 +272,18 @@ impl AppWorkerContext {
     }
 
     #[inline]
-    pub fn backend(&self) -> AppBackend {
-        AppBackend::from_inner(self.inner.backend())
+    pub fn op(&self) -> AppOpId {
+        self.inner.op()
     }
 
     #[inline]
     pub fn runtime(&self) -> AppRuntime {
         AppRuntime::from_inner(self.inner.runtime())
+    }
+
+    #[inline]
+    pub fn ring(&self) -> AppRing {
+        AppRing::new(self.inner.runtime())
     }
 
     #[inline]
@@ -461,13 +297,150 @@ impl AppWorkerContext {
     }
 
     #[inline]
-    pub(crate) fn from_inner(inner: hammer_runtime::app::AppWorkerContext) -> Self {
+    fn from_inner(inner: runtime_app::AppWorkerContext) -> Self {
         Self { inner }
     }
 }
 
 pub type AppTaskContext = AppWorkerContext;
 pub type AppWorkerLocalExecutor = ();
+
+#[derive(Clone)]
+pub struct AppRuntime {
+    inner: runtime_app::AppRuntime,
+}
+
+impl AppRuntime {
+    #[inline]
+    pub fn recv(&self) -> runtime_app::AppRecvFuture {
+        self.inner.recv()
+    }
+
+    #[inline]
+    pub async fn send(&self, send: AppSend) -> HammerResult<()> {
+        self.inner.send(send).await
+    }
+
+    #[inline]
+    pub fn send_from_bytes(&self, bytes: &[u8]) -> HammerResult<AppSend> {
+        self.inner.send_from_bytes(bytes)
+    }
+
+    #[inline]
+    pub async fn shutdown(&self) -> HammerResult<()> {
+        self.inner.shutdown().await
+    }
+
+    #[inline]
+    pub fn read_data(&self, data: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
+        self.inner.read_data(data)
+    }
+
+    #[inline]
+    pub fn try_push_submission_descriptor(&self, descriptor: AppSqeDescriptor) -> HammerResult<()> {
+        self.inner.try_push_submission_descriptor(descriptor)
+    }
+
+    #[inline]
+    pub fn try_push_submission(&self, sqe: AppSqe) -> HammerResult<()> {
+        self.inner.try_push_submission(sqe)
+    }
+
+    #[inline]
+    pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
+        self.inner.try_push_submission_entry(entry)
+    }
+
+    #[inline]
+    pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.inner.next_submission_descriptor().await
+    }
+
+    #[inline]
+    pub fn try_pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
+        self.inner.try_pop_submission_descriptor()
+    }
+
+    #[inline]
+    pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.inner.next_submission_entry().await
+    }
+
+    #[inline]
+    pub fn try_pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
+        self.inner.try_pop_submission_entry()
+    }
+
+    #[inline]
+    pub async fn next_send(&self) -> Option<AppSend> {
+        self.inner.next_send().await
+    }
+
+    #[inline]
+    pub fn try_push_completion_descriptor(&self, cqe: AppCqeDescriptor) -> HammerResult<()> {
+        self.inner.try_push_completion_descriptor(cqe)
+    }
+
+    #[inline]
+    pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
+        self.inner.try_push_completion_entry(entry)
+    }
+
+    #[inline]
+    pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
+        self.inner.next_completion_descriptor().await
+    }
+
+    #[inline]
+    pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
+        self.inner.next_completion_entry().await
+    }
+
+    #[inline]
+    pub async fn next_completion(&self) -> Option<AppCqe> {
+        self.inner.next_completion().await
+    }
+
+    #[inline]
+    pub async fn complete_recv_buffer(
+        &self,
+        buffers: hammer_adapter::DataPlaneBuffers,
+        index: hammer_adapter::BufferIndex,
+    ) -> HammerResult<()> {
+        self.inner.complete_recv_buffer(buffers, index).await
+    }
+
+    #[inline]
+    pub async fn complete_recv_buffer_with_fin(
+        &self,
+        buffers: hammer_adapter::DataPlaneBuffers,
+        index: hammer_adapter::BufferIndex,
+        fin: bool,
+    ) -> HammerResult<()> {
+        self.inner
+            .complete_recv_buffer_with_fin(buffers, index, fin)
+            .await
+    }
+
+    #[inline]
+    fn from_inner(inner: runtime_app::AppRuntime) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    fn into_inner(self) -> runtime_app::AppRuntime {
+        self.inner
+    }
+}
+
+impl TryFrom<AppOp> for AppWorkerContext {
+    type Error = HammerError;
+
+    fn try_from(op: AppOp) -> Result<Self, Self::Error> {
+        op.worker
+            .ok_or_else(|| HammerError::internal("app op requires worker context"))
+    }
+}
 
 #[derive(Debug)]
 pub struct AppLocalJoinError {
@@ -514,217 +487,5 @@ impl<T> Future for AppLocalJoinHandle<T> {
         Pin::new(&mut self.inner)
             .poll(cx)
             .map(|result| result.map_err(AppLocalJoinError::from_inner))
-    }
-}
-
-#[derive(Clone)]
-pub struct App {
-    inner: AppContext,
-}
-
-impl App {
-    #[inline]
-    pub fn new(data_context: DataRuntimeContext) -> Self {
-        Self::with_ring_capacity(data_context, 256)
-    }
-
-    #[inline]
-    pub fn with_ring_capacity(data_context: DataRuntimeContext, ring_capacity: usize) -> Self {
-        Self {
-            inner: AppContext::with_ring_capacity(data_context, ring_capacity),
-        }
-    }
-
-    #[inline]
-    pub fn context(&self) -> &AppContext {
-        &self.inner
-    }
-
-    #[inline]
-    pub fn install_control(&self, control: AppControl) -> HammerResult<()> {
-        self.inner.install_control(control)
-    }
-
-    #[inline]
-    pub fn connect_tcp_stream(
-        &self,
-        peer: std::net::SocketAddr,
-        owner_worker: usize,
-    ) -> HammerResult<AppFlowId> {
-        self.inner.connect_tcp_stream(peer, owner_worker)
-    }
-
-    #[inline]
-    pub fn flow(&self, flow: AppFlowId) -> AppFlow {
-        AppFlow::new(self.clone(), flow)
-    }
-
-    pub async fn spawn<F, Fut, T>(&self, flow: AppFlowId, f: F) -> HammerResult<T>
-    where
-        F: FnOnce(AppFlow) -> Fut + Send + 'static,
-        Fut: Future<Output = T> + 'static,
-        T: Send + 'static,
-    {
-        let app = self.clone();
-        self.inner
-            .spawn_on_flow(flow, move |worker| {
-                let flow = AppFlowRuntime {
-                    app,
-                    flow,
-                    worker: Some(worker),
-                };
-                f(AppFlow { inner: flow })
-            })
-            .await
-    }
-}
-
-#[derive(Clone)]
-pub struct AppFlow {
-    inner: AppFlowRuntime,
-}
-
-impl AppFlow {
-    #[inline]
-    pub fn new(app: App, flow: AppFlowId) -> Self {
-        Self {
-            inner: AppFlowRuntime::pending(app, flow),
-        }
-    }
-
-    #[inline]
-    pub fn id(&self) -> AppFlowId {
-        self.inner.flow
-    }
-
-    #[inline]
-    pub fn app(&self) -> &App {
-        &self.inner.app
-    }
-
-    pub async fn owner(&self) -> HammerResult<usize> {
-        self.run(|flow| async move { flow.owner_worker() }).await
-    }
-
-    pub async fn run<F, Fut, T>(&self, f: F) -> HammerResult<T>
-    where
-        F: FnOnce(AppFlow) -> Fut + Send + 'static,
-        Fut: Future<Output = T> + 'static,
-        T: Send + 'static,
-    {
-        let flow = self.id();
-        let app = self.app().clone();
-        app.spawn(flow, f).await
-    }
-
-    #[inline]
-    pub fn owner_worker(&self) -> usize {
-        self.inner
-            .worker
-            .as_ref()
-            .expect("app flow owner_worker requires runtime context")
-            .owner_worker()
-    }
-
-    #[inline]
-    pub fn backend(&self) -> AppBackend {
-        self.inner
-            .worker
-            .as_ref()
-            .expect("app flow backend requires runtime context")
-            .backend()
-    }
-
-    #[inline]
-    pub fn runtime(&self) -> AppRuntime {
-        self.inner
-            .worker
-            .as_ref()
-            .expect("app flow runtime requires runtime context")
-            .runtime()
-    }
-
-    #[inline]
-    pub fn ring(&self) -> AppRing {
-        AppRing::new(self.runtime())
-    }
-
-    #[inline]
-    pub fn recv(&self) -> AppRecvFuture {
-        self.runtime().recv()
-    }
-
-    #[inline]
-    pub async fn send(&self, send: AppSend) -> HammerResult<()> {
-        self.runtime().send(send).await
-    }
-
-    #[inline]
-    pub async fn shutdown(&self, how: std::net::Shutdown) -> HammerResult<()> {
-        self.runtime().shutdown(how).await
-    }
-
-    #[inline]
-    pub async fn shutdown_read(&self) -> HammerResult<()> {
-        self.shutdown(std::net::Shutdown::Read).await
-    }
-
-    #[inline]
-    pub async fn shutdown_write(&self) -> HammerResult<()> {
-        self.shutdown(std::net::Shutdown::Write).await
-    }
-
-    #[inline]
-    pub async fn shutdown_both(&self) -> HammerResult<()> {
-        self.shutdown(std::net::Shutdown::Both).await
-    }
-
-    #[inline]
-    pub fn spawn_local<F, Fut, T>(&self, factory: F) -> AppLocalJoinHandle<T>
-    where
-        F: FnOnce() -> Fut + 'static,
-        Fut: Future<Output = T> + 'static,
-        T: Send + 'static,
-    {
-        self.inner
-            .worker
-            .as_ref()
-            .expect("app flow spawn_local requires runtime context")
-            .spawn_local(factory)
-    }
-}
-
-#[derive(Clone)]
-struct AppFlowRuntime {
-    app: App,
-    flow: AppFlowId,
-    worker: Option<AppWorkerContext>,
-}
-
-impl AppFlowRuntime {
-    #[inline]
-    fn pending(app: App, flow: AppFlowId) -> Self {
-        Self {
-            app,
-            flow,
-            worker: None,
-        }
-    }
-}
-
-impl From<AppContext> for App {
-    #[inline]
-    fn from(inner: AppContext) -> Self {
-        Self { inner }
-    }
-}
-
-impl TryFrom<AppFlow> for AppWorkerContext {
-    type Error = HammerError;
-
-    fn try_from(flow: AppFlow) -> Result<Self, Self::Error> {
-        flow.inner
-            .worker
-            .ok_or_else(|| HammerError::internal("app flow requires runtime context"))
     }
 }

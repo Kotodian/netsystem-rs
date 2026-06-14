@@ -77,6 +77,24 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
         self.insert_key_value(key, value);
     }
 
+    #[inline]
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let mut slot = self.slot(*key);
+        loop {
+            match self.buckets[slot].entry {
+                Some(entry) if entry.key == *key => {
+                    let value = entry.value;
+                    self.buckets[slot].entry = None;
+                    self.len -= 1;
+                    self.reinsert_cluster_after_removed_slot(slot);
+                    return Some(value);
+                }
+                Some(_) => slot = self.next_slot(slot),
+                None => return None,
+            }
+        }
+    }
+
     #[inline(always)]
     pub fn get(&self, key: &K) -> Option<&V> {
         let mut slot = self.slot(*key);
@@ -152,6 +170,17 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
                     return true;
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn reinsert_cluster_after_removed_slot(&mut self, removed_slot: usize) {
+        let mut slot = self.next_slot(removed_slot);
+        while let Some(entry) = self.buckets[slot].entry {
+            self.buckets[slot].entry = None;
+            self.len -= 1;
+            self.insert_key_value(entry.key, entry.value);
+            slot = self.next_slot(slot);
         }
     }
 

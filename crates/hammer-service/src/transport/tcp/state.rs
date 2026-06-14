@@ -45,11 +45,11 @@ impl Default for TcpCongestionRegistry {
 }
 
 #[derive(Debug)]
-pub struct TcpConnectionState {
+pub struct TcpConnectionConfigState {
     selected_algorithm: TcpCongestionAlgorithm,
 }
 
-impl TcpConnectionState {
+impl TcpConnectionConfigState {
     #[inline]
     pub fn new(
         registry: &TcpCongestionRegistry,

@@ -39,8 +39,8 @@ fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
 #[test]
 fn core_tcp_options_parse_mss_window_scale_sack_timestamp_ecn() {
     let parsed = tcp_options_from_bytes(&[
-        2, 4, 0x05, 0xb4, 1, 3, 3, 15, 4, 2, 8, 10, 0x01, 0x02, 0x03, 0x04, 0xa1, 0xa2, 0xa3,
-        0xa4, 172, 2,
+        2, 4, 0x05, 0xb4, 1, 3, 3, 15, 4, 2, 8, 10, 0x01, 0x02, 0x03, 0x04, 0xa1, 0xa2, 0xa3, 0xa4,
+        172, 2,
     ]);
 
     assert_eq!(parsed.capabilities.max_segment_size, Some(1_460));

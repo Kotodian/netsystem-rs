@@ -1,27 +1,37 @@
-use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use hammer_adapter::DataWorkerId;
-use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq, TcpV4ConnectionKey,
-    TcpV6ConnectionKey,
-};
-use hammer_infra::map::FlatHashTable;
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
 
-use crate::session::SessionId;
-use crate::transport::tcp::congestion::TcpCongestionState;
-use crate::transport::tcp::output::{
+use super::TcpState;
+use super::congestion::TcpCongestionState;
+use super::output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputRetransmitQueue, TcpOutputSendView,
     tcp_effective_output_payload_len,
 };
-use crate::transport::tcp::{TcpLookupId, TcpState};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
+const TCP_CONNECTION_TIMER_RETRANSMIT_BIT: u8 = 1 << 0;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpConnectionTimerKind {
+    Retransmit,
+}
+
+impl TcpConnectionTimerKind {
+    #[inline(always)]
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Retransmit => TCP_CONNECTION_TIMER_RETRANSMIT_BIT,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpRetransmitTimeoutState {
@@ -100,13 +110,13 @@ impl Default for TcpRetransmitTimeoutState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpSessionOptionState {
+pub struct TcpConnectionOptionState {
     local_capabilities: TcpCapabilities,
     remote_capabilities: Option<TcpCapabilities>,
     negotiated: TcpNegotiatedOptions,
 }
 
-impl TcpSessionOptionState {
+impl TcpConnectionOptionState {
     #[inline]
     pub fn new(local_capabilities: TcpCapabilities) -> Self {
         Self {
@@ -180,7 +190,7 @@ impl TcpSessionOptionState {
     }
 }
 
-impl Default for TcpSessionOptionState {
+impl Default for TcpConnectionOptionState {
     #[inline]
     fn default() -> Self {
         Self::new(TcpCapabilities::default())
@@ -188,8 +198,7 @@ impl Default for TcpSessionOptionState {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpSessionState {
-    lookup_id: TcpLookupId,
+pub struct TcpConnectionState {
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
     state: TcpState,
@@ -203,17 +212,18 @@ pub struct TcpSessionState {
     snd_wnd: u32,
     rcv_nxt: u32,
     rcv_wnd: u32,
-    options: TcpSessionOptionState,
+    options: TcpConnectionOptionState,
     output_payload_len: usize,
     retransmit_queue: TcpOutputRetransmitQueue,
     retransmit_timeout: TcpRetransmitTimeoutState,
     congestion: TcpCongestionState,
-    next_output_at: Option<std::time::Instant>,
+    active_timers: u8,
+    pending_timers: u8,
+    next_output_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpSessionView {
-    pub lookup_id: TcpLookupId,
+pub struct TcpConnectionView {
     pub connection_id: Option<TcpConnectionId>,
     pub owner_worker: DataWorkerId,
     pub state: TcpState,
@@ -229,10 +239,9 @@ pub struct TcpSessionView {
     pub rcv_wnd: u32,
 }
 
-impl TcpSessionState {
+impl TcpConnectionState {
     #[inline]
     pub fn new(
-        lookup_id: TcpLookupId,
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
         state: TcpState,
@@ -241,7 +250,6 @@ impl TcpSessionState {
         remote: SocketAddr,
     ) -> Self {
         Self {
-            lookup_id,
             connection_id,
             owner_worker,
             state,
@@ -255,23 +263,25 @@ impl TcpSessionState {
             snd_wnd: DEFAULT_TCP_WINDOW,
             rcv_nxt: 0,
             rcv_wnd: DEFAULT_TCP_WINDOW,
-            options: TcpSessionOptionState::default(),
+            options: TcpConnectionOptionState::default(),
             output_payload_len: tcp_effective_output_payload_len(None),
             retransmit_queue: TcpOutputRetransmitQueue::new(),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
             congestion: TcpCongestionState::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
+            active_timers: 0,
+            pending_timers: 0,
             next_output_at: None,
         }
     }
 
     #[inline]
-    pub fn lookup_id(&self) -> TcpLookupId {
-        self.lookup_id
+    pub fn connection_id(&self) -> Option<TcpConnectionId> {
+        self.connection_id
     }
 
     #[inline]
-    pub fn connection_id(&self) -> Option<TcpConnectionId> {
-        self.connection_id
+    pub fn set_connection_id(&mut self, connection_id: TcpConnectionId) {
+        self.connection_id = Some(connection_id);
     }
 
     #[inline]
@@ -350,12 +360,12 @@ impl TcpSessionState {
     }
 
     #[inline]
-    pub fn option_state(&self) -> &TcpSessionOptionState {
+    pub fn option_state(&self) -> &TcpConnectionOptionState {
         &self.options
     }
 
     #[inline]
-    pub fn option_state_mut(&mut self) -> &mut TcpSessionOptionState {
+    pub fn option_state_mut(&mut self) -> &mut TcpConnectionOptionState {
         &mut self.options
     }
 
@@ -443,6 +453,60 @@ impl TcpSessionState {
     }
 
     #[inline]
+    pub fn tcp_timer_set(&mut self, timer: TcpConnectionTimerKind) {
+        self.active_timers |= timer.bit();
+    }
+
+    #[inline]
+    pub fn tcp_timer_reset(&mut self, timer: TcpConnectionTimerKind) {
+        let bit = timer.bit();
+        self.active_timers &= !bit;
+        self.pending_timers &= !bit;
+    }
+
+    #[inline]
+    pub fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
+        let bit = timer.bit();
+        self.active_timers &= !bit;
+        self.pending_timers |= bit;
+    }
+
+    #[inline]
+    pub fn tcp_timer_take_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
+        let bit = timer.bit();
+        if self.pending_timers & bit == 0 {
+            return false;
+        }
+        self.pending_timers &= !bit;
+        true
+    }
+
+    #[inline]
+    pub fn tcp_timer_dispatch_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
+        let bit = timer.bit();
+        if self.pending_timers & bit == 0 {
+            return false;
+        }
+        self.pending_timers &= !bit;
+        self.active_timers & bit == 0
+    }
+
+    #[inline]
+    pub fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.active_timers & timer.bit() != 0
+    }
+
+    #[inline]
+    pub fn tcp_timer_is_pending(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.pending_timers & timer.bit() != 0
+    }
+
+    #[inline]
+    pub fn tcp_timer_is_live(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.tcp_timer_is_active(timer) || self.tcp_timer_is_pending(timer)
+    }
+
+    #[inline]
     pub fn output_send_view(&self) -> TcpOutputSendView {
         TcpOutputSendView {
             snd_una: self.snd_una,
@@ -453,9 +517,8 @@ impl TcpSessionState {
     }
 
     #[inline]
-    pub fn view(&self) -> TcpSessionView {
-        TcpSessionView {
-            lookup_id: self.lookup_id,
+    pub fn view(&self) -> TcpConnectionView {
+        TcpConnectionView {
             connection_id: self.connection_id,
             owner_worker: self.owner_worker,
             state: self.state,
@@ -511,219 +574,48 @@ impl TcpSessionState {
     }
 
     #[inline]
-    pub(crate) fn apply_receive_progress(&mut self, progress: TcpReceiveProgress) {
-        if self.irs == 0 && self.rcv_nxt == 0 {
-            self.irs = progress.sequence.wrapping_sub(1);
-            self.rcv_nxt = progress.sequence;
-        }
-        if let Some(acknowledgment) = progress.acknowledgment {
-            if self.iss == 0 && self.snd_una == 0 && self.snd_nxt == 0 {
-                self.iss = acknowledgment.wrapping_sub(1);
-            }
-            self.snd_una = tcp_seq_max(self.snd_una, acknowledgment);
-            self.snd_nxt = tcp_seq_max(self.snd_nxt, self.snd_una);
-            self.snd_wnd = self.effective_send_window(progress.advertised_window);
-        }
-        if let Some(next_receive_sequence) = progress.next_receive_sequence
-            && self.rcv_nxt == progress.sequence
-        {
-            self.rcv_nxt = next_receive_sequence;
-        }
-        if let Some(state) = progress.state {
-            self.state = state;
-        }
+    pub fn initialize_passive_open(&mut self, iss: u32, peer_sequence: u32, peer_window: u16) {
+        self.iss = iss;
+        self.irs = peer_sequence;
+        self.snd_una = iss;
+        self.snd_nxt = TcpSeq::new(iss).advance(1).raw();
+        self.snd_wnd = self.effective_send_window(u32::from(peer_window));
+        self.rcv_nxt = TcpSeq::new(peer_sequence).advance(1).raw();
+        self.state = TcpState::SynRcvd;
     }
 
     #[inline]
-    pub fn next_output_at(&self) -> Option<std::time::Instant> {
+    pub fn accepts_ack(&self, acknowledgment: u32) -> bool {
+        !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.snd_una))
+            && !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))
+    }
+
+    #[inline]
+    pub fn apply_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
+        if self.accepts_ack(acknowledgment) {
+            self.snd_una = acknowledgment;
+        }
+        self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
+        self.retransmit_queue.acknowledge_through(acknowledgment);
+    }
+
+    #[inline]
+    pub fn accept_in_order_payload(&mut self, sequence: u32, payload_len: usize) -> bool {
+        if sequence != self.rcv_nxt {
+            return false;
+        }
+        self.rcv_nxt = TcpSeq::new(self.rcv_nxt).advance(payload_len as u32).raw();
+        true
+    }
+
+    #[inline]
+    pub fn next_output_at(&self) -> Option<Instant> {
         self.next_output_at
     }
 
     #[inline]
-    pub fn set_next_output_at(&mut self, deadline: Option<std::time::Instant>) {
+    pub fn set_next_output_at(&mut self, deadline: Option<Instant>) {
         self.next_output_at = deadline;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct TcpReceiveProgress {
-    pub(crate) state: Option<TcpState>,
-    pub(crate) sequence: u32,
-    pub(crate) acknowledgment: Option<u32>,
-    pub(crate) advertised_window: u32,
-    pub(crate) next_receive_sequence: Option<u32>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpSessionIndex {
-    entries: hammer_infra::vec::Vec<TcpSessionIndexEntry>,
-    lookup_slots: FlatHashTable<TcpLookupId, SessionId>,
-    connection_slots: FlatHashTable<u64, SessionId>,
-    tuple_v4_slots: FlatHashTable<TcpV4ConnectionKey, SessionId>,
-    tuple_v6_slots: FlatHashTable<TcpV6ConnectionKey, SessionId>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpSessionIndexEntry {
-    session_id: SessionId,
-    lookup_id: TcpLookupId,
-    connection_id: Option<TcpConnectionId>,
-    local: Option<SocketAddr>,
-    remote: SocketAddr,
-}
-
-impl TcpSessionIndexEntry {
-    #[inline]
-    fn new(session_id: SessionId, session: &TcpSessionState) -> Self {
-        Self {
-            session_id,
-            lookup_id: session.lookup_id(),
-            connection_id: session.connection_id(),
-            local: session.local(),
-            remote: session.remote(),
-        }
-    }
-
-    #[inline]
-    fn tuple_key(self) -> Option<TcpSocketTupleKey> {
-        self.local
-            .and_then(|local| tcp_socket_tuple_key(local, self.remote))
-    }
-}
-
-impl TcpSessionIndex {
-    #[inline]
-    pub fn empty() -> Self {
-        Self {
-            entries: hammer_infra::vec::Vec::new(),
-            lookup_slots: FlatHashTable::new(),
-            connection_slots: FlatHashTable::new(),
-            tuple_v4_slots: FlatHashTable::new(),
-            tuple_v6_slots: FlatHashTable::new(),
-        }
-    }
-
-    #[inline]
-    pub fn insert(&mut self, session_id: SessionId, session: &TcpSessionState) {
-        let entry = TcpSessionIndexEntry::new(session_id, session);
-        self.entries.push(entry);
-        self.index_entry(entry);
-    }
-
-    #[inline]
-    fn index_entry(&mut self, entry: TcpSessionIndexEntry) {
-        self.lookup_slots.insert(entry.lookup_id, entry.session_id);
-        if let Some(connection_id) = entry.connection_id {
-            self.connection_slots
-                .insert(connection_id.get(), entry.session_id);
-        }
-        match entry.tuple_key() {
-            Some(TcpSocketTupleKey::V4(key)) => {
-                self.tuple_v4_slots.insert(key, entry.session_id);
-            }
-            Some(TcpSocketTupleKey::V6(key)) => {
-                self.tuple_v6_slots.insert(key, entry.session_id);
-            }
-            None => {}
-        }
-    }
-
-    #[inline]
-    pub fn upsert(&mut self, session_id: SessionId, session: &TcpSessionState) {
-        let entry = TcpSessionIndexEntry::new(session_id, session);
-        if let Some(existing) = self
-            .entries
-            .iter_mut()
-            .find(|existing| existing.session_id == session_id)
-        {
-            *existing = entry;
-        } else {
-            self.entries.push(entry);
-        }
-        self.rebuild_indexes();
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    #[inline]
-    pub fn iter_session_ids(&self) -> impl Iterator<Item = SessionId> + '_ {
-        self.entries.iter().map(|entry| entry.session_id)
-    }
-
-    #[inline]
-    pub fn lookup_by_lookup_id(&self, lookup_id: TcpLookupId) -> Option<SessionId> {
-        self.lookup_slots.lookup(&lookup_id)
-    }
-
-    #[inline]
-    pub fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<SessionId> {
-        self.connection_slots.lookup(&connection_id.get())
-    }
-
-    #[inline]
-    pub fn lookup_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
-        match tcp_socket_tuple_key(local, remote)? {
-            TcpSocketTupleKey::V4(key) => self.tuple_v4_slots.lookup(&key),
-            TcpSocketTupleKey::V6(key) => self.tuple_v6_slots.lookup(&key),
-        }
-    }
-
-    pub fn remove_session(&mut self, session_id: SessionId) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.session_id == session_id)
-        {
-            let last = self
-                .entries
-                .pop()
-                .expect("session index entry exists at computed index");
-            if index != self.entries.len() {
-                self.entries[index] = last;
-            }
-        }
-        self.rebuild_indexes();
-    }
-
-    pub fn remove_lookup_id(&mut self, lookup_id: TcpLookupId) -> Option<SessionId> {
-        let session_id = self.lookup_slots.lookup(&lookup_id)?;
-        self.remove_session(session_id);
-        Some(session_id)
-    }
-
-    fn rebuild_indexes(&mut self) {
-        self.lookup_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
-        self.connection_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
-        self.tuple_v4_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
-        self.tuple_v6_slots = FlatHashTable::with_capacity(self.entries.len().max(1) * 2);
-        for index in 0..self.entries.len() {
-            let entry = self.entries[index];
-            self.index_entry(entry);
-        }
-    }
-}
-
-impl Default for TcpSessionIndex {
-    #[inline]
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-#[inline]
-fn tcp_seq_max(current: u32, candidate: u32) -> u32 {
-    if current == 0 || TcpSeq::new(current).before(TcpSeq::new(candidate)) {
-        candidate
-    } else {
-        current
     }
 }
 
@@ -840,36 +732,5 @@ fn duration_from_nanos_saturating(nanos: u128) -> Duration {
         Duration::new(u64::MAX, 999_999_999)
     } else {
         Duration::new(seconds as u64, subsecond_nanos)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TcpSocketTupleKey {
-    V4(TcpV4ConnectionKey),
-    V6(TcpV6ConnectionKey),
-}
-
-#[inline]
-fn tcp_socket_tuple_key(local: SocketAddr, remote: SocketAddr) -> Option<TcpSocketTupleKey> {
-    match (local.ip(), remote.ip()) {
-        (IpAddr::V4(local_addr), IpAddr::V4(remote_addr)) => {
-            Some(TcpSocketTupleKey::V4(TcpV4ConnectionKey::new(
-                0,
-                local_addr,
-                local.port(),
-                remote_addr,
-                remote.port(),
-            )))
-        }
-        (IpAddr::V6(local_addr), IpAddr::V6(remote_addr)) => {
-            Some(TcpSocketTupleKey::V6(TcpV6ConnectionKey::new(
-                0,
-                local_addr,
-                local.port(),
-                remote_addr,
-                remote.port(),
-            )))
-        }
-        _ => None,
     }
 }

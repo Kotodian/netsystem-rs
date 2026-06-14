@@ -211,7 +211,6 @@ fn manual_record(sequence: u32, flags: u8, payload: &[u8]) -> TcpOutputRecord {
     let local: SocketAddr = "192.0.2.30:50000".parse().expect("manual local");
     let remote: SocketAddr = "198.51.100.30:443".parse().expect("manual remote");
     TcpOutputRecord {
-        lookup_id: 33,
         connection_id: TcpConnectionId::new(3301),
         local,
         remote,

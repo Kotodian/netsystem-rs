@@ -3,6 +3,7 @@ pub mod dns;
 pub mod icmp;
 pub mod ip;
 pub mod tcp;
+pub mod transport;
 
 #[cfg(feature = "hysteria2")]
 pub mod hysteria2;

@@ -1,5 +1,5 @@
 use hammer_service::transport::tcp::{
-    TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionState,
+    TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionConfigState,
 };
 
 #[test]
@@ -13,8 +13,8 @@ fn tcp_connection_defaults_to_hammer_owned_congestion_control() {
         registry.default_algorithm()
     );
 
-    let connection =
-        TcpConnectionState::new(&registry, None).expect("default congestion control selection");
+    let connection = TcpConnectionConfigState::new(&registry, None)
+        .expect("default congestion control selection");
 
     assert_eq!(
         connection.selected_congestion_algorithm(),
@@ -26,7 +26,7 @@ fn tcp_connection_defaults_to_hammer_owned_congestion_control() {
 fn tcp_connection_override_to_reno_is_rejected_until_hammer_tcp_node_support_exists() {
     let registry = TcpCongestionRegistry::default();
 
-    let err = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Reno))
+    let err = TcpConnectionConfigState::new(&registry, Some(TcpCongestionAlgorithm::Reno))
         .expect_err("reno must wait for Hammer TCP node support");
 
     assert!(
@@ -40,7 +40,7 @@ fn tcp_connection_override_to_reno_is_rejected_until_hammer_tcp_node_support_exi
 fn tcp_connection_override_to_cubic_is_rejected_until_hammer_tcp_node_support_exists() {
     let registry = TcpCongestionRegistry::default();
 
-    let err = TcpConnectionState::new(&registry, Some(TcpCongestionAlgorithm::Cubic))
+    let err = TcpConnectionConfigState::new(&registry, Some(TcpCongestionAlgorithm::Cubic))
         .expect_err("cubic must wait for Hammer TCP node support");
 
     assert!(
@@ -52,12 +52,12 @@ fn tcp_connection_override_to_cubic_is_rejected_until_hammer_tcp_node_support_ex
 
 #[test]
 fn tcp_connection_rejects_registry_default_until_hammer_tcp_node_support_exists() {
-    let reno = TcpConnectionState::new(
+    let reno = TcpConnectionConfigState::new(
         &TcpCongestionRegistry::new(TcpCongestionAlgorithm::Reno),
         None,
     )
     .expect_err("reno default must wait for Hammer TCP node support");
-    let cubic = TcpConnectionState::new(
+    let cubic = TcpConnectionConfigState::new(
         &TcpCongestionRegistry::new(TcpCongestionAlgorithm::Cubic),
         None,
     )

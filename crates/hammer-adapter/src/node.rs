@@ -690,6 +690,32 @@ impl NodeRuntimeInner {
         }
         Ok(())
     }
+
+    fn add_node_next_slot(&mut self, node: NodeId, next: NodeId) -> CoreResult<usize> {
+        self.validate_node(node)?;
+        self.validate_node(next)?;
+        let slot = self
+            .next_nodes
+            .get(node.0 as usize)
+            .map(Vec::len)
+            .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+        if slot >= MAX_NODE_NEXT_FRAMES {
+            return Err(CoreError::internal("node next frame capacity exceeded"));
+        }
+        let mut group = self.siblings[node.0 as usize].clone();
+        group.push(node);
+        for sibling in group {
+            let sibling_nexts = self
+                .next_nodes
+                .get_mut(sibling.0 as usize)
+                .ok_or_else(|| CoreError::internal("node id out of bounds"))?;
+            if sibling_nexts.len() != slot {
+                return Err(CoreError::internal("node sibling next count mismatch"));
+            }
+            sibling_nexts.push(Some(next));
+        }
+        Ok(slot)
+    }
 }
 
 impl Default for NodeRuntime {
@@ -1034,6 +1060,11 @@ impl NodeRuntime {
         inner.validate_node(node)?;
         inner.validate_node(next)?;
         inner.set_node_next_slot(node, slot, next)
+    }
+
+    pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> CoreResult<usize> {
+        let mut inner = self.inner.borrow_mut();
+        inner.add_node_next_slot(node, next)
     }
 
     pub fn node_siblings(&self, node: NodeId) -> CoreResult<Vec<NodeId>> {

@@ -70,7 +70,7 @@ Agents must not edit the same file concurrently. The coordination order is:
 - Modify: `crates/hammer-service/src/session/protocol/tcp/state.rs`
 - Modify: `crates/hammer-service/src/session/protocol/tcp/mod.rs`
 - Modify: `crates/hammer-service/src/session/protocol/tcp/node.rs`
-- Modify: `crates/hammer-service/src/session/worker.rs` only if a safe helper is needed to borrow `program` and `SessionProtocolContext` together.
+- Modify: `crates/hammer-service/src/session/runtime.rs` only if a safe helper is needed to borrow `program` and `SessionProtocolContext` together.
 - Modify tests: `crates/hammer-service/tests/tcp_connection_state.rs`
 - Modify tests: `crates/hammer-service/tests/session_queue_node.rs`
 - Create tests: `crates/hammer-service/tests/tcp_session_app_ring.rs`
@@ -161,27 +161,27 @@ git commit -m "hammer-service(Refactor): make tcp protocol own session state"
 
 **Deliverables:**
 
-- [ ] Move TCP option parsing out of `crates/hammer-service/src/transport/tcp/options.rs` into `hammer-core::protocol::tcp::options`:
+- [x] Move TCP option parsing out of `crates/hammer-service/src/transport/tcp/options.rs` into `hammer-core::protocol::tcp::options`:
   - expose parsed MSS/window scale/SACK/SACK blocks/timestamps/ECN
   - keep `TcpCapabilities` and `TcpNegotiatedOptions` in core
   - make service import core option parsing instead of owning `tcp_options_from_bytes`
   - delete or reduce service `options.rs` to output-option construction only if output code still needs a service-local builder
-- [ ] Add `hammer-core::protocol::tcp::segment` backed by `etherparse`:
+- [x] Add `hammer-core::protocol::tcp::segment` backed by `etherparse`:
   - add `etherparse = { workspace = true }` to `crates/hammer-core/Cargo.toml`
   - expose `ParsedTcpSegment<'a>` or `TcpSegmentView<'a>` from core
   - expose `TcpFlags` from core or move existing `TcpInputFlags` into core if it is protocol-level
   - parse TCP header length, ports, sequence, optional ACK, flags, advertised window, options slice, and payload slice
   - return typed parse errors for short header, bad data offset, and invalid TCP slice
   - do not parse IP addresses inside the TCP segment parser
-- [ ] Reuse the existing packet stack in service; do not write a new IP/TCP parser:
+- [x] Reuse the existing packet stack in service; do not write a new IP/TCP parser:
   - use `crate::net::ip::parse_ip_packet_with_chain_len`
   - use `hammer_adapter::BufferPacketCursor`
   - reuse cursor values set by IP local/input nodes
   - pass the TCP header/payload slice to `hammer_core::protocol::tcp::segment`
   - reuse existing TCP sequence/handshake/key types from `hammer_core::protocol::tcp`
-- [ ] Remove duplicated manual TCP header offset reads from service packet nodes. It is acceptable to keep tiny test packet builders, but production parsing should go through `hammer-core` TCP parsing.
-- [ ] If service duplicated TCP view logic needs cleanup, add only a thin packet-buffer glue wrapper in `transport/tcp/segment.rs`; it must borrow packet bytes/cursor and combine parsed IP metadata plus `hammer-core` TCP parse results, not reimplement IP/TCP parsing.
-- [ ] Core `TcpSegmentView` plus optional service packet glue expose:
+- [x] Remove duplicated manual TCP header offset reads from service packet nodes. It is acceptable to keep tiny test packet builders, but production parsing should go through `hammer-core` TCP parsing.
+- [x] If service duplicated TCP view logic needs cleanup, add only a thin packet-buffer glue wrapper in `transport/tcp/segment.rs`; it must borrow packet bytes/cursor and combine parsed IP metadata plus `hammer-core` TCP parse results, not reimplement IP/TCP parsing.
+- [x] Core `TcpSegmentView` plus optional service packet glue expose:
   - IP version
   - local/remote socket tuple
   - sequence number
@@ -190,12 +190,12 @@ git commit -m "hammer-service(Refactor): make tcp protocol own session state"
   - flags
   - payload range/length
   - TCP option bytes slice
-- [ ] `TcpInputNode` dispatch rules:
+- [x] `TcpInputNode` dispatch rules:
   - existing session tuple -> state-based next node
   - listener tuple -> `TcpListenNode` on the current worker
   - bad listen ACK -> reset
   - no listener/session -> punt/reset/drop according to existing policy
-- [ ] `TcpListenNode`:
+- [x] `TcpListenNode`:
   - pure SYN creates a TCP session through `TcpSessionProtocol`
   - does not handoff just because the listener was created by the control plane
   - chooses child session owner as the current data worker
@@ -203,42 +203,42 @@ git commit -m "hammer-service(Refactor): make tcp protocol own session state"
   - applies peer SYN options using the core TCP options parser
   - emits SYN-ACK
   - arms SYN-ACK retransmit timer through session context
-- [ ] `TcpRcvProcessNode`:
+- [x] `TcpRcvProcessNode`:
   - handles `SYN_RCVD` final ACK
   - promotes session to `ESTABLISHED`
   - cancels SYN-ACK timer
   - handles close-state ACK/FIN/RST dispatch
-- [ ] `TcpEstablishedNode`:
+- [x] `TcpEstablishedNode`:
   - rejects invalid SEQ with ACK/challenge ACK
   - processes valid ACK into `snd_una`, retransmit queue release, congestion ACK sample
   - forwards in-order payload/FIN work to TCP session protocol
   - handles RST by closing/removing session and completing app close/reset signal
-- [ ] `TcpSynSentNode`:
+- [x] `TcpSynSentNode`:
   - handles active-open `SYN|ACK`
   - validates ACK range
   - promotes session to `ESTABLISHED`
   - emits final ACK
   - handles RST/refused path
-- [ ] `reply.rs`/`output.rs`:
+- [x] `reply.rs`/`output.rs`:
   - provide packet emission helpers for SYN-ACK, ACK, RST, FIN-ACK, and data segments from `TcpSessionState`
   - track sequence-consuming output in session retransmit queue
   - update `snd_nxt` only through typed session methods
 
 **Required tests:**
 
-- [ ] `core_tcp_segment_parses_header_ports_sequence_ack_flags_window_options_and_payload`
-- [ ] `core_tcp_segment_rejects_short_header_and_bad_data_offset`
-- [ ] `core_tcp_options_parse_mss_window_scale_sack_timestamp_ecn`
-- [ ] `tcp_input_routes_existing_established_tuple_to_established_node`
-- [ ] `tcp_input_handoffs_existing_session_to_owner_worker`
-- [ ] `tcp_input_routes_listener_syn_to_local_listen_node_without_handoff`
-- [ ] `tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack`
-- [ ] `tcp_syn_rcvd_final_ack_promotes_session_to_established`
-- [ ] `tcp_established_in_order_payload_advances_rcv_nxt_and_completes_recv`
-- [ ] `tcp_established_out_of_window_segment_emits_ack_without_advancing_rcv_nxt`
-- [ ] `tcp_established_rst_closes_session`
-- [ ] `tcp_syn_sent_valid_syn_ack_emits_final_ack_and_establishes`
-- [ ] `tcp_syn_sent_rst_closes_half_open`
+- [x] `core_tcp_segment_parses_header_ports_sequence_ack_flags_window_options_and_payload`
+- [x] `core_tcp_segment_rejects_short_header_and_bad_data_offset`
+- [x] `core_tcp_options_parse_mss_window_scale_sack_timestamp_ecn`
+- [x] `tcp_input_routes_existing_established_tuple_to_established_node`
+- [x] `tcp_input_handoffs_existing_session_to_owner_worker`
+- [x] `tcp_input_routes_listener_syn_to_local_listen_node_without_handoff`
+- [x] `tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack`
+- [x] `tcp_syn_rcvd_final_ack_promotes_session_to_established`
+- [x] `tcp_established_in_order_payload_advances_rcv_nxt_and_completes_recv`
+- [x] `tcp_established_out_of_window_segment_emits_ack_without_advancing_rcv_nxt`
+- [x] `tcp_established_rst_closes_session`
+- [x] `tcp_syn_sent_valid_syn_ack_emits_final_ack_and_establishes`
+- [x] `tcp_syn_sent_rst_closes_half_open`
 
 **Implementation notes:**
 

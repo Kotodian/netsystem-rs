@@ -11,8 +11,7 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::tcp::{
     TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpIpv4ListenerAddress,
-    TcpListenNext, TcpListenNode, TcpResetNext, TcpResetNode, TcpV4ListenerKey,
-    TcpWorkerOwnedState,
+    TcpResetNext, TcpResetNode, TcpV4ListenerKey, TcpWorkerOwnedState,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -153,7 +152,7 @@ fn ip_local_routes_tcp_packets_into_tcp_input_listen_next() {
 
     assert!(runtime.schedule_frame(local, frame).expect("schedule"));
 
-    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 4);
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 3);
     assert_capture_packets(&graph.listen_state, &[packet]);
     assert!(graph.reset_state.lock().unwrap().packets.is_empty());
     let state = graph.listen_state.lock().unwrap();
@@ -289,15 +288,12 @@ fn tcp_input_routes_listener_syn_locally_without_handoff() {
             .expect("schedule first")
     );
 
-    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 3);
+    assert_eq!(first_runtime.run_ready_nodes().expect("run first"), 2);
     assert_eq!(second_runtime.run_ready_nodes().expect("run second"), 0);
     assert_capture_packets(&first_graph.listen_state, &[packet]);
     assert!(second_graph.listen_state.lock().unwrap().packets.is_empty());
     let state = first_graph.listen_state.lock().unwrap();
-    assert_eq!(
-        state.handoff_source_workers,
-        vec![None]
-    );
+    assert_eq!(state.handoff_source_workers, vec![None]);
     assert_metadata(
         &state.metadata[0],
         Ipv4Addr::new(198, 51, 100, 33).into(),
@@ -343,15 +339,12 @@ impl TcpGraph {
             .register_internal(CaptureNode::new(Arc::new(Mutex::new(
                 CaptureState::default(),
             ))));
-        let listen_sink = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&listen_state)));
         let reset_sink = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&reset_state)));
-        let listen_node = TcpListenNode::new(TcpListenNext::nodes(listen_sink));
-        assert_internal_node(&listen_node);
-        let listen = runtime.nodes().register_internal(listen_node);
+        let listen = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&listen_state)));
         let reset_node = TcpResetNode::new(TcpResetNext::nodes(drop, reset_sink));
         assert_internal_node(&reset_node);
         let reset = runtime.nodes().register_internal(reset_node);

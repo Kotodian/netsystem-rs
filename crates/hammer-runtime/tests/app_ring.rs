@@ -1,11 +1,11 @@
 use std::future::Future;
 use std::time::Duration;
 
-use hammer_adapter::BufferIndex;
+use hammer_infra::align::CACHE_LINE;
 use hammer_runtime::app::{
-    AppBufferLease, AppCompletionEntry, AppContext, AppCqe, AppCqeData, AppCqeDescriptor,
-    AppCqeFlags, AppObjectRef, AppOpId, AppOpcode, AppRegisteredBuffer, AppRingHandle, AppSend,
-    AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
+    AppCompletionEntry, AppContext, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppDataAddr,
+    AppDataArea, AppDataAreaConfig, AppObjectRef, AppOpId, AppOpcode, AppRingHandle,
+    AppRingMemoryKind, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
 };
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
@@ -20,6 +20,111 @@ fn app_ring_uses_opaque_operation_identity() {
         AppSqeData::Recv { max_len: 64 }
     ));
     assert_eq!(AppCqeData::None, AppCqeData::None);
+}
+
+#[test]
+fn app_data_area_allocates_copies_and_rejects_stale_addresses() {
+    let area = AppDataArea::new(AppDataAreaConfig {
+        chunk_size: 64,
+        chunk_count: 2,
+    })
+    .expect("data area");
+
+    let first = area.alloc().expect("first chunk");
+    assert_eq!(first.offset(), 0);
+    assert_eq!(first.offset() % CACHE_LINE, 0);
+    assert_eq!(first.len(), 0);
+    assert_eq!(first.capacity(), 64);
+
+    let first = area.write(first, b"hello").expect("write first");
+    assert_eq!(area.read(first).expect("read first"), b"hello");
+
+    let second = area.alloc().expect("second chunk");
+    assert_eq!(second.offset(), 64);
+    assert_eq!(second.offset() % CACHE_LINE, 0);
+    assert!(area.alloc().is_none());
+
+    area.release(first).expect("release first");
+    assert!(
+        area.read(first).is_err(),
+        "released address generation must be stale"
+    );
+
+    let reused = area.alloc().expect("reused chunk");
+    assert_eq!(reused.offset(), 0);
+    assert_ne!(reused.generation(), first.generation());
+
+    area.release(second).expect("release second");
+    area.release(reused).expect("release reused");
+}
+
+#[test]
+fn app_data_area_rejects_non_cacheline_chunk_size() {
+    assert!(
+        AppDataArea::new(AppDataAreaConfig {
+            chunk_size: CACHE_LINE - 1,
+            chunk_count: 1,
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn app_data_area_rejects_forged_chunk_offset() {
+    let area = AppDataArea::new(AppDataAreaConfig {
+        chunk_size: 64,
+        chunk_count: 2,
+    })
+    .expect("data area");
+    let addr = area.alloc().expect("chunk");
+    let forged = AppDataAddr::new(
+        addr.chunk(),
+        addr.generation(),
+        64,
+        addr.len() as u32,
+        addr.capacity() as u32,
+    );
+
+    assert!(area.write(forged, b"bad").is_err());
+    area.release(addr).expect("release original");
+}
+
+#[test]
+fn app_ring_export_layout_has_no_process_local_state() {
+    let ring = AppRingHandle::with_data_area(8, 16, 2048, 64).expect("ring");
+    let export = ring.export_layout();
+
+    assert_eq!(export.memory_kind(), AppRingMemoryKind::ProcessLocal);
+    assert_eq!(export.cacheline_size(), CACHE_LINE);
+    assert_eq!(export.submission_capacity(), 8);
+    assert_eq!(export.completion_capacity(), 16);
+    assert_eq!(export.data_chunk_count(), 64);
+    assert_eq!(export.data_chunk_size(), 2048);
+    assert_eq!(export.submission_ring_offset(), 0);
+    assert!(export.submission_ring_bytes() > 0);
+    assert!(export.completion_ring_bytes() > 0);
+    assert!(export.fill_ring_bytes() > 0);
+    assert!(export.submission_ring_offset() < export.completion_ring_offset());
+    assert!(export.completion_ring_offset() < export.fill_ring_offset());
+    assert!(export.fill_ring_offset() < export.data_area_offset());
+    assert_eq!(export.submission_ring_offset() % CACHE_LINE, 0);
+    assert_eq!(export.completion_ring_offset() % CACHE_LINE, 0);
+    assert_eq!(export.fill_ring_offset() % CACHE_LINE, 0);
+    assert_eq!(export.data_area_offset() % CACHE_LINE, 0);
+}
+
+#[test]
+fn app_descriptors_use_data_area_addresses_not_dataplane_buffer_indexes() {
+    let addr = AppDataAddr::new(3, 9, 4096, 12, 2048);
+
+    assert_eq!(
+        AppSqeData::Send { data: addr },
+        AppSqeData::Send { data: addr }
+    );
+    assert_eq!(
+        AppCqeData::Recv { data: addr },
+        AppCqeData::Recv { data: addr }
+    );
 }
 
 #[test]
@@ -61,26 +166,19 @@ fn app_runtime_try_pop_submission_entry_without_awaiting() {
         .block_on(async {
             app.spawn_on_op(op, 0, move |worker| async move {
                 let runtime = worker.runtime();
-                let buffers = with_data_plane_buffers(Clone::clone);
-                let index = buffers
-                    .alloc_index_with_bytes(Default::default(), b"sync-entry-send")
-                    .expect("alloc sync entry send buffer");
-                let registered =
-                    AppRegisteredBuffer::from_lease(AppBufferLease::from_buffer(buffers, index))
-                        .expect("registered buffer");
+                let send = runtime
+                    .send_from_bytes(b"sync-entry-send")
+                    .expect("send data");
+                let data = send.into_data_addr().expect("send data address");
                 let descriptor = AppSqeDescriptor::new(
                     AppOpcode::Send,
                     Some(AppUserData::new(101)),
                     AppObjectRef::Operation(op),
-                    AppSqeData::Send {
-                        buffer: registered.index(),
-                    },
+                    AppSqeData::Send { data },
                 );
 
                 runtime
-                    .try_push_submission_entry(AppSubmissionEntry::with_attachment(
-                        descriptor, registered,
-                    ))
+                    .try_push_submission_entry(AppSubmissionEntry::new(descriptor))
                     .expect("push submission entry");
 
                 let entry = runtime
@@ -88,11 +186,13 @@ fn app_runtime_try_pop_submission_entry_without_awaiting() {
                     .expect("pop submission entry");
                 assert!(runtime.try_pop_submission_entry().is_none());
                 let (descriptor_round_trip, registered) = entry.into_parts();
-                let (_buffer_index, lease) = registered
-                    .expect("submission entry attachment")
-                    .into_parts();
-                let payload = lease.copy_current().expect("copy send payload");
-                lease.release();
+                assert!(registered.is_none());
+                let payload = match descriptor_round_trip.payload() {
+                    AppSqeData::Send { data } => runtime
+                        .read_data(data)
+                        .expect("copy send payload from app data"),
+                    other => panic!("unexpected payload: {other:?}"),
+                };
                 (descriptor_round_trip, payload)
             })
             .await
@@ -107,7 +207,7 @@ fn app_runtime_try_pop_submission_entry_without_awaiting() {
 }
 
 #[test]
-fn app_send_descriptor_uses_buffer_handle_not_payload_object() {
+fn app_send_descriptor_uses_data_area_address_not_payload_object() {
     let data_runtime =
         DataRuntime::new(1, "app-ring-descriptor-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
@@ -118,14 +218,16 @@ fn app_send_descriptor_uses_buffer_handle_not_payload_object() {
         .build()
         .expect("driver runtime")
         .block_on(async {
-            app.spawn_on_op(op, 0, move |_worker| async move {
-                let runtime = with_data_plane_buffers(Clone::clone);
-                let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"descriptor-buffer")
-                    .expect("alloc app send buffer");
-                let lease = AppBufferLease::from_buffer(runtime, index);
-                let send = AppSend::new(lease);
-                send.descriptor(Some(AppUserData::new(55)), op)
+            app.spawn_on_op(op, 0, move |worker| async move {
+                let app_runtime = worker.runtime();
+                let send = app_runtime
+                    .send_from_bytes(b"descriptor-buffer")
+                    .expect("send data");
+                app_runtime
+                    .try_push_submission(AppSqe::send(Some(AppUserData::new(55)), op, send))
+                    .expect("push send");
+                app_runtime
+                    .try_pop_submission_descriptor()
                     .expect("send descriptor")
             })
             .await
@@ -136,7 +238,10 @@ fn app_send_descriptor_uses_buffer_handle_not_payload_object() {
     assert_eq!(descriptor.user_data(), Some(AppUserData::new(55)));
     assert_eq!(descriptor.object(), AppObjectRef::Operation(op));
     match descriptor.payload() {
-        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        AppSqeData::Send { data } => {
+            assert_eq!(data.len(), "descriptor-buffer".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected sqe data: {other:?}"),
     }
 
@@ -150,7 +255,7 @@ fn app_runtime_send_enqueues_op_owned_send_sqe_descriptor() {
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let op = AppOpId::new(61);
 
-    let descriptor = tokio::runtime::Builder::new_current_thread()
+    let (recv_descriptor, send_descriptor) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("driver runtime")
@@ -168,7 +273,7 @@ fn app_runtime_send_enqueues_op_owned_send_sqe_descriptor() {
                     .expect("alloc app send buffer");
 
                 app_runtime
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv_buffer(runtime.clone(), index)
                     .await
                     .expect("complete recv cqe");
 
@@ -189,12 +294,15 @@ fn app_runtime_send_enqueues_op_owned_send_sqe_descriptor() {
             .expect("spawn app op task")
         });
 
-    assert_eq!(descriptor.0.opcode(), AppOpcode::Recv);
-    assert_eq!(descriptor.0.object(), AppObjectRef::Operation(op));
-    assert_eq!(descriptor.1.opcode(), AppOpcode::Send);
-    assert_eq!(descriptor.1.object(), AppObjectRef::Operation(op));
-    match descriptor.1.payload() {
-        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+    assert_eq!(recv_descriptor.opcode(), AppOpcode::Recv);
+    assert_eq!(recv_descriptor.object(), AppObjectRef::Operation(op));
+    assert_eq!(send_descriptor.opcode(), AppOpcode::Send);
+    assert_eq!(send_descriptor.object(), AppObjectRef::Operation(op));
+    match send_descriptor.payload() {
+        AppSqeData::Send { data } => {
+            assert_eq!(data.len(), "runtime-send-sqe".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected sqe data: {other:?}"),
     }
 
@@ -226,7 +334,6 @@ fn app_context_try_complete_recv_buffer_enqueues_op_owned_cqe() {
                 let index = runtime
                     .alloc_index_with_bytes(Default::default(), b"complete-recv")
                     .expect("alloc app recv buffer");
-                let expected_ptr = runtime.current_ptr(index).expect("buffer pointer") as usize;
 
                 app_for_worker
                     .try_complete_recv_buffer(op, runtime.clone(), index, false)
@@ -236,26 +343,16 @@ fn app_context_try_complete_recv_buffer_enqueues_op_owned_cqe() {
                 let recv = recv_future.await.expect("recv cqe");
                 let descriptor = AppCqeDescriptor::new(
                     recv_sqe.user_data(),
-                    recv.lease().current_len().expect("recv len") as i32,
+                    recv.copy_current().expect("recv payload").len() as i32,
                     AppCqeFlags::BUFFER,
                     AppObjectRef::Operation(op),
-                    AppCqeData::Recv {
-                        buffer: recv.lease().index(),
-                    },
+                    AppCqeData::Recv { data: recv.data() },
                 );
-                let recv_ptr = recv.lease().current_ptr().expect("recv pointer") as usize;
-                let recv_payload = recv.lease().copy_current().expect("recv payload");
+                let recv_payload = recv.copy_current().expect("recv payload");
                 recv.release();
                 let after_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
 
-                (
-                    descriptor,
-                    expected_ptr,
-                    recv_ptr,
-                    recv_payload,
-                    before_in_use,
-                    after_in_use,
-                )
+                (descriptor, recv_payload, before_in_use, after_in_use)
             })
             .await
             .expect("spawn app op task")
@@ -266,13 +363,15 @@ fn app_context_try_complete_recv_buffer_enqueues_op_owned_cqe() {
     assert_eq!(result.0.object(), AppObjectRef::Operation(op));
     assert!(result.0.flags().contains(AppCqeFlags::BUFFER));
     match result.0.payload() {
-        AppCqeData::Recv { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        AppCqeData::Recv { data } => {
+            assert_eq!(data.len(), "complete-recv".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected cqe data: {other:?}"),
     }
-    assert_eq!(result.1, result.2);
-    assert_eq!(result.3, b"complete-recv");
-    assert_eq!(result.4, 0);
-    assert_eq!(result.5, 0);
+    assert_eq!(result.1, b"complete-recv");
+    assert_eq!(result.2, 0);
+    assert_eq!(result.3, 0);
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
@@ -317,6 +416,57 @@ fn app_context_try_complete_recv_buffer_requires_pending_recv_submission() {
 }
 
 #[test]
+fn app_context_failed_recv_completion_keeps_pending_recv_submission() {
+    let data_runtime = DataRuntime::new(1, "app-complete-recv-keeps-pending-test", 512 * 1024, 2)
+        .expect("data runtime");
+    let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
+    let op = AppOpId::new(73);
+
+    let payload = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("driver runtime")
+        .block_on(async {
+            let app_for_worker = app.clone();
+            app.spawn_on_op(op, 0, move |worker| async move {
+                let app_runtime = worker.runtime();
+                let recv_future = app_runtime.recv();
+                let _recv_sqe = app_runtime
+                    .next_submission_descriptor()
+                    .await
+                    .expect("recv sqe descriptor");
+                let runtime = with_data_plane_buffers(Clone::clone);
+                let first = runtime
+                    .alloc_index_with_bytes(Default::default(), b"first")
+                    .expect("alloc first recv buffer");
+
+                app_for_worker
+                    .try_complete_recv_buffer(op, runtime.clone(), first, false)
+                    .expect("first recv completion");
+
+                let second = runtime
+                    .alloc_index_with_bytes(Default::default(), b"second")
+                    .expect("alloc second recv buffer");
+                app_for_worker
+                    .try_complete_recv_buffer(op, runtime.clone(), second, false)
+                    .expect_err("pending recv was already consumed");
+                assert_eq!(runtime.in_use_buffers(), 0);
+
+                let recv = recv_future.await.expect("first recv cqe");
+                let payload = recv.copy_current().expect("first payload");
+                recv.release();
+                payload
+            })
+            .await
+            .expect("spawn app op task")
+        });
+
+    assert_eq!(payload, b"first");
+
+    data_runtime.shutdown_timeout(Duration::from_secs(1));
+}
+
+#[test]
 fn app_runtime_reuses_one_ring_handle_for_sq_and_cq() {
     let data_runtime =
         DataRuntime::new(1, "app-shared-ring-handle-test", 512 * 1024, 2).expect("data runtime");
@@ -347,7 +497,7 @@ fn app_runtime_reuses_one_ring_handle_for_sq_and_cq() {
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv cqe");
-                let recv_payload = recv.lease().copy_current().expect("recv payload");
+                let recv_payload = recv.copy_current().expect("recv payload");
                 app_runtime
                     .send(recv.into_send())
                     .await
@@ -366,7 +516,10 @@ fn app_runtime_reuses_one_ring_handle_for_sq_and_cq() {
     assert_eq!(result.1.opcode(), AppOpcode::Send);
     assert_eq!(result.1.object(), AppObjectRef::Operation(op));
     match result.1.payload() {
-        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        AppSqeData::Send { data } => {
+            assert_eq!(data.len(), "shared-ring".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected sqe data: {other:?}"),
     }
 
@@ -382,7 +535,7 @@ fn app_ring_handle_round_trips_pure_descriptors_without_high_level_objects() {
         Some(AppUserData::new(41)),
         AppObjectRef::Operation(op),
         AppSqeData::Send {
-            buffer: buffer_index(7, 9, 11),
+            data: AppDataAddr::new(7, 9, 64, 11, 64),
         },
     );
     let recv_descriptor = AppCqeDescriptor::new(
@@ -391,7 +544,7 @@ fn app_ring_handle_round_trips_pure_descriptors_without_high_level_objects() {
         AppCqeFlags::BUFFER,
         AppObjectRef::Operation(op),
         AppCqeData::Recv {
-            buffer: buffer_index(7, 9, 11),
+            data: AppDataAddr::new(7, 9, 64, 11, 64),
         },
     );
 
@@ -472,7 +625,7 @@ fn app_ring_descriptor_and_object_apis_share_one_underlying_queue() {
 }
 
 #[test]
-fn app_ring_entry_registers_recv_buffer_for_object_view() {
+fn app_ring_entry_round_trips_recv_data_address_for_object_view() {
     let data_runtime =
         DataRuntime::new(1, "app-ring-entry-recv-test", 512 * 1024, 2).expect("data runtime");
     let ring = AppRingHandle::new(4, 4);
@@ -483,48 +636,44 @@ fn app_ring_entry_registers_recv_buffer_for_object_view() {
         .build()
         .expect("driver runtime")
         .block_on(async {
-            let runtime = with_data_plane_buffers(Clone::clone);
-            let index = runtime
-                .alloc_index_with_bytes(Default::default(), b"entry-registered-recv")
-                .expect("alloc recv buffer");
-            let lease = AppBufferLease::from_buffer(runtime, index);
-            let registered = AppRegisteredBuffer::from_lease(lease).expect("registered buffer");
+            let data = ring
+                .alloc_data_for_bytes(b"entry-data-recv")
+                .expect("recv data");
             let descriptor = AppCqeDescriptor::new(
                 Some(AppUserData::new(64)),
-                "entry-registered-recv".len() as i32,
+                "entry-data-recv".len() as i32,
                 AppCqeFlags::BUFFER,
                 AppObjectRef::Operation(op),
-                AppCqeData::Recv {
-                    buffer: registered.index(),
-                },
+                AppCqeData::Recv { data },
             );
 
-            ring.try_push_completion_entry(AppCompletionEntry::with_attachment(
-                descriptor, registered,
-            ))
-            .expect("push registered completion entry");
+            ring.try_push_completion_entry(AppCompletionEntry::new(descriptor))
+                .expect("push completion entry");
 
-            let cqe = ring.next_completion().await.expect("next completion");
-            let descriptor_round_trip = cqe
+            let descriptor_round_trip = ring
+                .next_completion()
+                .await
+                .expect("next completion")
                 .descriptor()
                 .expect("cqe descriptor")
                 .expect("recv descriptor");
-            let recv = cqe.into_recv().expect("recv cqe");
-            let payload = recv.lease().copy_current().expect("recv payload");
-            recv.release();
+            let payload = match descriptor_round_trip.payload() {
+                AppCqeData::Recv { data } => ring.read_data(data).expect("recv payload"),
+                other => panic!("unexpected cqe data: {other:?}"),
+            };
 
             (descriptor_round_trip, payload)
         });
 
     assert_eq!(result.0.user_data(), Some(AppUserData::new(64)));
     assert_eq!(result.0.object(), AppObjectRef::Operation(op));
-    assert_eq!(result.1, b"entry-registered-recv");
+    assert_eq!(result.1, b"entry-data-recv");
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_ring_entry_registers_send_buffer_for_object_view() {
+fn app_ring_entry_round_trips_send_data_address_for_object_view() {
     let data_runtime =
         DataRuntime::new(1, "app-ring-entry-send-test", 512 * 1024, 2).expect("data runtime");
     let ring = AppRingHandle::new(4, 4);
@@ -535,30 +684,23 @@ fn app_ring_entry_registers_send_buffer_for_object_view() {
         .build()
         .expect("driver runtime")
         .block_on(async {
-            let runtime = with_data_plane_buffers(Clone::clone);
-            let index = runtime
-                .alloc_index_with_bytes(Default::default(), b"entry-registered-send")
-                .expect("alloc send buffer");
-            let lease = AppBufferLease::from_buffer(runtime, index);
-            let registered = AppRegisteredBuffer::from_lease(lease).expect("registered buffer");
+            let data = ring
+                .alloc_data_for_bytes(b"entry-data-send")
+                .expect("send data");
             let descriptor = AppSqeDescriptor::new(
                 AppOpcode::Send,
                 Some(AppUserData::new(65)),
                 AppObjectRef::Operation(op),
-                AppSqeData::Send {
-                    buffer: registered.index(),
-                },
+                AppSqeData::Send { data },
             );
 
-            ring.try_push_submission_entry(AppSubmissionEntry::with_attachment(
-                descriptor, registered,
-            ))
-            .expect("push registered submission entry");
+            ring.try_push_submission_entry(AppSubmissionEntry::new(descriptor))
+                .expect("push submission entry");
 
             let sqe = ring.next_submission().await.expect("next submission");
             let descriptor_round_trip = sqe.descriptor().expect("sqe descriptor");
             let send = sqe.into_send().expect("send sqe");
-            let payload = send.lease().copy_current().expect("send payload");
+            let payload = send.copy_current().expect("send payload");
             send.release();
 
             (descriptor_round_trip, payload)
@@ -566,34 +708,50 @@ fn app_ring_entry_registers_send_buffer_for_object_view() {
 
     assert_eq!(result.0.user_data(), Some(AppUserData::new(65)));
     assert_eq!(result.0.object(), AppObjectRef::Operation(op));
-    assert_eq!(result.1, b"entry-registered-send");
+    assert_eq!(result.1, b"entry-data-send");
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_recv_cqe_descriptor_uses_result_flags_and_buffer_handle() {
+fn app_recv_cqe_descriptor_uses_result_flags_and_data_address() {
     let data_runtime =
         DataRuntime::new(1, "app-cqe-descriptor-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
     let op = AppOpId::new(41);
 
-    let descriptor = tokio::runtime::Builder::new_current_thread()
+    let (descriptor, payload) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("driver runtime")
         .block_on(async {
-            app.spawn_on_op(op, 0, move |_worker| async move {
+            app.spawn_on_op(op, 0, move |worker| async move {
+                let app_runtime = worker.runtime();
+                let recv_future = app_runtime.recv();
+                let _recv_sqe = app_runtime
+                    .next_submission_descriptor()
+                    .await
+                    .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
                     .alloc_index_with_bytes(Default::default(), b"descriptor-cqe")
                     .expect("alloc app recv buffer");
-                let recv =
-                    hammer_runtime::app::AppRecv::new(AppBufferLease::from_buffer(runtime, index));
-                AppCqe::recv(Some(AppUserData::new(77)), op, recv, true)
+                app_runtime
+                    .complete_recv_buffer(runtime, index)
+                    .await
+                    .expect("complete recv");
+                let recv = recv_future.await.expect("recv");
+                let descriptor = AppCqe::recv(Some(AppUserData::new(77)), op, recv, true)
                     .descriptor()
                     .expect("descriptor conversion")
-                    .expect("recv descriptor")
+                    .expect("recv descriptor");
+                let payload = match descriptor.payload() {
+                    AppCqeData::Recv { data } => app_runtime
+                        .read_data(data)
+                        .expect("descriptor data remains owned by cqe"),
+                    other => panic!("unexpected cqe data: {other:?}"),
+                };
+                (descriptor, payload)
             })
             .await
             .expect("spawn app op task")
@@ -605,15 +763,19 @@ fn app_recv_cqe_descriptor_uses_result_flags_and_buffer_handle() {
     assert!(descriptor.flags().contains(AppCqeFlags::BUFFER));
     assert!(descriptor.flags().contains(AppCqeFlags::FIN));
     match descriptor.payload() {
-        AppCqeData::Recv { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        AppCqeData::Recv { data } => {
+            assert_eq!(data.len(), "descriptor-cqe".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected cqe data: {other:?}"),
     }
+    assert_eq!(payload, b"descriptor-cqe");
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_ring_zero_copy_recv_and_stable_op_owner() {
+fn app_ring_copies_recv_into_app_data_and_keeps_stable_op_owner() {
     let data_runtime = DataRuntime::new(2, "app-ring-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
     let op = AppOpId::new(7);
@@ -638,34 +800,28 @@ fn app_ring_zero_copy_recv_and_stable_op_owner() {
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let before_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"ring-zero-copy")
+                    .alloc_index_with_bytes(Default::default(), b"ring-app-data-copy")
                     .expect("alloc app recv buffer");
-                let expected_ptr = runtime.current_ptr(index).expect("buffer pointer");
 
                 app_runtime
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv_buffer(runtime.clone(), index)
                     .await
                     .expect("complete recv cqe");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv cqe");
-                let recv_ptr = recv.lease().current_ptr().expect("recv lease pointer");
-                let recv_payload = recv.lease().copy_current().expect("recv payload");
+                let recv_payload = recv.copy_current().expect("recv payload");
 
                 app_runtime.send(recv.into_send()).await.expect("send sqe");
 
                 let send = app_runtime.next_send().await.expect("send sqe");
-                let send_ptr = send.lease().current_ptr().expect("send lease pointer");
-                let send_payload = send.lease().copy_current().expect("send payload");
+                let send_payload = send.copy_current().expect("send payload");
                 drop(send);
                 let after_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
 
                 (
                     owner,
                     thread,
-                    expected_ptr as usize,
-                    recv_ptr as usize,
-                    send_ptr as usize,
                     recv_payload,
                     send_payload,
                     before_in_use,
@@ -696,18 +852,16 @@ fn app_ring_zero_copy_recv_and_stable_op_owner() {
 
     assert_eq!(first.0, second.0);
     assert_eq!(first.1, second.1);
-    assert_eq!(first.2, first.3);
-    assert_eq!(first.3, first.4);
-    assert_eq!(first.5, b"ring-zero-copy");
-    assert_eq!(first.6, b"ring-zero-copy");
-    assert_eq!(first.7, 0);
-    assert_eq!(first.8, 0);
+    assert_eq!(first.2, b"ring-app-data-copy");
+    assert_eq!(first.3, b"ring-app-data-copy");
+    assert_eq!(first.4, 0);
+    assert_eq!(first.5, 0);
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_recv_drop_releases_buffer_lease() {
+fn app_recv_drop_releases_app_data_chunk() {
     let data_runtime =
         DataRuntime::new(1, "app-ring-drop-test", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 2);
@@ -732,13 +886,13 @@ fn app_recv_drop_releases_buffer_lease() {
                     .expect("alloc app recv buffer");
 
                 app_runtime
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv_buffer(runtime.clone(), index)
                     .await
                     .expect("complete recv cqe");
 
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
                 let recv = recv_future.await.expect("recv cqe");
-                let payload = recv.lease().copy_current().expect("recv payload");
+                let payload = recv.copy_current().expect("recv payload");
                 drop(recv);
                 let after_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
 
@@ -780,7 +934,7 @@ fn same_op_reuses_runtime_ring_across_spawn_calls() {
                     .expect("alloc app recv buffer");
 
                 app_runtime
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv_buffer(runtime.clone(), index)
                     .await
                     .expect("complete recv cqe");
                 assert_eq!(recv_sqe.opcode(), AppOpcode::Recv);
@@ -902,26 +1056,19 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
         .block_on(async {
             app.spawn_on_op(op, 0, move |worker| async move {
                 let runtime = worker.runtime();
-                let buffers = with_data_plane_buffers(Clone::clone);
-                let index = buffers
-                    .alloc_index_with_bytes(Default::default(), b"runtime-entry-send")
-                    .expect("alloc runtime entry buffer");
-                let registered =
-                    AppRegisteredBuffer::from_lease(AppBufferLease::from_buffer(buffers, index))
-                        .expect("registered buffer");
+                let send = runtime
+                    .send_from_bytes(b"runtime-entry-send")
+                    .expect("send data");
+                let data = send.into_data_addr().expect("send data address");
                 let descriptor = AppSqeDescriptor::new(
                     AppOpcode::Send,
                     Some(AppUserData::new(64)),
                     AppObjectRef::Operation(op),
-                    AppSqeData::Send {
-                        buffer: registered.index(),
-                    },
+                    AppSqeData::Send { data },
                 );
 
                 runtime
-                    .try_push_submission_entry(AppSubmissionEntry::with_attachment(
-                        descriptor, registered,
-                    ))
+                    .try_push_submission_entry(AppSubmissionEntry::new(descriptor))
                     .expect("push runtime submission entry");
 
                 let sqe = runtime
@@ -929,9 +1076,13 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
                     .await
                     .expect("runtime next submission entry");
                 let (descriptor_round_trip, registered) = sqe.into_parts();
-                let (_handle, lease) = registered.expect("submission attachment").into_parts();
-                let payload = lease.copy_current().expect("send payload");
-                lease.release();
+                assert!(registered.is_none());
+                let payload = match descriptor_round_trip.payload() {
+                    AppSqeData::Send { data } => {
+                        runtime.read_data(data).expect("send payload from app data")
+                    }
+                    other => panic!("unexpected payload: {other:?}"),
+                };
 
                 (descriptor_round_trip, payload)
             })
@@ -942,7 +1093,10 @@ fn app_runtime_pushes_submission_entry_without_app_send_wrapper() {
     assert_eq!(round_trip.0.user_data(), Some(AppUserData::new(64)));
     assert_eq!(round_trip.0.object(), AppObjectRef::Operation(op));
     match round_trip.0.payload() {
-        AppSqeData::Send { buffer } => assert_ne!(buffer, buffer_index(0, 0, 0)),
+        AppSqeData::Send { data } => {
+            assert_eq!(data.len(), "runtime-entry-send".len());
+            assert_eq!(data.offset() % CACHE_LINE, 0);
+        }
         other => panic!("unexpected sqe data: {other:?}"),
     }
     assert_eq!(round_trip.1, b"runtime-entry-send");
@@ -978,9 +1132,4 @@ fn non_owner_worker_does_not_own_foreign_op_runtime() {
     );
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-#[inline]
-fn buffer_index(pool_id: u64, slot: u32, generation: u32) -> BufferIndex {
-    unsafe { std::mem::transmute::<(u64, u32, u32), BufferIndex>((pool_id, slot, generation)) }
 }

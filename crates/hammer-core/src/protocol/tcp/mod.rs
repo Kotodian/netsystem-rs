@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ds::FlatHashKey;
+use crate::protocol::transport::TransportConnectionKey;
 
 pub mod options;
 pub mod segment;
@@ -294,71 +295,6 @@ impl FlatHashKey for TcpV4ListenerKey {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TcpV4ConnectionKey(u128);
-
-impl TcpV4ConnectionKey {
-    #[inline]
-    pub fn new(
-        scope_id: u32,
-        local_addr: Ipv4Addr,
-        local_port: u16,
-        remote_addr: Ipv4Addr,
-        remote_port: u16,
-    ) -> Self {
-        Self(
-            (u128::from(scope_id) << 96)
-                | (u128::from(u32::from(local_addr)) << 64)
-                | (u128::from(u32::from(remote_addr)) << 32)
-                | (u128::from(local_port) << 16)
-                | u128::from(remote_port),
-        )
-    }
-
-    #[inline]
-    pub const fn scope_id(self) -> u32 {
-        (self.0 >> 96) as u32
-    }
-
-    #[inline]
-    pub fn local_addr(self) -> Ipv4Addr {
-        Ipv4Addr::from((self.0 >> 64) as u32)
-    }
-
-    #[inline]
-    pub const fn local_port(self) -> u16 {
-        (self.0 >> 16) as u16
-    }
-
-    #[inline]
-    pub fn remote_addr(self) -> Ipv4Addr {
-        Ipv4Addr::from((self.0 >> 32) as u32)
-    }
-
-    #[inline]
-    pub const fn remote_port(self) -> u16 {
-        self.0 as u16
-    }
-
-    #[inline]
-    pub fn reverse(self) -> Self {
-        Self::new(
-            self.scope_id(),
-            self.remote_addr(),
-            self.remote_port(),
-            self.local_addr(),
-            self.local_port(),
-        )
-    }
-}
-
-impl FlatHashKey for TcpV4ConnectionKey {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        self.0.hash_key()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TcpV6ListenerKey {
     local_addr: u128,
     scope_port: u64,
@@ -393,79 +329,6 @@ impl FlatHashKey for TcpV6ListenerKey {
     #[inline(always)]
     fn hash_key(self) -> usize {
         hash_words(&[fold_u128(self.local_addr), self.scope_port])
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TcpV6ConnectionKey {
-    local_addr: u128,
-    remote_addr: u128,
-    scope_ports: u64,
-}
-
-impl TcpV6ConnectionKey {
-    #[inline]
-    pub fn new(
-        scope_id: u32,
-        local_addr: Ipv6Addr,
-        local_port: u16,
-        remote_addr: Ipv6Addr,
-        remote_port: u16,
-    ) -> Self {
-        Self {
-            local_addr: u128::from(local_addr),
-            remote_addr: u128::from(remote_addr),
-            scope_ports: (u64::from(scope_id) << 32)
-                | (u64::from(local_port) << 16)
-                | u64::from(remote_port),
-        }
-    }
-
-    #[inline]
-    pub const fn scope_id(self) -> u32 {
-        (self.scope_ports >> 32) as u32
-    }
-
-    #[inline]
-    pub fn local_addr(self) -> Ipv6Addr {
-        Ipv6Addr::from(self.local_addr)
-    }
-
-    #[inline]
-    pub const fn local_port(self) -> u16 {
-        (self.scope_ports >> 16) as u16
-    }
-
-    #[inline]
-    pub fn remote_addr(self) -> Ipv6Addr {
-        Ipv6Addr::from(self.remote_addr)
-    }
-
-    #[inline]
-    pub const fn remote_port(self) -> u16 {
-        self.scope_ports as u16
-    }
-
-    #[inline]
-    pub fn reverse(self) -> Self {
-        Self::new(
-            self.scope_id(),
-            self.remote_addr(),
-            self.remote_port(),
-            self.local_addr(),
-            self.local_port(),
-        )
-    }
-}
-
-impl FlatHashKey for TcpV6ConnectionKey {
-    #[inline(always)]
-    fn hash_key(self) -> usize {
-        hash_words(&[
-            fold_u128(self.local_addr),
-            fold_u128(self.remote_addr),
-            self.scope_ports,
-        ])
     }
 }
 
@@ -511,96 +374,6 @@ impl TcpListenerKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum TcpConnectionKey {
-    V4(TcpV4ConnectionKey),
-    V6(TcpV6ConnectionKey),
-}
-
-impl TcpConnectionKey {
-    #[inline]
-    pub fn v4(
-        scope_id: u32,
-        local_addr: Ipv4Addr,
-        local_port: u16,
-        remote_addr: Ipv4Addr,
-        remote_port: u16,
-    ) -> Self {
-        Self::V4(TcpV4ConnectionKey::new(
-            scope_id,
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-        ))
-    }
-
-    #[inline]
-    pub fn v6(
-        scope_id: u32,
-        local_addr: Ipv6Addr,
-        local_port: u16,
-        remote_addr: Ipv6Addr,
-        remote_port: u16,
-    ) -> Self {
-        Self::V6(TcpV6ConnectionKey::new(
-            scope_id,
-            local_addr,
-            local_port,
-            remote_addr,
-            remote_port,
-        ))
-    }
-
-    #[inline]
-    pub const fn scope_id(self) -> u32 {
-        match self {
-            Self::V4(key) => key.scope_id(),
-            Self::V6(key) => key.scope_id(),
-        }
-    }
-
-    #[inline]
-    pub fn local_addr(self) -> IpAddr {
-        match self {
-            Self::V4(key) => IpAddr::V4(key.local_addr()),
-            Self::V6(key) => IpAddr::V6(key.local_addr()),
-        }
-    }
-
-    #[inline]
-    pub const fn local_port(self) -> u16 {
-        match self {
-            Self::V4(key) => key.local_port(),
-            Self::V6(key) => key.local_port(),
-        }
-    }
-
-    #[inline]
-    pub fn remote_addr(self) -> IpAddr {
-        match self {
-            Self::V4(key) => IpAddr::V4(key.remote_addr()),
-            Self::V6(key) => IpAddr::V6(key.remote_addr()),
-        }
-    }
-
-    #[inline]
-    pub const fn remote_port(self) -> u16 {
-        match self {
-            Self::V4(key) => key.remote_port(),
-            Self::V6(key) => key.remote_port(),
-        }
-    }
-
-    #[inline]
-    pub fn reverse(self) -> Self {
-        match self {
-            Self::V4(key) => Self::V4(key.reverse()),
-            Self::V6(key) => Self::V6(key.reverse()),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpControlPlaneAction {
     // The shared TCP control plane only owns listener registrations.
@@ -620,7 +393,7 @@ pub enum TcpWorkerEvent {
     IncomingConnection {
         listener_id: TcpListenerId,
         listener: TcpListenerKey,
-        key: TcpConnectionKey,
+        key: TransportConnectionKey<IpAddr>,
         capabilities: TcpCapabilities,
     },
 }

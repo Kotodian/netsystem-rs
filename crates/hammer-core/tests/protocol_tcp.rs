@@ -1,11 +1,11 @@
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use hammer_core::ds::FlatHashTable;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpCloseReason, TcpConnectionKey, TcpControlPlaneAction, TcpListenerId,
-    TcpListenerKey, TcpSeq, TcpV4ConnectionKey, TcpV6ConnectionKey, TcpV6ListenerKey,
-    TcpWorkerEvent,
+    TcpCapabilities, TcpCloseReason, TcpControlPlaneAction, TcpListenerId, TcpListenerKey, TcpSeq,
+    TcpV6ListenerKey, TcpWorkerEvent,
 };
+use hammer_core::protocol::transport::TransportConnectionKey;
 
 #[test]
 fn tcp_seq_wraparound_order_and_advance_are_safe() {
@@ -20,7 +20,7 @@ fn tcp_seq_wraparound_order_and_advance_are_safe() {
 
 #[test]
 fn tcp_connection_keys_reverse_direction_and_hash_for_lookup_tables() {
-    let key = TcpV4ConnectionKey::new(
+    let key = TransportConnectionKey::new(
         9,
         Ipv4Addr::new(192, 0, 2, 10),
         443,
@@ -34,11 +34,26 @@ fn tcp_connection_keys_reverse_direction_and_hash_for_lookup_tables() {
     assert_eq!(table.lookup(&key), Some(17));
     assert_eq!(table.lookup(&reversed), None);
 
-    let generic = TcpConnectionKey::V4(key);
+    let generic = TransportConnectionKey::new(
+        9,
+        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+        443,
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        54_321,
+    );
     assert_eq!(generic.scope_id(), 9);
     assert_eq!(generic.local_port(), 443);
     assert_eq!(generic.remote_port(), 54_321);
-    assert_eq!(generic.reverse(), TcpConnectionKey::V4(reversed));
+    assert_eq!(
+        generic.reverse(),
+        TransportConnectionKey::new(
+            9,
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+            54_321,
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+            443,
+        )
+    );
 }
 
 #[test]
@@ -48,13 +63,13 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         Ipv6Addr::new(0x2001, 0xdb8, 0, 7, 0, 0, 0, 10),
         443,
     ));
-    let key = TcpConnectionKey::V6(TcpV6ConnectionKey::new(
+    let key = TransportConnectionKey::new(
         7,
-        Ipv6Addr::new(0x2001, 0xdb8, 0, 7, 0, 0, 0, 10),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 7, 0, 0, 0, 10)),
         443,
-        Ipv6Addr::new(0x2001, 0xdb8, 0, 8, 0, 0, 0, 20),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 8, 0, 0, 0, 20)),
         49_152,
-    ));
+    );
     let capabilities = TcpCapabilities {
         max_segment_size: Some(1440),
         window_scale: Some(7),
@@ -110,7 +125,6 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
             assert_eq!(incoming_key, key);
             assert_eq!(incoming_capabilities, capabilities);
         }
-        other => panic!("unexpected event: {other:?}"),
     }
 
     let _ = key;

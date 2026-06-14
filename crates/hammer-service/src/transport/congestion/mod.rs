@@ -106,9 +106,7 @@ impl CongestionState {
 
     pub fn on_packet_sent(&mut self, bytes_sent: u32, bytes_in_flight: u32) {
         match &mut self.inner {
-            CongestionStateKind::Paced(state) => {
-                state.on_packet_sent(bytes_sent, bytes_in_flight)
-            }
+            CongestionStateKind::Paced(state) => state.on_packet_sent(bytes_sent, bytes_in_flight),
         }
     }
 
@@ -623,9 +621,7 @@ mod tests {
 
         state.on_packet_sent(TEST_MAX_SEGMENT_SIZE, 0);
         state.on_ack(ack_sample(
-            now + PACED_MIN_RTT_FILTER
-                + PACED_PROBE_RTT_DURATION
-                + Duration::from_millis(2),
+            now + PACED_MIN_RTT_FILTER + PACED_PROBE_RTT_DURATION + Duration::from_millis(2),
             TEST_MAX_SEGMENT_SIZE,
             Duration::from_millis(12),
             test_min_window(),
@@ -707,9 +703,7 @@ mod tests {
         state.on_packet_sent(TEST_MAX_SEGMENT_SIZE, 0);
         let exit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             state.on_ack(ack_sample(
-                now + PACED_MIN_RTT_FILTER
-                    + PACED_PROBE_RTT_DURATION
-                    + Duration::from_millis(2),
+                now + PACED_MIN_RTT_FILTER + PACED_PROBE_RTT_DURATION + Duration::from_millis(2),
                 TEST_MAX_SEGMENT_SIZE,
                 Duration::MAX,
                 test_min_window(),

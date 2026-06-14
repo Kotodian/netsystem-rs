@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use hammer_runtime::app::{
-    AppBufferLease, AppContext, AppObjectRef, AppOpId, AppOpcode, AppSend, AppSqeData,
-};
+use hammer_runtime::app::{AppContext, AppObjectRef, AppOpId, AppOpcode, AppSqeData};
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
 
 #[test]
@@ -37,14 +35,12 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                     .alloc_index_with_bytes(Default::default(), b"echo-from-app")
                     .expect("alloc app echo buffer");
                 app_runtime
-                    .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                    .complete_recv_buffer(runtime.clone(), index)
                     .await
                     .expect("complete recv");
                 let recv = recv_future.await.expect("recv echo buffer");
-                let recv_ptr = recv.lease().current_ptr().expect("recv pointer") as usize;
-                let copied = recv.lease().copy_current().expect("copy echo payload");
+                let copied = recv.copy_current().expect("copy echo payload");
                 let send = recv.into_send();
-                let send_ptr = send.lease().current_ptr().expect("send pointer") as usize;
                 app_runtime.send(send).await.expect("echo send");
                 let after = std::thread::current()
                     .name()
@@ -60,8 +56,6 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                     before,
                     after,
                     copied,
-                    recv_ptr,
-                    send_ptr,
                     recv_descriptor,
                     send_descriptor,
                 )
@@ -73,15 +67,14 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
     assert_eq!(result.0, result.1);
     assert_eq!(result.1, result.2);
     assert_eq!(result.3, b"echo-from-app");
-    assert_eq!(result.4, result.5);
-    assert_eq!(result.6.opcode(), AppOpcode::Recv);
-    assert_eq!(result.7.opcode(), AppOpcode::Send);
+    assert_eq!(result.4.opcode(), AppOpcode::Recv);
+    assert_eq!(result.5.opcode(), AppOpcode::Send);
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }
 
 #[test]
-fn app_context_send_on_op_forwards_registered_buffer_across_workers() {
+fn app_context_send_on_op_forwards_app_data_across_workers() {
     let data_runtime = DataRuntime::new(2, "app-send-on-op", 512 * 1024, 2).expect("data runtime");
     let app = AppContext::with_ring_capacity(data_runtime.context(), 4);
     let source_op = AppOpId::new(10);
@@ -93,56 +86,49 @@ fn app_context_send_on_op_forwards_registered_buffer_across_workers() {
         .expect("driver runtime")
         .block_on(async {
             let app_for_source = app.clone();
-            let source_ptr = app
-                .spawn_on_op(source_op, 0, move |_worker| async move {
-                    let runtime = with_data_plane_buffers(Clone::clone);
-                    let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"cross-worker-send")
-                        .expect("alloc cross-worker send buffer");
-                    let send = AppSend::new(AppBufferLease::from_buffer(runtime, index));
-                    let source_ptr = send.lease().current_ptr().expect("source pointer") as usize;
-                    app_for_source
-                        .send_on_op(target_op, send)
-                        .await
-                        .expect("send on target op");
-                    source_ptr
-                })
-                .await
-                .expect("spawn source op");
+            app.spawn_on_op(source_op, 0, move |worker| async move {
+                let send = worker
+                    .runtime()
+                    .send_from_bytes(b"cross-worker-send")
+                    .expect("app send data");
+                app_for_source
+                    .send_on_op(target_op, send)
+                    .await
+                    .expect("send on target op");
+            })
+            .await
+            .expect("spawn source op");
 
-            let (descriptor, payload, target_ptr) = app
+            let (descriptor, payload) = app
                 .spawn_on_op(target_op, 1, move |worker| async move {
-                    let entry = worker
-                        .runtime()
+                    let runtime = worker.runtime();
+                    let entry = runtime
                         .next_submission_entry()
                         .await
                         .expect("target send entry");
                     let descriptor = *entry.descriptor();
-                    let attachment = entry.attachment().expect("target send attachment");
-                    let payload = attachment
-                        .lease()
-                        .copy_current()
-                        .expect("copy target payload");
-                    let ptr = attachment.lease().current_ptr().expect("target pointer") as usize;
-                    (descriptor, payload, ptr)
+                    assert!(entry.attachment().is_none());
+                    let payload = match descriptor.payload() {
+                        AppSqeData::Send { data } => {
+                            runtime.read_data(data).expect("copy target payload")
+                        }
+                        other => panic!("unexpected sqe data: {other:?}"),
+                    };
+                    (descriptor, payload)
                 })
                 .await
                 .expect("spawn target op");
 
-            (source_ptr, descriptor, payload, target_ptr)
+            (descriptor, payload)
         });
 
-    assert_eq!(result.1.opcode(), AppOpcode::Send);
-    assert_eq!(result.1.object(), AppObjectRef::Operation(target_op));
-    match result.1.payload() {
+    assert_eq!(result.0.opcode(), AppOpcode::Send);
+    assert_eq!(result.0.object(), AppObjectRef::Operation(target_op));
+    match result.0.payload() {
         AppSqeData::Send { .. } => {}
         other => panic!("unexpected sqe data: {other:?}"),
     }
-    assert_eq!(result.2, b"cross-worker-send");
-    assert_eq!(
-        result.0, result.3,
-        "cross-worker send must preserve the registered buffer lease"
-    );
+    assert_eq!(result.1, b"cross-worker-send");
 
     data_runtime.shutdown_timeout(Duration::from_secs(1));
 }

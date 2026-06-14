@@ -15,16 +15,13 @@ use hammer_adapter::{
     PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{
-    TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView, TcpState,
-};
+use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView, TcpState};
 
 use crate::session::SessionQueueHandle;
-use crate::session::protocol::tcp::TcpSessionProtocol;
 
 use super::{
     TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
-    TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
+    TcpLookupSnapshot, TcpLookupValue, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,15 +495,15 @@ fn session_input_entry(
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
     TcpSessionProtocol::with_queue(handle, |runtime| {
-        let Some(session_id) = runtime.program().session_id_by_tuple(local, remote) else {
+        let Some(session_id) = runtime.session_id_by_tuple(local, remote) else {
             return Ok(None);
         };
-        let Some(session) = runtime.session_state(session_id) else {
+        let Some(connection) = runtime.session_state(session_id) else {
             return Ok(None);
         };
         Ok(Some(TcpSessionInputEntry {
-            owner: session.owner_worker(),
-            next: tcp_session_input_next(session.state()),
+            owner: connection.owner_worker(),
+            next: tcp_session_input_next(connection.state()),
         }))
     })
 }
@@ -549,11 +546,22 @@ fn tcp_listener_input_entry(flags: TcpInputFlags) -> TcpInputEntry {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
     use arc_swap::ArcSwap;
+    use hammer_adapter::{DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, NodeHandle, NodeId};
+    use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
 
-    use super::{TcpInputSnapshot, TcpInputSnapshotHandle, register_tcp_input_runtime};
+    use crate::transport::tcp::connection::TcpConnectionState;
+    use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext, TcpSessionProtocol};
+
+    use super::{
+        ParsedTcpInput, TcpInputSnapshot, TcpInputSnapshotHandle, TcpSessionInputEntry,
+        next_node_for_index, parse_tcp_input, register_tcp_input_runtime, session_input_entry,
+    };
+    use crate::net::ip::{IpProtocol, IpVersion};
+    use crate::session::node::SessionQueueHandle;
 
     #[test]
     fn tcp_input_runtime_registry_is_isolated_per_thread() {
@@ -576,6 +584,235 @@ mod tests {
         .expect("worker thread joins");
 
         assert_eq!(worker_runtime, 0);
+    }
+
+    #[test]
+    fn tcp_input_routes_existing_established_tuple_to_established_node() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let handle = install_tcp_session(
+            &runtime,
+            DataWorkerId::new(0),
+            TcpState::Established,
+            50_044,
+        );
+
+        let entry = session_input_entry(Some(handle), &parsed_input(50_044))
+            .expect("session lookup")
+            .expect("existing tcp session");
+
+        assert_eq!(
+            entry,
+            TcpSessionInputEntry {
+                owner: DataWorkerId::new(0),
+                next: TcpInputNext::Established,
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_input_existing_session_entry_keeps_owner_for_handoff_decision() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let handle = install_tcp_session(
+            &runtime,
+            DataWorkerId::new(1),
+            TcpState::Established,
+            50_055,
+        );
+
+        let entry = session_input_entry(Some(handle), &parsed_input(50_055))
+            .expect("session lookup")
+            .expect("existing tcp session");
+
+        assert_eq!(
+            entry,
+            TcpSessionInputEntry {
+                owner: DataWorkerId::new(1),
+                next: TcpInputNext::Established,
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_input_handoffs_existing_session_to_owner_worker() {
+        const TCP_INPUT_HANDLE: NodeHandle = NodeHandle::new(44);
+
+        let handoff = DataPlaneHandoff::new(2, 8);
+        let runtime = DataPlaneRuntime::with_handoff(
+            DataPlaneRuntime::with_capacities(2048, 16, 8, 8),
+            DataWorkerId::new(0),
+            handoff.worker(DataWorkerId::new(0)),
+        );
+        let handle = install_tcp_session(
+            &runtime,
+            DataWorkerId::new(1),
+            TcpState::Established,
+            50_066,
+        );
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let packet = tcp_packet(
+            Ipv4Addr::new(198, 51, 100, 50_066u16 as u8),
+            443,
+            Ipv4Addr::new(192, 0, 2, 50_066u16 as u8),
+            50_066,
+        );
+        let index = runtime
+            .alloc_index_with_bytes(Default::default(), &packet)
+            .expect("alloc packet");
+        stamp_tcp_cursor(&runtime, index, &packet);
+        assert!(
+            parse_tcp_input(&runtime, index)
+                .expect("parse tcp input")
+                .is_ok()
+        );
+        runtime
+            .get_frame_mut(frame)
+            .expect("frame mut")
+            .push_index(index)
+            .expect("push packet");
+
+        let next = TcpInputNext::nodes(
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+            NodeId::new(6),
+            NodeId::new(7),
+        );
+        let selected = next_node_for_index(
+            &runtime,
+            index,
+            &TcpInputSnapshot::new(),
+            &next,
+            Some(TcpInputHandoff::new(TCP_INPUT_HANDLE, DataWorkerId::new(0))),
+            Some(handle),
+        )
+        .expect("next node");
+
+        assert_eq!(selected, None);
+        assert_eq!(
+            runtime
+                .handoff_source_worker(index)
+                .expect("handoff source"),
+            Some(DataWorkerId::new(0))
+        );
+        runtime.free_frame_index(frame).expect("free frame");
+    }
+
+    fn install_tcp_session(
+        runtime: &DataPlaneRuntime,
+        owner: DataWorkerId,
+        state: TcpState,
+        local_port: u16,
+    ) -> SessionQueueHandle {
+        let local = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
+            local_port,
+        );
+        let remote = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
+            443,
+        );
+        let connection = TcpConnectionState::new(
+            Some(TcpConnectionId::new(u64::from(local_port))),
+            owner,
+            state,
+            local_port,
+            Some(local),
+            remote,
+        );
+        TcpSessionProtocol::register_queue_with_connection_for_test(
+            owner,
+            runtime.packet_buffers().clone(),
+            connection,
+        )
+        .expect("register test queue")
+    }
+
+    fn parsed_input(local_port: u16) -> ParsedTcpInput {
+        ParsedTcpInput {
+            version: IpVersion::V4,
+            protocol: IpProtocol::Tcp,
+            source_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
+            destination_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
+            source_port: 443,
+            destination_port: local_port,
+            flags: TcpInputFlags::ACK,
+        }
+    }
+
+    fn tcp_packet(
+        source: Ipv4Addr,
+        source_port: u16,
+        destination: Ipv4Addr,
+        destination_port: u16,
+    ) -> std::vec::Vec<u8> {
+        let mut packet = std::vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..22].copy_from_slice(&source_port.to_be_bytes());
+        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        packet[32] = 0x50;
+        packet[33] = TcpInputFlags::ACK.bits();
+        let tcp_checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
+        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+        let ip_checksum = internet_checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+        packet
+    }
+
+    fn ipv4_l4_checksum(
+        source: Ipv4Addr,
+        destination: Ipv4Addr,
+        protocol: u8,
+        segment: &[u8],
+    ) -> u16 {
+        let mut pseudo = std::vec::Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
+        pseudo.extend_from_slice(&source.octets());
+        pseudo.extend_from_slice(&destination.octets());
+        pseudo.push(0);
+        pseudo.push(protocol);
+        pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(segment);
+        internet_checksum(&pseudo)
+    }
+
+    fn internet_checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for chunk in bytes.chunks(2) {
+            let word = match chunk {
+                [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
+                [hi] => u16::from_be_bytes([*hi, 0]) as u32,
+                _ => unreachable!(),
+            };
+            sum += word;
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+        }
+        !(sum as u16)
+    }
+
+    fn stamp_tcp_cursor(
+        runtime: &DataPlaneRuntime,
+        buffer: hammer_adapter::BufferIndex,
+        packet: &[u8],
+    ) {
+        let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
+        runtime
+            .get_buffer_mut(buffer)
+            .expect("buffer mut")
+            .set_packet_cursor(
+                hammer_adapter::BufferPacketCursor::new()
+                    .with_packet_len(packet.len())
+                    .with_network_header(0, header_len)
+                    .with_transport_header(header_len, 20)
+                    .with_transport_payload_offset(header_len + 20),
+            );
     }
 }
 
@@ -609,13 +846,14 @@ fn parse_tcp_input(
     if parsed.input_error != IpInputError::None || !valid_tcp_cursor(cursor) {
         return Ok(Err(TcpInputParseError::BadLength));
     }
+    let first_len = current.len().min(parsed.packet_len);
     let packet = current
-        .get(..parsed.packet_len)
+        .get(..first_len)
         .ok_or_else(|| CoreError::internal("invalid TCP packet length"))?;
     let source_ip = source_ip(parsed.version, packet)?;
     let destination_ip = destination_ip(parsed.version, packet)?;
     let transport = packet
-        .get(cursor.transport_header_offset()..)
+        .get(cursor.transport_header_offset()..first_len)
         .ok_or_else(|| CoreError::internal("missing TCP header"))?;
     let segment = match TcpSegmentView::parse(transport) {
         Ok(segment) => segment,

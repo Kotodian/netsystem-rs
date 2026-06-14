@@ -103,7 +103,8 @@ impl SessionTimerWheel {
 
     pub fn expire(&mut self, ticks: u32, ready: &mut SessionReadyQueue) -> CoreResult<usize> {
         self.expired_slots.clear();
-        let expired = self.wheel.expire(ticks, &mut self.expired_slots);
+        self.wheel.expire(ticks, &mut self.expired_slots);
+        let mut expired = 0;
         let expired_slots: hammer_infra::vec::Vec<u32> =
             self.expired_slots.iter().copied().collect();
         for slot in expired_slots {
@@ -117,6 +118,7 @@ impl SessionTimerWheel {
             let expiry = SessionTimerExpiry::new(timer.session_id, timer.token);
             self.pending.push(expiry);
             ready.mark_ready(timer.session_id);
+            expired += 1;
         }
         Ok(expired)
     }

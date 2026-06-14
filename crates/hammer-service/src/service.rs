@@ -44,11 +44,11 @@ use std::time::Duration;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 use crate::app::AppHost;
-use crate::session::protocol::tcp::node::TcpSessionQueueNode;
+use crate::session::{SessionQueueNext, SessionQueueNode};
 use crate::transport::tcp::{
     TcpInputControlPlane, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpListenerAddress, TcpListenerLookupAccess, TcpLookupId, TcpLookupSnapshot, TcpLookupValue,
-    TcpV4ListenerKey, TcpV6ListenerKey,
+    TcpOutputNode, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 use crate::{DnsRouter, DnsTransportManager, Router};
 
@@ -1003,6 +1003,7 @@ const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
     "tcp-syn-sent-node",
     "tcp-established-node",
     "tcp-reset-node",
+    "tcp-output-node",
     "ip-receive-node",
     "ip-reassembly-node",
     "icmp-echo-request-node",
@@ -1016,10 +1017,28 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
     data_context
         .install_on_workers(|worker, runtime| {
             let worker = worker_id(worker)?;
-            let node = TcpSessionQueueNode::new(worker).map_err(HammerError::from)?;
+            let tcp_output = runtime
+                .nodes()
+                .try_register_internal(TcpOutputNode::new())
+                .map_err(HammerError::from)?;
+            let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
+            let queue =
+                TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+                    .map_err(HammerError::from)?;
             let node = runtime
                 .nodes()
-                .try_register_driver(node)
+                .try_register_driver(session_queue_node.clone())
+                .map_err(HammerError::from)?;
+            let tcp_output_next = runtime
+                .nodes()
+                .add_node_next_slot(node, tcp_output)
+                .map_err(HammerError::from)?;
+            session_queue_node
+                .attach_queue(
+                    queue,
+                    SessionQueueNext::from_slot(tcp_output_next),
+                    TcpSessionProtocol::session_queue_dispatch_fn(),
+                )
                 .map_err(HammerError::from)?;
             runtime
                 .nodes()
@@ -1408,7 +1427,7 @@ impl RuntimeService {
 mod tests {
     use super::*;
     use hammer_core::StartStage;
-    use hammer_runtime::app::{AppBufferLease, AppOpId};
+    use hammer_runtime::app::AppOpId;
     use hammer_runtime::spawn::with_data_plane_buffers;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
@@ -1823,12 +1842,12 @@ interval = "5s"
                         .expect("alloc buffer");
                     worker
                         .runtime()
-                        .complete_recv(AppBufferLease::from_buffer(runtime.clone(), index))
+                        .complete_recv_buffer(runtime.clone(), index)
                         .await
                         .expect("complete recv");
                     assert_eq!(recv_sqe.opcode(), hammer_runtime::app::AppOpcode::Recv);
                     let recv = recv_future.await.expect("recv app payload");
-                    let payload = recv.lease().copy_current().expect("payload copy");
+                    let payload = recv.copy_current().expect("payload copy");
                     recv.release();
                     (
                         worker.owner_worker(),

@@ -1,11 +1,10 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::DataWorkerId;
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataWorkerId};
 use hammer_core::error::CoreResult;
 use hammer_infra::pool::Pool;
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
-use crate::session::protocol::SessionProtocolContext;
 use crate::session::{
     SessionAppRuntime, SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken,
     SessionTimerWheel,
@@ -72,11 +71,13 @@ impl WorkerSessionRuntime {
         token: SessionTimerToken,
         ticks: u64,
     ) -> CoreResult<()> {
+        self.clear_pending_timer_expiry(session_id, token);
         self.timers.arm_ticks(session_id, token, ticks)
     }
 
     #[inline]
     pub fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
+        self.clear_pending_timer_expiry(session_id, token);
         self.timers.cancel(session_id, token)
     }
 
@@ -89,6 +90,18 @@ impl WorkerSessionRuntime {
 
     pub(crate) fn take_timer_expiries(&mut self) -> hammer_infra::vec::Vec<SessionTimerExpiry> {
         self.pending_timer_expiries.drain(..).collect()
+    }
+
+    fn clear_pending_timer_expiry(&mut self, session_id: SessionId, token: SessionTimerToken) {
+        let pending = self
+            .pending_timer_expiries
+            .drain(..)
+            .collect::<hammer_infra::vec::Vec<_>>();
+        for expiry in pending {
+            if expiry.session_id() != session_id || expiry.token() != token {
+                self.pending_timer_expiries.push(expiry);
+            }
+        }
     }
 
     pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
@@ -120,27 +133,26 @@ impl WorkerSessionRuntime {
     }
 }
 
-pub(crate) trait SessionQueueProgram: 'static {
-    type Session: 'static;
+pub(crate) struct SessionDriverRuntime<S> {
+    sessions: WorkerSessionRuntime,
+    entries: Pool<SessionEntry<S>>,
+    app: SessionAppRuntime,
+    buffers: DataPlaneBuffers,
+}
 
+pub(crate) trait SessionQueueProtocol<S> {
     fn handle_timer_expiry(
         &mut self,
-        context: &mut SessionProtocolContext<'_, Self::Session>,
+        driver: &mut SessionDriverRuntime<S>,
         expiry: SessionTimerExpiry,
     ) -> CoreResult<()>;
 
-    fn handle_ready(
+    fn handle_ready_session(
         &mut self,
-        context: &mut SessionProtocolContext<'_, Self::Session>,
+        driver: &mut SessionDriverRuntime<S>,
         session_id: SessionId,
+        output_next: crate::session::SessionQueueNext,
     ) -> CoreResult<()>;
-}
-
-pub(crate) struct SessionQueueRuntime<P: SessionQueueProgram> {
-    sessions: WorkerSessionRuntime,
-    entries: Pool<SessionEntry<P::Session>>,
-    app: SessionAppRuntime,
-    program: P,
 }
 
 #[derive(Debug)]
@@ -169,11 +181,6 @@ impl<S> SessionEntry<S> {
     }
 
     #[inline]
-    pub(crate) fn clear_app_op(&mut self) -> Option<AppOpId> {
-        self.app_op.take()
-    }
-
-    #[inline]
     pub(crate) fn state(&self) -> &S {
         &self.state
     }
@@ -182,24 +189,16 @@ impl<S> SessionEntry<S> {
     pub(crate) fn state_mut(&mut self) -> &mut S {
         &mut self.state
     }
-
-    #[inline]
-    pub(crate) fn into_state(self) -> S {
-        self.state
-    }
 }
 
-impl<P> SessionQueueRuntime<P>
-where
-    P: SessionQueueProgram,
-{
+impl<S> SessionDriverRuntime<S> {
     #[inline]
-    pub(crate) fn new(worker: DataWorkerId, protocol: P) -> Self {
+    pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
         Self {
             sessions: WorkerSessionRuntime::new(worker),
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app: SessionAppRuntime::new(),
-            program: protocol,
+            buffers,
         }
     }
 
@@ -207,7 +206,7 @@ where
     #[cfg(test)]
     pub(crate) fn with_timer_clock(
         worker: DataWorkerId,
-        protocol: P,
+        buffers: DataPlaneBuffers,
         timer_tick_duration: Duration,
         last_timer_tick: Instant,
     ) -> Self {
@@ -219,51 +218,65 @@ where
             ),
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app: SessionAppRuntime::new(),
-            program: protocol,
+            buffers,
         }
     }
 
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn sessions_mut(&mut self) -> &mut WorkerSessionRuntime {
-        &mut self.sessions
+    pub(crate) fn worker(&self) -> DataWorkerId {
+        self.sessions.worker()
     }
 
     #[inline]
-    pub(crate) fn insert_session(&mut self, state: P::Session) -> SessionId {
+    pub(crate) fn mark_ready(&mut self, session_id: SessionId) {
+        self.sessions.mark_ready(session_id);
+    }
+
+    #[inline]
+    pub(crate) fn insert_session(&mut self, state: S) -> SessionId {
         let index = self
             .entries
             .insert(SessionEntry::new(state))
             .expect("session pool capacity exhausted");
-        SessionId::from_pool_index(index)
+        SessionId::from(index)
     }
 
     #[inline]
-    pub(crate) fn session(&self, id: SessionId) -> Option<&SessionEntry<P::Session>> {
+    pub(crate) fn session(&self, id: SessionId) -> Option<&SessionEntry<S>> {
         self.entries.get(id.pool_index())
     }
 
     #[inline]
-    pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut SessionEntry<P::Session>> {
+    pub(crate) fn session_mut(&mut self, id: SessionId) -> Option<&mut SessionEntry<S>> {
         self.entries.get_mut(id.pool_index())
     }
 
     #[inline]
-    pub(crate) fn session_state(&self, id: SessionId) -> Option<&P::Session> {
+    pub(crate) fn session_state(&self, id: SessionId) -> Option<&S> {
         self.session(id).map(SessionEntry::state)
     }
 
     #[inline]
-    pub(crate) fn session_state_mut(&mut self, id: SessionId) -> Option<&mut P::Session> {
+    pub(crate) fn session_state_mut(&mut self, id: SessionId) -> Option<&mut S> {
         self.session_mut(id).map(SessionEntry::state_mut)
     }
 
-    pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<SessionEntry<P::Session>> {
+    pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<SessionEntry<S>> {
         let removed = self.entries.remove(id.pool_index())?;
         if let Some(op) = removed.app_op() {
             self.app.unbind_ring(op);
         }
         Some(removed)
+    }
+
+    pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<SessionEntry<S>>> {
+        let Some(entry) = self.session(id) else {
+            return Ok(None);
+        };
+        if let Some(op) = entry.app_op() {
+            self.app.complete_closed(op)?;
+        }
+        Ok(self.remove_session(id))
     }
 
     #[inline]
@@ -292,54 +305,100 @@ where
     }
 
     #[inline]
-    pub(crate) fn program_mut(&mut self) -> &mut P {
-        &mut self.program
+    pub(crate) fn enqueue_rx(
+        &self,
+        session_id: SessionId,
+        index: BufferIndex,
+        fin: bool,
+    ) -> CoreResult<bool> {
+        let Some(op) = self.session(session_id).and_then(SessionEntry::app_op) else {
+            self.buffers.free_index(index);
+            return Ok(false);
+        };
+        self.app
+            .complete_recv(op, self.buffers.clone(), index, fin)?;
+        Ok(true)
     }
 
-    #[inline]
-    pub(crate) fn program(&self) -> &P {
-        &self.program
+    pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
+        self.sessions.poll_once_for_ticks(timer_ticks)
+    }
+
+    pub(crate) fn poll_once_at(&mut self, now: Instant) -> CoreResult<SessionQueueStep> {
+        let timer_ticks = self.sessions.elapsed_timer_ticks(now);
+        self.poll_once_for_ticks(timer_ticks)
+    }
+
+    pub(crate) fn take_timer_expiries(&mut self) -> hammer_infra::vec::Vec<SessionTimerExpiry> {
+        self.sessions.take_timer_expiries()
+    }
+
+    pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
+        self.sessions.take_ready_sessions()
+    }
+
+    pub(crate) fn arm_timer_ticks(
+        &mut self,
+        session_id: SessionId,
+        token: SessionTimerToken,
+        ticks: u64,
+    ) -> CoreResult<()> {
+        self.sessions.arm_timer_ticks(session_id, token, ticks)
+    }
+
+    pub(crate) fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
+        self.sessions.cancel_timer(session_id, token)
     }
 }
 
-impl<P> SessionQueueRuntime<P>
+#[cfg(test)]
+pub(crate) fn dispatch_session_queue_for_ticks<S, P>(
+    driver: &mut SessionDriverRuntime<S>,
+    protocol: &mut P,
+    timer_ticks: u32,
+    output_next: crate::session::SessionQueueNext,
+) -> CoreResult<SessionQueueStep>
 where
-    P: SessionQueueProgram,
+    P: SessionQueueProtocol<S>,
 {
-    pub(crate) fn run_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
-        let mut step = self.sessions.poll_once_for_ticks(timer_ticks)?;
-        let expiries = self.sessions.take_timer_expiries();
-        let worker = self.sessions.worker();
+    let mut step = driver.poll_once_for_ticks(timer_ticks)?;
+    dispatch_session_queue_pending(driver, protocol, output_next, &mut step)?;
+    Ok(step)
+}
 
-        for expiry in expiries {
-            let mut context = crate::session::SessionProtocolContext::new(
-                worker,
-                &mut self.sessions,
-                &mut self.entries,
-                &mut self.app,
-            );
-            self.program.handle_timer_expiry(&mut context, expiry)?;
-        }
+pub(crate) fn dispatch_session_queue_once_at<S, P>(
+    driver: &mut SessionDriverRuntime<S>,
+    protocol: &mut P,
+    now: Instant,
+    output_next: crate::session::SessionQueueNext,
+) -> CoreResult<SessionQueueStep>
+where
+    P: SessionQueueProtocol<S>,
+{
+    let mut step = driver.poll_once_at(now)?;
+    dispatch_session_queue_pending(driver, protocol, output_next, &mut step)?;
+    Ok(step)
+}
 
-        let ready_sessions = self.sessions.take_ready_sessions();
-        step.ready_sessions = ready_sessions.len();
-        for session_id in ready_sessions {
-            let mut context = crate::session::SessionProtocolContext::new(
-                worker,
-                &mut self.sessions,
-                &mut self.entries,
-                &mut self.app,
-            );
-            self.program.handle_ready(&mut context, session_id)?;
-        }
-
-        Ok(step)
+fn dispatch_session_queue_pending<S, P>(
+    driver: &mut SessionDriverRuntime<S>,
+    protocol: &mut P,
+    output_next: crate::session::SessionQueueNext,
+    step: &mut SessionQueueStep,
+) -> CoreResult<()>
+where
+    P: SessionQueueProtocol<S>,
+{
+    let expiries = driver.take_timer_expiries();
+    for expiry in expiries {
+        protocol.handle_timer_expiry(driver, expiry)?;
     }
-
-    pub(crate) fn run_once_at(&mut self, now: Instant) -> CoreResult<SessionQueueStep> {
-        let timer_ticks = self.sessions.elapsed_timer_ticks(now);
-        self.run_once_for_ticks(timer_ticks)
+    let ready_sessions = driver.take_ready_sessions();
+    step.ready_sessions = ready_sessions.len();
+    for session_id in ready_sessions {
+        protocol.handle_ready_session(driver, session_id, output_next)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]

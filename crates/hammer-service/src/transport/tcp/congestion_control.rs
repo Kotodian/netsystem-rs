@@ -3,9 +3,8 @@ use std::time::Instant;
 use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpSeq;
 
-use crate::session::protocol::tcp::state::TcpSessionState;
-
 use super::congestion::TcpCongestionAckSample;
+use super::connection::TcpConnectionState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionAckObservation {
@@ -30,16 +29,16 @@ pub struct TcpCongestionControlNode;
 
 impl TcpCongestionControlNode {
     pub fn observe_ack(
-        session: &mut TcpSessionState,
+        connection: &mut TcpConnectionState,
         observation: TcpCongestionAckObservation,
     ) -> CoreResult<()> {
-        let sample = session
+        let sample = connection
             .retransmit_queue_mut()
             .acknowledge_through_with_sample(observation.accepted_acknowledgment, observation.now);
         if let Some(rtt) = sample.latest_rtt {
             let bytes_in_flight =
-                tcp_seq_distance(observation.accepted_acknowledgment, session.snd_nxt());
-            session.congestion_mut().on_ack(TcpCongestionAckSample {
+                tcp_seq_distance(observation.accepted_acknowledgment, connection.snd_nxt());
+            connection.congestion_mut().on_ack(TcpCongestionAckSample {
                 bytes_acked: sample.bytes_acked,
                 rtt,
                 now: observation.now,
@@ -50,26 +49,26 @@ impl TcpCongestionControlNode {
     }
 
     pub fn observe_send(
-        session: &mut TcpSessionState,
+        connection: &mut TcpConnectionState,
         observation: TcpCongestionSendObservation,
     ) -> CoreResult<()> {
-        session
+        connection
             .congestion_mut()
             .on_packet_sent(observation.bytes_sent, observation.bytes_in_flight);
-        let next_output_at = session
+        let next_output_at = connection
             .congestion()
             .next_send_delay(observation.bytes_sent)
             .map(|delay| observation.now + delay);
-        session.set_next_output_at(next_output_at);
+        connection.set_next_output_at(next_output_at);
         Ok(())
     }
 
     pub fn observe_loss(
-        session: &mut TcpSessionState,
+        connection: &mut TcpConnectionState,
         observation: TcpCongestionLossObservation,
     ) -> CoreResult<()> {
-        session.congestion_mut().on_loss(observation.bytes_lost);
-        session.set_next_output_at(None);
+        connection.congestion_mut().on_loss(observation.bytes_lost);
+        connection.set_next_output_at(None);
         Ok(())
     }
 }

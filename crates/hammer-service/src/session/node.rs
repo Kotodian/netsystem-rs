@@ -1,10 +1,12 @@
 use std::cell::RefCell;
 use std::thread::LocalKey;
+use std::time::Instant;
 
-use hammer_adapter::NodeRuntimeData;
+use hammer_adapter::{
+    BufferFrame, DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeRegistration, NodeResult,
+    NodeRuntimeData,
+};
 use hammer_core::error::{CoreError, CoreResult};
-
-use crate::session::worker::{SessionQueueProgram, SessionQueueRuntime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionQueueHandle {
@@ -13,48 +15,165 @@ pub struct SessionQueueHandle {
 
 impl SessionQueueHandle {
     #[inline]
-    pub(in crate::session) const fn new(runtime_data: NodeRuntimeData) -> Self {
+    pub(crate) const fn new(runtime_data: NodeRuntimeData) -> Self {
         Self { runtime_data }
     }
 
     #[inline]
-    pub(in crate::session) const fn runtime_data(self) -> NodeRuntimeData {
+    pub(crate) const fn runtime_data(self) -> NodeRuntimeData {
         self.runtime_data
     }
 }
 
-pub(crate) fn register_session_queue_runtime<P>(
-    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<SessionQueueRuntime<P>>>>,
-    runtime: SessionQueueRuntime<P>,
-) -> CoreResult<SessionQueueHandle>
-where
-    P: SessionQueueProgram,
-{
-    store.with(|runtimes| {
-        let mut runtimes = runtimes.borrow_mut();
-        let slot = runtimes.len();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionQueueNext(usize);
+
+impl SessionQueueNext {
+    #[inline]
+    pub const fn from_slot(slot: usize) -> Self {
+        Self(slot)
+    }
+
+    #[inline]
+    pub const fn slot(self) -> usize {
+        self.0
+    }
+}
+
+pub type SessionQueueDispatchFn =
+    fn(SessionQueueHandle, SessionQueueNext, Instant) -> CoreResult<()>;
+
+#[derive(Clone, Copy)]
+struct SessionQueueAttachment {
+    handle: SessionQueueHandle,
+    output_next: SessionQueueNext,
+    dispatch: SessionQueueDispatchFn,
+}
+
+#[derive(Clone)]
+pub struct SessionQueueNode {
+    runtime_data: NodeRuntimeData,
+}
+
+thread_local! {
+    static SESSION_QUEUE_NODES: RefCell<hammer_infra::vec::Vec<hammer_infra::vec::Vec<SessionQueueAttachment>>> =
+        const { RefCell::new(hammer_infra::vec::Vec::new()) };
+}
+
+impl SessionQueueNode {
+    pub fn new() -> CoreResult<Self> {
+        SESSION_QUEUE_NODES.with(|nodes| {
+            let mut nodes = nodes.borrow_mut();
+            let slot = nodes.len();
+            let runtime_data = NodeRuntimeData::from_usize(slot)?;
+            nodes.push(hammer_infra::vec::Vec::new());
+            Ok(Self { runtime_data })
+        })
+    }
+
+    pub fn attach_queue(
+        &self,
+        handle: SessionQueueHandle,
+        output_next: SessionQueueNext,
+        dispatch: SessionQueueDispatchFn,
+    ) -> CoreResult<()> {
+        let slot = self.runtime_data.usize_word(0)?;
+        SESSION_QUEUE_NODES.with(|nodes| {
+            let mut nodes = nodes
+                .try_borrow_mut()
+                .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
+            let node = nodes
+                .get_mut(slot)
+                .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
+            node.push(SessionQueueAttachment {
+                handle,
+                output_next,
+                dispatch,
+            });
+            Ok(())
+        })
+    }
+}
+
+impl Node for SessionQueueNode {
+    fn process(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        session_queue_node_process(runtime, self.runtime_data, frame)
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        session_queue_node_process
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl DriverNode for SessionQueueNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next("session-queue", 0)
+    }
+}
+
+fn session_queue_node_process(
+    _runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    frame.clear();
+    let slot = data.usize_word(0)?;
+    let attachments = SESSION_QUEUE_NODES.with(|nodes| {
+        let nodes = nodes
+            .try_borrow()
+            .map_err(|_| CoreError::internal("session queue nodes borrowed"))?;
+        let node = nodes
+            .get(slot)
+            .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
+        Ok::<_, CoreError>(node.clone())
+    })?;
+    let now = Instant::now();
+    for attachment in attachments {
+        (attachment.dispatch)(attachment.handle, attachment.output_next, now)?;
+    }
+    Ok(NodeResult::drop())
+}
+
+pub(crate) fn register_session_queue<Q>(
+    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<Q>>>,
+    queue: Q,
+) -> CoreResult<SessionQueueHandle> {
+    store.with(|queues| {
+        let mut queues = queues.borrow_mut();
+        let slot = queues.len();
         let runtime_data = NodeRuntimeData::from_usize(slot)?;
-        runtimes.push(runtime);
+        queues.push(queue);
         Ok(SessionQueueHandle::new(runtime_data))
     })
 }
 
-pub(crate) fn with_session_queue_runtime<P, R>(
-    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<SessionQueueRuntime<P>>>>,
+pub(crate) fn with_session_queue<Q, R>(
+    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<Q>>>,
     handle: SessionQueueHandle,
-    f: impl FnOnce(&mut SessionQueueRuntime<P>) -> CoreResult<R>,
-) -> CoreResult<R>
-where
-    P: SessionQueueProgram,
-{
+    f: impl FnOnce(&mut Q) -> CoreResult<R>,
+) -> CoreResult<R> {
     let slot = handle.runtime_data().usize_word(0)?;
-    store.with(|runtimes| {
-        let mut runtimes = runtimes
+    store.with(|queues| {
+        let mut queues = queues
             .try_borrow_mut()
-            .map_err(|_| CoreError::internal("session queue runtimes borrowed"))?;
-        let runtime = runtimes
+            .map_err(|_| CoreError::internal("session queues borrowed"))?;
+        let queue = queues
             .get_mut(slot)
-            .ok_or_else(|| CoreError::internal("session queue runtime slot is invalid"))?;
-        f(runtime)
+            .ok_or_else(|| CoreError::internal("session queue slot is invalid"))?;
+        f(queue)
     })
 }

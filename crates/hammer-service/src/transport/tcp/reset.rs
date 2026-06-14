@@ -8,6 +8,7 @@ use hammer_adapter::{
     NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentView};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -373,8 +374,8 @@ fn tcp_synthesized_reset(
         .into_iter()
         .collect();
     let cursor = runtime.packet_cursor(index).ok()?;
-    let flags = packet.get(cursor.transport_header_offset() + 13).copied()?;
-    if flags & 0x04 != 0 {
+    let source_segment = parse_reset_source_segment(&packet, cursor)?;
+    if source_segment.flags.contains(TcpSegmentFlags::RST) {
         return None;
     }
     match packet
@@ -382,21 +383,58 @@ fn tcp_synthesized_reset(
         .copied()
         .map(|byte| byte >> 4)
     {
-        Some(4) => synthesize_ipv4_tcp_reset(&packet, cursor, metadata),
-        Some(6) => synthesize_ipv6_tcp_reset(&packet, cursor, metadata),
+        Some(4) => synthesize_ipv4_tcp_reset(&packet, cursor, source_segment, metadata),
+        Some(6) => synthesize_ipv6_tcp_reset(&packet, cursor, source_segment, metadata),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResetSourceSegment {
+    source_port: u16,
+    destination_port: u16,
+    sequence_number: u32,
+    acknowledgment_number: Option<u32>,
+    flags: TcpSegmentFlags,
+    segment_len: usize,
+}
+
+fn parse_reset_source_segment(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
+) -> Option<ResetSourceSegment> {
+    let available_len = packet.len().min(cursor.packet_len());
+    let transport_offset = cursor.transport_header_offset();
+    let payload_offset = cursor.transport_payload_offset();
+    if transport_offset > available_len || payload_offset > available_len {
+        return None;
+    }
+    let segment = TcpSegmentView::parse(packet.get(transport_offset..available_len)?).ok()?;
+    if payload_offset != transport_offset.checked_add(segment.header_len())? {
+        return None;
+    }
+    let payload_len = available_len.checked_sub(payload_offset)?;
+    let segment_len = payload_len
+        .checked_add(usize::from(segment.flags().contains(TcpSegmentFlags::SYN)))?
+        .checked_add(usize::from(segment.flags().contains(TcpSegmentFlags::FIN)))?;
+    Some(ResetSourceSegment {
+        source_port: segment.source_port(),
+        destination_port: segment.destination_port(),
+        sequence_number: segment.sequence_number(),
+        acknowledgment_number: segment.acknowledgment_number(),
+        flags: segment.flags(),
+        segment_len,
+    })
 }
 
 fn synthesize_ipv4_tcp_reset(
     packet: &[u8],
     cursor: BufferPacketCursor,
+    source_segment: ResetSourceSegment,
     metadata: &RouteMetadata,
 ) -> Option<TcpSynthesizedReset> {
     const IPV4_MIN_HEADER_LEN: usize = 20;
     const TCP_MIN_HEADER_LEN: usize = 20;
-    const TCP_FLAG_FIN: u8 = 0x01;
-    const TCP_FLAG_SYN: u8 = 0x02;
     const TCP_FLAG_RST: u8 = 0x04;
     const TCP_FLAG_ACK: u8 = 0x10;
 
@@ -409,11 +447,7 @@ fn synthesize_ipv4_tcp_reset(
     let available_len = packet.len().min(cursor.packet_len());
     let network_offset = cursor.network_header_offset();
     let transport_offset = cursor.transport_header_offset();
-    let payload_offset = cursor.transport_payload_offset();
-    if network_offset > available_len
-        || transport_offset > available_len
-        || payload_offset > available_len
-    {
+    if network_offset > available_len || transport_offset > available_len {
         return None;
     }
 
@@ -428,20 +462,18 @@ fn synthesize_ipv4_tcp_reset(
         return None;
     }
 
-    let tcp = &packet[transport_offset..transport_end];
-    let flags = *tcp.get(13)?;
-    let ack_flag = flags & TCP_FLAG_ACK != 0;
-    let sequence_number = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
-    let acknowledgment_number = u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?);
-    let payload_len = available_len.checked_sub(payload_offset)?;
-    let segment_len = payload_len
-        .checked_add(usize::from(flags & TCP_FLAG_SYN != 0))?
-        .checked_add(usize::from(flags & TCP_FLAG_FIN != 0))?;
-    let response_sequence = if ack_flag { acknowledgment_number } else { 0 };
+    let ack_flag = source_segment.flags.contains(TcpSegmentFlags::ACK);
+    let response_sequence = if ack_flag {
+        source_segment.acknowledgment_number?
+    } else {
+        0
+    };
     let response_acknowledgment = if ack_flag {
         0
     } else {
-        sequence_number.wrapping_add(u32::try_from(segment_len).ok()?)
+        source_segment
+            .sequence_number
+            .wrapping_add(u32::try_from(source_segment.segment_len).ok()?)
     };
     let response_flags = if ack_flag {
         TCP_FLAG_RST
@@ -459,8 +491,8 @@ fn synthesize_ipv4_tcp_reset(
     reset[12..16].copy_from_slice(packet.get(network_offset + 16..network_offset + 20)?);
     reset[16..20].copy_from_slice(packet.get(network_offset + 12..network_offset + 16)?);
 
-    reset[20..22].copy_from_slice(tcp.get(2..4)?);
-    reset[22..24].copy_from_slice(tcp.get(0..2)?);
+    reset[20..22].copy_from_slice(&source_segment.destination_port.to_be_bytes());
+    reset[22..24].copy_from_slice(&source_segment.source_port.to_be_bytes());
     reset[24..28].copy_from_slice(&response_sequence.to_be_bytes());
     reset[28..32].copy_from_slice(&response_acknowledgment.to_be_bytes());
     reset[32] = 0x50;
@@ -488,12 +520,11 @@ fn synthesize_ipv4_tcp_reset(
 fn synthesize_ipv6_tcp_reset(
     packet: &[u8],
     cursor: BufferPacketCursor,
+    source_segment: ResetSourceSegment,
     metadata: &RouteMetadata,
 ) -> Option<TcpSynthesizedReset> {
     const IPV6_HEADER_LEN: usize = 40;
     const TCP_MIN_HEADER_LEN: usize = 20;
-    const TCP_FLAG_FIN: u8 = 0x01;
-    const TCP_FLAG_SYN: u8 = 0x02;
     const TCP_FLAG_RST: u8 = 0x04;
     const TCP_FLAG_ACK: u8 = 0x10;
 
@@ -506,11 +537,7 @@ fn synthesize_ipv6_tcp_reset(
     let available_len = packet.len().min(cursor.packet_len());
     let network_offset = cursor.network_header_offset();
     let transport_offset = cursor.transport_header_offset();
-    let payload_offset = cursor.transport_payload_offset();
-    if network_offset > available_len
-        || transport_offset > available_len
-        || payload_offset > available_len
-    {
+    if network_offset > available_len || transport_offset > available_len {
         return None;
     }
 
@@ -525,20 +552,18 @@ fn synthesize_ipv6_tcp_reset(
         return None;
     }
 
-    let tcp = &packet[transport_offset..transport_end];
-    let flags = *tcp.get(13)?;
-    let ack_flag = flags & TCP_FLAG_ACK != 0;
-    let sequence_number = u32::from_be_bytes(tcp.get(4..8)?.try_into().ok()?);
-    let acknowledgment_number = u32::from_be_bytes(tcp.get(8..12)?.try_into().ok()?);
-    let payload_len = available_len.checked_sub(payload_offset)?;
-    let segment_len = payload_len
-        .checked_add(usize::from(flags & TCP_FLAG_SYN != 0))?
-        .checked_add(usize::from(flags & TCP_FLAG_FIN != 0))?;
-    let response_sequence = if ack_flag { acknowledgment_number } else { 0 };
+    let ack_flag = source_segment.flags.contains(TcpSegmentFlags::ACK);
+    let response_sequence = if ack_flag {
+        source_segment.acknowledgment_number?
+    } else {
+        0
+    };
     let response_acknowledgment = if ack_flag {
         0
     } else {
-        sequence_number.wrapping_add(u32::try_from(segment_len).ok()?)
+        source_segment
+            .sequence_number
+            .wrapping_add(u32::try_from(source_segment.segment_len).ok()?)
     };
     let response_flags = if ack_flag {
         TCP_FLAG_RST
@@ -554,8 +579,8 @@ fn synthesize_ipv6_tcp_reset(
     reset[8..24].copy_from_slice(packet.get(network_offset + 24..network_offset + 40)?);
     reset[24..40].copy_from_slice(packet.get(network_offset + 8..network_offset + 24)?);
 
-    reset[40..42].copy_from_slice(tcp.get(2..4)?);
-    reset[42..44].copy_from_slice(tcp.get(0..2)?);
+    reset[40..42].copy_from_slice(&source_segment.destination_port.to_be_bytes());
+    reset[42..44].copy_from_slice(&source_segment.source_port.to_be_bytes());
     reset[44..48].copy_from_slice(&response_sequence.to_be_bytes());
     reset[48..52].copy_from_slice(&response_acknowledgment.to_be_bytes());
     reset[52] = 0x50;

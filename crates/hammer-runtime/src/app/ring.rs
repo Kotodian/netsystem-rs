@@ -2,13 +2,18 @@ use std::cell::RefCell;
 use std::future::poll_fn;
 use std::ops::Deref;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{HammerError, HammerResult};
 use hammer_infra::descriptor::Descriptor;
-use hammer_infra::ring::{CompletionDescriptor, IndexedRing, RingEntry, SubmissionDescriptor};
+use hammer_infra::map::FlatHashTable;
+use hammer_infra::ring::{CompletionDescriptor, LockFreeRing, RingEntry, SubmissionDescriptor};
 use hammer_infra::vec::Vec;
+
+use crate::app::data::{AppDataAddr, AppDataArea, AppDataAreaConfig};
+use crate::app::layout::{AppRingExport, AppRingLayout, AppRingMemoryKind, ring_size_for_capacity};
 
 pub enum AppOpTag {}
 pub type AppOpId = Descriptor<AppOpTag>;
@@ -36,20 +41,8 @@ pub enum AppOpcode {
     Close,
 }
 
-#[derive(Debug)]
-pub struct AppBufferLease {
-    runtime: Option<DataPlaneBuffers>,
-    index: BufferIndex,
-}
-
-#[derive(Debug)]
-pub struct AppRegisteredBuffer {
-    index: BufferIndex,
-    lease: AppBufferLease,
-}
-
-pub type AppSubmissionEntry = RingEntry<AppSqeDescriptor, AppRegisteredBuffer>;
-pub type AppCompletionEntry = RingEntry<AppCqeDescriptor, AppRegisteredBuffer>;
+pub type AppSubmissionEntry = RingEntry<AppSqeDescriptor, ()>;
+pub type AppCompletionEntry = RingEntry<AppCqeDescriptor, ()>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppObjectRef {
@@ -61,7 +54,7 @@ pub enum AppObjectRef {
 pub enum AppSqeData {
     Nop,
     Recv { max_len: u32 },
-    Send { buffer: BufferIndex },
+    Send { data: AppDataAddr },
     Close,
 }
 
@@ -95,7 +88,7 @@ impl AppCqeFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppCqeData {
     None,
-    Recv { buffer: BufferIndex },
+    Recv { data: AppDataAddr },
     Closed,
 }
 
@@ -224,94 +217,10 @@ impl AppSqe {
     }
 }
 
-impl AppBufferLease {
-    #[inline]
-    pub fn from_buffer(runtime: DataPlaneBuffers, index: BufferIndex) -> Self {
-        Self {
-            runtime: Some(runtime),
-            index,
-        }
-    }
-
-    #[inline]
-    pub fn index(&self) -> BufferIndex {
-        self.index
-    }
-
-    #[inline]
-    pub fn current_ptr(&self) -> HammerResult<*const u8> {
-        self.runtime().current_ptr(self.index)
-    }
-
-    #[inline]
-    pub fn current_mut_ptr(&self) -> HammerResult<*mut u8> {
-        self.runtime().current_mut_ptr(self.index)
-    }
-
-    #[inline]
-    pub fn current_len(&self) -> HammerResult<usize> {
-        self.runtime().current_len(self.index)
-    }
-
-    #[inline]
-    pub fn copy_current(&self) -> HammerResult<Vec<u8>> {
-        self.runtime().copy_current(self.index)
-    }
-
-    #[inline]
-    pub fn runtime(&self) -> &DataPlaneBuffers {
-        self.runtime.as_ref().expect("app buffer lease released")
-    }
-
-    #[inline]
-    pub fn release(mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.free_index(self.index);
-        }
-    }
-
-    #[inline]
-    pub fn into_recv(self) -> AppRecv {
-        AppRecv::new(self)
-    }
-}
-
-impl Drop for AppBufferLease {
-    fn drop(&mut self) {
-        if let Some(runtime) = self.runtime.take() {
-            runtime.free_index(self.index);
-        }
-    }
-}
-
-impl AppRegisteredBuffer {
-    #[inline]
-    pub fn from_lease(lease: AppBufferLease) -> HammerResult<Self> {
-        Ok(Self {
-            index: lease.index(),
-            lease,
-        })
-    }
-
-    #[inline]
-    pub const fn index(&self) -> BufferIndex {
-        self.index
-    }
-
-    #[inline]
-    pub fn lease(&self) -> &AppBufferLease {
-        &self.lease
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (BufferIndex, AppBufferLease) {
-        (self.index, self.lease)
-    }
-}
-
 #[derive(Debug)]
 pub struct AppRecv {
-    lease: AppBufferLease,
+    data: Option<AppDataAddr>,
+    ring: AppRingHandle,
 }
 
 #[derive(Debug)]
@@ -397,30 +306,13 @@ impl AppCqe {
     }
 
     #[inline]
-    pub fn descriptor(&self) -> HammerResult<Option<AppCqeDescriptor>> {
-        let descriptor = match self.kind() {
-            AppCqeKind::Recv { op, recv, fin } => Some(AppCqeDescriptor::new(
-                self.user_data(),
-                recv.lease().current_len()? as i32,
-                if *fin {
-                    AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
-                } else {
-                    AppCqeFlags::BUFFER
-                },
-                AppObjectRef::Operation(*op),
-                AppCqeData::Recv {
-                    buffer: recv.lease().index(),
-                },
-            )),
-            AppCqeKind::Closed { op } => Some(AppCqeDescriptor::new(
-                self.user_data(),
-                0,
-                AppCqeFlags::NONE,
-                op.map_or(AppObjectRef::None, AppObjectRef::Operation),
-                AppCqeData::Closed,
-            )),
-        };
-        Ok(descriptor)
+    pub fn into_descriptor(self) -> HammerResult<Option<AppCqeDescriptor>> {
+        Ok(Some(cqe_into_descriptor(self)))
+    }
+
+    #[inline]
+    pub fn descriptor(self) -> HammerResult<Option<AppCqeDescriptor>> {
+        self.into_descriptor()
     }
 }
 
@@ -444,72 +336,112 @@ impl AppCqeView {
 
 impl AppRecv {
     #[inline]
-    pub fn new(lease: AppBufferLease) -> Self {
-        Self { lease }
+    pub fn new(ring: AppRingHandle, data: AppDataAddr) -> Self {
+        Self {
+            data: Some(data),
+            ring,
+        }
     }
 
     #[inline]
-    pub fn lease(&self) -> &AppBufferLease {
-        &self.lease
+    pub fn data(&self) -> AppDataAddr {
+        self.data.expect("app recv released")
+    }
+
+    #[inline]
+    pub fn copy_current(&self) -> HammerResult<std::vec::Vec<u8>> {
+        self.ring.read_data(self.data())
     }
 
     #[inline]
     pub fn into_send(self) -> AppSend {
-        AppSend { lease: self.lease }
+        let mut this = self;
+        let data = this.data.take().expect("app recv released");
+        AppSend::from_data(this.ring.clone(), data)
     }
 
     #[inline]
-    pub fn into_lease(self) -> AppBufferLease {
-        self.lease
+    pub fn into_data_addr(self) -> AppDataAddr {
+        let mut this = self;
+        this.data.take().expect("app recv released")
     }
 
     #[inline]
-    pub fn release(self) {
-        self.lease.release();
+    pub fn release(mut self) {
+        if let Some(data) = self.data.take() {
+            let _ = self.ring.release_data(data);
+        }
+    }
+}
+
+impl Drop for AppRecv {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            let _ = self.ring.release_data(data);
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct AppSend {
-    lease: AppBufferLease,
+    payload: Option<AppSendPayload>,
 }
 
 #[derive(Debug)]
-struct AppRingState<T> {
-    ring: IndexedRing<T>,
+enum AppSendPayload {
+    Data {
+        data: AppDataAddr,
+        ring: AppRingHandle,
+    },
+}
+
+#[derive(Debug)]
+pub struct AppSendData {
+    data: Option<AppDataAddr>,
+    data_area: Arc<AppDataArea>,
+    free_chunks: Arc<LockFreeRing<u32>>,
+}
+
+impl Drop for AppSendData {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            let _ = self.data_area.release(data);
+            let _ = self.free_chunks.enqueue_sp(data.chunk());
+        }
+    }
+}
+
+impl Drop for AppSend {
+    fn drop(&mut self) {
+        match self.payload.take() {
+            Some(AppSendPayload::Data { data, ring }) => {
+                let _ = ring.release_data(data);
+            }
+            None => {}
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AppRingWaker {
     waker: Option<Waker>,
 }
 
-impl<T> AppRingState<T> {
+impl AppRingWaker {
     #[inline]
-    fn new(capacity: usize) -> Self {
-        Self {
-            ring: IndexedRing::with_capacity(capacity),
-            waker: None,
-        }
+    fn new() -> Self {
+        Self { waker: None }
     }
 
     #[inline]
-    fn try_push(&mut self, value: T) -> Result<(), T> {
-        let pushed = self.ring.try_push(value);
-        if pushed.is_ok()
-            && let Some(waker) = self.waker.take()
-        {
+    fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
             waker.wake();
         }
-        pushed.map(|_| ())
     }
 
     #[inline]
-    fn pop(&mut self) -> Option<T> {
-        self.ring.pop().map(|(_, value)| value)
-    }
-
-    #[inline]
-    fn poll_pop(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
-        if let Some((_, value)) = self.ring.pop() {
-            return Poll::Ready(Some(value));
-        }
+    fn register(&mut self, cx: &mut Context<'_>) {
         let replace = match self.waker.as_ref() {
             Some(waker) => !waker.will_wake(cx.waker()),
             None => true,
@@ -517,49 +449,13 @@ impl<T> AppRingState<T> {
         if replace {
             self.waker = Some(cx.waker().clone());
         }
-        if let Some((_, value)) = self.ring.pop() {
-            self.waker.take();
-            Poll::Ready(Some(value))
-        } else {
-            Poll::Pending
-        }
     }
 }
 
-#[derive(Debug)]
-struct RegisteredBufferLease {
-    index: BufferIndex,
-    lease: AppBufferLease,
-}
-
-#[derive(Debug, Default)]
-struct AppRingBufferRegistry {
-    leases: Vec<RegisteredBufferLease>,
-}
-
-impl AppRingBufferRegistry {
+impl Default for AppRingWaker {
     #[inline]
-    fn register(&mut self, index: BufferIndex, lease: AppBufferLease) {
-        if let Some(entry) = self.leases.iter_mut().find(|entry| entry.index == index) {
-            entry.lease = lease;
-            return;
-        }
-        self.leases.push(RegisteredBufferLease { index, lease });
-    }
-
-    #[inline]
-    fn take(&mut self, index: BufferIndex) -> Option<AppBufferLease> {
-        let index = self.leases.iter().position(|entry| entry.index == index)?;
-        let last = self
-            .leases
-            .pop()
-            .expect("buffer registry entry exists at computed index");
-        if index == self.leases.len() {
-            return Some(last.lease);
-        }
-        let mut removed = last;
-        std::mem::swap(&mut self.leases[index], &mut removed);
-        Some(removed.lease)
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -567,13 +463,12 @@ impl AppRingBufferRegistry {
 struct PendingSubmission {
     user_data: Option<AppUserData>,
     object: AppObjectRef,
-    opcode: AppOpcode,
     payload: AppSqeData,
 }
 
 #[derive(Debug, Default)]
 struct AppPendingSubmissionRegistry {
-    submissions: Vec<PendingSubmission>,
+    recv_by_op: FlatHashTable<u64, PendingSubmission>,
 }
 
 impl AppPendingSubmissionRegistry {
@@ -581,12 +476,17 @@ impl AppPendingSubmissionRegistry {
     fn record_descriptor(&mut self, descriptor: AppSqeDescriptor) {
         match descriptor.opcode() {
             AppOpcode::Recv => {
-                self.submissions.push(PendingSubmission {
-                    user_data: descriptor.user_data(),
-                    object: descriptor.object(),
-                    opcode: descriptor.opcode(),
-                    payload: descriptor.payload(),
-                });
+                let AppObjectRef::Operation(op) = descriptor.object() else {
+                    return;
+                };
+                self.recv_by_op.insert(
+                    op.value(),
+                    PendingSubmission {
+                        user_data: descriptor.user_data(),
+                        object: descriptor.object(),
+                        payload: descriptor.payload(),
+                    },
+                );
             }
             _ => {
                 let _ = descriptor.payload();
@@ -595,42 +495,88 @@ impl AppPendingSubmissionRegistry {
     }
 
     #[inline]
-    fn find_op(&self, op: AppOpId, opcode: AppOpcode) -> Option<(usize, PendingSubmission)> {
-        self.submissions
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, pending)| {
-                pending.object == AppObjectRef::Operation(op) && pending.opcode == opcode
-            })
+    fn lookup_recv(&self, op: AppOpId) -> Option<PendingSubmission> {
+        self.recv_by_op.lookup(&op.value())
     }
 
     #[inline]
-    fn remove_at(&mut self, index: usize) -> PendingSubmission {
-        self.submissions
-            .drain(index..index + 1)
-            .next()
-            .expect("pending submission exists at computed index")
+    fn remove_recv(&mut self, op: AppOpId) -> Option<PendingSubmission> {
+        self.recv_by_op.remove(&op.value())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct AppRingHandle {
-    submissions: Rc<RefCell<AppRingState<AppSqeDescriptor>>>,
-    completions: Rc<RefCell<AppRingState<AppCqeDescriptor>>>,
-    buffers: Rc<RefCell<AppRingBufferRegistry>>,
+    submissions: Arc<LockFreeRing<AppSqeDescriptor>>,
+    completions: Arc<LockFreeRing<AppCqeDescriptor>>,
+    free_chunks: Arc<LockFreeRing<u32>>,
+    submission_waker: Rc<RefCell<AppRingWaker>>,
+    completion_waker: Rc<RefCell<AppRingWaker>>,
     pending_submissions: Rc<RefCell<AppPendingSubmissionRegistry>>,
+    layout: AppRingLayout,
+    data_area: Arc<AppDataArea>,
 }
 
 impl AppRingHandle {
     #[inline]
     pub fn new(submission_capacity: usize, completion_capacity: usize) -> Self {
-        Self {
-            submissions: Rc::new(RefCell::new(AppRingState::new(submission_capacity))),
-            completions: Rc::new(RefCell::new(AppRingState::new(completion_capacity))),
-            buffers: Rc::new(RefCell::new(AppRingBufferRegistry::default())),
-            pending_submissions: Rc::new(RefCell::new(AppPendingSubmissionRegistry::default())),
+        Self::with_data_area(
+            submission_capacity,
+            completion_capacity,
+            2048,
+            submission_capacity.max(completion_capacity).max(1),
+        )
+        .expect("default app ring data area")
+    }
+
+    pub fn with_data_area(
+        submission_capacity: usize,
+        completion_capacity: usize,
+        data_chunk_size: usize,
+        data_chunk_count: usize,
+    ) -> HammerResult<Self> {
+        if submission_capacity == 0 || completion_capacity == 0 || data_chunk_count == 0 {
+            return Err(HammerError::internal(
+                "app ring capacities must be non-zero",
+            ));
         }
+        let submission_ring_size = ring_size_for_capacity(submission_capacity);
+        let completion_ring_size = ring_size_for_capacity(completion_capacity);
+        let fill_ring_size = ring_size_for_capacity(data_chunk_count);
+        let layout = AppRingLayout::new(
+            submission_capacity,
+            completion_capacity,
+            data_chunk_size,
+            data_chunk_count,
+        );
+        let free_chunks = Arc::new(
+            LockFreeRing::with_capacity(fill_ring_size)
+                .map_err(|_| HammerError::internal("invalid app fill ring capacity"))?,
+        );
+        for chunk in 0..data_chunk_count {
+            free_chunks
+                .enqueue_sp(chunk as u32)
+                .map_err(|_| HammerError::internal("app fill ring initialization failed"))?;
+        }
+        Ok(Self {
+            submissions: Arc::new(
+                LockFreeRing::with_capacity(submission_ring_size)
+                    .map_err(|_| HammerError::internal("invalid app submission ring capacity"))?,
+            ),
+            completions: Arc::new(
+                LockFreeRing::with_capacity(completion_ring_size)
+                    .map_err(|_| HammerError::internal("invalid app completion ring capacity"))?,
+            ),
+            free_chunks,
+            submission_waker: Rc::new(RefCell::new(AppRingWaker::default())),
+            completion_waker: Rc::new(RefCell::new(AppRingWaker::default())),
+            pending_submissions: Rc::new(RefCell::new(AppPendingSubmissionRegistry::default())),
+            layout,
+            data_area: Arc::new(AppDataArea::new(AppDataAreaConfig {
+                chunk_size: data_chunk_size,
+                chunk_count: data_chunk_count,
+            })?),
+        })
     }
 
     #[inline]
@@ -639,195 +585,280 @@ impl AppRingHandle {
     }
 
     #[inline]
+    pub fn layout(&self) -> AppRingLayout {
+        self.layout
+    }
+
+    #[inline]
+    pub fn export_layout(&self) -> AppRingExport {
+        AppRingExport::new(AppRingMemoryKind::ProcessLocal, self.layout)
+    }
+
+    #[inline]
+    pub fn alloc_data_for_bytes(&self, bytes: &[u8]) -> HammerResult<AppDataAddr> {
+        let chunk = self
+            .free_chunks
+            .dequeue_sc()
+            .ok_or_else(|| HammerError::internal("app data area is full"))?;
+        let addr = self.data_area.alloc_chunk(chunk)?;
+        match self.data_area.write(addr, bytes) {
+            Ok(addr) => Ok(addr),
+            Err(err) => {
+                let _ = self.data_area.release(addr);
+                let _ = self.free_chunks.enqueue_sp(chunk);
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn alloc_data_from_dataplane_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> HammerResult<AppDataAddr> {
+        let chunk = self
+            .free_chunks
+            .dequeue_sc()
+            .ok_or_else(|| HammerError::internal("app data area is full"))?;
+        let addr = self.data_area.alloc_chunk(chunk)?;
+        match self.data_area.copy_from_buffer(addr, buffers, index) {
+            Ok(addr) => Ok(addr),
+            Err(err) => {
+                let _ = self.data_area.release(addr);
+                let _ = self.free_chunks.enqueue_sp(chunk);
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn read_data(&self, addr: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
+        self.data_area.read(addr)
+    }
+
+    #[inline]
+    pub fn release_data(&self, addr: AppDataAddr) -> HammerResult<()> {
+        self.data_area.release(addr)?;
+        self.free_chunks
+            .enqueue_sp(addr.chunk())
+            .map_err(|_| HammerError::internal("app free chunk ring is full"))
+    }
+
+    #[inline]
+    pub fn copy_data_from_send(&self, send: &AppSendData) -> HammerResult<AppDataAddr> {
+        let source = send.data()?;
+        let chunk = self
+            .free_chunks
+            .dequeue_sc()
+            .ok_or_else(|| HammerError::internal("app data area is full"))?;
+        let addr = self.data_area.alloc_chunk(chunk)?;
+        match self
+            .data_area
+            .copy_from_area(addr, send.data_area(), source)
+        {
+            Ok(addr) => Ok(addr),
+            Err(err) => {
+                let _ = self.data_area.release(addr);
+                let _ = self.free_chunks.enqueue_sp(chunk);
+                Err(err)
+            }
+        }
+    }
+
+    #[inline]
     pub fn try_push_submission(&self, sqe: AppSqe) -> HammerResult<()> {
-        let descriptor = sqe_into_descriptor(sqe, &self.buffers)?;
-        self.submissions
-            .borrow_mut()
-            .try_push(descriptor)
-            .map_err(|_| HammerError::internal("app submission ring full"))
+        match sqe {
+            AppSqe::Send {
+                user_data,
+                op,
+                send,
+            } => {
+                let data = send.into_data_addr()?;
+                if let Err(err) = self.try_push_submission_descriptor(AppSqeDescriptor::new(
+                    AppOpcode::Send,
+                    user_data,
+                    AppObjectRef::Operation(op),
+                    AppSqeData::Send { data },
+                )) {
+                    let _ = self.release_data(data);
+                    return Err(err);
+                }
+                Ok(())
+            }
+            other => {
+                let descriptor = sqe_into_descriptor(other)?;
+                self.try_push_submission_descriptor(descriptor)
+            }
+        }
     }
 
     #[inline]
     pub fn pop_submission(&self) -> Option<AppSqe> {
-        let descriptor = self.submissions.borrow_mut().pop()?;
-        Some(sqe_from_descriptor(descriptor, &self.buffers))
+        let descriptor = self.submissions.dequeue_sc()?;
+        Some(sqe_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub fn try_push_completion(&self, cqe: AppCqe) -> HammerResult<()> {
-        let Some(descriptor) = cqe_into_descriptor(cqe, &self.buffers)? else {
-            return Err(HammerError::internal(
-                "app completion descriptor is missing buffer payload",
-            ));
-        };
-        self.completions
-            .borrow_mut()
-            .try_push(descriptor)
-            .map_err(|_| HammerError::internal("app completion ring full"))
+        let descriptor = cqe_into_descriptor(cqe);
+        if let Err(err) = self.try_push_completion_descriptor(descriptor) {
+            if let AppCqeData::Recv { data } = descriptor.payload() {
+                let _ = self.release_data(data);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     #[inline]
     pub fn pop_completion(&self) -> Option<AppCqe> {
-        let descriptor = self.completions.borrow_mut().pop()?;
-        Some(cqe_from_descriptor(descriptor, &self.buffers))
+        let descriptor = self.completions.dequeue_sc()?;
+        Some(cqe_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub async fn next_submission(&self) -> Option<AppSqe> {
-        let descriptor = poll_fn(|cx| self.submissions.borrow_mut().poll_pop(cx)).await?;
-        Some(sqe_from_descriptor(descriptor, &self.buffers))
+        let descriptor = poll_fn(|cx| self.poll_next_submission_descriptor(cx)).await?;
+        Some(sqe_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub async fn next_completion(&self) -> Option<AppCqe> {
-        let descriptor = poll_fn(|cx| self.completions.borrow_mut().poll_pop(cx)).await?;
-        Some(cqe_from_descriptor(descriptor, &self.buffers))
+        let descriptor = poll_fn(|cx| self.poll_next_completion_descriptor(cx)).await?;
+        Some(cqe_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub fn try_push_submission_descriptor(&self, sqe: AppSqeDescriptor) -> HammerResult<()> {
         self.submissions
-            .borrow_mut()
-            .try_push(sqe)
+            .enqueue_sp(sqe)
             .map_err(|_| HammerError::internal("app submission descriptor ring full"))?;
+        self.submission_waker.borrow_mut().wake();
         self.pending_submissions.borrow_mut().record_descriptor(sqe);
         Ok(())
     }
 
     #[inline]
     pub fn try_push_submission_entry(&self, entry: AppSubmissionEntry) -> HammerResult<()> {
-        let (descriptor, registered) = entry.into_parts();
-        if let Some(registered) = registered {
-            let (index, lease) = registered.into_parts();
-            self.buffers.borrow_mut().register(index, lease);
-            if let Err(err) = self.try_push_submission_descriptor(descriptor) {
-                let _ = self.buffers.borrow_mut().take(index);
-                return Err(err);
-            }
-            return Ok(());
+        let (descriptor, attachment) = entry.into_parts();
+        if attachment.is_some() {
+            return Err(HammerError::internal(
+                "app submission entries do not accept buffer attachments",
+            ));
         }
-        self.try_push_submission_descriptor(descriptor)
+        if let Err(err) = self.try_push_submission_descriptor(descriptor) {
+            if let AppSqeData::Send { data } = descriptor.payload() {
+                let _ = self.release_data(data);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     #[inline]
     pub fn try_push_completion_descriptor(&self, cqe: AppCqeDescriptor) -> HammerResult<()> {
         self.completions
-            .borrow_mut()
-            .try_push(cqe)
-            .map_err(|_| HammerError::internal("app completion descriptor ring full"))
+            .enqueue_sp(cqe)
+            .map_err(|_| HammerError::internal("app completion descriptor ring full"))?;
+        self.completion_waker.borrow_mut().wake();
+        Ok(())
     }
 
     #[inline]
-    pub fn take_buffer_lease(&self, index: BufferIndex) -> HammerResult<AppBufferLease> {
-        self.buffers.borrow_mut().take(index).ok_or_else(|| {
-            HammerError::internal(format!(
-                "registered app buffer {}:{}:{} is missing",
-                index.pool_id(),
-                index.slot(),
-                index.generation()
-            ))
-        })
+    pub fn send_from_data(&self, data: AppDataAddr) -> AppSend {
+        AppSend::from_data(self.clone(), data)
     }
 
     #[inline]
-    pub fn take_send_buffer(&self, index: BufferIndex) -> HammerResult<AppSend> {
-        self.take_buffer_lease(index).map(AppSend::new)
-    }
-
-    #[inline]
-    pub fn take_recv_buffer(&self, index: BufferIndex) -> HammerResult<AppRecv> {
-        self.take_buffer_lease(index).map(AppRecv::new)
+    pub fn send_data_from_addr(&self, data: AppDataAddr) -> AppSendData {
+        AppSendData {
+            data: Some(data),
+            data_area: Arc::clone(&self.data_area),
+            free_chunks: Arc::clone(&self.free_chunks),
+        }
     }
 
     #[inline]
     pub fn try_push_completion_entry(&self, entry: AppCompletionEntry) -> HammerResult<()> {
-        let (descriptor, registered) = entry.into_parts();
-        if let Some(registered) = registered {
-            let (index, lease) = registered.into_parts();
-            self.buffers.borrow_mut().register(index, lease);
-            if let Err(err) = self.try_push_completion_descriptor(descriptor) {
-                let _ = self.buffers.borrow_mut().take(index);
-                return Err(err);
-            }
-            return Ok(());
+        let (descriptor, attachment) = entry.into_parts();
+        if attachment.is_some() {
+            return Err(HammerError::internal(
+                "app completion entries do not accept buffer attachments",
+            ));
         }
         self.try_push_completion_descriptor(descriptor)
     }
 
     #[inline]
-    pub(crate) fn try_complete_recv_buffer(
+    pub fn try_complete_recv_buffer(
         &self,
         op: AppOpId,
         buffers: DataPlaneBuffers,
         index: BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        self.try_complete_recv_lease(op, AppBufferLease::from_buffer(buffers, index), fin)
-    }
-
-    #[inline]
-    pub(crate) fn try_complete_recv_lease(
-        &self,
-        op: AppOpId,
-        lease: AppBufferLease,
-        fin: bool,
-    ) -> HammerResult<()> {
-        let (pending_index, pending) = {
+        let pending = {
             let pending = self.pending_submissions.borrow();
-            pending.find_op(op, AppOpcode::Recv).ok_or_else(|| {
-                HammerError::internal(format!(
-                    "pending recv submission missing for app op {}",
-                    op.value()
-                ))
-            })?
+            match pending.lookup_recv(op) {
+                Some(found) => found,
+                None => {
+                    buffers.free_index(index);
+                    return Err(HammerError::internal(format!(
+                        "pending recv submission missing for app op {}",
+                        op.value()
+                    )));
+                }
+            }
         };
         if !matches!(pending.payload, AppSqeData::Recv { .. }) {
+            buffers.free_index(index);
             return Err(HammerError::internal("pending app op is not recv"));
         }
-        self.try_complete_recv_pending(op, pending_index, pending, lease, fin)
+        self.try_complete_recv_pending(op, pending, buffers, index, fin)
     }
 
     #[inline]
     pub async fn next_submission_entry(&self) -> Option<AppSubmissionEntry> {
-        let descriptor = poll_fn(|cx| self.submissions.borrow_mut().poll_pop(cx)).await?;
-        Some(submission_entry_from_descriptor(descriptor, &self.buffers))
+        let descriptor = poll_fn(|cx| self.poll_next_submission_descriptor(cx)).await?;
+        Some(submission_entry_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub fn pop_submission_entry(&self) -> Option<AppSubmissionEntry> {
         let descriptor = self.pop_submission_descriptor()?;
-        Some(submission_entry_from_descriptor(descriptor, &self.buffers))
+        Some(submission_entry_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub async fn next_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        poll_fn(|cx| self.submissions.borrow_mut().poll_pop(cx)).await
+        poll_fn(|cx| self.poll_next_submission_descriptor(cx)).await
     }
 
     #[inline]
     pub fn pop_submission_descriptor(&self) -> Option<AppSqeDescriptor> {
-        self.submissions.borrow_mut().pop()
+        self.submissions.dequeue_sc()
     }
 
     #[inline]
     pub async fn next_completion_entry(&self) -> Option<AppCompletionEntry> {
-        let descriptor = poll_fn(|cx| self.completions.borrow_mut().poll_pop(cx)).await?;
-        Some(completion_entry_from_descriptor(descriptor, &self.buffers))
+        let descriptor = poll_fn(|cx| self.poll_next_completion_descriptor(cx)).await?;
+        Some(completion_entry_from_descriptor(descriptor, self))
     }
 
     #[inline]
     pub async fn next_completion_descriptor(&self) -> Option<AppCqeDescriptor> {
-        poll_fn(|cx| self.completions.borrow_mut().poll_pop(cx)).await
+        poll_fn(|cx| self.poll_next_completion_descriptor(cx)).await
     }
 
     #[inline]
     pub(crate) fn poll_next_completion(&self, cx: &mut Context<'_>) -> Poll<Option<AppCqe>> {
-        let descriptor = match self.completions.borrow_mut().poll_pop(cx) {
+        let descriptor = match self.poll_next_completion_descriptor(cx) {
             Poll::Ready(Some(descriptor)) => descriptor,
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => return Poll::Pending,
         };
-        Poll::Ready(Some(cqe_from_descriptor(descriptor, &self.buffers)))
+        Poll::Ready(Some(cqe_from_descriptor(descriptor, self)))
     }
 
     #[inline]
@@ -837,9 +868,9 @@ impl AppRingHandle {
 
     #[inline]
     pub fn take_test_submissions(&self, max: usize) -> Vec<AppSqe> {
-        drain_ring_descriptors(&self.submissions, max)
+        drain_submission_descriptors(self, max)
             .into_iter()
-            .map(|descriptor| sqe_from_descriptor(descriptor, &self.buffers))
+            .map(|descriptor| sqe_from_descriptor(descriptor, self))
             .collect()
     }
 
@@ -850,52 +881,100 @@ impl AppRingHandle {
 
     #[inline]
     pub fn take_test_completions(&self, max: usize) -> Vec<AppCqe> {
-        drain_ring_descriptors(&self.completions, max)
+        drain_completion_descriptors(self, max)
             .into_iter()
-            .map(|descriptor| cqe_from_descriptor(descriptor, &self.buffers))
+            .map(|descriptor| cqe_from_descriptor(descriptor, self))
             .collect()
+    }
+
+    #[inline]
+    fn poll_next_submission_descriptor(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<AppSqeDescriptor>> {
+        if let Some(descriptor) = self.submissions.dequeue_sc() {
+            return Poll::Ready(Some(descriptor));
+        }
+        self.submission_waker.borrow_mut().register(cx);
+        if let Some(descriptor) = self.submissions.dequeue_sc() {
+            self.submission_waker.borrow_mut().waker = None;
+            Poll::Ready(Some(descriptor))
+        } else {
+            Poll::Pending
+        }
+    }
+
+    #[inline]
+    fn poll_next_completion_descriptor(
+        &self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<AppCqeDescriptor>> {
+        if let Some(descriptor) = self.completions.dequeue_sc() {
+            return Poll::Ready(Some(descriptor));
+        }
+        self.completion_waker.borrow_mut().register(cx);
+        if let Some(descriptor) = self.completions.dequeue_sc() {
+            self.completion_waker.borrow_mut().waker = None;
+            Poll::Ready(Some(descriptor))
+        } else {
+            Poll::Pending
+        }
     }
 
     #[inline]
     fn try_complete_recv_pending(
         &self,
         op: AppOpId,
-        pending_index: usize,
         pending: PendingSubmission,
-        lease: AppBufferLease,
+        buffers: DataPlaneBuffers,
+        index: BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        let registered = AppRegisteredBuffer::from_lease(lease)?;
+        let data = match self.alloc_data_from_dataplane_buffer(&buffers, index) {
+            Ok(data) => data,
+            Err(err) => {
+                buffers.free_index(index);
+                return Err(err);
+            }
+        };
+        buffers.free_index(index);
+        self.complete_recv_pending_with_data(op, pending, data, fin)
+    }
+
+    #[inline]
+    fn complete_recv_pending_with_data(
+        &self,
+        op: AppOpId,
+        pending: PendingSubmission,
+        data: AppDataAddr,
+        fin: bool,
+    ) -> HammerResult<()> {
         let descriptor = AppCqeDescriptor::new(
             pending.user_data,
-            registered.lease().current_len()? as i32,
+            data.len() as i32,
             if fin {
                 AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
             } else {
                 AppCqeFlags::BUFFER
             },
             pending.object,
-            AppCqeData::Recv {
-                buffer: registered.index(),
-            },
+            AppCqeData::Recv { data },
         );
-        self.try_push_completion_entry(AppCompletionEntry::with_attachment(
-            descriptor, registered,
-        ))?;
-        self.pending_submissions
-            .borrow_mut()
-            .remove_at(pending_index);
+        if let Err(err) = self.try_push_completion_descriptor(descriptor) {
+            let _ = self.release_data(data);
+            return Err(err);
+        }
+        self.pending_submissions.borrow_mut().remove_recv(op);
         let _ = op;
         Ok(())
     }
 }
 
 #[inline]
-fn drain_ring_descriptors<T>(ring: &Rc<RefCell<AppRingState<T>>>, max: usize) -> Vec<T> {
+fn drain_submission_descriptors(ring: &AppRingHandle, max: usize) -> Vec<AppSqeDescriptor> {
     let mut drained = Vec::new();
-    let mut ring = ring.borrow_mut();
     for _ in 0..max {
-        let Some(value) = ring.pop() else {
+        let Some(value) = ring.submissions.dequeue_sc() else {
             break;
         };
         drained.push(value);
@@ -904,10 +983,19 @@ fn drain_ring_descriptors<T>(ring: &Rc<RefCell<AppRingState<T>>>, max: usize) ->
 }
 
 #[inline]
-fn sqe_into_descriptor(
-    sqe: AppSqe,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
-) -> HammerResult<AppSqeDescriptor> {
+fn drain_completion_descriptors(ring: &AppRingHandle, max: usize) -> Vec<AppCqeDescriptor> {
+    let mut drained = Vec::new();
+    for _ in 0..max {
+        let Some(value) = ring.completions.dequeue_sc() else {
+            break;
+        };
+        drained.push(value);
+    }
+    drained
+}
+
+#[inline]
+fn sqe_into_descriptor(sqe: AppSqe) -> HammerResult<AppSqeDescriptor> {
     match sqe {
         AppSqe::Nop { user_data } => Ok(AppSqeDescriptor::new(
             AppOpcode::Nop,
@@ -923,21 +1011,9 @@ fn sqe_into_descriptor(
                 max_len: max as u32,
             },
         )),
-        AppSqe::Send {
-            user_data,
-            op,
-            send,
-        } => {
-            let lease = send.into_lease();
-            let index = lease.index();
-            buffers.borrow_mut().register(index, lease);
-            Ok(AppSqeDescriptor::new(
-                AppOpcode::Send,
-                user_data,
-                AppObjectRef::Operation(op),
-                AppSqeData::Send { buffer: index },
-            ))
-        }
+        AppSqe::Send { .. } => Err(HammerError::internal(
+            "send sqe conversion requires app ring data area",
+        )),
         AppSqe::Close { user_data, op } => Ok(AppSqeDescriptor::new(
             AppOpcode::Close,
             user_data,
@@ -948,10 +1024,7 @@ fn sqe_into_descriptor(
 }
 
 #[inline]
-fn sqe_from_descriptor(
-    descriptor: AppSqeDescriptor,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
-) -> AppSqe {
+fn sqe_from_descriptor(descriptor: AppSqeDescriptor, ring: &AppRingHandle) -> AppSqe {
     match descriptor.payload() {
         AppSqeData::Nop => AppSqe::nop(descriptor.user_data()),
         AppSqeData::Recv { max_len } => AppSqe::recv(
@@ -959,17 +1032,11 @@ fn sqe_from_descriptor(
             op_from_descriptor(descriptor),
             max_len as usize,
         ),
-        AppSqeData::Send { buffer } => {
-            let lease = buffers
-                .borrow_mut()
-                .take(buffer)
-                .expect("registered send lease for submission descriptor");
-            AppSqe::send(
-                descriptor.user_data(),
-                op_from_descriptor(descriptor),
-                AppSend::new(lease),
-            )
-        }
+        AppSqeData::Send { data } => AppSqe::send(
+            descriptor.user_data(),
+            op_from_descriptor(descriptor),
+            AppSend::from_data(ring.clone(), data),
+        ),
         AppSqeData::Close => AppSqe::close(descriptor.user_data(), op_from_descriptor(descriptor)),
     }
 }
@@ -985,79 +1052,50 @@ fn op_from_descriptor(descriptor: AppSqeDescriptor) -> AppOpId {
 #[inline]
 fn submission_entry_from_descriptor(
     descriptor: AppSqeDescriptor,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
+    ring: &AppRingHandle,
 ) -> AppSubmissionEntry {
-    match descriptor.payload() {
-        AppSqeData::Send { buffer } => {
-            let lease = buffers
-                .borrow_mut()
-                .take(buffer)
-                .expect("registered send lease for submission entry");
-            AppSubmissionEntry::with_attachment(
-                descriptor,
-                AppRegisteredBuffer {
-                    index: buffer,
-                    lease,
-                },
-            )
-        }
-        _ => AppSubmissionEntry::new(descriptor),
-    }
+    let _ = ring;
+    AppSubmissionEntry::new(descriptor)
 }
 
 #[inline]
-fn cqe_into_descriptor(
-    cqe: AppCqe,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
-) -> HammerResult<Option<AppCqeDescriptor>> {
+fn cqe_into_descriptor(cqe: AppCqe) -> AppCqeDescriptor {
     let user_data = cqe.user_data();
     match cqe.inner.kind {
         AppCqeKind::Recv { op, recv, fin } => {
-            let lease = recv.into_lease();
-            let index = lease.index();
-            let result = lease.current_len()? as i32;
-            buffers.borrow_mut().register(index, lease);
-            Ok(Some(AppCqeDescriptor::new(
+            let data = recv.into_data_addr();
+            AppCqeDescriptor::new(
                 user_data,
-                result,
+                data.len() as i32,
                 if fin {
                     AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
                 } else {
                     AppCqeFlags::BUFFER
                 },
                 AppObjectRef::Operation(op),
-                AppCqeData::Recv { buffer: index },
-            )))
+                AppCqeData::Recv { data },
+            )
         }
-        AppCqeKind::Closed { op } => Ok(Some(AppCqeDescriptor::new(
+        AppCqeKind::Closed { op } => AppCqeDescriptor::new(
             user_data,
             0,
             AppCqeFlags::NONE,
             op.map_or(AppObjectRef::None, AppObjectRef::Operation),
             AppCqeData::Closed,
-        ))),
+        ),
     }
 }
 
 #[inline]
-fn cqe_from_descriptor(
-    descriptor: AppCqeDescriptor,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
-) -> AppCqe {
+fn cqe_from_descriptor(descriptor: AppCqeDescriptor, ring: &AppRingHandle) -> AppCqe {
     match descriptor.payload() {
         AppCqeData::None => AppCqe::new(descriptor.user_data(), AppCqeKind::Closed { op: None }),
-        AppCqeData::Recv { buffer } => {
-            let lease = buffers
-                .borrow_mut()
-                .take(buffer)
-                .expect("registered recv lease for completion descriptor");
-            AppCqe::recv(
-                descriptor.user_data(),
-                op_from_completion_descriptor(descriptor),
-                AppRecv::new(lease),
-                descriptor.flags().contains(AppCqeFlags::FIN),
-            )
-        }
+        AppCqeData::Recv { data } => AppCqe::recv(
+            descriptor.user_data(),
+            op_from_completion_descriptor(descriptor),
+            AppRecv::new(ring.clone(), data),
+            descriptor.flags().contains(AppCqeFlags::FIN),
+        ),
         AppCqeData::Closed => AppCqe::new(
             descriptor.user_data(),
             AppCqeKind::Closed {
@@ -1081,60 +1119,99 @@ fn op_from_completion_descriptor(descriptor: AppCqeDescriptor) -> AppOpId {
 #[inline]
 fn completion_entry_from_descriptor(
     descriptor: AppCqeDescriptor,
-    buffers: &Rc<RefCell<AppRingBufferRegistry>>,
+    ring: &AppRingHandle,
 ) -> AppCompletionEntry {
-    match descriptor.payload() {
-        AppCqeData::Recv { buffer } => {
-            let lease = buffers
-                .borrow_mut()
-                .take(buffer)
-                .expect("registered recv lease for completion entry");
-            AppCompletionEntry::with_attachment(
-                descriptor,
-                AppRegisteredBuffer {
-                    index: buffer,
-                    lease,
-                },
-            )
-        }
-        _ => AppCompletionEntry::new(descriptor),
-    }
+    let _ = ring;
+    AppCompletionEntry::new(descriptor)
 }
 
 impl AppSend {
     #[inline]
-    pub fn new(lease: AppBufferLease) -> Self {
-        Self { lease }
+    pub fn from_data(ring: AppRingHandle, data: AppDataAddr) -> Self {
+        Self {
+            payload: Some(AppSendPayload::Data { data, ring }),
+        }
     }
 
     #[inline]
-    pub fn lease(&self) -> &AppBufferLease {
-        &self.lease
+    pub fn data(&self) -> Option<AppDataAddr> {
+        match self.payload.as_ref().expect("app send released") {
+            AppSendPayload::Data { data, .. } => Some(*data),
+        }
     }
 
     #[inline]
-    pub fn into_lease(self) -> AppBufferLease {
-        self.lease
+    pub fn copy_current(&self) -> HammerResult<std::vec::Vec<u8>> {
+        match self.payload.as_ref().expect("app send released") {
+            AppSendPayload::Data { data, ring } => ring.read_data(*data),
+        }
     }
 
     #[inline]
-    pub fn release(self) {
-        self.lease.release();
+    pub fn into_data_addr(self) -> HammerResult<AppDataAddr> {
+        let mut this = self;
+        match this.payload.take().expect("app send released") {
+            AppSendPayload::Data { data, .. } => Ok(data),
+        }
     }
 
+    #[inline]
+    pub(crate) fn into_transfer_data(self) -> HammerResult<AppSendData> {
+        let mut this = self;
+        match this.payload.take().expect("app send released") {
+            AppSendPayload::Data { data, ring } => Ok(ring.send_data_from_addr(data)),
+        }
+    }
+
+    #[inline]
+    pub fn release(mut self) {
+        match self.payload.take() {
+            Some(AppSendPayload::Data { data, ring }) => {
+                let _ = ring.release_data(data);
+            }
+            None => {}
+        }
+    }
+}
+
+impl AppSendData {
+    #[inline]
+    fn data(&self) -> HammerResult<AppDataAddr> {
+        self.data
+            .ok_or_else(|| HammerError::internal("app send data released"))
+    }
+
+    #[inline]
+    fn data_area(&self) -> &AppDataArea {
+        &self.data_area
+    }
+
+    #[inline]
+    pub fn release(mut self) {
+        if let Some(data) = self.data.take() {
+            let _ = self.data_area.release(data);
+            let _ = self.free_chunks.enqueue_sp(data.chunk());
+        }
+    }
+}
+
+impl AppSend {
     #[inline]
     pub fn descriptor(
         &self,
         user_data: Option<AppUserData>,
         op: AppOpId,
     ) -> HammerResult<AppSqeDescriptor> {
+        let Some(data) = self.data() else {
+            return Err(HammerError::internal(
+                "send descriptor requires app data address",
+            ));
+        };
         Ok(AppSqeDescriptor::new(
             AppOpcode::Send,
             user_data,
             AppObjectRef::Operation(op),
-            AppSqeData::Send {
-                buffer: self.lease.index(),
-            },
+            AppSqeData::Send { data },
         ))
     }
 }

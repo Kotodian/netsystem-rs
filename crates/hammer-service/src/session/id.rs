@@ -16,11 +16,6 @@ impl SessionId {
     }
 
     #[inline(always)]
-    pub const fn from_pool_index(index: PoolIndex) -> Self {
-        Self(index)
-    }
-
-    #[inline(always)]
     pub const fn pool_index(self) -> PoolIndex {
         self.0
     }
@@ -28,5 +23,12 @@ impl SessionId {
     #[inline(always)]
     pub const fn get(self) -> u64 {
         ((self.0.generation() as u64) << 32) | self.0.slot() as u64
+    }
+}
+
+impl From<PoolIndex> for SessionId {
+    #[inline(always)]
+    fn from(index: PoolIndex) -> Self {
+        Self(index)
     }
 }

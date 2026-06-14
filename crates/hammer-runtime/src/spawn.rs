@@ -1233,7 +1233,14 @@ fn poll_data_worker_once(
         return false;
     }
 
-    let mut progressed = false;
+    let mut progressed =
+        match with_data_plane_runtime(|runtime| runtime.schedule_polling_driver_nodes()) {
+            Ok(scheduled) => scheduled > 0,
+            Err(err) => {
+                tracing::debug!("data plane polling driver scheduler failed: {err}");
+                false
+            }
+        };
     progressed |= poll_remote_local_tasks(remote_local);
     progressed |= poll_data_plane_nodes(&mut cx);
     progressed |= poll_data_local_tasks(&mut cx);
@@ -1702,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn data_worker_schedules_polling_driver_after_worker_local_progress() {
+    fn data_worker_busy_loops_polling_driver_from_worker_loop() {
         let _guard = test_lock();
         POLLING_DRIVER_CALLS.store(0, Ordering::SeqCst);
         let data_runtime =
@@ -1721,21 +1728,21 @@ mod tests {
             })
             .expect("register polling driver on worker");
 
-        context
-            .spawn_local_on_worker(0, || async {})
-            .expect("schedule worker-local progress");
-
         let deadline = StdInstant::now() + Duration::from_secs(1);
         while StdInstant::now() < deadline {
-            if POLLING_DRIVER_CALLS.load(Ordering::SeqCst) > 0 {
+            if POLLING_DRIVER_CALLS.load(Ordering::SeqCst) >= 3 {
                 data_runtime.shutdown_timeout(Duration::from_secs(1));
                 return;
             }
             thread::sleep(Duration::from_millis(5));
         }
 
+        let calls = POLLING_DRIVER_CALLS.load(Ordering::SeqCst);
         data_runtime.shutdown_timeout(Duration::from_secs(1));
-        assert_eq!(POLLING_DRIVER_CALLS.load(Ordering::SeqCst), 1);
+        assert!(
+            calls >= 3,
+            "polling driver should keep running in the data worker loop; calls={calls}"
+        );
     }
 
     #[test]

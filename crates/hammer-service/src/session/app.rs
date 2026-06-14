@@ -1,11 +1,12 @@
 use hammer_core::error::CoreResult;
 use hammer_infra::map::FlatHashTable;
 use hammer_runtime::app::{
-    AppCqe, AppObjectRef, AppOpId, AppOpcode, AppRecv, AppRingHandle, AppSend, AppSqeDescriptor,
-    AppSqeData,
+    AppCqe, AppObjectRef, AppOpId, AppOpcode, AppRingHandle, AppSend, AppSqeData, AppSqeDescriptor,
 };
 
 use crate::session::SessionId;
+
+const UNBOUND_SESSION: SessionId = SessionId::new(u64::MAX);
 
 #[derive(Debug)]
 pub struct SessionAppSendSubmission {
@@ -20,16 +21,9 @@ pub struct SessionAppCloseSubmission {
     pub op: AppOpId,
 }
 
-#[derive(Debug, Clone)]
-struct AppRingBinding {
-    op: AppOpId,
-    ring: AppRingHandle,
-}
-
 #[derive(Debug)]
 pub struct SessionAppRuntime {
-    bindings: hammer_infra::vec::Vec<AppRingBinding>,
-    binding_slots: FlatHashTable<u64, usize>,
+    ring: Option<AppRingHandle>,
     session_slots: FlatHashTable<u64, SessionId>,
     drained_sends: hammer_infra::vec::Vec<SessionAppSendSubmission>,
     drained_closes: hammer_infra::vec::Vec<SessionAppCloseSubmission>,
@@ -39,8 +33,7 @@ impl SessionAppRuntime {
     #[inline]
     pub fn new() -> Self {
         Self {
-            bindings: hammer_infra::vec::Vec::new(),
-            binding_slots: FlatHashTable::new(),
+            ring: None,
             session_slots: FlatHashTable::new(),
             drained_sends: hammer_infra::vec::Vec::new(),
             drained_closes: hammer_infra::vec::Vec::new(),
@@ -49,43 +42,42 @@ impl SessionAppRuntime {
 
     #[inline]
     pub fn bind_ring(&mut self, session_id: SessionId, op: AppOpId, ring: AppRingHandle) {
-        if let Some(slot) = self.binding_slots.lookup(&op.value()) {
-            self.bindings[slot] = AppRingBinding { op, ring };
-            self.session_slots.insert(op.value(), session_id);
-            return;
-        }
-        let slot = self.bindings.len();
-        self.bindings.push(AppRingBinding { op, ring });
-        self.binding_slots.insert(op.value(), slot);
+        self.ring.get_or_insert(ring);
         self.session_slots.insert(op.value(), session_id);
     }
 
     #[inline]
     pub fn unbind_ring(&mut self, op: AppOpId) -> Option<AppRingHandle> {
-        let slot = self.binding_slots.lookup(&op.value())?;
-        let removed = swap_remove_binding(&mut self.bindings, slot)?;
-        self.rebuild_indexes();
-        Some(removed.ring)
+        self.session_slots.lookup(&op.value())?;
+        self.session_slots.insert(op.value(), UNBOUND_SESSION);
+        self.ring.clone()
     }
 
     #[inline]
-    pub fn complete_recv(&self, op: AppOpId, recv: AppRecv, fin: bool) -> CoreResult<()> {
-        let Some(ring) = self.ring_for_op(op) else {
+    pub fn complete_recv(
+        &self,
+        op: AppOpId,
+        buffers: hammer_adapter::DataPlaneBuffers,
+        index: hammer_adapter::BufferIndex,
+        fin: bool,
+    ) -> CoreResult<()> {
+        let Some(ring) = self.ring.as_ref() else {
+            buffers.free_index(index);
             return Ok(());
         };
-        ring.try_push_completion(AppCqe::recv(None, op, recv, fin))
+        ring.try_complete_recv_buffer(op, buffers, index, fin)
     }
 
     #[inline]
     pub fn complete_closed(&self, op: AppOpId) -> CoreResult<()> {
-        let Some(ring) = self.ring_for_op(op) else {
+        let Some(ring) = self.ring.as_ref() else {
             return Ok(());
         };
         ring.try_push_completion(AppCqe::closed(None, Some(op)))
     }
 
-    pub fn drain_submissions_for_op(&mut self, op: AppOpId) -> CoreResult<()> {
-        let Some(ring) = self.ring_for_op(op).cloned() else {
+    pub fn drain_submissions(&mut self) -> CoreResult<()> {
+        let Some(ring) = self.ring.clone() else {
             return Ok(());
         };
         while let Some(descriptor) = ring.pop_submission_descriptor() {
@@ -104,29 +96,21 @@ impl SessionAppRuntime {
         self.drained_closes.drain(..).collect()
     }
 
-    #[inline]
-    fn ring_for_op(&self, op: AppOpId) -> Option<&AppRingHandle> {
-        let slot = self.binding_slots.lookup(&op.value())?;
-        let binding = self.bindings.get(slot)?;
-        debug_assert_eq!(binding.op, op);
-        Some(&binding.ring)
-    }
-
-    fn handle_submission_descriptor(
-        &mut self,
-        descriptor: AppSqeDescriptor,
-    ) -> CoreResult<()> {
+    fn handle_submission_descriptor(&mut self, descriptor: AppSqeDescriptor) -> CoreResult<()> {
         match descriptor.opcode() {
             AppOpcode::Send => {
-                if let AppSqeData::Send { buffer } = descriptor.payload() {
+                if let AppSqeData::Send { data } = descriptor.payload() {
                     let op = app_op_from_descriptor(descriptor);
                     let Some(session_id) = self.session_for_op(op) else {
                         return Ok(());
                     };
-                    if let Some(ring) = self.ring_for_op(op).cloned() {
-                        let send = ring.take_send_buffer(buffer)?;
-                        self.drained_sends
-                            .push(SessionAppSendSubmission { session_id, op, send });
+                    if let Some(ring) = self.ring.clone() {
+                        let send = ring.send_from_data(data);
+                        self.drained_sends.push(SessionAppSendSubmission {
+                            session_id,
+                            op,
+                            send,
+                        });
                     }
                 }
             }
@@ -144,21 +128,9 @@ impl SessionAppRuntime {
 
     #[inline]
     fn session_for_op(&self, op: AppOpId) -> Option<SessionId> {
-        self.session_slots.lookup(&op.value())
-    }
-
-    fn rebuild_indexes(&mut self) {
-        let old_session_slots = std::mem::replace(
-            &mut self.session_slots,
-            FlatHashTable::with_capacity(self.bindings.len().max(1) * 2),
-        );
-        self.binding_slots = FlatHashTable::with_capacity(self.bindings.len().max(1) * 2);
-        for (slot, binding) in self.bindings.iter().enumerate() {
-            self.binding_slots.insert(binding.op.value(), slot);
-            if let Some(session_id) = old_session_slots.lookup(&binding.op.value()) {
-                self.session_slots.insert(binding.op.value(), session_id);
-            }
-        }
+        self.session_slots
+            .lookup(&op.value())
+            .filter(|session_id| *session_id != UNBOUND_SESSION)
     }
 }
 
@@ -175,20 +147,4 @@ fn app_op_from_descriptor(descriptor: AppSqeDescriptor) -> AppOpId {
         AppObjectRef::Operation(op) => op,
         other => panic!("session app submission expects operation object, got {other:?}"),
     }
-}
-
-#[inline]
-fn swap_remove_binding(
-    bindings: &mut hammer_infra::vec::Vec<AppRingBinding>,
-    slot: usize,
-) -> Option<AppRingBinding> {
-    if slot >= bindings.len() {
-        return None;
-    }
-    let last = bindings.pop()?;
-    if slot == bindings.len() {
-        return Some(last);
-    }
-    let removed = std::mem::replace(&mut bindings[slot], last);
-    Some(removed)
 }
