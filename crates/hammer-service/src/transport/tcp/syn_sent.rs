@@ -3,12 +3,13 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSeq, TcpState};
+use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpState};
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
+use super::output::{tcp_output_acknowledgment, tcp_output_sequence};
+use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -102,7 +103,7 @@ fn tcp_syn_sent_index(
     let mut remove_session = None;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
         let session_id = queue
-            .session_id_by_tuple(packet.local, packet.remote)
+            .pending_id_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
         let connection = queue
             .session_state_mut(session_id)
@@ -135,16 +136,26 @@ fn tcp_syn_sent_index(
             connection.rcv_wnd(),
         );
         connection.set_state(TcpState::Established);
-        let (allocated, _, _) = alloc_tcp_segment_for_connection(
+        let flags = TcpSegmentFlags::ACK;
+        let flags_bits = flags.bits();
+        let allocated = alloc_tcp_segment(
             runtime.packet_buffers(),
-            connection,
-            packet.local,
-            TcpSegmentFlags::ACK,
-            0,
+            tcp_segment_metadata(packet.local, connection.remote()),
+            TcpSegmentHeader {
+                source_port: packet.local.port(),
+                destination_port: connection.remote().port(),
+                sequence_number: tcp_output_sequence(connection, flags_bits),
+                acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
+                flags,
+                advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
+                capabilities: connection.local_capabilities(),
+            },
         )?;
         output_index = Some(allocated);
         let indexed = connection.clone();
+        queue.remove_pending_index(session_id);
         queue.index_session(session_id, &indexed);
+        queue.complete_connected(session_id)?;
         Ok(())
     });
     if let Err(error) = result {
@@ -155,6 +166,7 @@ fn tcp_syn_sent_index(
     }
     if let Some(session_id) = remove_session {
         let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
+            queue.remove_pending_index(session_id);
             queue.close_session(session_id)?;
             Ok(())
         });
@@ -292,6 +304,13 @@ mod tests {
         )
         .expect("session queue");
         let session_id = insert_syn_sent_session(handle);
+        let app_ring = AppRingHandle::new(4, 4);
+        let app_op = AppOpId::new(8_000);
+        TcpSessionProtocol::with_queue(handle, |queue| {
+            assert!(queue.bind_session_app_ring(session_id, app_op, app_ring.clone()));
+            Ok(())
+        })
+        .expect("bind app ring");
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
         let output = runtime
             .nodes()
@@ -335,13 +354,23 @@ mod tests {
             assert_eq!(session.state(), TcpState::Established);
             assert_eq!(session.snd_una(), CLIENT_ISN + 1);
             assert_eq!(session.rcv_nxt(), SERVER_ISN + 1);
+            assert_eq!(
+                queue.session_id_by_tuple(local_addr(), remote_addr()),
+                Some(session_id)
+            );
+            assert_eq!(queue.pending_id_by_tuple(local_addr(), remote_addr()), None);
             Ok(())
         })
         .expect("inspect session");
+        let completion = app_ring.pop_completion().expect("connected completion");
+        match completion.kind() {
+            AppCqeKind::Connected { op } => assert_eq!(*op, app_op),
+            other => panic!("expected connected completion, got {other:?}"),
+        }
     }
 
     #[test]
-    fn rst_closes_half_open_session() {
+    fn rst_closes_pending_syn_sent_session() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let handle = TcpSessionProtocol::register_queue(
             DataWorkerId::new(0),
@@ -393,6 +422,11 @@ mod tests {
                     .session_id_by_tuple(local_addr(), remote_addr())
                     .is_none()
             );
+            assert!(
+                queue
+                    .pending_id_by_tuple(local_addr(), remote_addr())
+                    .is_none()
+            );
             Ok(())
         })
         .expect("inspect queue");
@@ -427,7 +461,7 @@ mod tests {
                 .session_state(session_id)
                 .expect("inserted session")
                 .clone();
-            queue.index_session(session_id, &indexed);
+            queue.index_pending(session_id, &indexed);
             Ok(session_id)
         })
         .expect("insert syn-sent session")

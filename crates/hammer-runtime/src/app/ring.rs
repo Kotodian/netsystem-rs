@@ -89,6 +89,7 @@ impl AppCqeFlags {
 pub enum AppCqeData {
     None,
     Recv { data: AppDataAddr },
+    Connected,
     Closed,
 }
 
@@ -230,6 +231,9 @@ pub enum AppCqeKind {
         recv: AppRecv,
         fin: bool,
     },
+    Connected {
+        op: AppOpId,
+    },
     Closed {
         op: Option<AppOpId>,
     },
@@ -240,6 +244,7 @@ impl AppCqeKind {
     pub const fn opcode(&self) -> AppOpcode {
         match self {
             Self::Recv { .. } => AppOpcode::Recv,
+            Self::Connected { .. } => AppOpcode::Nop,
             Self::Closed { .. } => AppOpcode::Close,
         }
     }
@@ -267,6 +272,11 @@ impl AppCqe {
     #[inline]
     pub fn recv(user_data: Option<AppUserData>, op: AppOpId, recv: AppRecv, fin: bool) -> Self {
         Self::new(user_data, AppCqeKind::Recv { op, recv, fin })
+    }
+
+    #[inline]
+    pub const fn connected(user_data: Option<AppUserData>, op: AppOpId) -> Self {
+        Self::new(user_data, AppCqeKind::Connected { op })
     }
 
     #[inline]
@@ -307,7 +317,7 @@ impl AppCqe {
 
     #[inline]
     pub fn into_descriptor(self) -> HammerResult<Option<AppCqeDescriptor>> {
-        Ok(Some(cqe_into_descriptor(self)))
+        Ok(Some(self.into()))
     }
 
     #[inline]
@@ -701,7 +711,7 @@ impl AppRingHandle {
 
     #[inline]
     pub fn try_push_completion(&self, cqe: AppCqe) -> HammerResult<()> {
-        let descriptor = cqe_into_descriptor(cqe);
+        let descriptor = AppCqeDescriptor::from(cqe);
         if let Err(err) = self.try_push_completion_descriptor(descriptor) {
             if let AppCqeData::Recv { data } = descriptor.payload() {
                 let _ = self.release_data(data);
@@ -714,7 +724,7 @@ impl AppRingHandle {
     #[inline]
     pub fn pop_completion(&self) -> Option<AppCqe> {
         let descriptor = self.completions.dequeue_sc()?;
-        Some(cqe_from_descriptor(descriptor, self))
+        Some(AppCqe::from((descriptor, self.clone())))
     }
 
     #[inline]
@@ -726,7 +736,7 @@ impl AppRingHandle {
     #[inline]
     pub async fn next_completion(&self) -> Option<AppCqe> {
         let descriptor = poll_fn(|cx| self.poll_next_completion_descriptor(cx)).await?;
-        Some(cqe_from_descriptor(descriptor, self))
+        Some(AppCqe::from((descriptor, self.clone())))
     }
 
     #[inline]
@@ -858,7 +868,7 @@ impl AppRingHandle {
             Poll::Ready(None) => return Poll::Ready(None),
             Poll::Pending => return Poll::Pending,
         };
-        Poll::Ready(Some(cqe_from_descriptor(descriptor, self)))
+        Poll::Ready(Some(AppCqe::from((descriptor, self.clone()))))
     }
 
     #[inline]
@@ -883,7 +893,7 @@ impl AppRingHandle {
     pub fn take_test_completions(&self, max: usize) -> Vec<AppCqe> {
         drain_completion_descriptors(self, max)
             .into_iter()
-            .map(|descriptor| cqe_from_descriptor(descriptor, self))
+            .map(|descriptor| AppCqe::from((descriptor, self.clone())))
             .collect()
     }
 
@@ -1058,53 +1068,68 @@ fn submission_entry_from_descriptor(
     AppSubmissionEntry::new(descriptor)
 }
 
-#[inline]
-fn cqe_into_descriptor(cqe: AppCqe) -> AppCqeDescriptor {
-    let user_data = cqe.user_data();
-    match cqe.inner.kind {
-        AppCqeKind::Recv { op, recv, fin } => {
-            let data = recv.into_data_addr();
-            AppCqeDescriptor::new(
+impl From<AppCqe> for AppCqeDescriptor {
+    fn from(cqe: AppCqe) -> Self {
+        let user_data = cqe.user_data();
+        match cqe.inner.kind {
+            AppCqeKind::Recv { op, recv, fin } => {
+                let data = recv.into_data_addr();
+                AppCqeDescriptor::new(
+                    user_data,
+                    data.len() as i32,
+                    if fin {
+                        AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
+                    } else {
+                        AppCqeFlags::BUFFER
+                    },
+                    AppObjectRef::Operation(op),
+                    AppCqeData::Recv { data },
+                )
+            }
+            AppCqeKind::Connected { op } => AppCqeDescriptor::new(
                 user_data,
-                data.len() as i32,
-                if fin {
-                    AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
-                } else {
-                    AppCqeFlags::BUFFER
-                },
+                0,
+                AppCqeFlags::NONE,
                 AppObjectRef::Operation(op),
-                AppCqeData::Recv { data },
-            )
+                AppCqeData::Connected,
+            ),
+            AppCqeKind::Closed { op } => AppCqeDescriptor::new(
+                user_data,
+                0,
+                AppCqeFlags::NONE,
+                op.map_or(AppObjectRef::None, AppObjectRef::Operation),
+                AppCqeData::Closed,
+            ),
         }
-        AppCqeKind::Closed { op } => AppCqeDescriptor::new(
-            user_data,
-            0,
-            AppCqeFlags::NONE,
-            op.map_or(AppObjectRef::None, AppObjectRef::Operation),
-            AppCqeData::Closed,
-        ),
     }
 }
 
-#[inline]
-fn cqe_from_descriptor(descriptor: AppCqeDescriptor, ring: &AppRingHandle) -> AppCqe {
-    match descriptor.payload() {
-        AppCqeData::None => AppCqe::new(descriptor.user_data(), AppCqeKind::Closed { op: None }),
-        AppCqeData::Recv { data } => AppCqe::recv(
-            descriptor.user_data(),
-            op_from_completion_descriptor(descriptor),
-            AppRecv::new(ring.clone(), data),
-            descriptor.flags().contains(AppCqeFlags::FIN),
-        ),
-        AppCqeData::Closed => AppCqe::new(
-            descriptor.user_data(),
-            AppCqeKind::Closed {
-                op: match descriptor.object() {
-                    AppObjectRef::Operation(op) => Some(op),
-                    AppObjectRef::None => None,
+impl From<(AppCqeDescriptor, AppRingHandle)> for AppCqe {
+    fn from((descriptor, ring): (AppCqeDescriptor, AppRingHandle)) -> Self {
+        match descriptor.payload() {
+            AppCqeData::None => {
+                AppCqe::new(descriptor.user_data(), AppCqeKind::Closed { op: None })
+            }
+            AppCqeData::Recv { data } => AppCqe::recv(
+                descriptor.user_data(),
+                op_from_completion_descriptor(descriptor),
+                AppRecv::new(ring, data),
+                descriptor.flags().contains(AppCqeFlags::FIN),
+            ),
+            AppCqeData::Connected => AppCqe::connected(
+                descriptor.user_data(),
+                op_from_completion_descriptor(descriptor),
+            ),
+            AppCqeData::Closed => AppCqe::new(
+                descriptor.user_data(),
+                AppCqeKind::Closed {
+                    op: match descriptor.object() {
+                        AppObjectRef::Operation(op) => Some(op),
+                        AppObjectRef::None => None,
+                    },
                 },
-            },
-        ),
+            ),
+        }
     }
 }
 

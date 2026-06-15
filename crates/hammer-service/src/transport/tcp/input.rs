@@ -495,7 +495,10 @@ fn session_input_entry(
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
     TcpSessionProtocol::with_queue(handle, |runtime| {
-        let Some(session_id) = runtime.session_id_by_tuple(local, remote) else {
+        let session_id = runtime
+            .session_id_by_tuple(local, remote)
+            .or_else(|| runtime.pending_id_by_tuple(local, remote));
+        let Some(session_id) = session_id else {
             return Ok(None);
         };
         let Some(connection) = runtime.session_state(session_id) else {
@@ -630,6 +633,42 @@ mod tests {
                 next: TcpInputNext::Established,
             }
         );
+    }
+
+    #[test]
+    fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let worker = DataWorkerId::new(0);
+        let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+            .expect("register tcp queue");
+        let local_port = 50_077;
+        let local = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
+            local_port,
+        );
+        let remote = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
+            443,
+        );
+        let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("connect");
+
+        let entry = session_input_entry(Some(handle), &parsed_input(local_port))
+            .expect("session lookup")
+            .expect("pending tcp session");
+
+        assert_eq!(
+            entry,
+            TcpSessionInputEntry {
+                owner: worker,
+                next: TcpInputNext::SynSent,
+            }
+        );
+        TcpSessionProtocol::with_queue(handle, |queue| {
+            assert_eq!(queue.session_id_by_tuple(local, remote), None);
+            assert_eq!(queue.pending_id_by_tuple(local, remote), Some(session_id));
+            Ok(())
+        })
+        .expect("inspect pending session");
     }
 
     #[test]

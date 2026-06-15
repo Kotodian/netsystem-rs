@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use hammer_infra::align::CACHE_LINE;
 use hammer_runtime::app::{
-    AppCompletionEntry, AppContext, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppDataAddr,
-    AppDataArea, AppDataAreaConfig, AppObjectRef, AppOpId, AppOpcode, AppRingHandle,
+    AppCompletionEntry, AppContext, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppCqeKind,
+    AppDataAddr, AppDataArea, AppDataAreaConfig, AppObjectRef, AppOpId, AppOpcode, AppRingHandle,
     AppRingMemoryKind, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
 };
 use hammer_runtime::spawn::{DataRuntime, with_data_plane_buffers};
@@ -622,6 +622,38 @@ fn app_ring_descriptor_and_object_apis_share_one_underlying_queue() {
 
     assert_eq!(submission_descriptor, send_descriptor);
     assert_eq!(completion_descriptor, recv_descriptor);
+}
+
+#[test]
+fn app_ring_connected_completion_round_trips_descriptor() {
+    let ring = AppRingHandle::new(4, 4);
+    let op = AppOpId::new(9_001);
+
+    ring.push_test_completion(AppCqe::connected(Some(AppUserData::new(44)), op))
+        .expect("push connected completion");
+
+    let completion = ring.pop_completion().expect("connected completion");
+    assert_eq!(completion.user_data(), Some(AppUserData::new(44)));
+    assert_eq!(completion.opcode(), AppOpcode::Nop);
+    match completion.kind() {
+        AppCqeKind::Connected { op: completed_op } => assert_eq!(*completed_op, op),
+        other => panic!("expected connected completion, got {other:?}"),
+    }
+
+    let descriptor = AppCqe::connected(None, op)
+        .descriptor()
+        .expect("connected descriptor")
+        .expect("connected descriptor present");
+    assert_eq!(descriptor.result(), 0);
+    assert_eq!(descriptor.flags(), AppCqeFlags::NONE);
+    assert_eq!(descriptor.object(), AppObjectRef::Operation(op));
+    assert_eq!(descriptor.payload(), AppCqeData::Connected);
+
+    let round_trip = AppCqe::from((descriptor, ring.clone()));
+    match round_trip.kind() {
+        AppCqeKind::Connected { op: completed_op } => assert_eq!(*completed_op, op),
+        other => panic!("expected connected round trip, got {other:?}"),
+    }
 }
 
 #[test]

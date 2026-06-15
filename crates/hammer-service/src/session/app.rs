@@ -76,6 +76,14 @@ impl SessionAppRuntime {
         ring.try_push_completion(AppCqe::closed(None, Some(op)))
     }
 
+    #[inline]
+    pub fn complete_connected(&self, op: AppOpId) -> CoreResult<()> {
+        let Some(ring) = self.ring.as_ref() else {
+            return Ok(());
+        };
+        ring.try_push_completion(AppCqe::connected(None, op))
+    }
+
     pub fn drain_submissions(&mut self) -> CoreResult<()> {
         let Some(ring) = self.ring.clone() else {
             return Ok(());

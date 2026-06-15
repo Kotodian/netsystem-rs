@@ -47,7 +47,7 @@ pub use reply::{
 };
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use session::TcpSessionProtocol;
-pub use session_index::TcpSessionConnectionIndex;
+pub use session_index::{TcpPendingIndex, TcpSessionConnectionIndex};
 pub use state::{
     TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionConfigState, TcpInputFlags,
 };

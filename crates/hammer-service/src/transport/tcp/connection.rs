@@ -561,17 +561,6 @@ impl TcpConnectionState {
     }
 
     #[inline]
-    pub fn initialize_passive_open(&mut self, iss: u32, peer_sequence: u32, peer_window: u16) {
-        self.iss = iss;
-        self.irs = peer_sequence;
-        self.snd_una = iss;
-        self.snd_nxt = TcpSeq::new(iss).advance(1).raw();
-        self.snd_wnd = self.effective_send_window(u32::from(peer_window));
-        self.rcv_nxt = TcpSeq::new(peer_sequence).advance(1).raw();
-        self.state = TcpState::SynRcvd;
-    }
-
-    #[inline]
     pub fn accepts_ack(&self, acknowledgment: u32) -> bool {
         !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.snd_una))
             && !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))

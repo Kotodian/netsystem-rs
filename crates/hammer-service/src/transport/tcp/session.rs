@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId};
-use hammer_core::error::CoreResult;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
     TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpState,
 };
@@ -13,7 +13,9 @@ use hammer_core::protocol::tcp::{
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
 use super::segment::alloc_tcp_segment;
-use super::{TcpConnectionState, TcpConnectionTimerKind, TcpSessionConnectionIndex};
+use super::{
+    TcpConnectionState, TcpConnectionTimerKind, TcpPendingIndex, TcpSessionConnectionIndex,
+};
 use crate::session::node::{
     SessionQueueDispatchFn, SessionQueueHandle, SessionQueueNext, SessionQueueOutput,
     register_session_queue, with_session_queue,
@@ -100,6 +102,7 @@ impl TcpSessionQueue {
         self.driver.session_state_mut(session_id)
     }
 
+    #[inline]
     pub(crate) fn close_session(
         &mut self,
         session_id: SessionId,
@@ -139,12 +142,31 @@ impl TcpSessionQueue {
     }
 
     #[inline]
+    pub(crate) fn index_pending(&mut self, id: SessionId, connection: &TcpConnectionState) {
+        self.protocol.index_pending(id, connection);
+    }
+
+    #[inline]
+    pub(crate) fn remove_pending_index(&mut self, session_id: SessionId) {
+        self.protocol.remove_pending_index(session_id);
+    }
+
+    #[inline]
     pub(crate) fn session_id_by_tuple(
         &self,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<SessionId> {
         self.protocol.session_id_by_tuple(local, remote)
+    }
+
+    #[inline]
+    pub(crate) fn pending_id_by_tuple(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<SessionId> {
+        self.protocol.pending_id_by_tuple(local, remote)
     }
 
     #[inline]
@@ -180,6 +202,53 @@ impl TcpSessionQueue {
         fin: bool,
     ) -> CoreResult<bool> {
         self.driver.enqueue_rx(session_id, index, fin)
+    }
+
+    pub(crate) fn complete_connected(&mut self, session_id: SessionId) -> CoreResult<()> {
+        let Some(op) = self
+            .driver
+            .session(session_id)
+            .and_then(|entry| entry.app_op())
+        else {
+            return Ok(());
+        };
+        self.driver.app().complete_connected(op)
+    }
+
+    pub(crate) fn connect(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> CoreResult<SessionId> {
+        let iss = self.protocol.next_initial_sequence(local, remote);
+        let mut connection = TcpConnectionState::new(
+            None,
+            self.worker(),
+            TcpState::SynSent,
+            local.port(),
+            Some(local),
+            remote,
+        );
+        connection.set_sequence_state(
+            iss,
+            0,
+            iss,
+            TcpSeq::new(iss).advance(1).raw(),
+            connection.snd_wnd(),
+            0,
+            connection.rcv_wnd(),
+        );
+        connection.set_state(TcpState::SynSent);
+
+        let session_id = self.insert_session(connection);
+        let indexed = self
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?
+            .clone();
+        self.index_pending(session_id, &indexed);
+        self.arm_retransmit_timer(session_id, TCP_ACTIVE_OPEN_TIMER_TICKS)?;
+        self.mark_session_ready(session_id);
+        Ok(session_id)
     }
 
     #[cfg(test)]
@@ -228,10 +297,10 @@ impl SessionQueueProtocol<TcpConnectionState> for TcpSessionProtocol {
         driver: &mut SessionDriverRuntime<TcpConnectionState>,
         expiry: SessionTimerExpiry,
     ) -> CoreResult<()> {
-        if expiry.token() == TcpSessionProtocol::RETRANSMIT_TIMER_TOKEN
-            && let Some(connection) = driver.session_state_mut(expiry.session_id())
-        {
-            connection.tcp_timer_expire(TcpConnectionTimerKind::Retransmit);
+        if expiry.token() == TcpSessionProtocol::RETRANSMIT_TIMER_TOKEN {
+            if let Some(connection) = driver.session_state_mut(expiry.session_id()) {
+                connection.tcp_timer_expire(TcpConnectionTimerKind::Retransmit);
+            }
         }
         driver.mark_ready(expiry.session_id());
         Ok(())
@@ -323,6 +392,8 @@ impl SessionQueueProtocol<TcpConnectionState> for TcpSessionProtocol {
 pub struct TcpSessionProtocol {
     worker: DataWorkerId,
     index: TcpSessionConnectionIndex,
+    pending_index: TcpPendingIndex,
+    next_iss: u32,
 }
 
 impl TcpSessionProtocol {
@@ -333,6 +404,8 @@ impl TcpSessionProtocol {
         Self {
             worker,
             index: TcpSessionConnectionIndex::empty(),
+            pending_index: TcpPendingIndex::empty(),
+            next_iss: 81_000,
         }
     }
 
@@ -357,8 +430,18 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
+    pub fn index_pending(&mut self, id: SessionId, connection: &TcpConnectionState) {
+        self.pending_index.upsert(id, connection);
+    }
+
+    #[inline]
     pub fn session_id_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
         self.index.lookup_by_tuple(local, remote)
+    }
+
+    #[inline]
+    pub fn pending_id_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
+        self.pending_index.lookup_by_tuple(local, remote)
     }
 
     #[inline]
@@ -369,6 +452,29 @@ impl TcpSessionProtocol {
     #[inline]
     pub fn remove_session_index(&mut self, session_id: SessionId) {
         self.index.remove_session(session_id);
+    }
+
+    #[inline]
+    pub fn remove_pending_index(&mut self, id: SessionId) {
+        self.pending_index.remove(id);
+    }
+
+    pub fn next_initial_sequence(&mut self, local: SocketAddr, remote: SocketAddr) -> u32 {
+        let mut value = self.next_iss;
+        value ^= u32::from(local.port()) << 16 | u32::from(remote.port());
+        value ^= match (local.ip(), remote.ip()) {
+            (std::net::IpAddr::V4(local), std::net::IpAddr::V4(remote)) => {
+                u32::from(local) ^ u32::from(remote).rotate_left(13)
+            }
+            (std::net::IpAddr::V6(local), std::net::IpAddr::V6(remote)) => {
+                let local = u128::from(local);
+                let remote = u128::from(remote);
+                (local as u32) ^ ((local >> 64) as u32) ^ (remote as u32).rotate_left(7)
+            }
+            _ => 0x9e37_79b9,
+        };
+        self.next_iss = self.next_iss.wrapping_add(64_099);
+        value.max(1)
     }
 
     #[inline]
@@ -425,6 +531,15 @@ impl TcpSessionProtocol {
         buffers: DataPlaneBuffers,
     ) -> CoreResult<SessionQueueHandle> {
         register_session_queue(&TCP_SESSION_QUEUES, TcpSessionQueue::new(worker, buffers))
+    }
+
+    #[inline]
+    pub fn connect(
+        handle: SessionQueueHandle,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> CoreResult<SessionId> {
+        Self::with_queue(handle, |queue| queue.connect(local, remote))
     }
 
     #[inline]
@@ -625,13 +740,11 @@ mod tests {
         connection: TcpConnectionState,
     ) -> CoreResult<SessionId> {
         let session_id = queue.insert_session(connection);
-        let connection_id = TcpConnectionId::new(session_id.get());
-        let connection = queue
-            .session_state_mut(session_id)
-            .expect("inserted connecting session");
-        connection.set_connection_id(connection_id);
-        let indexed = connection.clone();
-        queue.index_session(session_id, &indexed);
+        let indexed = queue
+            .session_state(session_id)
+            .expect("inserted connecting session")
+            .clone();
+        queue.index_pending(session_id, &indexed);
         queue.arm_retransmit_timer(session_id, TCP_ACTIVE_OPEN_TIMER_TICKS)?;
         queue.mark_session_ready(session_id);
         Ok(session_id)
@@ -662,25 +775,14 @@ mod tests {
             .expect("attach tcp queue");
         let session_queue = runtime.nodes().register_driver(session_node);
 
-        let session_id = TcpSessionProtocol::with_queue(handle, |queue| {
-            install_connecting_session(
-                queue,
-                syn_sent_connection(
-                    worker,
-                    local,
-                    remote,
-                    ACTIVE_OPEN_ISS,
-                    TcpCapabilities {
-                        max_segment_size: Some(1_200),
-                        window_scale: Some(7),
-                        sack: true,
-                        timestamps: false,
-                        ecn: false,
-                    },
-                ),
-            )
+        let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("active open");
+        let active_open_iss = TcpSessionProtocol::with_queue(handle, |queue| {
+            let session = queue
+                .session_state(session_id)
+                .expect("active open session exists before SYN output");
+            Ok(session.iss())
         })
-        .expect("active open");
+        .expect("read active-open iss");
 
         runtime
             .schedule_empty_frame(session_queue)
@@ -693,14 +795,8 @@ mod tests {
             &packets[0],
             local,
             remote,
-            ACTIVE_OPEN_ISS,
-            TcpCapabilities {
-                max_segment_size: Some(1_200),
-                window_scale: Some(7),
-                sack: true,
-                timestamps: false,
-                ecn: false,
-            },
+            active_open_iss,
+            TcpCapabilities::default(),
         );
 
         TcpSessionProtocol::with_queue(handle, |queue| {
@@ -708,11 +804,12 @@ mod tests {
                 .session_state(session_id)
                 .expect("active open session remains installed");
             assert_eq!(session.state(), TcpState::SynSent);
-            assert_eq!(session.snd_una(), ACTIVE_OPEN_ISS);
-            assert_eq!(session.snd_nxt(), ACTIVE_OPEN_ISS + 1);
+            assert_eq!(session.snd_una(), active_open_iss);
+            assert_eq!(session.snd_nxt(), active_open_iss + 1);
             assert_eq!(session.rcv_nxt(), 0);
             assert!(session.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-            assert_eq!(queue.session_id_by_tuple(local, remote), Some(session_id));
+            assert_eq!(queue.session_id_by_tuple(local, remote), None);
+            assert_eq!(queue.pending_id_by_tuple(local, remote), Some(session_id));
             Ok(())
         })
         .expect("inspect active open");

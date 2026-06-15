@@ -3,13 +3,19 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpSegmentFlags, TcpState};
+use hammer_core::protocol::tcp::{
+    TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpState,
+};
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
 use super::connection::TcpConnectionState;
-use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
+use super::output::{
+    tcp_output_acknowledgment, tcp_output_next_sequence, tcp_output_sequence,
+    tcp_output_sequence_len,
+};
+use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
@@ -116,19 +122,40 @@ fn tcp_listen_index(
             packet.remote,
         );
         connection.apply_peer_handshake_capabilities(packet.capabilities);
-        connection.initialize_passive_open(1, packet.sequence, packet.advertised_window);
+        let iss = 1;
+        connection.set_sequence_state(
+            iss,
+            packet.sequence,
+            iss,
+            TcpSeq::new(iss).advance(1).raw(),
+            connection.effective_send_window(u32::from(packet.advertised_window)),
+            TcpSeq::new(packet.sequence).advance(1).raw(),
+            connection.rcv_wnd(),
+        );
+        connection.set_state(TcpState::SynRcvd);
         let session_id = queue.insert_session(connection);
         let connection_id = TcpConnectionId::new(session_id.get());
         let connection = queue
             .session_state_mut(session_id)
             .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?;
         connection.set_connection_id(connection_id);
-        let (allocated, _sequence, next_sequence) = alloc_tcp_segment_for_connection(
+        let flags = TcpSegmentFlags::SYN | TcpSegmentFlags::ACK;
+        let flags_bits = flags.bits();
+        let sequence = tcp_output_sequence(connection, flags_bits);
+        let sequence_len = tcp_output_sequence_len(flags_bits, 0);
+        let next_sequence = tcp_output_next_sequence(sequence, sequence_len);
+        let allocated = alloc_tcp_segment(
             runtime.packet_buffers(),
-            connection,
-            packet.local,
-            TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
-            0,
+            tcp_segment_metadata(packet.local, connection.remote()),
+            TcpSegmentHeader {
+                source_port: packet.local.port(),
+                destination_port: connection.remote().port(),
+                sequence_number: sequence,
+                acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
+                flags,
+                advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
+                capabilities: connection.local_capabilities(),
+            },
         )?;
         connection.set_send_state(connection.snd_una(), next_sequence, connection.snd_wnd());
         output_index = Some(allocated);

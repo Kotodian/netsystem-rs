@@ -3,12 +3,13 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpState};
+use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentHeader, TcpState};
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::segment::{alloc_tcp_segment_for_connection, parse_tcp_packet};
+use super::output::{tcp_output_acknowledgment, tcp_output_sequence};
+use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -134,12 +135,20 @@ fn tcp_rcv_process_index(
             }
             connection.apply_ack(acknowledgment, packet.advertised_window);
             connection.set_state(TcpState::Established);
-            let (allocated, _, _) = alloc_tcp_segment_for_connection(
+            let flags = TcpSegmentFlags::ACK;
+            let flags_bits = flags.bits();
+            let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
-                connection,
-                packet.local,
-                TcpSegmentFlags::ACK,
-                0,
+                tcp_segment_metadata(packet.local, connection.remote()),
+                TcpSegmentHeader {
+                    source_port: packet.local.port(),
+                    destination_port: connection.remote().port(),
+                    sequence_number: tcp_output_sequence(connection, flags_bits),
+                    acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
+                    flags,
+                    advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
+                    capabilities: connection.local_capabilities(),
+                },
             )?;
             output_index = Some(allocated);
             let indexed = connection.clone();
@@ -156,12 +165,21 @@ fn tcp_rcv_process_index(
                     return Err(CoreError::internal("tcp FIN sequence is unacceptable"));
                 }
                 connection.set_state(TcpState::CloseWait);
-                let (allocated, _, _) = alloc_tcp_segment_for_connection(
+                let flags = TcpSegmentFlags::ACK;
+                let flags_bits = flags.bits();
+                let allocated = alloc_tcp_segment(
                     runtime.packet_buffers(),
-                    connection,
-                    packet.local,
-                    TcpSegmentFlags::ACK,
-                    0,
+                    tcp_segment_metadata(packet.local, connection.remote()),
+                    TcpSegmentHeader {
+                        source_port: packet.local.port(),
+                        destination_port: connection.remote().port(),
+                        sequence_number: tcp_output_sequence(connection, flags_bits),
+                        acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
+                        flags,
+                        advertised_window: connection
+                            .advertised_receive_window(connection.rcv_wnd()),
+                        capabilities: connection.local_capabilities(),
+                    },
                 )?;
                 output_index = Some(allocated);
                 let indexed = connection.clone();

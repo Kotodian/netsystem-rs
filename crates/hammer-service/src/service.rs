@@ -56,7 +56,9 @@ use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;
-const DATA_WORKER_STACK_SIZE: usize = 512 * 1024;
+// Data workers initialize the packet graph plus worker-local TCP/session
+// runtime state on the worker thread before entering the reactor loop.
+const DATA_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
 const DATA_MAX_BLOCKING_THREADS: usize = 4;
 const METRICS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const TRACE_DRAIN_INTERVAL: Duration = Duration::from_secs(1);

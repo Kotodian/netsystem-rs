@@ -238,7 +238,7 @@ git commit -m "hammer-service(Refactor): make tcp protocol own session state"
 - [x] `tcp_established_out_of_window_segment_emits_ack_without_advancing_rcv_nxt`
 - [x] `tcp_established_rst_closes_session`
 - [x] `tcp_syn_sent_valid_syn_ack_emits_final_ack_and_establishes`
-- [x] `tcp_syn_sent_rst_closes_half_open`
+- [x] `tcp_syn_sent_rst_closes_pending_syn_sent_session`
 
 **Implementation notes:**
 
@@ -303,41 +303,75 @@ git commit -m "hammer-service(Feat): wire tcp transport nodes to sessions"
 
 ### Feature Group 3.1: Active Open
 
-- [ ] Implement active-open session creation in `TcpSessionProtocol`:
-  - allocate `SessionId`
-  - bind opaque `AppOpId`
-  - assign local ephemeral port through the service/runtime caller, not inside app runtime
-  - initialize `TcpState::SynSent`
-  - set `iss`, `snd_una = iss`, `snd_nxt = iss + 1`, `rcv_nxt = 0`
-  - store remote/local tuple for packet lookup
-- [ ] Emit SYN from session/output path:
-  - include MSS/window scale/SACK/timestamp options according to local capabilities
-  - track SYN as sequence-consuming in retransmit queue
-  - arm `TcpTimerKind::Connect` or SYN retransmit timer
-- [ ] Handle valid `SYN|ACK`:
-  - require `SEG.ACK == snd_nxt`
-  - set `irs = SEG.SEQ`
-  - set `rcv_nxt = SEG.SEQ + 1`
-  - set `snd_una = SEG.ACK`
-  - apply peer options and advertised window
-  - transition to `Established`
-  - cancel connect/SYN retransmit timer
-  - emit final ACK
-- [ ] Handle simultaneous open as a scoped follow-up only if needed:
-  - `SYN_SENT + SYN without ACK -> SYN_RCVD`
-  - emit SYN-ACK
-- [ ] Reject invalid active-open packets:
-  - stray ACK that does not ACK our SYN -> RST/drop according to RFC/VPP dispatch
-  - RST with acceptable ACK -> close/refused completion
-  - malformed SYN-ACK -> drop and keep timer alive
+**Architecture boundary:** Active open is a TCP state-machine operation behind a stable Hammer
+`SessionId`. Fuchsia netstack3's TCP code has a TCP-internal `State<I, R, S, ActiveOpen>`
+enum whose variants wrap concrete TCP-owned state structs (`Closed<Error>`, `Listen`,
+`SynSent<I, ActiveOpen>`, `Established<I, R, S>`), and transitions happen inside TCP methods.
+That state enum is not a socket/session/app dispatch surface. Hammer should follow that
+boundary in 3.1: `SessionDriverRuntime<S>` stores generic `S` and app binding only; it must
+not grow workflow-specific session variants, a second session identity, a TCP
+pre-establishment pool, or separate ready dispatch for pre-establishment sessions. Reworking
+Hammer's internal `TcpState` enum into Fuchsia-style TCP-owned typed states is a later
+TCP-state-machine refactor, not part of this session-state cleanup.
+
+**VPP mapping:** VPP keeps SYN-SENT lookup separate from established connection
+lookup, sends SYN from active-open TCP state, removes pending lookup on success/refusal, adds
+established lookup only after a valid `SYN|ACK`, and notifies the app after the state-machine
+result. Hammer maps this to a TCP-owned `TcpPendingIndex` whose value is the same stable
+`SessionId`; it does not copy VPP's pre-establishment session pool into Hammer's generic
+session layer.
+
+- [x] Implement generic connected CQE support:
+  - add `AppCqeData::Connected`, `AppCqeKind::Connected`, and `AppCqe::connected`
+  - convert CQE descriptors through standard `From`/`TryFrom` style trait impls, not ad hoc
+    conversion helper functions
+  - add `SessionAppRuntime::complete_connected(op)` so only session/app runtime completes app ops
+- [x] Keep session runtime generic:
+  - one `Pool<SessionEntry<S>>`
+  - one stable `SessionId`
+  - `SessionEntry<S> { app_op: Option<AppOpId>, state: S }`
+  - one generic `handle_ready_session(...)`
+  - no second session identity, no app binding target enum, no ready queue item enum, no
+    pending/established ready dispatch
+  - no session-visible TCP state enum or phase discriminator
+- [x] Implement `TcpSessionProtocol::connect(handle, local, remote) -> CoreResult<SessionId>`:
+  - choose `iss` inside TCP
+  - create `TcpConnectionState` with `TcpState::SynSent`
+  - set `snd_una = iss`, `snd_nxt = iss + 1`, `rcv_nxt = 0`
+  - insert the state as a normal session entry under the returned `SessionId`
+  - add TCP pending tuple lookup for that same `SessionId`
+  - arm the normal session retransmit timer and mark the same session ready
+  - do not accept `iss`, capabilities, app ring, or TCP policy from the caller
+- [x] Maintain TCP indexes incrementally:
+  - delete the full-table index rebuild helper
+  - remove old tuple/connection-id keys during `upsert`
+  - remove exact keys during `remove_session`
+  - add `TcpPendingIndex: tuple -> SessionId` for SYN-SENT demux only
+- [x] Route SYN-SENT input through TCP pending lookup:
+  - `tcp_input` checks established tuple lookup first and pending tuple lookup second
+  - `tcp_syn_sent` uses `pending_id_by_tuple`, not `session_id_by_tuple`
+  - valid `SYN|ACK` mutates the same session's TCP state to `Established`, removes pending
+    lookup, inserts established lookup, sends the final ACK, and completes connected through
+    session/app runtime
+  - acceptable `RST|ACK` removes pending lookup, closes the same session, and completes closed
+- [x] Replace remaining TCP one-off helpers:
+  - replace all connection-specific segment allocation call sites with generic
+    `alloc_tcp_segment(buffers, metadata, TcpSegmentHeader { ... })`
+  - replace open-specific state initializers with generic setters at the transition site
+  - do not add active-open request structs or reset-specific allocation helpers
 
 Tests:
 
-- [ ] `tcp_active_open_send_syn_tracks_half_open_session`
-- [ ] `tcp_syn_sent_valid_syn_ack_establishes_and_sends_ack`
-- [ ] `tcp_syn_sent_invalid_ack_does_not_establish_and_emits_reset_when_required`
-- [ ] `tcp_syn_sent_rst_completes_closed`
-- [ ] `tcp_syn_sent_retransmit_timer_reemits_syn`
+- [x] `app_ring_connected_completion_round_trips_descriptor`
+- [x] `tcp_active_open_creates_syn_sent_session_and_emits_syn`
+- [x] `tcp_active_open_retransmit_timer_reemits_syn`
+- [x] `tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node`
+- [x] `valid_syn_ack_emits_final_ack_and_establishes`
+- [x] `rst_closes_pending_syn_sent_session`
+- [x] `transport::tcp::session_index::tests`
+- [x] structural check: session layer remains generic over `S`
+- [x] cleanup check: no full index rebuild, no active-open request/reset special APIs, and no
+  remaining TCP connection-specific segment allocation helper
 
 ### Feature Group 3.2: Close State Machine
 

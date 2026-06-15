@@ -339,7 +339,7 @@ fn tcp_reset_observation(
     index: BufferIndex,
 ) -> CoreResult<TcpResetObservation> {
     let metadata = runtime.metadata(index)?;
-    let synthesized_reset = tcp_synthesized_reset(runtime, index, &metadata);
+    let synthesized_reset = tcp_reset_reply(runtime, index, &metadata);
     let remote = socket_addr(
         metadata.source.clone(),
         "tcp reset observer requires remote source metadata",
@@ -363,7 +363,7 @@ fn socket_addr(value: Option<SocksAddr>, missing: &'static str) -> CoreResult<So
     Ok(SocketAddr::new(value.host, value.port))
 }
 
-fn tcp_synthesized_reset(
+fn tcp_reset_reply(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     metadata: &RouteMetadata,
