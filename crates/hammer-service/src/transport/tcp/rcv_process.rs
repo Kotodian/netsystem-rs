@@ -3,13 +3,15 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentHeader, TcpState};
+use hammer_core::protocol::tcp::TcpState;
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::output::{tcp_output_acknowledgment, tcp_output_sequence};
+use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::session::TcpSessionQueue;
+use super::state_machine::{CloseWait, SynRcvd};
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -113,79 +115,60 @@ fn tcp_rcv_process_index(
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut output_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let session_id = queue
             .session_id_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
-        if packet.flags.contains(TcpSegmentFlags::RST) {
+        if let Ok(connection) = queue.take_connection::<SynRcvd>(session_id) {
+            let (next, control): (super::connection::TcpConnectionState, _) =
+                connection.receive_final_ack(&packet);
+            let _next_node = next.next_node();
+            if next.state() == TcpState::Closed {
+                queue.close_session(session_id)?;
+                return Ok(());
+            }
+            if let Some(header) = control {
+                let allocated = alloc_tcp_segment(
+                    runtime.packet_buffers(),
+                    tcp_segment_metadata(packet.local, packet.remote),
+                    header,
+                )?;
+                output_index = Some(allocated);
+            }
+            let established = next.state() == TcpState::Established;
+            queue.put_connection(session_id, next);
+            let indexed = queue
+                .session_state(session_id)
+                .ok_or_else(|| CoreError::internal("updated tcp rcv-process session is missing"))?
+                .clone();
+            queue.index_session(session_id, &indexed);
+            if established {
+                queue.cancel_retransmit_timer(session_id);
+            }
+            return Ok(());
+        }
+        let connection: TcpConnection<CloseWait> = queue.take_connection(session_id)?;
+        let (next, control): (super::connection::TcpConnectionState, _) =
+            connection.receive_close_wait(&packet);
+        let _next_node = next.next_node();
+        if next.state() == TcpState::Closed {
             queue.close_session(session_id)?;
             return Ok(());
         }
-        let connection = queue
-            .session_state_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp rcv-process state is missing"))?;
-        if connection.state() == TcpState::SynRcvd {
-            let acknowledgment = packet
-                .acknowledgment
-                .ok_or_else(|| CoreError::internal("syn-rcvd packet missing ACK"))?;
-            if !packet.flags.contains(TcpSegmentFlags::ACK)
-                || !connection.accepts_ack(acknowledgment)
-            {
-                return Err(CoreError::internal("syn-rcvd ACK is unacceptable"));
-            }
-            connection.apply_ack(acknowledgment, packet.advertised_window);
-            connection.set_state(TcpState::Established);
-            let flags = TcpSegmentFlags::ACK;
-            let flags_bits = flags.bits();
+        if let Some(header) = control {
             let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
-                tcp_segment_metadata(packet.local, connection.remote()),
-                TcpSegmentHeader {
-                    source_port: packet.local.port(),
-                    destination_port: connection.remote().port(),
-                    sequence_number: tcp_output_sequence(connection, flags_bits),
-                    acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
-                    flags,
-                    advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
-                    capabilities: connection.local_capabilities(),
-                },
+                tcp_segment_metadata(packet.local, packet.remote),
+                header,
             )?;
             output_index = Some(allocated);
-            let indexed = connection.clone();
-            queue.index_session(session_id, &indexed);
-            queue.cancel_retransmit_timer(session_id);
-        } else {
-            if let Some(acknowledgment) = packet.acknowledgment
-                && packet.flags.contains(TcpSegmentFlags::ACK)
-            {
-                connection.apply_ack(acknowledgment, packet.advertised_window);
-            }
-            if packet.flags.contains(TcpSegmentFlags::FIN) {
-                if !connection.accept_in_order_payload(packet.sequence, 1) {
-                    return Err(CoreError::internal("tcp FIN sequence is unacceptable"));
-                }
-                connection.set_state(TcpState::CloseWait);
-                let flags = TcpSegmentFlags::ACK;
-                let flags_bits = flags.bits();
-                let allocated = alloc_tcp_segment(
-                    runtime.packet_buffers(),
-                    tcp_segment_metadata(packet.local, connection.remote()),
-                    TcpSegmentHeader {
-                        source_port: packet.local.port(),
-                        destination_port: connection.remote().port(),
-                        sequence_number: tcp_output_sequence(connection, flags_bits),
-                        acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
-                        flags,
-                        advertised_window: connection
-                            .advertised_receive_window(connection.rcv_wnd()),
-                        capabilities: connection.local_capabilities(),
-                    },
-                )?;
-                output_index = Some(allocated);
-                let indexed = connection.clone();
-                queue.index_session(session_id, &indexed);
-            }
         }
+        queue.put_connection(session_id, next);
+        let indexed = queue
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("updated tcp rcv-process session is missing"))?
+            .clone();
+        queue.index_session(session_id, &indexed);
         Ok(())
     });
     if let Err(error) = result {

@@ -15,10 +15,11 @@ use hammer_adapter::{
     PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView, TcpState};
+use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView};
 
 use crate::session::SessionQueueHandle;
 
+use super::session::TcpSessionQueue;
 use super::{
     TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpLookupSnapshot, TcpLookupValue, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
@@ -494,7 +495,7 @@ fn session_input_entry(
     };
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
-    TcpSessionProtocol::with_queue(handle, |runtime| {
+    TcpSessionProtocol::with_queue(handle, |runtime: &mut TcpSessionQueue| {
         let session_id = runtime
             .session_id_by_tuple(local, remote)
             .or_else(|| runtime.pending_id_by_tuple(local, remote));
@@ -506,25 +507,9 @@ fn session_input_entry(
         };
         Ok(Some(TcpSessionInputEntry {
             owner: connection.owner_worker(),
-            next: tcp_session_input_next(connection.state()),
+            next: connection.next_node(),
         }))
     })
-}
-
-#[inline(always)]
-fn tcp_session_input_next(state: TcpState) -> TcpInputNext {
-    match state {
-        TcpState::SynSent => TcpInputNext::SynSent,
-        TcpState::SynRcvd
-        | TcpState::FinWait1
-        | TcpState::FinWait2
-        | TcpState::CloseWait
-        | TcpState::Closing
-        | TcpState::LastAck
-        | TcpState::TimeWait => TcpInputNext::RcvProcess,
-        TcpState::Established => TcpInputNext::Established,
-        TcpState::Closed | TcpState::Listen => TcpInputNext::Drop,
-    }
 }
 
 #[inline(always)]
@@ -554,9 +539,10 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use hammer_adapter::{DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, NodeHandle, NodeId};
-    use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
+    use hammer_core::protocol::tcp::TcpConnectionId;
 
     use crate::transport::tcp::connection::TcpConnectionState;
+    use crate::transport::tcp::session::TcpSessionQueue;
     use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext, TcpSessionProtocol};
 
     use super::{
@@ -592,12 +578,7 @@ mod tests {
     #[test]
     fn tcp_input_routes_existing_established_tuple_to_established_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
-        let handle = install_tcp_session(
-            &runtime,
-            DataWorkerId::new(0),
-            TcpState::Established,
-            50_044,
-        );
+        let handle = install_tcp_session(&runtime, DataWorkerId::new(0), 50_044);
 
         let entry = session_input_entry(Some(handle), &parsed_input(50_044))
             .expect("session lookup")
@@ -615,12 +596,7 @@ mod tests {
     #[test]
     fn tcp_input_existing_session_entry_keeps_owner_for_handoff_decision() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
-        let handle = install_tcp_session(
-            &runtime,
-            DataWorkerId::new(1),
-            TcpState::Established,
-            50_055,
-        );
+        let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_055);
 
         let entry = session_input_entry(Some(handle), &parsed_input(50_055))
             .expect("session lookup")
@@ -663,7 +639,7 @@ mod tests {
                 next: TcpInputNext::SynSent,
             }
         );
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             assert_eq!(queue.session_id_by_tuple(local, remote), None);
             assert_eq!(queue.pending_id_by_tuple(local, remote), Some(session_id));
             Ok(())
@@ -681,12 +657,7 @@ mod tests {
             DataWorkerId::new(0),
             handoff.worker(DataWorkerId::new(0)),
         );
-        let handle = install_tcp_session(
-            &runtime,
-            DataWorkerId::new(1),
-            TcpState::Established,
-            50_066,
-        );
+        let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_066);
         let frame = runtime.alloc_frame_index().expect("alloc frame");
         let packet = tcp_packet(
             Ipv4Addr::new(198, 51, 100, 50_066u16 as u8),
@@ -741,7 +712,6 @@ mod tests {
     fn install_tcp_session(
         runtime: &DataPlaneRuntime,
         owner: DataWorkerId,
-        state: TcpState,
         local_port: u16,
     ) -> SessionQueueHandle {
         let local = SocketAddr::new(
@@ -752,10 +722,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
             443,
         );
-        let connection = TcpConnectionState::new(
+        let connection = TcpConnectionState::established_for_test(
             Some(TcpConnectionId::new(u64::from(local_port))),
             owner,
-            state,
             local_port,
             Some(local),
             remote,

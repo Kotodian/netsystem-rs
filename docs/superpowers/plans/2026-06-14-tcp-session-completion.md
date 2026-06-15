@@ -238,7 +238,7 @@ git commit -m "hammer-service(Refactor): make tcp protocol own session state"
 - [x] `tcp_established_out_of_window_segment_emits_ack_without_advancing_rcv_nxt`
 - [x] `tcp_established_rst_closes_session`
 - [x] `tcp_syn_sent_valid_syn_ack_emits_final_ack_and_establishes`
-- [x] `tcp_syn_sent_rst_closes_pending_syn_sent_session`
+- [x] `tcp_syn_sent_rst_closes_half_open`
 
 **Implementation notes:**
 
@@ -303,75 +303,1614 @@ git commit -m "hammer-service(Feat): wire tcp transport nodes to sessions"
 
 ### Feature Group 3.1: Active Open
 
-**Architecture boundary:** Active open is a TCP state-machine operation behind a stable Hammer
-`SessionId`. Fuchsia netstack3's TCP code has a TCP-internal `State<I, R, S, ActiveOpen>`
-enum whose variants wrap concrete TCP-owned state structs (`Closed<Error>`, `Listen`,
-`SynSent<I, ActiveOpen>`, `Established<I, R, S>`), and transitions happen inside TCP methods.
-That state enum is not a socket/session/app dispatch surface. Hammer should follow that
-boundary in 3.1: `SessionDriverRuntime<S>` stores generic `S` and app binding only; it must
-not grow workflow-specific session variants, a second session identity, a TCP
-pre-establishment pool, or separate ready dispatch for pre-establishment sessions. Reworking
-Hammer's internal `TcpState` enum into Fuchsia-style TCP-owned typed states is a later
-TCP-state-machine refactor, not part of this session-state cleanup.
+**Purpose:** Finish active open using the worker-local `TcpSessionQueue` that already exists. Current code can build a test-only `SynSent` connection, emit and retransmit SYN from `TcpSessionProtocol::handle_ready_session`, route `TcpState::SynSent` packets from `TcpInputNode`, and establish on a basic `SYN|ACK` in `TcpSynSentNode`. This feature group turns those pieces into a real service/runtime connect path with VPP-aligned half-open behavior: app connect completion, strict SYN-SENT ACK/RST handling, timer cleanup, and no TCP/session identifiers exposed through `hammer-runtime::app`.
 
-**VPP mapping:** VPP keeps SYN-SENT lookup separate from established connection
-lookup, sends SYN from active-open TCP state, removes pending lookup on success/refusal, adds
-established lookup only after a valid `SYN|ACK`, and notifies the app after the state-machine
-result. Hammer maps this to a TCP-owned `TcpPendingIndex` whose value is the same stable
-`SessionId`; it does not copy VPP's pre-establishment session pool into Hammer's generic
-session layer.
+**VPP mapping researched:**
 
-- [x] Implement generic connected CQE support:
-  - add `AppCqeData::Connected`, `AppCqeKind::Connected`, and `AppCqe::connected`
-  - convert CQE descriptors through standard `From`/`TryFrom` style trait impls, not ad hoc
-    conversion helper functions
-  - add `SessionAppRuntime::complete_connected(op)` so only session/app runtime completes app ops
-- [x] Keep session runtime generic:
-  - one `Pool<SessionEntry<S>>`
-  - one stable `SessionId`
-  - `SessionEntry<S> { app_op: Option<AppOpId>, state: S }`
-  - one generic `handle_ready_session(...)`
-  - no second session identity, no app binding target enum, no ready queue item enum, no
-    pending/established ready dispatch
-  - no session-visible TCP state enum or phase discriminator
-- [x] Implement `TcpSessionProtocol::connect(handle, local, remote) -> CoreResult<SessionId>`:
-  - choose `iss` inside TCP
-  - create `TcpConnectionState` with `TcpState::SynSent`
-  - set `snd_una = iss`, `snd_nxt = iss + 1`, `rcv_nxt = 0`
-  - insert the state as a normal session entry under the returned `SessionId`
-  - add TCP pending tuple lookup for that same `SessionId`
-  - arm the normal session retransmit timer and mark the same session ready
-  - do not accept `iss`, capabilities, app ring, or TCP policy from the caller
-- [x] Maintain TCP indexes incrementally:
-  - delete the full-table index rebuild helper
-  - remove old tuple/connection-id keys during `upsert`
-  - remove exact keys during `remove_session`
-  - add `TcpPendingIndex: tuple -> SessionId` for SYN-SENT demux only
-- [x] Route SYN-SENT input through TCP pending lookup:
-  - `tcp_input` checks established tuple lookup first and pending tuple lookup second
-  - `tcp_syn_sent` uses `pending_id_by_tuple`, not `session_id_by_tuple`
-  - valid `SYN|ACK` mutates the same session's TCP state to `Established`, removes pending
-    lookup, inserts established lookup, sends the final ACK, and completes connected through
-    session/app runtime
-  - acceptable `RST|ACK` removes pending lookup, closes the same session, and completes closed
-- [x] Replace remaining TCP one-off helpers:
-  - replace all connection-specific segment allocation call sites with generic
-    `alloc_tcp_segment(buffers, metadata, TcpSegmentHeader { ... })`
-  - replace open-specific state initializers with generic setters at the transition site
-  - do not add active-open request structs or reset-specific allocation helpers
+- VPP `session_open_vc` calls `transport_connect`, allocates a half-open session with `session_alloc_for_half_open`, stores it in the app-worker half-open table, and publishes half-open lookup before establishment in `/private/tmp/vpp_session.c:1320-1356`.
+- VPP `session_stream_connect_notify` removes half-open lookup, reports connect errors to the app, and on success allocates the established session, adds normal lookup, and sends `app_worker_connect_notify(..., SESSION_E_NONE, opaque)` in `/private/tmp/vpp_session.c:747-800`.
+- VPP `tcp_connect` sets `TCP_STATE_SYN_SENT`, initializes send variables, and sends the initial SYN in `/private/tmp/vpp_tcp.c:847-850`.
+- VPP `tcp46_syn_sent_inline` handles every `SYN_SENT` packet shape, rejects unacceptable ACKs with RST unless the packet already has RST, reports acceptable RST as `SESSION_E_REFUSED`, parses peer options, moves the half-open connection to the worker pool, transitions `SYN|ACK` to `ESTABLISHED`, notifies the app, estimates initial RTT, and sends the mandatory final ACK in `/private/tmp/vpp_tcp_input.c:1736-1980`.
+- VPP `tcp_timer_retransmit_syn_handler` ignores stale SYN timers after the connection is no longer `SYN_SENT`, reports active-open timeout to the app, retransmits SYN, and backs off RTO in `/private/tmp/vpp_tcp_output.c:1480-1535`.
 
-Tests:
+**Hammer mapping and deviations:**
 
-- [x] `app_ring_connected_completion_round_trips_descriptor`
-- [x] `tcp_active_open_creates_syn_sent_session_and_emits_syn`
-- [x] `tcp_active_open_retransmit_timer_reemits_syn`
-- [x] `tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node`
-- [x] `valid_syn_ack_emits_final_ack_and_establishes`
-- [x] `rst_closes_pending_syn_sent_session`
-- [x] `transport::tcp::session_index::tests`
-- [x] structural check: session layer remains generic over `S`
-- [x] cleanup check: no full index rebuild, no active-open request/reset special APIs, and no
-  remaining TCP connection-specific segment allocation helper
+- Hammer does not need VPP's separate half-open pool today. The active-open connection remains a worker-local `TcpConnectionState` stored directly in `TcpSessionQueue` with `TcpState::SynSent`; tuple lookup in `TcpSessionConnectionIndex` plays the role of VPP half-open lookup.
+- Keep app API opaque. `hammer-runtime::app` may learn a generic completion kind such as `Connected`, but it must not learn `SessionId`, `TcpConnectionId`, TCP tuple keys, or transport state.
+- Keep state mutation in `crates/hammer-service/src/transport/tcp/session.rs`, `connection.rs`, and `syn_sent.rs`. `TcpInputNode` only dispatches by tuple/state; it must not own active-open state.
+- Do not implement simultaneous open in this feature group. VPP supports `SYN_SENT + SYN without ACK -> SYN_RCVD`, but this plan keeps it as an explicit follow-up because current Hammer tests and service API only require normal active open.
+
+**Files:**
+- Modify: `crates/hammer-runtime/src/app/ring.rs`
+- Modify: `crates/hammer-runtime/src/app/context.rs`
+- Modify: `crates/hammer-runtime/src/app/mod.rs`
+- Modify tests: `crates/hammer-runtime/tests/app_ring.rs`
+- Modify: `crates/hammer-service/src/transport/tcp/session.rs`
+- Modify: `crates/hammer-service/src/transport/tcp/syn_sent.rs`
+- Modify: `crates/hammer-service/src/transport/tcp/connection.rs`
+- Modify: `crates/hammer-service/src/transport/tcp/reset.rs`
+- Modify tests: `crates/hammer-service/src/transport/tcp/input.rs`
+- Modify tests: `crates/hammer-service/src/transport/tcp/session.rs`
+- Modify tests: `crates/hammer-service/src/transport/tcp/syn_sent.rs`
+- Create tests: `crates/hammer-service/tests/tcp_active_open.rs`
+
+#### Task 3.1.1: Generic App Connect Completion
+
+**Why:** VPP reports connect success with `app_worker_connect_notify(..., SESSION_E_NONE, opaque)`. Hammer's app ring currently has `Recv` and `Closed`; using `Closed` for successful connect would make active open ambiguous. Add a generic `Connected` CQE that carries only the opaque app op.
+
+- [ ] **Step 1: Add the failing runtime ring test**
+
+Add this test to `crates/hammer-runtime/tests/app_ring.rs`:
+
+```rust
+#[test]
+fn app_ring_connected_completion_round_trips_descriptor() {
+    let ring = AppRingHandle::new(4, 4);
+    let op = AppOpId::new(9_001);
+
+    ring.push_test_completion(AppCqe::connected(Some(AppUserData::new(44)), op))
+        .expect("push connected completion");
+
+    let completion = ring.pop_completion().expect("connected completion");
+    assert_eq!(completion.user_data(), Some(AppUserData::new(44)));
+    assert_eq!(completion.opcode(), AppOpcode::Nop);
+    match completion.kind() {
+        AppCqeKind::Connected { op: completed_op } => assert_eq!(*completed_op, op),
+        other => panic!("expected connected completion, got {other:?}"),
+    }
+
+    let descriptor = AppCqe::connected(None, op)
+        .descriptor()
+        .expect("connected descriptor")
+        .expect("connected descriptor present");
+    assert_eq!(descriptor.result(), 0);
+    assert_eq!(descriptor.flags(), AppCqeFlags::NONE);
+    assert_eq!(descriptor.object(), AppObjectRef::Operation(op));
+    assert_eq!(descriptor.payload(), AppCqeData::Connected);
+}
+```
+
+- [ ] **Step 2: Run the failing runtime ring test**
+
+Run:
+
+```bash
+cargo test -p hammer-runtime --test app_ring app_ring_connected_completion_round_trips_descriptor
+```
+
+Expected: FAIL with unresolved `AppCqe::connected`, `AppCqeKind::Connected`, and `AppCqeData::Connected`.
+
+- [ ] **Step 3: Implement `Connected` in `hammer-runtime::app`**
+
+In `crates/hammer-runtime/src/app/ring.rs`, update the app completion data and kind:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AppCqeData {
+    None,
+    Recv { data: AppDataAddr },
+    Connected,
+    Closed,
+}
+```
+
+```rust
+#[derive(Debug)]
+pub enum AppCqeKind {
+    Recv {
+        op: AppOpId,
+        recv: AppRecv,
+        fin: bool,
+    },
+    Connected {
+        op: AppOpId,
+    },
+    Closed {
+        op: Option<AppOpId>,
+    },
+}
+```
+
+Update `AppCqeKind::opcode` so connected completions use `AppOpcode::Nop`:
+
+```rust
+impl AppCqeKind {
+    #[inline]
+    pub const fn opcode(&self) -> AppOpcode {
+        match self {
+            Self::Recv { .. } => AppOpcode::Recv,
+            Self::Connected { .. } => AppOpcode::Nop,
+            Self::Closed { .. } => AppOpcode::Close,
+        }
+    }
+}
+```
+
+Add the constructor next to `AppCqe::recv` and `AppCqe::closed`:
+
+```rust
+impl AppCqe {
+    #[inline]
+    pub const fn connected(user_data: Option<AppUserData>, op: AppOpId) -> Self {
+        Self::new(user_data, AppCqeKind::Connected { op })
+    }
+}
+```
+
+Update `cqe_into_descriptor`:
+
+```rust
+fn cqe_into_descriptor(cqe: AppCqe) -> AppCqeDescriptor {
+    let user_data = cqe.user_data();
+    match cqe.inner.kind {
+        AppCqeKind::Recv { op, recv, fin } => {
+            let data = recv.into_data_addr();
+            AppCqeDescriptor::new(
+                user_data,
+                data.len() as i32,
+                if fin {
+                    AppCqeFlags::BUFFER.union(AppCqeFlags::FIN)
+                } else {
+                    AppCqeFlags::BUFFER
+                },
+                AppObjectRef::Operation(op),
+                AppCqeData::Recv { data },
+            )
+        }
+        AppCqeKind::Connected { op } => AppCqeDescriptor::new(
+            user_data,
+            0,
+            AppCqeFlags::NONE,
+            AppObjectRef::Operation(op),
+            AppCqeData::Connected,
+        ),
+        AppCqeKind::Closed { op } => AppCqeDescriptor::new(
+            user_data,
+            0,
+            AppCqeFlags::NONE,
+            op.map_or(AppObjectRef::None, AppObjectRef::Operation),
+            AppCqeData::Closed,
+        ),
+    }
+}
+```
+
+Update `cqe_from_descriptor`:
+
+```rust
+fn cqe_from_descriptor(descriptor: AppCqeDescriptor, ring: &AppRingHandle) -> AppCqe {
+    match descriptor.payload() {
+        AppCqeData::None => AppCqe::new(descriptor.user_data(), AppCqeKind::Closed { op: None }),
+        AppCqeData::Recv { data } => AppCqe::recv(
+            descriptor.user_data(),
+            op_from_completion_descriptor(descriptor),
+            AppRecv::new(ring.clone(), data),
+            descriptor.flags().contains(AppCqeFlags::FIN),
+        ),
+        AppCqeData::Connected => AppCqe::connected(
+            descriptor.user_data(),
+            op_from_completion_descriptor(descriptor),
+        ),
+        AppCqeData::Closed => AppCqe::new(
+            descriptor.user_data(),
+            AppCqeKind::Closed {
+                op: match descriptor.object() {
+                    AppObjectRef::Operation(op) => Some(op),
+                    AppObjectRef::None => None,
+                },
+            },
+        ),
+    }
+}
+```
+
+In `crates/hammer-runtime/src/app/context.rs`, add a generic completion helper next to `try_complete_closed_op`:
+
+```rust
+pub fn try_complete_connected_op(&self, op: AppOpId) -> HammerResult<bool> {
+    let Some(owner_worker) = self.registered_op_owner(op)? else {
+        return Ok(false);
+    };
+    if self.current_worker_index().ok() == Some(owner_worker) {
+        let ring = self.local_ring_for_op(op)?;
+        ring.try_push_completion(AppCqe::connected(None, op))?;
+    } else {
+        let app_context_id = self.id;
+        let ring_capacity = self.ring_capacity;
+        self.data_context
+            .call_blocking_on_worker(owner_worker, move || {
+                worker_app_ring(app_context_id, ring_capacity)
+                    .try_push_completion(AppCqe::connected(None, op))
+            })?;
+    }
+    Ok(true)
+}
+```
+
+- [ ] **Step 4: Run the runtime ring test**
+
+Run:
+
+```bash
+cargo test -p hammer-runtime --test app_ring app_ring_connected_completion_round_trips_descriptor
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/hammer-runtime/src/app/ring.rs crates/hammer-runtime/src/app/context.rs crates/hammer-runtime/src/app/mod.rs crates/hammer-runtime/tests/app_ring.rs
+git commit -m "hammer-runtime(Feat): add app connected completion"
+```
+
+#### Task 3.1.2: Public Active-Open Session API
+
+**Why:** VPP opens a VC by allocating and indexing half-open state before the SYN-ACK arrives. Hammer should expose the same operation at the service/session boundary by creating a worker-local `TcpState::SynSent` session, indexing its tuple, binding the opaque app op, arming SYN retransmit, and marking it ready for the existing session queue driver.
+
+- [ ] **Step 1: Add the failing integration test**
+
+Create `crates/hammer-service/tests/tcp_active_open.rs` with this first test and support code:
+
+```rust
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use hammer_adapter::{
+    BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
+    NodeResult, NodeRuntimeData,
+};
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpSegmentFlags, TcpSegmentView, tcp_options_from_bytes,
+};
+use hammer_service::session::{SessionQueueNext, SessionQueueNode};
+use hammer_service::transport::tcp::{TcpActiveOpenRequest, TcpSessionProtocol};
+
+const CLIENT_ISN: u32 = 81_000;
+
+#[derive(Default)]
+struct CaptureState {
+    packets: std::vec::Vec<std::vec::Vec<u8>>,
+}
+
+struct CaptureNode {
+    runtime_data: NodeRuntimeData,
+}
+
+impl CaptureNode {
+    fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+        let mut states = capture_states().lock().expect("capture registry");
+        let slot = states.len();
+        states.push(state);
+        Self {
+            runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+        }
+    }
+}
+
+impl Node for CaptureNode {
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Err(CoreError::internal("capture node must use descriptor process"))
+    }
+
+    fn node_process(&self) -> NodeProcessFn {
+        capture_process
+    }
+
+    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl InternalNode for CaptureNode {}
+
+fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+    static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+}
+
+fn capture_process(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    let state = {
+        let states = capture_states()
+            .lock()
+            .map_err(|_| CoreError::internal("capture registry poisoned"))?;
+        Arc::clone(
+            states
+                .get(data.usize_word(0)?)
+                .ok_or_else(|| CoreError::internal("capture state missing"))?,
+        )
+    };
+    for index in frame.drain_pending() {
+        let packet = runtime.copy_current_chain(index)?;
+        state
+            .lock()
+            .map_err(|_| CoreError::internal("capture poisoned"))?
+            .packets
+            .push(packet.into_iter().collect());
+        runtime.free_index(index);
+    }
+    Ok(NodeResult::drop())
+}
+
+#[test]
+fn tcp_active_open_start_emits_syn_from_session_queue() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50001".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
+    let capabilities = TcpCapabilities {
+        max_segment_size: Some(1_200),
+        window_scale: Some(7),
+        sack: true,
+        timestamps: false,
+        ecn: false,
+    };
+
+    let capture = Arc::new(Mutex::new(CaptureState::default()));
+    let output = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&capture)));
+    let session_node = SessionQueueNode::new().expect("session queue node");
+    session_node
+        .attach_queue(
+            handle,
+            SessionQueueNext::from_node(output),
+            TcpSessionProtocol::session_queue_dispatch_fn(),
+        )
+        .expect("attach tcp queue");
+    let session_queue = runtime.nodes().register_driver(session_node);
+
+    let _started = TcpSessionProtocol::start_active_open(
+        handle,
+        TcpActiveOpenRequest {
+            app_op: None,
+            app_ring: None,
+            local,
+            remote,
+            iss: CLIENT_ISN,
+            capabilities,
+        },
+    )
+    .expect("start active open");
+
+    runtime
+        .schedule_empty_frame(session_queue)
+        .expect("schedule session queue");
+    assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
+
+    let packets = &capture.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    let segment = TcpSegmentView::parse(&packets[0]).expect("tcp segment");
+    assert_eq!(segment.source_port(), local.port());
+    assert_eq!(segment.destination_port(), remote.port());
+    assert_eq!(segment.sequence_number(), CLIENT_ISN);
+    assert!(segment.flags().contains(TcpSegmentFlags::SYN));
+    assert_eq!(tcp_options_from_bytes(segment.options()).capabilities, capabilities);
+}
+```
+
+Add this internal state test to the existing `#[cfg(test)] mod tests` in `crates/hammer-service/src/transport/tcp/session.rs`:
+
+```rust
+#[test]
+fn tcp_active_open_start_initializes_indexes_and_arms_retransmit_timer() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue_for_test(TcpSessionQueue::new(
+        worker,
+        runtime.packet_buffers().clone(),
+    ))
+    .expect("register queue");
+    let local: SocketAddr = "192.0.2.10:50001".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
+
+    let started = TcpSessionProtocol::with_queue(handle, |queue| {
+        queue.start_active_open(TcpActiveOpenRequest {
+            app_op: None,
+            app_ring: None,
+            local,
+            remote,
+            iss: ACTIVE_OPEN_ISS,
+            capabilities: TcpCapabilities::default(),
+        })
+    })
+    .expect("start active open");
+
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue
+            .session_state(started.session_id)
+            .expect("active-open session");
+        assert_eq!(session.state(), TcpState::SynSent);
+        assert_eq!(session.connection_id(), Some(started.connection_id));
+        assert_eq!(session.snd_una(), ACTIVE_OPEN_ISS);
+        assert_eq!(session.snd_nxt(), ACTIVE_OPEN_ISS + 1);
+        assert_eq!(session.rcv_nxt(), 0);
+        assert!(session.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
+        assert_eq!(queue.session_id_by_tuple(local, remote), Some(started.session_id));
+        Ok(())
+    })
+    .expect("inspect active open");
+}
+```
+
+- [ ] **Step 2: Run the failing integration test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_active_open_start_emits_syn_from_session_queue
+cargo test -p hammer-service transport::tcp::session::tests::tcp_active_open_start_initializes_indexes_and_arms_retransmit_timer
+```
+
+Expected: FAIL with unresolved `TcpActiveOpenRequest`, `TcpActiveOpenStarted`, and `start_active_open`.
+
+- [ ] **Step 3: Add active-open request types and initializer**
+
+In `crates/hammer-service/src/transport/tcp/connection.rs`, add `initialize_active_open` next to `initialize_passive_open`:
+
+```rust
+impl TcpConnectionState {
+    #[inline]
+    pub fn initialize_active_open(&mut self, iss: u32) {
+        self.iss = iss;
+        self.irs = 0;
+        self.snd_una = iss;
+        self.snd_nxt = TcpSeq::new(iss).advance(1).raw();
+        self.snd_wnd = self.effective_send_window(self.snd_wnd);
+        self.rcv_nxt = 0;
+        self.state = TcpState::SynSent;
+    }
+}
+```
+
+In `crates/hammer-service/src/transport/tcp/session.rs`, import app types for non-test builds:
+
+```rust
+use hammer_runtime::app::{AppOpId, AppRingHandle};
+```
+
+Add these request/result types near `TcpSessionQueue`:
+
+```rust
+pub(crate) struct TcpActiveOpenRequest {
+    pub app_op: Option<AppOpId>,
+    pub app_ring: Option<AppRingHandle>,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub iss: u32,
+    pub capabilities: TcpCapabilities,
+}
+
+pub(crate) struct TcpActiveOpenStarted {
+    pub session_id: SessionId,
+    pub connection_id: TcpConnectionId,
+}
+```
+
+Add `TcpSessionQueue::start_active_open`:
+
+```rust
+impl TcpSessionQueue {
+    pub(crate) fn start_active_open(
+        &mut self,
+        request: TcpActiveOpenRequest,
+    ) -> CoreResult<TcpActiveOpenStarted> {
+        match (request.app_op, request.app_ring.as_ref()) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => {
+                return Err(CoreError::internal(
+                    "active-open app op/ring must be both set or both absent",
+                ));
+            }
+        }
+
+        let mut connection = TcpConnectionState::new(
+            None,
+            self.worker(),
+            TcpState::SynSent,
+            request.local.port(),
+            Some(request.local),
+            request.remote,
+        );
+        connection.set_local_capabilities(request.capabilities);
+        connection.initialize_active_open(request.iss);
+
+        let session_id = self.insert_session(connection);
+        let connection_id = TcpConnectionId::new(session_id.get());
+        let connection = self
+            .session_state_mut(session_id)
+            .ok_or_else(|| CoreError::internal("active-open session missing after insert"))?;
+        connection.set_connection_id(connection_id);
+        let indexed = connection.clone();
+        self.index_session(session_id, &indexed);
+
+        if let (Some(op), Some(ring)) = (request.app_op, request.app_ring) {
+            if !self.bind_session_app_ring(session_id, op, ring) {
+                let _ = self.close_session(session_id)?;
+                return Err(CoreError::internal("failed to bind active-open app ring"));
+            }
+        }
+
+        self.arm_retransmit_timer(session_id, TCP_ACTIVE_OPEN_TIMER_TICKS)?;
+        self.mark_session_ready(session_id);
+        Ok(TcpActiveOpenStarted {
+            session_id,
+            connection_id,
+        })
+    }
+}
+```
+
+Add a public wrapper on `TcpSessionProtocol` so integration tests and later `RuntimeService` code do not need access to the private `TcpSessionQueue` type:
+
+```rust
+impl TcpSessionProtocol {
+    pub fn start_active_open(
+        handle: SessionQueueHandle,
+        request: TcpActiveOpenRequest,
+    ) -> CoreResult<TcpActiveOpenStarted> {
+        Self::with_queue(handle, |queue| queue.start_active_open(request))
+    }
+}
+```
+
+Export the new API from `crates/hammer-service/src/transport/tcp/mod.rs`:
+
+```rust
+pub use session::{TcpActiveOpenRequest, TcpActiveOpenStarted, TcpSessionProtocol};
+```
+
+- [ ] **Step 4: Run the active-open API test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_active_open_start_creates_indexed_syn_sent_session_and_emits_syn
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/hammer-service/src/transport/tcp/connection.rs crates/hammer-service/src/transport/tcp/session.rs crates/hammer-service/src/transport/tcp/mod.rs crates/hammer-service/tests/tcp_active_open.rs
+git commit -m "hammer-service(Feat): add tcp active open session api"
+```
+
+#### Task 3.1.3: SYN-SENT Success Path
+
+**Why:** VPP accepts only an ACK that covers our SYN, converts half-open state to established state, notifies the app, resets the SYN retransmit timer, and emits the final ACK. Hammer already establishes and emits ACK; this task adds app success completion and explicit timer cleanup.
+
+- [ ] **Step 1: Add the failing success-path test**
+
+Extend `crates/hammer-service/tests/tcp_active_open.rs` with:
+
+```rust
+#[test]
+fn tcp_syn_sent_valid_syn_ack_establishes_cancels_timer_sends_ack_and_completes_connect() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50002".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote");
+    let app_ring = hammer_runtime::app::AppRingHandle::new(4, 4);
+    let app_op = hammer_runtime::app::AppOpId::new(9_101);
+    let server_isn = 17_000;
+
+    let _started = TcpSessionProtocol::start_active_open(
+        handle,
+        TcpActiveOpenRequest {
+            app_op: Some(app_op),
+            app_ring: Some(app_ring.clone()),
+            local,
+            remote,
+            iss: CLIENT_ISN,
+            capabilities: TcpCapabilities::default(),
+        },
+    )
+    .expect("start active open");
+
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let output_node = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&output)));
+    let drop_node = runtime.nodes().register_internal(hammer_service::data_plane::DropNode::new());
+    let syn_sent = runtime.nodes().register_internal(
+        hammer_service::transport::tcp::TcpSynSentNode::new(
+            hammer_service::transport::tcp::TcpSynSentNext::nodes(output_node, drop_node),
+        )
+        .with_session_queue(handle),
+    );
+
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        server_isn,
+        CLIENT_ISN + 1,
+        TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+
+    let packets = &output.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    let ack = TcpSegmentView::parse(&packets[0]).expect("final ack");
+    assert_eq!(ack.source_port(), local.port());
+    assert_eq!(ack.destination_port(), remote.port());
+    assert_eq!(ack.sequence_number(), CLIENT_ISN + 1);
+    assert_eq!(ack.acknowledgment_number(), Some(server_isn + 1));
+    assert!(ack.flags().contains(TcpSegmentFlags::ACK));
+
+    let completion = app_ring.pop_completion().expect("connect completion");
+    match completion.kind() {
+        hammer_runtime::app::AppCqeKind::Connected { op } => assert_eq!(*op, app_op),
+        other => panic!("expected connected completion, got {other:?}"),
+    }
+}
+```
+
+Add this state-focused unit test to the existing `#[cfg(test)] mod tests` in `crates/hammer-service/src/transport/tcp/syn_sent.rs`:
+
+```rust
+#[test]
+fn valid_syn_ack_establishes_and_cancels_retransmit_timer() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let handle = TcpSessionProtocol::register_queue(
+        DataWorkerId::new(0),
+        runtime.packet_buffers().clone(),
+    )
+    .expect("session queue");
+    let session_id = insert_syn_sent_session(handle);
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        queue.arm_retransmit_timer(session_id, 2)?;
+        Ok(())
+    })
+    .expect("arm retransmit");
+
+    let output_state = Arc::new(Mutex::new(CaptureState::default()));
+    let output = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let syn_sent = runtime.nodes().register_internal(
+        TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
+    );
+
+    send_packet(
+        &runtime,
+        syn_sent,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            SERVER_ISN,
+            CLIENT_ISN + 1,
+            SYN | ACK,
+        ),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue
+            .session_state(session_id)
+            .expect("established session");
+        assert_eq!(session.state(), TcpState::Established);
+        assert_eq!(session.snd_una(), CLIENT_ISN + 1);
+        assert_eq!(session.irs(), SERVER_ISN);
+        assert_eq!(session.rcv_nxt(), SERVER_ISN + 1);
+        assert!(!session.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+        Ok(())
+    })
+    .expect("inspect established session");
+}
+```
+
+Add helper functions in the same test file:
+
+```rust
+fn send_tcp_packet(
+    runtime: &DataPlaneRuntime,
+    node: NodeId,
+    remote: SocketAddr,
+    local: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: TcpSegmentFlags,
+    capabilities: TcpCapabilities,
+) {
+    let frame = runtime.alloc_frame_index().expect("frame");
+    let packet = tcp_packet(remote, local, sequence, acknowledgment, flags, capabilities);
+    let buffer = runtime
+        .alloc_index_with_bytes(tcp_metadata(remote, local), &packet)
+        .expect("packet");
+    stamp_tcp_cursor(runtime, buffer, &packet);
+    runtime
+        .get_frame_mut(frame)
+        .expect("frame mut")
+        .push_index(buffer)
+        .expect("push packet");
+    assert!(runtime.schedule_frame(node, frame).expect("schedule"));
+}
+
+fn tcp_metadata(remote: SocketAddr, local: SocketAddr) -> hammer_adapter::RouteMetadata {
+    hammer_adapter::RouteMetadata {
+        network: hammer_adapter::Network::Tcp,
+        source: Some(hammer_adapter::SocksAddr::ip(remote.ip(), remote.port())),
+        destination: Some(hammer_adapter::SocksAddr::ip(local.ip(), local.port())),
+        ..hammer_adapter::RouteMetadata::default()
+    }
+}
+
+fn stamp_tcp_cursor(
+    runtime: &DataPlaneRuntime,
+    buffer: hammer_adapter::BufferIndex,
+    packet: &[u8],
+) {
+    let header_len = ((*packet.first().expect("IPv4 header") & 0x0f) as usize) * 4;
+    let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let tcp_header_len = ((packet[header_len + 12] >> 4) as usize) * 4;
+    runtime
+        .get_buffer_mut(buffer)
+        .expect("buffer mut")
+        .set_packet_cursor(
+            hammer_adapter::BufferPacketCursor::new()
+                .with_packet_len(packet_len)
+                .with_network_header(0, header_len)
+                .with_transport_header(header_len, tcp_header_len)
+                .with_transport_payload_offset(header_len + tcp_header_len),
+        );
+}
+
+fn tcp_packet(
+    remote: SocketAddr,
+    local: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    flags: TcpSegmentFlags,
+    capabilities: TcpCapabilities,
+) -> std::vec::Vec<u8> {
+    let remote_ip = match remote.ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => panic!("test helper expects IPv4"),
+    };
+    let local_ip = match local.ip() {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(_) => panic!("test helper expects IPv4"),
+    };
+    let mut tcp = vec![0u8; 60];
+    let options_len = hammer_core::protocol::tcp::write_tcp_segment_header(
+        &mut tcp,
+        hammer_core::protocol::tcp::TcpSegmentHeader {
+            source_port: remote.port(),
+            destination_port: local.port(),
+            sequence_number: sequence,
+            acknowledgment_number: acknowledgment,
+            flags,
+            advertised_window: u16::MAX,
+            capabilities,
+        },
+    )
+    .expect("tcp header");
+    tcp.truncate(options_len);
+
+    let total_len = 20 + tcp.len();
+    let mut packet = vec![0u8; total_len];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+    packet[8] = 64;
+    packet[9] = 6;
+    packet[12..16].copy_from_slice(&remote_ip.octets());
+    packet[16..20].copy_from_slice(&local_ip.octets());
+    packet[20..].copy_from_slice(&tcp);
+    packet
+}
+```
+
+- [ ] **Step 2: Run the failing success-path test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_valid_syn_ack_establishes_cancels_timer_sends_ack_and_completes_connect
+```
+
+Expected: FAIL because the existing `TcpSynSentNode` does not complete `Connected` and does not cancel the retransmit timer on success.
+
+- [ ] **Step 3: Implement success completion and timer cleanup**
+
+In `crates/hammer-service/src/session/app.rs`, add a connected completion helper:
+
+```rust
+pub fn complete_connected(&self, op: AppOpId) -> CoreResult<()> {
+    let Some(ring) = self.ring.as_ref() else {
+        return Ok(());
+    };
+    ring.try_push_completion(AppCqe::connected(None, op))
+}
+```
+
+In `crates/hammer-service/src/session/runtime.rs`, add:
+
+```rust
+pub(crate) fn complete_connected(&self, id: SessionId) -> CoreResult<bool> {
+    let Some(op) = self.session(id).and_then(SessionEntry::app_op) else {
+        return Ok(false);
+    };
+    self.app.complete_connected(op)?;
+    Ok(true)
+}
+```
+
+In `crates/hammer-service/src/transport/tcp/session.rs`, add a queue wrapper:
+
+```rust
+pub(crate) fn complete_connected(&self, session_id: SessionId) -> CoreResult<bool> {
+    self.driver.complete_connected(session_id)
+}
+```
+
+In `crates/hammer-service/src/transport/tcp/syn_sent.rs`, after `connection.set_state(TcpState::Established)` and before enqueueing the final ACK, complete the active-open app op and cancel retransmit:
+
+```rust
+connection.set_state(TcpState::Established);
+connection.tcp_timer_reset(TcpConnectionTimerKind::Retransmit);
+let (allocated, _, _) = alloc_tcp_segment_for_connection(
+    runtime.packet_buffers(),
+    connection,
+    packet.local,
+    TcpSegmentFlags::ACK,
+    0,
+)?;
+output_index = Some(allocated);
+let indexed = connection.clone();
+queue.index_session(session_id, &indexed);
+queue.cancel_retransmit_timer(session_id);
+queue.complete_connected(session_id)?;
+```
+
+Also tighten ACK acceptance for Hammer's no-TFO active open:
+
+```rust
+if !packet.flags.contains(TcpSegmentFlags::ACK)
+    || acknowledgment != connection.snd_nxt()
+{
+    return Err(CoreError::internal("syn-sent ACK is unacceptable"));
+}
+```
+
+- [ ] **Step 4: Run the success-path test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_valid_syn_ack_establishes_cancels_timer_sends_ack_and_completes_connect
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Add and run the options test**
+
+Add this test to `crates/hammer-service/tests/tcp_active_open.rs`:
+
+```rust
+#[test]
+fn tcp_syn_sent_syn_ack_options_update_output_payload_len_and_window_scale() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50003".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.30:443".parse().expect("remote");
+    let server_isn = 18_000;
+
+    let _started = TcpSessionProtocol::start_active_open(
+        handle,
+        TcpActiveOpenRequest {
+            app_op: None,
+            app_ring: None,
+            local,
+            remote,
+            iss: CLIENT_ISN,
+            capabilities: TcpCapabilities {
+                max_segment_size: Some(1_200),
+                window_scale: Some(7),
+                sack: true,
+                timestamps: false,
+                ecn: false,
+            },
+        },
+    )
+    .expect("start active open");
+
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let output_node = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&output)));
+    let drop_node = runtime.nodes().register_internal(hammer_service::data_plane::DropNode::new());
+    let syn_sent = runtime.nodes().register_internal(
+        hammer_service::transport::tcp::TcpSynSentNode::new(
+            hammer_service::transport::tcp::TcpSynSentNext::nodes(output_node, drop_node),
+        )
+        .with_session_queue(handle),
+    );
+
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        server_isn,
+        CLIENT_ISN + 1,
+        TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+        TcpCapabilities {
+            max_segment_size: Some(536),
+            window_scale: Some(3),
+            sack: true,
+            timestamps: false,
+            ecn: false,
+        },
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+
+    let packets = &output.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+}
+```
+
+Add this options state unit test to `crates/hammer-service/src/transport/tcp/syn_sent.rs`:
+
+```rust
+#[test]
+fn valid_syn_ack_options_update_output_payload_len_and_window_scale() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let handle = TcpSessionProtocol::register_queue(
+        DataWorkerId::new(0),
+        runtime.packet_buffers().clone(),
+    )
+    .expect("session queue");
+    let session_id = TcpSessionProtocol::with_queue(handle, |queue| {
+        let mut connection = TcpConnectionState::new(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            TcpState::SynSent,
+            LOCAL_PORT,
+            Some(local_addr()),
+            remote_addr(),
+        );
+        connection.set_local_capabilities(TcpCapabilities {
+            max_segment_size: Some(1_200),
+            window_scale: Some(7),
+            sack: true,
+            timestamps: false,
+            ecn: false,
+        });
+        connection.set_sequence_state(
+            CLIENT_ISN,
+            0,
+            CLIENT_ISN,
+            CLIENT_ISN + 1,
+            u16::MAX as u32,
+            0,
+            u16::MAX as u32,
+        );
+        let session_id = queue.insert_session(connection);
+        let indexed = queue.session_state(session_id).expect("session").clone();
+        queue.index_session(session_id, &indexed);
+        Ok(session_id)
+    })
+    .expect("insert session");
+
+    let output_state = Arc::new(Mutex::new(CaptureState::default()));
+    let output = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&output_state)));
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let syn_sent = runtime.nodes().register_internal(
+        TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
+    );
+
+    send_packet(
+        &runtime,
+        syn_sent,
+        tcp_packet_with_options(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            SERVER_ISN,
+            CLIENT_ISN + 1,
+            SYN | ACK,
+            TcpCapabilities {
+                max_segment_size: Some(536),
+                window_scale: Some(3),
+                sack: true,
+                timestamps: false,
+                ecn: false,
+            },
+        ),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue.session_state(session_id).expect("session");
+        assert_eq!(session.output_payload_len(), 536);
+        assert_eq!(session.effective_send_window_scale(), 3);
+        assert_eq!(session.effective_receive_window_scale(), 7);
+        assert!(session.negotiated_options().sack);
+        Ok(())
+    })
+    .expect("inspect session options");
+}
+```
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_syn_ack_options_update_output_payload_len_and_window_scale
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/hammer-service/src/session/app.rs crates/hammer-service/src/session/runtime.rs crates/hammer-service/src/transport/tcp/session.rs crates/hammer-service/src/transport/tcp/syn_sent.rs crates/hammer-service/tests/tcp_active_open.rs
+git commit -m "hammer-service(Feat): complete tcp syn-sent success path"
+```
+
+#### Task 3.1.4: Invalid ACK And RST Behavior
+
+**Why:** VPP follows RFC 793 SYN-SENT handling: unacceptable ACKs trigger RST unless the packet is already RST, acceptable RST reports refused, and malformed/non-SYN packets do not destroy the half-open state. Hammer currently returns an error to the drop path for invalid ACKs; it needs an explicit reset emission path for the unacceptable ACK case.
+
+- [ ] **Step 1: Add reset synthesis helper for reuse**
+
+Make `TcpResetNode`'s existing reset synthesis reusable without exposing node internals. In `crates/hammer-service/src/transport/tcp/reset.rs`, change:
+
+```rust
+fn tcp_synthesized_reset(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    metadata: &RouteMetadata,
+) -> Option<TcpSynthesizedReset> {
+```
+
+to:
+
+```rust
+pub(crate) fn tcp_synthesized_reset(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+    metadata: &RouteMetadata,
+) -> Option<TcpSynthesizedReset> {
+```
+
+Add this allocator helper below it:
+
+```rust
+pub(crate) fn alloc_synthesized_tcp_reset(
+    runtime: &DataPlaneRuntime,
+    index: BufferIndex,
+) -> CoreResult<Option<BufferIndex>> {
+    let metadata = runtime.metadata(index)?;
+    let Some(reset) = tcp_synthesized_reset(runtime, index, &metadata) else {
+        return Ok(None);
+    };
+    let reset_index = runtime
+        .packet_buffers()
+        .alloc_index_with_bytes(reset.metadata, &reset.packet)?;
+    Ok(Some(reset_index))
+}
+```
+
+- [ ] **Step 2: Add failing invalid ACK/RST tests**
+
+Add these tests to `crates/hammer-service/tests/tcp_active_open.rs`:
+
+```rust
+#[test]
+fn tcp_syn_sent_invalid_ack_emits_reset_and_keeps_half_open_when_not_rst() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50004".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.40:443".parse().expect("remote");
+    let started = start_test_active_open(handle, local, remote, None);
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let syn_sent = install_syn_sent_node(&runtime, handle, Arc::clone(&output));
+
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        19_000,
+        CLIENT_ISN,
+        TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+
+    let packets = &output.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    let reset = TcpSegmentView::parse(&packets[0]).expect("reset");
+    assert!(reset.flags().contains(TcpSegmentFlags::RST));
+    assert_eq!(reset.sequence_number(), CLIENT_ISN);
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue.session_state(started.session_id).expect("half-open");
+        assert_eq!(session.state(), TcpState::SynSent);
+        assert!(session.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+        Ok(())
+    })
+    .expect("inspect half-open");
+}
+
+#[test]
+fn tcp_syn_sent_rst_with_acceptable_ack_removes_session_and_completes_refused() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50005".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.50:443".parse().expect("remote");
+    let app_ring = hammer_runtime::app::AppRingHandle::new(4, 4);
+    let app_op = hammer_runtime::app::AppOpId::new(9_102);
+    let started = start_test_active_open(handle, local, remote, Some((app_op, app_ring.clone())));
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let syn_sent = install_syn_sent_node(&runtime, handle, Arc::clone(&output));
+
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        20_000,
+        CLIENT_ISN + 1,
+        TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 1);
+
+    assert!(output.lock().unwrap().packets.is_empty());
+    match app_ring.pop_completion().expect("refused completion").kind() {
+        hammer_runtime::app::AppCqeKind::Closed { op } => assert_eq!(*op, Some(app_op)),
+        other => panic!("expected closed completion, got {other:?}"),
+    }
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        assert!(queue.session_state(started.session_id).is_none());
+        assert_eq!(queue.session_id_by_tuple(local, remote), None);
+        Ok(())
+    })
+    .expect("inspect removed session");
+}
+
+#[test]
+fn tcp_syn_sent_rst_with_unacceptable_ack_drops_without_removing_session() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50006".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.60:443".parse().expect("remote");
+    let started = start_test_active_open(handle, local, remote, None);
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let syn_sent = install_syn_sent_node(&runtime, handle, Arc::clone(&output));
+
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        21_000,
+        CLIENT_ISN,
+        TcpSegmentFlags::RST | TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 1);
+
+    assert!(output.lock().unwrap().packets.is_empty());
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue.session_state(started.session_id).expect("half-open");
+        assert_eq!(session.state(), TcpState::SynSent);
+        assert!(session.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+        Ok(())
+    })
+    .expect("inspect half-open");
+}
+```
+
+Add these helpers:
+
+```rust
+fn start_test_active_open(
+    handle: hammer_service::session::SessionQueueHandle,
+    local: SocketAddr,
+    remote: SocketAddr,
+    app: Option<(hammer_runtime::app::AppOpId, hammer_runtime::app::AppRingHandle)>,
+) -> hammer_service::transport::tcp::TcpActiveOpenStarted {
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        queue.start_active_open(TcpActiveOpenRequest {
+            app_op: app.as_ref().map(|(op, _)| *op),
+            app_ring: app.map(|(_, ring)| ring),
+            local,
+            remote,
+            iss: CLIENT_ISN,
+            capabilities: TcpCapabilities::default(),
+        })
+    })
+    .expect("start active open")
+}
+
+fn install_syn_sent_node(
+    runtime: &DataPlaneRuntime,
+    handle: hammer_service::session::SessionQueueHandle,
+    output: Arc<Mutex<CaptureState>>,
+) -> NodeId {
+    let output_node = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(output));
+    let drop_node = runtime.nodes().register_internal(hammer_service::data_plane::DropNode::new());
+    runtime.nodes().register_internal(
+        hammer_service::transport::tcp::TcpSynSentNode::new(
+            hammer_service::transport::tcp::TcpSynSentNext::nodes(output_node, drop_node),
+        )
+        .with_session_queue(handle),
+    )
+}
+```
+
+- [ ] **Step 3: Run the failing invalid ACK/RST tests**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_invalid_ack_emits_reset_and_keeps_half_open_when_not_rst
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_rst_with_acceptable_ack_removes_session_and_completes_refused
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_rst_with_unacceptable_ack_drops_without_removing_session
+```
+
+Expected: the invalid ACK reset test FAILS until `TcpSynSentNode` emits synthesized resets; the acceptable RST test FAILS until RST cleanup cancels retransmit cleanly; the unacceptable RST test may already pass if current drop behavior preserves state.
+
+- [ ] **Step 4: Implement VPP/RFC SYN-SENT ACK and RST handling**
+
+In `crates/hammer-service/src/transport/tcp/syn_sent.rs`, import the reset helper:
+
+```rust
+use super::reset::alloc_synthesized_tcp_reset;
+```
+
+Refactor `tcp_syn_sent_index` so it distinguishes four outcomes:
+
+```rust
+enum SynSentAction {
+    Drop,
+    Output(BufferIndex),
+    Reset(BufferIndex),
+    Remove(SessionId),
+}
+```
+
+Use these rules inside the queue mutation:
+
+```rust
+let ack_present = packet.flags.contains(TcpSegmentFlags::ACK);
+let ack_acceptable = ack_present && acknowledgment == connection.snd_nxt();
+
+if ack_present && !ack_acceptable {
+    if packet.flags.contains(TcpSegmentFlags::RST) {
+        action = SynSentAction::Drop;
+    } else {
+        action = match alloc_synthesized_tcp_reset(runtime, index)? {
+            Some(reset) => SynSentAction::Reset(reset),
+            None => SynSentAction::Drop,
+        };
+    }
+    return Ok(());
+}
+
+if packet.flags.contains(TcpSegmentFlags::RST) {
+    queue.cancel_retransmit_timer(session_id);
+    remove_session = Some(session_id);
+    action = SynSentAction::Remove(session_id);
+    return Ok(());
+}
+
+if !packet.flags.contains(TcpSegmentFlags::SYN) || !ack_present {
+    action = SynSentAction::Drop;
+    return Ok(());
+}
+```
+
+When removing on acceptable RST, use `queue.cancel_retransmit_timer(session_id)` before `queue.close_session(session_id)?` so pending and active timer bits are cleared before the session is removed. Continue to complete the app op through the existing `close_session` path; this maps VPP `SESSION_E_REFUSED` to Hammer's current `Closed` CQE.
+
+When `SynSentAction::Reset(reset_index)` is selected, enqueue `reset_index` to the output next and free the original input packet. When `SynSentAction::Drop` is selected, free the original input packet without removing the session or touching the timer.
+
+- [ ] **Step 5: Run the invalid ACK/RST tests**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_invalid_ack_emits_reset_and_keeps_half_open_when_not_rst
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_rst_with_acceptable_ack_removes_session_and_completes_refused
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_rst_with_unacceptable_ack_drops_without_removing_session
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/hammer-service/src/transport/tcp/reset.rs crates/hammer-service/src/transport/tcp/syn_sent.rs crates/hammer-service/tests/tcp_active_open.rs
+git commit -m "hammer-service(Fix): align tcp syn-sent reset handling"
+```
+
+#### Task 3.1.4: Timer And Retransmission Polishing
+
+**Why:** VPP's active-open SYN timer does nothing after the connection leaves `SYN_SENT`, and timeout reports connect failure to the app. Hammer already suppresses output for non-`SynSent` states; this task locks that behavior down and ensures cancelled/stale expiries do not revive SYN emission.
+
+- [ ] **Step 1: Add the stale timer test**
+
+Add this test to `crates/hammer-service/tests/tcp_active_open.rs`:
+
+```rust
+#[test]
+fn tcp_syn_sent_stale_retransmit_timer_after_established_does_not_reemit_syn() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50007".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.70:443".parse().expect("remote");
+    let started = start_test_active_open(handle, local, remote, None);
+
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        queue.expire_timers_for_test(2).expect("force stale expiry");
+        Ok(())
+    })
+    .expect("force timer expiry");
+
+    let output = Arc::new(Mutex::new(CaptureState::default()));
+    let syn_sent = install_syn_sent_node(&runtime, handle, Arc::clone(&output));
+    send_tcp_packet(
+        &runtime,
+        syn_sent,
+        remote,
+        local,
+        22_000,
+        CLIENT_ISN + 1,
+        TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    assert_eq!(runtime.run_ready_nodes().expect("establish"), 2);
+    output.lock().unwrap().packets.clear();
+
+    let session_node = SessionQueueNode::new().expect("session queue node");
+    let output_node = runtime
+        .nodes()
+        .register_internal(CaptureNode::new(Arc::clone(&output)));
+    session_node
+        .attach_queue(
+            handle,
+            SessionQueueNext::from_node(output_node),
+            TcpSessionProtocol::session_queue_dispatch_fn(),
+        )
+        .expect("attach tcp queue");
+    let session_queue = runtime.nodes().register_driver(session_node);
+    runtime
+        .schedule_empty_frame(session_queue)
+        .expect("schedule session queue");
+    assert_eq!(runtime.run_ready_nodes().expect("run stale timer"), 1);
+
+    assert!(output.lock().unwrap().packets.is_empty());
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        let session = queue.session_state(started.session_id).expect("session");
+        assert_eq!(session.state(), TcpState::Established);
+        assert!(!session.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+        Ok(())
+    })
+    .expect("inspect session");
+}
+```
+
+- [ ] **Step 2: Run the stale timer test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_active_open tcp_syn_sent_stale_retransmit_timer_after_established_does_not_reemit_syn
+```
+
+Expected: PASS after Task 3.1.3 success-path timer cancellation. If it fails because `expire_timers_for_test` is test-only private, expose only a `#[cfg(test)]` helper on `TcpSessionQueue` already matching the existing `expire_timers_for_test` shape.
+
+- [ ] **Step 3: Keep existing SYN retransmit unit tests**
+
+Run the existing unit tests rather than moving them unless public API access is required:
+
+```bash
+cargo test -p hammer-service transport::tcp::session::tests::tcp_active_open_creates_syn_sent_session_and_emits_syn
+cargo test -p hammer-service transport::tcp::session::tests::tcp_active_open_retransmit_timer_reemits_syn
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/hammer-service/src/transport/tcp/session.rs crates/hammer-service/tests/tcp_active_open.rs
+git commit -m "hammer-service(Fix): suppress stale tcp syn retransmits"
+```
+
+#### Task 3.1.5: Input Dispatch For Active-Open Responses
+
+**Why:** VPP dispatches half-open response packets to `tcp4-syn-sent`/`tcp6-syn-sent` through half-open lookup, not listener lookup. Hammer already has `session_input_entry` and maps `TcpState::SynSent` to `TcpInputNext::SynSent`; this task adds public integration coverage so regressions do not send active-open responses to listen/reset/drop.
+
+- [ ] **Step 1: Add or update the dispatch test**
+
+Add this test to `crates/hammer-service/tests/tcp_input_nodes.rs` if it does not already exist:
+
+```rust
+#[test]
+fn tcp_input_routes_syn_sent_tuple_to_syn_sent_node() {
+    let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let worker = DataWorkerId::new(0);
+    let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
+        .expect("session queue");
+    let local: SocketAddr = "192.0.2.10:50008".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.80:443".parse().expect("remote");
+    TcpSessionProtocol::with_queue(handle, |queue| {
+        queue.start_active_open(TcpActiveOpenRequest {
+            app_op: None,
+            app_ring: None,
+            local,
+            remote,
+            iss: 81_000,
+            capabilities: TcpCapabilities::default(),
+        })?;
+        Ok(())
+    })
+    .expect("start active open");
+
+    let drop = runtime.nodes().register_internal(DropNode::new());
+    let listen = NodeId::new(101);
+    let rcv_process = NodeId::new(102);
+    let syn_sent = NodeId::new(103);
+    let established = NodeId::new(104);
+    let reset = NodeId::new(105);
+    let punt = NodeId::new(106);
+    let control = TcpInputControlPlane::new(TcpInputNext::nodes(
+        drop,
+        listen,
+        rcv_process,
+        syn_sent,
+        established,
+        reset,
+        punt,
+    ));
+    let mut node = control.node().with_session_queue(handle);
+    let packet = tcp_packet(
+        remote,
+        local,
+        23_000,
+        81_001,
+        TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+        TcpCapabilities::default(),
+    );
+    let index = runtime
+        .alloc_index_with_bytes(tcp_metadata(remote, local), &packet)
+        .expect("packet");
+    stamp_tcp_cursor(&runtime, index, &packet);
+    let frame = runtime.alloc_frame_index().expect("frame");
+    runtime
+        .get_frame_mut(frame)
+        .expect("frame mut")
+        .push_index(index)
+        .expect("push");
+
+    assert_eq!(
+        super::next_node_for_index(
+            &runtime,
+            index,
+            &TcpInputSnapshot::new(),
+            &TcpInputNext::nodes(drop, listen, rcv_process, syn_sent, established, reset, punt),
+            None,
+            Some(handle),
+        )
+        .expect("next"),
+        Some(syn_sent)
+    );
+}
+```
+
+If `next_node_for_index` remains private to the module's unit tests, put this assertion in the existing `#[cfg(test)] mod tests` in `crates/hammer-service/src/transport/tcp/input.rs` instead, using the same setup. The behavior under test is the important part: existing `SynSent` tuple resolves to `TcpInputNext::SynSent` before listener lookup.
+
+- [ ] **Step 2: Run the dispatch test**
+
+Run:
+
+```bash
+cargo test -p hammer-service --test tcp_input_nodes tcp_input_routes_syn_sent_tuple_to_syn_sent_node
+```
+
+Expected: PASS if the test lives in integration tests. If it lives in the module unit tests instead, run:
+
+```bash
+cargo test -p hammer-service transport::tcp::input::tests::tcp_input_routes_syn_sent_tuple_to_syn_sent_node
+```
+
+Expected: PASS.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/hammer-service/src/transport/tcp/input.rs crates/hammer-service/tests/tcp_input_nodes.rs
+git commit -m "hammer-service(Test): cover tcp syn-sent input dispatch"
+```
+
+#### Task 3.1.6: Verification And Commit
+
+- [ ] **Step 1: Run active-open focused tests**
+
+```bash
+cargo test -p hammer-service --test tcp_active_open
+```
+
+Expected: PASS.
+
+- [ ] **Step 2: Run related TCP dispatch and receive tests**
+
+```bash
+cargo test -p hammer-service --test tcp_input_nodes
+cargo test -p hammer-service --test tcp_established_receive
+```
+
+Expected: PASS.
+
+- [ ] **Step 3: Run app ring completion coverage**
+
+```bash
+cargo test -p hammer-runtime --test app_ring app_ring_connected_completion_round_trips_descriptor
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Run existing active-open unit coverage**
+
+```bash
+cargo test -p hammer-service transport::tcp::session::tests::tcp_active_open_creates_syn_sent_session_and_emits_syn
+cargo test -p hammer-service transport::tcp::session::tests::tcp_active_open_retransmit_timer_reemits_syn
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Format changed Rust code**
+
+```bash
+cargo fmt --all
+```
+
+Expected: exits 0 with no formatting errors.
+
+- [ ] **Step 6: Commit final cleanup if formatting changed files**
+
+```bash
+git add crates/hammer-runtime/src/app crates/hammer-runtime/tests/app_ring.rs crates/hammer-service/src/session crates/hammer-service/src/transport/tcp crates/hammer-service/tests/tcp_active_open.rs crates/hammer-service/tests/tcp_input_nodes.rs
+git commit -m "hammer-service(Feat): complete tcp active open"
+```
 
 ### Feature Group 3.2: Close State Machine
 

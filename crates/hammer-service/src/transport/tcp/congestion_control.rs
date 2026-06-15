@@ -36,7 +36,7 @@ impl TcpCongestionControlNode {
     ) -> CoreResult<()> {
         let bytes_in_flight =
             tcp_seq_distance(observation.accepted_acknowledgment, connection.snd_nxt());
-        connection.congestion_mut().on_ack(TcpCongestionAckSample {
+        connection.observe_congestion_ack(TcpCongestionAckSample {
             bytes_acked: observation.bytes_acked,
             rtt: observation.rtt,
             now: observation.now,
@@ -49,14 +49,11 @@ impl TcpCongestionControlNode {
         connection: &mut TcpConnectionState,
         observation: TcpCongestionSendObservation,
     ) -> CoreResult<()> {
-        connection
-            .congestion_mut()
-            .on_packet_sent(observation.bytes_sent, observation.bytes_in_flight);
-        let next_output_at = connection
-            .congestion()
-            .next_send_delay(observation.bytes_sent)
-            .map(|delay| observation.now + delay);
-        connection.set_next_output_at(next_output_at);
+        connection.observe_congestion_send(
+            observation.bytes_sent,
+            observation.bytes_in_flight,
+            observation.now,
+        );
         Ok(())
     }
 
@@ -64,8 +61,7 @@ impl TcpCongestionControlNode {
         connection: &mut TcpConnectionState,
         observation: TcpCongestionLossObservation,
     ) -> CoreResult<()> {
-        connection.congestion_mut().on_loss(observation.bytes_lost);
-        connection.set_next_output_at(None);
+        connection.observe_congestion_loss(observation.bytes_lost);
         Ok(())
     }
 }

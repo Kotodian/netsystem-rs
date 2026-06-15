@@ -157,6 +157,20 @@ pub(crate) trait SessionQueueProtocol<S> {
     ) -> CoreResult<()>;
 }
 
+pub(crate) trait SessionStateFactory<S> {
+    fn build(self, session_id: SessionId) -> S;
+}
+
+impl<S, F> SessionStateFactory<S> for F
+where
+    F: FnOnce(SessionId) -> S,
+{
+    #[inline]
+    fn build(self, session_id: SessionId) -> S {
+        self(session_id)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SessionEntry<S> {
     app_op: Option<AppOpId>,
@@ -244,6 +258,21 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
+    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> SessionId
+    where
+        F: SessionStateFactory<S>,
+    {
+        let index = self
+            .entries
+            .insert_with(|index| {
+                let session_id = SessionId::from(index);
+                SessionEntry::new(f.build(session_id))
+            })
+            .expect("session pool capacity exhausted");
+        SessionId::from(index)
+    }
+
+    #[inline]
     pub(crate) fn session(&self, id: SessionId) -> Option<&SessionEntry<S>> {
         self.entries.get(id.pool_index())
     }
@@ -261,6 +290,11 @@ impl<S> SessionDriverRuntime<S> {
     #[inline]
     pub(crate) fn session_state_mut(&mut self, id: SessionId) -> Option<&mut S> {
         self.session_mut(id).map(SessionEntry::state_mut)
+    }
+
+    pub(crate) fn replace_session_state(&mut self, id: SessionId, state: S) -> Option<S> {
+        let entry = self.session_mut(id)?;
+        Some(std::mem::replace(entry.state_mut(), state))
     }
 
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<SessionEntry<S>> {

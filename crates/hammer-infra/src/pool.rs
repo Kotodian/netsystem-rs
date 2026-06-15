@@ -116,6 +116,19 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     }
 
     #[inline]
+    pub fn insert_with(&mut self, f: impl FnOnce(Index) -> T) -> Option<Index> {
+        let slot = self.free.pop()?;
+        let slot_index = slot as usize;
+        let generation = self.generations[slot_index].wrapping_add(1).max(1);
+        self.generations[slot_index] = generation;
+        self.allocated[slot_index] = true;
+        self.len += 1;
+        let index = Index { slot, generation };
+        unsafe { self.slot_ptr_unchecked(slot_index).write(f(index)) };
+        Some(index)
+    }
+
+    #[inline]
     pub fn get(&self, index: Index) -> Option<&T> {
         self.validate(index)
             .map(|slot| unsafe { &*self.slot_ptr_unchecked(slot) })

@@ -5,8 +5,6 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
 
-use super::connection::TcpConnectionState;
-
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -149,41 +147,30 @@ pub const fn tcp_effective_output_payload_len(peer_max_segment_size: Option<u16>
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TcpOutputSendView {
-    pub snd_una: u32,
-    pub snd_nxt: u32,
-    pub snd_wnd: u32,
-    pub congestion_window: u32,
-}
-
-impl TcpOutputSendView {
-    #[inline]
-    pub fn from_connection(connection: &TcpConnectionState) -> Self {
-        Self {
-            snd_una: connection.snd_una(),
-            snd_nxt: connection.snd_nxt(),
-            snd_wnd: connection.snd_wnd(),
-            congestion_window: connection.congestion().congestion_window(),
-        }
-    }
-}
-
 #[inline]
-pub fn tcp_available_send_window(view: TcpOutputSendView) -> u32 {
-    view.snd_wnd
-        .min(view.congestion_window)
-        .saturating_sub(tcp_inflight_sequence_len(view.snd_una, view.snd_nxt))
+pub fn tcp_available_send_window(
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_wnd: u32,
+    congestion_window: u32,
+) -> u32 {
+    snd_wnd
+        .min(congestion_window)
+        .saturating_sub(tcp_inflight_sequence_len(snd_una, snd_nxt))
 }
 
 #[inline]
 pub fn tcp_payload_len_in_send_window(
-    view: TcpOutputSendView,
+    snd_una: u32,
+    snd_nxt: u32,
+    snd_wnd: u32,
+    congestion_window: u32,
     requested_payload_len: usize,
     control_len: u32,
 ) -> usize {
     let available_payload_len =
-        tcp_available_send_window(view).saturating_sub(control_len) as usize;
+        tcp_available_send_window(snd_una, snd_nxt, snd_wnd, congestion_window)
+            .saturating_sub(control_len) as usize;
     available_payload_len.min(requested_payload_len)
 }
 
@@ -196,35 +183,6 @@ pub const fn tcp_output_sequence_len(flags: u8, payload_len: usize) -> u32 {
 #[inline]
 pub fn tcp_output_next_sequence(sequence: u32, sequence_len: u32) -> u32 {
     TcpSeq::new(sequence).advance(sequence_len).raw()
-}
-
-#[inline]
-pub(crate) fn tcp_output_sequence(connection: &TcpConnectionState, flags: u8) -> u32 {
-    if flags & TCP_FLAG_SYN != 0 && connection.iss() != 0 {
-        connection.iss()
-    } else if connection.snd_nxt() != 0 {
-        connection.snd_nxt()
-    } else if connection.snd_una() != 0 {
-        connection.snd_una()
-    } else if connection.iss() != 0 {
-        TcpSeq::new(connection.iss()).advance(1).raw()
-    } else {
-        1
-    }
-}
-
-#[inline]
-pub(crate) fn tcp_output_acknowledgment(connection: &TcpConnectionState, flags: u8) -> u32 {
-    if flags & TCP_FLAG_ACK == 0 {
-        return 0;
-    }
-    if connection.rcv_nxt() != 0 {
-        connection.rcv_nxt()
-    } else if connection.irs() != 0 {
-        TcpSeq::new(connection.irs()).advance(1).raw()
-    } else {
-        1
-    }
 }
 
 #[inline]

@@ -90,16 +90,16 @@ pub fn tcp_control_metadata(local: SocketAddr, remote: SocketAddr) -> RouteMetad
     }
 }
 
-pub fn emit_tcp_control_packet(
+pub fn queue_tcp_control_packet(
     buffers: &DataPlaneBuffers,
     packet: &[u8],
     metadata: RouteMetadata,
-    emit: impl FnOnce(&DataPlaneBuffers, BufferIndex) -> CoreResult<()>,
+    enqueue: fn(&DataPlaneBuffers, BufferIndex) -> CoreResult<()>,
 ) -> CoreResult<()> {
     let index = buffers.alloc_index_with_bytes(metadata, packet)?;
     let result = (|| {
         set_ipv4_tcp_cursor(buffers, index, packet)?;
-        emit(buffers, index)
+        enqueue(buffers, index)
     })();
     buffers.free_index(index);
     result

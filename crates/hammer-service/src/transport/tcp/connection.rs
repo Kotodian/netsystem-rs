@@ -2,16 +2,19 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use hammer_adapter::DataWorkerId;
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpNegotiatedOptions, TcpSeq};
-
-use super::TcpState;
-use super::congestion::TcpCongestionState;
-use super::output::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputSendView, tcp_effective_output_payload_len,
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSegmentHeader,
+    TcpState,
 };
 
-const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
-const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
+use super::TcpInputNext;
+use super::congestion::{TcpCongestionAckSample, TcpCongestionState};
+use super::state_machine::{
+    CloseWait, Closed, Closing, Established, FinWait1, FinWait2, LastAck, Listen, SynRcvd, SynSent,
+    TcpPhase, TcpRootPhase, TcpStateMachine, TimeWait,
+};
+
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const TCP_CONNECTION_TIMER_RETRANSMIT_BIT: u8 = 1 << 0;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
@@ -25,7 +28,7 @@ pub enum TcpConnectionTimerKind {
 
 impl TcpConnectionTimerKind {
     #[inline(always)]
-    const fn bit(self) -> u8 {
+    pub(super) const fn bit(self) -> u8 {
         match self {
             Self::Retransmit => TCP_CONNECTION_TIMER_RETRANSMIT_BIT,
         }
@@ -73,15 +76,15 @@ impl TcpRetransmitTimeoutState {
         }
         match (self.srtt, self.rttvar) {
             (Some(srtt), Some(rttvar)) => {
-                let rtt_delta = duration_abs_diff(srtt, rtt);
-                let next_rttvar = duration_weighted_average(rttvar, 3, rtt_delta, 1, 4);
-                let next_srtt = duration_weighted_average(srtt, 7, rtt, 1, 8);
+                let rtt_delta = srtt.abs_diff(rtt);
+                let next_rttvar = (rttvar * 3 + rtt_delta) / 4;
+                let next_srtt = (srtt * 7 + rtt) / 8;
                 self.srtt = Some(next_srtt);
                 self.rttvar = Some(next_rttvar);
             }
             _ => {
                 self.srtt = Some(rtt);
-                self.rttvar = Some(duration_div(rtt, 2));
+                self.rttvar = Some(rtt / 2);
             }
         }
         self.rto = retransmit_timeout_from_estimate(
@@ -95,7 +98,7 @@ impl TcpRetransmitTimeoutState {
 
     #[inline]
     pub fn on_retransmission_timeout(&mut self) -> Duration {
-        self.rto = clamp_retransmit_timeout(duration_mul(self.rto, 2));
+        self.rto = clamp_retransmit_timeout(self.rto * 2);
         self.skip_next_sample = true;
         self.rto
     }
@@ -141,7 +144,7 @@ impl TcpConnectionOptionState {
     }
 
     #[inline]
-    pub fn set_local_capabilities(
+    pub(super) fn set_local_capabilities(
         &mut self,
         capabilities: TcpCapabilities,
     ) -> TcpNegotiatedOptions {
@@ -151,7 +154,7 @@ impl TcpConnectionOptionState {
     }
 
     #[inline]
-    pub fn apply_peer_handshake_capabilities(
+    pub(super) fn apply_peer_handshake_capabilities(
         &mut self,
         capabilities: TcpCapabilities,
     ) -> TcpNegotiatedOptions {
@@ -197,7 +200,32 @@ impl Default for TcpConnectionOptionState {
 }
 
 #[derive(Debug, Clone)]
-pub struct TcpConnectionState {
+pub struct TcpConnection<S> {
+    connection_id: Option<TcpConnectionId>,
+    owner_worker: DataWorkerId,
+    local_port: u16,
+    local: Option<SocketAddr>,
+    remote: SocketAddr,
+    machine: TcpStateMachine<S>,
+}
+
+#[derive(Debug, Clone)]
+pub enum TcpConnectionState {
+    Closed(TcpConnection<Closed>),
+    Listen(TcpConnection<Listen>),
+    SynSent(TcpConnection<SynSent>),
+    SynRcvd(TcpConnection<SynRcvd>),
+    Established(TcpConnection<Established>),
+    CloseWait(TcpConnection<CloseWait>),
+    LastAck(TcpConnection<LastAck>),
+    FinWait1(TcpConnection<FinWait1>),
+    FinWait2(TcpConnection<FinWait2>),
+    Closing(TcpConnection<Closing>),
+    TimeWait(TcpConnection<TimeWait>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpConnectionView {
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
     state: TcpState,
@@ -211,174 +239,303 @@ pub struct TcpConnectionState {
     snd_wnd: u32,
     rcv_nxt: u32,
     rcv_wnd: u32,
-    options: TcpConnectionOptionState,
-    output_payload_len: usize,
-    retransmit_timeout: TcpRetransmitTimeoutState,
-    congestion: TcpCongestionState,
-    active_timers: u8,
-    pending_timers: u8,
-    next_output_at: Option<Instant>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpConnectionView {
-    pub connection_id: Option<TcpConnectionId>,
-    pub owner_worker: DataWorkerId,
-    pub state: TcpState,
-    pub local_port: u16,
-    pub local: Option<SocketAddr>,
-    pub remote: SocketAddr,
-    pub iss: u32,
-    pub irs: u32,
-    pub snd_una: u32,
-    pub snd_nxt: u32,
-    pub snd_wnd: u32,
-    pub rcv_nxt: u32,
-    pub rcv_wnd: u32,
-}
-
-impl TcpConnectionState {
+impl TcpConnectionView {
     #[inline]
-    pub fn new(
-        connection_id: Option<TcpConnectionId>,
-        owner_worker: DataWorkerId,
-        state: TcpState,
-        local_port: u16,
-        local: Option<SocketAddr>,
-        remote: SocketAddr,
-    ) -> Self {
-        Self {
-            connection_id,
-            owner_worker,
-            state,
-            local_port,
-            local,
-            remote,
-            iss: 0,
-            irs: 0,
-            snd_una: 0,
-            snd_nxt: 0,
-            snd_wnd: DEFAULT_TCP_WINDOW,
-            rcv_nxt: 0,
-            rcv_wnd: DEFAULT_TCP_WINDOW,
-            options: TcpConnectionOptionState::default(),
-            output_payload_len: tcp_effective_output_payload_len(None),
-            retransmit_timeout: TcpRetransmitTimeoutState::new(),
-            congestion: TcpCongestionState::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
-            active_timers: 0,
-            pending_timers: 0,
-            next_output_at: None,
-        }
-    }
-
-    #[inline]
-    pub fn connection_id(&self) -> Option<TcpConnectionId> {
+    pub const fn connection_id(self) -> Option<TcpConnectionId> {
         self.connection_id
     }
 
     #[inline]
-    pub fn set_connection_id(&mut self, connection_id: TcpConnectionId) {
-        self.connection_id = Some(connection_id);
-    }
-
-    #[inline]
-    pub fn owner_worker(&self) -> DataWorkerId {
+    pub const fn owner_worker(self) -> DataWorkerId {
         self.owner_worker
     }
 
     #[inline]
-    pub fn state(&self) -> TcpState {
+    pub const fn state(self) -> TcpState {
         self.state
     }
 
     #[inline]
-    pub fn local_port(&self) -> u16 {
+    pub const fn local_port(self) -> u16 {
         self.local_port
     }
 
     #[inline]
-    pub fn local(&self) -> Option<SocketAddr> {
+    pub const fn local(self) -> Option<SocketAddr> {
         self.local
     }
 
     #[inline]
-    pub fn remote(&self) -> SocketAddr {
+    pub const fn remote(self) -> SocketAddr {
         self.remote
     }
 
     #[inline]
-    pub fn iss(&self) -> u32 {
+    pub const fn iss(self) -> u32 {
         self.iss
     }
 
     #[inline]
-    pub fn irs(&self) -> u32 {
+    pub const fn irs(self) -> u32 {
         self.irs
     }
 
     #[inline]
-    pub fn snd_una(&self) -> u32 {
+    pub const fn snd_una(self) -> u32 {
         self.snd_una
     }
 
     #[inline]
-    pub fn snd_nxt(&self) -> u32 {
+    pub const fn snd_nxt(self) -> u32 {
         self.snd_nxt
     }
 
     #[inline]
-    pub fn snd_wnd(&self) -> u32 {
+    pub const fn snd_wnd(self) -> u32 {
         self.snd_wnd
     }
 
     #[inline]
-    pub fn rcv_nxt(&self) -> u32 {
+    pub const fn rcv_nxt(self) -> u32 {
         self.rcv_nxt
     }
 
     #[inline]
-    pub fn rcv_wnd(&self) -> u32 {
+    pub const fn rcv_wnd(self) -> u32 {
         self.rcv_wnd
     }
+}
 
-    #[inline]
-    pub fn output_payload_len(&self) -> usize {
-        self.output_payload_len
+impl<S: TcpRootPhase> TcpConnection<S> {
+    pub fn new(
+        connection_id: Option<TcpConnectionId>,
+        owner_worker: DataWorkerId,
+        local_port: u16,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+    ) -> Self {
+        let machine: TcpStateMachine<S> = TcpStateMachine::new();
+        Self::from_parts(
+            connection_id,
+            owner_worker,
+            local_port,
+            local,
+            remote,
+            machine,
+        )
     }
+}
 
+impl<S: TcpPhase> TcpConnection<S> {
     #[inline]
-    pub fn apply_peer_max_segment_size(&mut self, max_segment_size: Option<u16>) {
-        if let Some(max_segment_size) =
-            max_segment_size.filter(|max_segment_size| *max_segment_size != 0)
-        {
-            self.output_payload_len = tcp_effective_output_payload_len(Some(max_segment_size));
-            self.congestion = TcpCongestionState::new(u32::from(max_segment_size));
+    pub(super) fn from_parts(
+        connection_id: Option<TcpConnectionId>,
+        owner_worker: DataWorkerId,
+        local_port: u16,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        machine: TcpStateMachine<S>,
+    ) -> Self {
+        Self {
+            connection_id,
+            owner_worker,
+            local_port,
+            local,
+            remote,
+            machine,
         }
     }
 
     #[inline]
-    pub fn option_state(&self) -> &TcpConnectionOptionState {
-        &self.options
+    pub(super) fn into_metadata(
+        self,
+    ) -> (
+        Option<TcpConnectionId>,
+        DataWorkerId,
+        u16,
+        Option<SocketAddr>,
+        SocketAddr,
+        TcpStateMachine<S>,
+    ) {
+        (
+            self.connection_id,
+            self.owner_worker,
+            self.local_port,
+            self.local,
+            self.remote,
+            self.machine,
+        )
     }
 
     #[inline]
-    pub fn option_state_mut(&mut self) -> &mut TcpConnectionOptionState {
-        &mut self.options
+    pub const fn tcp_state(&self) -> TcpState {
+        self.machine.tcp_state()
+    }
+
+    #[inline]
+    pub const fn state(&self) -> TcpState {
+        self.tcp_state()
+    }
+
+    #[inline]
+    pub const fn next_node(&self) -> TcpInputNext {
+        self.machine.next_node()
+    }
+
+    #[inline]
+    pub const fn connection_id(&self) -> Option<TcpConnectionId> {
+        self.connection_id
+    }
+
+    #[inline]
+    pub const fn owner_worker(&self) -> DataWorkerId {
+        self.owner_worker
+    }
+
+    #[inline]
+    pub const fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    #[inline]
+    pub const fn local(&self) -> Option<SocketAddr> {
+        self.local
+    }
+
+    #[inline]
+    pub const fn remote(&self) -> SocketAddr {
+        self.remote
+    }
+
+    #[inline]
+    pub const fn iss(&self) -> u32 {
+        self.machine.iss()
+    }
+
+    #[inline]
+    pub const fn irs(&self) -> u32 {
+        self.machine.irs()
+    }
+
+    #[inline]
+    pub const fn snd_una(&self) -> u32 {
+        self.machine.snd_una()
+    }
+
+    #[inline]
+    pub const fn snd_nxt(&self) -> u32 {
+        self.machine.snd_nxt()
+    }
+
+    #[inline]
+    pub const fn snd_wnd(&self) -> u32 {
+        self.machine.snd_wnd()
+    }
+
+    #[inline]
+    pub const fn rcv_nxt(&self) -> u32 {
+        self.machine.rcv_nxt()
+    }
+
+    #[inline]
+    pub const fn rcv_wnd(&self) -> u32 {
+        self.machine.rcv_wnd()
+    }
+
+    #[inline]
+    pub fn close_reason(&self) -> Option<TcpCloseReason> {
+        self.machine.close_reason()
     }
 
     #[inline]
     pub fn local_capabilities(&self) -> TcpCapabilities {
-        self.options.local_capabilities()
+        self.machine.local_capabilities()
     }
 
     #[inline]
     pub fn remote_capabilities(&self) -> Option<TcpCapabilities> {
-        self.options.remote_capabilities()
+        self.machine.remote_capabilities()
     }
 
     #[inline]
     pub fn negotiated_options(&self) -> TcpNegotiatedOptions {
-        self.options.negotiated_options()
+        self.machine.negotiated_options()
+    }
+
+    #[inline]
+    pub fn effective_send_window_scale(&self) -> u8 {
+        self.machine.effective_send_window_scale()
+    }
+
+    #[inline]
+    pub fn effective_receive_window_scale(&self) -> u8 {
+        self.machine.effective_receive_window_scale()
+    }
+
+    #[inline]
+    pub fn effective_send_window(&self, advertised_window: u32) -> u32 {
+        self.machine.effective_send_window(advertised_window)
+    }
+
+    #[inline]
+    pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
+        self.machine.advertised_receive_window(receive_window)
+    }
+
+    #[inline]
+    pub fn output_payload_len(&self) -> usize {
+        self.machine.output_payload_len()
+    }
+
+    #[inline]
+    pub fn congestion(&self) -> &TcpCongestionState {
+        self.machine.congestion()
+    }
+
+    #[inline]
+    pub fn retransmit_timeout(&self) -> &TcpRetransmitTimeoutState {
+        self.machine.retransmit_timeout()
+    }
+
+    #[inline]
+    pub const fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.machine.tcp_timer_is_active(timer)
+    }
+
+    #[inline]
+    pub const fn tcp_timer_is_pending(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.machine.tcp_timer_is_pending(timer)
+    }
+
+    #[inline]
+    pub const fn tcp_timer_is_live(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.machine.tcp_timer_is_live(timer)
+    }
+
+    #[inline]
+    pub const fn next_output_at(&self) -> Option<Instant> {
+        self.machine.next_output_at()
+    }
+
+    #[inline]
+    pub(super) fn view(&self) -> TcpConnectionView {
+        TcpConnectionView {
+            connection_id: self.connection_id,
+            owner_worker: self.owner_worker,
+            state: self.tcp_state(),
+            local_port: self.local_port,
+            local: self.local,
+            remote: self.remote,
+            iss: self.iss(),
+            irs: self.irs(),
+            snd_una: self.snd_una(),
+            snd_nxt: self.snd_nxt(),
+            snd_wnd: self.snd_wnd(),
+            rcv_nxt: self.rcv_nxt(),
+            rcv_wnd: self.rcv_wnd(),
+        }
     }
 
     #[inline]
@@ -386,106 +543,450 @@ impl TcpConnectionState {
         &mut self,
         capabilities: TcpCapabilities,
     ) -> TcpNegotiatedOptions {
-        self.options.set_local_capabilities(capabilities)
+        self.machine.configure_local_capabilities(capabilities)
     }
 
     #[inline]
-    pub fn apply_peer_handshake_capabilities(
-        &mut self,
-        capabilities: TcpCapabilities,
-    ) -> TcpNegotiatedOptions {
-        let negotiated = self.options.apply_peer_handshake_capabilities(capabilities);
-        self.apply_peer_max_segment_size(negotiated.send_max_segment_size);
-        negotiated
+    pub fn observe_congestion_ack(&mut self, sample: TcpCongestionAckSample) {
+        self.machine.observe_congestion_ack(sample);
     }
 
     #[inline]
-    pub fn effective_send_window_scale(&self) -> u8 {
-        self.options.effective_send_window_scale()
+    pub fn observe_congestion_send(&mut self, bytes_sent: u32, bytes_in_flight: u32, now: Instant) {
+        self.machine
+            .observe_congestion_send(bytes_sent, bytes_in_flight, now);
     }
 
     #[inline]
-    pub fn effective_receive_window_scale(&self) -> u8 {
-        self.options.effective_receive_window_scale()
+    pub fn observe_congestion_loss(&mut self, bytes_lost: u32) {
+        self.machine.observe_congestion_loss(bytes_lost);
     }
 
     #[inline]
-    pub fn effective_send_window(&self, advertised_window: u32) -> u32 {
-        self.options.effective_send_window(advertised_window)
-    }
-
-    #[inline]
-    pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
-        self.options.advertised_receive_window(receive_window)
-    }
-
-    #[inline]
-    pub fn congestion(&self) -> &TcpCongestionState {
-        &self.congestion
-    }
-
-    #[inline]
-    pub fn congestion_mut(&mut self) -> &mut TcpCongestionState {
-        &mut self.congestion
-    }
-
-    #[inline]
-    pub fn retransmit_timeout(&self) -> &TcpRetransmitTimeoutState {
-        &self.retransmit_timeout
-    }
-
-    #[inline]
-    pub fn retransmit_timeout_mut(&mut self) -> &mut TcpRetransmitTimeoutState {
-        &mut self.retransmit_timeout
+    pub fn schedule_next_output(&mut self, deadline: Option<Instant>) {
+        self.machine.schedule_next_output(deadline);
     }
 
     #[inline]
     pub fn tcp_timer_set(&mut self, timer: TcpConnectionTimerKind) {
-        self.active_timers |= timer.bit();
+        self.machine.arm_tcp_timer(timer);
     }
 
     #[inline]
     pub fn tcp_timer_reset(&mut self, timer: TcpConnectionTimerKind) {
-        let bit = timer.bit();
-        self.active_timers &= !bit;
-        self.pending_timers &= !bit;
+        self.machine.reset_tcp_timer(timer);
     }
 
     #[inline]
     pub fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
-        let bit = timer.bit();
-        self.active_timers &= !bit;
-        self.pending_timers |= bit;
+        self.machine.expire_tcp_timer(timer);
     }
 
     #[inline]
     pub fn tcp_timer_take_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
-        let bit = timer.bit();
-        if self.pending_timers & bit == 0 {
-            return false;
-        }
-        self.pending_timers &= !bit;
-        true
+        self.machine.take_pending_tcp_timer(timer)
     }
 
     #[inline]
     pub fn tcp_timer_dispatch_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
-        let bit = timer.bit();
-        if self.pending_timers & bit == 0 {
-            return false;
+        self.machine.dispatch_pending_tcp_timer(timer)
+    }
+
+    #[inline]
+    pub fn observe_retransmit_timeout(&mut self) -> Duration {
+        self.machine.observe_retransmit_timeout()
+    }
+
+    #[inline]
+    pub fn syn_header(&self) -> CoreResult<TcpSegmentHeader> {
+        let local = self
+            .local
+            .ok_or_else(|| CoreError::internal("syn-sent tcp session missing local address"))?;
+        Ok(self.machine.syn_header(local.port(), self.remote.port()))
+    }
+}
+
+impl TcpConnection<Closed> {
+    #[inline]
+    pub fn connect(self, initial_sequence: u32) -> TcpConnection<SynSent> {
+        let (connection_id, owner_worker, local_port, local, remote, machine) =
+            self.into_metadata();
+        let next = machine.connect(initial_sequence);
+        TcpConnection::from_parts(connection_id, owner_worker, local_port, local, remote, next)
+    }
+}
+
+impl TcpConnectionState {
+    #[cfg(test)]
+    pub(crate) fn established_for_test(
+        connection_id: Option<TcpConnectionId>,
+        owner_worker: DataWorkerId,
+        local_port: u16,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+    ) -> Self {
+        let connection: TcpConnection<Listen> =
+            TcpConnection::new(connection_id, owner_worker, local_port, local, remote);
+        let (connection_id, owner_worker, local_port, local, remote, machine) =
+            connection.into_metadata();
+        let machine = machine.on_syn(7_000, u16::MAX, TcpCapabilities::default());
+        let final_ack = machine.snd_nxt();
+        let machine = machine.on_final_ack(final_ack, u16::MAX);
+        TcpConnection::from_parts(
+            connection_id,
+            owner_worker,
+            local_port,
+            local,
+            remote,
+            machine,
+        )
+        .into()
+    }
+
+    #[inline]
+    pub fn connection_id(&self) -> Option<TcpConnectionId> {
+        self.view().connection_id()
+    }
+
+    #[inline]
+    pub fn owner_worker(&self) -> DataWorkerId {
+        self.view().owner_worker()
+    }
+
+    #[inline]
+    pub fn state(&self) -> TcpState {
+        self.view().state()
+    }
+
+    #[inline]
+    pub fn next_node(&self) -> TcpInputNext {
+        match self {
+            Self::Closed(connection) => connection.next_node(),
+            Self::Listen(connection) => connection.next_node(),
+            Self::SynSent(connection) => connection.next_node(),
+            Self::SynRcvd(connection) => connection.next_node(),
+            Self::Established(connection) => connection.next_node(),
+            Self::CloseWait(connection) => connection.next_node(),
+            Self::LastAck(connection) => connection.next_node(),
+            Self::FinWait1(connection) => connection.next_node(),
+            Self::FinWait2(connection) => connection.next_node(),
+            Self::Closing(connection) => connection.next_node(),
+            Self::TimeWait(connection) => connection.next_node(),
         }
-        self.pending_timers &= !bit;
-        self.active_timers & bit == 0
+    }
+
+    #[inline]
+    pub fn local_port(&self) -> u16 {
+        self.view().local_port()
+    }
+
+    #[inline]
+    pub fn local(&self) -> Option<SocketAddr> {
+        self.view().local()
+    }
+
+    #[inline]
+    pub fn remote(&self) -> SocketAddr {
+        self.view().remote()
+    }
+
+    #[inline]
+    pub fn iss(&self) -> u32 {
+        self.view().iss()
+    }
+
+    #[inline]
+    pub fn irs(&self) -> u32 {
+        self.view().irs()
+    }
+
+    #[inline]
+    pub fn snd_una(&self) -> u32 {
+        self.view().snd_una()
+    }
+
+    #[inline]
+    pub fn snd_nxt(&self) -> u32 {
+        self.view().snd_nxt()
+    }
+
+    #[inline]
+    pub fn snd_wnd(&self) -> u32 {
+        self.view().snd_wnd()
+    }
+
+    #[inline]
+    pub fn rcv_nxt(&self) -> u32 {
+        self.view().rcv_nxt()
+    }
+
+    #[inline]
+    pub fn rcv_wnd(&self) -> u32 {
+        self.view().rcv_wnd()
+    }
+
+    #[inline]
+    pub fn close_reason(&self) -> Option<TcpCloseReason> {
+        match self {
+            Self::Closed(connection) => connection.close_reason(),
+            Self::Listen(connection) => connection.close_reason(),
+            Self::SynSent(connection) => connection.close_reason(),
+            Self::SynRcvd(connection) => connection.close_reason(),
+            Self::Established(connection) => connection.close_reason(),
+            Self::CloseWait(connection) => connection.close_reason(),
+            Self::LastAck(connection) => connection.close_reason(),
+            Self::FinWait1(connection) => connection.close_reason(),
+            Self::FinWait2(connection) => connection.close_reason(),
+            Self::Closing(connection) => connection.close_reason(),
+            Self::TimeWait(connection) => connection.close_reason(),
+        }
+    }
+
+    #[inline]
+    pub fn local_capabilities(&self) -> TcpCapabilities {
+        match self {
+            Self::Closed(connection) => connection.local_capabilities(),
+            Self::Listen(connection) => connection.local_capabilities(),
+            Self::SynSent(connection) => connection.local_capabilities(),
+            Self::SynRcvd(connection) => connection.local_capabilities(),
+            Self::Established(connection) => connection.local_capabilities(),
+            Self::CloseWait(connection) => connection.local_capabilities(),
+            Self::LastAck(connection) => connection.local_capabilities(),
+            Self::FinWait1(connection) => connection.local_capabilities(),
+            Self::FinWait2(connection) => connection.local_capabilities(),
+            Self::Closing(connection) => connection.local_capabilities(),
+            Self::TimeWait(connection) => connection.local_capabilities(),
+        }
+    }
+
+    #[inline]
+    pub fn remote_capabilities(&self) -> Option<TcpCapabilities> {
+        match self {
+            Self::Closed(connection) => connection.remote_capabilities(),
+            Self::Listen(connection) => connection.remote_capabilities(),
+            Self::SynSent(connection) => connection.remote_capabilities(),
+            Self::SynRcvd(connection) => connection.remote_capabilities(),
+            Self::Established(connection) => connection.remote_capabilities(),
+            Self::CloseWait(connection) => connection.remote_capabilities(),
+            Self::LastAck(connection) => connection.remote_capabilities(),
+            Self::FinWait1(connection) => connection.remote_capabilities(),
+            Self::FinWait2(connection) => connection.remote_capabilities(),
+            Self::Closing(connection) => connection.remote_capabilities(),
+            Self::TimeWait(connection) => connection.remote_capabilities(),
+        }
+    }
+
+    #[inline]
+    pub fn negotiated_options(&self) -> TcpNegotiatedOptions {
+        match self {
+            Self::Closed(connection) => connection.negotiated_options(),
+            Self::Listen(connection) => connection.negotiated_options(),
+            Self::SynSent(connection) => connection.negotiated_options(),
+            Self::SynRcvd(connection) => connection.negotiated_options(),
+            Self::Established(connection) => connection.negotiated_options(),
+            Self::CloseWait(connection) => connection.negotiated_options(),
+            Self::LastAck(connection) => connection.negotiated_options(),
+            Self::FinWait1(connection) => connection.negotiated_options(),
+            Self::FinWait2(connection) => connection.negotiated_options(),
+            Self::Closing(connection) => connection.negotiated_options(),
+            Self::TimeWait(connection) => connection.negotiated_options(),
+        }
+    }
+
+    #[inline]
+    pub fn effective_send_window_scale(&self) -> u8 {
+        self.negotiated_options()
+            .send_window_scale
+            .unwrap_or_default()
+            .min(TCP_MAX_WINDOW_SCALE)
+    }
+
+    #[inline]
+    pub fn effective_receive_window_scale(&self) -> u8 {
+        self.negotiated_options()
+            .receive_window_scale
+            .unwrap_or_default()
+            .min(TCP_MAX_WINDOW_SCALE)
+    }
+
+    #[inline]
+    pub fn effective_send_window(&self, advertised_window: u32) -> u32 {
+        scaled_window_from_advertised(advertised_window, self.effective_send_window_scale())
+    }
+
+    #[inline]
+    pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
+        advertised_window_from_receive(receive_window, self.effective_receive_window_scale())
+    }
+
+    #[inline]
+    pub fn output_payload_len(&self) -> usize {
+        match self {
+            Self::Closed(connection) => connection.output_payload_len(),
+            Self::Listen(connection) => connection.output_payload_len(),
+            Self::SynSent(connection) => connection.output_payload_len(),
+            Self::SynRcvd(connection) => connection.output_payload_len(),
+            Self::Established(connection) => connection.output_payload_len(),
+            Self::CloseWait(connection) => connection.output_payload_len(),
+            Self::LastAck(connection) => connection.output_payload_len(),
+            Self::FinWait1(connection) => connection.output_payload_len(),
+            Self::FinWait2(connection) => connection.output_payload_len(),
+            Self::Closing(connection) => connection.output_payload_len(),
+            Self::TimeWait(connection) => connection.output_payload_len(),
+        }
+    }
+
+    #[inline]
+    pub fn congestion(&self) -> &TcpCongestionState {
+        match self {
+            Self::Closed(connection) => connection.congestion(),
+            Self::Listen(connection) => connection.congestion(),
+            Self::SynSent(connection) => connection.congestion(),
+            Self::SynRcvd(connection) => connection.congestion(),
+            Self::Established(connection) => connection.congestion(),
+            Self::CloseWait(connection) => connection.congestion(),
+            Self::LastAck(connection) => connection.congestion(),
+            Self::FinWait1(connection) => connection.congestion(),
+            Self::FinWait2(connection) => connection.congestion(),
+            Self::Closing(connection) => connection.congestion(),
+            Self::TimeWait(connection) => connection.congestion(),
+        }
+    }
+
+    #[inline]
+    pub fn retransmit_timeout(&self) -> &TcpRetransmitTimeoutState {
+        match self {
+            Self::Closed(connection) => connection.retransmit_timeout(),
+            Self::Listen(connection) => connection.retransmit_timeout(),
+            Self::SynSent(connection) => connection.retransmit_timeout(),
+            Self::SynRcvd(connection) => connection.retransmit_timeout(),
+            Self::Established(connection) => connection.retransmit_timeout(),
+            Self::CloseWait(connection) => connection.retransmit_timeout(),
+            Self::LastAck(connection) => connection.retransmit_timeout(),
+            Self::FinWait1(connection) => connection.retransmit_timeout(),
+            Self::FinWait2(connection) => connection.retransmit_timeout(),
+            Self::Closing(connection) => connection.retransmit_timeout(),
+            Self::TimeWait(connection) => connection.retransmit_timeout(),
+        }
+    }
+
+    #[inline]
+    pub fn tcp_timer_set(&mut self, timer: TcpConnectionTimerKind) {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_set(timer),
+            Self::Listen(connection) => connection.tcp_timer_set(timer),
+            Self::SynSent(connection) => connection.tcp_timer_set(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_set(timer),
+            Self::Established(connection) => connection.tcp_timer_set(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_set(timer),
+            Self::LastAck(connection) => connection.tcp_timer_set(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_set(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_set(timer),
+            Self::Closing(connection) => connection.tcp_timer_set(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_set(timer),
+        }
+    }
+
+    #[inline]
+    pub fn tcp_timer_reset(&mut self, timer: TcpConnectionTimerKind) {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_reset(timer),
+            Self::Listen(connection) => connection.tcp_timer_reset(timer),
+            Self::SynSent(connection) => connection.tcp_timer_reset(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_reset(timer),
+            Self::Established(connection) => connection.tcp_timer_reset(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_reset(timer),
+            Self::LastAck(connection) => connection.tcp_timer_reset(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_reset(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_reset(timer),
+            Self::Closing(connection) => connection.tcp_timer_reset(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_reset(timer),
+        }
+    }
+
+    #[inline]
+    pub fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_expire(timer),
+            Self::Listen(connection) => connection.tcp_timer_expire(timer),
+            Self::SynSent(connection) => connection.tcp_timer_expire(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_expire(timer),
+            Self::Established(connection) => connection.tcp_timer_expire(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_expire(timer),
+            Self::LastAck(connection) => connection.tcp_timer_expire(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_expire(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_expire(timer),
+            Self::Closing(connection) => connection.tcp_timer_expire(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_expire(timer),
+        }
+    }
+
+    #[inline]
+    pub fn tcp_timer_take_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_take_pending(timer),
+            Self::Listen(connection) => connection.tcp_timer_take_pending(timer),
+            Self::SynSent(connection) => connection.tcp_timer_take_pending(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_take_pending(timer),
+            Self::Established(connection) => connection.tcp_timer_take_pending(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_take_pending(timer),
+            Self::LastAck(connection) => connection.tcp_timer_take_pending(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_take_pending(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_take_pending(timer),
+            Self::Closing(connection) => connection.tcp_timer_take_pending(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_take_pending(timer),
+        }
+    }
+
+    #[inline]
+    pub fn tcp_timer_dispatch_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::Listen(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::SynSent(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::Established(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::LastAck(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::Closing(connection) => connection.tcp_timer_dispatch_pending(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_dispatch_pending(timer),
+        }
     }
 
     #[inline]
     pub fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
-        self.active_timers & timer.bit() != 0
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_is_active(timer),
+            Self::Listen(connection) => connection.tcp_timer_is_active(timer),
+            Self::SynSent(connection) => connection.tcp_timer_is_active(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_is_active(timer),
+            Self::Established(connection) => connection.tcp_timer_is_active(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_is_active(timer),
+            Self::LastAck(connection) => connection.tcp_timer_is_active(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_is_active(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_is_active(timer),
+            Self::Closing(connection) => connection.tcp_timer_is_active(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_is_active(timer),
+        }
     }
 
     #[inline]
     pub fn tcp_timer_is_pending(&self, timer: TcpConnectionTimerKind) -> bool {
-        self.pending_timers & timer.bit() != 0
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_is_pending(timer),
+            Self::Listen(connection) => connection.tcp_timer_is_pending(timer),
+            Self::SynSent(connection) => connection.tcp_timer_is_pending(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_is_pending(timer),
+            Self::Established(connection) => connection.tcp_timer_is_pending(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_is_pending(timer),
+            Self::LastAck(connection) => connection.tcp_timer_is_pending(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_is_pending(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_is_pending(timer),
+            Self::Closing(connection) => connection.tcp_timer_is_pending(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_is_pending(timer),
+        }
     }
 
     #[inline]
@@ -494,105 +995,205 @@ impl TcpConnectionState {
     }
 
     #[inline]
-    pub fn output_send_view(&self) -> TcpOutputSendView {
-        TcpOutputSendView {
-            snd_una: self.snd_una,
-            snd_nxt: self.snd_nxt,
-            snd_wnd: self.snd_wnd,
-            congestion_window: self.congestion.congestion_window(),
+    pub fn next_output_at(&self) -> Option<Instant> {
+        match self {
+            Self::Closed(connection) => connection.next_output_at(),
+            Self::Listen(connection) => connection.next_output_at(),
+            Self::SynSent(connection) => connection.next_output_at(),
+            Self::SynRcvd(connection) => connection.next_output_at(),
+            Self::Established(connection) => connection.next_output_at(),
+            Self::CloseWait(connection) => connection.next_output_at(),
+            Self::LastAck(connection) => connection.next_output_at(),
+            Self::FinWait1(connection) => connection.next_output_at(),
+            Self::FinWait2(connection) => connection.next_output_at(),
+            Self::Closing(connection) => connection.next_output_at(),
+            Self::TimeWait(connection) => connection.next_output_at(),
+        }
+    }
+
+    #[inline]
+    pub fn schedule_next_output(&mut self, deadline: Option<Instant>) {
+        match self {
+            Self::Closed(connection) => connection.schedule_next_output(deadline),
+            Self::Listen(connection) => connection.schedule_next_output(deadline),
+            Self::SynSent(connection) => connection.schedule_next_output(deadline),
+            Self::SynRcvd(connection) => connection.schedule_next_output(deadline),
+            Self::Established(connection) => connection.schedule_next_output(deadline),
+            Self::CloseWait(connection) => connection.schedule_next_output(deadline),
+            Self::LastAck(connection) => connection.schedule_next_output(deadline),
+            Self::FinWait1(connection) => connection.schedule_next_output(deadline),
+            Self::FinWait2(connection) => connection.schedule_next_output(deadline),
+            Self::Closing(connection) => connection.schedule_next_output(deadline),
+            Self::TimeWait(connection) => connection.schedule_next_output(deadline),
+        }
+    }
+
+    #[inline]
+    pub fn set_local_capabilities(
+        &mut self,
+        capabilities: TcpCapabilities,
+    ) -> TcpNegotiatedOptions {
+        match self {
+            Self::Closed(connection) => connection.set_local_capabilities(capabilities),
+            Self::Listen(connection) => connection.set_local_capabilities(capabilities),
+            Self::SynSent(connection) => connection.set_local_capabilities(capabilities),
+            Self::SynRcvd(connection) => connection.set_local_capabilities(capabilities),
+            Self::Established(connection) => connection.set_local_capabilities(capabilities),
+            Self::CloseWait(connection) => connection.set_local_capabilities(capabilities),
+            Self::LastAck(connection) => connection.set_local_capabilities(capabilities),
+            Self::FinWait1(connection) => connection.set_local_capabilities(capabilities),
+            Self::FinWait2(connection) => connection.set_local_capabilities(capabilities),
+            Self::Closing(connection) => connection.set_local_capabilities(capabilities),
+            Self::TimeWait(connection) => connection.set_local_capabilities(capabilities),
+        }
+    }
+
+    #[inline]
+    pub fn observe_congestion_ack(&mut self, sample: TcpCongestionAckSample) {
+        match self {
+            Self::Closed(connection) => connection.observe_congestion_ack(sample),
+            Self::Listen(connection) => connection.observe_congestion_ack(sample),
+            Self::SynSent(connection) => connection.observe_congestion_ack(sample),
+            Self::SynRcvd(connection) => connection.observe_congestion_ack(sample),
+            Self::Established(connection) => connection.observe_congestion_ack(sample),
+            Self::CloseWait(connection) => connection.observe_congestion_ack(sample),
+            Self::LastAck(connection) => connection.observe_congestion_ack(sample),
+            Self::FinWait1(connection) => connection.observe_congestion_ack(sample),
+            Self::FinWait2(connection) => connection.observe_congestion_ack(sample),
+            Self::Closing(connection) => connection.observe_congestion_ack(sample),
+            Self::TimeWait(connection) => connection.observe_congestion_ack(sample),
+        }
+    }
+
+    #[inline]
+    pub fn observe_congestion_send(&mut self, bytes_sent: u32, bytes_in_flight: u32, now: Instant) {
+        match self {
+            Self::Closed(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::Listen(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::SynSent(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::SynRcvd(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::Established(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::CloseWait(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::LastAck(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::FinWait1(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::FinWait2(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::Closing(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+            Self::TimeWait(connection) => {
+                connection.observe_congestion_send(bytes_sent, bytes_in_flight, now)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn observe_congestion_loss(&mut self, bytes_lost: u32) {
+        match self {
+            Self::Closed(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::Listen(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::SynSent(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::SynRcvd(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::Established(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::CloseWait(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::LastAck(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::FinWait1(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::FinWait2(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::Closing(connection) => connection.observe_congestion_loss(bytes_lost),
+            Self::TimeWait(connection) => connection.observe_congestion_loss(bytes_lost),
+        }
+    }
+
+    #[inline]
+    pub fn observe_retransmit_timeout(&mut self) -> Duration {
+        match self {
+            Self::Closed(connection) => connection.observe_retransmit_timeout(),
+            Self::Listen(connection) => connection.observe_retransmit_timeout(),
+            Self::SynSent(connection) => connection.observe_retransmit_timeout(),
+            Self::SynRcvd(connection) => connection.observe_retransmit_timeout(),
+            Self::Established(connection) => connection.observe_retransmit_timeout(),
+            Self::CloseWait(connection) => connection.observe_retransmit_timeout(),
+            Self::LastAck(connection) => connection.observe_retransmit_timeout(),
+            Self::FinWait1(connection) => connection.observe_retransmit_timeout(),
+            Self::FinWait2(connection) => connection.observe_retransmit_timeout(),
+            Self::Closing(connection) => connection.observe_retransmit_timeout(),
+            Self::TimeWait(connection) => connection.observe_retransmit_timeout(),
         }
     }
 
     #[inline]
     pub fn view(&self) -> TcpConnectionView {
-        TcpConnectionView {
-            connection_id: self.connection_id,
-            owner_worker: self.owner_worker,
-            state: self.state,
-            local_port: self.local_port,
-            local: self.local,
-            remote: self.remote,
-            iss: self.iss,
-            irs: self.irs,
-            snd_una: self.snd_una,
-            snd_nxt: self.snd_nxt,
-            snd_wnd: self.snd_wnd,
-            rcv_nxt: self.rcv_nxt,
-            rcv_wnd: self.rcv_wnd,
+        match self {
+            Self::Closed(connection) => connection.view(),
+            Self::Listen(connection) => connection.view(),
+            Self::SynSent(connection) => connection.view(),
+            Self::SynRcvd(connection) => connection.view(),
+            Self::Established(connection) => connection.view(),
+            Self::CloseWait(connection) => connection.view(),
+            Self::LastAck(connection) => connection.view(),
+            Self::FinWait1(connection) => connection.view(),
+            Self::FinWait2(connection) => connection.view(),
+            Self::Closing(connection) => connection.view(),
+            Self::TimeWait(connection) => connection.view(),
         }
-    }
-
-    #[inline]
-    pub fn set_send_state(&mut self, snd_una: u32, snd_nxt: u32, snd_wnd: u32) {
-        self.snd_una = snd_una;
-        self.snd_nxt = snd_nxt;
-        self.snd_wnd = self.effective_send_window(snd_wnd);
-    }
-
-    #[inline]
-    pub fn set_receive_state(&mut self, rcv_nxt: u32, rcv_wnd: u32) {
-        self.rcv_nxt = rcv_nxt;
-        self.rcv_wnd = rcv_wnd;
-    }
-
-    #[inline]
-    pub fn set_sequence_state(
-        &mut self,
-        iss: u32,
-        irs: u32,
-        snd_una: u32,
-        snd_nxt: u32,
-        snd_wnd: u32,
-        rcv_nxt: u32,
-        rcv_wnd: u32,
-    ) {
-        self.iss = iss;
-        self.irs = irs;
-        self.snd_una = snd_una;
-        self.snd_nxt = snd_nxt;
-        self.snd_wnd = snd_wnd;
-        self.rcv_nxt = rcv_nxt;
-        self.rcv_wnd = rcv_wnd;
-    }
-
-    #[inline]
-    pub fn set_state(&mut self, state: TcpState) {
-        self.state = state;
-    }
-
-    #[inline]
-    pub fn accepts_ack(&self, acknowledgment: u32) -> bool {
-        !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.snd_una))
-            && !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))
-    }
-
-    #[inline]
-    pub fn apply_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
-        if self.accepts_ack(acknowledgment) {
-            self.snd_una = acknowledgment;
-        }
-        self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
-    }
-
-    #[inline]
-    pub fn accept_in_order_payload(&mut self, sequence: u32, payload_len: usize) -> bool {
-        if sequence != self.rcv_nxt {
-            return false;
-        }
-        self.rcv_nxt = TcpSeq::new(self.rcv_nxt).advance(payload_len as u32).raw();
-        true
-    }
-
-    #[inline]
-    pub fn next_output_at(&self) -> Option<Instant> {
-        self.next_output_at
-    }
-
-    #[inline]
-    pub fn set_next_output_at(&mut self, deadline: Option<Instant>) {
-        self.next_output_at = deadline;
     }
 }
+
+macro_rules! impl_connection_storage {
+    ($state_type:ty, $variant:ident) => {
+        impl TryFrom<TcpConnectionState> for TcpConnection<$state_type> {
+            type Error = CoreError;
+
+            #[inline]
+            fn try_from(state: TcpConnectionState) -> Result<Self, Self::Error> {
+                match state {
+                    TcpConnectionState::$variant(connection) => Ok(connection),
+                    other => Err(CoreError::internal(format!(
+                        "tcp connection state mismatch: expected {}, got {:?}",
+                        stringify!($variant),
+                        other.state()
+                    ))),
+                }
+            }
+        }
+
+        impl From<TcpConnection<$state_type>> for TcpConnectionState {
+            #[inline]
+            fn from(connection: TcpConnection<$state_type>) -> Self {
+                Self::$variant(connection)
+            }
+        }
+    };
+}
+
+impl_connection_storage!(Closed, Closed);
+impl_connection_storage!(Listen, Listen);
+impl_connection_storage!(SynSent, SynSent);
+impl_connection_storage!(SynRcvd, SynRcvd);
+impl_connection_storage!(Established, Established);
+impl_connection_storage!(CloseWait, CloseWait);
+impl_connection_storage!(LastAck, LastAck);
+impl_connection_storage!(FinWait1, FinWait1);
+impl_connection_storage!(FinWait2, FinWait2);
+impl_connection_storage!(Closing, Closing);
+impl_connection_storage!(TimeWait, TimeWait);
 
 #[inline]
 fn tcp_negotiate_options(local: TcpCapabilities, remote: TcpCapabilities) -> TcpNegotiatedOptions {
@@ -644,7 +1245,7 @@ fn advertised_window_from_receive(receive_window: u32, window_scale: u8) -> u16 
 
 #[inline]
 fn retransmit_timeout_from_estimate(srtt: Duration, rttvar: Duration) -> Duration {
-    clamp_retransmit_timeout(duration_add(srtt, duration_mul(rttvar, 4)))
+    clamp_retransmit_timeout(srtt.saturating_add(rttvar.saturating_mul(4)))
 }
 
 #[inline]
@@ -655,57 +1256,5 @@ fn clamp_retransmit_timeout(timeout: Duration) -> Duration {
         TCP_MAX_RETRANSMIT_TIMEOUT
     } else {
         timeout
-    }
-}
-
-#[inline]
-fn duration_weighted_average(
-    left: Duration,
-    left_weight: u32,
-    right: Duration,
-    right_weight: u32,
-    denominator: u32,
-) -> Duration {
-    duration_from_nanos_saturating(
-        left.as_nanos()
-            .saturating_mul(u128::from(left_weight))
-            .saturating_add(right.as_nanos().saturating_mul(u128::from(right_weight)))
-            / u128::from(denominator),
-    )
-}
-
-#[inline]
-fn duration_add(left: Duration, right: Duration) -> Duration {
-    duration_from_nanos_saturating(left.as_nanos().saturating_add(right.as_nanos()))
-}
-
-#[inline]
-fn duration_mul(duration: Duration, factor: u32) -> Duration {
-    duration_from_nanos_saturating(duration.as_nanos().saturating_mul(u128::from(factor)))
-}
-
-#[inline]
-fn duration_div(duration: Duration, divisor: u32) -> Duration {
-    duration_from_nanos_saturating(duration.as_nanos() / u128::from(divisor))
-}
-
-#[inline]
-fn duration_abs_diff(left: Duration, right: Duration) -> Duration {
-    if left >= right {
-        left - right
-    } else {
-        right - left
-    }
-}
-
-#[inline]
-fn duration_from_nanos_saturating(nanos: u128) -> Duration {
-    const NANOS_PER_SECOND: u128 = 1_000_000_000;
-    let seconds = nanos / NANOS_PER_SECOND;
-    let subsecond_nanos = (nanos % NANOS_PER_SECOND) as u32;
-    if seconds > u128::from(u64::MAX) {
-        Duration::new(u64::MAX, 999_999_999)
-    } else {
-        Duration::new(seconds as u64, subsecond_nanos)
     }
 }

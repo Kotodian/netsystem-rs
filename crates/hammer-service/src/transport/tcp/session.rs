@@ -12,7 +12,9 @@ use hammer_core::protocol::tcp::{
 #[cfg(test)]
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
+use super::connection::TcpConnection;
 use super::segment::alloc_tcp_segment;
+use super::state_machine::Closed;
 use super::{
     TcpConnectionState, TcpConnectionTimerKind, TcpPendingIndex, TcpSessionConnectionIndex,
 };
@@ -21,7 +23,8 @@ use crate::session::node::{
     register_session_queue, with_session_queue,
 };
 use crate::session::runtime::{
-    SessionDriverRuntime, SessionEntry, SessionQueueProtocol, dispatch_session_queue_once_at,
+    SessionDriverRuntime, SessionEntry, SessionQueueProtocol, SessionStateFactory,
+    dispatch_session_queue_once_at,
 };
 #[cfg(test)]
 use crate::session::runtime::{SessionQueueStep, dispatch_session_queue_for_ticks};
@@ -81,6 +84,14 @@ impl TcpSessionQueue {
     }
 
     #[inline]
+    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> SessionId
+    where
+        F: SessionStateFactory<TcpConnectionState>,
+    {
+        self.driver.insert_session_with_id(f)
+    }
+
+    #[inline]
     #[cfg(test)]
     pub(crate) fn session(
         &self,
@@ -94,12 +105,28 @@ impl TcpSessionQueue {
         self.driver.session_state(session_id)
     }
 
-    #[inline]
-    pub(crate) fn session_state_mut(
+    pub(crate) fn take_connection<S>(
         &mut self,
         session_id: SessionId,
-    ) -> Option<&mut TcpConnectionState> {
-        self.driver.session_state_mut(session_id)
+    ) -> CoreResult<TcpConnection<S>>
+    where
+        TcpConnection<S>: TryFrom<TcpConnectionState, Error = CoreError>,
+    {
+        self.driver
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("tcp session is missing"))?
+            .clone()
+            .try_into()
+    }
+
+    pub(crate) fn put_connection<C>(&mut self, session_id: SessionId, connection: C)
+    where
+        C: Into<TcpConnectionState>,
+    {
+        let replaced = self
+            .driver
+            .replace_session_state(session_id, connection.into());
+        debug_assert!(replaced.is_some());
     }
 
     #[inline]
@@ -221,24 +248,10 @@ impl TcpSessionQueue {
         remote: SocketAddr,
     ) -> CoreResult<SessionId> {
         let iss = self.protocol.next_initial_sequence(local, remote);
-        let mut connection = TcpConnectionState::new(
-            None,
-            self.worker(),
-            TcpState::SynSent,
-            local.port(),
-            Some(local),
-            remote,
-        );
-        connection.set_sequence_state(
-            iss,
-            0,
-            iss,
-            TcpSeq::new(iss).advance(1).raw(),
-            connection.snd_wnd(),
-            0,
-            connection.rcv_wnd(),
-        );
-        connection.set_state(TcpState::SynSent);
+        let closed: TcpConnection<Closed> =
+            TcpConnection::new(None, self.worker(), local.port(), Some(local), remote);
+        let syn_sent = closed.connect(iss);
+        let connection = syn_sent.into();
 
         let session_id = self.insert_session(connection);
         let indexed = self
@@ -331,9 +344,7 @@ impl SessionQueueProtocol<TcpConnectionState> for TcpSessionProtocol {
                     )
                 })?;
                 if retransmit_syn {
-                    connection
-                        .retransmit_timeout_mut()
-                        .on_retransmission_timeout();
+                    connection.observe_retransmit_timeout();
                 }
                 connection.tcp_timer_set(TcpConnectionTimerKind::Retransmit);
                 Some((
@@ -539,7 +550,9 @@ impl TcpSessionProtocol {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> CoreResult<SessionId> {
-        Self::with_queue(handle, |queue| queue.connect(local, remote))
+        Self::with_queue(handle, |queue: &mut TcpSessionQueue| {
+            queue.connect(local, remote)
+        })
     }
 
     #[inline]
@@ -548,10 +561,10 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub(crate) fn with_queue<R>(
-        handle: SessionQueueHandle,
-        f: impl FnOnce(&mut TcpSessionQueue) -> CoreResult<R>,
-    ) -> CoreResult<R> {
+    pub(crate) fn with_queue<R, F>(handle: SessionQueueHandle, f: F) -> CoreResult<R>
+    where
+        F: crate::session::node::SessionQueueAccess<TcpSessionQueue, R>,
+    {
         with_session_queue(&TCP_SESSION_QUEUES, handle, f)
     }
 
@@ -587,7 +600,7 @@ fn tcp_session_queue_dispatch(
     output_next: SessionQueueNext,
     now: Instant,
 ) -> CoreResult<()> {
-    TcpSessionProtocol::with_queue(handle, |queue| {
+    TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
         queue.dispatch_once_at(runtime, now, output_next)?;
         Ok(())
     })
@@ -603,7 +616,7 @@ mod tests {
     };
     use hammer_core::error::CoreError;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentView, TcpSeq, TcpState,
+        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentView, TcpState,
         tcp_options_from_bytes,
     };
     use hammer_runtime::app::{AppCqeKind, AppOpId, AppRingHandle, AppSqe, AppUserData};
@@ -696,10 +709,9 @@ mod tests {
     fn tcp_connection() -> TcpConnectionState {
         let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
         let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-        TcpConnectionState::new(
+        TcpConnectionState::established_for_test(
             Some(TcpConnectionId::new(7001)),
             DataWorkerId::new(0),
-            TcpState::Established,
             local.port(),
             Some(local),
             remote,
@@ -713,26 +725,11 @@ mod tests {
         iss: u32,
         capabilities: TcpCapabilities,
     ) -> TcpConnectionState {
-        let mut connection = TcpConnectionState::new(
-            None,
-            worker,
-            TcpState::SynSent,
-            local.port(),
-            Some(local),
-            remote,
-        );
-        connection.set_local_capabilities(capabilities);
-        connection.set_sequence_state(
-            iss,
-            0,
-            iss,
-            TcpSeq::new(iss).advance(1).raw(),
-            connection.snd_wnd(),
-            0,
-            connection.rcv_wnd(),
-        );
-        connection.set_state(TcpState::SynSent);
-        connection
+        let closed: TcpConnection<Closed> =
+            TcpConnection::new(None, worker, local.port(), Some(local), remote);
+        let mut syn_sent = closed.connect(iss);
+        syn_sent.set_local_capabilities(capabilities);
+        syn_sent.into()
     }
 
     fn install_connecting_session(
@@ -765,24 +762,25 @@ mod tests {
         let output = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&capture)));
-        let session_node = SessionQueueNode::new().expect("session queue node");
-        session_node
+        let queue_driver = SessionQueueNode::new().expect("session queue node");
+        queue_driver
             .attach_queue(
                 handle,
                 SessionQueueNext::from_node(output),
                 TcpSessionProtocol::session_queue_dispatch_fn(),
             )
             .expect("attach tcp queue");
-        let session_queue = runtime.nodes().register_driver(session_node);
+        let session_queue = runtime.nodes().register_driver(queue_driver);
 
         let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("active open");
-        let active_open_iss = TcpSessionProtocol::with_queue(handle, |queue| {
-            let session = queue
-                .session_state(session_id)
-                .expect("active open session exists before SYN output");
-            Ok(session.iss())
-        })
-        .expect("read active-open iss");
+        let active_open_iss =
+            TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+                let session = queue
+                    .session_state(session_id)
+                    .expect("active open session exists before SYN output");
+                Ok(session.iss())
+            })
+            .expect("read active-open iss");
 
         runtime
             .schedule_empty_frame(session_queue)
@@ -799,7 +797,7 @@ mod tests {
             TcpCapabilities::default(),
         );
 
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             let session = queue
                 .session_state(session_id)
                 .expect("active open session remains installed");
@@ -833,17 +831,17 @@ mod tests {
         let output = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&capture)));
-        let session_node = SessionQueueNode::new().expect("session queue node");
-        session_node
+        let queue_driver = SessionQueueNode::new().expect("session queue node");
+        queue_driver
             .attach_queue(
                 handle,
                 SessionQueueNext::from_node(output),
                 TcpSessionProtocol::session_queue_dispatch_fn(),
             )
             .expect("attach tcp queue");
-        let session_queue = runtime.nodes().register_driver(session_node);
+        let session_queue = runtime.nodes().register_driver(queue_driver);
 
-        let session_id = TcpSessionProtocol::with_queue(handle, |queue| {
+        let session_id = TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             install_connecting_session(
                 queue,
                 syn_sent_connection(
@@ -863,7 +861,7 @@ mod tests {
         assert_eq!(runtime.run_ready_nodes().expect("run first syn"), 2);
         capture.lock().unwrap().packets.clear();
 
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             queue
                 .expire_timers_for_test(1)
                 .expect("expire before timer");
@@ -876,7 +874,7 @@ mod tests {
         assert_eq!(runtime.run_ready_nodes().expect("run empty"), 1);
         assert!(capture.lock().unwrap().packets.is_empty());
 
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             queue.expire_timers_for_test(1).expect("expire retransmit");
             Ok(())
         })
@@ -895,7 +893,7 @@ mod tests {
             ACTIVE_OPEN_ISS,
             TcpCapabilities::default(),
         );
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             let session = queue.session_state(session_id).expect("session after rxt");
             assert!(session.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
             Ok(())

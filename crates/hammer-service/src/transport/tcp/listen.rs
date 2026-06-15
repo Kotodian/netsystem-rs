@@ -3,19 +3,16 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{
-    TcpConnectionId, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpState,
-};
+use hammer_core::protocol::tcp::TcpConnectionId;
 
+use crate::session::SessionId;
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::connection::TcpConnectionState;
-use super::output::{
-    tcp_output_acknowledgment, tcp_output_next_sequence, tcp_output_sequence,
-    tcp_output_sequence_len,
-};
+use super::connection::{TcpConnection, TcpConnectionState};
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::session::TcpSessionQueue;
+use super::state_machine::Listen;
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
@@ -103,63 +100,36 @@ fn tcp_listen_index(
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
-    if !packet.flags.contains(TcpSegmentFlags::SYN)
-        || packet
-            .flags
-            .intersects(TcpSegmentFlags::ACK | TcpSegmentFlags::RST)
-    {
-        return Err(CoreError::internal("tcp listen received non-SYN packet"));
-    }
-
     let mut output_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
-        let mut connection = TcpConnectionState::new(
-            None,
-            queue.worker(),
-            TcpState::SynRcvd,
-            packet.local.port(),
-            Some(packet.local),
-            packet.remote,
-        );
-        connection.apply_peer_handshake_capabilities(packet.capabilities);
-        let iss = 1;
-        connection.set_sequence_state(
-            iss,
-            packet.sequence,
-            iss,
-            TcpSeq::new(iss).advance(1).raw(),
-            connection.effective_send_window(u32::from(packet.advertised_window)),
-            TcpSeq::new(packet.sequence).advance(1).raw(),
-            connection.rcv_wnd(),
-        );
-        connection.set_state(TcpState::SynRcvd);
-        let session_id = queue.insert_session(connection);
-        let connection_id = TcpConnectionId::new(session_id.get());
-        let connection = queue
-            .session_state_mut(session_id)
-            .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?;
-        connection.set_connection_id(connection_id);
-        let flags = TcpSegmentFlags::SYN | TcpSegmentFlags::ACK;
-        let flags_bits = flags.bits();
-        let sequence = tcp_output_sequence(connection, flags_bits);
-        let sequence_len = tcp_output_sequence_len(flags_bits, 0);
-        let next_sequence = tcp_output_next_sequence(sequence, sequence_len);
-        let allocated = alloc_tcp_segment(
-            runtime.packet_buffers(),
-            tcp_segment_metadata(packet.local, connection.remote()),
-            TcpSegmentHeader {
-                source_port: packet.local.port(),
-                destination_port: connection.remote().port(),
-                sequence_number: sequence,
-                acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
-                flags,
-                advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
-                capabilities: connection.local_capabilities(),
-            },
-        )?;
-        connection.set_send_state(connection.snd_una(), next_sequence, connection.snd_wnd());
-        output_index = Some(allocated);
-        let indexed = connection.clone();
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+        let mut control = None;
+        let worker = queue.worker();
+        let session_id = queue.insert_session_with_id(|session_id: SessionId| {
+            let connection_id = TcpConnectionId::new(session_id.get());
+            let connection: TcpConnection<Listen> = TcpConnection::new(
+                Some(connection_id),
+                worker,
+                packet.local.port(),
+                Some(packet.local),
+                packet.remote,
+            );
+            let (connection, header): (TcpConnectionState, _) = connection.receive_syn(&packet);
+            let _next_node = connection.next_node();
+            control = header;
+            connection
+        });
+        if let Some(header) = control {
+            let allocated = alloc_tcp_segment(
+                runtime.packet_buffers(),
+                tcp_segment_metadata(packet.local, packet.remote),
+                header,
+            )?;
+            output_index = Some(allocated);
+        }
+        let indexed = queue
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?
+            .clone();
         queue.index_session(session_id, &indexed);
         queue.arm_retransmit_timer(session_id, 1)?;
         queue.mark_session_ready(session_id);

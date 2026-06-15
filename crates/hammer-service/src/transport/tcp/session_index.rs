@@ -255,7 +255,7 @@ mod tests {
     use std::net::SocketAddr;
 
     use hammer_adapter::DataWorkerId;
-    use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
+    use hammer_core::protocol::tcp::TcpConnectionId;
 
     use super::*;
 
@@ -268,10 +268,9 @@ mod tests {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> TcpConnectionState {
-        TcpConnectionState::new(
+        TcpConnectionState::established_for_test(
             connection_id.map(TcpConnectionId::new),
             DataWorkerId::new(0),
-            TcpState::Established,
             local.port(),
             Some(local),
             remote,

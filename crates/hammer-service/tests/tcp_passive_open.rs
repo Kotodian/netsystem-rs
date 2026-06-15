@@ -9,7 +9,8 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::TcpSessionProtocol;
 use hammer_service::transport::tcp::{
-    TcpListenNext, TcpListenNode, TcpRcvProcessNext, TcpRcvProcessNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpRcvProcessNext,
+    TcpRcvProcessNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -224,11 +225,14 @@ fn tcp_rcv_process_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
     let rcv_process = runtime.nodes().register_internal(
         TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
     );
+    let established = runtime.nodes().register_internal(
+        TcpEstablishedNode::new(TcpEstablishedNext::nodes(output, drop)).with_session_queue(handle),
+    );
     establish_passive_session(&runtime, listen, rcv_process, &output_state);
 
     send_packet(
         &runtime,
-        rcv_process,
+        established,
         tcp_packet(
             REMOTE,
             REMOTE_PORT,
@@ -241,7 +245,7 @@ fn tcp_rcv_process_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run rcv-process"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run established"), 2);
     let packets = &output_state.lock().unwrap().packets;
     assert_eq!(packets.len(), 1);
     assert_tcp_packet(
@@ -273,11 +277,14 @@ fn tcp_rcv_process_rst_closes_session_and_completes_app_closed() {
     let rcv_process = runtime.nodes().register_internal(
         TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
     );
+    let established = runtime.nodes().register_internal(
+        TcpEstablishedNode::new(TcpEstablishedNext::nodes(output, drop)).with_session_queue(handle),
+    );
     establish_passive_session(&runtime, listen, rcv_process, &output_state);
 
     send_packet(
         &runtime,
-        rcv_process,
+        established,
         tcp_packet(
             REMOTE,
             REMOTE_PORT,
@@ -290,7 +297,7 @@ fn tcp_rcv_process_rst_closes_session_and_completes_app_closed() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run rcv-process"), 1);
+    assert_eq!(runtime.run_ready_nodes().expect("run established"), 1);
     assert!(output_state.lock().unwrap().packets.is_empty());
 }
 

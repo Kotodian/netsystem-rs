@@ -16,6 +16,7 @@ mod segment;
 pub mod session;
 pub mod session_index;
 pub mod state;
+pub mod state_machine;
 pub mod syn_sent;
 
 pub use accept::{TcpAcceptNext, TcpAcceptNode};
@@ -39,11 +40,11 @@ pub use lookup::{
 };
 pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
-    TcpOutputNext, TcpOutputNode, TcpOutputSendView,
+    TcpOutputNext, TcpOutputNode,
 };
 pub use rcv_process::{TcpRcvProcessControlPlane, TcpRcvProcessNext, TcpRcvProcessNode};
 pub use reply::{
-    TcpControlFlags, emit_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
+    TcpControlFlags, queue_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
 };
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use session::TcpSessionProtocol;

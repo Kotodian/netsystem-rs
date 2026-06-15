@@ -25,13 +25,6 @@ pub(crate) struct TcpPacket {
     pub(crate) payload_len: usize,
 }
 
-impl TcpPacket {
-    #[inline]
-    pub(crate) const fn has_payload(&self) -> bool {
-        self.payload_len != 0
-    }
-}
-
 pub(crate) fn parse_tcp_packet(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,

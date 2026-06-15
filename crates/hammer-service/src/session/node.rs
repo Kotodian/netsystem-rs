@@ -183,11 +183,28 @@ pub(crate) fn register_session_queue<Q>(
     })
 }
 
-pub(crate) fn with_session_queue<Q, R>(
+pub(crate) trait SessionQueueAccess<Q, R> {
+    fn access(self, queue: &mut Q) -> CoreResult<R>;
+}
+
+impl<Q, R, F> SessionQueueAccess<Q, R> for F
+where
+    F: FnOnce(&mut Q) -> CoreResult<R>,
+{
+    #[inline]
+    fn access(self, queue: &mut Q) -> CoreResult<R> {
+        self(queue)
+    }
+}
+
+pub(crate) fn with_session_queue<Q, R, F>(
     store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<Q>>>,
     handle: SessionQueueHandle,
-    f: impl FnOnce(&mut Q) -> CoreResult<R>,
-) -> CoreResult<R> {
+    f: F,
+) -> CoreResult<R>
+where
+    F: SessionQueueAccess<Q, R>,
+{
     let slot = handle.runtime_data().usize_word(0)?;
     store.with(|queues| {
         let mut queues = queues
@@ -196,6 +213,6 @@ pub(crate) fn with_session_queue<Q, R>(
         let queue = queues
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("session queue slot is invalid"))?;
-        f(queue)
+        f.access(queue)
     })
 }

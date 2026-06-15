@@ -3,13 +3,15 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentHeader, TcpState};
+use hammer_core::protocol::tcp::TcpState;
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::output::{tcp_output_acknowledgment, tcp_output_sequence};
+use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::session::TcpSessionQueue;
+use super::state_machine::Established;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -99,58 +101,38 @@ fn tcp_established_index(
     let mut output_index = None;
     let mut remove_session = None;
     let mut deliver_payload = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let session_id = queue
             .session_id_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        if packet.flags.contains(TcpSegmentFlags::RST) {
+        let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+        let (next, control, accepted_payload_len, fin): (
+            super::connection::TcpConnectionState,
+            _,
+            _,
+            _,
+        ) = connection.receive_data(&packet);
+        let _next_node = next.next_node();
+        if next.state() == TcpState::Closed {
             remove_session = Some(session_id);
             return Ok(());
         }
-        let connection = queue
-            .session_state_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp established state is missing"))?;
-        if let Some(acknowledgment) = packet.acknowledgment
-            && packet.flags.contains(TcpSegmentFlags::ACK)
-        {
-            connection.apply_ack(acknowledgment, packet.advertised_window);
+        if let Some(payload_len) = accepted_payload_len {
+            deliver_payload = Some((session_id, packet.payload_offset, payload_len, fin));
         }
-        let mut ack = false;
-        if packet.has_payload() {
-            ack = true;
-            if connection.accept_in_order_payload(packet.sequence, packet.payload_len) {
-                deliver_payload = Some((session_id, packet.payload_offset, packet.payload_len));
-            }
-        }
-        if packet.flags.contains(TcpSegmentFlags::FIN) {
-            ack = true;
-            let fin_sequence = packet.sequence.wrapping_add(packet.payload_len as u32);
-            if !connection.accept_in_order_payload(fin_sequence, 1) {
-                return Err(CoreError::internal(
-                    "tcp established FIN sequence is unacceptable",
-                ));
-            }
-            connection.set_state(TcpState::CloseWait);
-        }
-        if ack {
-            let flags = TcpSegmentFlags::ACK;
-            let flags_bits = flags.bits();
+        if let Some(header) = control {
             let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
-                tcp_segment_metadata(packet.local, connection.remote()),
-                TcpSegmentHeader {
-                    source_port: packet.local.port(),
-                    destination_port: connection.remote().port(),
-                    sequence_number: tcp_output_sequence(connection, flags_bits),
-                    acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
-                    flags,
-                    advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
-                    capabilities: connection.local_capabilities(),
-                },
+                tcp_segment_metadata(packet.local, packet.remote),
+                header,
             )?;
             output_index = Some(allocated);
         }
-        let indexed = connection.clone();
+        queue.put_connection(session_id, next);
+        let indexed = queue
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("updated tcp established session is missing"))?
+            .clone();
         queue.index_session(session_id, &indexed);
         Ok(())
     });
@@ -161,7 +143,7 @@ fn tcp_established_index(
         return Err(error);
     }
     let mut input_consumed = false;
-    if let Some((session_id, payload_offset, payload_len)) = deliver_payload {
+    if let Some((session_id, payload_offset, payload_len, fin)) = deliver_payload {
         if let Err(error) = runtime
             .advance(index, payload_offset)
             .and_then(|()| runtime.truncate_chain(index, payload_len))
@@ -171,10 +153,11 @@ fn tcp_established_index(
             }
             return Err(error);
         }
-        let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
-            queue.enqueue_rx(session_id, index, false)?;
-            Ok(())
-        });
+        let result =
+            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+                queue.enqueue_rx(session_id, index, fin)?;
+                Ok(())
+            });
         input_consumed = true;
         if let Err(error) = result {
             if let Some(output_index) = output_index.take() {
@@ -184,10 +167,11 @@ fn tcp_established_index(
         }
     }
     if let Some(session_id) = remove_session {
-        let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
-            queue.close_session(session_id)?;
-            Ok(())
-        });
+        let result =
+            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+                queue.close_session(session_id)?;
+                Ok(())
+            });
         if let Err(error) = result {
             if let Some(output_index) = output_index.take() {
                 runtime.free_index(output_index);

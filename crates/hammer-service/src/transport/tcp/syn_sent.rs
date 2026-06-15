@@ -3,13 +3,15 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpState};
+use hammer_core::protocol::tcp::TcpState;
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::output::{tcp_output_acknowledgment, tcp_output_sequence};
+use super::connection::{TcpConnection, TcpConnectionState};
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::session::TcpSessionQueue;
+use super::state_machine::SynSent;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -96,66 +98,37 @@ fn tcp_syn_sent_index(
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
-    let acknowledgment = packet
-        .acknowledgment
-        .ok_or_else(|| CoreError::internal("syn-sent packet missing ACK"))?;
     let mut output_index = None;
     let mut remove_session = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let session_id = queue
             .pending_id_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
-        let connection = queue
-            .session_state_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp syn-sent state is missing"))?;
-        if connection.state() != TcpState::SynSent {
-            return Err(CoreError::internal(
-                "tcp syn-sent received non-syn-sent session",
-            ));
-        }
-        if !packet.flags.contains(TcpSegmentFlags::ACK)
-            || !tcp_syn_sent_ack_acceptable(connection.iss(), connection.snd_nxt(), acknowledgment)
-        {
-            return Err(CoreError::internal("syn-sent ACK is unacceptable"));
-        }
-        if packet.flags.contains(TcpSegmentFlags::RST) {
+        let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+        let (next, control): (TcpConnectionState, _) = connection.receive_open_reply(&packet);
+        let _next_node = next.next_node();
+        if next.state() == TcpState::Closed {
             remove_session = Some(session_id);
             return Ok(());
         }
-        if !packet.flags.contains(TcpSegmentFlags::SYN) {
-            return Err(CoreError::internal("syn-sent segment missing SYN"));
+        if let Some(header) = control {
+            let allocated = alloc_tcp_segment(
+                runtime.packet_buffers(),
+                tcp_segment_metadata(packet.local, packet.remote),
+                header,
+            )?;
+            output_index = Some(allocated);
         }
-        connection.apply_peer_handshake_capabilities(packet.capabilities);
-        connection.set_sequence_state(
-            connection.iss(),
-            packet.sequence,
-            acknowledgment,
-            connection.snd_nxt(),
-            connection.effective_send_window(u32::from(packet.advertised_window)),
-            TcpSeq::new(packet.sequence).advance(1).raw(),
-            connection.rcv_wnd(),
-        );
-        connection.set_state(TcpState::Established);
-        let flags = TcpSegmentFlags::ACK;
-        let flags_bits = flags.bits();
-        let allocated = alloc_tcp_segment(
-            runtime.packet_buffers(),
-            tcp_segment_metadata(packet.local, connection.remote()),
-            TcpSegmentHeader {
-                source_port: packet.local.port(),
-                destination_port: connection.remote().port(),
-                sequence_number: tcp_output_sequence(connection, flags_bits),
-                acknowledgment_number: tcp_output_acknowledgment(connection, flags_bits),
-                flags,
-                advertised_window: connection.advertised_receive_window(connection.rcv_wnd()),
-                capabilities: connection.local_capabilities(),
-            },
-        )?;
-        output_index = Some(allocated);
-        let indexed = connection.clone();
-        queue.remove_pending_index(session_id);
-        queue.index_session(session_id, &indexed);
-        queue.complete_connected(session_id)?;
+        queue.put_connection(session_id, next);
+        let indexed = queue
+            .session_state(session_id)
+            .ok_or_else(|| CoreError::internal("updated tcp syn-sent session is missing"))?
+            .clone();
+        if indexed.state() == TcpState::Established {
+            queue.remove_pending_index(session_id);
+            queue.index_session(session_id, &indexed);
+            queue.complete_connected(session_id)?;
+        }
         Ok(())
     });
     if let Err(error) = result {
@@ -165,11 +138,12 @@ fn tcp_syn_sent_index(
         return Err(error);
     }
     if let Some(session_id) = remove_session {
-        let result = TcpSessionProtocol::with_queue(session_queue, |queue| {
-            queue.remove_pending_index(session_id);
-            queue.close_session(session_id)?;
-            Ok(())
-        });
+        let result =
+            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+                queue.remove_pending_index(session_id);
+                queue.close_session(session_id)?;
+                Ok(())
+            });
         if let Err(error) = result {
             if let Some(output_index) = output_index.take() {
                 runtime.free_index(output_index);
@@ -187,12 +161,6 @@ fn tcp_syn_sent_index(
     Ok(())
 }
 
-#[inline]
-fn tcp_syn_sent_ack_acceptable(iss: u32, snd_nxt: u32, acknowledgment: u32) -> bool {
-    TcpSeq::new(acknowledgment).after(TcpSeq::new(iss))
-        && !TcpSeq::new(acknowledgment).after(TcpSeq::new(snd_nxt))
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -207,7 +175,8 @@ mod tests {
 
     use crate::data_plane::DropNode;
     use crate::session::SessionQueueHandle;
-    use crate::transport::tcp::connection::TcpConnectionState;
+    use crate::transport::tcp::connection::{TcpConnection, TcpConnectionState};
+    use crate::transport::tcp::state_machine::Closed;
 
     use super::*;
 
@@ -306,7 +275,7 @@ mod tests {
         let session_id = insert_syn_sent_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_000);
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             assert!(queue.bind_session_app_ring(session_id, app_op, app_ring.clone()));
             Ok(())
         })
@@ -347,7 +316,7 @@ mod tests {
             SERVER_ISN + 1,
             ACK,
         );
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             let session = queue
                 .session_state(session_id)
                 .expect("syn-sent session should remain installed");
@@ -380,7 +349,7 @@ mod tests {
         let session_id = insert_syn_sent_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_001);
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             assert!(queue.bind_session_app_ring(session_id, app_op, app_ring.clone()));
             Ok(())
         })
@@ -415,7 +384,7 @@ mod tests {
             AppCqeKind::Closed { op } => assert_eq!(*op, Some(app_op)),
             other => panic!("expected closed completion, got {other:?}"),
         }
-        TcpSessionProtocol::with_queue(handle, |queue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             assert!(queue.session_state(session_id).is_none());
             assert!(
                 queue
@@ -433,30 +402,17 @@ mod tests {
     }
 
     fn insert_syn_sent_session(handle: SessionQueueHandle) -> crate::session::SessionId {
-        TcpSessionProtocol::with_queue(handle, |queue| {
-            let connection = TcpConnectionState::new(
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+            let closed: TcpConnection<Closed> = TcpConnection::new(
                 Some(TcpConnectionId::new(1)),
                 DataWorkerId::new(0),
-                TcpState::SynSent,
                 LOCAL_PORT,
                 Some(local_addr()),
                 remote_addr(),
             );
+            let syn_sent = closed.connect(CLIENT_ISN);
+            let connection: TcpConnectionState = syn_sent.into();
             let session_id = queue.insert_session(connection);
-            {
-                let connection = queue
-                    .session_state_mut(session_id)
-                    .expect("inserted session");
-                connection.set_sequence_state(
-                    CLIENT_ISN,
-                    0,
-                    CLIENT_ISN,
-                    CLIENT_ISN + 1,
-                    u16::MAX as u32,
-                    0,
-                    u16::MAX as u32,
-                );
-            }
             let indexed = queue
                 .session_state(session_id)
                 .expect("inserted session")
