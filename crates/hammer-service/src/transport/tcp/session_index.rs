@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
 
+use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::TcpConnectionId;
 use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::map::FlatHashTable;
 
 use crate::session::SessionId;
-use crate::transport::tcp::TcpConnectionState;
+use crate::transport::tcp::TcpInputNext;
 
 #[derive(Debug, Clone)]
 pub struct TcpSessionConnectionIndex {
@@ -25,6 +26,8 @@ struct TcpPendingIndexEntry {
     id: SessionId,
     local: Option<SocketAddr>,
     remote: SocketAddr,
+    owner: DataWorkerId,
+    next: TcpInputNext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,16 +36,27 @@ struct TcpConnectionIndexEntry {
     connection_id: Option<TcpConnectionId>,
     local: Option<SocketAddr>,
     remote: SocketAddr,
+    owner: DataWorkerId,
+    next: TcpInputNext,
 }
 
 impl TcpConnectionIndexEntry {
     #[inline]
-    fn new(session_id: SessionId, connection: &TcpConnectionState) -> Self {
+    fn new(
+        session_id: SessionId,
+        connection_id: Option<TcpConnectionId>,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        owner: DataWorkerId,
+        next: TcpInputNext,
+    ) -> Self {
         Self {
             session_id,
-            connection_id: connection.connection_id(),
-            local: connection.local(),
-            remote: connection.remote(),
+            connection_id,
+            local,
+            remote,
+            owner,
+            next,
         }
     }
 
@@ -55,11 +69,19 @@ impl TcpConnectionIndexEntry {
 
 impl TcpPendingIndexEntry {
     #[inline]
-    fn new(id: SessionId, connection: &TcpConnectionState) -> Self {
+    fn new(
+        id: SessionId,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        owner: DataWorkerId,
+        next: TcpInputNext,
+    ) -> Self {
         Self {
             id,
-            local: connection.local(),
-            remote: connection.remote(),
+            local,
+            remote,
+            owner,
+            next,
         }
     }
 
@@ -81,8 +103,17 @@ impl TcpSessionConnectionIndex {
     }
 
     #[inline]
-    pub fn insert(&mut self, session_id: SessionId, connection: &TcpConnectionState) {
-        let entry = TcpConnectionIndexEntry::new(session_id, connection);
+    pub fn remember_session(
+        &mut self,
+        session_id: SessionId,
+        connection_id: Option<TcpConnectionId>,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        owner: DataWorkerId,
+        next: TcpInputNext,
+    ) {
+        let entry =
+            TcpConnectionIndexEntry::new(session_id, connection_id, local, remote, owner, next);
         self.entries.push(entry);
         self.index_entry(entry);
     }
@@ -114,8 +145,17 @@ impl TcpSessionConnectionIndex {
     }
 
     #[inline]
-    pub fn upsert(&mut self, session_id: SessionId, connection: &TcpConnectionState) {
-        let entry = TcpConnectionIndexEntry::new(session_id, connection);
+    pub fn upsert(
+        &mut self,
+        session_id: SessionId,
+        connection_id: Option<TcpConnectionId>,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        owner: DataWorkerId,
+        next: TcpInputNext,
+    ) {
+        let entry =
+            TcpConnectionIndexEntry::new(session_id, connection_id, local, remote, owner, next);
         if let Some(position) = self
             .entries
             .iter()
@@ -151,14 +191,23 @@ impl TcpSessionConnectionIndex {
     }
 
     #[inline]
-    pub fn lookup_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
-        self.tuple_slots
+    pub fn lookup_by_tuple(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+        let session_id = self
+            .tuple_slots
             .lookup(&TransportConnectionKey::from_socket_addrs(
                 0, local, remote,
-            )?)
+            )?)?;
+        self.entries
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .map(|entry| (entry.session_id, entry.owner, entry.next))
     }
 
-    pub fn remove_session(&mut self, session_id: SessionId) {
+    pub fn forget_session(&mut self, session_id: SessionId) {
         if let Some(index) = self
             .entries
             .iter()
@@ -209,8 +258,15 @@ impl TcpPendingIndex {
         }
     }
 
-    pub fn upsert(&mut self, id: SessionId, connection: &TcpConnectionState) {
-        let entry = TcpPendingIndexEntry::new(id, connection);
+    pub fn remember_pending_open(
+        &mut self,
+        id: SessionId,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+        owner: DataWorkerId,
+        next: TcpInputNext,
+    ) {
+        let entry = TcpPendingIndexEntry::new(id, local, remote, owner, next);
         if let Some(position) = self.entries.iter().position(|existing| existing.id == id) {
             let old_entry = self.entries[position];
             self.unindex_entry(old_entry);
@@ -221,14 +277,23 @@ impl TcpPendingIndex {
         self.index_entry(entry);
     }
 
-    pub fn lookup_by_tuple(&self, local: SocketAddr, remote: SocketAddr) -> Option<SessionId> {
-        self.tuple_slots
+    pub fn lookup_pending_by_tuple(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+        let id = self
+            .tuple_slots
             .lookup(&TransportConnectionKey::from_socket_addrs(
                 0, local, remote,
-            )?)
+            )?)?;
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| (entry.id, entry.owner, entry.next))
     }
 
-    pub fn remove(&mut self, id: SessionId) {
+    pub fn forget_pending_open(&mut self, id: SessionId) {
         if let Some(index) = self.entries.iter().position(|entry| entry.id == id) {
             let removed = self.entries[index];
             self.unindex_entry(removed);
@@ -263,18 +328,21 @@ mod tests {
         value.parse().expect("socket address")
     }
 
-    fn connection(
+    fn remember(
+        index: &mut TcpSessionConnectionIndex,
+        session_id: SessionId,
         connection_id: Option<u64>,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> TcpConnectionState {
-        TcpConnectionState::established_for_test(
+    ) {
+        index.remember_session(
+            session_id,
             connection_id.map(TcpConnectionId::new),
-            DataWorkerId::new(0),
-            local.port(),
             Some(local),
             remote,
-        )
+            DataWorkerId::new(0),
+            TcpInputNext::Established,
+        );
     }
 
     #[test]
@@ -285,16 +353,24 @@ mod tests {
         let old_local = addr("192.0.2.10:50010");
         let new_local = addr("192.0.2.11:50011");
 
-        let first = connection(Some(7_001), old_local, remote);
-        index.upsert(session_id, &first);
-        assert_eq!(index.lookup_by_tuple(old_local, remote), Some(session_id));
+        remember(&mut index, session_id, Some(7_001), old_local, remote);
+        assert_eq!(
+            index.lookup_by_tuple(old_local, remote),
+            Some((session_id, DataWorkerId::new(0), TcpInputNext::Established))
+        );
         assert_eq!(
             index.lookup_by_connection_id(TcpConnectionId::new(7_001)),
             Some(session_id)
         );
 
-        let second = connection(None, new_local, remote);
-        index.upsert(session_id, &second);
+        index.upsert(
+            session_id,
+            None,
+            Some(new_local),
+            remote,
+            DataWorkerId::new(0),
+            TcpInputNext::Established,
+        );
 
         assert_eq!(index.len(), 1);
         assert_eq!(index.lookup_by_tuple(old_local, remote), None);
@@ -302,7 +378,10 @@ mod tests {
             index.lookup_by_connection_id(TcpConnectionId::new(7_001)),
             None
         );
-        assert_eq!(index.lookup_by_tuple(new_local, remote), Some(session_id));
+        assert_eq!(
+            index.lookup_by_tuple(new_local, remote),
+            Some((session_id, DataWorkerId::new(0), TcpInputNext::Established))
+        );
     }
 
     #[test]
@@ -315,12 +394,22 @@ mod tests {
         let removed_remote = addr("198.51.100.20:443");
         let kept_remote = addr("198.51.100.21:443");
 
-        let removed = connection(Some(8_001), removed_local, removed_remote);
-        let kept = connection(Some(8_002), kept_local, kept_remote);
-        index.insert(removed_session, &removed);
-        index.insert(kept_session, &kept);
+        remember(
+            &mut index,
+            removed_session,
+            Some(8_001),
+            removed_local,
+            removed_remote,
+        );
+        remember(
+            &mut index,
+            kept_session,
+            Some(8_002),
+            kept_local,
+            kept_remote,
+        );
 
-        index.remove_session(removed_session);
+        index.forget_session(removed_session);
 
         assert_eq!(index.len(), 1);
         assert_eq!(index.lookup_by_tuple(removed_local, removed_remote), None);
@@ -330,7 +419,11 @@ mod tests {
         );
         assert_eq!(
             index.lookup_by_tuple(kept_local, kept_remote),
-            Some(kept_session)
+            Some((
+                kept_session,
+                DataWorkerId::new(0),
+                TcpInputNext::Established
+            ))
         );
         assert_eq!(
             index.lookup_by_connection_id(TcpConnectionId::new(8_002)),

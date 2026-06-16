@@ -3,12 +3,11 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::TcpState;
 
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::connection::{TcpConnection, TcpConnectionState};
+use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 use super::session::TcpSessionQueue;
 use super::state_machine::SynSent;
@@ -99,18 +98,12 @@ fn tcp_syn_sent_index(
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut output_index = None;
-    let mut remove_session = None;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
-        let session_id = queue
-            .pending_id_by_tuple(packet.local, packet.remote)
+        let (session_id, _, _) = queue
+            .pending_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
         let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
-        let (next, control): (TcpConnectionState, _) = connection.receive_open_reply(&packet);
-        let _next_node = next.next_node();
-        if next.state() == TcpState::Closed {
-            remove_session = Some(session_id);
-            return Ok(());
-        }
+        let control = connection.receive_open_reply(queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
@@ -119,16 +112,6 @@ fn tcp_syn_sent_index(
             )?;
             output_index = Some(allocated);
         }
-        queue.put_connection(session_id, next);
-        let indexed = queue
-            .session_state(session_id)
-            .ok_or_else(|| CoreError::internal("updated tcp syn-sent session is missing"))?
-            .clone();
-        if indexed.state() == TcpState::Established {
-            queue.remove_pending_index(session_id);
-            queue.index_session(session_id, &indexed);
-            queue.complete_connected(session_id)?;
-        }
         Ok(())
     });
     if let Err(error) = result {
@@ -136,20 +119,6 @@ fn tcp_syn_sent_index(
             runtime.free_index(output_index);
         }
         return Err(error);
-    }
-    if let Some(session_id) = remove_session {
-        let result =
-            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
-                queue.remove_pending_index(session_id);
-                queue.close_session(session_id)?;
-                Ok(())
-            });
-        if let Err(error) = result {
-            if let Some(output_index) = output_index.take() {
-                runtime.free_index(output_index);
-            }
-            return Err(error);
-        }
     }
     if let Some(output_index) = output_index.take()
         && let Err(error) = next_frames.enqueue(runtime, output, output_index)
@@ -170,13 +139,13 @@ mod tests {
         BufferPacketCursor, DataWorkerId, InternalNode, Network, NodeId, RouteMetadata, SocksAddr,
     };
     use hammer_core::error::CoreError;
-    use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
     use hammer_runtime::app::{AppCqeKind, AppOpId, AppRingHandle};
 
     use crate::data_plane::DropNode;
     use crate::session::SessionQueueHandle;
-    use crate::transport::tcp::connection::{TcpConnection, TcpConnectionState};
-    use crate::transport::tcp::state_machine::Closed;
+    use crate::transport::tcp::TcpInputNext;
+    use crate::transport::tcp::connection::TcpConnection;
+    use crate::transport::tcp::state_machine::{Established, SynSent};
 
     use super::*;
 
@@ -184,7 +153,6 @@ mod tests {
     const REMOTE: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
     const LOCAL_PORT: u16 = 50_001;
     const REMOTE_PORT: u16 = 443;
-    const CLIENT_ISN: u32 = 7_000;
     const SERVER_ISN: u32 = 11_000;
     const SYN: u8 = 0x02;
     const RST: u8 = 0x04;
@@ -272,7 +240,7 @@ mod tests {
             runtime.packet_buffers().clone(),
         )
         .expect("session queue");
-        let session_id = insert_syn_sent_session(handle);
+        let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_000);
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
@@ -298,7 +266,7 @@ mod tests {
                 LOCAL,
                 LOCAL_PORT,
                 SERVER_ISN,
-                CLIENT_ISN + 1,
+                client_isn + 1,
                 SYN | ACK,
             ),
         );
@@ -312,22 +280,22 @@ mod tests {
             LOCAL_PORT,
             REMOTE,
             REMOTE_PORT,
-            CLIENT_ISN + 1,
+            client_isn + 1,
             SERVER_ISN + 1,
             ACK,
         );
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let session = queue
-                .session_state(session_id)
-                .expect("syn-sent session should remain installed");
-            assert_eq!(session.state(), TcpState::Established);
-            assert_eq!(session.snd_una(), CLIENT_ISN + 1);
-            assert_eq!(session.rcv_nxt(), SERVER_ISN + 1);
+            let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+            assert_eq!(connection.snd_una(), client_isn + 1);
+            assert_eq!(connection.rcv_nxt(), SERVER_ISN + 1);
             assert_eq!(
-                queue.session_id_by_tuple(local_addr(), remote_addr()),
-                Some(session_id)
+                queue.session_route_by_tuple(local_addr(), remote_addr()),
+                Some((session_id, DataWorkerId::new(0), TcpInputNext::Established))
             );
-            assert_eq!(queue.pending_id_by_tuple(local_addr(), remote_addr()), None);
+            assert_eq!(
+                queue.pending_route_by_tuple(local_addr(), remote_addr()),
+                None
+            );
             Ok(())
         })
         .expect("inspect session");
@@ -346,7 +314,7 @@ mod tests {
             runtime.packet_buffers().clone(),
         )
         .expect("session queue");
-        let session_id = insert_syn_sent_session(handle);
+        let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_001);
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
@@ -372,7 +340,7 @@ mod tests {
                 LOCAL,
                 LOCAL_PORT,
                 SERVER_ISN,
-                CLIENT_ISN + 1,
+                client_isn + 1,
                 RST | ACK,
             ),
         );
@@ -388,12 +356,12 @@ mod tests {
             assert!(queue.session_state(session_id).is_none());
             assert!(
                 queue
-                    .session_id_by_tuple(local_addr(), remote_addr())
+                    .session_route_by_tuple(local_addr(), remote_addr())
                     .is_none()
             );
             assert!(
                 queue
-                    .pending_id_by_tuple(local_addr(), remote_addr())
+                    .pending_route_by_tuple(local_addr(), remote_addr())
                     .is_none()
             );
             Ok(())
@@ -401,26 +369,14 @@ mod tests {
         .expect("inspect queue");
     }
 
-    fn insert_syn_sent_session(handle: SessionQueueHandle) -> crate::session::SessionId {
+    fn open_client_session(handle: SessionQueueHandle) -> (crate::session::SessionId, u32) {
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let closed: TcpConnection<Closed> = TcpConnection::new(
-                Some(TcpConnectionId::new(1)),
-                DataWorkerId::new(0),
-                LOCAL_PORT,
-                Some(local_addr()),
-                remote_addr(),
-            );
-            let syn_sent = closed.connect(CLIENT_ISN);
-            let connection: TcpConnectionState = syn_sent.into();
-            let session_id = queue.insert_session(connection);
-            let indexed = queue
-                .session_state(session_id)
-                .expect("inserted session")
-                .clone();
-            queue.index_pending(session_id, &indexed);
-            Ok(session_id)
+            let session_id = queue.connect(local_addr(), remote_addr())?;
+            let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+            let initial_sequence = connection.iss();
+            Ok((session_id, initial_sequence))
         })
-        .expect("insert syn-sent session")
+        .expect("open client session")
     }
 
     fn local_addr() -> SocketAddr {

@@ -10,21 +10,21 @@ use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 use super::session::TcpSessionQueue;
-use super::state_machine::Established;
+use super::state_machine::FinWait2;
 
 #[hammer_component_macros::node_next]
-pub enum TcpEstablishedNext {
+pub enum TcpFinWait2Next {
     Output,
     Drop,
 }
 
-#[hammer_component_macros::node(role = internal, next = TcpEstablishedNext)]
-pub struct TcpEstablishedNode {
+#[hammer_component_macros::node(role = internal, next = TcpFinWait2Next)]
+pub struct TcpFinWait2Node {
     #[node(default)]
     session_queue: Option<SessionQueueHandle>,
 }
 
-impl TcpEstablishedNode {
+impl TcpFinWait2Node {
     #[inline]
     pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
         self.session_queue = Some(handle);
@@ -32,7 +32,7 @@ impl TcpEstablishedNode {
     }
 }
 
-impl Node for TcpEstablishedNode {
+impl Node for TcpFinWait2Node {
     #[inline(always)]
     fn process(
         &mut self,
@@ -40,44 +40,44 @@ impl Node for TcpEstablishedNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        tcp_established_frame(runtime, frame, self.session_queue, next)
+        tcp_fin_wait2_frame(runtime, frame, self.session_queue, next)
     }
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_established_process
+        tcp_fin_wait2_process
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
         self.session_queue
             .map(SessionQueueHandle::runtime_data)
-            .ok_or_else(|| CoreError::internal("tcp established node missing session queue"))
+            .ok_or_else(|| CoreError::internal("tcp fin-wait2 node missing session queue"))
     }
 }
 
-fn tcp_established_process(
+fn tcp_fin_wait2_process(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let next = TcpEstablishedNode::runtime_nexts(runtime)?;
-    tcp_established_frame(runtime, frame, Some(SessionQueueHandle::new(data)), next)
+    let next = TcpFinWait2Node::runtime_nexts(runtime)?;
+    tcp_fin_wait2_frame(runtime, frame, Some(SessionQueueHandle::new(data)), next)
 }
 
-fn tcp_established_frame(
+fn tcp_fin_wait2_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     session_queue: Option<SessionQueueHandle>,
-    next: [NodeId; TcpEstablishedNext::COUNT],
+    next: [NodeId; TcpFinWait2Next::COUNT],
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
-        .ok_or_else(|| CoreError::internal("tcp established node missing session queue"))?;
-    let output = next[TcpEstablishedNext::Output as usize];
-    let drop_next = next[TcpEstablishedNext::Drop as usize];
+        .ok_or_else(|| CoreError::internal("tcp fin-wait2 node missing session queue"))?;
+    let output = next[TcpFinWait2Next::Output as usize];
+    let drop_next = next[TcpFinWait2Next::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_established_index(runtime, index, session_queue, output, &mut next_frames) {
+        match tcp_fin_wait2_index(runtime, index, session_queue, output, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -89,7 +89,7 @@ fn tcp_established_frame(
     Ok(NodeResult::drop())
 }
 
-fn tcp_established_index(
+fn tcp_fin_wait2_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
@@ -98,13 +98,12 @@ fn tcp_established_index(
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut output_index = None;
-    let input_consumed = packet.payload_len != 0;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
-        let control = connection.receive_data(runtime, index, queue, session_id, &packet)?;
+            .ok_or_else(|| CoreError::internal("tcp fin-wait2 session is missing"))?;
+        let connection: TcpConnection<FinWait2> = queue.take_connection(session_id)?;
+        let control = connection.receive_fin_wait2(queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
@@ -127,8 +126,6 @@ fn tcp_established_index(
         runtime.free_index(output_index);
         return Err(error);
     }
-    if !input_consumed {
-        runtime.free_index(index);
-    }
+    runtime.free_index(index);
     Ok(())
 }

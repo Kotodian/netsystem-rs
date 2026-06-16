@@ -495,20 +495,14 @@ fn session_input_entry(
     };
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
-    TcpSessionProtocol::with_queue(handle, |runtime: &mut TcpSessionQueue| {
-        let session_id = runtime
-            .session_id_by_tuple(local, remote)
-            .or_else(|| runtime.pending_id_by_tuple(local, remote));
-        let Some(session_id) = session_id else {
+    TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        let route = queue
+            .session_route_by_tuple(local, remote)
+            .or_else(|| queue.pending_route_by_tuple(local, remote));
+        let Some((_session_id, owner, next)) = route else {
             return Ok(None);
         };
-        let Some(connection) = runtime.session_state(session_id) else {
-            return Ok(None);
-        };
-        Ok(Some(TcpSessionInputEntry {
-            owner: connection.owner_worker(),
-            next: connection.next_node(),
-        }))
+        Ok(Some(TcpSessionInputEntry { owner, next }))
     })
 }
 
@@ -640,8 +634,11 @@ mod tests {
             }
         );
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            assert_eq!(queue.session_id_by_tuple(local, remote), None);
-            assert_eq!(queue.pending_id_by_tuple(local, remote), Some(session_id));
+            assert_eq!(queue.session_route_by_tuple(local, remote), None);
+            assert_eq!(
+                queue.pending_route_by_tuple(local, remote),
+                Some((session_id, worker, TcpInputNext::SynSent))
+            );
             Ok(())
         })
         .expect("inspect pending session");
@@ -688,6 +685,12 @@ mod tests {
             NodeId::new(5),
             NodeId::new(6),
             NodeId::new(7),
+            NodeId::new(8),
+            NodeId::new(9),
+            NodeId::new(10),
+            NodeId::new(11),
+            NodeId::new(12),
+            NodeId::new(13),
         );
         let selected = next_node_for_index(
             &runtime,

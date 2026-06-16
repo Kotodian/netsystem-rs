@@ -121,7 +121,8 @@ fn tcp_reset_observer_records_local_remote_metadata_reason_and_synthesized_reset
     );
     let tcp_input = runtime.nodes().register_internal(
         TcpInputControlPlane::new(TcpInputNext::nodes(
-            drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, reset,
+            drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, drop_node,
+            drop_node, drop_node, drop_node, drop_node, reset,
         ))
         .node(),
     );

@@ -9,7 +9,7 @@ use crate::session::SessionId;
 use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
-use super::connection::{TcpConnection, TcpConnectionState};
+use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
 use super::session::TcpSessionQueue;
 use super::state_machine::Listen;
@@ -102,7 +102,6 @@ fn tcp_listen_index(
     let packet = parse_tcp_packet(runtime, index)?;
     let mut output_index = None;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
-        let mut control = None;
         let worker = queue.worker();
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
@@ -113,11 +112,10 @@ fn tcp_listen_index(
                 Some(packet.local),
                 packet.remote,
             );
-            let (connection, header): (TcpConnectionState, _) = connection.receive_syn(&packet);
-            let _next_node = connection.next_node();
-            control = header;
-            connection
+            connection.into()
         });
+        let connection: TcpConnection<Listen> = queue.take_connection(session_id)?;
+        let control = connection.receive_syn(queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
                 runtime.packet_buffers(),
@@ -126,13 +124,6 @@ fn tcp_listen_index(
             )?;
             output_index = Some(allocated);
         }
-        let indexed = queue
-            .session_state(session_id)
-            .ok_or_else(|| CoreError::internal("inserted tcp session is missing"))?
-            .clone();
-        queue.index_session(session_id, &indexed);
-        queue.arm_retransmit_timer(session_id, 1)?;
-        queue.mark_session_ready(session_id);
         Ok(())
     });
     if let Err(error) = result {

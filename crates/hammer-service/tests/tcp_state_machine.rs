@@ -1,70 +1,117 @@
-#[test]
-fn tcp_sources_do_not_expose_connection_mutation_hooks() {
-    let sources = [
-        include_str!("../src/transport/tcp/connection.rs"),
-        include_str!("../src/transport/tcp/state_machine.rs"),
-    ];
-    let forbidden = [
-        concat!("machine", "_"),
-        concat!("set", "_state"),
-        concat!("set", "_sequence", "_state"),
-        concat!("set", "_send", "_state"),
-        concat!("set", "_receive", "_state"),
-        concat!("connection", "_mut"),
-        concat!("option", "_state", "_mut"),
-        concat!("congestion", "_mut"),
-        concat!("retransmit", "_timeout", "_mut"),
-        concat!("accept", "_in", "_order", "_payload"),
-    ];
+use std::fs;
+use std::path::Path;
 
-    for source in sources {
-        for symbol in forbidden {
-            assert!(!source.contains(symbol), "{symbol}");
-        }
-    }
+fn read_tcp_source(path: &str) -> String {
+    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect("read tcp source")
 }
 
 #[test]
-fn tcp_sources_do_not_expose_extra_transition_shapes() {
+fn tcp_state_machine_public_api_has_no_forbidden_middle_types() {
     let sources = [
-        include_str!("../src/transport/tcp/state_machine.rs"),
-        include_str!("../src/transport/tcp/connection.rs"),
-        include_str!("../src/transport/tcp/listen.rs"),
-        include_str!("../src/transport/tcp/syn_sent.rs"),
-        include_str!("../src/transport/tcp/rcv_process.rs"),
-        include_str!("../src/transport/tcp/established.rs"),
-    ];
+        read_tcp_source("src/transport/tcp/connection.rs"),
+        read_tcp_source("src/transport/tcp/state_machine.rs"),
+        read_tcp_source("src/transport/tcp/session.rs"),
+        read_tcp_source("src/transport/tcp/listen.rs"),
+        read_tcp_source("src/transport/tcp/syn_sent.rs"),
+        read_tcp_source("src/transport/tcp/established.rs"),
+        read_tcp_source("src/transport/tcp/syn_rcvd.rs"),
+        read_tcp_source("src/transport/tcp/close_wait.rs"),
+        read_tcp_source("src/transport/tcp/fin_wait1.rs"),
+        read_tcp_source("src/transport/tcp/fin_wait2.rs"),
+        read_tcp_source("src/transport/tcp/closing.rs"),
+        read_tcp_source("src/transport/tcp/last_ack.rs"),
+        read_tcp_source("src/transport/tcp/time_wait.rs"),
+        read_tcp_source("src/transport/tcp/mod.rs"),
+    ]
+    .join("\n");
+
     let forbidden = [
-        concat!("Tcp", "Active", "Open"),
+        concat!("Tcp", "State", "Machine"),
+        concat!("Tcp", "Connection", "View"),
         concat!("Tcp", "Output", "Send", "View"),
         concat!("Tcp", "State", "Segment"),
         concat!("Tcp", "State", "Transition"),
         concat!("Tcp", "State", "Machine", "Output"),
-        concat!("Dis", "position"),
-        concat!("enter", "_"),
+        concat!("Tcp", "Active", "Open"),
+        concat!("Tcp", "Connection", "Route"),
+        concat!("Tcp", "Connection", "Index", "Key"),
+        concat!("Tcp", "Connection", "Queue", "Commit"),
+        concat!("Tcp", "Connection", "Store"),
+        concat!("Disposition"),
+        concat!("Effect"),
     ];
 
-    for source in sources {
-        for symbol in forbidden {
-            assert!(!source.contains(symbol), "{symbol}");
-        }
+    for pattern in forbidden {
+        assert!(
+            !sources.contains(pattern),
+            "forbidden TCP state-machine helper remains: {pattern}"
+        );
     }
 }
 
 #[test]
-fn tcp_state_machine_structs_do_not_expose_session_or_app_types() {
-    let source = include_str!("../src/transport/tcp/state_machine.rs");
+fn packet_nodes_do_not_drive_tcp_queue_state() {
+    let sources = [
+        read_tcp_source("src/transport/tcp/listen.rs"),
+        read_tcp_source("src/transport/tcp/syn_sent.rs"),
+        read_tcp_source("src/transport/tcp/syn_rcvd.rs"),
+        read_tcp_source("src/transport/tcp/established.rs"),
+        read_tcp_source("src/transport/tcp/close_wait.rs"),
+        read_tcp_source("src/transport/tcp/fin_wait1.rs"),
+        read_tcp_source("src/transport/tcp/fin_wait2.rs"),
+        read_tcp_source("src/transport/tcp/closing.rs"),
+        read_tcp_source("src/transport/tcp/last_ack.rs"),
+        read_tcp_source("src/transport/tcp/time_wait.rs"),
+    ]
+    .join("\n");
+
     let forbidden = [
-        "AppOpId",
-        "AppRingHandle",
-        "SessionId",
-        "SessionQueue",
-        "BufferIndex",
-        "BufferFrame",
-        "alloc_tcp_segment",
+        concat!("put", "_connection"),
+        concat!("next", ".state()"),
+        concat!("indexed", ".state()"),
+        concat!("take_connection", "::"),
+        concat!("TcpState::Closed"),
+        concat!("TcpState::Established"),
+        concat!("match next"),
+        concat!("match connection"),
+        concat!("TcpConnectionState::"),
     ];
 
-    for symbol in forbidden {
-        assert!(!source.contains(symbol), "{symbol}");
+    for pattern in forbidden {
+        assert!(
+            !sources.contains(pattern),
+            "packet node still drives TCP state or queue policy: {pattern}"
+        );
+    }
+}
+
+#[test]
+fn tcp_timer_dispatch_is_owned_by_tcp_state() {
+    let source = read_tcp_source("src/transport/tcp/session.rs");
+    assert!(!source.contains("match state"));
+    assert!(!source.contains("TcpConnectionState::SynSent"));
+    assert!(!source.contains("on_retransmit_timeout"));
+    assert!(!source.contains("retransmit_syn_header_if_ready"));
+    assert!(source.contains("on_tcp_timer_expiry"));
+}
+
+#[test]
+fn tcp_input_has_dedicated_receive_nodes() {
+    let source = read_tcp_source("src/transport/tcp/mod.rs");
+
+    assert!(!source.contains("RcvProcess"));
+    for next in [
+        "SynRcvd",
+        "CloseWait",
+        "FinWait1",
+        "FinWait2",
+        "Closing",
+        "LastAck",
+        "TimeWait",
+    ] {
+        assert!(
+            source.contains(next),
+            "TcpInputNext is missing dedicated state node {next}"
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::DataWorkerId;
@@ -6,14 +6,14 @@ use hammer_core::protocol::tcp::TcpConnectionId;
 use hammer_service::session::SessionId;
 use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
 use hammer_service::transport::tcp::connection::{TcpConnection, TcpConnectionState};
-use hammer_service::transport::tcp::state_machine::Closed;
+use hammer_service::transport::tcp::state_machine::{Closed, SynSent};
 use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpConnectionTimerKind, TcpSessionConnectionIndex,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpConnectionTimerKind, TcpInputNext, TcpSessionConnectionIndex,
 };
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
-fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnectionState {
+fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<SynSent> {
     let local: SocketAddr = format!("192.0.2.10:{local_port}")
         .parse()
         .expect("test local");
@@ -25,10 +25,10 @@ fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnectionS
         Some(local),
         remote,
     );
-    connection.connect(1).into()
+    connection.connect_state(1)
 }
 
-fn acknowledge(connection: &mut TcpConnectionState, now: Instant) {
+fn acknowledge(connection: &mut TcpConnection<SynSent>, now: Instant) {
     connection.observe_congestion_ack(TcpCongestionAckSample {
         bytes_acked: TEST_SEGMENT_LEN,
         rtt: Duration::from_millis(20),
@@ -55,17 +55,12 @@ fn tcp_congestion_state_uses_connection_max_segment_size_for_initial_windows() {
 }
 
 #[test]
-fn tcp_connection_states_own_independent_congestion_state() {
+fn tcp_typed_connections_own_independent_congestion_state() {
     let now = Instant::now();
     let mut first = connection(TcpConnectionId::new(1), 50_001);
     let second = connection(TcpConnectionId::new(2), 50_002);
 
-    first.observe_congestion_ack(TcpCongestionAckSample {
-        bytes_acked: TEST_SEGMENT_LEN,
-        rtt: Duration::from_millis(20),
-        now,
-        bytes_in_flight: TEST_SEGMENT_LEN,
-    });
+    acknowledge(&mut first, now);
 
     assert_ne!(
         first.congestion().delivered(),
@@ -75,7 +70,7 @@ fn tcp_connection_states_own_independent_congestion_state() {
 }
 
 #[test]
-fn tcp_connection_state_exposes_owned_congestion_control() {
+fn tcp_typed_connection_exposes_owned_congestion_control() {
     let now = Instant::now();
     let mut connection = connection(TcpConnectionId::new(3), 50_003);
 
@@ -89,7 +84,7 @@ fn tcp_connection_state_exposes_owned_congestion_control() {
 }
 
 #[test]
-fn tcp_connection_state_keeps_owned_congestion_window() {
+fn tcp_typed_connection_keeps_owned_congestion_window() {
     let mut connection = connection(TcpConnectionId::new(4), 50_004);
     let initial_congestion_window = connection.congestion().congestion_window();
     connection.observe_congestion_loss(u32::MAX);
@@ -98,7 +93,18 @@ fn tcp_connection_state_keeps_owned_congestion_window() {
 }
 
 #[test]
-fn tcp_connection_index_resolves_connection_id_and_tuple_to_session_id() {
+fn tcp_connection_state_erases_and_restores_typed_state() {
+    let connection = connection(TcpConnectionId::new(5), 50_005);
+    let state: TcpConnectionState = connection.clone().into();
+    let restored: TcpConnection<SynSent> = state.try_into().expect("restore syn-sent");
+
+    assert_eq!(restored.connection_id(), connection.connection_id());
+    assert_eq!(restored.snd_nxt(), connection.snd_nxt());
+    assert_eq!(restored.next_node(), TcpInputNext::SynSent);
+}
+
+#[test]
+fn tcp_connection_index_resolves_connection_id_and_tuple_to_route() {
     let first = connection(TcpConnectionId::new(101), 50_011);
     let second = connection(TcpConnectionId::new(102), 50_012);
     let first_session = SessionId::new(1_011);
@@ -109,8 +115,22 @@ fn tcp_connection_index_resolves_connection_id_and_tuple_to_session_id() {
     let second_remote = second.remote();
     let mut index = TcpSessionConnectionIndex::empty();
 
-    index.insert(first_session, &first);
-    index.insert(second_session, &second);
+    index.remember_session(
+        first_session,
+        first.connection_id(),
+        first.local(),
+        first.remote(),
+        first.owner_worker(),
+        first.next_node(),
+    );
+    index.remember_session(
+        second_session,
+        second.connection_id(),
+        second.local(),
+        second.remote(),
+        second.owner_worker(),
+        second.next_node(),
+    );
 
     assert_eq!(
         index
@@ -122,10 +142,10 @@ fn tcp_connection_index_resolves_connection_id_and_tuple_to_session_id() {
         index
             .lookup_by_tuple(first_local, first_remote)
             .expect("tuple connection"),
-        first_session
+        (first_session, DataWorkerId::new(0), TcpInputNext::SynSent)
     );
 
-    index.remove_session(first_session);
+    index.forget_session(first_session);
     assert!(
         index
             .lookup_by_connection_id(TcpConnectionId::new(101))
@@ -136,7 +156,7 @@ fn tcp_connection_index_resolves_connection_id_and_tuple_to_session_id() {
         index
             .lookup_by_tuple(second_local, second_remote)
             .expect("second tuple remains"),
-        second_session
+        (second_session, DataWorkerId::new(0), TcpInputNext::SynSent)
     );
 }
 
@@ -157,25 +177,29 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
         Some(local),
         remote,
     );
-    let connection: TcpConnectionState = connection.connect(1).into();
+    let connection = connection.connect_state(1);
     let session_id = SessionId::new(2_022);
     let mut index = TcpSessionConnectionIndex::empty();
 
-    index.insert(session_id, &connection);
+    index.remember_session(
+        session_id,
+        connection.connection_id(),
+        connection.local(),
+        connection.remote(),
+        connection.owner_worker(),
+        connection.next_node(),
+    );
 
     assert_eq!(
         index
             .lookup_by_tuple(local, remote)
             .expect("IPv6 tuple lookup"),
-        session_id
+        (session_id, DataWorkerId::new(0), TcpInputNext::SynSent)
     );
     assert!(
         index
             .lookup_by_tuple(
-                SocketAddr::new(
-                    IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)),
-                    local.port()
-                ),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), local.port()),
                 remote
             )
             .is_none()
@@ -183,7 +207,7 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
 }
 
 #[test]
-fn tcp_connection_state_owns_timer_active_and_pending_bits() {
+fn tcp_connection_owns_timer_active_and_pending_bits() {
     let mut connection = connection(TcpConnectionId::new(303), 50_303);
 
     assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));

@@ -349,7 +349,7 @@ impl TcpGraph {
         assert_internal_node(&reset_node);
         let reset = runtime.nodes().register_internal(reset_node);
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
-            drop, punt, listen, drop, drop, drop, reset,
+            drop, punt, listen, drop, drop, drop, drop, drop, drop, drop, drop, drop, reset,
         ));
         let mut tcp_node = tcp_control.node();
         if let Some((handle, worker)) = handoff {

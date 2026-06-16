@@ -13,7 +13,7 @@ use crate::trace::TraceFormatter;
 
 pub mod next;
 
-pub const MAX_NODE_NEXT_FRAMES: usize = 8;
+pub const MAX_NODE_NEXT_FRAMES: usize = 16;
 
 pub use next::{
     NodeNext, NodeNextEnqueue, NodeNextFrames, NodeNextStorage, NodeNextVectorEnqueue,

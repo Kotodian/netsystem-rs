@@ -8,12 +8,12 @@ use hammer_service::transport::tcp::congestion_control::{
     TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
     TcpCongestionSendObservation,
 };
-use hammer_service::transport::tcp::connection::{TcpConnection, TcpConnectionState};
-use hammer_service::transport::tcp::state_machine::Closed;
+use hammer_service::transport::tcp::connection::TcpConnection;
+use hammer_service::transport::tcp::state_machine::{Closed, SynSent};
 
 const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
-fn connection() -> TcpConnectionState {
+fn connection() -> TcpConnection<SynSent> {
     let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
     let connection: TcpConnection<Closed> = TcpConnection::new(
@@ -23,7 +23,7 @@ fn connection() -> TcpConnectionState {
         Some(local),
         remote,
     );
-    connection.connect(1).into()
+    connection.connect_state(1)
 }
 
 #[test]

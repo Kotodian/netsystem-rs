@@ -213,6 +213,12 @@ impl RuntimeTcpListenerControlState {
             unused_node_id(),
             unused_node_id(),
             unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
+            unused_node_id(),
         ));
 
         Ok(Self {

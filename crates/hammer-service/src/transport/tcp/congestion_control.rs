@@ -4,7 +4,7 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpSeq;
 
 use super::congestion::TcpCongestionAckSample;
-use super::connection::TcpConnectionState;
+use super::connection::TcpConnection;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpCongestionAckObservation {
@@ -30,8 +30,8 @@ pub struct TcpCongestionLossObservation {
 pub struct TcpCongestionControlNode;
 
 impl TcpCongestionControlNode {
-    pub fn observe_ack(
-        connection: &mut TcpConnectionState,
+    pub fn observe_ack<S>(
+        connection: &mut TcpConnection<S>,
         observation: TcpCongestionAckObservation,
     ) -> CoreResult<()> {
         let bytes_in_flight =
@@ -45,8 +45,8 @@ impl TcpCongestionControlNode {
         Ok(())
     }
 
-    pub fn observe_send(
-        connection: &mut TcpConnectionState,
+    pub fn observe_send<S>(
+        connection: &mut TcpConnection<S>,
         observation: TcpCongestionSendObservation,
     ) -> CoreResult<()> {
         connection.observe_congestion_send(
@@ -57,8 +57,8 @@ impl TcpCongestionControlNode {
         Ok(())
     }
 
-    pub fn observe_loss(
-        connection: &mut TcpConnectionState,
+    pub fn observe_loss<S>(
+        connection: &mut TcpConnection<S>,
         observation: TcpCongestionLossObservation,
     ) -> CoreResult<()> {
         connection.observe_congestion_loss(observation.bytes_lost);

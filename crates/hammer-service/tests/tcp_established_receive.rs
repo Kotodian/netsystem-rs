@@ -9,8 +9,8 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::TcpSessionProtocol;
 use hammer_service::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpRcvProcessNext,
-    TcpRcvProcessNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpSynRcvdNext,
+    TcpSynRcvdNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -117,8 +117,8 @@ fn established_graph() -> Graph {
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
-    let rcv_process = runtime.nodes().register_internal(
-        TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
+    let syn_rcvd = runtime.nodes().register_internal(
+        TcpSynRcvdNode::new(TcpSynRcvdNext::nodes(output, drop)).with_session_queue(handle),
     );
     let established = runtime.nodes().register_internal(
         TcpEstablishedNode::new(TcpEstablishedNext::nodes(output, drop)).with_session_queue(handle),
@@ -143,7 +143,7 @@ fn established_graph() -> Graph {
 
     send_packet(
         &runtime,
-        rcv_process,
+        syn_rcvd,
         tcp_packet(
             REMOTE,
             REMOTE_PORT,
@@ -155,7 +155,7 @@ fn established_graph() -> Graph {
             b"",
         ),
     );
-    assert_eq!(runtime.run_ready_nodes().expect("run rcv-process"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 2);
     output_state.lock().unwrap().packets.clear();
 
     Graph {

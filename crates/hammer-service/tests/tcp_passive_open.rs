@@ -9,8 +9,8 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::TcpSessionProtocol;
 use hammer_service::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpRcvProcessNext,
-    TcpRcvProcessNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpSynRcvdNext,
+    TcpSynRcvdNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -157,8 +157,8 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
-    let rcv_process = runtime.nodes().register_internal(
-        TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
+    let syn_rcvd = runtime.nodes().register_internal(
+        TcpSynRcvdNode::new(TcpSynRcvdNext::nodes(output, drop)).with_session_queue(handle),
     );
 
     send_packet(
@@ -180,7 +180,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
 
     send_packet(
         &runtime,
-        rcv_process,
+        syn_rcvd,
         tcp_packet(
             REMOTE,
             REMOTE_PORT,
@@ -193,7 +193,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run rcv-process"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 2);
     let packets = &output_state.lock().unwrap().packets;
     assert_eq!(packets.len(), 1);
     assert_tcp_packet(
@@ -209,7 +209,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
 }
 
 #[test]
-fn tcp_rcv_process_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
+fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
@@ -222,13 +222,13 @@ fn tcp_rcv_process_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
-    let rcv_process = runtime.nodes().register_internal(
-        TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
+    let syn_rcvd = runtime.nodes().register_internal(
+        TcpSynRcvdNode::new(TcpSynRcvdNext::nodes(output, drop)).with_session_queue(handle),
     );
     let established = runtime.nodes().register_internal(
         TcpEstablishedNode::new(TcpEstablishedNext::nodes(output, drop)).with_session_queue(handle),
     );
-    establish_passive_session(&runtime, listen, rcv_process, &output_state);
+    establish_passive_session(&runtime, listen, syn_rcvd, &output_state);
 
     send_packet(
         &runtime,
@@ -261,7 +261,7 @@ fn tcp_rcv_process_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
 }
 
 #[test]
-fn tcp_rcv_process_rst_closes_session_and_completes_app_closed() {
+fn tcp_syn_rcvd_rst_closes_session_and_completes_app_closed() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
@@ -274,13 +274,13 @@ fn tcp_rcv_process_rst_closes_session_and_completes_app_closed() {
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
-    let rcv_process = runtime.nodes().register_internal(
-        TcpRcvProcessNode::new(TcpRcvProcessNext::nodes(output, drop)).with_session_queue(handle),
+    let syn_rcvd = runtime.nodes().register_internal(
+        TcpSynRcvdNode::new(TcpSynRcvdNext::nodes(output, drop)).with_session_queue(handle),
     );
     let established = runtime.nodes().register_internal(
         TcpEstablishedNode::new(TcpEstablishedNext::nodes(output, drop)).with_session_queue(handle),
     );
-    establish_passive_session(&runtime, listen, rcv_process, &output_state);
+    establish_passive_session(&runtime, listen, syn_rcvd, &output_state);
 
     send_packet(
         &runtime,
@@ -318,7 +318,7 @@ fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: Vec<u8>) {
 fn establish_passive_session(
     runtime: &DataPlaneRuntime,
     listen: NodeId,
-    rcv_process: NodeId,
+    syn_rcvd: NodeId,
     output_state: &Arc<Mutex<CaptureState>>,
 ) {
     send_packet(
@@ -340,7 +340,7 @@ fn establish_passive_session(
 
     send_packet(
         runtime,
-        rcv_process,
+        syn_rcvd,
         tcp_packet(
             REMOTE,
             REMOTE_PORT,
@@ -352,7 +352,7 @@ fn establish_passive_session(
             b"",
         ),
     );
-    assert_eq!(runtime.run_ready_nodes().expect("run rcv-process"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 2);
     output_state.lock().unwrap().packets.clear();
 }
 
