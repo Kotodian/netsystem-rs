@@ -9,12 +9,12 @@ use crate::session::SessionQueueHandle;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
-use super::session::TcpSessionQueue;
+use super::session::{TcpServiceController, TcpSessionQueue};
 use super::state_machine::SynSent;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
-    Output,
+    Congestion,
     Drop,
 }
 
@@ -73,11 +73,11 @@ fn tcp_syn_sent_frame(
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp syn-sent node missing session queue"))?;
-    let output = next[TcpSynSentNext::Output as usize];
+    let congestion = next[TcpSynSentNext::Congestion as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_syn_sent_index(runtime, index, session_queue, output, &mut next_frames) {
+        match tcp_syn_sent_index(runtime, index, session_queue, congestion, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -93,7 +93,7 @@ fn tcp_syn_sent_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
-    output: NodeId,
+    congestion: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
@@ -102,7 +102,8 @@ fn tcp_syn_sent_index(
         let (session_id, _, _) = queue
             .pending_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
-        let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<SynSent, TcpServiceController> =
+            queue.take_connection(session_id)?;
         let control = connection.receive_open_reply(queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
@@ -121,7 +122,7 @@ fn tcp_syn_sent_index(
         return Err(error);
     }
     if let Some(output_index) = output_index.take()
-        && let Err(error) = next_frames.enqueue(runtime, output, output_index)
+        && let Err(error) = next_frames.enqueue(runtime, congestion, output_index)
     {
         runtime.free_index(output_index);
         return Err(error);
@@ -249,12 +250,12 @@ mod tests {
         })
         .expect("bind app ring");
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
-        let output = runtime
+        let congestion = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&output_state)));
         let drop = runtime.nodes().register_internal(DropNode::new());
         let syn_sent = runtime.nodes().register_internal(
-            TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
+            TcpSynSentNode::new(TcpSynSentNext::nodes(congestion, drop)).with_session_queue(handle),
         );
 
         send_packet(
@@ -285,7 +286,8 @@ mod tests {
             ACK,
         );
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+            let connection: TcpConnection<Established, TcpServiceController> =
+                queue.take_connection(session_id)?;
             assert_eq!(connection.snd_una(), client_isn + 1);
             assert_eq!(connection.rcv_nxt(), SERVER_ISN + 1);
             assert_eq!(
@@ -323,12 +325,12 @@ mod tests {
         })
         .expect("bind app ring");
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
-        let output = runtime
+        let congestion = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&output_state)));
         let drop = runtime.nodes().register_internal(DropNode::new());
         let syn_sent = runtime.nodes().register_internal(
-            TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
+            TcpSynSentNode::new(TcpSynSentNext::nodes(congestion, drop)).with_session_queue(handle),
         );
 
         send_packet(
@@ -372,7 +374,8 @@ mod tests {
     fn open_client_session(handle: SessionQueueHandle) -> (crate::session::SessionId, u32) {
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
             let session_id = queue.connect(local_addr(), remote_addr())?;
-            let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+            let connection: TcpConnection<SynSent, TcpServiceController> =
+                queue.take_connection(session_id)?;
             let initial_sequence = connection.iss();
             Ok((session_id, initial_sequence))
         })

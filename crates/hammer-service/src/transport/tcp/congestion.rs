@@ -1,3 +1,4 @@
 pub use crate::transport::congestion::{
-    CongestionAckSample as TcpCongestionAckSample, CongestionState as TcpCongestionState,
+    AckedPacket as TcpAckedPacket, CongestionController as TcpCongestionController,
+    LostPacket as TcpLostPacket, RttSample as TcpRttSample,
 };

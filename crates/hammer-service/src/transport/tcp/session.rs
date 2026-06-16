@@ -10,6 +10,8 @@ use hammer_core::protocol::tcp::{TcpConnectionId, TcpSegmentFlags, TcpSegmentHea
 #[cfg(test)]
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
+use crate::transport::congestion::BbrController;
+
 use super::connection::TcpConnection;
 use super::segment::alloc_tcp_segment;
 use super::segment::tcp_segment_metadata;
@@ -37,6 +39,8 @@ use crate::session::{
 };
 
 const TCP_ACTIVE_OPEN_TIMER_TICKS: u64 = 2;
+pub(crate) type TcpServiceController = BbrController;
+pub(crate) type TcpServiceConnectionState = TcpConnectionState<TcpServiceController>;
 
 thread_local! {
     static TCP_SESSION_QUEUES: RefCell<hammer_infra::vec::Vec<TcpSessionQueue>> =
@@ -44,7 +48,7 @@ thread_local! {
 }
 
 pub(crate) struct TcpSessionQueue {
-    driver: SessionDriverRuntime<TcpConnectionState>,
+    driver: SessionDriverRuntime<TcpServiceConnectionState>,
     protocol: TcpSessionProtocol,
 }
 
@@ -83,39 +87,34 @@ impl TcpSessionQueue {
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn insert_session(&mut self, connection: TcpConnectionState) -> SessionId {
+    pub(crate) fn insert_session(&mut self, connection: TcpServiceConnectionState) -> SessionId {
         self.driver.insert_session(connection)
     }
 
     #[inline]
     pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> SessionId
     where
-        F: SessionStateFactory<TcpConnectionState>,
+        F: SessionStateFactory<TcpServiceConnectionState>,
     {
         self.driver.insert_session_with_id(f)
     }
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn session(
+    pub(crate) fn session_state(
         &self,
         session_id: SessionId,
-    ) -> Option<&SessionEntry<TcpConnectionState>> {
-        self.driver.session(session_id)
-    }
-
-    #[inline]
-    #[cfg(test)]
-    pub(crate) fn session_state(&self, session_id: SessionId) -> Option<&TcpConnectionState> {
+    ) -> Option<&TcpServiceConnectionState> {
         self.driver.session_state(session_id)
     }
 
     pub(crate) fn take_connection<S>(
         &mut self,
         session_id: SessionId,
-    ) -> CoreResult<TcpConnection<S>>
+    ) -> CoreResult<TcpConnection<S, TcpServiceController>>
     where
-        TcpConnection<S>: TryFrom<TcpConnectionState, Error = CoreError>,
+        TcpConnection<S, TcpServiceController>:
+            TryFrom<TcpServiceConnectionState, Error = CoreError>,
     {
         self.driver
             .session_state(session_id)
@@ -128,7 +127,7 @@ impl TcpSessionQueue {
     pub(crate) fn close_session(
         &mut self,
         session_id: SessionId,
-    ) -> CoreResult<Option<SessionEntry<TcpConnectionState>>> {
+    ) -> CoreResult<Option<SessionEntry<TcpServiceConnectionState>>> {
         let closed = self.driver.close_session(session_id)?;
         if closed.is_some() {
             self.protocol.forget_session(session_id);
@@ -178,28 +177,38 @@ impl TcpSessionQueue {
     }
 
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn session_id_by_connection_id(
-        &self,
-        connection_id: TcpConnectionId,
-    ) -> Option<SessionId> {
-        self.protocol.session_id_by_connection_id(connection_id)
-    }
-
-    #[inline]
     pub(crate) fn arm_retransmit_timer(
         &mut self,
         session_id: SessionId,
         ticks: u64,
     ) -> CoreResult<()> {
-        let mut context = SessionProtocolContext::new(&mut self.driver);
-        TcpSessionProtocol::arm_retransmit_timer(&mut context, session_id, ticks)
+        self.arm_tcp_timer_ticks(session_id, TcpConnectionTimerKind::RETRANSMIT, ticks)
     }
 
     #[inline]
     pub(crate) fn cancel_retransmit_timer(&mut self, session_id: SessionId) -> bool {
+        self.cancel_tcp_timer(session_id, TcpConnectionTimerKind::RETRANSMIT)
+    }
+
+    #[inline]
+    pub(crate) fn arm_tcp_timer_ticks(
+        &mut self,
+        session_id: SessionId,
+        kind: TcpConnectionTimerKind,
+        ticks: u64,
+    ) -> CoreResult<()> {
         let mut context = SessionProtocolContext::new(&mut self.driver);
-        TcpSessionProtocol::cancel_retransmit_timer(&mut context, session_id)
+        TcpSessionProtocol::arm_tcp_timer_ticks(&mut context, session_id, kind, ticks)
+    }
+
+    #[inline]
+    pub(crate) fn cancel_tcp_timer(
+        &mut self,
+        session_id: SessionId,
+        kind: TcpConnectionTimerKind,
+    ) -> bool {
+        let mut context = SessionProtocolContext::new(&mut self.driver);
+        TcpSessionProtocol::cancel_tcp_timer(&mut context, session_id, kind)
     }
 
     #[inline]
@@ -229,7 +238,7 @@ impl TcpSessionQueue {
         remote: SocketAddr,
     ) -> CoreResult<SessionId> {
         let iss = self.protocol.next_initial_sequence(local, remote);
-        let connection: TcpConnection<Closed> =
+        let connection: TcpConnection<Closed, TcpServiceController> =
             TcpConnection::new(None, self.worker(), local.port(), Some(local), remote);
         connection.connect(self, iss)
     }
@@ -274,7 +283,7 @@ impl TcpSessionQueue {
     }
 }
 
-impl TcpConnection<Closed> {
+impl TcpConnection<Closed, TcpServiceController> {
     pub(crate) fn connect(
         self,
         queue: &mut TcpSessionQueue,
@@ -295,7 +304,7 @@ impl TcpConnection<Closed> {
     }
 }
 
-impl TcpConnection<Listen> {
+impl TcpConnection<Listen, TcpServiceController> {
     pub(crate) fn receive_syn(
         self,
         queue: &mut TcpSessionQueue,
@@ -328,7 +337,7 @@ impl TcpConnection<Listen> {
     }
 }
 
-impl TcpConnection<SynSent> {
+impl TcpConnection<SynSent, TcpServiceController> {
     pub(crate) fn receive_open_reply(
         self,
         queue: &mut TcpSessionQueue,
@@ -355,7 +364,7 @@ impl TcpConnection<SynSent> {
             };
             if self.accepts_segment_ack(acknowledgment) {
                 let mut connection = self.close_remote_reset();
-                connection.tcp_timer_reset(TcpConnectionTimerKind::Retransmit);
+                connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
                 queue.protocol.forget_pending_open(session_id);
                 queue
                     .driver
@@ -380,7 +389,7 @@ impl TcpConnection<SynSent> {
                 return Ok(None);
             }
             let (mut connection, header) = self.accept_syn_ack(packet, acknowledgment);
-            connection.tcp_timer_reset(TcpConnectionTimerKind::Retransmit);
+            connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
             queue.cancel_retransmit_timer(session_id);
             queue.protocol.forget_pending_open(session_id);
             queue.protocol.remember_session(
@@ -413,7 +422,7 @@ impl TcpConnection<SynSent> {
     }
 }
 
-impl TcpConnection<SynRcvd> {
+impl TcpConnection<SynRcvd, TcpServiceController> {
     pub(crate) fn receive_final_ack(
         self,
         queue: &mut TcpSessionQueue,
@@ -440,7 +449,7 @@ impl TcpConnection<SynRcvd> {
             return Ok(Some(header));
         }
         let (mut connection, header) = self.accept_final_ack(packet, acknowledgment);
-        connection.tcp_timer_reset(TcpConnectionTimerKind::Retransmit);
+        connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
         queue.cancel_retransmit_timer(session_id);
         queue.protocol.remember_session(
             session_id,
@@ -457,7 +466,7 @@ impl TcpConnection<SynRcvd> {
     }
 }
 
-impl TcpConnection<Established> {
+impl TcpConnection<Established, TcpServiceController> {
     pub(crate) fn receive_data(
         mut self,
         runtime: &DataPlaneRuntime,
@@ -535,7 +544,7 @@ impl TcpConnection<Established> {
     }
 }
 
-impl TcpConnection<CloseWait> {
+impl TcpConnection<CloseWait, TcpServiceController> {
     pub(crate) fn receive_close_wait(
         mut self,
         queue: &mut TcpSessionQueue,
@@ -568,7 +577,7 @@ impl TcpConnection<CloseWait> {
     }
 }
 
-impl TcpConnection<FinWait1> {
+impl TcpConnection<FinWait1, TcpServiceController> {
     pub(crate) fn receive_fin_wait1(
         self,
         queue: &mut TcpSessionQueue,
@@ -642,7 +651,7 @@ impl TcpConnection<FinWait1> {
     }
 }
 
-impl TcpConnection<FinWait2> {
+impl TcpConnection<FinWait2, TcpServiceController> {
     pub(crate) fn receive_fin_wait2(
         self,
         queue: &mut TcpSessionQueue,
@@ -678,7 +687,7 @@ impl TcpConnection<FinWait2> {
     }
 }
 
-impl TcpConnection<Closing> {
+impl TcpConnection<Closing, TcpServiceController> {
     pub(crate) fn receive_closing(
         self,
         queue: &mut TcpSessionQueue,
@@ -716,7 +725,7 @@ impl TcpConnection<Closing> {
     }
 }
 
-impl TcpConnection<LastAck> {
+impl TcpConnection<LastAck, TcpServiceController> {
     pub(crate) fn receive_last_ack(
         self,
         queue: &mut TcpSessionQueue,
@@ -748,7 +757,7 @@ impl TcpConnection<LastAck> {
     }
 }
 
-impl TcpConnection<TimeWait> {
+impl TcpConnection<TimeWait, TcpServiceController> {
     pub(crate) fn receive_time_wait(
         self,
         queue: &mut TcpSessionQueue,
@@ -769,41 +778,43 @@ impl TcpConnection<TimeWait> {
     }
 }
 
-impl SessionQueueProtocol<TcpConnectionState> for TcpSessionProtocol {
+impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
     fn handle_timer_expiry(
         &mut self,
-        driver: &mut SessionDriverRuntime<TcpConnectionState>,
+        driver: &mut SessionDriverRuntime<TcpServiceConnectionState>,
         expiry: SessionTimerExpiry,
     ) -> CoreResult<()> {
-        if expiry.token() == TcpSessionProtocol::RETRANSMIT_TIMER_TOKEN {
-            driver.mark_ready(expiry.session_id());
+        let Some(kind) = Self::timer_kind(expiry.token()) else {
+            return Ok(());
+        };
+        if let Some(connection) = driver.session_state_mut(expiry.session_id()) {
+            connection.tcp_timer_expire(kind);
         }
+        driver.mark_ready(expiry.session_id());
         Ok(())
     }
 
     fn handle_ready_session(
         &mut self,
         runtime: &DataPlaneRuntime,
-        driver: &mut SessionDriverRuntime<TcpConnectionState>,
+        driver: &mut SessionDriverRuntime<TcpServiceConnectionState>,
         session_id: SessionId,
         output_next: SessionQueueNext,
         output: &mut SessionQueueOutput,
     ) -> CoreResult<()> {
-        let timer_output = driver.session_state_mut(session_id).and_then(|connection| {
-            connection.on_tcp_timer_expiry(TcpConnectionTimerKind::Retransmit)
-        });
-        if let Some((local, remote, header)) = timer_output {
+        let timer_output = driver
+            .session_state_mut(session_id)
+            .and_then(TcpConnectionState::on_tcp_timer_expiry);
+        if let Some((kind, local, remote, header)) = timer_output {
             let index = alloc_tcp_segment(
                 driver.buffers(),
                 tcp_segment_metadata(local, remote),
                 header,
             )?;
             output.enqueue(runtime, output_next.node(), index)?;
-            driver.arm_timer_ticks(
-                session_id,
-                TcpSessionProtocol::RETRANSMIT_TIMER_TOKEN,
-                TCP_ACTIVE_OPEN_TIMER_TICKS,
-            )?;
+            if let Some(token) = TcpSessionProtocol::timer_token(kind) {
+                driver.arm_timer_ticks(session_id, token, TCP_ACTIVE_OPEN_TIMER_TICKS)?;
+            }
         }
         if driver
             .session(session_id)
@@ -824,8 +835,6 @@ pub struct TcpSessionProtocol {
 }
 
 impl TcpSessionProtocol {
-    pub const RETRANSMIT_TIMER_TOKEN: SessionTimerToken = SessionTimerToken::new(1);
-
     #[inline]
     pub fn new(worker: DataWorkerId) -> Self {
         Self {
@@ -932,7 +941,7 @@ impl TcpSessionProtocol {
     #[inline]
     pub fn mark_session_ready(
         &mut self,
-        context: &mut SessionProtocolContext<'_, TcpConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
         session_id: SessionId,
     ) {
         context.mark_ready(session_id);
@@ -940,31 +949,79 @@ impl TcpSessionProtocol {
 
     #[inline]
     pub fn arm_retransmit_timer(
-        context: &mut SessionProtocolContext<'_, TcpConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
         session_id: SessionId,
         ticks: u64,
     ) -> CoreResult<()> {
-        context.arm_timer_ticks(session_id, Self::RETRANSMIT_TIMER_TOKEN, ticks)
+        Self::arm_tcp_timer_ticks(
+            context,
+            session_id,
+            TcpConnectionTimerKind::RETRANSMIT,
+            ticks,
+        )
     }
 
     #[inline]
     pub fn cancel_retransmit_timer(
-        context: &mut SessionProtocolContext<'_, TcpConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
         session_id: SessionId,
     ) -> bool {
-        context.cancel_timer(session_id, Self::RETRANSMIT_TIMER_TOKEN)
+        Self::cancel_tcp_timer(context, session_id, TcpConnectionTimerKind::RETRANSMIT)
+    }
+
+    #[inline]
+    pub fn timer_token(kind: TcpConnectionTimerKind) -> Option<SessionTimerToken> {
+        let bits = kind.bits();
+        if bits == 0 || bits.count_ones() != 1 {
+            return None;
+        }
+        Some(SessionTimerToken::new(bits.trailing_zeros() + 1))
+    }
+
+    #[inline]
+    pub fn timer_kind(token: SessionTimerToken) -> Option<TcpConnectionTimerKind> {
+        let ordinal = token.get();
+        if ordinal == 0 || ordinal > u16::BITS {
+            return None;
+        }
+        TcpConnectionTimerKind::from_timer_bit(1u16 << (ordinal - 1))
+    }
+
+    #[inline]
+    pub fn arm_tcp_timer_ticks(
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+        session_id: SessionId,
+        kind: TcpConnectionTimerKind,
+        ticks: u64,
+    ) -> CoreResult<()> {
+        let Some(token) = Self::timer_token(kind) else {
+            return Ok(());
+        };
+        context.arm_timer_ticks(session_id, token, ticks)
+    }
+
+    #[inline]
+    pub fn cancel_tcp_timer(
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+        session_id: SessionId,
+        kind: TcpConnectionTimerKind,
+    ) -> bool {
+        let Some(token) = Self::timer_token(kind) else {
+            return false;
+        };
+        context.cancel_timer(session_id, token)
     }
 
     #[inline]
     pub fn take_drained_sends(
-        context: &mut SessionProtocolContext<'_, TcpConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
     ) -> hammer_infra::vec::Vec<SessionAppSendSubmission> {
         context.app_mut().take_drained_sends()
     }
 
     #[inline]
     pub fn take_drained_closes(
-        context: &mut SessionProtocolContext<'_, TcpConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
     ) -> hammer_infra::vec::Vec<SessionAppCloseSubmission> {
         context.app_mut().take_drained_closes()
     }
@@ -1014,11 +1071,12 @@ impl TcpSessionProtocol {
     pub(crate) fn register_queue_with_connection_for_test(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-        connection: TcpConnectionState,
+        connection: TcpServiceConnectionState,
     ) -> CoreResult<SessionQueueHandle> {
         let mut queue = TcpSessionQueue::new(worker, buffers);
         let session_id = queue.insert_session(connection);
-        let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<Established, TcpServiceController> =
+            queue.take_connection(session_id)?;
         queue.protocol.remember_session(
             session_id,
             connection.connection_id(),
@@ -1145,10 +1203,10 @@ mod tests {
         Ok(NodeResult::drop())
     }
 
-    fn tcp_connection() -> TcpConnectionState {
+    fn tcp_connection() -> TcpServiceConnectionState {
         let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
         let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-        TcpConnectionState::established_for_test(
+        TcpServiceConnectionState::established_for_test(
             Some(TcpConnectionId::new(7001)),
             DataWorkerId::new(0),
             local.port(),
@@ -1163,8 +1221,8 @@ mod tests {
         remote: SocketAddr,
         iss: u32,
         capabilities: TcpCapabilities,
-    ) -> TcpConnectionState {
-        let closed: TcpConnection<Closed> =
+    ) -> TcpServiceConnectionState {
+        let closed: TcpConnection<Closed, TcpServiceController> =
             TcpConnection::new(None, worker, local.port(), Some(local), remote);
         let mut syn_sent = closed.connect_state(iss);
         syn_sent.set_local_capabilities(capabilities);
@@ -1172,7 +1230,8 @@ mod tests {
     }
 
     fn remember_established(queue: &mut TcpSessionQueue, session_id: SessionId) -> CoreResult<()> {
-        let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<Established, TcpServiceController> =
+            queue.take_connection(session_id)?;
         queue.protocol.remember_session(
             session_id,
             connection.connection_id(),
@@ -1188,7 +1247,8 @@ mod tests {
     }
 
     fn remember_pending(queue: &mut TcpSessionQueue, session_id: SessionId) -> CoreResult<()> {
-        let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<SynSent, TcpServiceController> =
+            queue.take_connection(session_id)?;
         queue.protocol.remember_pending_open(
             session_id,
             connection.local(),
@@ -1204,7 +1264,7 @@ mod tests {
 
     fn install_connecting_session(
         queue: &mut TcpSessionQueue,
-        connection: TcpConnectionState,
+        connection: TcpServiceConnectionState,
     ) -> CoreResult<SessionId> {
         let session_id = queue.insert_session(connection);
         remember_pending(queue, session_id)?;
@@ -1241,7 +1301,8 @@ mod tests {
         let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("active open");
         let active_open_iss =
             TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-                let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+                let connection: TcpConnection<SynSent, TcpServiceController> =
+                    queue.take_connection(session_id)?;
                 let iss = connection.iss();
                 queue
                     .driver
@@ -1266,11 +1327,12 @@ mod tests {
         );
 
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
+            let connection: TcpConnection<SynSent, TcpServiceController> =
+                queue.take_connection(session_id)?;
             assert_eq!(connection.snd_una(), active_open_iss);
             assert_eq!(connection.snd_nxt(), active_open_iss + 1);
             assert_eq!(connection.rcv_nxt(), 0);
-            assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
+            assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
             queue
                 .driver
                 .replace_session_state(session_id, connection.into());
@@ -1365,8 +1427,9 @@ mod tests {
             TcpCapabilities::default(),
         );
         TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<SynSent> = queue.take_connection(session_id)?;
-            assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
+            let connection: TcpConnection<SynSent, TcpServiceController> =
+                queue.take_connection(session_id)?;
+            assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
             queue
                 .driver
                 .replace_session_state(session_id, connection.into());
@@ -1491,6 +1554,28 @@ mod tests {
             .dispatch_for_ticks(&runtime, 1, unused_output_next())
             .expect("dispatch cancelled timer");
         assert!(queue.session_state(session_id).is_some());
+    }
+
+    #[test]
+    fn tcp_session_queue_can_register_rack_tlp_and_pacing_timers() {
+        let worker = DataWorkerId::new(0);
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let mut queue = TcpSessionQueue::new(worker, runtime.packet_buffers().clone());
+        let session_id = queue.insert_session(tcp_connection());
+
+        queue
+            .arm_tcp_timer_ticks(session_id, TcpConnectionTimerKind::RACK, 1)
+            .expect("arm rack timer");
+        queue
+            .arm_tcp_timer_ticks(session_id, TcpConnectionTimerKind::TLP, 2)
+            .expect("arm tlp timer");
+        queue
+            .arm_tcp_timer_ticks(session_id, TcpConnectionTimerKind::PACING, 3)
+            .expect("arm pacing timer");
+
+        assert_eq!(queue.expire_timers_for_test(1).expect("expire rack"), 1);
+        assert_eq!(queue.expire_timers_for_test(1).expect("expire tlp"), 1);
+        assert_eq!(queue.expire_timers_for_test(1).expect("expire pacing"), 1);
     }
 
     #[test]

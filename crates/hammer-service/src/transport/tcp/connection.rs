@@ -4,6 +4,8 @@ use std::time::Duration;
 use hammer_core::error::CoreError;
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpNegotiatedOptions, TcpSegmentHeader};
 
+use crate::transport::congestion::CongestionController;
+
 pub use super::state_machine::TcpConnection;
 use super::state_machine::{
     CloseWait, Closed, Closing, Established, FinWait1, FinWait2, LastAck, Listen, SynRcvd, SynSent,
@@ -11,22 +13,28 @@ use super::state_machine::{
 };
 
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
-const TCP_CONNECTION_TIMER_RETRANSMIT_BIT: u8 = 1 << 0;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TcpConnectionTimerKind {
-    Retransmit,
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TcpConnectionTimerKind: u16 {
+        const RETRANSMIT = 1 << 0;
+        const RACK = 1 << 1;
+        const TLP = 1 << 2;
+        const PACING = 1 << 3;
+        const DELAYED_ACK = 1 << 4;
+        const PERSIST = 1 << 5;
+        const KEEP_ALIVE = 1 << 6;
+        const TIME_WAIT = 1 << 7;
+    }
 }
 
 impl TcpConnectionTimerKind {
     #[inline(always)]
-    pub(super) const fn bit(self) -> u8 {
-        match self {
-            Self::Retransmit => TCP_CONNECTION_TIMER_RETRANSMIT_BIT,
-        }
+    pub(crate) const fn from_timer_bit(bit: u16) -> Option<Self> {
+        Self::from_bits(bit)
     }
 }
 
@@ -195,21 +203,27 @@ impl Default for TcpConnectionOptionState {
 }
 
 #[derive(Debug, Clone)]
-pub enum TcpConnectionState {
-    Closed(TcpConnection<Closed>),
-    Listen(TcpConnection<Listen>),
-    SynSent(TcpConnection<SynSent>),
-    SynRcvd(TcpConnection<SynRcvd>),
-    Established(TcpConnection<Established>),
-    CloseWait(TcpConnection<CloseWait>),
-    LastAck(TcpConnection<LastAck>),
-    FinWait1(TcpConnection<FinWait1>),
-    FinWait2(TcpConnection<FinWait2>),
-    Closing(TcpConnection<Closing>),
-    TimeWait(TcpConnection<TimeWait>),
+pub enum TcpConnectionState<C>
+where
+    C: CongestionController,
+{
+    Closed(TcpConnection<Closed, C>),
+    Listen(TcpConnection<Listen, C>),
+    SynSent(TcpConnection<SynSent, C>),
+    SynRcvd(TcpConnection<SynRcvd, C>),
+    Established(TcpConnection<Established, C>),
+    CloseWait(TcpConnection<CloseWait, C>),
+    LastAck(TcpConnection<LastAck, C>),
+    FinWait1(TcpConnection<FinWait1, C>),
+    FinWait2(TcpConnection<FinWait2, C>),
+    Closing(TcpConnection<Closing, C>),
+    TimeWait(TcpConnection<TimeWait, C>),
 }
 
-impl TcpConnectionState {
+impl<C> TcpConnectionState<C>
+where
+    C: CongestionController,
+{
     #[cfg(test)]
     pub(crate) fn established_for_test(
         connection_id: Option<hammer_core::protocol::tcp::TcpConnectionId>,
@@ -225,25 +239,106 @@ impl TcpConnectionState {
     #[inline]
     pub(crate) fn on_tcp_timer_expiry(
         &mut self,
+    ) -> Option<(
+        TcpConnectionTimerKind,
+        SocketAddr,
+        SocketAddr,
+        TcpSegmentHeader,
+    )> {
+        for timer in TcpConnectionTimerKind::all().iter() {
+            if let Some(output) = self.on_tcp_timer(timer) {
+                return Some(output);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn on_tcp_timer(
+        &mut self,
         timer: TcpConnectionTimerKind,
-    ) -> Option<(SocketAddr, SocketAddr, TcpSegmentHeader)> {
+    ) -> Option<(
+        TcpConnectionTimerKind,
+        SocketAddr,
+        SocketAddr,
+        TcpSegmentHeader,
+    )> {
         match self {
             Self::SynSent(connection) => {
                 let header = connection.on_tcp_timer_expiry(timer)?;
-                Some((connection.local()?, connection.remote(), header))
+                Some((timer, connection.local()?, connection.remote(), header))
             }
-            _ => None,
+            Self::Closed(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::Listen(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::SynRcvd(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::Established(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::CloseWait(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::LastAck(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::FinWait1(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::FinWait2(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::Closing(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+            Self::TimeWait(connection) => {
+                connection.tcp_timer_take_pending(timer);
+                None
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_expire(timer),
+            Self::Listen(connection) => connection.tcp_timer_expire(timer),
+            Self::SynSent(connection) => connection.tcp_timer_expire(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_expire(timer),
+            Self::Established(connection) => connection.tcp_timer_expire(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_expire(timer),
+            Self::LastAck(connection) => connection.tcp_timer_expire(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_expire(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_expire(timer),
+            Self::Closing(connection) => connection.tcp_timer_expire(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_expire(timer),
         }
     }
 }
 
 macro_rules! impl_connection_storage {
     ($state_type:ty, $variant:ident) => {
-        impl TryFrom<TcpConnectionState> for TcpConnection<$state_type> {
+        impl<C> TryFrom<TcpConnectionState<C>> for TcpConnection<$state_type, C>
+        where
+            C: CongestionController,
+        {
             type Error = CoreError;
 
             #[inline]
-            fn try_from(state: TcpConnectionState) -> Result<Self, Self::Error> {
+            fn try_from(state: TcpConnectionState<C>) -> Result<Self, Self::Error> {
                 match state {
                     TcpConnectionState::$variant(connection) => Ok(connection),
                     _ => Err(CoreError::internal(concat!(
@@ -254,9 +349,12 @@ macro_rules! impl_connection_storage {
             }
         }
 
-        impl From<TcpConnection<$state_type>> for TcpConnectionState {
+        impl<C> From<TcpConnection<$state_type, C>> for TcpConnectionState<C>
+        where
+            C: CongestionController,
+        {
             #[inline]
-            fn from(connection: TcpConnection<$state_type>) -> Self {
+            fn from(connection: TcpConnection<$state_type, C>) -> Self {
                 Self::$variant(connection)
             }
         }

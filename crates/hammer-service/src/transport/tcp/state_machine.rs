@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{
@@ -7,17 +7,18 @@ use hammer_core::protocol::tcp::{
     TcpSegmentHeader, TcpSeq, TcpState,
 };
 
+use crate::transport::congestion::CongestionController;
+
 use super::TcpInputNext;
-use super::congestion::{TcpCongestionAckSample, TcpCongestionState};
 use super::connection::{
     TcpConnectionOptionState, TcpConnectionTimerKind, TcpRetransmitTimeoutState,
 };
 use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
+use super::recovery::TcpRecoveryState;
 use super::segment::TcpPacket;
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed {
     _private: (),
@@ -73,40 +74,29 @@ pub struct TimeWait {
     _private: (),
 }
 
-trait TcpMarker {
-    fn marker() -> Self;
+trait TcpInitialState {
+    fn initial_state() -> Self;
 }
 
-trait TcpRootState: TcpMarker {}
-
-macro_rules! impl_marker {
-    ($state:ty) => {
-        impl TcpMarker for $state {
-            #[inline]
-            fn marker() -> Self {
-                Self { _private: () }
-            }
-        }
-    };
+impl TcpInitialState for Closed {
+    #[inline]
+    fn initial_state() -> Self {
+        Self { _private: () }
+    }
 }
 
-impl_marker!(Closed);
-impl_marker!(Listen);
-impl_marker!(SynSent);
-impl_marker!(SynRcvd);
-impl_marker!(Established);
-impl_marker!(CloseWait);
-impl_marker!(FinWait1);
-impl_marker!(FinWait2);
-impl_marker!(Closing);
-impl_marker!(LastAck);
-impl_marker!(TimeWait);
-
-impl TcpRootState for Closed {}
-impl TcpRootState for Listen {}
+impl TcpInitialState for Listen {
+    #[inline]
+    fn initial_state() -> Self {
+        Self { _private: () }
+    }
+}
 
 #[derive(Debug, Clone)]
-pub struct TcpConnection<S> {
+pub struct TcpConnection<S, C>
+where
+    C: CongestionController,
+{
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
     local_port: u16,
@@ -122,15 +112,20 @@ pub struct TcpConnection<S> {
     rcv_wnd: u32,
     options: TcpConnectionOptionState,
     retransmit_timeout: TcpRetransmitTimeoutState,
-    congestion: TcpCongestionState,
-    active_timers: u8,
-    pending_timers: u8,
-    next_output_at: Option<Instant>,
+    congestion: C,
+    recovery: TcpRecoveryState,
+    active_timers: TcpConnectionTimerKind,
+    pending_timers: TcpConnectionTimerKind,
     _state: S,
 }
 
 #[allow(private_bounds)]
-impl<S: TcpRootState> TcpConnection<S> {
+impl<S, C> TcpConnection<S, C>
+where
+    S: TcpInitialState,
+    C: CongestionController,
+{
+    #[inline]
     pub fn new(
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
@@ -154,16 +149,19 @@ impl<S: TcpRootState> TcpConnection<S> {
             rcv_wnd: DEFAULT_TCP_WINDOW,
             options: TcpConnectionOptionState::default(),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
-            congestion: TcpCongestionState::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
-            active_timers: 0,
-            pending_timers: 0,
-            next_output_at: None,
-            _state: S::marker(),
+            congestion: C::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
+            recovery: TcpRecoveryState::new(),
+            active_timers: TcpConnectionTimerKind::empty(),
+            pending_timers: TcpConnectionTimerKind::empty(),
+            _state: S::initial_state(),
         }
     }
 }
 
-impl<S> TcpConnection<S> {
+impl<S, C> TcpConnection<S, C>
+where
+    C: CongestionController,
+{
     #[inline]
     pub const fn connection_id(&self) -> Option<TcpConnectionId> {
         self.connection_id
@@ -270,7 +268,7 @@ impl<S> TcpConnection<S> {
     }
 
     #[inline]
-    pub fn congestion(&self) -> &TcpCongestionState {
+    pub fn congestion(&self) -> &C {
         &self.congestion
     }
 
@@ -280,23 +278,23 @@ impl<S> TcpConnection<S> {
     }
 
     #[inline]
-    pub const fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
-        self.active_timers & timer.bit() != 0
+    pub fn recovery(&self) -> &TcpRecoveryState {
+        &self.recovery
     }
 
     #[inline]
-    pub const fn tcp_timer_is_pending(&self, timer: TcpConnectionTimerKind) -> bool {
-        self.pending_timers & timer.bit() != 0
+    pub fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.active_timers.contains(timer)
     }
 
     #[inline]
-    pub const fn tcp_timer_is_live(&self, timer: TcpConnectionTimerKind) -> bool {
+    pub fn tcp_timer_is_pending(&self, timer: TcpConnectionTimerKind) -> bool {
+        self.pending_timers.contains(timer)
+    }
+
+    #[inline]
+    pub fn tcp_timer_is_live(&self, timer: TcpConnectionTimerKind) -> bool {
         self.tcp_timer_is_active(timer) || self.tcp_timer_is_pending(timer)
-    }
-
-    #[inline]
-    pub const fn next_output_at(&self) -> Option<Instant> {
-        self.next_output_at
     }
 
     #[inline]
@@ -306,73 +304,44 @@ impl<S> TcpConnection<S> {
     ) -> TcpNegotiatedOptions {
         let negotiated = self.options.set_local_capabilities(capabilities);
         if let Some(max_segment_size) = negotiated.send_max_segment_size.filter(|max| *max != 0) {
-            self.congestion = TcpCongestionState::new(u32::from(max_segment_size));
+            self.congestion.on_mtu_update(u32::from(max_segment_size));
         }
         negotiated
     }
 
     #[inline]
-    pub fn observe_congestion_ack(&mut self, sample: TcpCongestionAckSample) {
-        self.congestion.on_ack(sample);
-    }
-
-    #[inline]
-    pub fn observe_congestion_send(&mut self, bytes_sent: u32, bytes_in_flight: u32, now: Instant) {
-        self.congestion.on_packet_sent(bytes_sent, bytes_in_flight);
-        self.next_output_at = self
-            .congestion
-            .next_send_delay(bytes_sent)
-            .map(|delay| now + delay);
-    }
-
-    #[inline]
-    pub fn observe_congestion_loss(&mut self, bytes_lost: u32) {
-        self.congestion.on_loss(bytes_lost);
-        self.next_output_at = None;
-    }
-
-    #[inline]
-    pub fn schedule_next_output(&mut self, deadline: Option<Instant>) {
-        self.next_output_at = deadline;
-    }
-
-    #[inline]
     pub fn tcp_timer_set(&mut self, timer: TcpConnectionTimerKind) {
-        self.active_timers |= timer.bit();
+        self.active_timers.insert(timer);
     }
 
     #[inline]
     pub fn tcp_timer_reset(&mut self, timer: TcpConnectionTimerKind) {
-        let bit = timer.bit();
-        self.active_timers &= !bit;
-        self.pending_timers &= !bit;
+        self.active_timers.remove(timer);
+        self.pending_timers.remove(timer);
     }
 
     #[inline]
     pub fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
-        let bit = timer.bit();
-        self.active_timers &= !bit;
-        self.pending_timers |= bit;
+        self.active_timers.remove(timer);
+        self.pending_timers.insert(timer);
     }
 
     #[inline]
     pub fn tcp_timer_take_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
-        let bit = timer.bit();
-        if self.pending_timers & bit == 0 {
+        if !self.pending_timers.contains(timer) {
             return false;
         }
-        self.pending_timers &= !bit;
+        self.pending_timers.remove(timer);
         true
     }
 
     #[inline]
     pub fn tcp_timer_dispatch_pending(&mut self, timer: TcpConnectionTimerKind) -> bool {
-        let bit = timer.bit();
-        if self.pending_timers & bit == 0 {
+        if !self.pending_timers.contains(timer) {
             return false;
         }
-        self.pending_timers &= !bit;
-        self.active_timers & bit == 0
+        self.pending_timers.remove(timer);
+        !self.active_timers.contains(timer)
     }
 
     #[inline]
@@ -410,7 +379,7 @@ impl<S> TcpConnection<S> {
     ) -> TcpNegotiatedOptions {
         let negotiated = self.options.apply_peer_handshake_capabilities(capabilities);
         if let Some(max_segment_size) = negotiated.send_max_segment_size.filter(|max| *max != 0) {
-            self.congestion = TcpCongestionState::new(u32::from(max_segment_size));
+            self.congestion.on_mtu_update(u32::from(max_segment_size));
         }
         negotiated
     }
@@ -466,7 +435,10 @@ impl<S> TcpConnection<S> {
 
 macro_rules! impl_state_view {
     ($state:ty, $tcp_state:expr, $next:expr) => {
-        impl TcpConnection<$state> {
+        impl<C> TcpConnection<$state, C>
+        where
+            C: CongestionController,
+        {
             #[inline]
             pub const fn state(&self) -> TcpState {
                 $tcp_state
@@ -497,10 +469,13 @@ impl_state_view!(LastAck, TcpState::LastAck, TcpInputNext::LastAck);
 impl_state_view!(TimeWait, TcpState::TimeWait, TcpInputNext::TimeWait);
 
 macro_rules! impl_state_constructor {
-    ($target:ty, $method:ident, $source:ty) => {
-        impl TcpConnection<$target> {
+    ($target:ident, $method:ident, $source:ty) => {
+        impl<C> TcpConnection<$target, C>
+        where
+            C: CongestionController,
+        {
             #[inline]
-            fn $method(current: TcpConnection<$source>) -> Self {
+            fn $method(current: TcpConnection<$source, C>) -> Self {
                 let TcpConnection {
                     connection_id,
                     owner_worker,
@@ -518,9 +493,9 @@ macro_rules! impl_state_constructor {
                     options,
                     retransmit_timeout,
                     congestion,
+                    recovery,
                     active_timers,
                     pending_timers,
-                    next_output_at,
                     _state: _,
                 } = current;
                 Self {
@@ -540,10 +515,10 @@ macro_rules! impl_state_constructor {
                     options,
                     retransmit_timeout,
                     congestion,
+                    recovery,
                     active_timers,
                     pending_timers,
-                    next_output_at,
-                    _state: <$target as TcpMarker>::marker(),
+                    _state: $target { _private: () },
                 }
             }
         }
@@ -571,9 +546,12 @@ impl_state_constructor!(TimeWait, time_wait_from_closing, Closing);
 impl_state_constructor!(Closed, closed_from_last_ack, LastAck);
 impl_state_constructor!(Closed, closed_from_time_wait, TimeWait);
 
-impl TcpConnection<Closed> {
+impl<C> TcpConnection<Closed, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub fn connect_state(mut self, initial_sequence: u32) -> TcpConnection<SynSent> {
+    pub fn connect_state(mut self, initial_sequence: u32) -> TcpConnection<SynSent, C> {
         self.close_reason = None;
         self.iss = initial_sequence;
         self.snd_una = initial_sequence;
@@ -582,12 +560,15 @@ impl TcpConnection<Closed> {
     }
 }
 
-impl TcpConnection<Listen> {
+impl<C> TcpConnection<Listen, C>
+where
+    C: CongestionController,
+{
     #[inline]
     pub(crate) fn accept_syn(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<SynRcvd>, TcpSegmentHeader) {
+    ) -> (TcpConnection<SynRcvd, C>, TcpSegmentHeader) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         if self.iss == 0 {
             self.iss = 1;
@@ -603,7 +584,10 @@ impl TcpConnection<Listen> {
     }
 }
 
-impl TcpConnection<SynSent> {
+impl<C> TcpConnection<SynSent, C>
+where
+    C: CongestionController,
+{
     #[inline]
     pub(crate) fn unacceptable_ack(&self, acknowledgment: u32) -> bool {
         !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.iss))
@@ -616,7 +600,7 @@ impl TcpConnection<SynSent> {
     }
 
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_syn_sent(self)
     }
@@ -625,7 +609,7 @@ impl TcpConnection<SynSent> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<Established>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Established, C>, TcpSegmentHeader) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
@@ -639,7 +623,7 @@ impl TcpConnection<SynSent> {
     pub(crate) fn accept_simultaneous_syn(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<SynRcvd>, TcpSegmentHeader) {
+    ) -> (TcpConnection<SynRcvd, C>, TcpSegmentHeader) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
@@ -653,7 +637,7 @@ impl TcpConnection<SynSent> {
         &mut self,
         timer: TcpConnectionTimerKind,
     ) -> Option<TcpSegmentHeader> {
-        if timer != TcpConnectionTimerKind::Retransmit {
+        if timer != TcpConnectionTimerKind::RETRANSMIT {
             return None;
         }
         let retransmit = self.tcp_timer_dispatch_pending(timer);
@@ -679,14 +663,17 @@ impl TcpConnection<SynSent> {
     }
 }
 
-impl TcpConnection<SynRcvd> {
+impl<C> TcpConnection<SynRcvd, C>
+where
+    C: CongestionController,
+{
     #[inline]
     pub(crate) fn accepts_final_ack(&self, acknowledgment: u32) -> bool {
         self.accepts_ack(acknowledgment)
     }
 
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_syn_rcvd(self)
     }
@@ -695,7 +682,7 @@ impl TcpConnection<SynRcvd> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<Established>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Established, C>, TcpSegmentHeader) {
         self.apply_ack(acknowledgment, packet.advertised_window);
         let next = TcpConnection::established_from_syn_rcvd(self);
         let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
@@ -703,9 +690,12 @@ impl TcpConnection<SynRcvd> {
     }
 }
 
-impl TcpConnection<Established> {
+impl<C> TcpConnection<Established, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_established(self)
     }
@@ -727,7 +717,7 @@ impl TcpConnection<Established> {
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<CloseWait>, TcpSegmentHeader) {
+    ) -> (TcpConnection<CloseWait, C>, TcpSegmentHeader) {
         if let Some(acknowledgment) = packet.acknowledgment {
             self.apply_ack(acknowledgment, packet.advertised_window);
         }
@@ -740,9 +730,12 @@ impl TcpConnection<Established> {
     }
 }
 
-impl TcpConnection<CloseWait> {
+impl<C> TcpConnection<CloseWait, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_close_wait(self)
     }
@@ -760,9 +753,12 @@ impl TcpConnection<CloseWait> {
     }
 }
 
-impl TcpConnection<FinWait1> {
+impl<C> TcpConnection<FinWait1, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_fin_wait1(self)
     }
@@ -771,7 +767,7 @@ impl TcpConnection<FinWait1> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<TimeWait>, TcpSegmentHeader) {
+    ) -> (TcpConnection<TimeWait, C>, TcpSegmentHeader) {
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::time_wait_from_fin_wait1(self);
@@ -783,7 +779,7 @@ impl TcpConnection<FinWait1> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> TcpConnection<FinWait2> {
+    ) -> TcpConnection<FinWait2, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
         TcpConnection::fin_wait2_from_fin_wait1(self)
     }
@@ -791,7 +787,7 @@ impl TcpConnection<FinWait1> {
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<Closing>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Closing, C>, TcpSegmentHeader) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::closing_from_fin_wait1(self);
@@ -800,9 +796,12 @@ impl TcpConnection<FinWait1> {
     }
 }
 
-impl TcpConnection<FinWait2> {
+impl<C> TcpConnection<FinWait2, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_fin_wait2(self)
     }
@@ -810,7 +809,7 @@ impl TcpConnection<FinWait2> {
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<TimeWait>, TcpSegmentHeader) {
+    ) -> (TcpConnection<TimeWait, C>, TcpSegmentHeader) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::time_wait_from_fin_wait2(self);
@@ -819,9 +818,12 @@ impl TcpConnection<FinWait2> {
     }
 }
 
-impl TcpConnection<Closing> {
+impl<C> TcpConnection<Closing, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_closing(self)
     }
@@ -830,15 +832,18 @@ impl TcpConnection<Closing> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> TcpConnection<TimeWait> {
+    ) -> TcpConnection<TimeWait, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
         TcpConnection::time_wait_from_closing(self)
     }
 }
 
-impl TcpConnection<LastAck> {
+impl<C> TcpConnection<LastAck, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_last_ack(self)
     }
@@ -847,22 +852,28 @@ impl TcpConnection<LastAck> {
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> TcpConnection<Closed> {
+    ) -> TcpConnection<Closed, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.close_reason = Some(TcpCloseReason::LocalRequest);
         TcpConnection::closed_from_last_ack(self)
     }
 }
 
-impl TcpConnection<TimeWait> {
+impl<C> TcpConnection<TimeWait, C>
+where
+    C: CongestionController,
+{
     #[inline]
-    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed> {
+    pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
         TcpConnection::closed_from_time_wait(self)
     }
 }
 
-impl TcpConnection<Established> {
+impl<C> TcpConnection<Established, C>
+where
+    C: CongestionController,
+{
     #[cfg(test)]
     pub(crate) fn established_for_test(
         connection_id: Option<TcpConnectionId>,
@@ -871,7 +882,7 @@ impl TcpConnection<Established> {
         local: Option<SocketAddr>,
         remote: SocketAddr,
     ) -> Self {
-        let connection: TcpConnection<Listen> =
+        let connection: TcpConnection<Listen, C> =
             TcpConnection::new(connection_id, owner_worker, local_port, local, remote);
         let packet = TcpPacket {
             local: remote,

@@ -11,12 +11,12 @@ use crate::session::SessionQueueHandle;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
-use super::session::TcpSessionQueue;
+use super::session::{TcpServiceController, TcpSessionQueue};
 use super::state_machine::Listen;
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
-    Output,
+    Congestion,
     Drop,
 }
 
@@ -76,11 +76,11 @@ fn tcp_listen_process_frame(
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp listen node missing session queue"))?;
-    let output = next[TcpListenNext::Output as usize];
+    let congestion = next[TcpListenNext::Congestion as usize];
     let drop_next = next[TcpListenNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_listen_index(runtime, index, session_queue, output, &mut next_frames) {
+        match tcp_listen_index(runtime, index, session_queue, congestion, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -96,7 +96,7 @@ fn tcp_listen_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
-    output: NodeId,
+    congestion: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
@@ -105,7 +105,7 @@ fn tcp_listen_index(
         let worker = queue.worker();
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
-            let connection: TcpConnection<Listen> = TcpConnection::new(
+            let connection: TcpConnection<Listen, TcpServiceController> = TcpConnection::new(
                 Some(connection_id),
                 worker,
                 packet.local.port(),
@@ -114,7 +114,8 @@ fn tcp_listen_index(
             );
             connection.into()
         });
-        let connection: TcpConnection<Listen> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<Listen, TcpServiceController> =
+            queue.take_connection(session_id)?;
         let control = connection.receive_syn(queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
@@ -134,7 +135,7 @@ fn tcp_listen_index(
     }
 
     if let Some(output_index) = output_index.take() {
-        if let Err(error) = next_frames.enqueue(runtime, output, output_index) {
+        if let Err(error) = next_frames.enqueue(runtime, congestion, output_index) {
             runtime.free_index(output_index);
             return Err(error);
         }

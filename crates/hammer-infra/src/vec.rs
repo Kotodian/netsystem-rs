@@ -120,6 +120,18 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
     }
 
     #[inline]
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len, "remove index out of bounds");
+        unsafe {
+            let ptr = self.ptr.as_ptr().add(index);
+            let value = ptr.read();
+            ptr::copy(ptr.add(1), ptr, self.len - index - 1);
+            self.len -= 1;
+            value
+        }
+    }
+
+    #[inline]
     pub fn clear(&mut self) {
         unsafe {
             ptr::drop_in_place(std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len));

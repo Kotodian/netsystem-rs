@@ -9,12 +9,12 @@ use crate::session::SessionQueueHandle;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
-use super::session::TcpSessionQueue;
+use super::session::{TcpServiceController, TcpSessionQueue};
 use super::state_machine::Established;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
-    Output,
+    Congestion,
     Drop,
 }
 
@@ -73,11 +73,11 @@ fn tcp_established_frame(
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp established node missing session queue"))?;
-    let output = next[TcpEstablishedNext::Output as usize];
+    let congestion = next[TcpEstablishedNext::Congestion as usize];
     let drop_next = next[TcpEstablishedNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_established_index(runtime, index, session_queue, output, &mut next_frames) {
+        match tcp_established_index(runtime, index, session_queue, congestion, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -93,7 +93,7 @@ fn tcp_established_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
-    output: NodeId,
+    congestion: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
@@ -103,7 +103,8 @@ fn tcp_established_index(
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        let connection: TcpConnection<Established> = queue.take_connection(session_id)?;
+        let connection: TcpConnection<Established, TcpServiceController> =
+            queue.take_connection(session_id)?;
         let control = connection.receive_data(runtime, index, queue, session_id, &packet)?;
         if let Some(header) = control {
             let allocated = alloc_tcp_segment(
@@ -122,7 +123,7 @@ fn tcp_established_index(
         return Err(error);
     }
     if let Some(output_index) = output_index.take()
-        && let Err(error) = next_frames.enqueue(runtime, output, output_index)
+        && let Err(error) = next_frames.enqueue(runtime, congestion, output_index)
     {
         runtime.free_index(output_index);
         return Err(error);

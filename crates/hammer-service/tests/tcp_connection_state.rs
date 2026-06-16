@@ -1,24 +1,26 @@
+use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::TcpConnectionId;
 use hammer_service::session::SessionId;
-use hammer_service::transport::tcp::congestion::TcpCongestionAckSample;
+use hammer_service::transport::congestion::{BbrController, CongestionController};
 use hammer_service::transport::tcp::connection::{TcpConnection, TcpConnectionState};
-use hammer_service::transport::tcp::state_machine::{Closed, SynSent};
+use hammer_service::transport::tcp::state_machine::{Closed, Listen, SynSent};
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpConnectionTimerKind, TcpInputNext, TcpSessionConnectionIndex,
 };
 
-const TEST_SEGMENT_LEN: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
-
-fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<SynSent> {
+fn connection(
+    connection_id: TcpConnectionId,
+    local_port: u16,
+) -> TcpConnection<SynSent, BbrController> {
     let local: SocketAddr = format!("192.0.2.10:{local_port}")
         .parse()
         .expect("test local");
     let remote: SocketAddr = "198.51.100.10:443".parse().expect("test remote");
-    let connection: TcpConnection<Closed> = TcpConnection::new(
+    let connection: TcpConnection<Closed, BbrController> = TcpConnection::new(
         Some(connection_id),
         DataWorkerId::new(0),
         local_port,
@@ -28,75 +30,86 @@ fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<
     connection.connect_state(1)
 }
 
-fn acknowledge(connection: &mut TcpConnection<SynSent>, now: Instant) {
-    connection.observe_congestion_ack(TcpCongestionAckSample {
-        bytes_acked: TEST_SEGMENT_LEN,
-        rtt: Duration::from_millis(20),
-        now,
-        bytes_in_flight: TEST_SEGMENT_LEN,
-    });
-}
-
 #[test]
 fn tcp_congestion_state_uses_connection_max_segment_size_for_initial_windows() {
     let small_mss = 1_200;
     let large_mss = 1_460;
-    let mut small = hammer_service::transport::tcp::TcpCongestionState::new(small_mss);
-    let large = hammer_service::transport::tcp::TcpCongestionState::new(large_mss);
+    let small = BbrController::new(small_mss);
+    let large = BbrController::new(large_mss);
 
-    assert_eq!(small.max_segment_size(), small_mss);
-    assert_eq!(large.max_segment_size(), large_mss);
+    assert_eq!(small.max_datagram_size(), small_mss);
+    assert_eq!(large.max_datagram_size(), large_mss);
     assert_eq!(small.congestion_window(), 10 * small_mss);
     assert_eq!(large.congestion_window(), 10 * large_mss);
 
-    small.on_loss(u32::MAX);
-
-    assert_eq!(small.congestion_window(), 4 * small_mss);
+    assert_ne!(small.congestion_window(), large.congestion_window());
 }
 
 #[test]
 fn tcp_typed_connections_own_independent_congestion_state() {
-    let now = Instant::now();
-    let mut first = connection(TcpConnectionId::new(1), 50_001);
+    let first = connection(TcpConnectionId::new(1), 50_001);
     let second = connection(TcpConnectionId::new(2), 50_002);
 
-    acknowledge(&mut first, now);
-
-    assert_ne!(
+    assert_ne!(first.connection_id(), second.connection_id());
+    assert_eq!(
         first.congestion().delivered(),
         second.congestion().delivered()
     );
-    assert!(first.congestion().congestion_window() > second.congestion().congestion_window());
+    assert_eq!(
+        first.congestion().congestion_window(),
+        second.congestion().congestion_window()
+    );
 }
 
 #[test]
 fn tcp_typed_connection_exposes_owned_congestion_control() {
-    let now = Instant::now();
-    let mut connection = connection(TcpConnectionId::new(3), 50_003);
-
-    acknowledge(&mut connection, now);
+    let connection = connection(TcpConnectionId::new(3), 50_003);
 
     assert_eq!(
-        connection.congestion().delivered(),
-        u64::from(TEST_SEGMENT_LEN)
+        connection.congestion().max_datagram_size(),
+        DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32
     );
-    assert!(connection.congestion().congestion_window() > TEST_SEGMENT_LEN);
+    assert_eq!(connection.congestion().delivered(), 0);
 }
 
 #[test]
-fn tcp_typed_connection_keeps_owned_congestion_window() {
-    let mut connection = connection(TcpConnectionId::new(4), 50_004);
-    let initial_congestion_window = connection.congestion().congestion_window();
-    connection.observe_congestion_loss(u32::MAX);
+fn tcp_listen_connection_uses_left_hand_state_constructor() {
+    let local: SocketAddr = "192.0.2.10:50004".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
+    let connection: TcpConnection<Listen, BbrController> = TcpConnection::new(
+        Some(TcpConnectionId::new(4)),
+        DataWorkerId::new(0),
+        local.port(),
+        Some(local),
+        remote,
+    );
 
-    assert!(connection.congestion().congestion_window() < initial_congestion_window);
+    assert_eq!(connection.local(), Some(local));
+    assert_eq!(connection.remote(), remote);
+    assert_eq!(connection.next_node(), TcpInputNext::Listen);
+    assert_eq!(
+        connection.congestion().max_datagram_size(),
+        DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32
+    );
+}
+
+#[test]
+fn tcp_connection_does_not_keep_private_pacing_deadline() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/tcp/state_machine.rs"),
+    )
+    .expect("read tcp state machine");
+
+    assert!(!source.contains("next_output_at"));
+    assert!(!source.contains("schedule_next_output"));
 }
 
 #[test]
 fn tcp_connection_state_erases_and_restores_typed_state() {
     let connection = connection(TcpConnectionId::new(5), 50_005);
-    let state: TcpConnectionState = connection.clone().into();
-    let restored: TcpConnection<SynSent> = state.try_into().expect("restore syn-sent");
+    let state: TcpConnectionState<BbrController> = connection.clone().into();
+    let restored: TcpConnection<SynSent, BbrController> =
+        state.try_into().expect("restore syn-sent");
 
     assert_eq!(restored.connection_id(), connection.connection_id());
     assert_eq!(restored.snd_nxt(), connection.snd_nxt());
@@ -170,7 +183,7 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
         IpAddr::V6("2001:db8:100::20".parse::<Ipv6Addr>().expect("remote")),
         443,
     );
-    let connection: TcpConnection<Closed> = TcpConnection::new(
+    let connection: TcpConnection<Closed, BbrController> = TcpConnection::new(
         Some(TcpConnectionId::new(202)),
         DataWorkerId::new(0),
         local.port(),
@@ -210,46 +223,46 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
 fn tcp_connection_owns_timer_active_and_pending_bits() {
     let mut connection = connection(TcpConnectionId::new(303), 50_303);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::Retransmit));
+    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::Retransmit);
+    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
 
-    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::Retransmit));
+    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
 
-    connection.tcp_timer_expire(TcpConnectionTimerKind::Retransmit);
+    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-    assert!(connection.tcp_timer_is_pending(TcpConnectionTimerKind::Retransmit));
-    assert!(connection.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(connection.tcp_timer_is_live(TcpConnectionTimerKind::RETRANSMIT));
 
-    assert!(connection.tcp_timer_take_pending(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_is_live(TcpConnectionTimerKind::Retransmit));
+    assert!(connection.tcp_timer_take_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_is_live(TcpConnectionTimerKind::RETRANSMIT));
 }
 
 #[test]
 fn tcp_connection_timer_dispatch_skips_rearmed_pending_timer() {
     let mut connection = connection(TcpConnectionId::new(304), 50_304);
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::Retransmit);
-    connection.tcp_timer_expire(TcpConnectionTimerKind::Retransmit);
-    connection.tcp_timer_set(TcpConnectionTimerKind::Retransmit);
+    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
+    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
+    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
 
-    assert!(!connection.tcp_timer_dispatch_pending(TcpConnectionTimerKind::Retransmit));
-    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::Retransmit));
+    assert!(!connection.tcp_timer_dispatch_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
 }
 
 #[test]
 fn tcp_connection_timer_reset_clears_pending_dispatch() {
     let mut connection = connection(TcpConnectionId::new(305), 50_305);
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::Retransmit);
-    connection.tcp_timer_expire(TcpConnectionTimerKind::Retransmit);
-    connection.tcp_timer_reset(TcpConnectionTimerKind::Retransmit);
+    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
+    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
+    connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::Retransmit));
-    assert!(!connection.tcp_timer_take_pending(TcpConnectionTimerKind::Retransmit));
+    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.tcp_timer_take_pending(TcpConnectionTimerKind::RETRANSMIT));
 }

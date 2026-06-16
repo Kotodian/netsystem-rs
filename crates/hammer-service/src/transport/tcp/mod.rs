@@ -4,7 +4,6 @@ pub mod accept;
 pub mod close_wait;
 pub mod closing;
 pub mod congestion;
-pub mod congestion_control;
 pub mod connection;
 pub mod established;
 pub mod fin_wait1;
@@ -14,6 +13,7 @@ pub mod last_ack;
 pub mod listen;
 pub mod lookup;
 pub mod output;
+pub mod recovery;
 pub mod reply;
 pub mod reset;
 mod segment;
@@ -28,11 +28,6 @@ pub mod time_wait;
 pub use accept::{TcpAcceptNext, TcpAcceptNode};
 pub use close_wait::{TcpCloseWaitNext, TcpCloseWaitNode};
 pub use closing::{TcpClosingNext, TcpClosingNode};
-pub use congestion::{TcpCongestionAckSample, TcpCongestionState};
-pub use congestion_control::{
-    TcpCongestionAckObservation, TcpCongestionControlNode, TcpCongestionLossObservation,
-    TcpCongestionSendObservation,
-};
 pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TcpConnectionOptionState, TcpConnectionState, TcpConnectionTimerKind,
@@ -53,15 +48,14 @@ pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
     TcpOutputNext, TcpOutputNode,
 };
+pub use recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
 pub use reply::{
     TcpControlFlags, queue_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
 };
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use session::TcpSessionProtocol;
 pub use session_index::{TcpPendingIndex, TcpSessionConnectionIndex};
-pub use state::{
-    TcpCongestionAlgorithm, TcpCongestionRegistry, TcpConnectionConfigState, TcpInputFlags,
-};
+pub use state::TcpInputFlags;
 pub use syn_rcvd::{TcpSynRcvdNext, TcpSynRcvdNode};
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 pub use time_wait::{TcpTimeWaitNext, TcpTimeWaitNode};
