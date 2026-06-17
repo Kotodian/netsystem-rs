@@ -6,7 +6,7 @@ pub mod ready;
 pub(crate) mod runtime;
 pub mod timer;
 
-pub use app::{SessionAppCloseSubmission, SessionAppRuntime, SessionAppSendSubmission};
+pub use app::SessionAppRuntime;
 pub use id::SessionId;
 pub use node::{SessionQueueHandle, SessionQueueNext, SessionQueueNode};
 pub use protocol::SessionProtocolContext;

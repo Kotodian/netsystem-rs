@@ -12,7 +12,7 @@ use hammer_infra::vec::Vec;
 use crate::app::data::AppDataAddr;
 use crate::app::ring::{
     AppCompletionEntry, AppCqe, AppCqeDescriptor, AppObjectRef, AppOpId, AppRecv, AppRingHandle,
-    AppSend, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
+    AppSend, AppSendData, AppSqe, AppSqeData, AppSqeDescriptor, AppSubmissionEntry,
 };
 use crate::spawn::{DataLocalJoinHandle, DataRuntimeContext, spawn_local};
 
@@ -49,7 +49,7 @@ impl AppContext {
             return AppRuntime { op, ring }.send(send).await;
         }
 
-        let send = send.into_transfer_data()?;
+        let send: AppSendData = send.try_into()?;
         let owner_worker = self.owner_for_op(op)?;
         let app_context_id = self.id;
         let ring_capacity = self.ring_capacity;
@@ -377,7 +377,7 @@ impl AppRuntime {
     }
 
     #[inline]
-    pub fn read_data(&self, data: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
+    pub fn read_data(&self, data: AppDataAddr) -> HammerResult<Vec<u8>> {
         self.ring.read_data(data)
     }
 

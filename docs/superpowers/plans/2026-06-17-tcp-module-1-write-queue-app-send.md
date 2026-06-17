@@ -386,7 +386,7 @@ pub fn read_data(&self, data: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
 
 - [ ] **Step 7: Replace app send transfer helper with `TryFrom`**
 
-In `crates/hammer-runtime/src/app/ring.rs`, delete the crate-private `AppSend::into_transfer_data` method and add after `impl Drop for AppSend`:
+In `crates/hammer-runtime/src/app/ring.rs`, delete any crate-private app-send transfer helper and add after `impl Drop for AppSend`:
 
 ```rust
 impl TryFrom<AppSend> for AppSendData {
@@ -406,13 +406,7 @@ impl TryFrom<AppSend> for AppSendData {
 }
 ```
 
-In `crates/hammer-runtime/src/app/context.rs`, add `AppSendData` to the ring import and replace:
-
-```rust
-let send = send.into_transfer_data()?;
-```
-
-with:
+In `crates/hammer-runtime/src/app/context.rs`, add `AppSendData` to the ring import and transfer ownership with:
 
 ```rust
 let send: AppSendData = send.try_into()?;
@@ -833,7 +827,7 @@ use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, NodeId, Ro
 use hammer_core::error::CoreError;
 use hammer_runtime::app::{AppRingHandle, AppSendData};
 
-use crate::session::SessionQueueControlContext;
+use crate::session::protocol::SessionQueueControlContext;
 ```
 
 Add this fake protocol and tests inside the same module:
@@ -880,13 +874,13 @@ impl SessionQueueProtocol<FakeTxState> for FakeTxProtocol {
         &mut self,
         state: &FakeTxState,
         _: SessionId,
-    ) -> CoreResult<SessionTransportTxCapacity> {
-        Ok(SessionTransportTxCapacity {
+    ) -> CoreResult<Option<SessionTransportTxCapacity>> {
+        Ok(Some(SessionTransportTxCapacity {
             metadata: state.metadata.clone(),
             header_len: 8,
             payload_budget: 4,
             should_reschedule: true,
-        })
+        }))
     }
 
     fn write_transport_segment_header(
@@ -1060,7 +1054,7 @@ fn session_queue_node_process(
 In `crates/hammer-service/src/session/protocol.rs`, add this context next to the existing `SessionProtocolContext`:
 
 ```rust
-pub struct SessionQueueControlContext<'a, S> {
+pub(crate) struct SessionQueueControlContext<'a, S> {
     driver: &'a mut SessionDriverRuntime<S>,
 }
 
@@ -1071,17 +1065,12 @@ impl<'a, S> SessionQueueControlContext<'a, S> {
     }
 
     #[inline]
-    pub fn worker(&self) -> DataWorkerId {
-        self.driver.worker()
-    }
-
-    #[inline]
-    pub fn mark_ready(&mut self, session_id: SessionId) {
+    pub(crate) fn mark_ready(&mut self, session_id: SessionId) {
         self.driver.mark_ready(session_id);
     }
 
     #[inline]
-    pub fn arm_timer_ticks(
+    pub(crate) fn arm_timer_ticks(
         &mut self,
         session_id: SessionId,
         token: SessionTimerToken,
@@ -1091,28 +1080,18 @@ impl<'a, S> SessionQueueControlContext<'a, S> {
     }
 
     #[inline]
-    pub fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
-        self.driver.cancel_timer(session_id, token)
-    }
-
-    #[inline]
-    pub fn session_state(&self, session_id: SessionId) -> Option<&S> {
-        self.driver.session_state(session_id)
-    }
-
-    #[inline]
-    pub fn session_state_mut(&mut self, session_id: SessionId) -> Option<&mut S> {
+    pub(crate) fn session_state_mut(&mut self, session_id: SessionId) -> Option<&mut S> {
         self.driver.session_state_mut(session_id)
     }
 
     #[inline]
-    pub fn buffers(&self) -> &DataPlaneBuffers {
+    pub(crate) fn buffers(&self) -> &DataPlaneBuffers {
         self.driver.buffers()
     }
 }
 ```
 
-Do not add `app`, `app_mut`, `take_ready_sessions`, `take_timer_expiries`, `remove_session`, `close_session`, `session_mut`, or `replace_session_state` to this context. Those capabilities belong to session runtime orchestration or connection/open paths, not queue-time transport callbacks.
+Do not add `worker`, `cancel_timer`, `session_state`, `app`, `app_mut`, `take_ready_sessions`, `take_timer_expiries`, `remove_session`, `close_session`, `session_mut`, or `replace_session_state` to this context unless a concrete queue-time callback uses it. Those capabilities belong to session runtime orchestration or connection/open paths, not generic queue-time transport callbacks.
 
 In the existing `SessionProtocolContext<'a, S>` impl in the same file, delete these methods:
 
@@ -1123,10 +1102,10 @@ pub fn app_mut(&mut self) -> &mut SessionAppRuntime
 
 After deleting those methods, remove `SessionAppRuntime` from the `use crate::session::{ ... }` import list in `session/protocol.rs`.
 
-In `crates/hammer-service/src/session/mod.rs`, add the re-export:
+In `crates/hammer-service/src/session/mod.rs`, keep this context private to the crate. Do not re-export it:
 
 ```rust
-pub use protocol::{SessionProtocolContext, SessionQueueControlContext};
+pub use protocol::SessionProtocolContext;
 ```
 
 - [ ] **Step 5: Extend `SessionQueueProtocol` with narrow TX hooks**
@@ -1151,14 +1130,14 @@ pub(crate) trait SessionQueueProtocol<S> {
 
     fn handle_timer_expiry(
         &mut self,
-        context: &mut crate::session::SessionQueueControlContext<'_, S>,
+        context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
         expiry: SessionTimerExpiry,
     ) -> CoreResult<()>;
 
     fn handle_ready_session(
         &mut self,
         runtime: &DataPlaneRuntime,
-        context: &mut crate::session::SessionQueueControlContext<'_, S>,
+        context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
         session_id: SessionId,
         output_next: crate::session::SessionQueueNext,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -1168,7 +1147,7 @@ pub(crate) trait SessionQueueProtocol<S> {
         &mut self,
         state: &S,
         session_id: SessionId,
-    ) -> CoreResult<SessionTransportTxCapacity>;
+    ) -> CoreResult<Option<SessionTransportTxCapacity>>;
 
     fn write_transport_segment_header(
         &mut self,
@@ -1214,7 +1193,9 @@ where
     let state = driver
         .session_state(session_id)
         .ok_or_else(|| CoreError::internal("session tx state is missing"))?;
-    let capacity = protocol.transport_tx_capacity(state, session_id)?;
+    let Some(capacity) = protocol.transport_tx_capacity(state, session_id)? else {
+        return Ok(false);
+    };
     if capacity.payload_budget == 0 {
         return Ok(false);
     }
@@ -1382,14 +1363,14 @@ where
     driver.poll_app()?;
     let expiries = driver.take_timer_expiries();
     for expiry in expiries {
-        let mut context = crate::session::SessionQueueControlContext::new(driver);
+        let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
         protocol.handle_timer_expiry(&mut context, expiry)?;
     }
     let ready_sessions = driver.take_ready_sessions();
     step.ready_sessions = ready_sessions.len();
     for session_id in ready_sessions {
         while flush_one_session_tx(runtime, driver, protocol, session_id, output_next, output, now)? {}
-        let mut context = crate::session::SessionQueueControlContext::new(driver);
+        let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
         protocol.handle_ready_session(runtime, &mut context, session_id, output_next, output)?;
     }
     Ok(())
@@ -1687,7 +1668,7 @@ type TxUpdate = TcpEstablishedTxUpdate;
 
 fn handle_timer_expiry(
     &mut self,
-    context: &mut crate::session::SessionQueueControlContext<'_, TcpServiceConnectionState>,
+    context: &mut crate::session::protocol::SessionQueueControlContext<'_, TcpServiceConnectionState>,
     expiry: SessionTimerExpiry,
 ) -> CoreResult<()> {
     let Some(kind) = Self::timer_kind(expiry.token()) else {
@@ -1703,7 +1684,7 @@ fn handle_timer_expiry(
 fn handle_ready_session(
     &mut self,
     runtime: &DataPlaneRuntime,
-    context: &mut crate::session::SessionQueueControlContext<'_, TcpServiceConnectionState>,
+    context: &mut crate::session::protocol::SessionQueueControlContext<'_, TcpServiceConnectionState>,
     session_id: SessionId,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,
@@ -1729,19 +1710,20 @@ fn transport_tx_capacity(
     &mut self,
     state: &TcpServiceConnectionState,
     _: SessionId,
-) -> CoreResult<SessionTransportTxCapacity> {
-    let connection: TcpConnection<Established, TcpServiceController> =
-        state.clone().try_into()?;
+) -> CoreResult<Option<SessionTransportTxCapacity>> {
+    let TcpConnectionState::Established(connection) = state else {
+        return Ok(None);
+    };
     let local = connection
         .local()
         .ok_or_else(|| CoreError::internal("established tcp connection missing local address"))?;
     let tcp = connection.established_tx_capacity();
-    let capacity = SessionTransportTxCapacity {
+    let capacity = Some(SessionTransportTxCapacity {
         metadata: tcp_segment_metadata(local, connection.remote()),
         header_len: tcp.header_len,
         payload_budget: tcp.payload_budget,
         should_reschedule: true,
-    };
+    });
     Ok(capacity)
 }
 

@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hammer_adapter::DataWorkerId;
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataWorkerId};
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSegmentFlags,
-    TcpSegmentHeader, TcpSeq, TcpState,
+    TcpSegmentHeader, TcpSeq, TcpState, write_tcp_segment_header,
 };
 
 use crate::transport::congestion::CongestionController;
@@ -72,6 +73,17 @@ pub struct LastAck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeWait {
     _private: (),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpEstablishedTxCapacity {
+    pub(crate) header_len: usize,
+    pub(crate) payload_budget: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TcpEstablishedTxUpdate {
+    pub(crate) payload_len: u32,
 }
 
 trait TcpInitialState {
@@ -694,6 +706,58 @@ impl<C> TcpConnection<Established, C>
 where
     C: CongestionController,
 {
+    #[inline]
+    pub(crate) fn established_tx_capacity(&self) -> TcpEstablishedTxCapacity {
+        let mss = self.output_payload_len();
+        let in_flight = self.snd_nxt.wrapping_sub(self.snd_una);
+        let window = self.snd_wnd.saturating_sub(in_flight) as usize;
+        TcpEstablishedTxCapacity {
+            header_len: 20,
+            payload_budget: mss.min(window),
+        }
+    }
+
+    pub(crate) fn write_established_payload_segment_header(
+        &self,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+        payload_len: usize,
+        _: Instant,
+    ) -> CoreResult<TcpEstablishedTxUpdate> {
+        let payload_len = u32::try_from(payload_len)
+            .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+        let local = self.local().ok_or_else(|| {
+            CoreError::internal("established tcp connection missing local address")
+        })?;
+        let header = TcpSegmentHeader {
+            source_port: local.port(),
+            destination_port: self.remote().port(),
+            sequence_number: self.snd_nxt(),
+            acknowledgment_number: self.rcv_nxt(),
+            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+            advertised_window: self.advertised_receive_window(self.rcv_wnd),
+            capabilities: self.local_capabilities(),
+        };
+        let mut buffer = buffers.get_buffer_mut(index)?;
+        if buffer.current_len() < 20 {
+            return Err(CoreError::internal(
+                "tcp header prefix exceeds current buffer length",
+            ));
+        }
+        let written = write_tcp_segment_header(&mut buffer.current_mut()[..20], header)?;
+        if written != 20 {
+            return Err(CoreError::internal(
+                "tcp header length changed after prefix reservation",
+            ));
+        }
+        Ok(TcpEstablishedTxUpdate { payload_len })
+    }
+
+    #[inline]
+    pub(crate) fn commit_established_payload_segment(&mut self, update: TcpEstablishedTxUpdate) {
+        self.snd_nxt = TcpSeq::new(self.snd_nxt).advance(update.payload_len).raw();
+    }
+
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);

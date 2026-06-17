@@ -126,15 +126,15 @@ impl TcpResetObserverHandle {
 }
 
 #[inline]
-fn clone_noop_handle(_raw: *const ()) -> *const () {
+fn clone_noop_handle(_: *const ()) -> *const () {
     std::ptr::null()
 }
 
 #[inline]
-fn drop_noop_handle(_raw: *const ()) {}
+fn drop_noop_handle(_: *const ()) {}
 
 #[inline]
-fn observe_noop_reset(_raw: *const (), _observation: TcpResetObservation) -> CoreResult<()> {
+fn observe_noop_reset(_: *const (), _: TcpResetObservation) -> CoreResult<()> {
     Ok(())
 }
 

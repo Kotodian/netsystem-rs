@@ -40,8 +40,13 @@ impl SessionQueueNext {
     }
 }
 
-pub type SessionQueueDispatchFn =
-    fn(&DataPlaneRuntime, SessionQueueHandle, SessionQueueNext, Instant) -> CoreResult<()>;
+pub(crate) type SessionQueueDispatchFn = fn(
+    &DataPlaneRuntime,
+    SessionQueueHandle,
+    SessionQueueNext,
+    Instant,
+    &mut SessionQueueOutput,
+) -> CoreResult<()>;
 
 #[derive(Default)]
 pub(crate) struct SessionQueueOutput {
@@ -93,7 +98,7 @@ impl SessionQueueNode {
         })
     }
 
-    pub fn attach_queue(
+    pub(crate) fn attach_queue(
         &self,
         handle: SessionQueueHandle,
         output_next: SessionQueueNext,
@@ -164,9 +169,17 @@ fn session_queue_node_process(
         Ok::<_, CoreError>(node.clone())
     })?;
     let now = Instant::now();
+    let mut output = SessionQueueOutput::default();
     for attachment in attachments {
-        (attachment.dispatch)(runtime, attachment.handle, attachment.output_next, now)?;
+        (attachment.dispatch)(
+            runtime,
+            attachment.handle,
+            attachment.output_next,
+            now,
+            &mut output,
+        )?;
     }
+    output.schedule(runtime)?;
     Ok(NodeResult::drop())
 }
 

@@ -48,6 +48,18 @@ impl<T, const ALIGN: usize> RawVec<T, ALIGN> {
         }
     }
 
+    #[inline]
+    pub fn from_elem_copy(len: usize, value: T) -> Self
+    where
+        T: Copy,
+    {
+        let mut out = Self::with_capacity(len);
+        for _ in 0..len {
+            out.push(value);
+        }
+        out
+    }
+
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len

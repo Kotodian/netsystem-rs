@@ -10,6 +10,6 @@ pub use data::{AppDataAddr, AppDataArea, AppDataAreaConfig};
 pub use layout::{AppRingExport, AppRingIpcReservation, AppRingLayout, AppRingMemoryKind};
 pub use ring::{
     AppCompletionEntry, AppCqe, AppCqeData, AppCqeDescriptor, AppCqeFlags, AppCqeKind,
-    AppObjectRef, AppOpId, AppOpcode, AppRecv, AppRingHandle, AppSend, AppSqe, AppSqeData,
-    AppSqeDescriptor, AppSubmissionEntry, AppUserData,
+    AppObjectRef, AppOpId, AppOpcode, AppRecv, AppRingHandle, AppSend, AppSendData, AppSqe,
+    AppSqeData, AppSqeDescriptor, AppSubmissionEntry, AppUserData,
 };

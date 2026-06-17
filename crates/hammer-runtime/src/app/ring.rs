@@ -359,7 +359,7 @@ impl AppRecv {
     }
 
     #[inline]
-    pub fn copy_current(&self) -> HammerResult<std::vec::Vec<u8>> {
+    pub fn copy_current(&self) -> HammerResult<Vec<u8>> {
         self.ring.read_data(self.data())
     }
 
@@ -643,7 +643,7 @@ impl AppRingHandle {
     }
 
     #[inline]
-    pub fn read_data(&self, addr: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
+    pub fn read_data(&self, addr: AppDataAddr) -> HammerResult<Vec<u8>> {
         self.data_area.read(addr)
     }
 
@@ -1166,7 +1166,7 @@ impl AppSend {
     }
 
     #[inline]
-    pub fn copy_current(&self) -> HammerResult<std::vec::Vec<u8>> {
+    pub fn copy_current(&self) -> HammerResult<Vec<u8>> {
         match self.payload.as_ref().expect("app send released") {
             AppSendPayload::Data { data, ring } => ring.read_data(*data),
         }
@@ -1181,20 +1181,28 @@ impl AppSend {
     }
 
     #[inline]
-    pub(crate) fn into_transfer_data(self) -> HammerResult<AppSendData> {
-        let mut this = self;
-        match this.payload.take().expect("app send released") {
-            AppSendPayload::Data { data, ring } => Ok(ring.send_data_from_addr(data)),
-        }
-    }
-
-    #[inline]
     pub fn release(mut self) {
         match self.payload.take() {
             Some(AppSendPayload::Data { data, ring }) => {
                 let _ = ring.release_data(data);
             }
             None => {}
+        }
+    }
+}
+
+impl TryFrom<AppSend> for AppSendData {
+    type Error = HammerError;
+
+    #[inline]
+    fn try_from(send: AppSend) -> HammerResult<Self> {
+        let mut send = send;
+        match send
+            .payload
+            .take()
+            .ok_or_else(|| HammerError::internal("app send released"))?
+        {
+            AppSendPayload::Data { data, ring } => Ok(ring.send_data_from_addr(data)),
         }
     }
 }
@@ -1212,11 +1220,57 @@ impl AppSendData {
     }
 
     #[inline]
+    pub fn len(&self) -> HammerResult<usize> {
+        Ok(self.data()?.len())
+    }
+
+    #[inline]
+    pub fn copy_range(&self, offset: usize, len: usize) -> HammerResult<Vec<u8>> {
+        let data = self.data()?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| HammerError::internal("app send data range overflow"))?;
+        self.data_area.read((data + (offset..end))?)
+    }
+
+    #[inline]
     pub fn release(mut self) {
         if let Some(data) = self.data.take() {
             let _ = self.data_area.release(data);
             let _ = self.free_chunks.enqueue_sp(data.chunk());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_send_into_app_send_data_moves_ownership() {
+        let ring = AppRingHandle::with_data_area(4, 4, 256, 4).expect("ring");
+        let data = ring.alloc_data_for_bytes(b"abcdef").expect("data");
+        let transfer: AppSendData = ring.send_from_data(data).try_into().expect("transfer");
+
+        assert_eq!(transfer.len().expect("len"), 6);
+        let copied = transfer.copy_range(0, 6).expect("copy");
+        assert_eq!(copied.as_slice(), b"abcdef");
+
+        transfer.release();
+    }
+
+    #[test]
+    fn app_send_data_copies_checked_range_as_infra_vec() {
+        let ring = AppRingHandle::with_data_area(4, 4, 256, 4).expect("ring");
+        let data = ring.alloc_data_for_bytes(b"abcdefgh").expect("data");
+        let transfer: AppSendData = ring.send_from_data(data).try_into().expect("transfer");
+
+        let copied = transfer.copy_range(2, 4).expect("copy");
+
+        assert_eq!(copied.as_slice(), b"cdef");
+        assert!(transfer.copy_range(9, 1).is_err());
+
+        transfer.release();
     }
 }
 

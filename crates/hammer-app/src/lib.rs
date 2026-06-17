@@ -333,7 +333,7 @@ impl AppRuntime {
 
     #[inline]
     pub fn read_data(&self, data: AppDataAddr) -> HammerResult<std::vec::Vec<u8>> {
-        self.inner.read_data(data)
+        Ok(self.inner.read_data(data)?.as_slice().to_vec())
     }
 
     #[inline]

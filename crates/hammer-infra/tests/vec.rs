@@ -4,6 +4,14 @@ use std::rc::Rc;
 use hammer_infra::vec::Vec;
 
 #[test]
+fn from_elem_copy_initializes_aligned_vec() {
+    let values = Vec::from_elem_copy(4, 7_u8);
+
+    assert_eq!(values.as_slice(), &[7, 7, 7, 7]);
+    assert_eq!(values.len(), 4);
+}
+
+#[test]
 fn remove_returns_element_and_shifts_tail() {
     let mut values = Vec::new();
     values.extend_from_slice(&[10, 20, 30, 40]);
