@@ -90,7 +90,7 @@ Results:
 
 - Tightened outbound SACK emission so the existing header path emits SACK only for segments carrying `TcpSegmentFlags::ACK`.
 - Added a regression test covering the required boundary: non-ACK segments must not emit SACK even when optional SACK facts are passed.
-- Commit: pending in this fix round until the ACK-only regression and focused verification completed.
+- Commit: `fdefb0a3` `tcp(Fix): gate sack emission to ack segments`
 
 ### ACK-only RED
 
