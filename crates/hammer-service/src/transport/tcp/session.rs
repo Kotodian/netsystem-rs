@@ -490,7 +490,11 @@ impl TcpConnection<Established, TcpServiceController> {
         if let Some(acknowledgment) = packet.acknowledgment
             && packet.flags.contains(TcpSegmentFlags::ACK)
         {
-            self.receive_ack(acknowledgment, packet.advertised_window);
+            self.receive_ack(
+                acknowledgment,
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+            );
         }
 
         let mut ack = false;
@@ -563,7 +567,11 @@ impl TcpConnection<CloseWait, TcpServiceController> {
         if let Some(acknowledgment) = packet.acknowledgment
             && packet.flags.contains(TcpSegmentFlags::ACK)
         {
-            self.receive_ack(acknowledgment, packet.advertised_window);
+            self.receive_ack(
+                acknowledgment,
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+            );
         }
         if packet.flags.contains(TcpSegmentFlags::FIN) {
             let (connection, segment) = self.accept_repeated_fin(packet);

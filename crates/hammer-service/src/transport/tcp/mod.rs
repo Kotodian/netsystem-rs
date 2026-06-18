@@ -48,7 +48,7 @@ pub use output::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
     TcpOutputNext, TcpOutputNode,
 };
-pub use recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
+pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
 pub use reply::{
     TcpControlFlags, queue_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
 };

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSegmentFlags,
-    TcpSeq, TcpState,
+    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSackBlock,
+    TcpSegmentFlags, TcpSeq, TcpState,
 };
 
 use crate::transport::congestion::CongestionController;
@@ -16,7 +16,7 @@ use super::connection::{
     TcpRetransmitTimeoutState,
 };
 use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
-use super::recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
+use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::segment::{TcpPacket, TcpSegment};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
@@ -370,33 +370,49 @@ where
     #[inline]
     fn apply_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
         if self.accepts_ack(acknowledgment) {
-            if TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una)) {
-                self.ack_sent_data(acknowledgment);
-            }
             self.snd_una = acknowledgment;
         }
         self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
     }
 
-    fn ack_sent_data(&mut self, acknowledgment: u32) {
+    fn recovery_ack(&self, acknowledgment: u32) -> TcpRecoveryAck {
         let now = Instant::now();
         let latest_rtt = self
             .retransmit_timeout
             .smoothed_rtt()
             .unwrap_or(TCP_INITIAL_RETRANSMIT_TIMEOUT);
         let min_rtt = latest_rtt;
-        self.recovery.on_ack(
-            TcpRecoveryAck {
-                acknowledgment,
-                now,
-                latest_rtt,
-                min_rtt,
-                app_limited: false,
-                ecn_ce: false,
-            },
-            &mut self.congestion,
-        );
-        self.retransmit_timeout.observe_ack_sample(latest_rtt);
+        TcpRecoveryAck {
+            acknowledgment,
+            now,
+            latest_rtt,
+            min_rtt,
+            app_limited: false,
+            ecn_ce: false,
+        }
+    }
+
+    fn observe_ack_progress(&mut self, acknowledgment: u32, sack_blocks: &[TcpSackBlock]) {
+        if !self.accepts_ack(acknowledgment) {
+            return;
+        }
+        let advanced = TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una));
+        let recovery_ack = self.recovery_ack(acknowledgment);
+        let latest_rtt = recovery_ack.latest_rtt;
+        if advanced {
+            if sack_blocks.is_empty() {
+                self.recovery.on_ack(recovery_ack, &mut self.congestion);
+            } else {
+                self.recovery
+                    .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion);
+            }
+        } else if !sack_blocks.is_empty() {
+            self.recovery
+                .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion);
+        }
+        if advanced {
+            self.retransmit_timeout.observe_ack_sample(latest_rtt);
+        }
     }
 
     #[inline]
@@ -786,15 +802,15 @@ where
         let end_sequence = TcpSeq::new(sequence).advance(payload_len).raw();
         let bytes_in_flight = self.recovery.bytes_in_flight();
         let packet_number = self.recovery.next_packet_number();
-        self.recovery.record_sent(TcpSentSegment {
+        self.recovery.record_sent(
             packet_number,
             sequence,
             end_sequence,
-            bytes: payload_len,
-            sent_at: now,
-            retransmitted: false,
-            is_probe: false,
-        });
+            payload_len,
+            now,
+            false,
+            false,
+        );
         self.congestion
             .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
         self.snd_nxt = end_sequence;
@@ -815,7 +831,13 @@ where
     }
 
     #[inline]
-    pub(crate) fn receive_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
+    pub(crate) fn receive_ack(
+        &mut self,
+        acknowledgment: u32,
+        advertised_window: u16,
+        sack_blocks: &[TcpSackBlock],
+    ) {
+        self.observe_ack_progress(acknowledgment, sack_blocks);
         self.apply_ack(acknowledgment, advertised_window);
     }
 
@@ -833,7 +855,11 @@ where
         packet: &TcpPacket,
     ) -> (TcpConnection<CloseWait, C>, TcpSegment) {
         if let Some(acknowledgment) = packet.acknowledgment {
-            self.apply_ack(acknowledgment, packet.advertised_window);
+            self.receive_ack(
+                acknowledgment,
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+            );
         }
         let fin_sequence = packet.sequence.wrapping_add(packet.payload_len as u32);
         self.receive_in_order(fin_sequence, 1);
@@ -855,7 +881,13 @@ where
     }
 
     #[inline]
-    pub(crate) fn receive_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
+    pub(crate) fn receive_ack(
+        &mut self,
+        acknowledgment: u32,
+        advertised_window: u16,
+        sack_blocks: &[TcpSackBlock],
+    ) {
+        self.observe_ack_progress(acknowledgment, sack_blocks);
         self.apply_ack(acknowledgment, advertised_window);
     }
 
@@ -1169,11 +1201,71 @@ mod tests {
         let end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
 
         connection.commit_payload_tx(5, now).expect("commit tx");
-        connection.receive_ack(end, u16::MAX);
+        connection.receive_ack(end, u16::MAX, &[]);
 
         assert_eq!(connection.snd_una(), end);
         assert_eq!(connection.recovery().bytes_in_flight(), 0);
         assert_eq!(connection.congestion.acked.len(), 1);
         assert_eq!(connection.congestion.end_acks, 1);
+    }
+
+    #[test]
+    fn established_receive_ack_with_sack_only_cleans_cumulative_range_once() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
+        let second_end = TcpSeq::new(first_end).advance(5).raw();
+
+        connection.commit_payload_tx(5, now).expect("first tx");
+        connection
+            .commit_payload_tx(5, now + Duration::from_millis(1))
+            .expect("second tx");
+
+        connection.receive_ack(
+            first_end,
+            u16::MAX,
+            &[TcpSackBlock {
+                left_edge: first_end,
+                right_edge: second_end,
+            }],
+        );
+
+        assert_eq!(connection.snd_una(), first_end);
+        assert_eq!(connection.recovery().bytes_in_flight(), 0);
+        assert_eq!(connection.congestion.acked.len(), 2);
+        assert_eq!(connection.congestion.end_acks, 1);
+    }
+
+    #[test]
+    fn established_duplicate_ack_with_sack_does_not_update_rto_sample() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
+        let second_end = TcpSeq::new(first_end).advance(5).raw();
+
+        connection.commit_payload_tx(5, now).expect("first tx");
+        connection
+            .commit_payload_tx(5, now + Duration::from_millis(1))
+            .expect("second tx");
+        connection.receive_ack(first_end, u16::MAX, &[]);
+
+        let before = connection.retransmit_timeout().smoothed_rtt();
+        let before_var = connection.retransmit_timeout().rtt_variance();
+        let before_rto = connection.retransmit_timeout().retransmit_timeout();
+        connection.receive_ack(
+            first_end,
+            u16::MAX,
+            &[TcpSackBlock {
+                left_edge: first_end,
+                right_edge: second_end,
+            }],
+        );
+
+        assert_eq!(connection.retransmit_timeout().smoothed_rtt(), before);
+        assert_eq!(connection.retransmit_timeout().rtt_variance(), before_var);
+        assert_eq!(
+            connection.retransmit_timeout().retransmit_timeout(),
+            before_rto
+        );
     }
 }
