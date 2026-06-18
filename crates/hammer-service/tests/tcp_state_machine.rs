@@ -37,6 +37,10 @@ fn tcp_state_machine_public_api_has_no_forbidden_middle_types() {
         concat!("Tcp", "Connection", "Index", "Key"),
         concat!("Tcp", "Connection", "Queue", "Commit"),
         concat!("Tcp", "Connection", "Store"),
+        concat!("Tcp", "Established", "Tx", "Capacity"),
+        concat!("Tcp", "Established", "Tx", "Update"),
+        concat!("write", "_established", "_payload", "_segment", "_header"),
+        concat!("commit", "_established", "_payload", "_segment"),
         concat!("Disposition"),
         concat!("Effect"),
     ];
@@ -88,11 +92,15 @@ fn packet_nodes_do_not_drive_tcp_queue_state() {
 #[test]
 fn tcp_timer_dispatch_is_owned_by_tcp_state() {
     let source = read_tcp_source("src/transport/tcp/session.rs");
+    let connection = read_tcp_source("src/transport/tcp/connection.rs");
     assert!(!source.contains("match state"));
     assert!(!source.contains("TcpConnectionState::SynSent"));
     assert!(!source.contains("on_retransmit_timeout"));
     assert!(!source.contains("retransmit_syn_header_if_ready"));
-    assert!(source.contains("on_tcp_timer_expiry"));
+    assert!(source.contains("connection.on_tcp_timer(kind)"));
+    assert!(connection.contains("pub(crate) fn on_tcp_timer("));
+    assert!(!source.contains("TcpConnectionTimerKind::all"));
+    assert!(!connection.contains("TcpConnectionTimerKind::all"));
 }
 
 #[test]

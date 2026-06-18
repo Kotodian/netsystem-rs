@@ -143,12 +143,13 @@ pub(crate) struct SessionDriverRuntime<S> {
 }
 
 pub(crate) trait SessionQueueProtocol<S> {
-    type TxUpdate;
-
     fn handle_timer_expiry(
         &mut self,
+        runtime: &DataPlaneRuntime,
         context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
         expiry: SessionTimerExpiry,
+        output_next: crate::session::SessionQueueNext,
+        output: &mut crate::session::node::SessionQueueOutput,
     ) -> CoreResult<()>;
 
     fn handle_ready_session(
@@ -160,30 +161,33 @@ pub(crate) trait SessionQueueProtocol<S> {
         output: &mut crate::session::node::SessionQueueOutput,
     ) -> CoreResult<()>;
 
-    fn transport_tx_capacity(
+    fn tx_payload_len(
         &mut self,
-        state: &S,
+        context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
         session_id: SessionId,
-    ) -> CoreResult<Option<SessionTransportTxCapacity>>;
+        pending_len: usize,
+        now: Instant,
+    ) -> CoreResult<usize>;
 
-    fn write_transport_segment_header(
+    fn prepare_tx(
         &mut self,
-        state: &S,
-        buffers: &DataPlaneBuffers,
+        context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
+        session_id: SessionId,
         index: BufferIndex,
         payload_len: usize,
         now: Instant,
-    ) -> CoreResult<Self::TxUpdate>;
+    ) -> CoreResult<()>;
 
-    fn commit_transport_tx(&mut self, state: &mut S, update: Self::TxUpdate) -> CoreResult<()>;
-}
+    fn cancel_tx(&mut self, index: BufferIndex);
 
-#[derive(Debug, Clone)]
-pub(crate) struct SessionTransportTxCapacity {
-    pub(crate) metadata: RouteMetadata,
-    pub(crate) header_len: usize,
-    pub(crate) payload_budget: usize,
-    pub(crate) should_reschedule: bool,
+    fn commit_tx(
+        &mut self,
+        context: &mut crate::session::protocol::SessionQueueControlContext<'_, S>,
+        session_id: SessionId,
+        index: BufferIndex,
+        payload_len: usize,
+        now: Instant,
+    ) -> CoreResult<()>;
 }
 
 pub(crate) trait SessionStateFactory<S> {
@@ -377,7 +381,7 @@ impl<S> SessionDriverRuntime<S> {
     pub(crate) fn poll_app(&mut self) -> CoreResult<()> {
         self.app.drain_submissions()?;
         let mut ready = hammer_infra::vec::Vec::new();
-        self.app.pending_send_session_ids(&mut ready);
+        self.app.take_ready_send_sessions(&mut ready);
         for close in self.app.pending_closes() {
             if !ready
                 .iter()
@@ -451,99 +455,62 @@ fn flush_one_session_tx<S, P>(
 where
     P: SessionQueueProtocol<S>,
 {
-    if !driver.app().has_pending_send(session_id) {
-        return Ok(false);
-    }
-    let state = driver
-        .session_state(session_id)
-        .ok_or_else(|| CoreError::internal("session tx state is missing"))?;
-    let Some(capacity) = protocol.transport_tx_capacity(state, session_id)? else {
+    let Some(pending_len) = driver.app().pending_send_len(session_id)? else {
         return Ok(false);
     };
-    if capacity.payload_budget == 0 {
+    let payload_len = {
+        let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
+        protocol
+            .tx_payload_len(&mut context, session_id, pending_len, now)?
+            .min(pending_len)
+    };
+    if payload_len == 0 {
         return Ok(false);
     }
     let Some(payload) = driver
         .app()
-        .copy_pending_send_bytes(session_id, capacity.payload_budget)?
+        .copy_pending_send_bytes(session_id, payload_len)?
     else {
-        return Ok(false);
+        return Err(CoreError::internal("session app tx progress is missing"));
     };
     if payload.is_empty() {
         let completed = driver.app_mut().commit_pending_send_bytes(session_id, 0)?;
         return Ok(completed);
     }
 
-    let index = driver.buffers().alloc_index(capacity.metadata.clone())?;
-    let reserved = (|| {
-        let mut buffer = driver.buffers().get_buffer_mut(index)?;
-        let tail = buffer.writable_tail_mut();
-        if tail.len() < capacity.header_len {
-            return Err(CoreError::internal(
-                "transport header prefix exceeds buffer capacity",
-            ));
-        }
-        tail[..capacity.header_len].fill(0);
-        buffer.commit_writable_tail(capacity.header_len)
-    })();
-    if let Err(err) = reserved {
-        driver.buffers().free_index(index);
-        return Err(err);
-    }
-
-    match driver.buffers().current_len(index) {
-        Ok(len) if len == capacity.header_len => {}
-        Ok(_) => {
-            driver.buffers().free_index(index);
-            return Err(CoreError::internal(
-                "packet append offset does not match header length",
-            ));
-        }
-        Err(err) => {
-            driver.buffers().free_index(index);
-            return Err(err);
-        }
-    }
+    let index = driver.buffers().alloc_index(RouteMetadata::default())?;
     if let Err(err) = driver.buffers().append(index, payload.as_slice()) {
         driver.buffers().free_index(index);
         return Err(err);
     }
     let payload_len = payload.len();
 
-    let update = {
-        let state = driver
-            .session_state(session_id)
-            .ok_or_else(|| CoreError::internal("session tx state is missing"))?;
-        match protocol.write_transport_segment_header(
-            state,
-            driver.buffers(),
-            index,
-            payload_len,
-            now,
-        ) {
-            Ok(update) => update,
-            Err(err) => {
-                driver.buffers().free_index(index);
-                return Err(err);
-            }
+    {
+        let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
+        if let Err(err) = protocol.prepare_tx(&mut context, session_id, index, payload_len, now) {
+            context.buffers().free_index(index);
+            return Err(err);
         }
-    };
+    }
 
     if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
+        protocol.cancel_tx(index);
         driver.buffers().free_index(index);
         return Err(err);
     }
 
-    {
-        let state = driver
-            .session_state_mut(session_id)
-            .ok_or_else(|| CoreError::internal("session tx state is missing"))?;
-        protocol.commit_transport_tx(state, update)?;
+    let commit_result = {
+        let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
+        protocol.commit_tx(&mut context, session_id, index, payload_len, now)
+    };
+    if let Err(err) = commit_result {
+        protocol.cancel_tx(index);
+        return Err(err);
     }
     let completed = driver
         .app_mut()
         .commit_pending_send_bytes(session_id, payload_len)?;
-    if !completed && capacity.should_reschedule {
+    if !completed {
         driver.mark_ready(session_id);
     }
     Ok(true)
@@ -616,7 +583,7 @@ where
     let expiries = driver.take_timer_expiries();
     for expiry in expiries {
         let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
-        protocol.handle_timer_expiry(&mut context, expiry)?;
+        protocol.handle_timer_expiry(runtime, &mut context, expiry, output_next, output)?;
     }
     let ready_sessions = driver.take_ready_sessions();
     step.ready_sessions = ready_sessions.len();
@@ -639,7 +606,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_adapter::{NodeId, RouteMetadata};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use hammer_adapter::{
+        BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
+        NodeRuntimeData,
+    };
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
     use crate::session::protocol::SessionQueueControlContext;
@@ -654,27 +626,30 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct FakeTxState {
-        metadata: RouteMetadata,
         prepared: usize,
         committed: usize,
+        canceled: usize,
     }
 
-    #[derive(Debug, Clone, Copy)]
-    struct FakeTxUpdate {
-        payload_len: usize,
+    fn fake_tx_state() -> FakeTxState {
+        FakeTxState {
+            prepared: 0,
+            committed: 0,
+            canceled: 0,
+        }
     }
 
     struct FakeTxProtocol;
 
     impl SessionQueueProtocol<FakeTxState> for FakeTxProtocol {
-        type TxUpdate = FakeTxUpdate;
-
         fn handle_timer_expiry(
             &mut self,
-            context: &mut SessionQueueControlContext<'_, FakeTxState>,
-            expiry: SessionTimerExpiry,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
+            _: SessionTimerExpiry,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
         ) -> CoreResult<()> {
-            context.mark_ready(expiry.session_id());
             Ok(())
         }
 
@@ -689,58 +664,60 @@ mod tests {
             Ok(())
         }
 
-        fn transport_tx_capacity(
+        fn tx_payload_len(
             &mut self,
-            state: &FakeTxState,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
             _: SessionId,
-        ) -> CoreResult<Option<SessionTransportTxCapacity>> {
-            Ok(Some(SessionTransportTxCapacity {
-                metadata: state.metadata.clone(),
-                header_len: 8,
-                payload_budget: 4,
-                should_reschedule: true,
-            }))
+            pending_len: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Ok(pending_len.min(4))
         }
 
-        fn write_transport_segment_header(
+        fn prepare_tx(
             &mut self,
-            state: &FakeTxState,
-            buffers: &DataPlaneBuffers,
-            index: BufferIndex,
+            context: &mut SessionQueueControlContext<'_, FakeTxState>,
+            session_id: SessionId,
+            _: BufferIndex,
             payload_len: usize,
             _: Instant,
-        ) -> CoreResult<Self::TxUpdate> {
-            {
-                let mut buffer = buffers.get_buffer_mut(index)?;
-                buffer.current_mut()[..8].copy_from_slice(b"fakehdr!");
-            }
-            assert!(payload_len <= 4);
-            assert_eq!(state.prepared, state.committed);
-            Ok(FakeTxUpdate { payload_len })
+        ) -> CoreResult<()> {
+            let state = context
+                .session_state_mut(session_id)
+                .ok_or_else(|| CoreError::internal("missing fake state"))?;
+            state.prepared += payload_len;
+            Ok(())
         }
 
-        fn commit_transport_tx(
+        fn cancel_tx(&mut self, _: BufferIndex) {}
+
+        fn commit_tx(
             &mut self,
-            state: &mut FakeTxState,
-            update: Self::TxUpdate,
+            context: &mut SessionQueueControlContext<'_, FakeTxState>,
+            session_id: SessionId,
+            _: BufferIndex,
+            payload_len: usize,
+            _: Instant,
         ) -> CoreResult<()> {
-            state.prepared += update.payload_len;
-            state.committed += update.payload_len;
+            let state = context
+                .session_state_mut(session_id)
+                .ok_or_else(|| CoreError::internal("missing fake state"))?;
+            state.committed += payload_len;
             Ok(())
         }
     }
 
-    struct NoTxCapacityProtocol;
+    struct NoTxPayloadProtocol;
 
-    impl SessionQueueProtocol<FakeTxState> for NoTxCapacityProtocol {
-        type TxUpdate = FakeTxUpdate;
-
+    impl SessionQueueProtocol<FakeTxState> for NoTxPayloadProtocol {
         fn handle_timer_expiry(
             &mut self,
-            context: &mut SessionQueueControlContext<'_, FakeTxState>,
-            expiry: SessionTimerExpiry,
+            _: &DataPlaneRuntime,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
+            _: SessionTimerExpiry,
+            _: crate::session::SessionQueueNext,
+            _: &mut crate::session::node::SessionQueueOutput,
         ) -> CoreResult<()> {
-            context.mark_ready(expiry.session_id());
             Ok(())
         }
 
@@ -755,32 +732,112 @@ mod tests {
             Ok(())
         }
 
-        fn transport_tx_capacity(
+        fn tx_payload_len(
             &mut self,
-            _: &FakeTxState,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
             _: SessionId,
-        ) -> CoreResult<Option<SessionTransportTxCapacity>> {
-            Ok(None)
+            _: usize,
+            _: Instant,
+        ) -> CoreResult<usize> {
+            Ok(0)
         }
 
-        fn write_transport_segment_header(
+        fn prepare_tx(
             &mut self,
-            _: &FakeTxState,
-            _: &DataPlaneBuffers,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
+            _: SessionId,
             _: BufferIndex,
             _: usize,
             _: Instant,
-        ) -> CoreResult<Self::TxUpdate> {
-            Err(CoreError::internal("transport header writer must not run"))
+        ) -> CoreResult<()> {
+            Err(CoreError::internal("transport tx prepare must not run"))
         }
 
-        fn commit_transport_tx(
+        fn cancel_tx(&mut self, _: BufferIndex) {}
+
+        fn commit_tx(
             &mut self,
-            _: &mut FakeTxState,
-            _: Self::TxUpdate,
+            _: &mut SessionQueueControlContext<'_, FakeTxState>,
+            _: SessionId,
+            _: BufferIndex,
+            _: usize,
+            _: Instant,
         ) -> CoreResult<()> {
             Err(CoreError::internal("transport tx commit must not run"))
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureState {
+        packets: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    struct CaptureNode {
+        runtime_data: NodeRuntimeData,
+    }
+
+    impl CaptureNode {
+        fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+            let mut states = capture_states().lock().expect("capture registry");
+            let slot = states.len();
+            states.push(state);
+            Self {
+                runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+            }
+        }
+    }
+
+    impl Node for CaptureNode {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
+            Err(CoreError::internal(
+                "capture node must use descriptor process",
+            ))
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            capture_process
+        }
+
+        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+            Ok(self.runtime_data)
+        }
+    }
+
+    impl InternalNode for CaptureNode {
+        fn node_registration(&self) -> NodeRegistration
+        where
+            Self: Sized,
+        {
+            NodeRegistration::Plain
+        }
+    }
+
+    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    }
+
+    fn capture_process(
+        runtime: &DataPlaneRuntime,
+        data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let slot = data.usize_word(0)?;
+        let state = {
+            let states = capture_states().lock().expect("capture registry");
+            Arc::clone(
+                states
+                    .get(slot)
+                    .ok_or_else(|| CoreError::internal("capture slot is invalid"))?,
+            )
+        };
+        let mut state = state.lock().expect("capture state");
+        for index in frame.drain_pending() {
+            let packet = runtime.copy_current_chain(index)?;
+            state.packets.push(packet.to_vec());
+            runtime.free_index(index);
+        }
+        Ok(NodeResult::drop())
     }
 
     #[test]
@@ -877,15 +934,11 @@ mod tests {
     }
 
     #[test]
-    fn session_tx_copies_app_send_writes_header_and_commits_progress() {
+    fn session_tx_copies_app_send_and_commits_progress() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.packet_buffers();
         let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxState {
-            metadata: RouteMetadata::default(),
-            prepared: 0,
-            committed: 0,
-        });
+        let session_id = driver.insert_session(fake_tx_state());
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
         let send: AppSendData = ring
             .send_from_data(ring.alloc_data_for_bytes(b"abcdef").expect("data"))
@@ -895,7 +948,11 @@ mod tests {
         driver.mark_ready(session_id);
 
         let mut protocol = FakeTxProtocol;
-        let next = crate::session::SessionQueueNext::from_node(NodeId::new(9));
+        let capture = Arc::new(Mutex::new(CaptureState::default()));
+        let output_node = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture)));
+        let next = crate::session::SessionQueueNext::from_node(output_node);
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
 
@@ -913,7 +970,15 @@ mod tests {
         let state = driver.session_state(session_id).expect("state");
         assert_eq!(state.prepared, 6);
         assert_eq!(state.committed, 6);
+        assert_eq!(state.canceled, 0);
         assert!(!driver.app().has_pending_send(session_id));
+
+        output.schedule(&runtime).expect("schedule output");
+        assert_eq!(runtime.run_ready_nodes().expect("run output"), 1);
+        let packets = &capture.lock().expect("capture").packets;
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].as_slice(), b"abcd");
+        assert_eq!(packets[1].as_slice(), b"ef");
     }
 
     #[test]
@@ -921,11 +986,7 @@ mod tests {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.packet_buffers();
         let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxState {
-            metadata: RouteMetadata::default(),
-            prepared: 0,
-            committed: 0,
-        });
+        let session_id = driver.insert_session(fake_tx_state());
         driver.mark_ready(session_id);
 
         let mut protocol = FakeTxProtocol;
@@ -947,6 +1008,7 @@ mod tests {
         let state = driver.session_state(session_id).expect("state");
         assert_eq!(state.prepared, 0);
         assert_eq!(state.committed, 0);
+        assert_eq!(state.canceled, 0);
     }
 
     #[test]
@@ -954,11 +1016,7 @@ mod tests {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
         let buffers = runtime.packet_buffers();
         let mut driver = SessionDriverRuntime::new(DataWorkerId::new(0), buffers.clone());
-        let session_id = driver.insert_session(FakeTxState {
-            metadata: RouteMetadata::default(),
-            prepared: 0,
-            committed: 0,
-        });
+        let session_id = driver.insert_session(fake_tx_state());
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
         let send: AppSendData = ring
             .send_from_data(ring.alloc_data_for_bytes(b"pending").expect("data"))
@@ -967,7 +1025,7 @@ mod tests {
         driver.app_mut().push_pending_send(session_id, send);
         driver.mark_ready(session_id);
 
-        let mut protocol = NoTxCapacityProtocol;
+        let mut protocol = NoTxPayloadProtocol;
         let next = crate::session::SessionQueueNext::from_node(NodeId::new(9));
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
@@ -986,6 +1044,7 @@ mod tests {
         let state = driver.session_state(session_id).expect("state");
         assert_eq!(state.prepared, 0);
         assert_eq!(state.committed, 0);
+        assert_eq!(state.canceled, 0);
         assert!(driver.app().has_pending_send(session_id));
     }
 }

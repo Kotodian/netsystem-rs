@@ -1,11 +1,13 @@
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::{
     AppCqe, AppObjectRef, AppOpId, AppOpcode, AppRingHandle, AppSendData, AppSqeData,
     AppSqeDescriptor,
 };
 
-use crate::session::SessionId;
+use crate::session::{SessionId, SessionReadyQueue};
 
 const UNBOUND_SESSION: SessionId = SessionId::new(u64::MAX);
 
@@ -35,24 +37,14 @@ impl SessionAppCloseSubmission {
 
 #[derive(Debug)]
 struct SessionAppTxProgress {
-    session_id: SessionId,
     send: AppSendData,
     sent_len: usize,
 }
 
 impl SessionAppTxProgress {
     #[inline]
-    fn new(session_id: SessionId, send: AppSendData) -> Self {
-        Self {
-            session_id,
-            send,
-            sent_len: 0,
-        }
-    }
-
-    #[inline]
-    const fn session_id(&self) -> SessionId {
-        self.session_id
+    fn new(send: AppSendData) -> Self {
+        Self { send, sent_len: 0 }
     }
 
     #[inline]
@@ -85,11 +77,15 @@ impl SessionAppTxProgress {
     }
 }
 
+type SessionAppTxQueue = FifoQueue<SessionAppTxProgress>;
+
 #[derive(Debug)]
 pub struct SessionAppRuntime {
     ring: Option<AppRingHandle>,
     session_slots: FlatHashTable<u64, SessionId>,
-    pending_sends: hammer_infra::vec::Vec<SessionAppTxProgress>,
+    pending_sends: Pool<SessionAppTxQueue>,
+    pending_send_queues: FlatHashTable<u64, PoolIndex>,
+    ready_send_sessions: SessionReadyQueue,
     drained_closes: hammer_infra::vec::Vec<SessionAppCloseSubmission>,
 }
 
@@ -99,7 +95,9 @@ impl SessionAppRuntime {
         Self {
             ring: None,
             session_slots: FlatHashTable::new(),
-            pending_sends: hammer_infra::vec::Vec::new(),
+            pending_sends: Pool::with_capacity(1024),
+            pending_send_queues: FlatHashTable::new(),
+            ready_send_sessions: SessionReadyQueue::new(),
             drained_closes: hammer_infra::vec::Vec::new(),
         }
     }
@@ -168,8 +166,26 @@ impl SessionAppRuntime {
 
     #[inline]
     pub(crate) fn push_pending_send(&mut self, session_id: SessionId, send: AppSendData) {
-        self.pending_sends
-            .push(SessionAppTxProgress::new(session_id, send));
+        let key = session_id.get();
+        let progress = SessionAppTxProgress::new(send);
+        match self.pending_send_queues.lookup(&key) {
+            Some(index) => {
+                self.pending_sends
+                    .get_mut(index)
+                    .expect("pending send queue index is valid")
+                    .push_back(progress);
+            }
+            None => {
+                let mut queue = FifoQueue::new();
+                queue.push_back(progress);
+                let index = self
+                    .pending_sends
+                    .insert(queue)
+                    .expect("session app pending send queue pool capacity exhausted");
+                self.pending_send_queues.insert(key, index);
+                self.ready_send_sessions.mark_ready(session_id);
+            }
+        }
     }
 
     pub(crate) fn copy_pending_send_bytes(
@@ -177,11 +193,10 @@ impl SessionAppRuntime {
         session_id: SessionId,
         max_len: usize,
     ) -> CoreResult<Option<hammer_infra::vec::Vec<u8>>> {
-        let Some(send) = self
-            .pending_sends
-            .iter()
-            .find(|send| send.session_id() == session_id)
-        else {
+        let Some(queue) = self.pending_queue(session_id) else {
+            return Ok(None);
+        };
+        let Some(send) = queue.front() else {
             return Ok(None);
         };
         Ok(Some(send.copy_pending_bytes(max_len)?))
@@ -192,37 +207,58 @@ impl SessionAppRuntime {
         session_id: SessionId,
         len: usize,
     ) -> CoreResult<bool> {
+        let key = session_id.get();
         let index = self
-            .pending_sends
-            .iter()
-            .position(|send| send.session_id() == session_id)
-            .ok_or_else(|| CoreError::internal("session app tx progress is missing"))?;
+            .pending_send_queues
+            .lookup(&key)
+            .ok_or_else(|| CoreError::internal("session app tx queue is missing"))?;
         let completed = {
-            let send = &mut self.pending_sends.as_mut_slice()[index];
+            let queue = self
+                .pending_sends
+                .get_mut(index)
+                .ok_or_else(|| CoreError::internal("session app tx queue index is invalid"))?;
+            let send = queue
+                .front_mut()
+                .ok_or_else(|| CoreError::internal("session app tx progress is missing"))?;
             send.commit_bytes(len)?
         };
         if completed {
-            let send = self.pending_sends.remove(index);
+            let queue = self
+                .pending_sends
+                .get_mut(index)
+                .ok_or_else(|| CoreError::internal("session app tx queue index is invalid"))?;
+            let send = queue
+                .pop_front()
+                .ok_or_else(|| CoreError::internal("session app tx progress is missing"))?;
             send.finish();
+            if queue.is_empty() {
+                self.pending_send_queues.remove(&key);
+                self.pending_sends.remove(index);
+            }
         }
         Ok(completed)
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn has_pending_send(&self, session_id: SessionId) -> bool {
-        self.pending_sends
-            .iter()
-            .any(|send| send.session_id() == session_id)
+        self.pending_queue(session_id)
+            .is_some_and(|queue| !queue.is_empty())
     }
 
-    pub(crate) fn pending_send_session_ids(&self, out: &mut hammer_infra::vec::Vec<SessionId>) {
-        for send in &self.pending_sends {
-            if !out
-                .iter()
-                .any(|session_id| *session_id == send.session_id())
-            {
-                out.push(send.session_id());
-            }
+    pub(crate) fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
+        let Some(queue) = self.pending_queue(session_id) else {
+            return Ok(None);
+        };
+        let Some(send) = queue.front() else {
+            return Ok(None);
+        };
+        Ok(Some(send.remaining_len()?))
+    }
+
+    pub(crate) fn take_ready_send_sessions(&mut self, out: &mut hammer_infra::vec::Vec<SessionId>) {
+        for session_id in self.ready_send_sessions.take_ready_sessions() {
+            out.push(session_id);
         }
     }
 
@@ -255,6 +291,11 @@ impl SessionAppRuntime {
             AppOpcode::Recv | AppOpcode::Nop => {}
         }
         Ok(())
+    }
+
+    fn pending_queue(&self, session_id: SessionId) -> Option<&SessionAppTxQueue> {
+        let index = self.pending_send_queues.lookup(&session_id.get())?;
+        self.pending_sends.get(index)
     }
 
     #[inline]
@@ -315,6 +356,95 @@ mod tests {
         );
         assert!(!app.has_pending_send(session_a));
         assert!(app.has_pending_send(session_b));
+    }
+
+    #[test]
+    fn pending_send_progress_preserves_second_session_after_first_completes() {
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+        let first: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"first").expect("first"))
+            .try_into()
+            .expect("first transfer");
+        let second: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"second").expect("second"))
+            .try_into()
+            .expect("second transfer");
+        let mut app = SessionAppRuntime::new();
+        let session_a = SessionId::new(10);
+        let session_b = SessionId::new(20);
+
+        app.push_pending_send(session_a, first);
+        app.push_pending_send(session_b, second);
+
+        assert!(
+            app.commit_pending_send_bytes(session_a, 5)
+                .expect("commit first")
+        );
+        assert!(!app.has_pending_send(session_a));
+        assert_eq!(
+            app.copy_pending_send_bytes(session_b, 8)
+                .expect("copy second")
+                .expect("second pending")
+                .as_slice(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn pending_sends_for_same_session_are_fifo() {
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+        let first: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"first").expect("first"))
+            .try_into()
+            .expect("first transfer");
+        let second: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"second").expect("second"))
+            .try_into()
+            .expect("second transfer");
+        let mut app = SessionAppRuntime::new();
+        let session = SessionId::new(30);
+
+        app.push_pending_send(session, first);
+        app.push_pending_send(session, second);
+
+        assert_eq!(
+            app.copy_pending_send_bytes(session, 16)
+                .expect("copy first")
+                .expect("first pending")
+                .as_slice(),
+            b"first"
+        );
+        assert!(
+            app.commit_pending_send_bytes(session, 5)
+                .expect("commit first")
+        );
+        assert_eq!(
+            app.copy_pending_send_bytes(session, 16)
+                .expect("copy second")
+                .expect("second pending")
+                .as_slice(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn poll_ready_send_sessions_returns_only_newly_pending_sessions() {
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+        let send: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"bytes").expect("bytes"))
+            .try_into()
+            .expect("transfer");
+        let mut app = SessionAppRuntime::new();
+        let session = SessionId::new(40);
+        let mut ready = hammer_infra::vec::Vec::new();
+
+        app.push_pending_send(session, send);
+        app.take_ready_send_sessions(&mut ready);
+        assert_eq!(ready.as_slice(), &[session]);
+
+        ready.clear();
+        app.take_ready_send_sessions(&mut ready);
+        assert!(ready.is_empty());
     }
 
     #[test]

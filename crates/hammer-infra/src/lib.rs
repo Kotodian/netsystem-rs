@@ -1,6 +1,7 @@
 pub mod align;
 pub mod boxed;
 pub mod descriptor;
+pub mod fifo;
 pub mod hint;
 pub mod map;
 pub mod mtrie;

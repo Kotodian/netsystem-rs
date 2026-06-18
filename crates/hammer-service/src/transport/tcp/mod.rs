@@ -16,7 +16,7 @@ pub mod output;
 pub mod recovery;
 pub mod reply;
 pub mod reset;
-mod segment;
+pub mod segment;
 pub mod session;
 pub mod session_index;
 pub mod state;

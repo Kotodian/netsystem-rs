@@ -8,13 +8,13 @@ use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
-use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::segment::parse_tcp_packet;
 use super::session::{TcpServiceController, TcpSessionQueue};
 use super::state_machine::SynSent;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
-    Congestion,
+    Output,
     Drop,
 }
 
@@ -73,11 +73,11 @@ fn tcp_syn_sent_frame(
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp syn-sent node missing session queue"))?;
-    let congestion = next[TcpSynSentNext::Congestion as usize];
+    let tcp_output = next[TcpSynSentNext::Output as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_syn_sent_index(runtime, index, session_queue, congestion, &mut next_frames) {
+        match tcp_syn_sent_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -93,11 +93,11 @@ fn tcp_syn_sent_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
-    congestion: NodeId,
+    tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
-    let mut output_index = None;
+    let mut tx_index = None;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let (session_id, _, _) = queue
             .pending_route_by_tuple(packet.local, packet.remote)
@@ -105,26 +105,34 @@ fn tcp_syn_sent_index(
         let connection: TcpConnection<SynSent, TcpServiceController> =
             queue.take_connection(session_id)?;
         let control = connection.receive_open_reply(queue, session_id, &packet)?;
-        if let Some(header) = control {
-            let allocated = alloc_tcp_segment(
-                runtime.packet_buffers(),
-                tcp_segment_metadata(packet.local, packet.remote),
-                header,
-            )?;
-            output_index = Some(allocated);
+        if let Some(segment) = control {
+            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
+            if let Err(error) = queue.protocol.insert_segment(allocated, segment) {
+                runtime.free_index(allocated);
+                return Err(error);
+            }
+            tx_index = Some(allocated);
         }
         Ok(())
     });
     if let Err(error) = result {
-        if let Some(output_index) = output_index.take() {
-            runtime.free_index(output_index);
+        if let Some(tx_index) = tx_index.take() {
+            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+                queue.protocol.remove_segment(tx_index);
+                Ok(())
+            })?;
+            runtime.free_index(tx_index);
         }
         return Err(error);
     }
-    if let Some(output_index) = output_index.take()
-        && let Err(error) = next_frames.enqueue(runtime, congestion, output_index)
+    if let Some(tx_index) = tx_index.take()
+        && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
     {
-        runtime.free_index(output_index);
+        TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            queue.protocol.remove_segment(tx_index);
+            Ok(())
+        })?;
+        runtime.free_index(tx_index);
         return Err(error);
     }
     runtime.free_index(index);
@@ -146,6 +154,7 @@ mod tests {
     use crate::session::SessionQueueHandle;
     use crate::transport::tcp::TcpInputNext;
     use crate::transport::tcp::connection::TcpConnection;
+    use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
     use crate::transport::tcp::state_machine::{Established, SynSent};
 
     use super::*;
@@ -250,12 +259,16 @@ mod tests {
         })
         .expect("bind app ring");
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
-        let congestion = runtime
+        let capture = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&output_state)));
         let drop = runtime.nodes().register_internal(DropNode::new());
+        let output = runtime.nodes().register_internal(TcpOutputNode::new(
+            TcpOutputNext::nodes(drop, capture),
+            handle,
+        ));
         let syn_sent = runtime.nodes().register_internal(
-            TcpSynSentNode::new(TcpSynSentNext::nodes(congestion, drop)).with_session_queue(handle),
+            TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
         );
 
         send_packet(
@@ -272,7 +285,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 2);
+        assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 3);
         let packets = &output_state.lock().unwrap().packets;
         assert_eq!(packets.len(), 1);
         assert_tcp_packet(
@@ -325,12 +338,16 @@ mod tests {
         })
         .expect("bind app ring");
         let output_state = Arc::new(Mutex::new(CaptureState::default()));
-        let congestion = runtime
+        let capture = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&output_state)));
         let drop = runtime.nodes().register_internal(DropNode::new());
+        let output = runtime.nodes().register_internal(TcpOutputNode::new(
+            TcpOutputNext::nodes(drop, capture),
+            handle,
+        ));
         let syn_sent = runtime.nodes().register_internal(
-            TcpSynSentNode::new(TcpSynSentNext::nodes(congestion, drop)).with_session_queue(handle),
+            TcpSynSentNode::new(TcpSynSentNext::nodes(output, drop)).with_session_queue(handle),
         );
 
         send_packet(

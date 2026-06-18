@@ -1,22 +1,23 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataWorkerId};
+use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSegmentFlags,
-    TcpSegmentHeader, TcpSeq, TcpState, write_tcp_segment_header,
+    TcpSeq, TcpState,
 };
 
 use crate::transport::congestion::CongestionController;
 
 use super::TcpInputNext;
 use super::connection::{
-    TcpConnectionOptionState, TcpConnectionTimerKind, TcpRetransmitTimeoutState,
+    TCP_INITIAL_RETRANSMIT_TIMEOUT, TcpConnectionOptionState, TcpConnectionTimerKind,
+    TcpRetransmitTimeoutState,
 };
 use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
-use super::recovery::TcpRecoveryState;
-use super::segment::TcpPacket;
+use super::recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
+use super::segment::{TcpPacket, TcpSegment};
 
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -73,17 +74,6 @@ pub struct LastAck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimeWait {
     _private: (),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TcpEstablishedTxCapacity {
-    pub(crate) header_len: usize,
-    pub(crate) payload_budget: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TcpEstablishedTxUpdate {
-    pub(crate) payload_len: u32,
 }
 
 trait TcpInitialState {
@@ -294,6 +284,16 @@ where
         &self.recovery
     }
 
+    pub(crate) fn tcp_timer_ticks(&self, timer: TcpConnectionTimerKind) -> Option<u64> {
+        if timer == TcpConnectionTimerKind::RACK {
+            return self.recovery.rack_timeout_ticks();
+        }
+        if timer == TcpConnectionTimerKind::TLP {
+            return self.recovery.tlp_timeout_ticks();
+        }
+        None
+    }
+
     #[inline]
     pub fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
         self.active_timers.contains(timer)
@@ -370,9 +370,33 @@ where
     #[inline]
     fn apply_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
         if self.accepts_ack(acknowledgment) {
+            if TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una)) {
+                self.ack_sent_data(acknowledgment);
+            }
             self.snd_una = acknowledgment;
         }
         self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
+    }
+
+    fn ack_sent_data(&mut self, acknowledgment: u32) {
+        let now = Instant::now();
+        let latest_rtt = self
+            .retransmit_timeout
+            .smoothed_rtt()
+            .unwrap_or(TCP_INITIAL_RETRANSMIT_TIMEOUT);
+        let min_rtt = latest_rtt;
+        self.recovery.on_ack(
+            TcpRecoveryAck {
+                acknowledgment,
+                now,
+                latest_rtt,
+                min_rtt,
+                app_limited: false,
+                ecn_ce: false,
+            },
+            &mut self.congestion,
+        );
+        self.retransmit_timeout.observe_ack_sample(latest_rtt);
     }
 
     #[inline]
@@ -397,22 +421,23 @@ where
     }
 
     #[inline]
-    pub(crate) fn control_header(
+    pub(crate) fn control_segment(
         &self,
         packet: &TcpPacket,
         flags: TcpSegmentFlags,
         reset_sequence: Option<u32>,
-    ) -> TcpSegmentHeader {
+    ) -> TcpSegment {
         let flags_bits = flags.bits();
-        TcpSegmentHeader {
-            source_port: packet.local.port(),
-            destination_port: packet.remote.port(),
-            sequence_number: reset_sequence.unwrap_or_else(|| self.output_sequence(flags_bits)),
-            acknowledgment_number: self.output_acknowledgment(flags_bits),
+        TcpSegment::new(
+            packet.local,
+            packet.remote,
+            reset_sequence.unwrap_or_else(|| self.output_sequence(flags_bits)),
+            self.output_acknowledgment(flags_bits),
+            self.advertised_receive_window(self.rcv_wnd),
             flags,
-            advertised_window: self.advertised_receive_window(self.rcv_wnd),
-            capabilities: self.options.local_capabilities(),
-        }
+            self.options.local_capabilities(),
+            0,
+        )
     }
 
     #[inline]
@@ -580,7 +605,7 @@ where
     pub(crate) fn accept_syn(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<SynRcvd, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<SynRcvd, C>, TcpSegment) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         if self.iss == 0 {
             self.iss = 1;
@@ -591,8 +616,9 @@ where
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
         let next = TcpConnection::syn_rcvd_from_listen(self);
-        let header = next.control_header(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment =
+            next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 }
 
@@ -621,40 +647,42 @@ where
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<Established, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Established, C>, TcpSegment) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
         self.snd_una = acknowledgment;
         let next = TcpConnection::established_from_syn_sent(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 
     pub(crate) fn accept_simultaneous_syn(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<SynRcvd, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<SynRcvd, C>, TcpSegment) {
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
         let next = TcpConnection::syn_rcvd_from_syn_sent(self);
-        let header = next.control_header(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment =
+            next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 
     pub(crate) fn on_tcp_timer_expiry(
         &mut self,
         timer: TcpConnectionTimerKind,
-    ) -> Option<TcpSegmentHeader> {
+    ) -> Option<TcpSegment> {
         if timer != TcpConnectionTimerKind::RETRANSMIT {
             return None;
         }
         let retransmit = self.tcp_timer_dispatch_pending(timer);
-        let first_syn =
-            self.snd_una == self.iss && self.snd_nxt == TcpSeq::new(self.iss).advance(1).raw();
+        let first_syn = !self.tcp_timer_is_active(timer)
+            && self.snd_una == self.iss
+            && self.snd_nxt == TcpSeq::new(self.iss).advance(1).raw();
         if !retransmit && !first_syn {
             return None;
         }
@@ -663,15 +691,16 @@ where
         }
         self.tcp_timer_set(timer);
         let local = self.local?;
-        Some(TcpSegmentHeader {
-            source_port: local.port(),
-            destination_port: self.remote.port(),
-            sequence_number: self.iss,
-            acknowledgment_number: self.rcv_nxt,
-            flags: TcpSegmentFlags::SYN,
-            advertised_window: self.advertised_receive_window(self.rcv_wnd),
-            capabilities: self.options.local_capabilities(),
-        })
+        Some(TcpSegment::new(
+            local,
+            self.remote,
+            self.iss,
+            self.rcv_nxt,
+            self.advertised_receive_window(self.rcv_wnd),
+            TcpSegmentFlags::SYN,
+            self.options.local_capabilities(),
+            0,
+        ))
     }
 }
 
@@ -694,11 +723,11 @@ where
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<Established, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Established, C>, TcpSegment) {
         self.apply_ack(acknowledgment, packet.advertised_window);
         let next = TcpConnection::established_from_syn_rcvd(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 }
 
@@ -706,56 +735,74 @@ impl<C> TcpConnection<Established, C>
 where
     C: CongestionController,
 {
-    #[inline]
-    pub(crate) fn established_tx_capacity(&self) -> TcpEstablishedTxCapacity {
-        let mss = self.output_payload_len();
-        let in_flight = self.snd_nxt.wrapping_sub(self.snd_una);
-        let window = self.snd_wnd.saturating_sub(in_flight) as usize;
-        TcpEstablishedTxCapacity {
-            header_len: 20,
-            payload_budget: mss.min(window),
+    pub(crate) fn tx_payload_len(&self, pending_len: usize, _: Instant) -> usize {
+        if pending_len == 0 {
+            return 0;
         }
+        let mss = self.output_payload_len();
+        let bytes_in_flight = self.recovery.bytes_in_flight();
+        let peer_remaining = self.snd_wnd.saturating_sub(bytes_in_flight) as usize;
+        let cc_remaining = self
+            .congestion
+            .congestion_window()
+            .saturating_sub(bytes_in_flight) as usize;
+        let allowed = pending_len.min(mss).min(peer_remaining).min(cc_remaining);
+        if allowed == 0 {
+            return 0;
+        }
+        if self.congestion.next_send_delay(allowed as u32).is_some() {
+            return 0;
+        }
+        allowed
     }
 
-    pub(crate) fn write_established_payload_segment_header(
-        &self,
-        buffers: &DataPlaneBuffers,
-        index: BufferIndex,
-        payload_len: usize,
-        _: Instant,
-    ) -> CoreResult<TcpEstablishedTxUpdate> {
-        let payload_len = u32::try_from(payload_len)
-            .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+    pub(crate) fn tx_segment(&self, payload_len: usize) -> CoreResult<TcpSegment> {
         let local = self.local().ok_or_else(|| {
             CoreError::internal("established tcp connection missing local address")
         })?;
-        let header = TcpSegmentHeader {
-            source_port: local.port(),
-            destination_port: self.remote().port(),
-            sequence_number: self.snd_nxt(),
-            acknowledgment_number: self.rcv_nxt(),
-            flags: TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
-            advertised_window: self.advertised_receive_window(self.rcv_wnd),
-            capabilities: self.local_capabilities(),
-        };
-        let mut buffer = buffers.get_buffer_mut(index)?;
-        if buffer.current_len() < 20 {
-            return Err(CoreError::internal(
-                "tcp header prefix exceeds current buffer length",
-            ));
-        }
-        let written = write_tcp_segment_header(&mut buffer.current_mut()[..20], header)?;
-        if written != 20 {
-            return Err(CoreError::internal(
-                "tcp header length changed after prefix reservation",
-            ));
-        }
-        Ok(TcpEstablishedTxUpdate { payload_len })
+        Ok(TcpSegment::new(
+            local,
+            self.remote(),
+            self.snd_nxt(),
+            self.rcv_nxt(),
+            self.advertised_receive_window(self.rcv_wnd),
+            TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+            self.local_capabilities(),
+            payload_len,
+        ))
     }
 
-    #[inline]
-    pub(crate) fn commit_established_payload_segment(&mut self, update: TcpEstablishedTxUpdate) {
-        self.snd_nxt = TcpSeq::new(self.snd_nxt).advance(update.payload_len).raw();
+    pub(crate) fn commit_payload_tx(
+        &mut self,
+        payload_len: usize,
+        now: Instant,
+    ) -> CoreResult<TcpConnectionTimerKind> {
+        let payload_len = u32::try_from(payload_len)
+            .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+        let sequence = self.snd_nxt;
+        let end_sequence = TcpSeq::new(sequence).advance(payload_len).raw();
+        let bytes_in_flight = self.recovery.bytes_in_flight();
+        let packet_number = self.recovery.next_packet_number();
+        self.recovery.record_sent(TcpSentSegment {
+            packet_number,
+            sequence,
+            end_sequence,
+            bytes: payload_len,
+            sent_at: now,
+            retransmitted: false,
+            is_probe: false,
+        });
+        self.congestion
+            .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
+        self.snd_nxt = end_sequence;
+        let mut timers = TcpConnectionTimerKind::empty();
+        if self.recovery.rack_timeout_ticks().is_some() {
+            timers.insert(TcpConnectionTimerKind::RACK);
+        }
+        if self.recovery.tlp_timeout_ticks().is_some() {
+            timers.insert(TcpConnectionTimerKind::TLP);
+        }
+        Ok(timers)
     }
 
     #[inline]
@@ -781,7 +828,7 @@ where
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<CloseWait, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<CloseWait, C>, TcpSegment) {
         if let Some(acknowledgment) = packet.acknowledgment {
             self.apply_ack(acknowledgment, packet.advertised_window);
         }
@@ -789,8 +836,8 @@ where
         self.receive_in_order(fin_sequence, 1);
         self.close_reason = Some(TcpCloseReason::RemoteFin);
         let next = TcpConnection::close_wait_from_established(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 }
 
@@ -810,10 +857,10 @@ where
     }
 
     #[inline]
-    pub(crate) fn accept_repeated_fin(mut self, packet: &TcpPacket) -> (Self, TcpSegmentHeader) {
+    pub(crate) fn accept_repeated_fin(mut self, packet: &TcpPacket) -> (Self, TcpSegment) {
         self.receive_in_order(packet.sequence, 1);
-        let header = self.control_header(packet, TcpSegmentFlags::ACK, None);
-        (self, header)
+        let segment = self.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (self, segment)
     }
 }
 
@@ -831,12 +878,12 @@ where
         mut self,
         packet: &TcpPacket,
         acknowledgment: u32,
-    ) -> (TcpConnection<TimeWait, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<TimeWait, C>, TcpSegment) {
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::time_wait_from_fin_wait1(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 
     pub(crate) fn accept_ack(
@@ -851,12 +898,12 @@ where
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<Closing, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<Closing, C>, TcpSegment) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::closing_from_fin_wait1(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 }
 
@@ -873,12 +920,12 @@ where
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
-    ) -> (TcpConnection<TimeWait, C>, TcpSegmentHeader) {
+    ) -> (TcpConnection<TimeWait, C>, TcpSegment) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
         let next = TcpConnection::time_wait_from_fin_wait2(self);
-        let header = next.control_header(packet, TcpSegmentFlags::ACK, None);
-        (next, header)
+        let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+        (next, segment)
     }
 }
 
@@ -968,5 +1015,161 @@ where
         let (established, _) =
             syn_rcvd.accept_final_ack(&final_packet, final_packet.acknowledgment.unwrap());
         established
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use crate::transport::congestion::{
+        AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample,
+    };
+
+    use super::*;
+
+    #[derive(Clone, Debug)]
+    struct RecordingController {
+        congestion_window: u32,
+        delay: Option<Duration>,
+        sent: hammer_infra::vec::Vec<(PacketNumber, u32, u32, Instant)>,
+        acked: hammer_infra::vec::Vec<AckedPacket>,
+        end_acks: u32,
+        last_bytes_in_flight: u32,
+        mtu: u32,
+    }
+
+    impl CongestionController for RecordingController {
+        fn new(max_datagram_size: u32) -> Self {
+            Self {
+                congestion_window: 65_535,
+                delay: None,
+                sent: hammer_infra::vec::Vec::new(),
+                acked: hammer_infra::vec::Vec::new(),
+                end_acks: 0,
+                last_bytes_in_flight: 0,
+                mtu: max_datagram_size,
+            }
+        }
+
+        fn metrics(&self) -> CongestionMetrics {
+            CongestionMetrics {
+                congestion_window: self.congestion_window,
+                pacing_rate_bytes_per_second: None,
+                delivered: self.acked.len() as u64,
+                max_bandwidth_bytes_per_second: 0,
+                min_rtt: None,
+            }
+        }
+
+        fn max_datagram_size(&self) -> u32 {
+            self.mtu
+        }
+
+        fn congestion_window(&self) -> u32 {
+            self.congestion_window
+        }
+
+        fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
+            None
+        }
+
+        fn delivered(&self) -> u64 {
+            self.acked.len() as u64
+        }
+
+        fn min_rtt(&self) -> Option<Duration> {
+            None
+        }
+
+        fn max_bandwidth_bytes_per_second(&self) -> u64 {
+            0
+        }
+
+        fn on_packet_sent(
+            &mut self,
+            packet_number: PacketNumber,
+            bytes_sent: u32,
+            bytes_in_flight: u32,
+            now: Instant,
+        ) {
+            self.sent
+                .push((packet_number, bytes_sent, bytes_in_flight, now));
+            self.last_bytes_in_flight = bytes_in_flight;
+        }
+
+        fn on_ack(&mut self, _: Instant, acked: AckedPacket, _: RttSample, bytes_in_flight: u32) {
+            self.last_bytes_in_flight = bytes_in_flight;
+            self.acked.push(acked);
+        }
+
+        fn on_end_acks(&mut self, _: Instant, bytes_in_flight: u32, _: bool, _: PacketNumber) {
+            self.last_bytes_in_flight = bytes_in_flight;
+            self.end_acks += 1;
+        }
+
+        fn on_loss(&mut self, _: Instant, _: LostPacket, _: bool) {}
+
+        fn on_mtu_update(&mut self, max_datagram_size: u32) {
+            self.mtu = max_datagram_size;
+        }
+
+        fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
+            (pending_bytes != 0).then_some(self.delay).flatten()
+        }
+    }
+
+    fn established_connection() -> TcpConnection<Established, RecordingController> {
+        let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote");
+        TcpConnection::established_for_test(
+            Some(TcpConnectionId::new(900)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        )
+    }
+
+    #[test]
+    fn established_tx_payload_len_uses_window_congestion_and_mss() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+        connection.snd_wnd = 8;
+        connection.congestion.congestion_window = 6;
+
+        assert_eq!(connection.tx_payload_len(32, now), 6);
+
+        connection.congestion.delay = Some(Duration::from_millis(1));
+        assert_eq!(connection.tx_payload_len(32, now), 0);
+    }
+
+    #[test]
+    fn established_commit_records_sent_segment_and_congestion_send() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+        let start = connection.snd_nxt();
+
+        let timers = connection.commit_payload_tx(5, now).expect("commit tx");
+
+        assert!(timers.contains(TcpConnectionTimerKind::TLP));
+        assert_eq!(connection.snd_nxt(), TcpSeq::new(start).advance(5).raw());
+        assert_eq!(connection.recovery().bytes_in_flight(), 5);
+        assert_eq!(connection.congestion.sent.as_slice(), &[(1, 5, 0, now)]);
+    }
+
+    #[test]
+    fn established_ack_cleans_sent_segment_and_updates_congestion() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+        let end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
+
+        connection.commit_payload_tx(5, now).expect("commit tx");
+        connection.receive_ack(end, u16::MAX);
+
+        assert_eq!(connection.snd_una(), end);
+        assert_eq!(connection.recovery().bytes_in_flight(), 0);
+        assert_eq!(connection.congestion.acked.len(), 1);
+        assert_eq!(connection.congestion.end_acks, 1);
     }
 }

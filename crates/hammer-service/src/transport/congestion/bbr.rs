@@ -1,12 +1,6 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
-use hammer_core::error::CoreResult;
-
 use super::controller::CongestionController;
-use super::node::{CongestionControlNode, congestion_control_frame};
 use super::types::{AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample};
 
 pub const DEFAULT_BBR_MAX_DATAGRAM_SIZE: u32 = 1_460;
@@ -27,40 +21,6 @@ pub enum BbrMode {
     Drain,
     ProbeBw,
     ProbeRtt,
-}
-
-#[hammer_component_macros::node(role = internal, sibling_of = CongestionControlNode)]
-pub struct BbrCongestionNode {}
-
-impl Node for BbrCongestionNode {
-    #[inline(always)]
-    fn process(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> CoreResult<NodeResult> {
-        let next = Self::runtime_nexts(runtime)?;
-        congestion_control_frame(runtime, frame, next)
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        bbr_congestion_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
-    }
-}
-
-fn bbr_congestion_process(
-    runtime: &DataPlaneRuntime,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let next = BbrCongestionNode::runtime_nexts(runtime)?;
-    congestion_control_frame(runtime, frame, next)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

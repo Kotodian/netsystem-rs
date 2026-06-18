@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use hammer_core::error::CoreError;
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpNegotiatedOptions, TcpSegmentHeader};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpNegotiatedOptions};
 
 use crate::transport::congestion::CongestionController;
 
+use super::segment::TcpSegment;
 pub use super::state_machine::TcpConnection;
 use super::state_machine::{
     CloseWait, Closed, Closing, Established, FinWait1, FinWait2, LastAck, Listen, SynRcvd, SynSent,
@@ -237,36 +237,14 @@ where
     }
 
     #[inline]
-    pub(crate) fn on_tcp_timer_expiry(
-        &mut self,
-    ) -> Option<(
-        TcpConnectionTimerKind,
-        SocketAddr,
-        SocketAddr,
-        TcpSegmentHeader,
-    )> {
-        for timer in TcpConnectionTimerKind::all().iter() {
-            if let Some(output) = self.on_tcp_timer(timer) {
-                return Some(output);
-            }
-        }
-        None
-    }
-
-    #[inline]
-    fn on_tcp_timer(
+    pub(crate) fn on_tcp_timer(
         &mut self,
         timer: TcpConnectionTimerKind,
-    ) -> Option<(
-        TcpConnectionTimerKind,
-        SocketAddr,
-        SocketAddr,
-        TcpSegmentHeader,
-    )> {
+    ) -> Option<(TcpConnectionTimerKind, TcpSegment)> {
         match self {
             Self::SynSent(connection) => {
-                let header = connection.on_tcp_timer_expiry(timer)?;
-                Some((timer, connection.local()?, connection.remote(), header))
+                let segment = connection.on_tcp_timer_expiry(timer)?;
+                Some((timer, segment))
             }
             Self::Closed(connection) => {
                 connection.tcp_timer_take_pending(timer);
@@ -308,6 +286,16 @@ where
                 connection.tcp_timer_take_pending(timer);
                 None
             }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn on_tcp_ready(&mut self) -> Option<TcpSegment> {
+        match self {
+            Self::SynSent(connection) => {
+                connection.on_tcp_timer_expiry(TcpConnectionTimerKind::RETRANSMIT)
+            }
+            _ => None,
         }
     }
 

@@ -83,11 +83,6 @@ impl<'a, S> SessionQueueControlContext<'a, S> {
     }
 
     #[inline]
-    pub(crate) fn mark_ready(&mut self, session_id: SessionId) {
-        self.driver.mark_ready(session_id);
-    }
-
-    #[inline]
     pub(crate) fn arm_timer_ticks(
         &mut self,
         session_id: SessionId,
@@ -95,6 +90,16 @@ impl<'a, S> SessionQueueControlContext<'a, S> {
         ticks: u64,
     ) -> CoreResult<()> {
         self.driver.arm_timer_ticks(session_id, token, ticks)
+    }
+
+    #[inline]
+    pub(crate) fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
+        self.driver.cancel_timer(session_id, token)
+    }
+
+    #[inline]
+    pub(crate) fn session_state(&self, session_id: SessionId) -> Option<&S> {
+        self.driver.session_state(session_id)
     }
 
     #[inline]

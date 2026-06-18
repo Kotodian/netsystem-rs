@@ -4,9 +4,8 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::DataWorkerId;
 use hammer_service::transport::congestion::{
-    AckedPacket, BbrCongestionNode, BbrController, BbrMode, CongestionControlNext,
-    CongestionControlNode, CongestionController, CongestionMetrics, LostPacket, PacketNumber,
-    RttSample,
+    AckedPacket, BbrController, BbrMode, CongestionController, CongestionMetrics, LostPacket,
+    PacketNumber, RttSample,
 };
 use hammer_service::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
 use hammer_service::transport::tcp::connection::TcpConnection;
@@ -125,32 +124,6 @@ fn tcp_connection_uses_left_hand_congestion_controller_type() {
         TcpConnection::new(None, DataWorkerId::new(0), 10_000, None, remote);
 
     assert_eq!(connection.congestion().max_datagram_size(), MSS);
-}
-
-#[test]
-fn bbr_congestion_node_is_graph_sibling_without_direct_controller_api() {
-    let _root_type = core::any::type_name::<CongestionControlNode>();
-    let _bbr_type = core::any::type_name::<BbrCongestionNode>();
-    let _next = CongestionControlNext::Transmit;
-
-    let source = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/congestion/bbr.rs"),
-    )
-    .expect("read bbr source");
-
-    assert!(source.contains("sibling_of = CongestionControlNode"));
-    for forbidden in [
-        "pub fn observe_ack",
-        "pub fn observe_send",
-        "pub fn observe_loss",
-        "pub fn controller",
-        "pub fn controller_mut",
-    ] {
-        assert!(
-            !source.contains(forbidden),
-            "BBR graph node exposed controller-style API: {forbidden}"
-        );
-    }
 }
 
 #[test]

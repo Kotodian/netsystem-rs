@@ -20,6 +20,7 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const CURRENT_CHAIN_IO_SEGMENT_CAPACITY: usize = 64;
+pub const DEFAULT_PACKET_HEADROOM: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -1524,7 +1525,9 @@ impl BufferPool {
 
     #[inline]
     pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
-        self.alloc_index_with_bytes(metadata, &[])
+        let mut cache = self.thread_cache.borrow_mut();
+        let mut arena = self.arena.inner.borrow_mut();
+        arena.alloc_empty_chain(&mut cache, metadata)
     }
 
     #[inline]
@@ -2188,6 +2191,25 @@ impl BufferPoolInner {
         }
         self.buffer_mut(first)?.total_len_not_including_first = total_tail_len;
         Ok(first)
+    }
+
+    #[inline]
+    fn alloc_empty_chain(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        metadata: RouteMetadata,
+    ) -> CoreResult<BufferIndex> {
+        if self.slot_capacity == 0 {
+            return Err(CoreError::internal("buffer slot capacity must be nonzero"));
+        }
+        let index = self.alloc_slot(cache, metadata, &[])?;
+        let headroom = DEFAULT_PACKET_HEADROOM.min(self.slot_capacity);
+        {
+            let buffer = self.buffer_mut(index)?;
+            buffer.current_data = headroom;
+            buffer.data_len = headroom;
+        }
+        Ok(index)
     }
 
     #[inline]

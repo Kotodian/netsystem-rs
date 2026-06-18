@@ -8,13 +8,13 @@ use crate::session::SessionQueueHandle;
 
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
-use super::segment::{alloc_tcp_segment, parse_tcp_packet, tcp_segment_metadata};
+use super::segment::parse_tcp_packet;
 use super::session::{TcpServiceController, TcpSessionQueue};
 use super::state_machine::FinWait2;
 
 #[hammer_component_macros::node_next]
 pub enum TcpFinWait2Next {
-    Congestion,
+    Output,
     Drop,
 }
 
@@ -73,11 +73,11 @@ fn tcp_fin_wait2_frame(
 ) -> CoreResult<NodeResult> {
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp fin-wait2 node missing session queue"))?;
-    let congestion = next[TcpFinWait2Next::Congestion as usize];
+    let tcp_output = next[TcpFinWait2Next::Output as usize];
     let drop_next = next[TcpFinWait2Next::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_fin_wait2_index(runtime, index, session_queue, congestion, &mut next_frames) {
+        match tcp_fin_wait2_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -93,11 +93,11 @@ fn tcp_fin_wait2_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: SessionQueueHandle,
-    congestion: NodeId,
+    tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()> {
     let packet = parse_tcp_packet(runtime, index)?;
-    let mut output_index = None;
+    let mut tx_index = None;
     let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
@@ -105,26 +105,34 @@ fn tcp_fin_wait2_index(
         let connection: TcpConnection<FinWait2, TcpServiceController> =
             queue.take_connection(session_id)?;
         let control = connection.receive_fin_wait2(queue, session_id, &packet)?;
-        if let Some(header) = control {
-            let allocated = alloc_tcp_segment(
-                runtime.packet_buffers(),
-                tcp_segment_metadata(packet.local, packet.remote),
-                header,
-            )?;
-            output_index = Some(allocated);
+        if let Some(segment) = control {
+            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
+            if let Err(error) = queue.protocol.insert_segment(allocated, segment) {
+                runtime.free_index(allocated);
+                return Err(error);
+            }
+            tx_index = Some(allocated);
         }
         Ok(())
     });
     if let Err(error) = result {
-        if let Some(output_index) = output_index.take() {
-            runtime.free_index(output_index);
+        if let Some(tx_index) = tx_index.take() {
+            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+                queue.protocol.remove_segment(tx_index);
+                Ok(())
+            })?;
+            runtime.free_index(tx_index);
         }
         return Err(error);
     }
-    if let Some(output_index) = output_index.take()
-        && let Err(error) = next_frames.enqueue(runtime, congestion, output_index)
+    if let Some(tx_index) = tx_index.take()
+        && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
     {
-        runtime.free_index(output_index);
+        TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            queue.protocol.remove_segment(tx_index);
+            Ok(())
+        })?;
+        runtime.free_index(tx_index);
         return Err(error);
     }
     runtime.free_index(index);

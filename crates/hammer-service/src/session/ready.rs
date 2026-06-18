@@ -1,5 +1,6 @@
 use crate::session::SessionId;
 
+#[derive(Debug)]
 pub struct SessionReadyQueue {
     ready: hammer_infra::vec::Vec<SessionId>,
     slots: hammer_infra::map::FlatHashTable<u64, usize>,

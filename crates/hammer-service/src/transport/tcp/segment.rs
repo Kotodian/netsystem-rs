@@ -1,8 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hammer_adapter::{
-    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, Network, RouteMetadata, SocksAddr,
-};
+use hammer_adapter::{BufferIndex, DataPlaneRuntime, Network, RouteMetadata, SocksAddr};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
@@ -81,32 +79,71 @@ pub(crate) fn parse_tcp_packet(
     })
 }
 
-pub(crate) fn alloc_tcp_segment(
-    buffers: &DataPlaneBuffers,
-    metadata: RouteMetadata,
-    header: TcpSegmentHeader,
-) -> CoreResult<BufferIndex> {
-    let index = buffers.alloc_index(metadata)?;
-    let result = (|| {
-        let mut buffer = buffers.get_buffer_mut(index)?;
-        let output = buffer.writable_tail_mut();
-        let written = write_tcp_segment_header(output, header)?;
-        buffer.commit_writable_tail(written)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        buffers.free_index(index);
-        return Err(error);
-    }
-    Ok(index)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpSegment {
+    local: SocketAddr,
+    remote: SocketAddr,
+    sequence: u32,
+    acknowledgment: u32,
+    advertised_window: u16,
+    flags: TcpSegmentFlags,
+    capabilities: TcpCapabilities,
+    payload_len: usize,
 }
 
-pub(crate) fn tcp_segment_metadata(local: SocketAddr, remote: SocketAddr) -> RouteMetadata {
-    RouteMetadata {
-        network: Network::Tcp,
-        source: Some(SocksAddr::ip(local.ip(), local.port())),
-        destination: Some(SocksAddr::ip(remote.ip(), remote.port())),
-        ..RouteMetadata::default()
+impl TcpSegment {
+    #[inline]
+    pub fn new(
+        local: SocketAddr,
+        remote: SocketAddr,
+        sequence: u32,
+        acknowledgment: u32,
+        advertised_window: u16,
+        flags: TcpSegmentFlags,
+        capabilities: TcpCapabilities,
+        payload_len: usize,
+    ) -> Self {
+        Self {
+            local,
+            remote,
+            sequence,
+            acknowledgment,
+            advertised_window,
+            flags,
+            capabilities,
+            payload_len,
+        }
+    }
+
+    #[inline]
+    pub fn write_header(&self, output: &mut [u8]) -> CoreResult<usize> {
+        write_tcp_segment_header(
+            output,
+            TcpSegmentHeader {
+                source_port: self.local.port(),
+                destination_port: self.remote.port(),
+                sequence_number: self.sequence,
+                acknowledgment_number: self.acknowledgment,
+                flags: self.flags,
+                advertised_window: self.advertised_window,
+                capabilities: self.capabilities,
+            },
+        )
+    }
+
+    #[inline]
+    pub fn route_metadata(&self) -> RouteMetadata {
+        RouteMetadata {
+            network: Network::Tcp,
+            source: Some(SocksAddr::ip(self.local.ip(), self.local.port())),
+            destination: Some(SocksAddr::ip(self.remote.ip(), self.remote.port())),
+            ..RouteMetadata::default()
+        }
+    }
+
+    #[inline]
+    pub const fn payload_len(&self) -> usize {
+        self.payload_len
     }
 }
 

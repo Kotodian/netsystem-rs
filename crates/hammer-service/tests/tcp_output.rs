@@ -1,8 +1,48 @@
+use std::net::SocketAddr;
+
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
 use hammer_service::transport::tcp::output::{
     tcp_available_send_window, tcp_output_next_sequence, tcp_output_sequence_len,
     tcp_payload_len_in_send_window,
 };
+use hammer_service::transport::tcp::segment::TcpSegment;
 use hammer_service::transport::tcp::{TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_SYN};
+
+#[test]
+fn tcp_segment_writes_tcp_header_bytes() {
+    let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote");
+    let segment = TcpSegment::new(
+        local,
+        remote,
+        100,
+        200,
+        4096,
+        TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+        TcpCapabilities::default(),
+        5,
+    );
+    let mut header = [0u8; 64];
+
+    let written = segment.write_header(&mut header).expect("write header");
+
+    assert_eq!(written, 20);
+    assert_eq!(&header[0..2], &50000u16.to_be_bytes());
+    assert_eq!(&header[2..4], &443u16.to_be_bytes());
+    assert_eq!(&header[4..8], &100u32.to_be_bytes());
+    assert_eq!(&header[8..12], &200u32.to_be_bytes());
+    assert_eq!(header[12] >> 4, 5);
+    assert_eq!(
+        header[13] & TcpSegmentFlags::ACK.bits(),
+        TcpSegmentFlags::ACK.bits()
+    );
+    assert_eq!(
+        header[13] & TcpSegmentFlags::PSH.bits(),
+        TcpSegmentFlags::PSH.bits()
+    );
+    assert_eq!(&header[14..16], &4096u16.to_be_bytes());
+    assert_eq!(segment.payload_len(), 5);
+}
 
 #[test]
 fn tcp_output_sequence_space_counts_control_bits_and_wraps() {

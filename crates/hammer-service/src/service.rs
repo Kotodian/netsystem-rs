@@ -1037,14 +1037,17 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                     IpLookupControlPlane::new(FibTableBuilder::new(drop).build()).node(),
                 )
                 .map_err(HammerError::from)?;
-            let tcp_output = runtime
-                .nodes()
-                .try_register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)))
-                .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
             let queue =
                 TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
                     .map_err(HammerError::from)?;
+            let tcp_output = runtime
+                .nodes()
+                .try_register_internal(TcpOutputNode::new(
+                    TcpOutputNext::nodes(drop, lookup),
+                    queue,
+                ))
+                .map_err(HammerError::from)?;
             let node = runtime
                 .nodes()
                 .try_register_driver(session_queue_node.clone())

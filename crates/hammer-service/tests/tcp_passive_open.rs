@@ -9,8 +9,8 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::tcp::TcpSessionProtocol;
 use hammer_service::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpSynRcvdNext,
-    TcpSynRcvdNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
+    TcpOutputNode, TcpSynRcvdNext, TcpSynRcvdNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -105,10 +105,14 @@ fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
             .expect("session queue");
     let output_state = Arc::new(Mutex::new(CaptureState::default()));
-    let output = runtime
+    let output_capture = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&output_state)));
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let output = runtime.nodes().register_internal(TcpOutputNode::new(
+        TcpOutputNext::nodes(drop, output_capture),
+        handle,
+    ));
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
@@ -128,7 +132,7 @@ fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 3);
     let packets = &output_state.lock().unwrap().packets;
     assert_eq!(packets.len(), 1);
     assert_tcp_packet(
@@ -150,10 +154,14 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
             .expect("session queue");
     let output_state = Arc::new(Mutex::new(CaptureState::default()));
-    let output = runtime
+    let output_capture = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&output_state)));
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let output = runtime.nodes().register_internal(TcpOutputNode::new(
+        TcpOutputNext::nodes(drop, output_capture),
+        handle,
+    ));
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
@@ -175,7 +183,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
             b"",
         ),
     );
-    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 3);
     output_state.lock().unwrap().packets.clear();
 
     send_packet(
@@ -193,7 +201,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 3);
     let packets = &output_state.lock().unwrap().packets;
     assert_eq!(packets.len(), 1);
     assert_tcp_packet(
@@ -215,10 +223,14 @@ fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
             .expect("session queue");
     let output_state = Arc::new(Mutex::new(CaptureState::default()));
-    let output = runtime
+    let output_capture = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&output_state)));
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let output = runtime.nodes().register_internal(TcpOutputNode::new(
+        TcpOutputNext::nodes(drop, output_capture),
+        handle,
+    ));
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
@@ -245,7 +257,7 @@ fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
         ),
     );
 
-    assert_eq!(runtime.run_ready_nodes().expect("run established"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run established"), 3);
     let packets = &output_state.lock().unwrap().packets;
     assert_eq!(packets.len(), 1);
     assert_tcp_packet(
@@ -267,10 +279,14 @@ fn tcp_syn_rcvd_rst_closes_session_and_completes_app_closed() {
         TcpSessionProtocol::register_queue(DataWorkerId::new(0), runtime.packet_buffers().clone())
             .expect("session queue");
     let output_state = Arc::new(Mutex::new(CaptureState::default()));
-    let output = runtime
+    let output_capture = runtime
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&output_state)));
     let drop = runtime.nodes().register_internal(DropNode::new());
+    let output = runtime.nodes().register_internal(TcpOutputNode::new(
+        TcpOutputNext::nodes(drop, output_capture),
+        handle,
+    ));
     let listen = runtime.nodes().register_internal(
         TcpListenNode::new(TcpListenNext::nodes(output, drop)).with_session_queue(handle),
     );
@@ -335,7 +351,7 @@ fn establish_passive_session(
             b"",
         ),
     );
-    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run listen"), 3);
     output_state.lock().unwrap().packets.clear();
 
     send_packet(
@@ -352,7 +368,7 @@ fn establish_passive_session(
             b"",
         ),
     );
-    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 2);
+    assert_eq!(runtime.run_ready_nodes().expect("run syn-rcvd"), 3);
     output_state.lock().unwrap().packets.clear();
 }
 

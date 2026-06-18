@@ -88,6 +88,23 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 }
 
 #[test]
+fn empty_buffer_allocation_reserves_default_packet_headroom() {
+    let pool = BufferPool::with_capacity(512, 1);
+    let buffer = pool
+        .alloc_index(RouteMetadata::default())
+        .expect("alloc empty buffer");
+
+    pool.append(buffer, b"payload").expect("append payload");
+    pool.prepend(buffer, b"header").expect("prepend header");
+
+    assert_eq!(
+        pool.copy_current(buffer).expect("prepended packet"),
+        b"headerpayload"
+    );
+    pool.free_index(buffer);
+}
+
+#[test]
 fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 2);
     let first = runtime
