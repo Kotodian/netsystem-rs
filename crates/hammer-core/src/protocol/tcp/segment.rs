@@ -115,7 +115,7 @@ pub fn write_tcp_segment_header(
 ) -> CoreResult<usize> {
     let options = if header.flags.contains(TcpSegmentFlags::SYN) {
         super::options::tcp_syn_options_from_capabilities(header.capabilities)
-    } else {
+    } else if header.flags.contains(TcpSegmentFlags::ACK) {
         if let Some(sack_blocks) = sack_blocks.filter(|blocks| !blocks.is_empty()) {
             let limited_len = sack_blocks.len().min(TCP_MAX_SACK_BLOCKS);
             let mut options =
@@ -133,6 +133,8 @@ pub fn write_tcp_segment_header(
         } else {
             std::vec::Vec::new()
         }
+    } else {
+        std::vec::Vec::new()
     };
     let header_len = TCP_HEADER_MIN_LEN + options.len();
     if output.len() < header_len {

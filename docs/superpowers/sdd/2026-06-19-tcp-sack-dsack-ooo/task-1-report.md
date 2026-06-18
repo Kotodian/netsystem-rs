@@ -86,6 +86,40 @@ Results:
 - `cargo test -p hammer-core protocol_tcp_segment -- --nocapture`: exit 0
 - `cargo test -p hammer-service transport::tcp::segment -- --nocapture`: exit 0
 
+## ACK-only fix round
+
+- Tightened outbound SACK emission so the existing header path emits SACK only for segments carrying `TcpSegmentFlags::ACK`.
+- Added a regression test covering the required boundary: non-ACK segments must not emit SACK even when optional SACK facts are passed.
+- Commit: pending in this fix round until the ACK-only regression and focused verification completed.
+
+### ACK-only RED
+
+Ran:
+
+```bash
+cargo test -p hammer-core core_tcp_non_ack_does_not_write_sack_blocks -- --nocapture
+```
+
+Observed failure before the fix:
+
+- `core_tcp_non_ack_does_not_write_sack_blocks` failed because `parsed.sack_blocks` was not empty on a non-ACK segment.
+
+### ACK-only verification
+
+Ran after the fix:
+
+```bash
+cargo test -p hammer-core core_tcp_non_ack_does_not_write_sack_blocks -- --nocapture
+cargo test -p hammer-core protocol_tcp_segment -- --nocapture
+cargo test -p hammer-service transport::tcp::segment -- --nocapture
+```
+
+Results:
+
+- `cargo test -p hammer-core core_tcp_non_ack_does_not_write_sack_blocks -- --nocapture`: exit 0
+- `cargo test -p hammer-core protocol_tcp_segment -- --nocapture`: exit 0
+- `cargo test -p hammer-service transport::tcp::segment -- --nocapture`: exit 0
+
 ## Constraints check
 
 - No new public type added.
