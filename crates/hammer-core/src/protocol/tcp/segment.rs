@@ -1,7 +1,12 @@
-use super::{TcpCapabilities, TcpSegmentFlags};
+use super::{TcpCapabilities, TcpSackBlock, TcpSegmentFlags};
 use crate::error::{CoreError, CoreResult};
 
 const TCP_HEADER_MIN_LEN: usize = 20;
+const TCP_OPTION_EOL: u8 = 0;
+const TCP_OPTION_NOP: u8 = 1;
+const TCP_OPTION_SACK: u8 = 5;
+const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
+const TCP_MAX_SACK_BLOCKS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpSegmentParseError {
@@ -103,11 +108,31 @@ impl<'a> TcpSegmentView<'a> {
     }
 }
 
-pub fn write_tcp_segment_header(output: &mut [u8], header: TcpSegmentHeader) -> CoreResult<usize> {
+pub fn write_tcp_segment_header(
+    output: &mut [u8],
+    header: TcpSegmentHeader,
+    sack_blocks: Option<&[TcpSackBlock]>,
+) -> CoreResult<usize> {
     let options = if header.flags.contains(TcpSegmentFlags::SYN) {
         super::options::tcp_syn_options_from_capabilities(header.capabilities)
     } else {
-        std::vec::Vec::new()
+        if let Some(sack_blocks) = sack_blocks.filter(|blocks| !blocks.is_empty()) {
+            let limited_len = sack_blocks.len().min(TCP_MAX_SACK_BLOCKS);
+            let mut options =
+                std::vec::Vec::with_capacity(2 + limited_len * TCP_OPTION_SACK_BLOCK_BYTES + 3);
+            options.extend([TCP_OPTION_NOP, TCP_OPTION_NOP, TCP_OPTION_SACK]);
+            options.push((2 + limited_len * TCP_OPTION_SACK_BLOCK_BYTES) as u8);
+            for block in &sack_blocks[..limited_len] {
+                options.extend(block.left_edge.to_be_bytes());
+                options.extend(block.right_edge.to_be_bytes());
+            }
+            while options.len() % 4 != 0 {
+                options.push(TCP_OPTION_EOL);
+            }
+            options
+        } else {
+            std::vec::Vec::new()
+        }
     };
     let header_len = TCP_HEADER_MIN_LEN + options.len();
     if output.len() < header_len {

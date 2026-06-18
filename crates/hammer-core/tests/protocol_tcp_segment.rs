@@ -1,5 +1,6 @@
 use hammer_core::protocol::tcp::{
-    TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView, tcp_options_from_bytes,
+    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError,
+    TcpSegmentView, tcp_options_from_bytes, write_tcp_segment_header,
 };
 
 #[test]
@@ -51,6 +52,29 @@ fn core_tcp_options_parse_mss_window_scale_sack_timestamp_ecn() {
     assert_eq!(parsed.timestamp.expect("timestamp").tsval, 0x0102_0304);
 }
 
+#[test]
+fn core_tcp_write_ack_with_sack_blocks() {
+    let mut output = [0u8; 64];
+
+    let written = write_ack_for_test(
+        &mut output,
+        &[TcpSackBlock {
+            left_edge: 30,
+            right_edge: 40,
+        }],
+    )
+    .expect("write ack with sack");
+    let parsed = tcp_options_from_bytes(&output[20..written]);
+
+    assert_eq!(
+        parsed.sack_blocks,
+        vec![TcpSackBlock {
+            left_edge: 30,
+            right_edge: 40,
+        }]
+    );
+}
+
 fn tcp_segment(options: &[u8], payload: &[u8]) -> Vec<u8> {
     assert_eq!(options.len() % 4, 0);
     let header_len = 20 + options.len();
@@ -65,4 +89,20 @@ fn tcp_segment(options: &[u8], payload: &[u8]) -> Vec<u8> {
     bytes[20..header_len].copy_from_slice(options);
     bytes[header_len..].copy_from_slice(payload);
     bytes
+}
+
+fn write_ack_for_test(output: &mut [u8], sack_blocks: &[TcpSackBlock]) -> Result<usize, hammer_core::error::CoreError> {
+    write_tcp_segment_header(
+        output,
+        TcpSegmentHeader {
+            source_port: 49_152,
+            destination_port: 443,
+            sequence_number: 0x0102_0304,
+            acknowledgment_number: 0x1112_1314,
+            flags: TcpSegmentFlags::ACK,
+            advertised_window: 32_768,
+            capabilities: TcpCapabilities::default(),
+        },
+        Some(sack_blocks),
+    )
 }

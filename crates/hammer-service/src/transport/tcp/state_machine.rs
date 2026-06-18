@@ -436,6 +436,7 @@ where
             self.advertised_receive_window(self.rcv_wnd),
             flags,
             self.options.local_capabilities(),
+            None,
             0,
         )
     }
@@ -699,6 +700,7 @@ where
             self.advertised_receive_window(self.rcv_wnd),
             TcpSegmentFlags::SYN,
             self.options.local_capabilities(),
+            None,
             0,
         ))
     }
@@ -768,6 +770,7 @@ where
             self.advertised_receive_window(self.rcv_wnd),
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
             self.local_capabilities(),
+            None,
             payload_len,
         ))
     }
@@ -1005,6 +1008,7 @@ where
             payload_offset: 0,
             payload_len: 0,
             capabilities: TcpCapabilities::default(),
+            sack_blocks: Vec::new(),
         };
         let (syn_rcvd, _) = connection.accept_syn(&packet);
         let final_packet = TcpPacket {

@@ -1446,6 +1446,7 @@ mod tests {
             4096,
             TcpSegmentFlags::ACK,
             TcpCapabilities::default(),
+            None,
             0,
         );
 
@@ -1472,6 +1473,7 @@ mod tests {
             4096,
             TcpSegmentFlags::ACK,
             TcpCapabilities::default(),
+            None,
             0,
         );
 
