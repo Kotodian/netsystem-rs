@@ -50,15 +50,15 @@ impl BbrController {
         self.mode
     }
 
-    fn ack_sample(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample) -> BbrAckSample {
-        BbrAckSample {
+    fn ack_sample(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample) -> AckSample {
+        AckSample {
             bytes_acked: acked.bytes,
             rtt: rtt.latest,
             now,
         }
     }
 
-    fn apply_ack_sample(&mut self, sample: BbrAckSample, bytes_in_flight: u32, app_limited: bool) {
+    fn apply_ack_sample(&mut self, sample: AckSample, bytes_in_flight: u32, app_limited: bool) {
         if sample.bytes_acked == 0 {
             return;
         }
@@ -94,7 +94,7 @@ impl BbrController {
         bytes_in_flight.saturating_add(bytes_acked) < self.congestion_window()
     }
 
-    fn update_min_rtt(&mut self, sample: BbrAckSample) {
+    fn update_min_rtt(&mut self, sample: AckSample) {
         let expired = self
             .min_rtt_stamp
             .is_some_and(|stamp| sample.now.saturating_duration_since(stamp) > BBR_MIN_RTT_FILTER);
@@ -104,7 +104,7 @@ impl BbrController {
         }
     }
 
-    fn update_bandwidth(&mut self, sample: BbrAckSample, app_limited: bool) {
+    fn update_bandwidth(&mut self, sample: AckSample, app_limited: bool) {
         let micros = sample.rtt.as_micros().max(1);
         let sample_rate = ((u128::from(sample.bytes_acked) * 1_000_000u128) / micros)
             .min(u128::from(u64::MAX)) as u64;
@@ -134,7 +134,7 @@ impl BbrController {
         self.congestion_window = probe_rtt_window(self.max_datagram_size);
     }
 
-    fn update_startup(&mut self, sample: BbrAckSample, app_limited: bool) {
+    fn update_startup(&mut self, sample: AckSample, app_limited: bool) {
         self.congestion_window = self
             .congestion_window
             .saturating_add(sample.bytes_acked)
@@ -176,7 +176,7 @@ impl BbrController {
         }
     }
 
-    fn update_probe_bw(&mut self, sample: BbrAckSample) {
+    fn update_probe_bw(&mut self, sample: AckSample) {
         if self.should_advance_probe_bw_cycle(sample.now) {
             self.cycle_index = (self.cycle_index + 1) % PROBE_BW_GAIN_CYCLE.len();
             self.cycle_stamp = Some(sample.now);
@@ -187,7 +187,7 @@ impl BbrController {
             .max(min_congestion_window(self.max_datagram_size));
     }
 
-    fn update_probe_rtt(&mut self, sample: BbrAckSample, bytes_in_flight: u32) {
+    fn update_probe_rtt(&mut self, sample: AckSample, bytes_in_flight: u32) {
         let probe_rtt_window = probe_rtt_window(self.max_datagram_size);
         self.congestion_window = probe_rtt_window;
         if bytes_in_flight <= probe_rtt_window && self.probe_rtt_done_stamp.is_none() {
@@ -397,7 +397,7 @@ impl Default for BbrController {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BbrAckSample {
+struct AckSample {
     bytes_acked: u32,
     rtt: Duration,
     now: Instant,

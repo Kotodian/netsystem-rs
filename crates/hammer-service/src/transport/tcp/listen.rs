@@ -6,12 +6,11 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpConnectionId;
 
 use crate::session::SessionId;
-use crate::session::SessionQueueHandle;
-
+use crate::transport::congestion::CongestionController;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
-use super::session::{TcpServiceController, TcpSessionQueue};
+use super::session::TcpSessionQueueHandle;
 use super::state_machine::Listen;
 
 #[hammer_component_macros::node_next]
@@ -21,20 +20,26 @@ pub enum TcpListenNext {
 }
 
 #[hammer_component_macros::node(role = internal, next = TcpListenNext)]
-pub struct TcpListenNode {
+pub struct TcpListenNode<C: CongestionController + 'static> {
     #[node(default)]
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
 }
 
-impl TcpListenNode {
+impl<C> TcpListenNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline]
-    pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
+    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
         self.session_queue = Some(handle);
         self
     }
 }
 
-impl Node for TcpListenNode {
+impl<C> Node for TcpListenNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline(always)]
     fn process(
         &mut self,
@@ -47,33 +52,39 @@ impl Node for TcpListenNode {
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_listen_process
+        tcp_listen_process::<C>
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
         self.session_queue
-            .map(SessionQueueHandle::runtime_data)
+            .map(TcpSessionQueueHandle::runtime_data)
             .ok_or_else(|| CoreError::internal("tcp listen node missing session queue"))
     }
 }
 
-fn tcp_listen_process(
+fn tcp_listen_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let next = TcpListenNode::runtime_nexts(runtime)?;
-    tcp_listen_process_frame(runtime, frame, Some(SessionQueueHandle::new(data)), next)
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
+    let next = TcpListenNode::<C>::runtime_nexts(runtime)?;
+    tcp_listen_process_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
 }
 
 #[inline]
-fn tcp_listen_process_frame(
+fn tcp_listen_process_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
     next: [NodeId; TcpListenNext::COUNT],
-) -> CoreResult<NodeResult> {
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp listen node missing session queue"))?;
     let tcp_output = next[TcpListenNext::Output as usize];
@@ -92,30 +103,33 @@ fn tcp_listen_process_frame(
     Ok(NodeResult::drop())
 }
 
-fn tcp_listen_index(
+fn tcp_listen_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: SessionQueueHandle,
+    session_queue: TcpSessionQueueHandle<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
     let packet = parse_tcp_packet(runtime, index)?;
     let mut tx_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut super::session::TcpSessionQueue<C>| {
         let worker = queue.worker();
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
-            let connection: TcpConnection<Listen, TcpServiceController> = TcpConnection::new(
-                Some(connection_id),
-                worker,
-                packet.local.port(),
-                Some(packet.local),
-                packet.remote,
-            );
+            let connection: TcpConnection<Listen, _> =
+                TcpConnection::new(
+                    Some(connection_id),
+                    worker,
+                    packet.local.port(),
+                    Some(packet.local),
+                    packet.remote,
+                );
             connection.into()
         });
-        let connection: TcpConnection<Listen, TcpServiceController> =
-            queue.take_connection(session_id)?;
+        let connection: TcpConnection<Listen, _> = queue.take_connection(session_id)?;
         let control = connection.receive_syn(queue, session_id, &packet)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
@@ -129,10 +143,13 @@ fn tcp_listen_index(
     });
     if let Err(error) = result {
         if let Some(tx_index) = tx_index.take() {
-            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            TcpSessionProtocol::with_queue(
+                session_queue,
+                |queue: &mut super::session::TcpSessionQueue<C>| {
                 queue.protocol.remove_segment(tx_index);
                 Ok(())
-            })?;
+                },
+            )?;
             runtime.free_index(tx_index);
         }
         return Err(error);
@@ -140,10 +157,13 @@ fn tcp_listen_index(
 
     if let Some(tx_index) = tx_index.take() {
         if let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index) {
-            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            TcpSessionProtocol::with_queue(
+                session_queue,
+                |queue: &mut super::session::TcpSessionQueue<C>| {
                 queue.protocol.remove_segment(tx_index);
                 Ok(())
-            })?;
+                },
+            )?;
             runtime.free_index(tx_index);
             return Err(error);
         }

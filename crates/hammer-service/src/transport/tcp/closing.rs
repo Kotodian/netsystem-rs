@@ -4,12 +4,11 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::session::SessionQueueHandle;
-
+use crate::transport::congestion::CongestionController;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
-use super::session::{TcpServiceController, TcpSessionQueue};
+use super::session::TcpSessionQueueHandle;
 use super::state_machine::Closing;
 
 #[hammer_component_macros::node_next]
@@ -19,20 +18,26 @@ pub enum TcpClosingNext {
 }
 
 #[hammer_component_macros::node(role = internal, next = TcpClosingNext)]
-pub struct TcpClosingNode {
+pub struct TcpClosingNode<C: CongestionController + 'static> {
     #[node(default)]
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
 }
 
-impl TcpClosingNode {
+impl<C> TcpClosingNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline]
-    pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
+    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
         self.session_queue = Some(handle);
         self
     }
 }
 
-impl Node for TcpClosingNode {
+impl<C> Node for TcpClosingNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline(always)]
     fn process(
         &mut self,
@@ -45,32 +50,38 @@ impl Node for TcpClosingNode {
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_closing_process
+        tcp_closing_process::<C>
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
         self.session_queue
-            .map(SessionQueueHandle::runtime_data)
+            .map(TcpSessionQueueHandle::runtime_data)
             .ok_or_else(|| CoreError::internal("tcp closing node missing session queue"))
     }
 }
 
-fn tcp_closing_process(
+fn tcp_closing_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let next = TcpClosingNode::runtime_nexts(runtime)?;
-    tcp_closing_frame(runtime, frame, Some(SessionQueueHandle::new(data)), next)
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
+    let next = TcpClosingNode::<C>::runtime_nexts(runtime)?;
+    tcp_closing_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
 }
 
-fn tcp_closing_frame(
+fn tcp_closing_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
     next: [NodeId; TcpClosingNext::COUNT],
-) -> CoreResult<NodeResult> {
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp closing node missing session queue"))?;
     let tcp_output = next[TcpClosingNext::Output as usize];
@@ -89,21 +100,23 @@ fn tcp_closing_frame(
     Ok(NodeResult::drop())
 }
 
-fn tcp_closing_index(
+fn tcp_closing_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: SessionQueueHandle,
+    session_queue: TcpSessionQueueHandle<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
     let packet = parse_tcp_packet(runtime, index)?;
     let mut tx_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut super::session::TcpSessionQueue<C>| {
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp closing session is missing"))?;
-        let connection: TcpConnection<Closing, TcpServiceController> =
-            queue.take_connection(session_id)?;
+        let connection: TcpConnection<Closing, _> = queue.take_connection(session_id)?;
         let control = connection.receive_closing(queue, session_id, &packet)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
@@ -117,10 +130,13 @@ fn tcp_closing_index(
     });
     if let Err(error) = result {
         if let Some(tx_index) = tx_index.take() {
-            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            TcpSessionProtocol::with_queue(
+                session_queue,
+                |queue: &mut super::session::TcpSessionQueue<C>| {
                 queue.protocol.remove_segment(tx_index);
                 Ok(())
-            })?;
+                },
+            )?;
             runtime.free_index(tx_index);
         }
         return Err(error);
@@ -128,10 +144,13 @@ fn tcp_closing_index(
     if let Some(tx_index) = tx_index.take()
         && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
     {
-        TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(
+            session_queue,
+            |queue: &mut super::session::TcpSessionQueue<C>| {
             queue.protocol.remove_segment(tx_index);
             Ok(())
-        })?;
+            },
+        )?;
         runtime.free_index(tx_index);
         return Err(error);
     }

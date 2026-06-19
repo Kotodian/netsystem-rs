@@ -52,6 +52,7 @@ use crate::transport::tcp::{
     TcpListenerAddress, TcpListenerLookupAccess, TcpLookupId, TcpLookupSnapshot, TcpLookupValue,
     TcpOutputNext, TcpOutputNode, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
 };
+use crate::transport::congestion::BbrController;
 use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -1038,9 +1039,11 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 )
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
-            let queue =
-                TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
-                    .map_err(HammerError::from)?;
+            let queue = TcpSessionProtocol::register_queue::<BbrController>(
+                worker,
+                runtime.packet_buffers().clone(),
+            )
+            .map_err(HammerError::from)?;
             let tcp_output = runtime
                 .nodes()
                 .try_register_internal(TcpOutputNode::new(
@@ -1056,7 +1059,7 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .attach_queue(
                     queue,
                     SessionQueueNext::from_node(tcp_output),
-                    TcpSessionProtocol::session_queue_dispatch_fn(),
+                    TcpSessionProtocol::session_queue_dispatch_fn::<BbrController>(),
                 )
                 .map_err(HammerError::from)?;
             runtime

@@ -4,12 +4,11 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::session::SessionQueueHandle;
-
+use crate::transport::congestion::CongestionController;
 use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
-use super::session::{TcpServiceController, TcpSessionQueue};
+use super::session::TcpSessionQueueHandle;
 use super::state_machine::SynSent;
 
 #[hammer_component_macros::node_next]
@@ -19,20 +18,26 @@ pub enum TcpSynSentNext {
 }
 
 #[hammer_component_macros::node(role = internal, next = TcpSynSentNext)]
-pub struct TcpSynSentNode {
+pub struct TcpSynSentNode<C: CongestionController + 'static> {
     #[node(default)]
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
 }
 
-impl TcpSynSentNode {
+impl<C> TcpSynSentNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline]
-    pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
+    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
         self.session_queue = Some(handle);
         self
     }
 }
 
-impl Node for TcpSynSentNode {
+impl<C> Node for TcpSynSentNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline(always)]
     fn process(
         &mut self,
@@ -45,32 +50,38 @@ impl Node for TcpSynSentNode {
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_syn_sent_process
+        tcp_syn_sent_process::<C>
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
         self.session_queue
-            .map(SessionQueueHandle::runtime_data)
+            .map(TcpSessionQueueHandle::runtime_data)
             .ok_or_else(|| CoreError::internal("tcp syn-sent node missing session queue"))
     }
 }
 
-fn tcp_syn_sent_process(
+fn tcp_syn_sent_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
-    let next = TcpSynSentNode::runtime_nexts(runtime)?;
-    tcp_syn_sent_frame(runtime, frame, Some(SessionQueueHandle::new(data)), next)
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
+    let next = TcpSynSentNode::<C>::runtime_nexts(runtime)?;
+    tcp_syn_sent_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
 }
 
-fn tcp_syn_sent_frame(
+fn tcp_syn_sent_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
     next: [NodeId; TcpSynSentNext::COUNT],
-) -> CoreResult<NodeResult> {
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
     let session_queue = session_queue
         .ok_or_else(|| CoreError::internal("tcp syn-sent node missing session queue"))?;
     let tcp_output = next[TcpSynSentNext::Output as usize];
@@ -89,21 +100,23 @@ fn tcp_syn_sent_frame(
     Ok(NodeResult::drop())
 }
 
-fn tcp_syn_sent_index(
+fn tcp_syn_sent_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: SessionQueueHandle,
+    session_queue: TcpSessionQueueHandle<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
-) -> CoreResult<()> {
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
     let packet = parse_tcp_packet(runtime, index)?;
     let mut tx_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut super::session::TcpSessionQueue<C>| {
         let (session_id, _, _) = queue
             .pending_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
-        let connection: TcpConnection<SynSent, TcpServiceController> =
-            queue.take_connection(session_id)?;
+        let connection: TcpConnection<SynSent, _> = queue.take_connection(session_id)?;
         let control = connection.receive_open_reply(queue, session_id, &packet)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
@@ -117,10 +130,13 @@ fn tcp_syn_sent_index(
     });
     if let Err(error) = result {
         if let Some(tx_index) = tx_index.take() {
-            TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+            TcpSessionProtocol::with_queue(
+                session_queue,
+                |queue: &mut super::session::TcpSessionQueue<C>| {
                 queue.protocol.remove_segment(tx_index);
                 Ok(())
-            })?;
+                },
+            )?;
             runtime.free_index(tx_index);
         }
         return Err(error);
@@ -128,10 +144,13 @@ fn tcp_syn_sent_index(
     if let Some(tx_index) = tx_index.take()
         && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
     {
-        TcpSessionProtocol::with_queue(session_queue, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(
+            session_queue,
+            |queue: &mut super::session::TcpSessionQueue<C>| {
             queue.protocol.remove_segment(tx_index);
             Ok(())
-        })?;
+            },
+        )?;
         runtime.free_index(tx_index);
         return Err(error);
     }
@@ -253,7 +272,7 @@ mod tests {
         let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_000);
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             assert!(queue.bind_session_app_ring(session_id, app_op, app_ring.clone()));
             Ok(())
         })
@@ -298,9 +317,8 @@ mod tests {
             SERVER_ISN + 1,
             ACK,
         );
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<Established, TcpServiceController> =
-                queue.take_connection(session_id)?;
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            let connection: TcpConnection<Established, _> = queue.take_connection(session_id)?;
             assert_eq!(connection.snd_una(), client_isn + 1);
             assert_eq!(connection.rcv_nxt(), SERVER_ISN + 1);
             assert_eq!(
@@ -332,7 +350,7 @@ mod tests {
         let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_001);
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             assert!(queue.bind_session_app_ring(session_id, app_op, app_ring.clone()));
             Ok(())
         })
@@ -371,7 +389,7 @@ mod tests {
             AppCqeKind::Closed { op } => assert_eq!(*op, Some(app_op)),
             other => panic!("expected closed completion, got {other:?}"),
         }
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             assert!(queue.session_state(session_id).is_none());
             assert!(
                 queue
@@ -389,10 +407,9 @@ mod tests {
     }
 
     fn open_client_session(handle: SessionQueueHandle) -> (crate::session::SessionId, u32) {
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             let session_id = queue.connect(local_addr(), remote_addr())?;
-            let connection: TcpConnection<SynSent, TcpServiceController> =
-                queue.take_connection(session_id)?;
+            let connection: TcpConnection<SynSent, _> = queue.take_connection(session_id)?;
             let initial_sequence = connection.iss();
             Ok((session_id, initial_sequence))
         })

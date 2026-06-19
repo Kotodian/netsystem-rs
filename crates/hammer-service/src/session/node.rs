@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::thread::LocalKey;
+use std::fmt;
+use std::marker::PhantomData;
 use std::time::Instant;
 
 use hammer_adapter::{
@@ -8,20 +9,41 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionQueueHandle {
+#[derive(PartialEq, Eq)]
+pub struct SessionQueueHandle<Q> {
     runtime_data: NodeRuntimeData,
+    _queue: PhantomData<fn() -> Q>,
 }
 
-impl SessionQueueHandle {
+impl<Q> SessionQueueHandle<Q> {
     #[inline]
     pub(crate) const fn new(runtime_data: NodeRuntimeData) -> Self {
-        Self { runtime_data }
+        Self {
+            runtime_data,
+            _queue: PhantomData,
+        }
     }
 
     #[inline]
     pub(crate) const fn runtime_data(self) -> NodeRuntimeData {
         self.runtime_data
+    }
+}
+
+impl<Q> Copy for SessionQueueHandle<Q> {}
+
+impl<Q> Clone for SessionQueueHandle<Q> {
+    #[inline]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Q> fmt::Debug for SessionQueueHandle<Q> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionQueueHandle")
+            .field("runtime_data", &self.runtime_data)
+            .finish()
     }
 }
 
@@ -42,7 +64,7 @@ impl SessionQueueNext {
 
 pub(crate) type SessionQueueDispatchFn = fn(
     &DataPlaneRuntime,
-    SessionQueueHandle,
+    NodeRuntimeData,
     SessionQueueNext,
     Instant,
     &mut SessionQueueOutput,
@@ -72,7 +94,7 @@ impl SessionQueueOutput {
 
 #[derive(Clone, Copy)]
 struct SessionQueueAttachment {
-    handle: SessionQueueHandle,
+    runtime_data: NodeRuntimeData,
     output_next: SessionQueueNext,
     dispatch: SessionQueueDispatchFn,
 }
@@ -98,9 +120,9 @@ impl SessionQueueNode {
         })
     }
 
-    pub(crate) fn attach_queue(
+    pub(crate) fn attach_queue<Q>(
         &self,
-        handle: SessionQueueHandle,
+        handle: SessionQueueHandle<Q>,
         output_next: SessionQueueNext,
         dispatch: SessionQueueDispatchFn,
     ) -> CoreResult<()> {
@@ -113,7 +135,7 @@ impl SessionQueueNode {
                 .get_mut(slot)
                 .ok_or_else(|| CoreError::internal("session queue node slot is invalid"))?;
             node.push(SessionQueueAttachment {
-                handle,
+                runtime_data: handle.runtime_data(),
                 output_next,
                 dispatch,
             });
@@ -173,7 +195,7 @@ fn session_queue_node_process(
     for attachment in attachments {
         (attachment.dispatch)(
             runtime,
-            attachment.handle,
+            attachment.runtime_data,
             attachment.output_next,
             now,
             &mut output,
@@ -183,17 +205,10 @@ fn session_queue_node_process(
     Ok(NodeResult::drop())
 }
 
-pub(crate) fn register_session_queue<Q>(
-    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<Q>>>,
-    queue: Q,
-) -> CoreResult<SessionQueueHandle> {
-    store.with(|queues| {
-        let mut queues = queues.borrow_mut();
-        let slot = queues.len();
-        let runtime_data = NodeRuntimeData::from_usize(slot)?;
-        queues.push(queue);
-        Ok(SessionQueueHandle::new(runtime_data))
-    })
+pub(crate) fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<SessionQueueHandle<Q>> {
+    let queue = Box::leak(Box::new(RefCell::new(queue)));
+    let runtime_data = session_queue_runtime_data(queue)?;
+    Ok(SessionQueueHandle::new(runtime_data))
 }
 
 pub(crate) trait SessionQueueAccess<Q, R> {
@@ -210,22 +225,36 @@ where
     }
 }
 
-pub(crate) fn with_session_queue<Q, R, F>(
-    store: &'static LocalKey<RefCell<hammer_infra::vec::Vec<Q>>>,
-    handle: SessionQueueHandle,
+pub(crate) fn with_session_queue<Q: 'static, R, F>(
+    handle: SessionQueueHandle<Q>,
     f: F,
 ) -> CoreResult<R>
 where
     F: SessionQueueAccess<Q, R>,
 {
-    let slot = handle.runtime_data().usize_word(0)?;
-    store.with(|queues| {
-        let mut queues = queues
-            .try_borrow_mut()
-            .map_err(|_| CoreError::internal("session queues borrowed"))?;
-        let queue = queues
-            .get_mut(slot)
-            .ok_or_else(|| CoreError::internal("session queue slot is invalid"))?;
-        f.access(queue)
-    })
+    let queue = session_queue_cell::<Q>(handle.runtime_data())?;
+    let mut queue = queue
+        .try_borrow_mut()
+        .map_err(|_| CoreError::internal("session queue borrowed"))?;
+    f.access(&mut queue)
+}
+
+fn session_queue_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<NodeRuntimeData> {
+    Ok(NodeRuntimeData::from_words([
+        u64::try_from(queue as *const _ as usize)
+            .map_err(|_| CoreError::internal("session queue pointer overflow"))?,
+        0,
+        0,
+        0,
+    ]))
+}
+
+fn session_queue_cell<Q>(data: NodeRuntimeData) -> CoreResult<&'static RefCell<Q>> {
+    let raw = usize::try_from(data.word(0))
+        .map_err(|_| CoreError::internal("session queue pointer is invalid"))?;
+    let ptr = raw as *const RefCell<Q>;
+    // SAFETY: `register_session_queue` leaks a `RefCell<Q>` and stores the exact
+    // pointer in `NodeRuntimeData`. The typed handle preserves the same `Q` on
+    // recovery.
+    unsafe { ptr.as_ref() }.ok_or_else(|| CoreError::internal("session queue is missing"))
 }

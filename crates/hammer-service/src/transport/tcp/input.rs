@@ -17,9 +17,8 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView};
 
-use crate::session::SessionQueueHandle;
-
-use super::session::TcpSessionQueue;
+use crate::transport::congestion::CongestionController;
+use super::session::TcpSessionQueueHandle;
 use super::{
     TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpLookupSnapshot, TcpLookupValue, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
@@ -145,8 +144,11 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub fn node(&self) -> TcpInputNode {
-        TcpInputNode::new(
+    pub fn node<C>(&self) -> TcpInputNode<C>
+    where
+        C: CongestionController + 'static,
+    {
+        TcpInputNode::<C>::new(
             TcpInputSnapshotHandle::new(Arc::clone(&self.inner)),
             self.next,
         )
@@ -154,19 +156,22 @@ impl TcpInputControlPlane {
 }
 
 #[hammer_component_macros::node(role = internal, next = TcpInputNext)]
-pub struct TcpInputNode {
+pub struct TcpInputNode<C: CongestionController + 'static> {
     #[node(default = register_tcp_input_runtime(snapshot.clone()))]
     runtime_data: NodeRuntimeData,
     snapshot: TcpInputSnapshotHandle,
     #[node(default)]
     handoff: Option<TcpInputHandoff>,
     #[node(default)]
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<TcpSessionQueueHandle<C>>,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
 
-impl TcpInputNode {
+impl<C> TcpInputNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline]
     pub fn with_handoff(mut self, handoff: TcpInputHandoff) -> Self {
         self.handoff = Some(handoff);
@@ -174,13 +179,16 @@ impl TcpInputNode {
     }
 
     #[inline]
-    pub fn with_session_queue(mut self, handle: SessionQueueHandle) -> Self {
+    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
         self.session_queue = Some(handle);
         self
     }
 }
 
-impl Node for TcpInputNode {
+impl<C> Node for TcpInputNode<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline(always)]
     fn process(
         &mut self,
@@ -214,7 +222,7 @@ impl Node for TcpInputNode {
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_input_process
+        tcp_input_process::<C>
     }
 
     #[inline]
@@ -228,7 +236,7 @@ impl Node for TcpInputNode {
 struct TcpInputRuntime {
     snapshot: TcpInputSnapshotHandle,
     handoff: Option<TcpInputHandoff>,
-    session_queue: Option<SessionQueueHandle>,
+    session_queue: Option<NodeRuntimeData>,
 }
 
 thread_local! {
@@ -249,7 +257,9 @@ fn register_tcp_input_runtime(snapshot: TcpInputSnapshotHandle) -> NodeRuntimeDa
     })
 }
 
-fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
+fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime>
+where
+{
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         runtimes
@@ -260,11 +270,14 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> CoreResult<TcpInputRuntime> {
     })
 }
 
-fn sync_tcp_input_runtime(
+fn sync_tcp_input_runtime<C>(
     data: NodeRuntimeData,
     handoff: Option<TcpInputHandoff>,
-    session_queue: Option<SessionQueueHandle>,
-) -> CoreResult<()> {
+    session_queue: Option<TcpSessionQueueHandle<C>>,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
@@ -272,19 +285,23 @@ fn sync_tcp_input_runtime(
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
-        runtime.session_queue = session_queue;
+        runtime.session_queue = session_queue.map(TcpSessionQueueHandle::runtime_data);
         Ok(())
     })
 }
 
-fn tcp_input_process(
+fn tcp_input_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult> {
+) -> CoreResult<NodeResult>
+where
+    C: CongestionController + 'static,
+{
     let state = tcp_input_runtime(data)?;
     let snapshot = state.snapshot.load();
-    let next = TcpInputNode::runtime_nexts(runtime)?;
+    let next = TcpInputNode::<C>::runtime_nexts(runtime)?;
+    let session_queue = state.session_queue.map(TcpSessionQueueHandle::<C>::new);
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
         next_node_for_index(
             runtime,
@@ -292,7 +309,7 @@ fn tcp_input_process(
             &snapshot,
             &next,
             state.handoff,
-            state.session_queue,
+            session_queue,
         )
     })?;
     Ok(result)
@@ -319,14 +336,17 @@ enum TcpInputParseError {
 }
 
 #[inline(always)]
-fn next_node_for_index(
+fn next_node_for_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     snapshot: &TcpInputSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<TcpInputHandoff>,
-    session_queue: Option<SessionQueueHandle>,
-) -> CoreResult<Option<NodeId>> {
+    session_queue: Option<TcpSessionQueueHandle<C>>,
+) -> CoreResult<Option<NodeId>>
+where
+    C: CongestionController + 'static,
+{
     let parsed = match parse_tcp_input(runtime, index)? {
         Ok(parsed) => parsed,
         Err(TcpInputParseError::BadLength) => {
@@ -486,16 +506,19 @@ struct TcpSessionInputEntry {
     next: TcpInputNext,
 }
 
-fn session_input_entry(
-    session_queue: Option<SessionQueueHandle>,
+fn session_input_entry<C>(
+    session_queue: Option<TcpSessionQueueHandle<C>>,
     parsed: &ParsedTcpInput,
-) -> CoreResult<Option<TcpSessionInputEntry>> {
+) -> CoreResult<Option<TcpSessionInputEntry>>
+where
+    C: CongestionController + 'static,
+{
     let Some(handle) = session_queue else {
         return Ok(None);
     };
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
-    TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+    TcpSessionProtocol::with_queue(handle, |queue: &mut super::session::TcpSessionQueue<C>| {
         let route = queue
             .session_route_by_tuple(local, remote)
             .or_else(|| queue.pending_route_by_tuple(local, remote));
@@ -633,7 +656,7 @@ mod tests {
                 next: TcpInputNext::SynSent,
             }
         );
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             assert_eq!(queue.session_route_by_tuple(local, remote), None);
             assert_eq!(
                 queue.pending_route_by_tuple(local, remote),

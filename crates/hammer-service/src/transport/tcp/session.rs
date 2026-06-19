@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::time::Duration;
@@ -6,16 +5,16 @@ use std::time::Instant;
 
 use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId};
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpConnectionId, TcpSegmentFlags};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags};
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 #[cfg(test)]
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
-use crate::transport::congestion::BbrController;
+use crate::transport::congestion::CongestionController;
 
 use super::connection::TcpConnection;
-use super::segment::TcpSegment;
+use super::segment::{TcpPacket, TcpSegment};
 use super::state_machine::{
     CloseWait, Closed, Closing, Established, FinWait1, FinWait2, LastAck, Listen, SynRcvd, SynSent,
     TimeWait,
@@ -26,7 +25,6 @@ use super::{
 };
 use crate::session::node::{
     SessionQueueDispatchFn, SessionQueueHandle, SessionQueueNext, SessionQueueOutput,
-    register_session_queue, with_session_queue,
 };
 use crate::session::runtime::{
     SessionDriverRuntime, SessionEntry, SessionQueueProtocol, SessionStateFactory,
@@ -37,20 +35,184 @@ use crate::session::runtime::{SessionQueueStep, dispatch_session_queue_for_ticks
 use crate::session::{SessionId, SessionProtocolContext, SessionTimerExpiry, SessionTimerToken};
 
 const TCP_ACTIVE_OPEN_TIMER_TICKS: u64 = 2;
-pub(crate) type TcpServiceController = BbrController;
-pub(crate) type TcpServiceConnectionState = TcpConnectionState<TcpServiceController>;
 
-thread_local! {
-    static TCP_SESSION_QUEUES: RefCell<hammer_infra::vec::Vec<TcpSessionQueue>> =
-        const { RefCell::new(hammer_infra::vec::Vec::new()) };
+pub(crate) type TcpSessionQueueHandle<C> = SessionQueueHandle<TcpSessionQueue<C>>;
+
+#[derive(Debug, Default)]
+struct TcpSessionRx {
+    entries: hammer_infra::vec::Vec<(u32, BufferIndex, bool)>,
 }
 
-pub(crate) struct TcpSessionQueue {
-    driver: SessionDriverRuntime<TcpServiceConnectionState>,
+impl TcpSessionRx {
+    fn release(self, buffers: &DataPlaneBuffers) {
+        for (_, index, _) in self.entries {
+            buffers.free_index(index);
+        }
+    }
+
+    fn insert(&mut self, sequence: u32, index: BufferIndex, fin: bool) {
+        self.entries.push((sequence, index, fin));
+        let mut position = self.entries.len().saturating_sub(1);
+        while position > 0 && self.entries[position - 1].0 > self.entries[position].0 {
+            self.entries.swap(position - 1, position);
+            position -= 1;
+        }
+    }
+
+    fn end_sequence(
+        buffers: &DataPlaneBuffers,
+        sequence: u32,
+        index: BufferIndex,
+        fin: bool,
+    ) -> CoreResult<u32> {
+        let payload_len = buffers.get_buffer(index)?.current_len() as u32;
+        Ok(sequence.wrapping_add(payload_len + u32::from(fin)))
+    }
+
+    fn first_overlap(
+        &self,
+        buffers: &DataPlaneBuffers,
+        ready_through: u32,
+        start: u32,
+        end: u32,
+    ) -> CoreResult<Option<(u32, u32)>> {
+        for (sequence, index, fin) in self.entries.iter().copied() {
+            if sequence < ready_through {
+                continue;
+            }
+            let retained_end = Self::end_sequence(buffers, sequence, index, fin)?;
+            let overlap_start = start.max(sequence);
+            let overlap_end = end.min(retained_end);
+            if overlap_start < overlap_end {
+                return Ok(Some((overlap_start, overlap_end)));
+            }
+            if sequence > end {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    fn advance_connection<C>(
+        &self,
+        buffers: &DataPlaneBuffers,
+        connection: &mut TcpConnection<Established, C>,
+    ) -> CoreResult<()>
+    where
+        C: CongestionController + 'static,
+    {
+        loop {
+            let mut next = None;
+            for (sequence, index, fin) in self.entries.iter().copied() {
+                if sequence >= connection.rcv_nxt() {
+                    next = Some((sequence, index, fin));
+                    break;
+                }
+            }
+            let Some((sequence, index, _)) = next else {
+                return Ok(());
+            };
+            if sequence != connection.rcv_nxt() {
+                return Ok(());
+            }
+            let payload_len = buffers.get_buffer(index)?.current_len();
+            let packet = TcpPacket {
+                local: connection.local().unwrap_or(connection.remote()),
+                remote: connection.remote(),
+                sequence,
+                acknowledgment: None,
+                advertised_window: 0,
+                flags: TcpSegmentFlags::ACK,
+                capabilities: TcpCapabilities::default(),
+                sack_blocks: Vec::new(),
+                payload_offset: 0,
+                payload_len,
+            };
+            if connection.accept_payload(&packet).is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn deliver_ready<F>(&mut self, ready_through: u32, mut complete: F) -> CoreResult<()>
+    where
+        F: FnMut(BufferIndex, bool) -> CoreResult<bool>,
+    {
+        loop {
+            let Some((sequence, index, fin)) = self.entries.first().copied() else {
+                return Ok(());
+            };
+            if sequence >= ready_through {
+                return Ok(());
+            }
+            if !complete(index, fin)? {
+                return Ok(());
+            }
+            let _ = self.entries.remove(0);
+        }
+    }
+
+    fn sack_blocks(
+        &self,
+        buffers: &DataPlaneBuffers,
+        ready_through: u32,
+    ) -> CoreResult<([TcpSackBlock; 4], usize)> {
+        let mut blocks = [TcpSackBlock {
+            left_edge: 0,
+            right_edge: 0,
+        }; 4];
+        let mut count = 0usize;
+        let mut current: Option<TcpSackBlock> = None;
+        for (sequence, index, fin) in self.entries.iter().copied() {
+            if sequence < ready_through {
+                continue;
+            }
+            let right_edge = Self::end_sequence(buffers, sequence, index, fin)?;
+            match current.as_mut() {
+                Some(block) if sequence <= block.right_edge => {
+                    block.right_edge = block.right_edge.max(right_edge);
+                }
+                Some(block) => {
+                    if count == blocks.len() {
+                        break;
+                    }
+                    blocks[count] = *block;
+                    count += 1;
+                    current = Some(TcpSackBlock {
+                        left_edge: sequence,
+                        right_edge,
+                    });
+                }
+                None => {
+                    current = Some(TcpSackBlock {
+                        left_edge: sequence,
+                        right_edge,
+                    });
+                }
+            }
+        }
+        if let Some(block) = current
+            && count < blocks.len()
+        {
+            blocks[count] = block;
+            count += 1;
+        }
+        Ok((blocks, count))
+    }
+}
+
+pub(crate) struct TcpSessionQueue<C>
+where
+    C: CongestionController + 'static,
+{
+    driver: SessionDriverRuntime<TcpConnectionState<C>>,
     pub(super) protocol: TcpSessionProtocol,
 }
 
-impl TcpSessionQueue {
+impl<C> TcpSessionQueue<C>
+where
+    C: CongestionController + 'static,
+{
     #[inline]
     pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
         Self {
@@ -85,14 +247,14 @@ impl TcpSessionQueue {
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn insert_session(&mut self, connection: TcpServiceConnectionState) -> SessionId {
+    pub(crate) fn insert_session(&mut self, connection: TcpConnectionState<C>) -> SessionId {
         self.driver.insert_session(connection)
     }
 
     #[inline]
     pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> SessionId
     where
-        F: SessionStateFactory<TcpServiceConnectionState>,
+        F: SessionStateFactory<TcpConnectionState<C>>,
     {
         self.driver.insert_session_with_id(f)
     }
@@ -102,17 +264,16 @@ impl TcpSessionQueue {
     pub(crate) fn session_state(
         &self,
         session_id: SessionId,
-    ) -> Option<&TcpServiceConnectionState> {
+    ) -> Option<&TcpConnectionState<C>> {
         self.driver.session_state(session_id)
     }
 
     pub(crate) fn take_connection<S>(
         &mut self,
         session_id: SessionId,
-    ) -> CoreResult<TcpConnection<S, TcpServiceController>>
+    ) -> CoreResult<TcpConnection<S, C>>
     where
-        TcpConnection<S, TcpServiceController>:
-            TryFrom<TcpServiceConnectionState, Error = CoreError>,
+        TcpConnection<S, C>: TryFrom<TcpConnectionState<C>, Error = CoreError>,
     {
         self.driver
             .session_state(session_id)
@@ -125,9 +286,10 @@ impl TcpSessionQueue {
     pub(crate) fn close_session(
         &mut self,
         session_id: SessionId,
-    ) -> CoreResult<Option<SessionEntry<TcpServiceConnectionState>>> {
+    ) -> CoreResult<Option<SessionEntry<TcpConnectionState<C>>>> {
         let closed = self.driver.close_session(session_id)?;
         if closed.is_some() {
+            self.protocol.release_rx(self.driver.buffers(), session_id);
             self.protocol.forget_session(session_id);
         }
         Ok(closed)
@@ -209,16 +371,6 @@ impl TcpSessionQueue {
         TcpSessionProtocol::cancel_tcp_timer(&mut context, session_id, kind)
     }
 
-    #[inline]
-    pub(crate) fn enqueue_rx(
-        &mut self,
-        session_id: SessionId,
-        index: BufferIndex,
-        fin: bool,
-    ) -> CoreResult<bool> {
-        self.driver.enqueue_rx(session_id, index, fin)
-    }
-
     pub(crate) fn complete_connected(&mut self, session_id: SessionId) -> CoreResult<()> {
         let Some(op) = self
             .driver
@@ -236,7 +388,7 @@ impl TcpSessionQueue {
         remote: SocketAddr,
     ) -> CoreResult<SessionId> {
         let iss = self.protocol.next_initial_sequence(local, remote);
-        let connection: TcpConnection<Closed, TcpServiceController> =
+        let connection: TcpConnection<Closed, _> =
             TcpConnection::new(None, self.worker(), local.port(), Some(local), remote);
         connection.connect(self, iss)
     }
@@ -283,10 +435,13 @@ impl TcpSessionQueue {
     }
 }
 
-impl TcpConnection<Closed, TcpServiceController> {
+impl<C> TcpConnection<Closed, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn connect(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         initial_sequence: u32,
     ) -> CoreResult<SessionId> {
         let connection = self.connect_state(initial_sequence);
@@ -304,10 +459,13 @@ impl TcpConnection<Closed, TcpServiceController> {
     }
 }
 
-impl TcpConnection<Listen, TcpServiceController> {
+impl<C> TcpConnection<Listen, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_syn(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -337,10 +495,13 @@ impl TcpConnection<Listen, TcpServiceController> {
     }
 }
 
-impl TcpConnection<SynSent, TcpServiceController> {
+impl<C> TcpConnection<SynSent, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_open_reply(
-        self,
-        queue: &mut TcpSessionQueue,
+        mut self,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -422,10 +583,13 @@ impl TcpConnection<SynSent, TcpServiceController> {
     }
 }
 
-impl TcpConnection<SynRcvd, TcpServiceController> {
+impl<C> TcpConnection<SynRcvd, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_final_ack(
-        self,
-        queue: &mut TcpSessionQueue,
+        mut self,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -466,12 +630,15 @@ impl TcpConnection<SynRcvd, TcpServiceController> {
     }
 }
 
-impl TcpConnection<Established, TcpServiceController> {
+impl<C> TcpConnection<Established, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_data(
         mut self,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -498,13 +665,102 @@ impl TcpConnection<Established, TcpServiceController> {
         }
 
         let mut ack = false;
-        let mut accepted_payload_len = None;
         if packet.payload_len != 0 {
             ack = true;
-            accepted_payload_len = self.accept_payload(packet);
+            let buffers = runtime.packet_buffers();
+            let mut sequence = packet.sequence;
+            let mut payload_len = packet.payload_len;
+            let fin = packet.flags.contains(TcpSegmentFlags::FIN);
+            let ready_through = self.rcv_nxt();
+            let mut dsack = None;
+
+            buffers.advance(index, packet.payload_offset)?;
+
+            if sequence < ready_through {
+                let duplicate_end = sequence.wrapping_add(payload_len as u32).min(ready_through);
+                if duplicate_end > sequence {
+                    dsack = Some(TcpSackBlock {
+                        left_edge: sequence,
+                        right_edge: duplicate_end,
+                    });
+                }
+                let trim = ready_through.saturating_sub(sequence) as usize;
+                if trim >= payload_len {
+                    payload_len = 0;
+                } else {
+                    buffers.advance(index, trim)?;
+                    sequence = ready_through;
+                    payload_len -= trim;
+                }
+            }
+
+            if payload_len != 0 {
+                let end = sequence.wrapping_add(payload_len as u32);
+                if let Some((overlap_start, overlap_end)) = queue
+                    .protocol
+                    .rx(session_id)
+                    .map(|rx| rx.first_overlap(buffers, ready_through, sequence, end))
+                    .transpose()?
+                    .flatten()
+                {
+                    dsack.get_or_insert(TcpSackBlock {
+                        left_edge: overlap_start,
+                        right_edge: overlap_end,
+                    });
+                    if overlap_start == sequence {
+                        let trim = overlap_end.saturating_sub(sequence) as usize;
+                        if trim >= payload_len {
+                            payload_len = 0;
+                        } else {
+                            buffers.advance(index, trim)?;
+                            sequence = overlap_end;
+                            payload_len -= trim;
+                        }
+                    } else {
+                        payload_len = overlap_start.saturating_sub(sequence) as usize;
+                    }
+                }
+            }
+
+            if payload_len != 0 {
+                runtime.truncate_chain(index, payload_len)?;
+                let rx = queue.protocol.rx_mut_or_alloc(session_id);
+                rx.insert(sequence, index, fin);
+                rx.advance_connection(buffers, &mut self)?;
+            } else {
+                runtime.free_index(index);
+            }
+
+            let (sack_blocks, sack_block_count) = queue
+                .protocol
+                .rx(session_id)
+                .map(|rx| rx.sack_blocks(buffers, self.rcv_nxt()))
+                .transpose()?
+                .unwrap_or((
+                    [TcpSackBlock {
+                        left_edge: 0,
+                        right_edge: 0,
+                    }; 4],
+                    0,
+                ));
+            self.update_ack_sack_blocks(&sack_blocks[..sack_block_count], dsack);
+            let driver = &queue.driver;
+            let ready_through = self.rcv_nxt();
+            if let Some(rx) = queue.protocol.rx_index.lookup(&session_id.get()) {
+                let rx = queue
+                    .protocol
+                    .rx
+                    .get_mut(rx)
+                    .expect("tcp rx index is valid");
+                rx.deliver_ready(ready_through, |buffer, fin| {
+                    driver.enqueue_rx(session_id, buffer, fin)
+                })?;
+            }
         }
 
-        if packet.flags.contains(TcpSegmentFlags::FIN) {
+        if packet.flags.contains(TcpSegmentFlags::FIN)
+            && packet.sequence.wrapping_add(packet.payload_len as u32) == self.rcv_nxt()
+        {
             let (connection, segment) = self.accept_fin(packet);
             queue.protocol.remember_session(
                 session_id,
@@ -517,13 +773,6 @@ impl TcpConnection<Established, TcpServiceController> {
             queue
                 .driver
                 .replace_session_state(session_id, connection.into());
-            if let Some(payload_len) = accepted_payload_len {
-                runtime.advance(index, packet.payload_offset)?;
-                runtime.truncate_chain(index, payload_len)?;
-                queue.enqueue_rx(session_id, index, true)?;
-            } else if packet.payload_len != 0 {
-                runtime.free_index(index);
-            }
             return Ok(Some(segment));
         }
 
@@ -537,21 +786,17 @@ impl TcpConnection<Established, TcpServiceController> {
             self.next_node(),
         );
         queue.driver.replace_session_state(session_id, self.into());
-        if let Some(payload_len) = accepted_payload_len {
-            runtime.advance(index, packet.payload_offset)?;
-            runtime.truncate_chain(index, payload_len)?;
-            queue.enqueue_rx(session_id, index, false)?;
-        } else if packet.payload_len != 0 {
-            runtime.free_index(index);
-        }
         Ok(segment)
     }
 }
 
-impl TcpConnection<CloseWait, TcpServiceController> {
+impl<C> TcpConnection<CloseWait, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_close_wait(
         mut self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -585,10 +830,13 @@ impl TcpConnection<CloseWait, TcpServiceController> {
     }
 }
 
-impl TcpConnection<FinWait1, TcpServiceController> {
+impl<C> TcpConnection<FinWait1, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_fin_wait1(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -659,10 +907,13 @@ impl TcpConnection<FinWait1, TcpServiceController> {
     }
 }
 
-impl TcpConnection<FinWait2, TcpServiceController> {
+impl<C> TcpConnection<FinWait2, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_fin_wait2(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -695,10 +946,13 @@ impl TcpConnection<FinWait2, TcpServiceController> {
     }
 }
 
-impl TcpConnection<Closing, TcpServiceController> {
+impl<C> TcpConnection<Closing, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_closing(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -733,10 +987,13 @@ impl TcpConnection<Closing, TcpServiceController> {
     }
 }
 
-impl TcpConnection<LastAck, TcpServiceController> {
+impl<C> TcpConnection<LastAck, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_last_ack(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -765,10 +1022,13 @@ impl TcpConnection<LastAck, TcpServiceController> {
     }
 }
 
-impl TcpConnection<TimeWait, TcpServiceController> {
+impl<C> TcpConnection<TimeWait, C>
+where
+    C: CongestionController + 'static,
+{
     pub(crate) fn receive_time_wait(
         self,
-        queue: &mut TcpSessionQueue,
+        queue: &mut TcpSessionQueue<C>,
         session_id: SessionId,
         packet: &super::segment::TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
@@ -786,13 +1046,16 @@ impl TcpConnection<TimeWait, TcpServiceController> {
     }
 }
 
-impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
+impl<C> SessionQueueProtocol<TcpConnectionState<C>> for TcpSessionProtocol
+where
+    C: CongestionController + 'static,
+{
     fn handle_timer_expiry(
         &mut self,
         runtime: &DataPlaneRuntime,
         context: &mut crate::session::protocol::SessionQueueControlContext<
             '_,
-            TcpServiceConnectionState,
+            TcpConnectionState<C>,
         >,
         expiry: SessionTimerExpiry,
         output_next: SessionQueueNext,
@@ -840,12 +1103,23 @@ impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
         runtime: &DataPlaneRuntime,
         context: &mut crate::session::protocol::SessionQueueControlContext<
             '_,
-            TcpServiceConnectionState,
+            TcpConnectionState<C>,
         >,
         session_id: SessionId,
         output_next: SessionQueueNext,
         output: &mut SessionQueueOutput,
     ) -> CoreResult<()> {
+        if let Some(TcpConnectionState::Established(connection)) =
+            context.session_state_mut(session_id)
+        {
+            let ready_through = connection.rcv_nxt();
+            if let Some(index) = self.rx_index.lookup(&session_id.get()) {
+                let rx = self.rx.get_mut(index).expect("tcp rx index is valid");
+                rx.deliver_ready(ready_through, |buffer, fin| {
+                    context.enqueue_rx(session_id, buffer, fin)
+                })?;
+            }
+        }
         let timer_output = context
             .session_state_mut(session_id)
             .and_then(|connection| connection.on_tcp_ready());
@@ -868,7 +1142,7 @@ impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
         &mut self,
         context: &mut crate::session::protocol::SessionQueueControlContext<
             '_,
-            TcpServiceConnectionState,
+            TcpConnectionState<C>,
         >,
         session_id: SessionId,
         pending_len: usize,
@@ -885,14 +1159,15 @@ impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
         &mut self,
         context: &mut crate::session::protocol::SessionQueueControlContext<
             '_,
-            TcpServiceConnectionState,
+            TcpConnectionState<C>,
         >,
         session_id: SessionId,
         index: BufferIndex,
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<()> {
-        let Some(TcpConnectionState::Established(connection)) = context.session_state(session_id)
+        let Some(TcpConnectionState::Established(connection)) =
+            context.session_state_mut(session_id)
         else {
             return Err(CoreError::internal(
                 "tcp tx prepare requires established connection",
@@ -915,7 +1190,7 @@ impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
         &mut self,
         context: &mut crate::session::protocol::SessionQueueControlContext<
             '_,
-            TcpServiceConnectionState,
+            TcpConnectionState<C>,
         >,
         session_id: SessionId,
         _: BufferIndex,
@@ -925,7 +1200,7 @@ impl SessionQueueProtocol<TcpServiceConnectionState> for TcpSessionProtocol {
         let Some(state) = context.session_state_mut(session_id) else {
             return Err(CoreError::internal("tcp tx commit state is missing"));
         };
-        let mut connection: TcpConnection<Established, TcpServiceController> =
+        let mut connection: TcpConnection<Established, _> =
             state.clone().try_into()?;
         let timers = connection.commit_payload_tx(payload_len, now)?;
         let rack_ticks = timers
@@ -957,6 +1232,8 @@ pub struct TcpSessionProtocol {
     pending_index: TcpPendingIndex,
     segments: Pool<TcpSegment>,
     segment_index: FlatHashTable<u128, PoolIndex>,
+    rx: Pool<TcpSessionRx>,
+    rx_index: FlatHashTable<u64, PoolIndex>,
     next_iss: u32,
 }
 
@@ -969,6 +1246,8 @@ impl TcpSessionProtocol {
             pending_index: TcpPendingIndex::empty(),
             segments: Pool::with_capacity(1024),
             segment_index: FlatHashTable::new(),
+            rx: Pool::with_capacity(1024),
+            rx_index: FlatHashTable::new(),
             next_iss: 81_000,
         }
     }
@@ -1076,6 +1355,37 @@ impl TcpSessionProtocol {
         self.pending_index.forget_pending_open(id);
     }
 
+    fn release_rx(&mut self, buffers: &DataPlaneBuffers, session_id: SessionId) {
+        let Some(index) = self.rx_index.remove(&session_id.get()) else {
+            return;
+        };
+        let Some(rx) = self.rx.remove(index) else {
+            return;
+        };
+        rx.release(buffers);
+    }
+
+    fn rx(&self, session_id: SessionId) -> Option<&TcpSessionRx> {
+        let index = self.rx_index.lookup(&session_id.get())?;
+        self.rx.get(index)
+    }
+
+    fn rx_mut_or_alloc(&mut self, session_id: SessionId) -> &mut TcpSessionRx {
+        let key = session_id.get();
+        let index = match self.rx_index.lookup(&key) {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .rx
+                    .insert(TcpSessionRx::default())
+                    .expect("tcp rx pool exhausted");
+                self.rx_index.insert(key, index);
+                index
+            }
+        };
+        self.rx.get_mut(index).expect("tcp rx index is valid")
+    }
+
     pub fn next_initial_sequence(&mut self, local: SocketAddr, remote: SocketAddr) -> u32 {
         let mut value = self.next_iss;
         value ^= u32::from(local.port()) << 16 | u32::from(remote.port());
@@ -1095,20 +1405,26 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub fn mark_session_ready(
+    pub fn mark_session_ready<C>(
         &mut self,
-        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+        context: &mut SessionProtocolContext<'_, TcpConnectionState<C>>,
         session_id: SessionId,
-    ) {
+    )
+    where
+        C: CongestionController + 'static,
+    {
         context.mark_ready(session_id);
     }
 
     #[inline]
-    pub fn arm_retransmit_timer(
-        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+    pub fn arm_retransmit_timer<C>(
+        context: &mut SessionProtocolContext<'_, TcpConnectionState<C>>,
         session_id: SessionId,
         ticks: u64,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<()>
+    where
+        C: CongestionController + 'static,
+    {
         Self::arm_tcp_timer_ticks(
             context,
             session_id,
@@ -1118,10 +1434,13 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub fn cancel_retransmit_timer(
-        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+    pub fn cancel_retransmit_timer<C>(
+        context: &mut SessionProtocolContext<'_, TcpConnectionState<C>>,
         session_id: SessionId,
-    ) -> bool {
+    ) -> bool
+    where
+        C: CongestionController + 'static,
+    {
         Self::cancel_tcp_timer(context, session_id, TcpConnectionTimerKind::RETRANSMIT)
     }
 
@@ -1144,12 +1463,15 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub fn arm_tcp_timer_ticks(
-        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+    pub fn arm_tcp_timer_ticks<C>(
+        context: &mut SessionProtocolContext<'_, TcpConnectionState<C>>,
         session_id: SessionId,
         kind: TcpConnectionTimerKind,
         ticks: u64,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<()>
+    where
+        C: CongestionController + 'static,
+    {
         let Some(token) = Self::timer_token(kind) else {
             return Ok(());
         };
@@ -1157,11 +1479,14 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub fn cancel_tcp_timer(
-        context: &mut SessionProtocolContext<'_, TcpServiceConnectionState>,
+    pub fn cancel_tcp_timer<C>(
+        context: &mut SessionProtocolContext<'_, TcpConnectionState<C>>,
         session_id: SessionId,
         kind: TcpConnectionTimerKind,
-    ) -> bool {
+    ) -> bool
+    where
+        C: CongestionController + 'static,
+    {
         let Some(token) = Self::timer_token(kind) else {
             return false;
         };
@@ -1169,66 +1494,87 @@ impl TcpSessionProtocol {
     }
 
     #[inline]
-    pub fn register_queue(
+    pub(crate) fn register_queue<C>(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-    ) -> CoreResult<SessionQueueHandle> {
-        register_session_queue(&TCP_SESSION_QUEUES, TcpSessionQueue::new(worker, buffers))
+    ) -> CoreResult<TcpSessionQueueHandle<C>>
+    where
+        C: CongestionController + 'static,
+    {
+        crate::session::node::register_session_queue(TcpSessionQueue::<C>::new(worker, buffers))
     }
 
     #[inline]
-    pub fn connect(
-        handle: SessionQueueHandle,
+    pub(crate) fn connect<C>(
+        handle: TcpSessionQueueHandle<C>,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> CoreResult<SessionId> {
-        Self::with_queue(handle, |queue: &mut TcpSessionQueue| {
+    ) -> CoreResult<SessionId>
+    where
+        C: CongestionController + 'static,
+    {
+        Self::with_queue(handle, |queue: &mut TcpSessionQueue<C>| {
             queue.connect(local, remote)
         })
     }
 
     #[inline]
-    pub(crate) fn session_queue_dispatch_fn() -> SessionQueueDispatchFn {
-        tcp_session_queue_dispatch
-    }
-
-    #[inline]
-    pub(crate) fn with_queue<R, F>(handle: SessionQueueHandle, f: F) -> CoreResult<R>
+    pub(crate) fn session_queue_dispatch_fn<C>() -> SessionQueueDispatchFn
     where
-        F: crate::session::node::SessionQueueAccess<TcpSessionQueue, R>,
+        C: CongestionController + 'static,
     {
-        with_session_queue(&TCP_SESSION_QUEUES, handle, f)
+        tcp_session_queue_dispatch::<C>
     }
 
     #[inline]
-    pub(crate) fn take_segment_for_buffer(
-        handle: SessionQueueHandle,
+    pub(crate) fn with_queue<C, R, F>(
+        handle: TcpSessionQueueHandle<C>,
+        f: F,
+    ) -> CoreResult<R>
+    where
+        C: CongestionController + 'static,
+        F: crate::session::node::SessionQueueAccess<TcpSessionQueue<C>, R>,
+    {
+        crate::session::node::with_session_queue(handle, f)
+    }
+
+    #[inline]
+    pub(crate) fn take_segment_for_buffer<C>(
+        handle: TcpSessionQueueHandle<C>,
         index: BufferIndex,
-    ) -> CoreResult<Option<TcpSegment>> {
-        Self::with_queue(handle, |queue: &mut TcpSessionQueue| {
+    ) -> CoreResult<Option<TcpSegment>>
+    where
+        C: CongestionController + 'static,
+    {
+        Self::with_queue(handle, |queue: &mut TcpSessionQueue<C>| {
             Ok(queue.protocol.take_segment(index))
         })
     }
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn register_queue_for_test(
-        queue: TcpSessionQueue,
-    ) -> CoreResult<SessionQueueHandle> {
-        register_session_queue(&TCP_SESSION_QUEUES, queue)
+    pub(crate) fn register_queue_for_test<C>(
+        queue: TcpSessionQueue<C>,
+    ) -> CoreResult<TcpSessionQueueHandle<C>>
+    where
+        C: CongestionController + 'static,
+    {
+        crate::session::node::register_session_queue(queue)
     }
 
     #[inline]
     #[cfg(test)]
-    pub(crate) fn register_queue_with_connection_for_test(
+    pub(crate) fn register_queue_with_connection_for_test<C>(
         worker: DataWorkerId,
         buffers: DataPlaneBuffers,
-        connection: TcpServiceConnectionState,
-    ) -> CoreResult<SessionQueueHandle> {
-        let mut queue = TcpSessionQueue::new(worker, buffers);
+        connection: TcpConnectionState<C>,
+    ) -> CoreResult<TcpSessionQueueHandle<C>>
+    where
+        C: CongestionController + 'static,
+    {
+        let mut queue = TcpSessionQueue::<C>::new(worker, buffers);
         let session_id = queue.insert_session(connection);
-        let connection: TcpConnection<Established, TcpServiceController> =
-            queue.take_connection(session_id)?;
+        let connection: TcpConnection<Established, C> = queue.take_connection(session_id)?;
         queue.protocol.remember_session(
             session_id,
             connection.connection_id(),
@@ -1244,23 +1590,29 @@ impl TcpSessionProtocol {
     }
 }
 
+fn tcp_session_queue_dispatch<C>(
+    runtime: &DataPlaneRuntime,
+    data: hammer_adapter::NodeRuntimeData,
+    output_next: SessionQueueNext,
+    now: Instant,
+    output: &mut SessionQueueOutput,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    TcpSessionProtocol::with_queue(
+        SessionQueueHandle::<TcpSessionQueue<C>>::new(data),
+        |queue: &mut TcpSessionQueue<C>| {
+            queue.dispatch_once_at(runtime, now, output_next, output)?;
+            Ok(())
+        },
+    )
+}
+
 fn buffer_index_key(index: BufferIndex) -> u128 {
     (u128::from(index.pool_id()) << 64)
         | (u128::from(index.slot()) << 32)
         | u128::from(index.generation())
-}
-
-fn tcp_session_queue_dispatch(
-    runtime: &DataPlaneRuntime,
-    handle: SessionQueueHandle,
-    output_next: SessionQueueNext,
-    now: Instant,
-    output: &mut SessionQueueOutput,
-) -> CoreResult<()> {
-    TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-        queue.dispatch_once_at(runtime, now, output_next, output)?;
-        Ok(())
-    })
 }
 
 #[cfg(test)]
@@ -1273,8 +1625,10 @@ mod tests {
     };
     use hammer_core::error::CoreError;
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionId, TcpSegmentFlags, TcpSegmentView, tcp_options_from_bytes,
+        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
+        tcp_options_from_bytes,
     };
+    use crate::transport::congestion::BbrController;
     use hammer_runtime::app::{
         AppCqeKind, AppOpId, AppRingHandle, AppSendData, AppSqe, AppUserData,
     };
@@ -1282,6 +1636,7 @@ mod tests {
     use super::*;
     use crate::session::SessionQueueNode;
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
+    use crate::transport::tcp::segment::TcpPacket;
     use std::sync::{Arc, Mutex, OnceLock};
 
     const ACTIVE_OPEN_ISS: u32 = 81_000;
@@ -1366,10 +1721,13 @@ mod tests {
         Ok(NodeResult::drop())
     }
 
-    fn tcp_connection() -> TcpServiceConnectionState {
+    type TestTcpConnectionState = TcpConnectionState<BbrController>;
+    type TestTcpSessionQueue = TcpSessionQueue<BbrController>;
+
+    fn tcp_connection() -> TestTcpConnectionState {
         let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
         let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
-        TcpServiceConnectionState::established_for_test(
+        TestTcpConnectionState::established_for_test(
             Some(TcpConnectionId::new(7001)),
             DataWorkerId::new(0),
             local.port(),
@@ -1378,22 +1736,65 @@ mod tests {
         )
     }
 
+    fn tcp_connection_with_sack() -> TestTcpConnectionState {
+        let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.10:443".parse().expect("remote");
+        let mut listen: TcpConnection<Listen, BbrController> = TcpConnection::new(
+            Some(TcpConnectionId::new(7002)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        );
+        listen.set_local_capabilities(TcpCapabilities {
+            sack: true,
+            ..TcpCapabilities::default()
+        });
+        let syn = TcpPacket {
+            local: remote,
+            remote: local,
+            flags: TcpSegmentFlags::SYN,
+            sequence: 7_000,
+            acknowledgment: None,
+            advertised_window: u16::MAX,
+            payload_offset: 0,
+            payload_len: 0,
+            capabilities: TcpCapabilities {
+                sack: true,
+                ..TcpCapabilities::default()
+            },
+            sack_blocks: Vec::new(),
+        };
+        let (syn_rcvd, _) = listen.accept_syn(&syn);
+        let final_ack = TcpPacket {
+            acknowledgment: Some(syn_rcvd.snd_nxt()),
+            flags: TcpSegmentFlags::ACK,
+            ..syn
+        };
+        let (established, _) =
+            syn_rcvd.accept_final_ack(&final_ack, final_ack.acknowledgment.expect("ack"));
+        established.into()
+    }
+
     fn syn_sent_connection(
         worker: DataWorkerId,
         local: SocketAddr,
         remote: SocketAddr,
         iss: u32,
         capabilities: TcpCapabilities,
-    ) -> TcpServiceConnectionState {
-        let closed: TcpConnection<Closed, TcpServiceController> =
+    ) -> TestTcpConnectionState {
+        let closed: TcpConnection<Closed, BbrController> =
             TcpConnection::new(None, worker, local.port(), Some(local), remote);
         let mut syn_sent = closed.connect_state(iss);
         syn_sent.set_local_capabilities(capabilities);
         syn_sent.into()
     }
 
-    fn remember_established(queue: &mut TcpSessionQueue, session_id: SessionId) -> CoreResult<()> {
-        let connection: TcpConnection<Established, TcpServiceController> =
+    fn remember_established(
+        queue: &mut TestTcpSessionQueue,
+        session_id: SessionId,
+    ) -> CoreResult<()> {
+        let connection: TcpConnection<Established, BbrController> =
             queue.take_connection(session_id)?;
         queue.protocol.remember_session(
             session_id,
@@ -1409,8 +1810,8 @@ mod tests {
         Ok(())
     }
 
-    fn remember_pending(queue: &mut TcpSessionQueue, session_id: SessionId) -> CoreResult<()> {
-        let connection: TcpConnection<SynSent, TcpServiceController> =
+    fn remember_pending(queue: &mut TestTcpSessionQueue, session_id: SessionId) -> CoreResult<()> {
+        let connection: TcpConnection<SynSent, BbrController> =
             queue.take_connection(session_id)?;
         queue.protocol.remember_pending_open(
             session_id,
@@ -1426,14 +1827,20 @@ mod tests {
     }
 
     fn install_connecting_session(
-        queue: &mut TcpSessionQueue,
-        connection: TcpServiceConnectionState,
+        queue: &mut TestTcpSessionQueue,
+        connection: TestTcpConnectionState,
     ) -> CoreResult<SessionId> {
         let session_id = queue.insert_session(connection);
         remember_pending(queue, session_id)?;
         queue.arm_retransmit_timer(session_id, TCP_ACTIVE_OPEN_TIMER_TICKS)?;
         queue.mark_session_ready(session_id);
         Ok(session_id)
+    }
+
+    fn segment_sack_blocks(segment: &TcpSegment) -> std::vec::Vec<TcpSackBlock> {
+        let mut header = [0u8; 64];
+        let written = segment.write_header(&mut header).expect("write header");
+        tcp_options_from_bytes(&header[20..written]).sack_blocks
     }
 
     #[test]
@@ -1525,8 +1932,8 @@ mod tests {
 
         let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("active open");
         let active_open_iss =
-            TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-                let connection: TcpConnection<SynSent, TcpServiceController> =
+            TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+                let connection: TcpConnection<SynSent, BbrController> =
                     queue.take_connection(session_id)?;
                 let iss = connection.iss();
                 queue
@@ -1551,8 +1958,8 @@ mod tests {
             TcpCapabilities::default(),
         );
 
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<SynSent, TcpServiceController> =
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            let connection: TcpConnection<SynSent, BbrController> =
                 queue.take_connection(session_id)?;
             assert_eq!(connection.snd_una(), active_open_iss);
             assert_eq!(connection.snd_nxt(), active_open_iss + 1);
@@ -1606,7 +2013,7 @@ mod tests {
             .expect("attach tcp queue");
         let session_queue = runtime.nodes().register_driver(queue_driver);
 
-        let session_id = TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        let session_id = TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             install_connecting_session(
                 queue,
                 syn_sent_connection(
@@ -1626,7 +2033,7 @@ mod tests {
         assert_eq!(runtime.run_ready_nodes().expect("run first syn"), 3);
         capture.lock().unwrap().packets.clear();
 
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             queue
                 .expire_timers_for_test(1)
                 .expect("expire before timer");
@@ -1639,7 +2046,7 @@ mod tests {
         assert_eq!(runtime.run_ready_nodes().expect("run empty"), 1);
         assert!(capture.lock().unwrap().packets.is_empty());
 
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             queue.expire_timers_for_test(1).expect("expire retransmit");
             Ok(())
         })
@@ -1658,8 +2065,8 @@ mod tests {
             ACTIVE_OPEN_ISS,
             TcpCapabilities::default(),
         );
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
-            let connection: TcpConnection<SynSent, TcpServiceController> =
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            let connection: TcpConnection<SynSent, BbrController> =
                 queue.take_connection(session_id)?;
             assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
             queue
@@ -1728,7 +2135,7 @@ mod tests {
         let worker = DataWorkerId::new(0);
         let local: SocketAddr = "127.0.0.1:10000".parse().expect("local");
         let remote: SocketAddr = "127.0.0.1:20000".parse().expect("remote");
-        let connection = TcpServiceConnectionState::established_for_test(
+        let connection = TestTcpConnectionState::established_for_test(
             Some(TcpConnectionId::new(7)),
             worker,
             local.port(),
@@ -1739,7 +2146,7 @@ mod tests {
         let session_id = queue.insert_session(connection);
         remember_established(&mut queue, session_id).expect("remember established");
         let start_snd_nxt = {
-            let connection: TcpConnection<Established, TcpServiceController> =
+            let connection: TcpConnection<Established, BbrController> =
                 queue.take_connection(session_id).expect("established");
             let snd_nxt = connection.snd_nxt();
             queue
@@ -1787,11 +2194,11 @@ mod tests {
             assert_eq!(capture.packets[0].as_slice(), b"hello");
             capture.indices[0]
         };
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
             let segment = queue.protocol.take_segment(index).expect("segment");
             assert_eq!(segment.payload_len(), 5);
             assert!(queue.protocol.take_segment(index).is_none());
-            let connection: TcpConnection<Established, TcpServiceController> =
+            let connection: TcpConnection<Established, BbrController> =
                 queue.take_connection(session_id)?;
             assert_eq!(connection.snd_nxt(), start_snd_nxt + 5);
             assert_eq!(connection.recovery().bytes_in_flight(), 5);
@@ -1801,6 +2208,122 @@ mod tests {
             Ok(())
         })
         .expect("inspect tx intent");
+    }
+
+    #[test]
+    fn established_app_send_stays_pending_until_cumulative_ack_arrives() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let worker = DataWorkerId::new(0);
+        let local: SocketAddr = "127.0.0.1:10000".parse().expect("local");
+        let remote: SocketAddr = "127.0.0.1:20000".parse().expect("remote");
+        let connection = TestTcpConnectionState::established_for_test(
+            Some(TcpConnectionId::new(8)),
+            worker,
+            local.port(),
+            Some(local),
+            remote,
+        );
+        let mut queue = TcpSessionQueue::new(worker, runtime.packet_buffers().clone());
+        let session_id = queue.insert_session(connection);
+        remember_established(&mut queue, session_id).expect("remember established");
+
+        let (start_snd_nxt, local, remote) = {
+            let connection: TcpConnection<Established, BbrController> =
+                queue.take_connection(session_id).expect("established");
+            let local = connection.local().expect("local");
+            let remote = connection.remote();
+            let snd_nxt = connection.snd_nxt();
+            queue
+                .driver
+                .replace_session_state(session_id, connection.into());
+            (snd_nxt, local, remote)
+        };
+
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+        let send: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(b"hello").expect("data"))
+            .try_into()
+            .expect("transfer");
+        queue.driver.app_mut().push_pending_send(session_id, send);
+        queue.mark_session_ready(session_id);
+
+        let handle = TcpSessionProtocol::register_queue_for_test(queue).expect("register queue");
+        let capture = Arc::new(Mutex::new(CaptureState::default()));
+        let lookup = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&capture)));
+        let queue_driver = SessionQueueNode::new().expect("session queue node");
+        queue_driver
+            .attach_queue(
+                handle,
+                SessionQueueNext::from_node(lookup),
+                TcpSessionProtocol::session_queue_dispatch_fn(),
+            )
+            .expect("attach tcp queue");
+        let session_queue = runtime.nodes().register_driver(queue_driver);
+
+        runtime
+            .schedule_empty_frame(session_queue)
+            .expect("schedule session queue");
+        assert_eq!(
+            runtime
+                .run_ready_nodes()
+                .expect("run session and output capture"),
+            2
+        );
+
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            assert!(
+                queue.driver.app().has_pending_send(session_id),
+                "pending send must stay retained until ack cleanup"
+            );
+            let connection: TcpConnection<Established, BbrController> =
+                queue.take_connection(session_id)?;
+            assert_eq!(connection.snd_nxt(), start_snd_nxt + 5);
+            queue
+                .driver
+                .replace_session_state(session_id, connection.into());
+            Ok(())
+        })
+        .expect("inspect retained send");
+
+        let packet = runtime
+            .alloc_index_with_bytes(Default::default(), &[])
+            .expect("ack packet buffer");
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            let connection: TcpConnection<Established, BbrController> =
+                queue.take_connection(session_id)?;
+            let sequence = connection.rcv_nxt();
+            let _ = connection.receive_data(
+                &runtime,
+                packet,
+                queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence,
+                    acknowledgment: Some(start_snd_nxt + 5),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 0,
+                },
+            )?;
+            Ok(())
+        })
+        .expect("receive cumulative ack");
+
+        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+            assert!(
+                !queue.driver.app().has_pending_send(session_id),
+                "cumulative ack must release retained send"
+            );
+            Ok(())
+        })
+        .expect("inspect ack cleanup");
     }
 
     #[test]
@@ -1820,6 +2343,7 @@ mod tests {
         buffers.advance(buffer, 4).expect("advance to payload");
 
         queue
+            .driver
             .enqueue_rx(session_id, buffer, false)
             .expect("enqueue rx");
 
@@ -1842,6 +2366,340 @@ mod tests {
             b"hello".to_vec()
         );
         recv.release();
+    }
+
+    #[test]
+    fn established_receive_out_of_order_payload_emits_sack_and_keeps_state_open() {
+        let runtime = DataPlaneRuntime::with_capacities(256, 8, 4, 4);
+        let mut queue =
+            TcpSessionQueue::new(DataWorkerId::new(0), runtime.packet_buffers().clone());
+        let session_id = queue.insert_session(tcp_connection_with_sack());
+        remember_established(&mut queue, session_id).expect("remember established");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let rcv_nxt = connection.rcv_nxt();
+        let snd_nxt = connection.snd_nxt();
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+
+        let buffer = runtime
+            .alloc_index_with_bytes(Default::default(), b"later")
+            .expect("payload");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let segment = connection
+            .receive_data(
+                &runtime,
+                buffer,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: rcv_nxt + 5,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive data")
+            .expect("ack segment");
+
+        assert_eq!(
+            segment_sack_blocks(&segment),
+            vec![TcpSackBlock {
+                left_edge: rcv_nxt + 5,
+                right_edge: rcv_nxt + 10,
+            }]
+        );
+
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        assert_eq!(connection.rcv_nxt(), rcv_nxt);
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+    }
+
+    #[test]
+    fn established_gap_fill_advances_rcv_nxt_and_delivers_only_first_ready_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(256, 8, 4, 4);
+        let mut queue =
+            TcpSessionQueue::new(DataWorkerId::new(0), runtime.packet_buffers().clone());
+        let ring = AppRingHandle::new(8, 8);
+        let op = AppOpId::new(7_102);
+        let session_id = queue.insert_session(tcp_connection_with_sack());
+        remember_established(&mut queue, session_id).expect("remember established");
+        assert!(queue.bind_session_app_ring(session_id, op, ring.clone()));
+
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let start_rcv_nxt = connection.rcv_nxt();
+        let snd_nxt = connection.snd_nxt();
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+
+        let later = runtime
+            .alloc_index_with_bytes(Default::default(), b"later")
+            .expect("later");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        connection
+            .receive_data(
+                &runtime,
+                later,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt + 5,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive later");
+
+        ring.try_push_submission(AppSqe::recv(Some(AppUserData::new(44)), op, 32))
+            .expect("push recv");
+        let hello = runtime
+            .alloc_index_with_bytes(Default::default(), b"hello")
+            .expect("hello");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let segment = connection
+            .receive_data(
+                &runtime,
+                hello,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive hello")
+            .expect("ack segment");
+
+        assert!(segment_sack_blocks(&segment).is_empty());
+
+        let completion = ring.pop_completion().expect("recv completion");
+        let recv = completion.into_recv().expect("recv data");
+        assert_eq!(
+            recv.copy_current().expect("recv payload"),
+            b"hello".to_vec()
+        );
+        recv.release();
+        assert!(ring.pop_completion().is_none());
+
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        assert_eq!(connection.rcv_nxt(), start_rcv_nxt + 10);
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+    }
+
+    #[test]
+    fn recv_submission_retries_delivery_of_retained_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(256, 8, 4, 4);
+        let mut queue =
+            TcpSessionQueue::new(DataWorkerId::new(0), runtime.packet_buffers().clone());
+        let ring = AppRingHandle::new(8, 8);
+        let op = AppOpId::new(7_103);
+        let session_id = queue.insert_session(tcp_connection_with_sack());
+        remember_established(&mut queue, session_id).expect("remember established");
+        assert!(queue.bind_session_app_ring(session_id, op, ring.clone()));
+
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let start_rcv_nxt = connection.rcv_nxt();
+        let snd_nxt = connection.snd_nxt();
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+
+        let later = runtime
+            .alloc_index_with_bytes(Default::default(), b"later")
+            .expect("later");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        connection
+            .receive_data(
+                &runtime,
+                later,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt + 5,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive later");
+
+        let hello = runtime
+            .alloc_index_with_bytes(Default::default(), b"hello")
+            .expect("hello");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        connection
+            .receive_data(
+                &runtime,
+                hello,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive hello");
+
+        ring.try_push_submission(AppSqe::recv(Some(AppUserData::new(55)), op, 32))
+            .expect("push first recv");
+        queue
+            .dispatch_for_ticks(&runtime, 0, unused_output_next())
+            .expect("dispatch first recv");
+        let first = ring.pop_completion().expect("first completion");
+        let first_recv = first.into_recv().expect("first recv");
+        assert_eq!(
+            first_recv.copy_current().expect("first payload"),
+            b"hello".to_vec()
+        );
+        first_recv.release();
+
+        ring.try_push_submission(AppSqe::recv(Some(AppUserData::new(56)), op, 32))
+            .expect("push second recv");
+        queue
+            .dispatch_for_ticks(&runtime, 0, unused_output_next())
+            .expect("dispatch second recv");
+        let second = ring.pop_completion().expect("second completion");
+        let second_recv = second.into_recv().expect("second recv");
+        assert_eq!(
+            second_recv.copy_current().expect("second payload"),
+            b"later".to_vec()
+        );
+        second_recv.release();
+    }
+
+    #[test]
+    fn established_duplicate_payload_emits_dsack_block() {
+        let runtime = DataPlaneRuntime::with_capacities(256, 8, 4, 4);
+        let mut queue =
+            TcpSessionQueue::new(DataWorkerId::new(0), runtime.packet_buffers().clone());
+        let session_id = queue.insert_session(tcp_connection_with_sack());
+        remember_established(&mut queue, session_id).expect("remember established");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let start_rcv_nxt = connection.rcv_nxt();
+        let snd_nxt = connection.snd_nxt();
+        queue
+            .driver
+            .replace_session_state(session_id, connection.into());
+
+        let first = runtime
+            .alloc_index_with_bytes(Default::default(), b"hello")
+            .expect("first");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        connection
+            .receive_data(
+                &runtime,
+                first,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive first");
+
+        let duplicate = runtime
+            .alloc_index_with_bytes(Default::default(), b"hello")
+            .expect("duplicate");
+        let connection: TcpConnection<Established, BbrController> =
+            queue.take_connection(session_id).expect("established");
+        let segment = connection
+            .receive_data(
+                &runtime,
+                duplicate,
+                &mut queue,
+                session_id,
+                &TcpPacket {
+                    local,
+                    remote,
+                    sequence: start_rcv_nxt,
+                    acknowledgment: Some(snd_nxt),
+                    advertised_window: u16::MAX,
+                    flags: TcpSegmentFlags::ACK,
+                    capabilities: TcpCapabilities::default(),
+                    sack_blocks: Vec::new(),
+                    payload_offset: 0,
+                    payload_len: 5,
+                },
+            )
+            .expect("receive duplicate")
+            .expect("ack segment");
+
+        assert_eq!(
+            segment_sack_blocks(&segment),
+            vec![TcpSackBlock {
+                left_edge: start_rcv_nxt,
+                right_edge: start_rcv_nxt + 5,
+            }]
+        );
     }
 
     #[test]
