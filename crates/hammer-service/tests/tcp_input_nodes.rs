@@ -9,6 +9,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
+use hammer_service::transport::congestion::BbrController;
 use hammer_service::transport::tcp::{
     TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpIpv4ListenerAddress,
     TcpResetNext, TcpResetNode, TcpV4ListenerKey, TcpWorkerOwnedState,
@@ -351,7 +352,7 @@ impl TcpGraph {
         let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
             drop, punt, listen, drop, drop, drop, drop, drop, drop, drop, drop, drop, reset,
         ));
-        let mut tcp_node = tcp_control.node();
+        let mut tcp_node = tcp_control.node::<BbrController>();
         if let Some((handle, worker)) = handoff {
             tcp_node = tcp_node.with_handoff(TcpInputHandoff::new(handle, worker));
         }

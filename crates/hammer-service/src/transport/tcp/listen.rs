@@ -2,7 +2,7 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::TcpConnectionId;
 
 use crate::session::SessionId;
@@ -21,19 +21,7 @@ pub enum TcpListenNext {
 
 #[hammer_component_macros::node(role = internal, next = TcpListenNext)]
 pub struct TcpListenNode<C: CongestionController + 'static> {
-    #[node(default)]
-    session_queue: Option<TcpSessionQueueHandle<C>>,
-}
-
-impl<C> TcpListenNode<C>
-where
-    C: CongestionController + 'static,
-{
-    #[inline]
-    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
-        self.session_queue = Some(handle);
-        self
-    }
+    session_queue: TcpSessionQueueHandle<C>,
 }
 
 impl<C> Node for TcpListenNode<C>
@@ -57,9 +45,7 @@ where
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        self.session_queue
-            .map(TcpSessionQueueHandle::runtime_data)
-            .ok_or_else(|| CoreError::internal("tcp listen node missing session queue"))
+        Ok(self.session_queue.runtime_data())
     }
 }
 
@@ -72,21 +58,19 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpListenNode::<C>::runtime_nexts(runtime)?;
-    tcp_listen_process_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
+    tcp_listen_process_frame::<C>(runtime, frame, TcpSessionQueueHandle::new(data), next)
 }
 
 #[inline]
 fn tcp_listen_process_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: TcpSessionQueueHandle<C>,
     next: [NodeId; TcpListenNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
     C: CongestionController + 'static,
 {
-    let session_queue = session_queue
-        .ok_or_else(|| CoreError::internal("tcp listen node missing session queue"))?;
     let tcp_output = next[TcpListenNext::Output as usize];
     let drop_next = next[TcpListenNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();

@@ -116,6 +116,9 @@ where
     retransmit_timeout: TcpRetransmitTimeoutState,
     congestion: C,
     recovery: TcpRecoveryState,
+    sack_blocks: [TcpSackBlock; 4],
+    sack_block_count: u8,
+    pending_dsack: Option<TcpSackBlock>,
     active_timers: TcpConnectionTimerKind,
     pending_timers: TcpConnectionTimerKind,
     _state: S,
@@ -153,6 +156,12 @@ where
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
             congestion: C::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
             recovery: TcpRecoveryState::new(),
+            sack_blocks: [TcpSackBlock {
+                left_edge: 0,
+                right_edge: 0,
+            }; 4],
+            sack_block_count: 0,
+            pending_dsack: None,
             active_timers: TcpConnectionTimerKind::empty(),
             pending_timers: TcpConnectionTimerKind::empty(),
             _state: S::initial_state(),
@@ -425,6 +434,51 @@ where
     }
 
     #[inline]
+    pub(crate) fn update_ack_sack_blocks(
+        &mut self,
+        sack_blocks: &[TcpSackBlock],
+        dsack: Option<TcpSackBlock>,
+    ) {
+        if !self.negotiated_options().sack {
+            self.sack_block_count = 0;
+            self.pending_dsack = None;
+            return;
+        }
+        self.sack_block_count = 0;
+        for block in sack_blocks.iter().take(self.sack_blocks.len()) {
+            self.sack_blocks[self.sack_block_count as usize] = *block;
+            self.sack_block_count += 1;
+        }
+        self.pending_dsack = dsack;
+    }
+
+    fn output_sack_blocks(&mut self, flags: TcpSegmentFlags) -> Option<([TcpSackBlock; 4], usize)> {
+        if !flags.contains(TcpSegmentFlags::ACK) || !self.negotiated_options().sack {
+            return None;
+        }
+        let mut blocks = [TcpSackBlock {
+            left_edge: 0,
+            right_edge: 0,
+        }; 4];
+        let mut count = 0usize;
+        if let Some(dsack) = self.pending_dsack {
+            blocks[count] = dsack;
+            count += 1;
+        }
+        for block in self
+            .sack_blocks
+            .iter()
+            .take(self.sack_block_count as usize)
+            .take(blocks.len().saturating_sub(count))
+        {
+            blocks[count] = *block;
+            count += 1;
+        }
+        self.pending_dsack = None;
+        (count != 0).then_some((blocks, count))
+    }
+
+    #[inline]
     fn apply_peer_handshake_capabilities(
         &mut self,
         capabilities: TcpCapabilities,
@@ -438,12 +492,13 @@ where
 
     #[inline]
     pub(crate) fn control_segment(
-        &self,
+        &mut self,
         packet: &TcpPacket,
         flags: TcpSegmentFlags,
         reset_sequence: Option<u32>,
     ) -> TcpSegment {
         let flags_bits = flags.bits();
+        let sack_blocks = self.output_sack_blocks(flags);
         TcpSegment::new(
             packet.local,
             packet.remote,
@@ -452,7 +507,7 @@ where
             self.advertised_receive_window(self.rcv_wnd),
             flags,
             self.options.local_capabilities(),
-            None,
+            sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
             0,
         )
     }
@@ -506,6 +561,61 @@ macro_rules! impl_state_view {
     };
 }
 
+macro_rules! tcp_connection_into_state {
+    ($connection:expr, $state:ident) => {{
+        let TcpConnection {
+            connection_id,
+            owner_worker,
+            local_port,
+            local,
+            remote,
+            close_reason,
+            iss,
+            irs,
+            snd_una,
+            snd_nxt,
+            snd_wnd,
+            rcv_nxt,
+            rcv_wnd,
+            options,
+            retransmit_timeout,
+            congestion,
+            recovery,
+            sack_blocks,
+            sack_block_count,
+            pending_dsack,
+            active_timers,
+            pending_timers,
+            _state: _,
+        } = $connection;
+        TcpConnection {
+            connection_id,
+            owner_worker,
+            local_port,
+            local,
+            remote,
+            close_reason,
+            iss,
+            irs,
+            snd_una,
+            snd_nxt,
+            snd_wnd,
+            rcv_nxt,
+            rcv_wnd,
+            options,
+            retransmit_timeout,
+            congestion,
+            recovery,
+            sack_blocks,
+            sack_block_count,
+            pending_dsack,
+            active_timers,
+            pending_timers,
+            _state: $state { _private: () },
+        }
+    }};
+}
+
 impl_state_view!(Closed, TcpState::Closed, TcpInputNext::Drop);
 impl_state_view!(Listen, TcpState::Listen, TcpInputNext::Listen);
 impl_state_view!(SynSent, TcpState::SynSent, TcpInputNext::SynSent);
@@ -522,84 +632,6 @@ impl_state_view!(Closing, TcpState::Closing, TcpInputNext::Closing);
 impl_state_view!(LastAck, TcpState::LastAck, TcpInputNext::LastAck);
 impl_state_view!(TimeWait, TcpState::TimeWait, TcpInputNext::TimeWait);
 
-macro_rules! impl_state_constructor {
-    ($target:ident, $method:ident, $source:ty) => {
-        impl<C> TcpConnection<$target, C>
-        where
-            C: CongestionController,
-        {
-            #[inline]
-            fn $method(current: TcpConnection<$source, C>) -> Self {
-                let TcpConnection {
-                    connection_id,
-                    owner_worker,
-                    local_port,
-                    local,
-                    remote,
-                    close_reason,
-                    iss,
-                    irs,
-                    snd_una,
-                    snd_nxt,
-                    snd_wnd,
-                    rcv_nxt,
-                    rcv_wnd,
-                    options,
-                    retransmit_timeout,
-                    congestion,
-                    recovery,
-                    active_timers,
-                    pending_timers,
-                    _state: _,
-                } = current;
-                Self {
-                    connection_id,
-                    owner_worker,
-                    local_port,
-                    local,
-                    remote,
-                    close_reason,
-                    iss,
-                    irs,
-                    snd_una,
-                    snd_nxt,
-                    snd_wnd,
-                    rcv_nxt,
-                    rcv_wnd,
-                    options,
-                    retransmit_timeout,
-                    congestion,
-                    recovery,
-                    active_timers,
-                    pending_timers,
-                    _state: $target { _private: () },
-                }
-            }
-        }
-    };
-}
-
-impl_state_constructor!(SynSent, syn_sent_from_closed, Closed);
-impl_state_constructor!(SynRcvd, syn_rcvd_from_listen, Listen);
-impl_state_constructor!(Closed, closed_from_syn_sent, SynSent);
-impl_state_constructor!(SynRcvd, syn_rcvd_from_syn_sent, SynSent);
-impl_state_constructor!(Established, established_from_syn_sent, SynSent);
-impl_state_constructor!(Closed, closed_from_syn_rcvd, SynRcvd);
-impl_state_constructor!(Established, established_from_syn_rcvd, SynRcvd);
-impl_state_constructor!(Closed, closed_from_established, Established);
-impl_state_constructor!(CloseWait, close_wait_from_established, Established);
-impl_state_constructor!(Closed, closed_from_close_wait, CloseWait);
-impl_state_constructor!(Closed, closed_from_fin_wait1, FinWait1);
-impl_state_constructor!(FinWait2, fin_wait2_from_fin_wait1, FinWait1);
-impl_state_constructor!(Closing, closing_from_fin_wait1, FinWait1);
-impl_state_constructor!(TimeWait, time_wait_from_fin_wait1, FinWait1);
-impl_state_constructor!(Closed, closed_from_fin_wait2, FinWait2);
-impl_state_constructor!(TimeWait, time_wait_from_fin_wait2, FinWait2);
-impl_state_constructor!(Closed, closed_from_closing, Closing);
-impl_state_constructor!(TimeWait, time_wait_from_closing, Closing);
-impl_state_constructor!(Closed, closed_from_last_ack, LastAck);
-impl_state_constructor!(Closed, closed_from_time_wait, TimeWait);
-
 impl<C> TcpConnection<Closed, C>
 where
     C: CongestionController,
@@ -610,7 +642,7 @@ where
         self.iss = initial_sequence;
         self.snd_una = initial_sequence;
         self.snd_nxt = TcpSeq::new(initial_sequence).advance(1).raw();
-        TcpConnection::syn_sent_from_closed(self)
+        tcp_connection_into_state!(self, SynSent)
     }
 }
 
@@ -632,7 +664,7 @@ where
         self.snd_nxt = TcpSeq::new(self.iss).advance(1).raw();
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
-        let next = TcpConnection::syn_rcvd_from_listen(self);
+        let mut next = tcp_connection_into_state!(self, SynRcvd);
         let segment =
             next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
         (next, segment)
@@ -657,7 +689,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_syn_sent(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_syn_ack(
@@ -670,7 +702,7 @@ where
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
         self.snd_una = acknowledgment;
-        let next = TcpConnection::established_from_syn_sent(self);
+        let mut next = tcp_connection_into_state!(self, Established);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -683,7 +715,7 @@ where
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
         self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
-        let next = TcpConnection::syn_rcvd_from_syn_sent(self);
+        let mut next = tcp_connection_into_state!(self, SynRcvd);
         let segment =
             next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
         (next, segment)
@@ -734,7 +766,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_syn_rcvd(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_final_ack(
@@ -743,7 +775,7 @@ where
         acknowledgment: u32,
     ) -> (TcpConnection<Established, C>, TcpSegment) {
         self.apply_ack(acknowledgment, packet.advertised_window);
-        let next = TcpConnection::established_from_syn_rcvd(self);
+        let mut next = tcp_connection_into_state!(self, Established);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -774,10 +806,11 @@ where
         allowed
     }
 
-    pub(crate) fn tx_segment(&self, payload_len: usize) -> CoreResult<TcpSegment> {
+    pub(crate) fn tx_segment(&mut self, payload_len: usize) -> CoreResult<TcpSegment> {
         let local = self.local().ok_or_else(|| {
             CoreError::internal("established tcp connection missing local address")
         })?;
+        let sack_blocks = self.output_sack_blocks(TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
         Ok(TcpSegment::new(
             local,
             self.remote(),
@@ -786,7 +819,7 @@ where
             self.advertised_receive_window(self.rcv_wnd),
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
             self.local_capabilities(),
-            None,
+            sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
             payload_len,
         ))
     }
@@ -827,7 +860,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_established(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     #[inline]
@@ -854,17 +887,10 @@ where
         mut self,
         packet: &TcpPacket,
     ) -> (TcpConnection<CloseWait, C>, TcpSegment) {
-        if let Some(acknowledgment) = packet.acknowledgment {
-            self.receive_ack(
-                acknowledgment,
-                packet.advertised_window,
-                packet.sack_blocks.as_slice(),
-            );
-        }
         let fin_sequence = packet.sequence.wrapping_add(packet.payload_len as u32);
         self.receive_in_order(fin_sequence, 1);
         self.close_reason = Some(TcpCloseReason::RemoteFin);
-        let next = TcpConnection::close_wait_from_established(self);
+        let mut next = tcp_connection_into_state!(self, CloseWait);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -877,7 +903,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_close_wait(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     #[inline]
@@ -906,7 +932,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_fin_wait1(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_fin_ack(
@@ -916,7 +942,7 @@ where
     ) -> (TcpConnection<TimeWait, C>, TcpSegment) {
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
-        let next = TcpConnection::time_wait_from_fin_wait1(self);
+        let mut next = tcp_connection_into_state!(self, TimeWait);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -927,7 +953,7 @@ where
         acknowledgment: u32,
     ) -> TcpConnection<FinWait2, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
-        TcpConnection::fin_wait2_from_fin_wait1(self)
+        tcp_connection_into_state!(self, FinWait2)
     }
 
     pub(crate) fn accept_fin(
@@ -936,7 +962,7 @@ where
     ) -> (TcpConnection<Closing, C>, TcpSegment) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
-        let next = TcpConnection::closing_from_fin_wait1(self);
+        let mut next = tcp_connection_into_state!(self, Closing);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -949,7 +975,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_fin_wait2(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_fin(
@@ -958,7 +984,7 @@ where
     ) -> (TcpConnection<TimeWait, C>, TcpSegment) {
         self.apply_ack(self.snd_una, packet.advertised_window);
         self.receive_in_order(packet.sequence, 1);
-        let next = TcpConnection::time_wait_from_fin_wait2(self);
+        let mut next = tcp_connection_into_state!(self, TimeWait);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
         (next, segment)
     }
@@ -971,7 +997,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_closing(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_ack(
@@ -980,7 +1006,7 @@ where
         acknowledgment: u32,
     ) -> TcpConnection<TimeWait, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
-        TcpConnection::time_wait_from_closing(self)
+        tcp_connection_into_state!(self, TimeWait)
     }
 }
 
@@ -991,7 +1017,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_last_ack(self)
+        tcp_connection_into_state!(self, Closed)
     }
 
     pub(crate) fn accept_ack(
@@ -1001,7 +1027,7 @@ where
     ) -> TcpConnection<Closed, C> {
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.close_reason = Some(TcpCloseReason::LocalRequest);
-        TcpConnection::closed_from_last_ack(self)
+        tcp_connection_into_state!(self, Closed)
     }
 }
 
@@ -1012,7 +1038,7 @@ where
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
-        TcpConnection::closed_from_time_wait(self)
+        tcp_connection_into_state!(self, Closed)
     }
 }
 
@@ -1266,6 +1292,24 @@ mod tests {
         assert_eq!(
             connection.retransmit_timeout().retransmit_timeout(),
             before_rto
+        );
+    }
+
+    #[test]
+    fn established_accept_fin_leaves_ack_processing_to_session_ingress() {
+        let source = include_str!("state_machine.rs");
+        let start = source
+            .find("    pub(crate) fn accept_fin(")
+            .expect("accept_fin function");
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n\nimpl<C> TcpConnection<CloseWait, C>")
+            .expect("accept_fin end");
+        let accept_fin = &body[..end];
+
+        assert!(
+            !accept_fin.contains("self.receive_ack("),
+            "Established::accept_fin must not process ACK/SACK cleanup; session ingress owns the wire ACK event"
         );
     }
 }

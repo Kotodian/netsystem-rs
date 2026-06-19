@@ -1,3 +1,4 @@
+use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
@@ -54,9 +55,27 @@ impl SessionAppTxProgress {
     }
 
     #[inline]
-    fn copy_pending_bytes(&self, max_len: usize) -> CoreResult<hammer_infra::vec::Vec<u8>> {
+    fn copy_pending_bytes_to_buffer(
+        &self,
+        max_len: usize,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> CoreResult<usize> {
         let len = self.remaining_len()?.min(max_len);
-        self.send.copy_range(self.sent_len, len)
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut output = buffers.get_buffer_mut(index)?;
+        let tail = output.writable_tail_mut();
+        if tail.len() < len {
+            return Err(CoreError::internal("session app tx buffer tail is too small"));
+        }
+        let copied = self
+            .send
+            .copy_to(self.sent_len, &mut tail[..len])
+            .map_err(CoreError::from)?;
+        output.commit_writable_tail(copied)?;
+        Ok(copied)
     }
 
     #[inline]
@@ -85,7 +104,7 @@ pub struct SessionAppRuntime {
     session_slots: FlatHashTable<u64, SessionId>,
     pending_sends: Pool<SessionAppTxQueue>,
     pending_send_queues: FlatHashTable<u64, PoolIndex>,
-    ready_send_sessions: SessionReadyQueue,
+    ready_sessions: SessionReadyQueue,
     drained_closes: hammer_infra::vec::Vec<SessionAppCloseSubmission>,
 }
 
@@ -97,7 +116,7 @@ impl SessionAppRuntime {
             session_slots: FlatHashTable::new(),
             pending_sends: Pool::with_capacity(1024),
             pending_send_queues: FlatHashTable::new(),
-            ready_send_sessions: SessionReadyQueue::new(),
+            ready_sessions: SessionReadyQueue::new(),
             drained_closes: hammer_infra::vec::Vec::new(),
         }
     }
@@ -122,10 +141,10 @@ impl SessionAppRuntime {
         buffers: hammer_adapter::DataPlaneBuffers,
         index: hammer_adapter::BufferIndex,
         fin: bool,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<bool> {
         let Some(ring) = self.ring.as_ref() else {
             buffers.free_index(index);
-            return Ok(());
+            return Ok(true);
         };
         ring.try_complete_recv_buffer(op, buffers, index, fin)
     }
@@ -183,23 +202,25 @@ impl SessionAppRuntime {
                     .insert(queue)
                     .expect("session app pending send queue pool capacity exhausted");
                 self.pending_send_queues.insert(key, index);
-                self.ready_send_sessions.mark_ready(session_id);
+                self.ready_sessions.mark_ready(session_id);
             }
         }
     }
 
-    pub(crate) fn copy_pending_send_bytes(
+    pub(crate) fn copy_pending_send_to_buffer(
         &self,
         session_id: SessionId,
         max_len: usize,
-    ) -> CoreResult<Option<hammer_infra::vec::Vec<u8>>> {
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> CoreResult<Option<usize>> {
         let Some(queue) = self.pending_queue(session_id) else {
             return Ok(None);
         };
         let Some(send) = queue.front() else {
             return Ok(None);
         };
-        Ok(Some(send.copy_pending_bytes(max_len)?))
+        Ok(Some(send.copy_pending_bytes_to_buffer(max_len, buffers, index)?))
     }
 
     pub(crate) fn commit_pending_send_bytes(
@@ -256,8 +277,8 @@ impl SessionAppRuntime {
         Ok(Some(send.remaining_len()?))
     }
 
-    pub(crate) fn take_ready_send_sessions(&mut self, out: &mut hammer_infra::vec::Vec<SessionId>) {
-        for session_id in self.ready_send_sessions.take_ready_sessions() {
+    pub(crate) fn take_ready_sessions(&mut self, out: &mut hammer_infra::vec::Vec<SessionId>) {
+        for session_id in self.ready_sessions.take_ready_sessions() {
             out.push(session_id);
         }
     }
@@ -288,7 +309,13 @@ impl SessionAppRuntime {
                         .push(SessionAppCloseSubmission::new(session_id, op));
                 }
             }
-            AppOpcode::Recv | AppOpcode::Nop => {}
+            AppOpcode::Recv => {
+                let op = app_op_from_descriptor(descriptor);
+                if let Some(session_id) = self.session_for_op(op) {
+                    self.ready_sessions.mark_ready(session_id);
+                }
+            }
+            AppOpcode::Nop => {}
         }
         Ok(())
     }
@@ -304,6 +331,7 @@ impl SessionAppRuntime {
             .lookup(&op.value())
             .filter(|session_id| *session_id != UNBOUND_SESSION)
     }
+
 }
 
 impl Default for SessionAppRuntime {
@@ -324,6 +352,7 @@ fn app_op_from_descriptor(descriptor: AppSqeDescriptor) -> AppOpId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hammer_adapter::DataPlaneBuffers;
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
     #[test]
@@ -345,11 +374,15 @@ mod tests {
         app.push_pending_send(session_a, first);
         app.push_pending_send(session_b, second);
 
-        let first_bytes = app
-            .copy_pending_send_bytes(session_a, 8)
+        let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
+        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
+        let first_len = app
+            .copy_pending_send_to_buffer(session_a, 8, &buffers, first_index)
             .expect("copy first")
             .expect("first pending");
-        assert_eq!(first_bytes.as_slice(), b"first");
+        assert_eq!(first_len, 5);
+        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"first");
+        buffers.free_index(first_index);
         assert!(
             app.commit_pending_send_bytes(session_a, 5)
                 .expect("commit first")
@@ -380,14 +413,20 @@ mod tests {
             app.commit_pending_send_bytes(session_a, 5)
                 .expect("commit first")
         );
+        let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
+        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
         assert!(!app.has_pending_send(session_a));
         assert_eq!(
-            app.copy_pending_send_bytes(session_b, 8)
+            app.copy_pending_send_to_buffer(session_b, 8, &buffers, second_index)
                 .expect("copy second")
-                .expect("second pending")
-                .as_slice(),
+                .expect("second pending"),
+            6
+        );
+        assert_eq!(
+            buffers.copy_current_chain(second_index).expect("copied"),
             b"second"
         );
+        buffers.free_index(second_index);
     }
 
     #[test]
@@ -407,24 +446,32 @@ mod tests {
         app.push_pending_send(session, first);
         app.push_pending_send(session, second);
 
+        let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
+        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
         assert_eq!(
-            app.copy_pending_send_bytes(session, 16)
+            app.copy_pending_send_to_buffer(session, 16, &buffers, first_index)
                 .expect("copy first")
-                .expect("first pending")
-                .as_slice(),
-            b"first"
+                .expect("first pending"),
+            5
         );
+        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"first");
+        buffers.free_index(first_index);
         assert!(
             app.commit_pending_send_bytes(session, 5)
                 .expect("commit first")
         );
+        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
         assert_eq!(
-            app.copy_pending_send_bytes(session, 16)
+            app.copy_pending_send_to_buffer(session, 16, &buffers, second_index)
                 .expect("copy second")
-                .expect("second pending")
-                .as_slice(),
+                .expect("second pending"),
+            6
+        );
+        assert_eq!(
+            buffers.copy_current_chain(second_index).expect("copied"),
             b"second"
         );
+        buffers.free_index(second_index);
     }
 
     #[test]
@@ -439,11 +486,11 @@ mod tests {
         let mut ready = hammer_infra::vec::Vec::new();
 
         app.push_pending_send(session, send);
-        app.take_ready_send_sessions(&mut ready);
+        app.take_ready_sessions(&mut ready);
         assert_eq!(ready.as_slice(), &[session]);
 
         ready.clear();
-        app.take_ready_send_sessions(&mut ready);
+        app.take_ready_sessions(&mut ready);
         assert!(ready.is_empty());
     }
 
@@ -456,24 +503,31 @@ mod tests {
             .expect("transfer");
         let mut app = SessionAppRuntime::new();
         let session_id = SessionId::new(1);
+        let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
 
         app.push_pending_send(session_id, send);
 
+        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
         let first = app
-            .copy_pending_send_bytes(session_id, 4)
+            .copy_pending_send_to_buffer(session_id, 4, &buffers, first_index)
             .expect("copy first")
             .expect("pending");
-        assert_eq!(first.as_slice(), b"abcd");
+        assert_eq!(first, 4);
+        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"abcd");
+        buffers.free_index(first_index);
         assert!(
             !app.commit_pending_send_bytes(session_id, 4)
                 .expect("partial")
         );
 
+        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
         let second = app
-            .copy_pending_send_bytes(session_id, 8)
+            .copy_pending_send_to_buffer(session_id, 8, &buffers, second_index)
             .expect("copy second")
             .expect("pending after partial");
-        assert_eq!(second.as_slice(), b"ef");
+        assert_eq!(second, 2);
+        assert_eq!(buffers.copy_current_chain(second_index).expect("copied"), b"ef");
+        buffers.free_index(second_index);
         assert!(
             app.commit_pending_send_bytes(session_id, 2)
                 .expect("finish")

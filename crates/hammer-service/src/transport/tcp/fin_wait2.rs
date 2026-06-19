@@ -19,19 +19,7 @@ pub enum TcpFinWait2Next {
 
 #[hammer_component_macros::node(role = internal, next = TcpFinWait2Next)]
 pub struct TcpFinWait2Node<C: CongestionController + 'static> {
-    #[node(default)]
-    session_queue: Option<TcpSessionQueueHandle<C>>,
-}
-
-impl<C> TcpFinWait2Node<C>
-where
-    C: CongestionController + 'static,
-{
-    #[inline]
-    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
-        self.session_queue = Some(handle);
-        self
-    }
+    session_queue: TcpSessionQueueHandle<C>,
 }
 
 impl<C> Node for TcpFinWait2Node<C>
@@ -55,9 +43,7 @@ where
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        self.session_queue
-            .map(TcpSessionQueueHandle::runtime_data)
-            .ok_or_else(|| CoreError::internal("tcp fin-wait2 node missing session queue"))
+        Ok(self.session_queue.runtime_data())
     }
 }
 
@@ -70,20 +56,18 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpFinWait2Node::<C>::runtime_nexts(runtime)?;
-    tcp_fin_wait2_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
+    tcp_fin_wait2_frame::<C>(runtime, frame, TcpSessionQueueHandle::new(data), next)
 }
 
 fn tcp_fin_wait2_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: TcpSessionQueueHandle<C>,
     next: [NodeId; TcpFinWait2Next::COUNT],
 ) -> CoreResult<NodeResult>
 where
     C: CongestionController + 'static,
 {
-    let session_queue = session_queue
-        .ok_or_else(|| CoreError::internal("tcp fin-wait2 node missing session queue"))?;
     let tcp_output = next[TcpFinWait2Next::Output as usize];
     let drop_next = next[TcpFinWait2Next::Drop as usize];
     let mut next_frames = NodeNextFrames::default();

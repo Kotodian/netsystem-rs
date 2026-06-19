@@ -958,19 +958,21 @@ impl ReassemblyContext {
         fragments.sort_by_key(|fragment| fragment.start);
         for fragment in fragments.iter().copied() {
             if fragment.index == complete {
-                runtime.remove_current_range(
-                    complete,
-                    IPV6_HEADER_LEN,
-                    IPV6_FRAGMENT_HEADER_LEN,
-                )?;
                 let mut buffer = runtime.get_buffer_mut(complete)?;
+                {
+                    let packet = buffer.current_mut();
+                    packet.copy_within(
+                        IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
+                            ..IPV6_HEADER_LEN + (fragment.end - fragment.start) + IPV6_FRAGMENT_HEADER_LEN,
+                        IPV6_HEADER_LEN,
+                    );
+                }
                 let header = &mut buffer.current_mut()[..IPV6_HEADER_LEN];
                 header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
                     .copy_from_slice(&(payload_len as u16).to_be_bytes());
                 header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
                 drop(buffer);
-                runtime
-                    .truncate_chain(complete, IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
+                runtime.truncate_current(complete, IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.append_existing_chain(complete, fragment.index)?;
@@ -1048,7 +1050,9 @@ fn trim_fragment_payload_chain(
     fragment: ReassemblyFragment,
 ) -> CoreResult<()> {
     let payload_len = fragment.end - fragment.start;
-    runtime.advance(fragment.index, fragment.header_len)?;
+    runtime
+        .packet_buffers()
+        .advance(fragment.index, fragment.header_len)?;
     runtime.truncate_chain(fragment.index, payload_len)
 }
 

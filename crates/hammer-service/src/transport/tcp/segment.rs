@@ -292,8 +292,14 @@ mod tests {
     fn tcp_metadata() -> RouteMetadata {
         RouteMetadata {
             network: Network::Tcp,
-            source: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)), 443)),
-            destination: Some(SocksAddr::ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 50_000)),
+            source: Some(SocksAddr::ip(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+                443,
+            )),
+            destination: Some(SocksAddr::ip(
+                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
+                50_000,
+            )),
             ..RouteMetadata::default()
         }
     }

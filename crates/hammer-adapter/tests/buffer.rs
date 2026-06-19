@@ -6,8 +6,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
-    BufferPool, BufferPoolArena, DataPlaneHandoff, DataPlaneInstructionSet, DataPlaneRuntime,
-    DataWorkerId, FrameBatchWidth, RouteMetadata,
+    BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
+    DataPlaneRuntime, DataWorkerId, FrameBatchWidth, RouteMetadata, TraceMark,
 };
 
 #[derive(Default)]
@@ -187,7 +187,10 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
         assert_eq!(unsafe { *buffer_ref.current_ptr() }, b'n');
     }
 
-    runtime.advance(buffer, b"network-".len()).expect("advance");
+    runtime
+        .packet_buffers()
+        .advance(buffer, b"network-".len())
+        .expect("advance");
 
     {
         let mut buffer_ref = runtime.get_buffer_mut(buffer).expect("buffer ref mut");
@@ -271,7 +274,7 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
         .alloc_index_with_bytes(RouteMetadata::default(), b"head")
         .expect("alloc head");
     let tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"tail-data")
+        .alloc_index_with_bytes(RouteMetadata::default(), b"taildata")
         .expect("alloc tail chain");
     let tail_ptr = pool.current_ptr(tail).expect("tail ptr") as usize;
 
@@ -281,7 +284,7 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
     assert!(pool.is_chained(head).expect("head is chained"));
     assert_eq!(
         pool.copy_current_chain(head).expect("combined chain"),
-        b"headtail-data"
+        b"headtaildata"
     );
     assert_eq!(
         pool.current_ptr(tail).expect("tail ptr after append") as usize,
@@ -295,7 +298,7 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
     assert_eq!(pool.copy_current_chain(head).expect("head packet"), b"head");
     assert_eq!(
         pool.copy_current_chain(tail).expect("tail packet"),
-        b"tail-data"
+        b"taildata"
     );
 
     pool.free_index(head);
@@ -304,34 +307,235 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
 }
 
 #[test]
-fn buffer_chain_current_range_exposes_exact_subchain_and_restores_original() {
+fn buffer_chain_io_segments_expose_full_chain_without_copying_or_mutation() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
         .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
         .expect("alloc chained packet");
 
-    let head_range = pool
-        .with_current_chain_range(packet, 2, 7, |range| pool.copy_current_chain(range))
-        .expect("head-spanning range");
-    assert_eq!(head_range, b"cdefghi");
+    let (segments, total_len) = pool
+        .with_current_chain_io_segments(packet, |segments, total_len| {
+            Ok((
+                segments
+                    .iter()
+                    .map(|segment| segment.to_vec())
+                    .collect::<Vec<_>>(),
+                total_len,
+            ))
+        })
+        .expect("io segments");
+    assert_eq!(total_len, 12);
+    assert_eq!(segments, vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ijkl".to_vec()]);
     assert_eq!(
-        pool.copy_current_chain(packet).expect("restored packet"),
-        b"abcdefghijkl"
-    );
-
-    let tail_range = pool
-        .with_current_chain_range(packet, 5, 5, |range| pool.copy_current_chain(range))
-        .expect("tail-starting range");
-    assert_eq!(tail_range, b"fghij");
-    assert_eq!(
-        pool.copy_current_chain(packet)
-            .expect("restored packet after tail range"),
+        pool.copy_current_chain(packet).expect("packet remains unchanged"),
         b"abcdefghijkl"
     );
     assert_eq!(pool.in_use(), 3);
 
     pool.free_index(packet);
     assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
+    let pool = BufferPool::with_capacity(8, 8);
+    let session_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"taildata")
+        .expect("alloc session tail");
+    let output_head = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc output head");
+    let tail_ptr = pool.current_ptr(session_tail).expect("tail ptr");
+
+    pool.attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    assert_eq!(
+        pool.copy_current_chain(output_head).expect("output chain"),
+        b"headtaildata"
+    );
+    assert_eq!(
+        pool.current_ptr(session_tail)
+            .expect("tail ptr after attach"),
+        tail_ptr
+    );
+    assert_eq!(pool.in_use(), 2);
+
+    pool.free_index(output_head);
+
+    assert_eq!(
+        pool.copy_current_chain(session_tail)
+            .expect("tail survives output free"),
+        b"taildata"
+    );
+    assert_eq!(
+        pool.current_ptr(session_tail).expect("tail ptr after free"),
+        tail_ptr
+    );
+    assert_eq!(pool.in_use(), 1);
+
+    pool.free_index(session_tail);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn freeing_head_with_attached_clone_does_not_free_session_tail() {
+    let pool = BufferPool::with_capacity(8, 8);
+    let session_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .expect("alloc session tail");
+    let output_head = pool
+        .alloc_index(RouteMetadata::default())
+        .expect("alloc output head");
+
+    pool.prepend(output_head, b"hdr").expect("write head bytes");
+    pool.attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    pool.free_index(output_head);
+
+    assert_eq!(
+        pool.copy_current_chain(session_tail)
+            .expect("tail survives"),
+        b"payload"
+    );
+    assert_eq!(pool.in_use(), 1);
+
+    pool.free_index(session_tail);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn freeing_original_tail_after_output_head_returns_storage_once() {
+    let pool = BufferPool::with_capacity(8, 8);
+    let session_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .expect("alloc session tail");
+    let output_head = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc output head");
+
+    pool.attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    pool.free_index(session_tail);
+
+    assert_eq!(
+        pool.copy_current_chain(output_head)
+            .expect("head keeps tail alive"),
+        b"headpayload"
+    );
+    assert_eq!(pool.in_use(), 2);
+
+    pool.free_index(output_head);
+    assert_eq!(pool.in_use(), 0);
+
+    let reused = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"reuse")
+        .expect("reuse freed storage");
+    assert_eq!(pool.in_use(), 1);
+    pool.free_index(reused);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
+fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
+    let buffers = DataPlaneBuffers::with_buffer_capacity(8, 8);
+    let session_tail = buffers
+        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .expect("alloc session tail");
+    let output_head = buffers
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc output head");
+
+    buffers
+        .get_buffer_mut(session_tail)
+        .expect("tail buffer mut")
+        .set_trace_mark(TraceMark {
+            handle: 7,
+            epoch: 11,
+        });
+    buffers
+        .attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    buffers.free_index(output_head);
+
+    assert_eq!(
+        buffers
+            .get_buffer(session_tail)
+            .expect("tail buffer")
+            .trace_mark(),
+        Some(TraceMark {
+            handle: 7,
+            epoch: 11,
+        })
+    );
+
+    buffers.free_index(session_tail);
+}
+
+#[test]
+fn shared_tail_rejects_control_area_and_payload_mutation() {
+    let pool = BufferPool::with_capacity(8, 8);
+    let session_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .expect("alloc session tail");
+    let output_head = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc output head");
+
+    pool.attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    let metadata_err = pool.with_metadata_mut(session_tail, |metadata| {
+        metadata.override_destination = true;
+    });
+    assert!(metadata_err.is_err());
+    assert!(pool.advance(session_tail, 1).is_err());
+    assert!(pool.truncate_current(session_tail, 1).is_err());
+    assert!(pool.prepend(session_tail, b"x").is_err());
+    assert!(pool.append(session_tail, b"x").is_err());
+
+    assert_eq!(
+        pool.copy_current_chain(session_tail).expect("tail unchanged"),
+        b"payload"
+    );
+
+    pool.free_index(output_head);
+    pool.free_index(session_tail);
+}
+
+#[test]
+fn shared_tail_rejects_chain_header_mutation() {
+    let pool = BufferPool::with_capacity(4, 8);
+    let session_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefgh")
+        .expect("alloc session tail");
+    let output_head = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .expect("alloc output head");
+
+    pool.attach_clone(output_head, session_tail)
+        .expect("attach clone");
+
+    let extra_tail = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"tail")
+        .expect("alloc extra tail");
+
+    assert!(pool.detach_next(session_tail).is_err());
+    assert!(pool.truncate_chain(session_tail, 4).is_err());
+    assert!(pool.append_existing_chain(session_tail, extra_tail).is_err());
+
+    assert_eq!(
+        pool.copy_current_chain(session_tail)
+            .expect("tail chain unchanged"),
+        b"abcdefgh"
+    );
+
+    pool.free_index(extra_tail);
+    pool.free_index(output_head);
+    pool.free_index(session_tail);
 }
 
 #[test]

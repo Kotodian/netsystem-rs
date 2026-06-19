@@ -3,7 +3,6 @@ use hammer_core::error::CoreResult;
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
 use crate::session::{SessionId, SessionTimerToken, runtime::SessionDriverRuntime};
-
 pub struct SessionProtocolContext<'a, S> {
     driver: &'a mut SessionDriverRuntime<S>,
 }
@@ -110,5 +109,10 @@ impl<'a, S> SessionQueueControlContext<'a, S> {
     #[inline]
     pub(crate) fn buffers(&self) -> &DataPlaneBuffers {
         self.driver.buffers()
+    }
+
+    #[inline]
+    pub(crate) fn flush_session_rx(&mut self, session_id: SessionId) -> CoreResult<()> {
+        self.driver.flush_session_rx(session_id)
     }
 }

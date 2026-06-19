@@ -19,19 +19,7 @@ pub enum TcpClosingNext {
 
 #[hammer_component_macros::node(role = internal, next = TcpClosingNext)]
 pub struct TcpClosingNode<C: CongestionController + 'static> {
-    #[node(default)]
-    session_queue: Option<TcpSessionQueueHandle<C>>,
-}
-
-impl<C> TcpClosingNode<C>
-where
-    C: CongestionController + 'static,
-{
-    #[inline]
-    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
-        self.session_queue = Some(handle);
-        self
-    }
+    session_queue: TcpSessionQueueHandle<C>,
 }
 
 impl<C> Node for TcpClosingNode<C>
@@ -55,9 +43,7 @@ where
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        self.session_queue
-            .map(TcpSessionQueueHandle::runtime_data)
-            .ok_or_else(|| CoreError::internal("tcp closing node missing session queue"))
+        Ok(self.session_queue.runtime_data())
     }
 }
 
@@ -70,20 +56,18 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpClosingNode::<C>::runtime_nexts(runtime)?;
-    tcp_closing_frame::<C>(runtime, frame, Some(TcpSessionQueueHandle::new(data)), next)
+    tcp_closing_frame::<C>(runtime, frame, TcpSessionQueueHandle::new(data), next)
 }
 
 fn tcp_closing_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: TcpSessionQueueHandle<C>,
     next: [NodeId; TcpClosingNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
     C: CongestionController + 'static,
 {
-    let session_queue = session_queue
-        .ok_or_else(|| CoreError::internal("tcp closing node missing session queue"))?;
     let tcp_output = next[TcpClosingNext::Output as usize];
     let drop_next = next[TcpClosingNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();

@@ -485,4 +485,26 @@ mod tests {
         assert_eq!(probe.packet_number, 2);
         assert!(probe.is_probe);
     }
+
+    #[test]
+    fn recovery_module_does_not_depend_on_session_app_or_bbr_layers() {
+        let source = include_str!("recovery.rs");
+        let tests_start = source.find("#[cfg(test)]").expect("tests module");
+        let module_body = &source[..tests_start];
+        let forbidden = [
+            "crate::session::",
+            "hammer_runtime::app::",
+            "BbrController",
+            "TcpCongestionController",
+            "AppRingHandle",
+            "SessionId",
+        ];
+
+        for pattern in forbidden {
+            assert!(
+                !module_body.contains(pattern),
+                "recovery.rs unexpectedly depends on forbidden layer symbol: {pattern}"
+            );
+        }
+    }
 }

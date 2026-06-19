@@ -109,7 +109,10 @@ fn tcp_segment(options: &[u8], payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn write_ack_for_test(output: &mut [u8], sack_blocks: &[TcpSackBlock]) -> Result<usize, hammer_core::error::CoreError> {
+fn write_ack_for_test(
+    output: &mut [u8],
+    sack_blocks: &[TcpSackBlock],
+) -> Result<usize, hammer_core::error::CoreError> {
     write_header_for_test(output, TcpSegmentFlags::ACK, sack_blocks)
 }
 

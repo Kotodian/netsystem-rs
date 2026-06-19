@@ -807,25 +807,20 @@ impl AppRingHandle {
         buffers: DataPlaneBuffers,
         index: BufferIndex,
         fin: bool,
-    ) -> HammerResult<()> {
+    ) -> HammerResult<bool> {
         let pending = {
             let pending = self.pending_submissions.borrow();
             match pending.lookup_recv(op) {
                 Some(found) => found,
-                None => {
-                    buffers.free_index(index);
-                    return Err(HammerError::internal(format!(
-                        "pending recv submission missing for app op {}",
-                        op.value()
-                    )));
-                }
+                None => return Ok(false),
             }
         };
         if !matches!(pending.payload, AppSqeData::Recv { .. }) {
             buffers.free_index(index);
             return Err(HammerError::internal("pending app op is not recv"));
         }
-        self.try_complete_recv_pending(op, pending, buffers, index, fin)
+        self.try_complete_recv_pending(op, pending, buffers, index, fin)?;
+        Ok(true)
     }
 
     #[inline]
@@ -1225,12 +1220,9 @@ impl AppSendData {
     }
 
     #[inline]
-    pub fn copy_range(&self, offset: usize, len: usize) -> HammerResult<Vec<u8>> {
+    pub fn copy_to(&self, offset: usize, output: &mut [u8]) -> HammerResult<usize> {
         let data = self.data()?;
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| HammerError::internal("app send data range overflow"))?;
-        self.data_area.read((data + (offset..end))?)
+        self.data_area.copy_to(data, offset, output)
     }
 
     #[inline]
@@ -1253,22 +1245,24 @@ mod tests {
         let transfer: AppSendData = ring.send_from_data(data).try_into().expect("transfer");
 
         assert_eq!(transfer.len().expect("len"), 6);
-        let copied = transfer.copy_range(0, 6).expect("copy");
-        assert_eq!(copied.as_slice(), b"abcdef");
+        let mut copied = [0_u8; 6];
+        assert_eq!(transfer.copy_to(0, &mut copied).expect("copy"), 6);
+        assert_eq!(&copied, b"abcdef");
 
         transfer.release();
     }
 
     #[test]
-    fn app_send_data_copies_checked_range_as_infra_vec() {
+    fn app_send_data_copies_checked_range_into_output() {
         let ring = AppRingHandle::with_data_area(4, 4, 256, 4).expect("ring");
         let data = ring.alloc_data_for_bytes(b"abcdefgh").expect("data");
         let transfer: AppSendData = ring.send_from_data(data).try_into().expect("transfer");
 
-        let copied = transfer.copy_range(2, 4).expect("copy");
+        let mut copied = [0_u8; 4];
+        assert_eq!(transfer.copy_to(2, &mut copied).expect("copy"), 4);
 
-        assert_eq!(copied.as_slice(), b"cdef");
-        assert!(transfer.copy_range(9, 1).is_err());
+        assert_eq!(&copied, b"cdef");
+        assert!(transfer.copy_to(9, &mut [0_u8; 1]).is_err());
 
         transfer.release();
     }

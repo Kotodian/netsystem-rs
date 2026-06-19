@@ -196,6 +196,7 @@ pub struct Buffer {
     handoff_source_worker: Option<DataWorkerId>,
     trace_mark: Option<TraceMark>,
     flags: BufferFlags,
+    ref_count: usize,
     current_data: usize,
     current_len: usize,
     data_len: usize,
@@ -214,6 +215,7 @@ impl Buffer {
             handoff_source_worker: None,
             trace_mark: None,
             flags: BufferFlags::empty(),
+            ref_count: 0,
             current_data: 0,
             current_len: 0,
             data_len: 0,
@@ -238,6 +240,7 @@ impl Buffer {
         self.handoff_source_worker = None;
         self.trace_mark = None;
         self.flags = BufferFlags::empty();
+        self.ref_count = 1;
         self.current_data = 0;
         self.current_len = bytes.len();
         self.data_len = bytes.len();
@@ -255,6 +258,7 @@ impl Buffer {
         self.handoff_source_worker = None;
         self.trace_mark = None;
         self.flags = BufferFlags::empty();
+        self.ref_count = 0;
         self.current_data = 0;
         self.current_len = 0;
         self.data_len = 0;
@@ -269,6 +273,7 @@ impl Buffer {
 
     #[inline]
     pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
+        self.assert_exclusive();
         &mut self.metadata
     }
 
@@ -279,6 +284,7 @@ impl Buffer {
 
     #[inline]
     pub fn packet_cursor_mut(&mut self) -> &mut BufferPacketCursor {
+        self.assert_exclusive();
         &mut self.packet_cursor
     }
 
@@ -299,26 +305,31 @@ impl Buffer {
 
     #[inline]
     pub fn set_handoff_source_worker(&mut self, worker: DataWorkerId) {
+        self.assert_exclusive();
         self.handoff_source_worker = Some(worker);
     }
 
     #[inline]
     pub fn set_trace_mark(&mut self, mark: TraceMark) {
+        self.assert_exclusive();
         self.trace_mark = Some(mark);
     }
 
     #[inline]
     pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+        self.assert_exclusive();
         self.trace_mark.take()
     }
 
     #[inline]
     pub fn set_node_error(&mut self, error: BufferNodeError) {
+        self.assert_exclusive();
         self.node_error = Some(error);
     }
 
     #[inline]
     pub fn clear_node_error(&mut self) {
+        self.assert_exclusive();
         self.node_error = None;
     }
 
@@ -330,6 +341,29 @@ impl Buffer {
     #[inline]
     pub fn current_data(&self) -> usize {
         self.current_data
+    }
+
+    #[inline]
+    fn ref_count(&self) -> usize {
+        self.ref_count
+    }
+
+    #[inline]
+    fn ensure_exclusive(&self) -> CoreResult<()> {
+        if self.ref_count != 1 {
+            return Err(CoreError::internal(
+                "shared buffer segment requires exclusive ownership",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn assert_exclusive(&self) {
+        assert_eq!(
+            self.ref_count, 1,
+            "shared buffer segment requires exclusive ownership"
+        );
     }
 
     #[inline]
@@ -364,6 +398,7 @@ impl Buffer {
 
     #[inline]
     pub fn current_mut(&mut self) -> &mut [u8] {
+        self.assert_exclusive();
         let start = self.current_data;
         let end = start + self.current_len;
         &mut self.storage.as_mut_slice()[start..end]
@@ -371,12 +406,14 @@ impl Buffer {
 
     #[inline]
     pub fn writable_tail_mut(&mut self) -> &mut [u8] {
+        self.assert_exclusive();
         let start = self.current_data + self.current_len;
         &mut self.storage.as_mut_slice()[start..]
     }
 
     #[inline]
     pub fn commit_writable_tail(&mut self, len: usize) -> CoreResult<()> {
+        self.ensure_exclusive()?;
         if len > self.available_tail() {
             return Err(CoreError::internal("buffer commit exceeds writable tail"));
         }
@@ -399,6 +436,7 @@ impl Buffer {
 
     #[inline]
     fn append_in_place(&mut self, bytes: &[u8]) -> usize {
+        self.assert_exclusive();
         let take = bytes.len().min(self.available_tail());
         if take == 0 {
             return 0;
@@ -426,27 +464,6 @@ struct BufferPoolInner {
     slots: Vec<BufferSlot>,
     free: Vec<u32>,
     in_use: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct BufferChainRangeSnapshot {
-    index: BufferIndex,
-    current_data: usize,
-    current_len: usize,
-    next_buffer: Option<BufferIndex>,
-    flags: BufferFlags,
-    total_len_not_including_first: usize,
-}
-
-#[derive(Debug)]
-struct BufferChainRangeRestore {
-    snapshots: Vec<BufferChainRangeSnapshot>,
-}
-
-#[derive(Debug)]
-struct BufferChainRange {
-    head: BufferIndex,
-    restore: BufferChainRangeRestore,
 }
 
 #[derive(Debug, Clone)]
@@ -676,8 +693,19 @@ impl DataPlaneBuffers {
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
-        self.finalize_trace_chain(index);
-        self.buffers.free_index(index);
+        let mut cache = self.buffers.thread_cache.borrow_mut();
+        let marks = self
+            .buffers
+            .arena
+            .inner
+            .borrow_mut()
+            .free_chain_collect_trace_marks(&mut cache, index);
+        self.finalize_trace_marks(marks);
+    }
+
+    #[inline]
+    pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        self.buffers.attach_clone(head, tail)
     }
 
     #[inline]
@@ -813,6 +841,11 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        self.buffers.advance(index, len)
+    }
+
+    #[inline]
     pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
         self.buffers.node_error(index)
     }
@@ -833,11 +866,6 @@ impl DataPlaneBuffers {
         f: impl FnOnce(&mut RouteMetadata) -> R,
     ) -> CoreResult<R> {
         self.buffers.with_metadata_mut(index, f)
-    }
-
-    #[inline]
-    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        self.buffers.advance(index, len)
     }
 
     #[inline]
@@ -905,40 +933,8 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn with_current_range<R>(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-        f: impl FnOnce() -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        self.buffers.with_current_range(index, offset, len, f)
-    }
-
-    #[inline]
-    pub fn with_current_chain_range<R>(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-        f: impl FnOnce(BufferIndex) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        self.buffers.with_current_chain_range(index, offset, len, f)
-    }
-
-    #[inline]
     pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.truncate_chain(index, len)
-    }
-
-    #[inline]
-    pub fn remove_current_range(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-    ) -> CoreResult<()> {
-        self.buffers.remove_current_range(index, offset, len)
     }
 
     #[inline]
@@ -975,18 +971,9 @@ impl DataPlaneBuffers {
         self.buffers.with_current_chain_io_segments(index, f)
     }
 
-    fn finalize_trace_chain(&self, index: BufferIndex) {
-        let mut next = Some(index);
-        while let Some(index) = next {
-            let mut buffer = match self.get_buffer_mut(index) {
-                Ok(buffer) => buffer,
-                Err(_) => return,
-            };
-            next = buffer.next_buffer();
-            let mark = buffer.take_trace_mark();
-            if crate::unlikely(mark.is_some()) {
-                self.trace.finalize(mark.expect("trace mark checked"));
-            }
+    fn finalize_trace_marks(&self, marks: Vec<TraceMark>) {
+        for mark in marks {
+            self.trace.finalize(mark);
         }
     }
 }
@@ -1544,7 +1531,16 @@ impl BufferPool {
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         let mut cache = self.thread_cache.borrow_mut();
-        self.arena.inner.borrow_mut().free_chain(&mut cache, index);
+        let _ = self
+            .arena
+            .inner
+            .borrow_mut()
+            .free_chain_collect_trace_marks(&mut cache, index);
+    }
+
+    #[inline]
+    pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        self.arena.inner.borrow_mut().attach_clone(head, tail)
     }
 
     #[inline]
@@ -1557,7 +1553,7 @@ impl BufferPool {
         let mut cache = self.thread_cache.borrow_mut();
         let mut pool = self.arena.inner.borrow_mut();
         for index in frame.drain_indices() {
-            pool.free_chain(&mut cache, index);
+            let _ = pool.free_chain_collect_trace_marks(&mut cache, index);
         }
     }
 
@@ -1571,6 +1567,7 @@ impl BufferPool {
     #[inline]
     pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
         let mut guard = self.arena.inner.borrow_mut();
+        guard.buffer(index)?.ensure_exclusive()?;
         guard.buffer_mut(index)?;
         Ok(BufferRefMut { guard, index })
     }
@@ -1614,12 +1611,9 @@ impl BufferPool {
 
     #[inline]
     pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
-        Ok(self
-            .arena
-            .inner
-            .borrow_mut()
-            .buffer_mut(index)?
-            .current_mut_ptr())
+        let mut guard = self.arena.inner.borrow_mut();
+        guard.buffer(index)?.ensure_exclusive()?;
+        Ok(guard.buffer_mut(index)?.current_mut_ptr())
     }
 
     #[inline]
@@ -1638,11 +1632,9 @@ impl BufferPool {
         index: BufferIndex,
         worker: DataWorkerId,
     ) -> CoreResult<()> {
-        self.arena
-            .inner
-            .borrow_mut()
-            .buffer_mut(index)?
-            .set_handoff_source_worker(worker);
+        let mut guard = self.arena.inner.borrow_mut();
+        guard.buffer(index)?.ensure_exclusive()?;
+        guard.buffer_mut(index)?.set_handoff_source_worker(worker);
         Ok(())
     }
 
@@ -1674,6 +1666,7 @@ impl BufferPool {
         f: impl FnOnce(&mut RouteMetadata) -> R,
     ) -> CoreResult<R> {
         let mut pool = self.arena.inner.borrow_mut();
+        pool.buffer(index)?.ensure_exclusive()?;
         let metadata = pool.buffer_mut(index)?.metadata_mut();
         Ok(f(metadata))
     }
@@ -1682,6 +1675,7 @@ impl BufferPool {
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
+        buffer.ensure_exclusive()?;
         if len > buffer.current_len {
             return Err(CoreError::internal("buffer advance exceeds current length"));
         }
@@ -1694,6 +1688,7 @@ impl BufferPool {
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
+        buffer.ensure_exclusive()?;
         if len > buffer.current_len {
             return Err(CoreError::internal(
                 "buffer truncate extends current length",
@@ -1707,6 +1702,7 @@ impl BufferPool {
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
+        buffer.ensure_exclusive()?;
         if bytes.len() > buffer.current_data {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
         }
@@ -1741,77 +1737,12 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn with_current_range<R>(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-        f: impl FnOnce() -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        let original = self
-            .arena
-            .inner
-            .borrow_mut()
-            .set_current_range(index, offset, len)?;
-        let result = f();
-        let restore = self
-            .arena
-            .inner
-            .borrow_mut()
-            .restore_current_range(index, original);
-        match (result, restore) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
-    }
-
-    #[inline]
-    pub fn with_current_chain_range<R>(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-        f: impl FnOnce(BufferIndex) -> CoreResult<R>,
-    ) -> CoreResult<R> {
-        let range = self
-            .arena
-            .inner
-            .borrow_mut()
-            .set_current_chain_range(index, offset, len)?;
-        let result = f(range.head);
-        let restore = self
-            .arena
-            .inner
-            .borrow_mut()
-            .restore_current_chain_range(range.restore);
-        match (result, restore) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(err), _) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
-        }
-    }
-
-    #[inline]
     pub fn truncate_chain(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut cache = self.thread_cache.borrow_mut();
         self.arena
             .inner
             .borrow_mut()
             .truncate_chain(&mut cache, index, len)
-    }
-
-    #[inline]
-    pub fn remove_current_range(
-        &self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-    ) -> CoreResult<()> {
-        self.arena
-            .inner
-            .borrow_mut()
-            .remove_current_range(index, offset, len)
     }
 
     #[inline]
@@ -2297,27 +2228,77 @@ impl BufferPoolInner {
 
     #[inline]
     fn free_chain(&mut self, cache: &mut BufferThreadCache, index: BufferIndex) {
+        let _ = self.free_chain_collect_trace_marks(cache, index);
+    }
+
+    #[inline]
+    fn free_chain_collect_trace_marks(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        index: BufferIndex,
+    ) -> Vec<TraceMark> {
+        let mut released_trace_marks = Vec::new();
         let mut next = Some(index);
         while let Some(index) = next {
             if index.pool_id != self.pool_id {
-                return;
+                return released_trace_marks;
             }
             let Some(entry) = self.slots.get_mut(index.slot as usize) else {
-                return;
+                return released_trace_marks;
             };
             if entry.generation != index.generation {
-                return;
+                return released_trace_marks;
             }
             if entry.allocated {
                 next = entry.buffer.next_buffer();
-                entry.allocated = false;
-                entry.buffer.reset_for_free();
-                self.in_use = self.in_use.saturating_sub(1);
-                cache.free.push(index.slot);
+                entry.buffer.ref_count = entry.buffer.ref_count.saturating_sub(1);
+                if entry.buffer.ref_count() == 0 {
+                    if let Some(mark) = entry.buffer.trace_mark.take() {
+                        released_trace_marks.push(mark);
+                    }
+                    entry.allocated = false;
+                    entry.buffer.reset_for_free();
+                    self.in_use = self.in_use.saturating_sub(1);
+                    cache.free.push(index.slot);
+                }
             } else {
                 next = None;
             }
         }
+        released_trace_marks
+    }
+
+    #[inline]
+    fn attach_clone(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
+        if head == tail {
+            return Err(CoreError::internal(
+                "buffer attach clone requires distinct head and tail",
+            ));
+        }
+        let head_buffer = self.buffer(head)?;
+        head_buffer.ensure_exclusive()?;
+        if head_buffer.next_buffer().is_some() {
+            return Err(CoreError::internal(
+                "buffer attach clone requires head without next buffer",
+            ));
+        }
+
+        let mut next = Some(tail);
+        while let Some(index) = next {
+            let buffer = self.buffer_mut(index)?;
+            buffer.ref_count = buffer
+                .ref_count
+                .checked_add(1)
+                .ok_or_else(|| CoreError::internal("buffer refcount overflow"))?;
+            next = buffer.next_buffer();
+        }
+
+        {
+            let head_buffer = self.buffer_mut(head)?;
+            head_buffer.next_buffer = Some(tail);
+            head_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+        }
+        self.refresh_chain_lengths(head)
     }
 
     #[inline]
@@ -2368,6 +2349,7 @@ impl BufferPoolInner {
         index: BufferIndex,
         bytes: &[u8],
     ) -> CoreResult<()> {
+        self.buffer(index)?.ensure_exclusive()?;
         let mut tail = index;
         while let Some(next) = self.buffer(tail)?.next_buffer {
             tail = next;
@@ -2393,6 +2375,7 @@ impl BufferPoolInner {
     fn detach_next(&mut self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
         let next = {
             let buffer = self.buffer_mut(index)?;
+            buffer.ensure_exclusive()?;
             let next = buffer.next_buffer.take();
             buffer.flags.remove(BufferFlags::NEXT_PRESENT);
             buffer.total_len_not_including_first = 0;
@@ -2404,7 +2387,7 @@ impl BufferPoolInner {
 
     #[inline]
     fn append_existing_chain(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        self.buffer(head)?;
+        self.buffer(head)?.ensure_exclusive()?;
         self.buffer(tail)?;
         let mut current = head;
         while let Some(next) = self.buffer(current)?.next_buffer {
@@ -2412,184 +2395,11 @@ impl BufferPoolInner {
         }
         {
             let current_buffer = self.buffer_mut(current)?;
+            current_buffer.ensure_exclusive()?;
             current_buffer.next_buffer = Some(tail);
             current_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
         }
         self.refresh_chain_lengths(head)
-    }
-
-    #[inline]
-    fn set_current_range(
-        &mut self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-    ) -> CoreResult<(usize, usize)> {
-        let buffer = self.buffer_mut(index)?;
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| CoreError::internal("buffer current range overflow"))?;
-        if end > buffer.current_len {
-            return Err(CoreError::internal("buffer current range exceeds length"));
-        }
-        let original = (buffer.current_data, buffer.current_len);
-        buffer.current_data += offset;
-        buffer.current_len = len;
-        Ok(original)
-    }
-
-    #[inline]
-    fn restore_current_range(
-        &mut self,
-        index: BufferIndex,
-        original: (usize, usize),
-    ) -> CoreResult<()> {
-        let buffer = self.buffer_mut(index)?;
-        buffer.current_data = original.0;
-        buffer.current_len = original.1;
-        Ok(())
-    }
-
-    #[inline]
-    fn set_current_chain_range(
-        &mut self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-    ) -> CoreResult<BufferChainRange> {
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| CoreError::internal("buffer current chain range overflow"))?;
-        let mut snapshots = Vec::new();
-        let mut total_len = 0usize;
-        let mut next = Some(index);
-        while let Some(current) = next {
-            let buffer = self.buffer(current)?;
-            total_len = total_len
-                .checked_add(buffer.current_len)
-                .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
-            snapshots.push(BufferChainRangeSnapshot {
-                index: current,
-                current_data: buffer.current_data,
-                current_len: buffer.current_len,
-                next_buffer: buffer.next_buffer,
-                flags: buffer.flags,
-                total_len_not_including_first: buffer.total_len_not_including_first,
-            });
-            next = buffer.next_buffer;
-        }
-        if end > total_len {
-            return Err(CoreError::internal(
-                "buffer current chain range exceeds length",
-            ));
-        }
-        if snapshots.is_empty() {
-            return Err(CoreError::internal("buffer chain range source is empty"));
-        }
-
-        let mut range_head = None;
-        let mut range_start_offset = 0usize;
-        let mut cursor = 0usize;
-        for snapshot in &snapshots {
-            let next_cursor = cursor
-                .checked_add(snapshot.current_len)
-                .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
-            if offset < next_cursor {
-                range_head = Some(snapshot.index);
-                range_start_offset = offset - cursor;
-                break;
-            }
-            cursor = next_cursor;
-        }
-        if range_head.is_none() && len == 0 && end == total_len {
-            let last = snapshots
-                .last()
-                .ok_or_else(|| CoreError::internal("buffer chain range source is empty"))?;
-            range_head = Some(last.index);
-            range_start_offset = last.current_len;
-        }
-        let range_head =
-            range_head.ok_or_else(|| CoreError::internal("buffer current chain range is empty"))?;
-
-        let restore = BufferChainRangeRestore { snapshots };
-        if len == 0 {
-            let buffer = self.buffer_mut(range_head)?;
-            buffer.current_data += range_start_offset;
-            buffer.current_len = 0;
-            buffer.next_buffer = None;
-            buffer.flags.remove(BufferFlags::NEXT_PRESENT);
-            buffer.total_len_not_including_first = 0;
-            return Ok(BufferChainRange {
-                head: range_head,
-                restore,
-            });
-        }
-
-        let mut in_range = false;
-        let mut remaining = len;
-        for snapshot in restore.snapshots.iter() {
-            if snapshot.index == range_head {
-                in_range = true;
-            }
-            if !in_range {
-                continue;
-            }
-
-            let start_offset = if snapshot.index == range_head {
-                range_start_offset
-            } else {
-                0
-            };
-            let available = snapshot
-                .current_len
-                .checked_sub(start_offset)
-                .ok_or_else(|| {
-                    CoreError::internal("buffer current chain range start exceeds buffer length")
-                })?;
-            let take = available.min(remaining);
-            let finishes_range = take == remaining;
-            {
-                let buffer = self.buffer_mut(snapshot.index)?;
-                buffer.current_data = snapshot.current_data + start_offset;
-                buffer.current_len = take;
-                if finishes_range {
-                    buffer.next_buffer = None;
-                    buffer.flags.remove(BufferFlags::NEXT_PRESENT);
-                    buffer.total_len_not_including_first = 0;
-                }
-            }
-            remaining -= take;
-            if finishes_range {
-                break;
-            }
-        }
-        if remaining != 0 {
-            self.restore_current_chain_range(restore)?;
-            return Err(CoreError::internal(
-                "buffer current chain range exceeds length",
-            ));
-        }
-        if let Err(err) = self.refresh_chain_lengths(range_head) {
-            self.restore_current_chain_range(restore)?;
-            return Err(err);
-        }
-        Ok(BufferChainRange {
-            head: range_head,
-            restore,
-        })
-    }
-
-    #[inline]
-    fn restore_current_chain_range(&mut self, restore: BufferChainRangeRestore) -> CoreResult<()> {
-        for snapshot in restore.snapshots {
-            let buffer = self.buffer_mut(snapshot.index)?;
-            buffer.current_data = snapshot.current_data;
-            buffer.current_len = snapshot.current_len;
-            buffer.next_buffer = snapshot.next_buffer;
-            buffer.flags = snapshot.flags;
-            buffer.total_len_not_including_first = snapshot.total_len_not_including_first;
-        }
-        Ok(())
     }
 
     #[inline]
@@ -2602,6 +2412,7 @@ impl BufferPoolInner {
         let mut remaining = len;
         let mut current = Some(index);
         while let Some(current_index) = current {
+            self.buffer(current_index)?.ensure_exclusive()?;
             let current_len = self.buffer(current_index)?.current_len;
             if remaining > current_len {
                 remaining -= current_len;
@@ -2626,38 +2437,6 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn remove_current_range(
-        &mut self,
-        index: BufferIndex,
-        offset: usize,
-        len: usize,
-    ) -> CoreResult<()> {
-        if len == 0 {
-            return Ok(());
-        }
-        let buffer = self.buffer_mut(index)?;
-        let end = offset
-            .checked_add(len)
-            .ok_or_else(|| CoreError::internal("buffer remove range overflow"))?;
-        if end > buffer.current_len {
-            return Err(CoreError::internal(
-                "buffer remove range exceeds current length",
-            ));
-        }
-        let current_data = buffer.current_data;
-        let current_end = current_data + buffer.current_len;
-        let remove_start = current_data + offset;
-        let remove_end = current_data + end;
-        buffer
-            .storage
-            .as_mut_slice()
-            .copy_within(remove_end..current_end, remove_start);
-        buffer.current_len -= len;
-        buffer.data_len = buffer.data_len.saturating_sub(len);
-        Ok(())
-    }
-
-    #[inline]
     fn refresh_chain_lengths(&mut self, index: BufferIndex) -> CoreResult<()> {
         let mut total = 0usize;
         let mut next = self.buffer(index)?.next_buffer;
@@ -2666,7 +2445,9 @@ impl BufferPoolInner {
             total += buffer.current_len;
             next = buffer.next_buffer;
         }
-        self.buffer_mut(index)?.total_len_not_including_first = total;
+        let buffer = self.buffer_mut(index)?;
+        buffer.ensure_exclusive()?;
+        buffer.total_len_not_including_first = total;
         Ok(())
     }
 }
@@ -3855,6 +3636,7 @@ impl BufferBatchMut<'_> {
 
     #[inline]
     pub fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
+        self.guard.buffer(index)?.ensure_exclusive()?;
         self.guard.buffer_mut(index)
     }
 
@@ -3874,6 +3656,7 @@ impl BufferBatchMut<'_> {
         index: BufferIndex,
         f: impl FnOnce(&mut Buffer) -> R,
     ) -> CoreResult<R> {
+        self.guard.buffer(index)?.ensure_exclusive()?;
         let buffer = self.guard.buffer_mut(index)?;
         Ok(f(buffer))
     }
@@ -4016,6 +3799,11 @@ impl BufferRefMut<'_> {
     #[inline]
     pub fn set_node_error(&mut self, error: BufferNodeError) {
         self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .set_node_error(error);
@@ -4032,6 +3820,11 @@ impl BufferRefMut<'_> {
     #[inline]
     pub fn set_trace_mark(&mut self, mark: TraceMark) {
         self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .set_trace_mark(mark);
@@ -4039,6 +3832,11 @@ impl BufferRefMut<'_> {
 
     #[inline]
     pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
         self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
@@ -4048,6 +3846,11 @@ impl BufferRefMut<'_> {
     #[inline]
     pub fn clear_node_error(&mut self) {
         self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .clear_node_error();
@@ -4055,6 +3858,11 @@ impl BufferRefMut<'_> {
 
     #[inline]
     pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
         *self
             .guard
             .buffer_mut(self.index)

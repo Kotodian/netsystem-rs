@@ -7,6 +7,7 @@ use hammer_adapter::{
 };
 use hammer_core::error::CoreResult;
 use hammer_service::data_plane::DropNode;
+use hammer_service::transport::congestion::BbrController;
 use hammer_service::transport::tcp::reset::{
     TcpResetObservation, TcpResetObserver, TcpResetReason, TcpSynthesizedReset,
 };
@@ -124,7 +125,7 @@ fn tcp_reset_observer_records_local_remote_metadata_reason_and_synthesized_reset
             drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, drop_node, drop_node,
             drop_node, drop_node, drop_node, drop_node, reset,
         ))
-        .node(),
+        .node::<BbrController>(),
     );
 
     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 50_002);

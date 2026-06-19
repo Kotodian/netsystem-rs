@@ -39,7 +39,7 @@ where
     pub const NODE_NAME: &'static str = "tcp-output-node";
 
     #[inline]
-    pub(crate) fn new(
+    pub fn new(
         next: [NodeId; TcpOutputNext::COUNT],
         session_queue: TcpSessionQueueHandle<C>,
     ) -> Self {
@@ -249,6 +249,8 @@ mod tests {
     use hammer_adapter::{BufferFrame, DataWorkerId, NodeProcessFn, RouteMetadata};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
 
+    use crate::session::SessionQueueHandle;
+    use crate::transport::congestion::BbrController;
     use super::*;
     use crate::transport::tcp::segment::TcpSegment;
     use crate::transport::tcp::session::{TcpSessionProtocol, TcpSessionQueue};
@@ -325,7 +327,7 @@ mod tests {
 
     fn output_graph() -> (
         DataPlaneRuntime,
-        SessionQueueHandle,
+        SessionQueueHandle<TcpSessionQueue<BbrController>>,
         Arc<Mutex<CaptureState>>,
         Arc<Mutex<CaptureState>>,
         NodeId,
@@ -384,7 +386,7 @@ mod tests {
             .alloc_index(RouteMetadata::default())
             .expect("buffer");
         runtime.append(index, b"hello").expect("payload");
-        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
             queue.protocol.insert_segment(index, test_segment(5))
         })
         .expect("insert segment");
@@ -432,7 +434,7 @@ mod tests {
             .packet_buffers()
             .advance(index, current_data)
             .expect("consume headroom");
-        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
             queue.protocol.insert_segment(index, test_segment(5))
         })
         .expect("insert segment");

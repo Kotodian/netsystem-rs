@@ -2,4 +2,5 @@ target/
 /dist
 /ios-demo
 /.worktrees
+/third_party/vpp
 .DS_Store

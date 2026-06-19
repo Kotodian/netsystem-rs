@@ -177,12 +177,6 @@ where
         self.handoff = Some(handoff);
         self
     }
-
-    #[inline]
-    pub(crate) fn with_session_queue(mut self, handle: TcpSessionQueueHandle<C>) -> Self {
-        self.session_queue = Some(handle);
-        self
-    }
 }
 
 impl<C> Node for TcpInputNode<C>
@@ -558,6 +552,7 @@ mod tests {
     use hammer_adapter::{DataPlaneHandoff, DataPlaneRuntime, DataWorkerId, NodeHandle, NodeId};
     use hammer_core::protocol::tcp::TcpConnectionId;
 
+    use crate::transport::congestion::BbrController;
     use crate::transport::tcp::connection::TcpConnectionState;
     use crate::transport::tcp::session::TcpSessionQueue;
     use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext, TcpSessionProtocol};
@@ -632,8 +627,11 @@ mod tests {
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
         let worker = DataWorkerId::new(0);
-        let handle = TcpSessionProtocol::register_queue(worker, runtime.packet_buffers().clone())
-            .expect("register tcp queue");
+        let handle = TcpSessionProtocol::register_queue::<BbrController>(
+            worker,
+            runtime.packet_buffers().clone(),
+        )
+        .expect("register tcp queue");
         let local_port = 50_077;
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
@@ -656,7 +654,7 @@ mod tests {
                 next: TcpInputNext::SynSent,
             }
         );
-        TcpSessionProtocol::with_queue(handle, |queue: &mut _| {
+        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
             assert_eq!(queue.session_route_by_tuple(local, remote), None);
             assert_eq!(
                 queue.pending_route_by_tuple(local, remote),
@@ -739,7 +737,7 @@ mod tests {
         runtime: &DataPlaneRuntime,
         owner: DataWorkerId,
         local_port: u16,
-    ) -> SessionQueueHandle {
+    ) -> SessionQueueHandle<TcpSessionQueue<BbrController>> {
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
             local_port,
@@ -748,14 +746,14 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
             443,
         );
-        let connection = TcpConnectionState::established_for_test(
+        let connection = TcpConnectionState::<BbrController>::established_for_test(
             Some(TcpConnectionId::new(u64::from(local_port))),
             owner,
             local_port,
             Some(local),
             remote,
         );
-        TcpSessionProtocol::register_queue_with_connection_for_test(
+        TcpSessionProtocol::register_queue_with_connection_for_test::<BbrController>(
             owner,
             runtime.packet_buffers().clone(),
             connection,

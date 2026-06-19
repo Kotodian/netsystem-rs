@@ -4,7 +4,9 @@ use hammer_adapter::{
     BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, RouteMetadata,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::pool::Pool;
+use hammer_infra::fifo::FifoQueue;
+use hammer_infra::map::FlatHashTable;
+use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::{AppOpId, AppRingHandle};
 
 use crate::session::{
@@ -140,6 +142,11 @@ pub(crate) struct SessionDriverRuntime<S> {
     entries: Pool<SessionEntry<S>>,
     app: SessionAppRuntime,
     buffers: DataPlaneBuffers,
+    tx: Pool<FifoQueue<BufferIndex>>,
+    tx_index: FlatHashTable<u64, PoolIndex>,
+    rx: Pool<FifoQueue<(BufferIndex, bool)>>,
+    rx_index: FlatHashTable<u64, PoolIndex>,
+    rx_buffers: Pool<(BufferIndex, bool)>,
 }
 
 pub(crate) trait SessionQueueProtocol<S> {
@@ -248,6 +255,11 @@ impl<S> SessionDriverRuntime<S> {
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app: SessionAppRuntime::new(),
             buffers,
+            tx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            tx_index: FlatHashTable::new(),
+            rx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            rx_index: FlatHashTable::new(),
+            rx_buffers: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
         }
     }
 
@@ -268,6 +280,11 @@ impl<S> SessionDriverRuntime<S> {
             entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             app: SessionAppRuntime::new(),
             buffers,
+            tx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            tx_index: FlatHashTable::new(),
+            rx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
+            rx_index: FlatHashTable::new(),
+            rx_buffers: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
         }
     }
 
@@ -331,6 +348,8 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<SessionEntry<S>> {
+        self.release_session_tx(id);
+        self.release_session_rx(id);
         let removed = self.entries.remove(id.pool_index())?;
         if let Some(op) = removed.app_op() {
             self.app.unbind_ring(op);
@@ -378,10 +397,162 @@ impl<S> SessionDriverRuntime<S> {
         &self.buffers
     }
 
+    fn tx_queue_mut_or_alloc(&mut self, session_id: SessionId) -> &mut FifoQueue<BufferIndex> {
+        let key = session_id.get();
+        let index = match self.tx_index.lookup(&key) {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .tx
+                    .insert(FifoQueue::new())
+                    .expect("session tx queue pool exhausted");
+                self.tx_index.insert(key, index);
+                index
+            }
+        };
+        self.tx.get_mut(index).expect("session tx queue index is valid")
+    }
+
+    fn rx_queue_mut_or_alloc(
+        &mut self,
+        session_id: SessionId,
+    ) -> &mut FifoQueue<(BufferIndex, bool)> {
+        let key = session_id.get();
+        let index = match self.rx_index.lookup(&key) {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .rx
+                    .insert(FifoQueue::new())
+                    .expect("session rx queue pool exhausted");
+                self.rx_index.insert(key, index);
+                index
+            }
+        };
+        self.rx.get_mut(index).expect("session rx queue index is valid")
+    }
+
+    pub(crate) fn retain_tx_buffer(&mut self, session_id: SessionId, index: BufferIndex) {
+        self.tx_queue_mut_or_alloc(session_id).push_back(index);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_retained_tx(&self, session_id: SessionId) -> bool {
+        let Some(index) = self.tx_index.lookup(&session_id.get()) else {
+            return false;
+        };
+        self.tx.get(index).is_some_and(|queue| !queue.is_empty())
+    }
+
+    pub(crate) fn release_tx_up_to(
+        &mut self,
+        session_id: SessionId,
+        mut bytes: usize,
+    ) -> CoreResult<()> {
+        let key = session_id.get();
+        let Some(index) = self.tx_index.lookup(&key) else {
+            return Ok(());
+        };
+        let mut remove_queue = false;
+        while bytes != 0 {
+            let current = {
+                let queue = self
+                    .tx
+                    .get_mut(index)
+                    .ok_or_else(|| CoreError::internal("session tx queue index is invalid"))?;
+                queue.front().copied()
+            };
+            let Some(current) = current else {
+                break;
+            };
+            let current_len = self
+                .buffers
+                .current_len(current)?
+                .checked_add(self.buffers.total_len_not_including_first(current)?)
+                .ok_or_else(|| CoreError::internal("session tx chain length overflow"))?;
+            if bytes < current_len {
+                self.buffers.advance(current, bytes)?;
+                bytes = 0;
+            } else {
+                {
+                    let queue = self
+                        .tx
+                        .get_mut(index)
+                        .ok_or_else(|| CoreError::internal("session tx queue index is invalid"))?;
+                    let removed = queue
+                        .pop_front()
+                        .ok_or_else(|| CoreError::internal("session tx buffer is missing"))?;
+                    self.buffers.free_index(removed);
+                    remove_queue = queue.is_empty();
+                }
+                bytes -= current_len;
+            }
+        }
+        if remove_queue {
+            self.tx_index.remove(&key);
+            let _ = self.tx.remove(index);
+        }
+        Ok(())
+    }
+
+    fn release_session_tx(&mut self, session_id: SessionId) {
+        let Some(index) = self.tx_index.remove(&session_id.get()) else {
+            return;
+        };
+        let Some(mut queue) = self.tx.remove(index) else {
+            return;
+        };
+        while let Some(buffer) = queue.pop_front() {
+            self.buffers.free_index(buffer);
+        }
+    }
+
+    fn release_session_rx(&mut self, session_id: SessionId) {
+        let Some(index) = self.rx_index.remove(&session_id.get()) else {
+            return;
+        };
+        let Some(mut queue) = self.rx.remove(index) else {
+            return;
+        };
+        while let Some((buffer, _)) = queue.pop_front() {
+            self.buffers.free_index(buffer);
+        }
+    }
+
+    pub(crate) fn retain_rx_buffer(
+        &mut self,
+        index: BufferIndex,
+        fin: bool,
+    ) -> CoreResult<PoolIndex> {
+        self.rx_buffers
+            .insert((index, fin))
+            .ok_or_else(|| CoreError::internal("session rx buffer pool exhausted"))
+    }
+
+    pub(crate) fn enqueue_retained_rx(
+        &mut self,
+        session_id: SessionId,
+        index: PoolIndex,
+    ) -> CoreResult<bool> {
+        let (buffer, fin) = self
+            .rx_buffers
+            .remove(index)
+            .ok_or_else(|| CoreError::internal("session rx buffer index is invalid"))?;
+        self.enqueue_rx(session_id, buffer, fin)
+    }
+
+    pub(crate) fn release_retained_rx(&mut self, index: PoolIndex) {
+        let Some((buffer, _)) = self.rx_buffers.remove(index) else {
+            return;
+        };
+        self.buffers.free_index(buffer);
+    }
+
     pub(crate) fn poll_app(&mut self) -> CoreResult<()> {
         self.app.drain_submissions()?;
         let mut ready = hammer_infra::vec::Vec::new();
-        self.app.take_ready_send_sessions(&mut ready);
+        self.app.take_ready_sessions(&mut ready);
+        let recv_ready = ready.clone();
         for close in self.app.pending_closes() {
             if !ready
                 .iter()
@@ -389,6 +560,9 @@ impl<S> SessionDriverRuntime<S> {
             {
                 ready.push(close.session_id());
             }
+        }
+        for session_id in recv_ready {
+            self.flush_session_rx(session_id)?;
         }
         for session_id in ready {
             self.mark_ready(session_id);
@@ -398,19 +572,68 @@ impl<S> SessionDriverRuntime<S> {
 
     #[inline]
     pub(crate) fn enqueue_rx(
-        &self,
+        &mut self,
         session_id: SessionId,
         index: BufferIndex,
         fin: bool,
     ) -> CoreResult<bool> {
         let Some(op) = self.session(session_id).and_then(SessionEntry::app_op) else {
             self.buffers.free_index(index);
-            return Ok(false);
+            return Ok(true);
         };
-        self.app
-            .complete_recv(op, self.buffers.clone(), index, fin)?;
+        if self
+            .app
+            .complete_recv(op, self.buffers.clone(), index, fin)?
+        {
+            return Ok(true);
+        }
+        self.rx_queue_mut_or_alloc(session_id).push_back((index, fin));
         Ok(true)
     }
+
+    pub(crate) fn flush_session_rx(&mut self, session_id: SessionId) -> CoreResult<()> {
+        let Some(index) = self.rx_index.lookup(&session_id.get()) else {
+            return Ok(());
+        };
+        loop {
+            let current = {
+                let queue = self
+                    .rx
+                    .get_mut(index)
+                    .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
+                queue.front().copied()
+            };
+            let Some((buffer, fin)) = current else {
+                break;
+            };
+            let delivered = match self.session(session_id).and_then(SessionEntry::app_op) {
+                Some(op) => self
+                    .app
+                    .complete_recv(op, self.buffers.clone(), buffer, fin)?,
+                None => {
+                    self.buffers.free_index(buffer);
+                    true
+                }
+            };
+            if !delivered {
+                break;
+            }
+            let queue = self
+                .rx
+                .get_mut(index)
+                .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
+            let _ = queue
+                .pop_front()
+                .ok_or_else(|| CoreError::internal("session rx buffer is missing"))?;
+            if queue.is_empty() {
+                self.rx_index.remove(&session_id.get());
+                let _ = self.rx.remove(index);
+                break;
+            }
+        }
+        Ok(())
+    }
+
 
     pub(crate) fn poll_once_for_ticks(&mut self, timer_ticks: u32) -> CoreResult<SessionQueueStep> {
         self.sessions.poll_once_for_ticks(timer_ticks)
@@ -467,28 +690,32 @@ where
     if payload_len == 0 {
         return Ok(false);
     }
-    let Some(payload) = driver
+    let payload_index = driver.buffers().alloc_index(RouteMetadata::default())?;
+    let Some(payload_len) = driver
         .app()
-        .copy_pending_send_bytes(session_id, payload_len)?
+        .copy_pending_send_to_buffer(session_id, payload_len, driver.buffers(), payload_index)?
     else {
+        driver.buffers().free_index(payload_index);
         return Err(CoreError::internal("session app tx progress is missing"));
     };
-    if payload.is_empty() {
+    if payload_len == 0 {
+        driver.buffers().free_index(payload_index);
         let completed = driver.app_mut().commit_pending_send_bytes(session_id, 0)?;
         return Ok(completed);
     }
 
     let index = driver.buffers().alloc_index(RouteMetadata::default())?;
-    if let Err(err) = driver.buffers().append(index, payload.as_slice()) {
+    if let Err(err) = driver.buffers().attach_clone(index, payload_index) {
         driver.buffers().free_index(index);
+        driver.buffers().free_index(payload_index);
         return Err(err);
     }
-    let payload_len = payload.len();
 
     {
         let mut context = crate::session::protocol::SessionQueueControlContext::new(driver);
         if let Err(err) = protocol.prepare_tx(&mut context, session_id, index, payload_len, now) {
             context.buffers().free_index(index);
+            context.buffers().free_index(payload_index);
             return Err(err);
         }
     }
@@ -496,6 +723,7 @@ where
     if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
         protocol.cancel_tx(index);
         driver.buffers().free_index(index);
+        driver.buffers().free_index(payload_index);
         return Err(err);
     }
 
@@ -505,11 +733,13 @@ where
     };
     if let Err(err) = commit_result {
         protocol.cancel_tx(index);
+        driver.buffers().free_index(payload_index);
         return Err(err);
     }
     let completed = driver
         .app_mut()
         .commit_pending_send_bytes(session_id, payload_len)?;
+    driver.retain_tx_buffer(session_id, payload_index);
     if !completed {
         driver.mark_ready(session_id);
     }
@@ -972,6 +1202,7 @@ mod tests {
         assert_eq!(state.committed, 6);
         assert_eq!(state.canceled, 0);
         assert!(!driver.app().has_pending_send(session_id));
+        assert!(driver.has_retained_tx(session_id));
 
         output.schedule(&runtime).expect("schedule output");
         assert_eq!(runtime.run_ready_nodes().expect("run output"), 1);
@@ -1009,6 +1240,7 @@ mod tests {
         assert_eq!(state.prepared, 0);
         assert_eq!(state.committed, 0);
         assert_eq!(state.canceled, 0);
+        assert!(!driver.has_retained_tx(session_id));
     }
 
     #[test]
@@ -1046,5 +1278,6 @@ mod tests {
         assert_eq!(state.committed, 0);
         assert_eq!(state.canceled, 0);
         assert!(driver.app().has_pending_send(session_id));
+        assert!(!driver.has_retained_tx(session_id));
     }
 }

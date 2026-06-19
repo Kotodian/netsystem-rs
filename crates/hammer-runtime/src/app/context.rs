@@ -157,7 +157,8 @@ impl AppContext {
         fin: bool,
     ) -> HammerResult<()> {
         let ring = self.local_ring_for_op(op)?;
-        ring.try_complete_recv_buffer(op, buffers, index, fin)
+        let _ = ring.try_complete_recv_buffer(op, buffers, index, fin)?;
+        Ok(())
     }
 
     #[inline]
@@ -412,8 +413,10 @@ impl AppRuntime {
         buffers: DataPlaneBuffers,
         index: BufferIndex,
     ) -> HammerResult<()> {
-        self.ring
-            .try_complete_recv_buffer(self.op, buffers, index, false)
+        let _ = self
+            .ring
+            .try_complete_recv_buffer(self.op, buffers, index, false)?;
+        Ok(())
     }
 
     #[inline]
@@ -423,8 +426,10 @@ impl AppRuntime {
         index: BufferIndex,
         fin: bool,
     ) -> HammerResult<()> {
-        self.ring
-            .try_complete_recv_buffer(self.op, buffers, index, fin)
+        let _ = self
+            .ring
+            .try_complete_recv_buffer(self.op, buffers, index, fin)?;
+        Ok(())
     }
 }
 

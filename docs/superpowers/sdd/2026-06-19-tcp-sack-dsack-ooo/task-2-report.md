@@ -99,3 +99,53 @@ Ran successfully after the follow-up fixes:
 cargo test -p hammer-service on_ack_reports_per_acked_segment_bytes_in_flight -- --nocapture
 cargo test -p hammer-service established_duplicate_ack_with_sack_does_not_update_rto_sample -- --nocapture
 ```
+
+## Task 2 fix round
+
+### Scope
+
+Addressed the reviewer follow-up on top of HEAD by fixing the duplicated Established FIN+ACK recovery ingress and restoring an in-crate recovery boundary guard without reintroducing any public sent-record API.
+
+### TDD record
+
+#### RED
+
+Added two focused regression tests first:
+
+1. `transport::tcp::state_machine::tests::established_accept_fin_leaves_ack_processing_to_session_ingress`
+   - source-level regression guard that fails if `Established::accept_fin(...)` still calls `self.receive_ack(...)`.
+2. `transport::tcp::recovery::tests::recovery_module_does_not_depend_on_session_app_or_bbr_layers`
+   - in-crate boundary test that scans the non-test body of `recovery.rs` and fails if session/app/BBR-layer symbols appear there.
+
+Observed expected red/green setup:
+
+- `cargo test -p hammer-service established_accept_fin_leaves_ack_processing_to_session_ingress -- --nocapture`
+  - RED before fix: failed with `Established::accept_fin must not process ACK/SACK cleanup; session ingress owns the wire ACK event`.
+- `cargo test -p hammer-service recovery_module_does_not_depend_on_session_app_or_bbr_layers -- --nocapture`
+  - passed after narrowing the scan to the production portion of `recovery.rs`, which is the intended equivalent boundary coverage.
+
+#### GREEN
+
+1. Removed the ACK/SACK processing call from `TcpConnection<Established, C>::accept_fin(...)` in `state_machine.rs`.
+2. Left session ingress (`receive_data`) as the single wire-ACK cleanup entrypoint for Established FIN+ACK packets.
+3. Kept the recovery boundary test private to `recovery.rs`; no public helper/type/API was added.
+
+### Fix round verification
+
+Ran successfully after the fix:
+
+```bash
+cargo test -p hammer-service established_accept_fin_leaves_ack_processing_to_session_ingress -- --nocapture
+cargo test -p hammer-service recovery_module_does_not_depend_on_session_app_or_bbr_layers -- --nocapture
+cargo test -p hammer-service established_receive_ack_with_sack_only_cleans_cumulative_range_once -- --nocapture
+cargo test -p hammer-service transport::tcp::recovery::tests -- --nocapture
+cargo fmt --all
+```
+
+Results:
+
+- Established FIN+ACK regression guard passed.
+- Recovery boundary guard passed.
+- Existing ACK+SACK focused regression still passed.
+- Recovery self-tests all passed.
+- `cargo fmt --all` completed successfully.
