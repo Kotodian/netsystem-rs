@@ -18,10 +18,10 @@ use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView};
 
 use crate::transport::congestion::CongestionController;
-use super::session::TcpSessionQueueHandle;
+use super::TcpQueueHandle;
 use super::{
     TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
-    TcpLookupSnapshot, TcpLookupValue, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
+    TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +163,7 @@ pub struct TcpInputNode<C: CongestionController + 'static> {
     #[node(default)]
     handoff: Option<TcpInputHandoff>,
     #[node(default)]
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: Option<TcpQueueHandle<C>>,
     #[node(default)]
     cached_next: Option<NodeId>,
 }
@@ -267,7 +267,7 @@ where
 fn sync_tcp_input_runtime<C>(
     data: NodeRuntimeData,
     handoff: Option<TcpInputHandoff>,
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: Option<TcpQueueHandle<C>>,
 ) -> CoreResult<()>
 where
     C: CongestionController + 'static,
@@ -279,7 +279,7 @@ where
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
-        runtime.session_queue = session_queue.map(TcpSessionQueueHandle::runtime_data);
+        runtime.session_queue = session_queue.map(TcpQueueHandle::runtime_data);
         Ok(())
     })
 }
@@ -295,7 +295,7 @@ where
     let state = tcp_input_runtime(data)?;
     let snapshot = state.snapshot.load();
     let next = TcpInputNode::<C>::runtime_nexts(runtime)?;
-    let session_queue = state.session_queue.map(TcpSessionQueueHandle::<C>::new);
+    let session_queue = state.session_queue.map(TcpQueueHandle::<C>::new);
     let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
         next_node_for_index(
             runtime,
@@ -336,7 +336,7 @@ fn next_node_for_index<C>(
     snapshot: &TcpInputSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<TcpInputHandoff>,
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: Option<TcpQueueHandle<C>>,
 ) -> CoreResult<Option<NodeId>>
 where
     C: CongestionController + 'static,
@@ -495,15 +495,15 @@ struct TcpInputEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpSessionInputEntry {
+struct TcpInputRouteEntry {
     owner: DataWorkerId,
     next: TcpInputNext,
 }
 
 fn session_input_entry<C>(
-    session_queue: Option<TcpSessionQueueHandle<C>>,
+    session_queue: Option<TcpQueueHandle<C>>,
     parsed: &ParsedTcpInput,
-) -> CoreResult<Option<TcpSessionInputEntry>>
+) -> CoreResult<Option<TcpInputRouteEntry>>
 where
     C: CongestionController + 'static,
 {
@@ -512,15 +512,14 @@ where
     };
     let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
     let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
-    TcpSessionProtocol::with_queue(handle, |queue: &mut super::session::TcpSessionQueue<C>| {
-        let route = queue
-            .session_route_by_tuple(local, remote)
-            .or_else(|| queue.pending_route_by_tuple(local, remote));
-        let Some((_session_id, owner, next)) = route else {
-            return Ok(None);
-        };
-        Ok(Some(TcpSessionInputEntry { owner, next }))
-    })
+    let queue = handle.borrow_mut()?;
+    let route = queue
+        .session_route_by_tuple(local, remote)
+        .or_else(|| queue.pending_route_by_tuple(local, remote));
+    let Some((_session_id, owner, next)) = route else {
+        return Ok(None);
+    };
+    Ok(Some(TcpInputRouteEntry { owner, next }))
 }
 
 #[inline(always)]
@@ -554,11 +553,14 @@ mod tests {
 
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::connection::TcpConnectionState;
-    use crate::transport::tcp::session::TcpSessionQueue;
-    use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext, TcpSessionProtocol};
+    use crate::transport::tcp::queue::TcpQueue;
+    use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext};
+    use crate::transport::tcp::queue::{
+        register_tcp_session_queue, register_tcp_session_queue_with_connection_for_test,
+    };
 
     use super::{
-        ParsedTcpInput, TcpInputSnapshot, TcpInputSnapshotHandle, TcpSessionInputEntry,
+        ParsedTcpInput, TcpInputSnapshot, TcpInputSnapshotHandle, TcpInputRouteEntry,
         next_node_for_index, parse_tcp_input, register_tcp_input_runtime, session_input_entry,
     };
     use crate::net::ip::{IpProtocol, IpVersion};
@@ -598,7 +600,7 @@ mod tests {
 
         assert_eq!(
             entry,
-            TcpSessionInputEntry {
+            TcpInputRouteEntry {
                 owner: DataWorkerId::new(0),
                 next: TcpInputNext::Established,
             }
@@ -616,7 +618,7 @@ mod tests {
 
         assert_eq!(
             entry,
-            TcpSessionInputEntry {
+            TcpInputRouteEntry {
                 owner: DataWorkerId::new(1),
                 next: TcpInputNext::Established,
             }
@@ -627,7 +629,7 @@ mod tests {
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
         let worker = DataWorkerId::new(0);
-        let handle = TcpSessionProtocol::register_queue::<BbrController>(
+        let handle = register_tcp_session_queue::<BbrController>(
             worker,
             runtime.packet_buffers().clone(),
         )
@@ -641,7 +643,11 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
             443,
         );
-        let session_id = TcpSessionProtocol::connect(handle, local, remote).expect("connect");
+        let session_id = handle
+            .borrow_mut()
+            .expect("tcp queue")
+            .connect(local, remote)
+            .expect("connect");
 
         let entry = session_input_entry(Some(handle), &parsed_input(local_port))
             .expect("session lookup")
@@ -649,20 +655,19 @@ mod tests {
 
         assert_eq!(
             entry,
-            TcpSessionInputEntry {
+            TcpInputRouteEntry {
                 owner: worker,
                 next: TcpInputNext::SynSent,
             }
         );
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
+        {
+            let queue = handle.borrow_mut().expect("tcp queue");
             assert_eq!(queue.session_route_by_tuple(local, remote), None);
             assert_eq!(
                 queue.pending_route_by_tuple(local, remote),
                 Some((session_id, worker, TcpInputNext::SynSent))
             );
-            Ok(())
-        })
-        .expect("inspect pending session");
+        }
     }
 
     #[test]
@@ -737,7 +742,7 @@ mod tests {
         runtime: &DataPlaneRuntime,
         owner: DataWorkerId,
         local_port: u16,
-    ) -> SessionQueueHandle<TcpSessionQueue<BbrController>> {
+    ) -> SessionQueueHandle<TcpQueue<BbrController>> {
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
             local_port,
@@ -753,7 +758,7 @@ mod tests {
             Some(local),
             remote,
         );
-        TcpSessionProtocol::register_queue_with_connection_for_test::<BbrController>(
+        register_tcp_session_queue_with_connection_for_test::<BbrController>(
             owner,
             runtime.packet_buffers().clone(),
             connection,

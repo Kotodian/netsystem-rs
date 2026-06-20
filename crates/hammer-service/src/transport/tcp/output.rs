@@ -5,10 +5,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
 
-use crate::transport::congestion::CongestionController;
-use crate::transport::tcp::session::TcpSessionProtocol;
-
-use super::session::TcpSessionQueueHandle;
+use super::segment::TcpSegment;
 
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 pub const TCP_FLAG_FIN: u8 = 0x01;
@@ -23,51 +20,36 @@ pub enum TcpOutputNext {
 }
 
 #[derive(Clone, Copy)]
-pub struct TcpOutputNode<C>
-where
-    C: CongestionController + 'static,
-{
+pub struct TcpOutputNode {
     next: [NodeId; TcpOutputNext::COUNT],
     cached_next: Option<NodeId>,
-    session_queue: TcpSessionQueueHandle<C>,
 }
 
-impl<C> TcpOutputNode<C>
-where
-    C: CongestionController + 'static,
-{
+impl TcpOutputNode {
     pub const NODE_NAME: &'static str = "tcp-output-node";
 
     #[inline]
-    pub fn new(
-        next: [NodeId; TcpOutputNext::COUNT],
-        session_queue: TcpSessionQueueHandle<C>,
-    ) -> Self {
+    pub fn new(next: [NodeId; TcpOutputNext::COUNT]) -> Self {
         Self {
             next,
             cached_next: None,
-            session_queue,
         }
     }
 }
 
-impl<C> Node for TcpOutputNode<C>
-where
-    C: CongestionController + 'static,
-{
+impl Node for TcpOutputNode {
     #[inline(always)]
     fn process(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let (result, cached_next) = tcp_output_node_process_frame::<C>(
+        let (result, cached_next) = tcp_output_node_process_frame(
             runtime,
             frame,
             self.next[TcpOutputNext::Lookup as usize],
             self.next[TcpOutputNext::Drop as usize],
             self.cached_next,
-            self.session_queue,
         )?;
         self.cached_next = cached_next;
         Ok(result)
@@ -75,19 +57,16 @@ where
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_output_node_process::<C>
+        tcp_output_node_process
     }
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        Ok(self.session_queue.runtime_data())
+        Ok(NodeRuntimeData::default())
     }
 }
 
-impl<C> InternalNode for TcpOutputNode<C>
-where
-    C: CongestionController + 'static,
-{
+impl InternalNode for TcpOutputNode {
     #[inline]
     fn node_registration(&self) -> NodeRegistration
     where
@@ -102,14 +81,11 @@ where
     }
 }
 
-fn tcp_output_node_process<C>(
+fn tcp_output_node_process(
     runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
+    _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> CoreResult<NodeResult>
-where
-    C: CongestionController + 'static,
-{
+) -> CoreResult<NodeResult> {
     let current = runtime
         .current_node()
         .ok_or_else(|| CoreError::internal("tcp output missing current node"))?;
@@ -121,61 +97,41 @@ where
             .nodes()
             .node_next_slot(current, TcpOutputNext::Lookup as usize)?,
     ];
-    let (result, _) = tcp_output_node_process_frame::<C>(
+    let (result, _) = tcp_output_node_process_frame(
         runtime,
         frame,
         next[TcpOutputNext::Lookup as usize],
         next[TcpOutputNext::Drop as usize],
         None,
-        TcpSessionQueueHandle::new(data),
     )?;
     Ok(result)
 }
 
-fn tcp_output_node_process_frame<C>(
+fn tcp_output_node_process_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     lookup: NodeId,
     drop: NodeId,
     cached_next: Option<NodeId>,
-    session_queue: TcpSessionQueueHandle<C>,
-) -> CoreResult<(NodeResult, Option<NodeId>)>
-where
-    C: CongestionController + 'static,
-{
+) -> CoreResult<(NodeResult, Option<NodeId>)> {
     NodeVectorDispatch::new(cached_next).route_frame_index(runtime, frame, |index| {
-        Ok(Some(tcp_output_next_for_index(
-            runtime,
-            index,
-            lookup,
-            drop,
-            session_queue,
-        )?))
+        Ok(Some(tcp_output_next_for_index(runtime, index, lookup, drop)?))
     })
 }
 
-fn tcp_output_next_for_index<C>(
+fn tcp_output_next_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     lookup: NodeId,
     drop: NodeId,
-    session_queue: TcpSessionQueueHandle<C>,
-) -> CoreResult<NodeId>
-where
-    C: CongestionController + 'static,
-{
-    let Some(segment) = TcpSessionProtocol::take_segment_for_buffer(session_queue, index)? else {
-        return Ok(drop);
-    };
+) -> CoreResult<NodeId> {
+    let segment = TcpSegment::read_from_buffer(runtime, index)?;
     let mut header = [0u8; 64];
     let header_len = segment.write_header(&mut header)?;
     let header = &header[..header_len];
     if runtime.packet_buffers().prepend(index, header).is_err() {
         return Ok(drop);
     }
-    runtime.with_metadata_mut(index, |metadata| {
-        *metadata = segment.route_metadata();
-    })?;
     Ok(lookup)
 }
 
@@ -229,13 +185,13 @@ pub const fn tcp_output_sequence_len(flags: u8, payload_len: usize) -> u32 {
 
 #[inline]
 pub fn tcp_output_next_sequence(sequence: u32, sequence_len: u32) -> u32 {
-    TcpSeq::new(sequence).advance(sequence_len).raw()
+    TcpSeq::from(sequence).advance(sequence_len).raw()
 }
 
 #[inline]
 fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
     if snd_una != 0 && snd_nxt != 0 {
-        TcpSeq::new(snd_una).distance_to(TcpSeq::new(snd_nxt))
+        TcpSeq::from(snd_una).distance_to(TcpSeq::from(snd_nxt))
     } else {
         0
     }
@@ -246,14 +202,11 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{BufferFrame, DataWorkerId, NodeProcessFn, RouteMetadata};
+    use hammer_adapter::{BufferFrame, NodeProcessFn, RouteMetadata};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
 
-    use crate::session::SessionQueueHandle;
-    use crate::transport::congestion::BbrController;
     use super::*;
     use crate::transport::tcp::segment::TcpSegment;
-    use crate::transport::tcp::session::{TcpSessionProtocol, TcpSessionQueue};
 
     #[derive(Default)]
     struct CaptureState {
@@ -327,17 +280,11 @@ mod tests {
 
     fn output_graph() -> (
         DataPlaneRuntime,
-        SessionQueueHandle<TcpSessionQueue<BbrController>>,
         Arc<Mutex<CaptureState>>,
         Arc<Mutex<CaptureState>>,
         NodeId,
     ) {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let handle = TcpSessionProtocol::register_queue_for_test(TcpSessionQueue::new(
-            DataWorkerId::new(0),
-            runtime.packet_buffers().clone(),
-        ))
-        .expect("queue");
         let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
         let drop_state = Arc::new(Mutex::new(CaptureState::default()));
         let lookup = runtime
@@ -346,11 +293,10 @@ mod tests {
         let drop = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
-        let output = runtime.nodes().register_internal(TcpOutputNode::new(
-            TcpOutputNext::nodes(drop, lookup),
-            handle,
-        ));
-        (runtime, handle, lookup_state, drop_state, output)
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
+        (runtime, lookup_state, drop_state, output)
     }
 
     fn send_to_output(runtime: &DataPlaneRuntime, output: NodeId, index: BufferIndex) {
@@ -381,15 +327,14 @@ mod tests {
 
     #[test]
     fn tcp_output_prepends_segment_header_and_routes_lookup() {
-        let (runtime, handle, lookup_state, drop_state, output) = output_graph();
+        let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime
             .alloc_index(RouteMetadata::default())
             .expect("buffer");
         runtime.append(index, b"hello").expect("payload");
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
-            queue.protocol.insert_segment(index, test_segment(5))
-        })
-        .expect("insert segment");
+        test_segment(5)
+            .write_to_buffer(&runtime, index)
+            .expect("write segment");
 
         send_to_output(&runtime, output, index);
         assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
@@ -411,7 +356,7 @@ mod tests {
 
     #[test]
     fn tcp_output_missing_intent_routes_drop() {
-        let (runtime, _, lookup_state, drop_state, output) = output_graph();
+        let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime
             .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
             .expect("buffer");
@@ -425,7 +370,7 @@ mod tests {
 
     #[test]
     fn tcp_output_routes_drop_when_prepend_fails() {
-        let (runtime, handle, lookup_state, drop_state, output) = output_graph();
+        let (runtime, lookup_state, drop_state, output) = output_graph();
         let index = runtime
             .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
             .expect("buffer");
@@ -434,10 +379,9 @@ mod tests {
             .packet_buffers()
             .advance(index, current_data)
             .expect("consume headroom");
-        TcpSessionProtocol::with_queue(handle, |queue: &mut TcpSessionQueue<BbrController>| {
-            queue.protocol.insert_segment(index, test_segment(5))
-        })
-        .expect("insert segment");
+        test_segment(5)
+            .write_to_buffer(&runtime, index)
+            .expect("write segment");
 
         send_to_output(&runtime, output, index);
         assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);

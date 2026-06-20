@@ -1,3 +1,5 @@
+use core::fmt;
+
 pub trait PrimaryOpaquePayload: Sized {
     fn encode_primary(&self) -> [u64; 5];
     fn decode_primary(words: [u64; 5]) -> Self;
@@ -52,6 +54,15 @@ impl Default for PrimaryOpaque {
     }
 }
 
+impl fmt::Debug for PrimaryOpaque {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words64 = unsafe { self.storage.words64 };
+        f.debug_struct("PrimaryOpaque")
+            .field("words64", &words64)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, align(8))]
 union SecondaryOpaqueStorage {
@@ -90,5 +101,14 @@ impl Default for SecondaryOpaque {
         Self {
             storage: SecondaryOpaqueStorage { words64: [0; 7] },
         }
+    }
+}
+
+impl fmt::Debug for SecondaryOpaque {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let words64 = unsafe { self.storage.words64 };
+        f.debug_struct("SecondaryOpaque")
+            .field("words64", &words64)
+            .finish()
     }
 }

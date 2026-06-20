@@ -24,6 +24,21 @@ impl SessionReadyQueue {
         self.slots.insert(session_id.get(), slot);
     }
 
+    pub fn take(&mut self, session_id: SessionId) -> bool {
+        let Some(slot) = self.slots.remove(&session_id.get()) else {
+            return false;
+        };
+        let last = self.ready.len() - 1;
+        self.ready.swap(slot, last);
+        let removed = self.ready.pop().expect("ready slot must exist");
+        if slot != last {
+            let moved = self.ready[slot];
+            self.slots.insert(moved.get(), slot);
+        }
+        debug_assert_eq!(removed, session_id);
+        true
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.ready.len()

@@ -1,6 +1,12 @@
 use std::fs;
 use std::path::Path;
 
+use hammer_service::transport::tcp::session::testing::{
+    established_connection_state, syn_sent_connection_state_with_retransmit_pending,
+    tcp_timer_is_armed, test_tcp_queue,
+};
+use hammer_service::transport::tcp::{TcpConnectionState, TcpConnectionTimerKind};
+
 fn read_tcp_source(path: &str) -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect("read tcp source")
 }
@@ -122,4 +128,37 @@ fn tcp_input_has_dedicated_receive_nodes() {
             "TcpInputNext is missing dedicated state node {next}"
         );
     }
+}
+
+#[test]
+fn tcp_close_path_updates_session_state_without_take_replace_flow() {
+    let mut queue = test_tcp_queue();
+    let session_id = queue.insert_session(established_connection_state());
+
+    queue
+        .drive_close_submission(session_id)
+        .expect("drive close submission");
+
+    let state = queue.session_state(session_id).expect("state");
+    assert!(matches!(state, TcpConnectionState::FinWait1(_)));
+}
+
+#[test]
+fn tcp_syn_sent_timer_expiry_updates_session_state_without_take_replace_flow() {
+    let mut queue = test_tcp_queue();
+    let session_id = queue.insert_session(syn_sent_connection_state_with_retransmit_pending());
+
+    queue
+        .expire_retransmit_timer(session_id)
+        .expect("expire retransmit timer");
+
+    let state = queue.session_state(session_id).expect("state");
+    let TcpConnectionState::SynSent(connection) = state else {
+        panic!("expected syn-sent after retransmit expiry");
+    };
+    let _ = connection;
+    assert!(tcp_timer_is_armed(
+        state,
+        TcpConnectionTimerKind::RETRANSMIT
+    ));
 }

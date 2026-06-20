@@ -372,8 +372,8 @@ where
 
     #[inline]
     fn accepts_ack(&self, acknowledgment: u32) -> bool {
-        !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.snd_una))
-            && !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))
+        !TcpSeq::from(acknowledgment).before(TcpSeq::from(self.snd_una))
+            && !TcpSeq::from(acknowledgment).after(TcpSeq::from(self.snd_nxt))
     }
 
     #[inline]
@@ -405,7 +405,7 @@ where
         if !self.accepts_ack(acknowledgment) {
             return;
         }
-        let advanced = TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una));
+        let advanced = TcpSeq::from(acknowledgment).after(TcpSeq::from(self.snd_una));
         let recovery_ack = self.recovery_ack(acknowledgment);
         let latest_rtt = recovery_ack.latest_rtt;
         if advanced {
@@ -429,7 +429,7 @@ where
         if sequence != self.rcv_nxt {
             return false;
         }
-        self.rcv_nxt = TcpSeq::new(self.rcv_nxt).advance(payload_len as u32).raw();
+        self.rcv_nxt = TcpSeq::from(self.rcv_nxt).advance(payload_len as u32).raw();
         true
     }
 
@@ -521,7 +521,7 @@ where
         } else if self.snd_una != 0 {
             self.snd_una
         } else if self.iss != 0 {
-            TcpSeq::new(self.iss).advance(1).raw()
+            TcpSeq::from(self.iss).advance(1).raw()
         } else {
             1
         }
@@ -535,7 +535,7 @@ where
         if self.rcv_nxt != 0 {
             self.rcv_nxt
         } else if self.irs != 0 {
-            TcpSeq::new(self.irs).advance(1).raw()
+            TcpSeq::from(self.irs).advance(1).raw()
         } else {
             1
         }
@@ -641,7 +641,7 @@ where
         self.close_reason = None;
         self.iss = initial_sequence;
         self.snd_una = initial_sequence;
-        self.snd_nxt = TcpSeq::new(initial_sequence).advance(1).raw();
+        self.snd_nxt = TcpSeq::from(initial_sequence).advance(1).raw();
         tcp_connection_into_state!(self, SynSent)
     }
 }
@@ -661,9 +661,9 @@ where
         }
         self.irs = packet.sequence;
         self.snd_una = self.iss;
-        self.snd_nxt = TcpSeq::new(self.iss).advance(1).raw();
+        self.snd_nxt = TcpSeq::from(self.iss).advance(1).raw();
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
-        self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
+        self.rcv_nxt = TcpSeq::from(packet.sequence).advance(1).raw();
         let mut next = tcp_connection_into_state!(self, SynRcvd);
         let segment =
             next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
@@ -677,8 +677,8 @@ where
 {
     #[inline]
     pub(crate) fn unacceptable_ack(&self, acknowledgment: u32) -> bool {
-        !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.iss))
-            || TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))
+        !TcpSeq::from(acknowledgment).after(TcpSeq::from(self.iss))
+            || TcpSeq::from(acknowledgment).after(TcpSeq::from(self.snd_nxt))
     }
 
     #[inline]
@@ -700,7 +700,7 @@ where
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
-        self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
+        self.rcv_nxt = TcpSeq::from(packet.sequence).advance(1).raw();
         self.snd_una = acknowledgment;
         let mut next = tcp_connection_into_state!(self, Established);
         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
@@ -714,7 +714,7 @@ where
         self.apply_peer_handshake_capabilities(packet.capabilities);
         self.irs = packet.sequence;
         self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
-        self.rcv_nxt = TcpSeq::new(packet.sequence).advance(1).raw();
+        self.rcv_nxt = TcpSeq::from(packet.sequence).advance(1).raw();
         let mut next = tcp_connection_into_state!(self, SynRcvd);
         let segment =
             next.control_segment(packet, TcpSegmentFlags::SYN | TcpSegmentFlags::ACK, None);
@@ -731,7 +731,7 @@ where
         let retransmit = self.tcp_timer_dispatch_pending(timer);
         let first_syn = !self.tcp_timer_is_active(timer)
             && self.snd_una == self.iss
-            && self.snd_nxt == TcpSeq::new(self.iss).advance(1).raw();
+            && self.snd_nxt == TcpSeq::from(self.iss).advance(1).raw();
         if !retransmit && !first_syn {
             return None;
         }
@@ -785,6 +785,12 @@ impl<C> TcpConnection<Established, C>
 where
     C: CongestionController,
 {
+    #[inline]
+    pub(crate) fn close_local(mut self) -> TcpConnection<FinWait1, C> {
+        self.close_reason = Some(TcpCloseReason::LocalRequest);
+        tcp_connection_into_state!(self, FinWait1)
+    }
+
     pub(crate) fn tx_payload_len(&self, pending_len: usize, _: Instant) -> usize {
         if pending_len == 0 {
             return 0;
@@ -832,7 +838,7 @@ where
         let payload_len = u32::try_from(payload_len)
             .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
         let sequence = self.snd_nxt;
-        let end_sequence = TcpSeq::new(sequence).advance(payload_len).raw();
+        let end_sequence = TcpSeq::from(sequence).advance(payload_len).raw();
         let bytes_in_flight = self.recovery.bytes_in_flight();
         let packet_number = self.recovery.next_packet_number();
         self.recovery.record_sent(
@@ -883,6 +889,7 @@ where
             .then_some(packet.payload_len)
     }
 
+
     pub(crate) fn accept_fin(
         mut self,
         packet: &TcpPacket,
@@ -900,6 +907,12 @@ impl<C> TcpConnection<CloseWait, C>
 where
     C: CongestionController,
 {
+    #[inline]
+    pub(crate) fn close_local(mut self) -> TcpConnection<LastAck, C> {
+        self.close_reason = Some(TcpCloseReason::LocalRequest);
+        tcp_connection_into_state!(self, LastAck)
+    }
+
     #[inline]
     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
         self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1215,7 +1228,7 @@ mod tests {
         let timers = connection.commit_payload_tx(5, now).expect("commit tx");
 
         assert!(timers.contains(TcpConnectionTimerKind::TLP));
-        assert_eq!(connection.snd_nxt(), TcpSeq::new(start).advance(5).raw());
+        assert_eq!(connection.snd_nxt(), TcpSeq::from(start).advance(5).raw());
         assert_eq!(connection.recovery().bytes_in_flight(), 5);
         assert_eq!(connection.congestion.sent.as_slice(), &[(1, 5, 0, now)]);
     }
@@ -1224,7 +1237,7 @@ mod tests {
     fn established_ack_cleans_sent_segment_and_updates_congestion() {
         let now = Instant::now();
         let mut connection = established_connection();
-        let end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
+        let end = TcpSeq::from(connection.snd_nxt()).advance(5).raw();
 
         connection.commit_payload_tx(5, now).expect("commit tx");
         connection.receive_ack(end, u16::MAX, &[]);
@@ -1239,8 +1252,8 @@ mod tests {
     fn established_receive_ack_with_sack_only_cleans_cumulative_range_once() {
         let now = Instant::now();
         let mut connection = established_connection();
-        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
-        let second_end = TcpSeq::new(first_end).advance(5).raw();
+        let first_end = TcpSeq::from(connection.snd_nxt()).advance(5).raw();
+        let second_end = TcpSeq::from(first_end).advance(5).raw();
 
         connection.commit_payload_tx(5, now).expect("first tx");
         connection
@@ -1266,8 +1279,8 @@ mod tests {
     fn established_duplicate_ack_with_sack_does_not_update_rto_sample() {
         let now = Instant::now();
         let mut connection = established_connection();
-        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
-        let second_end = TcpSeq::new(first_end).advance(5).raw();
+        let first_end = TcpSeq::from(connection.snd_nxt()).advance(5).raw();
+        let second_end = TcpSeq::from(first_end).advance(5).raw();
 
         connection.commit_payload_tx(5, now).expect("first tx");
         connection

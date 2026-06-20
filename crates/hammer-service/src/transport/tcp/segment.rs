@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hammer_adapter::{BufferIndex, DataPlaneRuntime, Network, RouteMetadata, SocksAddr};
+use hammer_adapter::{BufferIndex, DataPlaneRuntime, PrimaryOpaquePayload, SecondaryOpaquePayload};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
@@ -143,16 +143,6 @@ impl TcpSegment {
     }
 
     #[inline]
-    pub fn route_metadata(&self) -> RouteMetadata {
-        RouteMetadata {
-            network: Network::Tcp,
-            source: Some(SocksAddr::ip(self.local.ip(), self.local.port())),
-            destination: Some(SocksAddr::ip(self.remote.ip(), self.remote.port())),
-            ..RouteMetadata::default()
-        }
-    }
-
-    #[inline]
     pub const fn payload_len(&self) -> usize {
         self.payload_len
     }
@@ -164,6 +154,165 @@ impl TcpSegment {
         };
         Some(&sack_blocks[..usize::from(self.sack_block_count)])
     }
+
+    pub(crate) fn write_to_buffer(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        buffer.opaque_mut().write(self);
+        buffer.opaque2_mut().write(self);
+        Ok(())
+    }
+
+    pub(crate) fn read_from_buffer(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<Self> {
+        let buffer = runtime.get_buffer(index)?;
+        let mut segment = buffer.opaque().read::<Self>();
+        let secondary = buffer.opaque2().read::<Self>();
+        if secondary.sack_block_count != 0 {
+            segment.sack_blocks = secondary.sack_blocks;
+            segment.sack_block_count = secondary.sack_block_count;
+        }
+        Ok(segment)
+    }
+}
+
+impl PrimaryOpaquePayload for TcpSegment {
+    fn encode_primary(&self) -> [u64; 5] {
+        let mut capabilities = 0u8;
+        capabilities |= u8::from(self.capabilities.sack);
+        capabilities |= u8::from(self.capabilities.timestamps) << 1;
+        capabilities |= u8::from(self.capabilities.ecn) << 2;
+        unsafe {
+            TcpSegmentHeaderOpaque {
+                fields: TcpSegmentHeaderFields {
+                    local_port: self.local.port(),
+                    remote_port: self.remote.port(),
+                    advertised_window: self.advertised_window,
+                    flags: self.flags.bits(),
+                    capabilities,
+                    sack_block_count: self.sack_block_count,
+                    reserved: 0,
+                    sequence: self.sequence,
+                    acknowledgment: self.acknowledgment,
+                    reserved_words: [0; 2],
+                },
+            }
+            .raw
+        }
+    }
+
+    fn decode_primary(words: [u64; 5]) -> Self {
+        let fields = unsafe { TcpSegmentHeaderOpaque { raw: words }.fields };
+        Self {
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.local_port),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.remote_port),
+            sequence: fields.sequence,
+            acknowledgment: fields.acknowledgment,
+            advertised_window: fields.advertised_window,
+            flags: TcpSegmentFlags::from_bits_truncate(fields.flags),
+            capabilities: TcpCapabilities {
+                max_segment_size: None,
+                window_scale: None,
+                sack: fields.capabilities & 0x01 != 0,
+                timestamps: fields.capabilities & 0x02 != 0,
+                ecn: fields.capabilities & 0x04 != 0,
+            },
+            sack_blocks: None,
+            sack_block_count: fields.sack_block_count,
+            payload_len: 0,
+        }
+    }
+}
+
+impl SecondaryOpaquePayload for TcpSegment {
+    fn encode_secondary(&self) -> [u64; 7] {
+        let mut blocks = [0u64; 4];
+        if let Some(sack_blocks) = self.sack_blocks() {
+            for (slot, block) in sack_blocks.iter().take(blocks.len()).enumerate() {
+                blocks[slot] =
+                    (u64::from(block.left_edge) << 32) | u64::from(block.right_edge);
+            }
+        }
+        unsafe {
+            TcpSegmentSackOpaque {
+                fields: TcpSegmentSackFields {
+                    blocks,
+                    reserved: [0; 3],
+                },
+            }
+            .raw
+        }
+    }
+
+    fn decode_secondary(words: [u64; 7]) -> Self {
+        let fields = unsafe { TcpSegmentSackOpaque { raw: words }.fields };
+        let mut blocks = [TcpSackBlock {
+            left_edge: 0,
+            right_edge: 0,
+        }; 4];
+        let mut count = 0usize;
+        for word in fields.blocks {
+            let left = (word >> 32) as u32;
+            let right = word as u32;
+            if left == 0 && right == 0 {
+                continue;
+            }
+            blocks[count] = TcpSackBlock {
+                left_edge: left,
+                right_edge: right,
+            };
+            count += 1;
+            if count == blocks.len() {
+                break;
+            }
+        }
+        Self {
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            sequence: 0,
+            acknowledgment: 0,
+            advertised_window: 0,
+            flags: TcpSegmentFlags::empty(),
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: (count != 0).then_some(blocks),
+            sack_block_count: count as u8,
+            payload_len: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TcpSegmentHeaderFields {
+    local_port: u16,
+    remote_port: u16,
+    advertised_window: u16,
+    flags: u8,
+    capabilities: u8,
+    sack_block_count: u8,
+    reserved: u8,
+    sequence: u32,
+    acknowledgment: u32,
+    reserved_words: [u64; 2],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+union TcpSegmentHeaderOpaque {
+    raw: [u64; 5],
+    fields: TcpSegmentHeaderFields,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TcpSegmentSackFields {
+    blocks: [u64; 4],
+    reserved: [u64; 3],
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+union TcpSegmentSackOpaque {
+    raw: [u64; 7],
+    fields: TcpSegmentSackFields,
 }
 
 fn source_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {

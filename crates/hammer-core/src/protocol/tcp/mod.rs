@@ -151,6 +151,20 @@ impl TcpSeq {
     }
 }
 
+impl From<u32> for TcpSeq {
+    #[inline]
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl From<TcpSeq> for u32 {
+    #[inline]
+    fn from(value: TcpSeq) -> Self {
+        value.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TcpCapabilities {
     pub max_segment_size: Option<u16>,

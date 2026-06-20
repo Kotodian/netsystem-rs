@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::fmt;
 use std::marker::PhantomData;
 use std::time::Instant;
@@ -27,6 +27,17 @@ impl<Q> SessionQueueHandle<Q> {
     #[inline]
     pub(crate) const fn runtime_data(self) -> NodeRuntimeData {
         self.runtime_data
+    }
+
+    #[inline]
+    pub(crate) fn borrow_mut(self) -> CoreResult<RefMut<'static, Q>>
+    where
+        Q: 'static,
+    {
+        let queue = session_queue_cell::<Q>(self.runtime_data)?;
+        queue
+            .try_borrow_mut()
+            .map_err(|_| CoreError::internal("session queue borrowed"))
     }
 }
 
@@ -209,34 +220,6 @@ pub(crate) fn register_session_queue<Q: 'static>(queue: Q) -> CoreResult<Session
     let queue = Box::leak(Box::new(RefCell::new(queue)));
     let runtime_data = session_queue_runtime_data(queue)?;
     Ok(SessionQueueHandle::new(runtime_data))
-}
-
-pub(crate) trait SessionQueueAccess<Q, R> {
-    fn access(self, queue: &mut Q) -> CoreResult<R>;
-}
-
-impl<Q, R, F> SessionQueueAccess<Q, R> for F
-where
-    F: FnOnce(&mut Q) -> CoreResult<R>,
-{
-    #[inline]
-    fn access(self, queue: &mut Q) -> CoreResult<R> {
-        self(queue)
-    }
-}
-
-pub(crate) fn with_session_queue<Q: 'static, R, F>(
-    handle: SessionQueueHandle<Q>,
-    f: F,
-) -> CoreResult<R>
-where
-    F: SessionQueueAccess<Q, R>,
-{
-    let queue = session_queue_cell::<Q>(handle.runtime_data())?;
-    let mut queue = queue
-        .try_borrow_mut()
-        .map_err(|_| CoreError::internal("session queue borrowed"))?;
-    f.access(&mut queue)
 }
 
 fn session_queue_runtime_data<Q>(queue: &'static RefCell<Q>) -> CoreResult<NodeRuntimeData> {

@@ -9,7 +9,6 @@ pub mod timer;
 pub use app::SessionAppRuntime;
 pub use id::SessionId;
 pub use node::{SessionQueueHandle, SessionQueueNext, SessionQueueNode};
-pub use protocol::SessionProtocolContext;
 pub use ready::SessionReadyQueue;
 pub use runtime::WorkerSessionRuntime;
 pub use timer::{SessionTimerExpiry, SessionTimerToken, SessionTimerWheel};

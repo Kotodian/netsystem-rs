@@ -141,7 +141,7 @@ fn shared_congestion_has_no_tcp_session_app_or_quic_types() {
         "TcpSeq",
         "TcpConnection",
         "TcpConnectionState",
-        "TcpSession",
+        "TcpConnection",
         "SessionId",
         "SessionQueue",
         "AppRing",

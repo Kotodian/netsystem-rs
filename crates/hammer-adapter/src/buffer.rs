@@ -14,6 +14,7 @@ use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{NodeHandle, NodeId, NodeNext, NodeRuntime};
+use crate::packet_buffer::{PrimaryOpaque, SecondaryOpaque};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle, TraceMark};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
@@ -191,6 +192,8 @@ impl BufferNodeError {
 #[repr(C, align(64))]
 pub struct Buffer {
     metadata: RouteMetadata,
+    opaque: PrimaryOpaque,
+    opaque2: SecondaryOpaque,
     packet_cursor: BufferPacketCursor,
     node_error: Option<BufferNodeError>,
     handoff_source_worker: Option<DataWorkerId>,
@@ -210,6 +213,8 @@ impl Buffer {
     fn with_slot_capacity(slot_capacity: usize) -> Self {
         Self {
             metadata: RouteMetadata::default(),
+            opaque: PrimaryOpaque::default(),
+            opaque2: SecondaryOpaque::default(),
             packet_cursor: BufferPacketCursor::default(),
             node_error: None,
             handoff_source_worker: None,
@@ -235,6 +240,8 @@ impl Buffer {
             )));
         }
         self.metadata = metadata;
+        self.opaque.clear();
+        self.opaque2.clear();
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
         self.handoff_source_worker = None;
@@ -253,6 +260,8 @@ impl Buffer {
     #[inline]
     fn reset_for_free(&mut self) {
         self.metadata = RouteMetadata::default();
+        self.opaque.clear();
+        self.opaque2.clear();
         self.packet_cursor = BufferPacketCursor::default();
         self.node_error = None;
         self.handoff_source_worker = None;
@@ -275,6 +284,28 @@ impl Buffer {
     pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
         self.assert_exclusive();
         &mut self.metadata
+    }
+
+    #[inline]
+    pub fn opaque(&self) -> &PrimaryOpaque {
+        &self.opaque
+    }
+
+    #[inline]
+    pub fn opaque_mut(&mut self) -> &mut PrimaryOpaque {
+        self.assert_exclusive();
+        &mut self.opaque
+    }
+
+    #[inline]
+    pub fn opaque2(&self) -> &SecondaryOpaque {
+        &self.opaque2
+    }
+
+    #[inline]
+    pub fn opaque2_mut(&mut self) -> &mut SecondaryOpaque {
+        self.assert_exclusive();
+        &mut self.opaque2
     }
 
     #[inline]
@@ -3702,6 +3733,22 @@ impl BufferRef<'_> {
     }
 
     #[inline]
+    pub fn opaque(&self) -> &crate::PrimaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque()
+    }
+
+    #[inline]
+    pub fn opaque2(&self) -> &crate::SecondaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque2()
+    }
+
+    #[inline]
     pub fn node_error(&self) -> Option<BufferNodeError> {
         self.guard
             .buffer(self.index)
@@ -3868,6 +3915,48 @@ impl BufferRefMut<'_> {
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
             .packet_cursor_mut() = cursor;
+    }
+
+    #[inline]
+    pub fn opaque(&self) -> &crate::PrimaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque()
+    }
+
+    #[inline]
+    pub fn opaque_mut(&mut self) -> &mut crate::PrimaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque_mut()
+    }
+
+    #[inline]
+    pub fn opaque2(&self) -> &crate::SecondaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque2()
+    }
+
+    #[inline]
+    pub fn opaque2_mut(&mut self) -> &mut crate::SecondaryOpaque {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .opaque2_mut()
     }
 
     #[inline]

@@ -8,7 +8,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::congestion::BbrController;
-use hammer_service::transport::tcp::TcpSessionProtocol;
+use hammer_service::transport::tcp::TcpWorkerOwnedState;
 use hammer_service::transport::tcp::{
     TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
     TcpOutputNode, TcpSynRcvdNext, TcpSynRcvdNode,
@@ -108,7 +108,7 @@ struct Graph {
 fn established_graph() -> Graph {
     let runtime = DataPlaneRuntime::with_capacities(4096, 32, 8, 8);
     let handle =
-        TcpSessionProtocol::register_queue::<BbrController>(
+        TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
             runtime.packet_buffers().clone(),
         )

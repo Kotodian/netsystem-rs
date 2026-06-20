@@ -176,7 +176,6 @@ impl SessionAppRuntime {
     }
 
     #[inline]
-    #[cfg(test)]
     pub(crate) fn take_drained_closes(
         &mut self,
     ) -> hammer_infra::vec::Vec<SessionAppCloseSubmission> {
@@ -281,11 +280,6 @@ impl SessionAppRuntime {
         for session_id in self.ready_sessions.take_ready_sessions() {
             out.push(session_id);
         }
-    }
-
-    #[inline]
-    pub(crate) fn pending_closes(&self) -> &[SessionAppCloseSubmission] {
-        self.drained_closes.as_slice()
     }
 
     fn handle_submission_descriptor(&mut self, descriptor: AppSqeDescriptor) -> CoreResult<()> {

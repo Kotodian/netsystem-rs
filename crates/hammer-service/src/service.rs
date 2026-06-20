@@ -50,9 +50,11 @@ use crate::session::{SessionQueueNext, SessionQueueNode};
 use crate::transport::tcp::{
     TcpInputControlPlane, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
     TcpListenerAddress, TcpListenerLookupAccess, TcpLookupId, TcpLookupSnapshot, TcpLookupValue,
-    TcpOutputNext, TcpOutputNode, TcpSessionProtocol, TcpV4ListenerKey, TcpV6ListenerKey,
+    TcpOutputNext, TcpOutputNode, TcpV4ListenerKey, TcpV6ListenerKey,
 };
+use crate::session::node::register_session_queue;
 use crate::transport::congestion::BbrController;
+use crate::transport::tcp::tcp_session_queue_dispatch_fn;
 use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -1039,17 +1041,20 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 )
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
-            let queue = TcpSessionProtocol::register_queue::<BbrController>(
-                worker,
-                runtime.packet_buffers().clone(),
+            let queue = register_session_queue(
+                crate::session::runtime::SessionDriverRuntime::<
+                    crate::transport::tcp::TcpConnectionState<BbrController>,
+                    crate::transport::tcp::TcpWorkerOwnedState,
+                >::new(
+                    worker,
+                    runtime.packet_buffers().clone(),
+                    crate::transport::tcp::TcpWorkerOwnedState::new(worker),
+                ),
             )
             .map_err(HammerError::from)?;
             let tcp_output = runtime
                 .nodes()
-                .try_register_internal(TcpOutputNode::new(
-                    TcpOutputNext::nodes(drop, lookup),
-                    queue,
-                ))
+                .try_register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)))
                 .map_err(HammerError::from)?;
             let node = runtime
                 .nodes()
@@ -1059,7 +1064,7 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .attach_queue(
                     queue,
                     SessionQueueNext::from_node(tcp_output),
-                    TcpSessionProtocol::session_queue_dispatch_fn::<BbrController>(),
+                    tcp_session_queue_dispatch_fn::<BbrController>(),
                 )
                 .map_err(HammerError::from)?;
             runtime

@@ -9,7 +9,7 @@ use hammer_core::protocol::transport::TransportConnectionKey;
 
 #[test]
 fn tcp_seq_wraparound_order_and_advance_are_safe() {
-    let before_wrap = TcpSeq::new(u32::MAX - 3);
+    let before_wrap = TcpSeq::from(u32::MAX - 3);
     let after_wrap = before_wrap.advance(8);
 
     assert_eq!(after_wrap.raw(), 4);

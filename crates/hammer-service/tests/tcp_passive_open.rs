@@ -8,7 +8,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::congestion::BbrController;
-use hammer_service::transport::tcp::TcpSessionProtocol;
+use hammer_service::transport::tcp::TcpWorkerOwnedState;
 use hammer_service::transport::tcp::{
     TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
     TcpOutputNode, TcpSynRcvdNext, TcpSynRcvdNode,
@@ -103,7 +103,7 @@ fn capture_process(
 fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
-        TcpSessionProtocol::register_queue::<BbrController>(
+        TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
             runtime.packet_buffers().clone(),
         )
@@ -155,7 +155,7 @@ fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
 fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
-        TcpSessionProtocol::register_queue::<BbrController>(
+        TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
             runtime.packet_buffers().clone(),
         )
@@ -228,7 +228,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
 fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
-        TcpSessionProtocol::register_queue::<BbrController>(
+        TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
             runtime.packet_buffers().clone(),
         )
@@ -289,7 +289,7 @@ fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
 fn tcp_syn_rcvd_rst_closes_session_and_completes_app_closed() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
     let handle =
-        TcpSessionProtocol::register_queue::<BbrController>(
+        TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
             runtime.packet_buffers().clone(),
         )

@@ -5,10 +5,9 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
-use super::TcpSessionProtocol;
 use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
-use super::session::TcpSessionQueueHandle;
+use super::TcpQueueHandle;
 use super::state_machine::FinWait1;
 
 #[hammer_component_macros::node_next]
@@ -19,7 +18,7 @@ pub enum TcpFinWait1Next {
 
 #[hammer_component_macros::node(role = internal, next = TcpFinWait1Next)]
 pub struct TcpFinWait1Node<C: CongestionController + 'static> {
-    session_queue: TcpSessionQueueHandle<C>,
+    session_queue: TcpQueueHandle<C>,
 }
 
 impl<C> Node for TcpFinWait1Node<C>
@@ -56,13 +55,13 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpFinWait1Node::<C>::runtime_nexts(runtime)?;
-    tcp_fin_wait1_frame::<C>(runtime, frame, TcpSessionQueueHandle::new(data), next)
+    tcp_fin_wait1_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
 }
 
 fn tcp_fin_wait1_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpSessionQueueHandle<C>,
+    session_queue: TcpQueueHandle<C>,
     next: [NodeId; TcpFinWait1Next::COUNT],
 ) -> CoreResult<NodeResult>
 where
@@ -87,7 +86,7 @@ where
 fn tcp_fin_wait1_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpSessionQueueHandle<C>,
+    session_queue: TcpQueueHandle<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
@@ -96,31 +95,34 @@ where
 {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut tx_index = None;
-    let result = TcpSessionProtocol::with_queue(session_queue, |queue: &mut super::session::TcpSessionQueue<C>| {
+    let result = {
+        let mut queue = session_queue.borrow_mut()?;
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp fin-wait1 session is missing"))?;
-        let connection: TcpConnection<FinWait1, _> = queue.take_connection(session_id)?;
-        let control = connection.receive_fin_wait1(queue, session_id, &packet)?;
+        let state = queue
+            .session(session_id)
+            .ok_or_else(|| CoreError::internal("tcp fin-wait1 session is missing"))?
+            .clone();
+        let connection: TcpConnection<FinWait1, _> = state.try_into()?;
+        let (next_state, control) =
+            connection.receive_fin_wait1(&mut queue, session_id, &packet)?;
+        let state = queue
+            .session_mut(session_id)
+            .ok_or_else(|| CoreError::internal("tcp fin-wait1 session is missing"))?;
+        *state = next_state;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
-            if let Err(error) = queue.protocol.insert_segment(allocated, segment) {
+            if let Err(error) = segment.write_to_buffer(runtime, allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }
             tx_index = Some(allocated);
         }
         Ok(())
-    });
+    };
     if let Err(error) = result {
         if let Some(tx_index) = tx_index.take() {
-            TcpSessionProtocol::with_queue(
-                session_queue,
-                |queue: &mut super::session::TcpSessionQueue<C>| {
-                queue.protocol.remove_segment(tx_index);
-                Ok(())
-                },
-            )?;
             runtime.free_index(tx_index);
         }
         return Err(error);
@@ -128,13 +130,6 @@ where
     if let Some(tx_index) = tx_index.take()
         && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
     {
-        TcpSessionProtocol::with_queue(
-            session_queue,
-            |queue: &mut super::session::TcpSessionQueue<C>| {
-            queue.protocol.remove_segment(tx_index);
-            Ok(())
-            },
-        )?;
         runtime.free_index(tx_index);
         return Err(error);
     }

@@ -1,0 +1,1312 @@
+11b02ef2 hammer-service(Refactor): privatize tcp sent recovery state
+
+## Files changed
+ crates/hammer-service/src/transport/tcp/mod.rs     |   2 +-
+ .../hammer-service/src/transport/tcp/recovery.rs   | 378 +++++++++++++++++----
+ crates/hammer-service/src/transport/tcp/session.rs |  12 +-
+ .../src/transport/tcp/state_machine.rs             | 150 ++++++--
+ crates/hammer-service/tests/tcp_rack_tlp.rs        | 236 -------------
+ .../2026-06-19-tcp-sack-dsack-ooo/task-2-report.md | 101 ++++++
+ 6 files changed, 539 insertions(+), 340 deletions(-)
+
+## Diff
+diff --git a/crates/hammer-service/src/transport/tcp/mod.rs b/crates/hammer-service/src/transport/tcp/mod.rs
+index b7575039..904a1255 100644
+--- a/crates/hammer-service/src/transport/tcp/mod.rs
++++ b/crates/hammer-service/src/transport/tcp/mod.rs
+@@ -41,21 +41,21 @@ pub use last_ack::{TcpLastAckNext, TcpLastAckNode};
+ pub use listen::{TcpListenNext, TcpListenNode};
+ pub use lookup::{
+     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerKey,
+     TcpListenerLookup, TcpListenerLookupAccess, TcpListenerTable, TcpLookupId, TcpLookupSnapshot,
+     TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey, TcpWorkerOwnedState,
+ };
+ pub use output::{
+     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN,
+     TcpOutputNext, TcpOutputNode,
+ };
+-pub use recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
++pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
+ pub use reply::{
+     TcpControlFlags, queue_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
+ };
+ pub use reset::{TcpResetNext, TcpResetNode};
+ pub use session::TcpSessionProtocol;
+ pub use session_index::{TcpPendingIndex, TcpSessionConnectionIndex};
+ pub use state::TcpInputFlags;
+ pub use syn_rcvd::{TcpSynRcvdNext, TcpSynRcvdNode};
+ pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
+ pub use time_wait::{TcpTimeWaitNext, TcpTimeWaitNode};
+diff --git a/crates/hammer-service/src/transport/tcp/recovery.rs b/crates/hammer-service/src/transport/tcp/recovery.rs
+index 3c7727a1..6edbb6b3 100644
+--- a/crates/hammer-service/src/transport/tcp/recovery.rs
++++ b/crates/hammer-service/src/transport/tcp/recovery.rs
+@@ -4,45 +4,45 @@ use hammer_core::protocol::tcp::TcpSackBlock;
+ use hammer_infra::vec::Vec;
+ 
+ use crate::transport::congestion::{
+     AckedPacket, CongestionController, LostPacket, PacketNumber, RttSample,
+ };
+ 
+ const DEFAULT_RACK_TIMEOUT_TICKS: u64 = 6;
+ const DEFAULT_TLP_TIMEOUT_TICKS: u64 = 20;
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+-pub struct TcpSentSegment {
+-    pub packet_number: PacketNumber,
+-    pub sequence: u32,
+-    pub end_sequence: u32,
+-    pub bytes: u32,
+-    pub sent_at: Instant,
+-    pub retransmitted: bool,
+-    pub is_probe: bool,
++struct OutstandingSegment {
++    packet_number: PacketNumber,
++    sequence: u32,
++    end_sequence: u32,
++    bytes: u32,
++    sent_at: Instant,
++    retransmitted: bool,
++    is_probe: bool,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub struct TcpRecoveryAck {
+     pub acknowledgment: u32,
+     pub now: Instant,
+     pub latest_rtt: Duration,
+     pub min_rtt: Duration,
+     pub app_limited: bool,
+     pub ecn_ce: bool,
+ }
+ 
+ #[derive(Clone, Debug, Default)]
+ pub struct TcpRecoveryState {
+     next_packet_number: PacketNumber,
+-    sent: Vec<TcpSentSegment>,
+-    rack_pending_loss: Vec<TcpSentSegment>,
++    sent: Vec<OutstandingSegment>,
++    rack_pending_loss: Vec<OutstandingSegment>,
+     rack_timer_armed: bool,
+     tlp_timer_armed: bool,
+ }
+ 
+ impl TcpRecoveryState {
+     pub fn new() -> Self {
+         Self {
+             next_packet_number: 1,
+             sent: Vec::new(),
+             rack_pending_loss: Vec::new(),
+@@ -50,22 +50,39 @@ impl TcpRecoveryState {
+             tlp_timer_armed: false,
+         }
+     }
+ 
+     pub fn next_packet_number(&mut self) -> PacketNumber {
+         let packet_number = self.next_packet_number;
+         self.next_packet_number = self.next_packet_number.saturating_add(1);
+         packet_number
+     }
+ 
+-    pub fn record_sent(&mut self, segment: TcpSentSegment) {
+-        self.sent.push(segment);
++    pub fn record_sent(
++        &mut self,
++        packet_number: PacketNumber,
++        sequence: u32,
++        end_sequence: u32,
++        bytes: u32,
++        sent_at: Instant,
++        retransmitted: bool,
++        is_probe: bool,
++    ) {
++        self.sent.push(OutstandingSegment {
++            packet_number,
++            sequence,
++            end_sequence,
++            bytes,
++            sent_at,
++            retransmitted,
++            is_probe,
++        });
+         self.tlp_timer_armed = true;
+     }
+ 
+     pub fn bytes_in_flight(&self) -> u32 {
+         self.sent
+             .iter()
+             .fold(0u32, |total, segment| total.saturating_add(segment.bytes))
+     }
+ 
+     pub fn has_unacked_data(&self) -> bool {
+@@ -74,119 +91,76 @@ impl TcpRecoveryState {
+ 
+     pub fn rack_timeout_ticks(&self) -> Option<u64> {
+         self.rack_timer_armed.then_some(DEFAULT_RACK_TIMEOUT_TICKS)
+     }
+ 
+     pub fn tlp_timeout_ticks(&self) -> Option<u64> {
+         (self.tlp_timer_armed && self.has_unacked_data()).then_some(DEFAULT_TLP_TIMEOUT_TICKS)
+     }
+ 
+     pub fn on_ack<C: CongestionController>(&mut self, ack: TcpRecoveryAck, congestion: &mut C) {
+-        let mut largest_acked = 0;
+-        let mut any_acked = false;
+-        let mut index = 0;
+-        while index < self.sent.len() {
+-            let segment = self.sent[index];
+-            if seq_before_or_equal(segment.end_sequence, ack.acknowledgment) {
+-                let segment = self.sent.remove(index);
+-                largest_acked = largest_acked.max(segment.packet_number);
+-                any_acked = true;
+-                deliver_acked_segment(self.bytes_in_flight(), ack, segment, congestion);
+-            } else {
+-                index += 1;
+-            }
+-        }
+-        if any_acked {
+-            congestion.on_end_acks(
+-                ack.now,
+-                self.bytes_in_flight(),
+-                ack.app_limited,
+-                largest_acked,
+-            );
+-        }
++        let acked = self.take_acked_segments(|segment| {
++            seq_before_or_equal(segment.end_sequence, ack.acknowledgment)
++        });
++        self.deliver_acked_segments(ack, acked, congestion);
+         self.tlp_timer_armed = self.has_unacked_data();
+     }
+ 
+     pub fn on_sack_blocks<C: CongestionController>(
+         &mut self,
+         ack: TcpRecoveryAck,
+         blocks: &[TcpSackBlock],
+         congestion: &mut C,
+     ) {
+-        self.on_ack(ack, congestion);
++        let mut acked = self.take_acked_segments(|segment| {
++            seq_before_or_equal(segment.end_sequence, ack.acknowledgment)
++        });
+         let mut highest_sacked_right = ack.acknowledgment;
+         for block in blocks {
+             highest_sacked_right = highest_sacked_right.max(block.right_edge);
+-            self.ack_sack_block(ack, *block, congestion);
++            acked.extend(self.take_acked_segments(|segment| {
++                seq_before_or_equal(block.left_edge, segment.sequence)
++                    && seq_before_or_equal(segment.end_sequence, block.right_edge)
++            }));
+         }
++        self.deliver_acked_segments(ack, acked, congestion);
+         if highest_sacked_right != ack.acknowledgment {
+             self.mark_rack_candidates(highest_sacked_right);
+         }
++        self.tlp_timer_armed = self.has_unacked_data();
+     }
+ 
+     pub fn on_rack_timeout<C: CongestionController>(&mut self, now: Instant, congestion: &mut C) {
+         while let Some(segment) = self.rack_pending_loss.pop() {
+             self.remove_outstanding(segment.packet_number);
+             congestion.on_loss(
+                 now,
+                 LostPacket {
+                     packet_number: segment.packet_number,
+                     bytes: segment.bytes,
+                     sent_at: segment.sent_at,
+                 },
+                 false,
+             );
+         }
+         self.rack_timer_armed = false;
+         self.tlp_timer_armed = self.has_unacked_data();
+     }
+ 
+-    pub fn next_tlp_probe(&mut self) -> Option<TcpSentSegment> {
++    #[cfg(test)]
++    fn next_tlp_probe(&mut self) -> Option<OutstandingSegment> {
+         let mut segment = *self.sent.iter().max_by_key(|segment| segment.sent_at)?;
+         segment.is_probe = true;
+         self.tlp_timer_armed = false;
+         Some(segment)
+     }
+ 
+-    fn ack_sack_block<C: CongestionController>(
+-        &mut self,
+-        ack: TcpRecoveryAck,
+-        block: TcpSackBlock,
+-        congestion: &mut C,
+-    ) {
+-        let mut largest_acked = 0;
+-        let mut any_acked = false;
+-        let mut index = 0;
+-        while index < self.sent.len() {
+-            let segment = self.sent[index];
+-            if seq_before_or_equal(block.left_edge, segment.sequence)
+-                && seq_before_or_equal(segment.end_sequence, block.right_edge)
+-            {
+-                let segment = self.sent.remove(index);
+-                largest_acked = largest_acked.max(segment.packet_number);
+-                any_acked = true;
+-                deliver_acked_segment(self.bytes_in_flight(), ack, segment, congestion);
+-            } else {
+-                index += 1;
+-            }
+-        }
+-        if any_acked {
+-            congestion.on_end_acks(
+-                ack.now,
+-                self.bytes_in_flight(),
+-                ack.app_limited,
+-                largest_acked,
+-            );
+-        }
+-        self.tlp_timer_armed = self.has_unacked_data();
+-    }
+-
+     fn mark_rack_candidates(&mut self, highest_sacked_right: u32) {
+         for segment in self.sent.iter().copied() {
+             if seq_before(segment.end_sequence, highest_sacked_right)
+                 && !self
+                     .rack_pending_loss
+                     .iter()
+                     .any(|pending| pending.packet_number == segment.packet_number)
+             {
+                 self.rack_pending_loss.push(segment);
+             }
+@@ -196,23 +170,72 @@ impl TcpRecoveryState {
+ 
+     fn remove_outstanding(&mut self, packet_number: PacketNumber) {
+         if let Some(index) = self
+             .sent
+             .iter()
+             .position(|segment| segment.packet_number == packet_number)
+         {
+             self.sent.remove(index);
+         }
+     }
++
++    fn take_acked_segments(
++        &mut self,
++        mut is_acked: impl FnMut(OutstandingSegment) -> bool,
++    ) -> Vec<OutstandingSegment> {
++        let mut acked = Vec::new();
++        let mut index = 0;
++        while index < self.sent.len() {
++            let segment = self.sent[index];
++            if is_acked(segment) {
++                acked.push(self.sent.remove(index));
++            } else {
++                index += 1;
++            }
++        }
++        acked
++    }
++
++    fn deliver_acked_segments<C: CongestionController>(
++        &mut self,
++        ack: TcpRecoveryAck,
++        acked: Vec<OutstandingSegment>,
++        congestion: &mut C,
++    ) {
++        let mut largest_acked = 0;
++        let mut any_acked = false;
++        let mut bytes_in_flight_after_ack = self.bytes_in_flight();
++        let total_acked_bytes = acked
++            .iter()
++            .fold(0u32, |total, segment| total.saturating_add(segment.bytes));
++        let mut bytes_in_flight_before_next_ack =
++            bytes_in_flight_after_ack.saturating_add(total_acked_bytes);
++        for segment in acked {
++            largest_acked = largest_acked.max(segment.packet_number);
++            any_acked = true;
++            bytes_in_flight_before_next_ack =
++                bytes_in_flight_before_next_ack.saturating_sub(segment.bytes);
++            bytes_in_flight_after_ack = bytes_in_flight_before_next_ack;
++            deliver_acked_segment(bytes_in_flight_after_ack, ack, segment, congestion);
++        }
++        if any_acked {
++            congestion.on_end_acks(
++                ack.now,
++                self.bytes_in_flight(),
++                ack.app_limited,
++                largest_acked,
++            );
++        }
++    }
+ }
+ 
+-impl Default for TcpSentSegment {
++impl Default for OutstandingSegment {
+     fn default() -> Self {
+         let now = Instant::now();
+         Self {
+             packet_number: 0,
+             sequence: 0,
+             end_sequence: 0,
+             bytes: 0,
+             sent_at: now,
+             retransmitted: false,
+             is_probe: false,
+@@ -226,29 +249,240 @@ fn seq_before(left: u32, right: u32) -> bool {
+ }
+ 
+ #[inline]
+ fn seq_before_or_equal(left: u32, right: u32) -> bool {
+     left == right || seq_before(left, right)
+ }
+ 
+ fn deliver_acked_segment<C: CongestionController>(
+     bytes_in_flight: u32,
+     ack: TcpRecoveryAck,
+-    segment: TcpSentSegment,
++    segment: OutstandingSegment,
+     congestion: &mut C,
+ ) {
+     congestion.on_ack(
+         ack.now,
+         AckedPacket {
+             packet_number: segment.packet_number,
+             bytes: segment.bytes,
+             sent_at: segment.sent_at,
+             app_limited: ack.app_limited,
+             ecn_ce: ack.ecn_ce,
+         },
+         RttSample {
+             latest: ack.latest_rtt,
+             min: ack.min_rtt,
+         },
+         bytes_in_flight,
+     );
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[derive(Clone, Debug, Default)]
++    struct RecordingController {
++        acked: Vec<AckedPacket>,
++        acked_bytes_in_flight: Vec<u32>,
++        lost: Vec<LostPacket>,
++        end_acks: u32,
++        mtu: u32,
++    }
++
++    impl CongestionController for RecordingController {
++        fn new(max_datagram_size: u32) -> Self {
++            Self {
++                mtu: max_datagram_size,
++                ..Self::default()
++            }
++        }
++
++        fn metrics(&self) -> crate::transport::congestion::CongestionMetrics {
++            crate::transport::congestion::CongestionMetrics {
++                congestion_window: 0,
++                pacing_rate_bytes_per_second: None,
++                delivered: self.acked.len() as u64,
++                max_bandwidth_bytes_per_second: 0,
++                min_rtt: None,
++            }
++        }
++
++        fn max_datagram_size(&self) -> u32 {
++            self.mtu
++        }
++
++        fn congestion_window(&self) -> u32 {
++            0
++        }
++
++        fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
++            None
++        }
++
++        fn delivered(&self) -> u64 {
++            self.acked.len() as u64
++        }
++
++        fn min_rtt(&self) -> Option<Duration> {
++            None
++        }
++
++        fn max_bandwidth_bytes_per_second(&self) -> u64 {
++            0
++        }
++
++        fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
++
++        fn on_ack(&mut self, _: Instant, acked: AckedPacket, _: RttSample, bytes_in_flight: u32) {
++            self.acked_bytes_in_flight.push(bytes_in_flight);
++            self.acked.push(acked);
++        }
++
++        fn on_end_acks(&mut self, _: Instant, _: u32, _: bool, _: PacketNumber) {
++            self.end_acks += 1;
++        }
++
++        fn on_loss(&mut self, _: Instant, lost: LostPacket, _: bool) {
++            self.lost.push(lost);
++        }
++
++        fn on_mtu_update(&mut self, max_datagram_size: u32) {
++            self.mtu = max_datagram_size;
++        }
++
++        fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
++            (pending_bytes != 0).then_some(Duration::ZERO)
++        }
++    }
++
++    fn ack(acknowledgment: u32, now: Instant, rtt_ms: u64) -> TcpRecoveryAck {
++        TcpRecoveryAck {
++            acknowledgment,
++            now,
++            latest_rtt: Duration::from_millis(rtt_ms),
++            min_rtt: Duration::from_millis(rtt_ms),
++            app_limited: false,
++            ecn_ce: false,
++        }
++    }
++
++    fn record_sent_for_test(
++        recovery: &mut TcpRecoveryState,
++        packet_number: PacketNumber,
++        sequence: u32,
++        end_sequence: u32,
++        bytes: u32,
++        sent_at: Instant,
++    ) {
++        recovery.record_sent(
++            packet_number,
++            sequence,
++            end_sequence,
++            bytes,
++            sent_at,
++            false,
++            false,
++        );
++    }
++
++    #[test]
++    fn on_ack_acknowledges_cumulative_range() {
++        let now = Instant::now();
++        let mut recovery = TcpRecoveryState::new();
++        let mut controller = RecordingController::new(1_460);
++        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
++        record_sent_for_test(
++            &mut recovery,
++            2,
++            2_000,
++            3_000,
++            1_000,
++            now + Duration::from_millis(1),
++        );
++
++        recovery.on_ack(
++            ack(2_000, now + Duration::from_millis(40), 40),
++            &mut controller,
++        );
++
++        assert_eq!(controller.acked.len(), 1);
++        assert_eq!(controller.acked[0].packet_number, 1);
++        assert_eq!(controller.acked_bytes_in_flight.as_slice(), &[1_000]);
++        assert_eq!(recovery.bytes_in_flight(), 1_000);
++    }
++
++    #[test]
++    fn on_ack_reports_per_acked_segment_bytes_in_flight() {
++        let now = Instant::now();
++        let mut recovery = TcpRecoveryState::new();
++        let mut controller = RecordingController::new(1_460);
++        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
++        record_sent_for_test(
++            &mut recovery,
++            2,
++            2_000,
++            3_000,
++            1_000,
++            now + Duration::from_millis(1),
++        );
++
++        recovery.on_ack(
++            ack(3_000, now + Duration::from_millis(30), 40),
++            &mut controller,
++        );
++
++        assert_eq!(controller.acked.len(), 2);
++        assert_eq!(controller.acked[0].packet_number, 1);
++        assert_eq!(controller.acked[1].packet_number, 2);
++        assert_eq!(controller.acked_bytes_in_flight.as_slice(), &[1_000, 0]);
++    }
++
++    #[test]
++    fn on_sack_blocks_marks_older_segment_lost_after_later_sack() {
++        let now = Instant::now();
++        let mut recovery = TcpRecoveryState::new();
++        let mut controller = RecordingController::new(1_460);
++        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
++        record_sent_for_test(
++            &mut recovery,
++            2,
++            2_000,
++            3_000,
++            1_000,
++            now + Duration::from_millis(1),
++        );
++
++        recovery.on_sack_blocks(
++            ack(1_000, now + Duration::from_millis(30), 40),
++            &[TcpSackBlock {
++                left_edge: 2_000,
++                right_edge: 3_000,
++            }],
++            &mut controller,
++        );
++        recovery.on_rack_timeout(now + Duration::from_millis(56), &mut controller);
++
++        assert_eq!(controller.lost.len(), 1);
++        assert_eq!(controller.lost[0].packet_number, 1);
++    }
++
++    #[test]
++    fn next_tlp_probe_selects_newest_outstanding_segment() {
++        let now = Instant::now();
++        let mut recovery = TcpRecoveryState::new();
++        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
++        record_sent_for_test(
++            &mut recovery,
++            2,
++            2_000,
++            3_000,
++            1_000,
++            now + Duration::from_millis(1),
++        );
++
++        let probe = recovery.next_tlp_probe().expect("tlp probe");
++
++        assert_eq!(probe.packet_number, 2);
++        assert!(probe.is_probe);
++    }
++}
+diff --git a/crates/hammer-service/src/transport/tcp/session.rs b/crates/hammer-service/src/transport/tcp/session.rs
+index 21b4b791..91583ef4 100644
+--- a/crates/hammer-service/src/transport/tcp/session.rs
++++ b/crates/hammer-service/src/transport/tcp/session.rs
+@@ -483,21 +483,25 @@ impl TcpConnection<Established, TcpServiceController> {
+                 .replace_session_state(session_id, connection.into());
+             queue.close_session(session_id)?;
+             if packet.payload_len != 0 {
+                 runtime.free_index(index);
+             }
+             return Ok(None);
+         }
+         if let Some(acknowledgment) = packet.acknowledgment
+             && packet.flags.contains(TcpSegmentFlags::ACK)
+         {
+-            self.receive_ack(acknowledgment, packet.advertised_window);
++            self.receive_ack(
++                acknowledgment,
++                packet.advertised_window,
++                packet.sack_blocks.as_slice(),
++            );
+         }
+ 
+         let mut ack = false;
+         let mut accepted_payload_len = None;
+         if packet.payload_len != 0 {
+             ack = true;
+             accepted_payload_len = self.accept_payload(packet);
+         }
+ 
+         if packet.flags.contains(TcpSegmentFlags::FIN) {
+@@ -556,21 +560,25 @@ impl TcpConnection<CloseWait, TcpServiceController> {
+             queue.protocol.forget_session(session_id);
+             queue
+                 .driver
+                 .replace_session_state(session_id, connection.into());
+             queue.close_session(session_id)?;
+             return Ok(None);
+         }
+         if let Some(acknowledgment) = packet.acknowledgment
+             && packet.flags.contains(TcpSegmentFlags::ACK)
+         {
+-            self.receive_ack(acknowledgment, packet.advertised_window);
++            self.receive_ack(
++                acknowledgment,
++                packet.advertised_window,
++                packet.sack_blocks.as_slice(),
++            );
+         }
+         if packet.flags.contains(TcpSegmentFlags::FIN) {
+             let (connection, segment) = self.accept_repeated_fin(packet);
+             queue
+                 .driver
+                 .replace_session_state(session_id, connection.into());
+             return Ok(Some(segment));
+         }
+         queue.driver.replace_session_state(session_id, self.into());
+         Ok(None)
+diff --git a/crates/hammer-service/src/transport/tcp/state_machine.rs b/crates/hammer-service/src/transport/tcp/state_machine.rs
+index bb233adb..75293f70 100644
+--- a/crates/hammer-service/src/transport/tcp/state_machine.rs
++++ b/crates/hammer-service/src/transport/tcp/state_machine.rs
+@@ -1,29 +1,29 @@
+ use std::net::SocketAddr;
+ use std::time::{Duration, Instant};
+ 
+ use hammer_adapter::DataWorkerId;
+ use hammer_core::error::{CoreError, CoreResult};
+ use hammer_core::protocol::tcp::{
+-    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSegmentFlags,
+-    TcpSeq, TcpState,
++    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSackBlock,
++    TcpSegmentFlags, TcpSeq, TcpState,
+ };
+ 
+ use crate::transport::congestion::CongestionController;
+ 
+ use super::TcpInputNext;
+ use super::connection::{
+     TCP_INITIAL_RETRANSMIT_TIMEOUT, TcpConnectionOptionState, TcpConnectionTimerKind,
+     TcpRetransmitTimeoutState,
+ };
+ use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
+-use super::recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
++use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
+ use super::segment::{TcpPacket, TcpSegment};
+ 
+ const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
+ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub struct Closed {
+     _private: (),
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -363,47 +363,63 @@ where
+ 
+     #[inline]
+     fn accepts_ack(&self, acknowledgment: u32) -> bool {
+         !TcpSeq::new(acknowledgment).before(TcpSeq::new(self.snd_una))
+             && !TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_nxt))
+     }
+ 
+     #[inline]
+     fn apply_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
+         if self.accepts_ack(acknowledgment) {
+-            if TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una)) {
+-                self.ack_sent_data(acknowledgment);
+-            }
+             self.snd_una = acknowledgment;
+         }
+         self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
+     }
+ 
+-    fn ack_sent_data(&mut self, acknowledgment: u32) {
++    fn recovery_ack(&self, acknowledgment: u32) -> TcpRecoveryAck {
+         let now = Instant::now();
+         let latest_rtt = self
+             .retransmit_timeout
+             .smoothed_rtt()
+             .unwrap_or(TCP_INITIAL_RETRANSMIT_TIMEOUT);
+         let min_rtt = latest_rtt;
+-        self.recovery.on_ack(
+-            TcpRecoveryAck {
+-                acknowledgment,
+-                now,
+-                latest_rtt,
+-                min_rtt,
+-                app_limited: false,
+-                ecn_ce: false,
+-            },
+-            &mut self.congestion,
+-        );
+-        self.retransmit_timeout.observe_ack_sample(latest_rtt);
++        TcpRecoveryAck {
++            acknowledgment,
++            now,
++            latest_rtt,
++            min_rtt,
++            app_limited: false,
++            ecn_ce: false,
++        }
++    }
++
++    fn observe_ack_progress(&mut self, acknowledgment: u32, sack_blocks: &[TcpSackBlock]) {
++        if !self.accepts_ack(acknowledgment) {
++            return;
++        }
++        let advanced = TcpSeq::new(acknowledgment).after(TcpSeq::new(self.snd_una));
++        let recovery_ack = self.recovery_ack(acknowledgment);
++        let latest_rtt = recovery_ack.latest_rtt;
++        if advanced {
++            if sack_blocks.is_empty() {
++                self.recovery.on_ack(recovery_ack, &mut self.congestion);
++            } else {
++                self.recovery
++                    .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion);
++            }
++        } else if !sack_blocks.is_empty() {
++            self.recovery
++                .on_sack_blocks(recovery_ack, sack_blocks, &mut self.congestion);
++        }
++        if advanced {
++            self.retransmit_timeout.observe_ack_sample(latest_rtt);
++        }
+     }
+ 
+     #[inline]
+     fn receive_in_order(&mut self, sequence: u32, payload_len: usize) -> bool {
+         if sequence != self.rcv_nxt {
+             return false;
+         }
+         self.rcv_nxt = TcpSeq::new(self.rcv_nxt).advance(payload_len as u32).raw();
+         true
+     }
+@@ -779,68 +795,78 @@ where
+         &mut self,
+         payload_len: usize,
+         now: Instant,
+     ) -> CoreResult<TcpConnectionTimerKind> {
+         let payload_len = u32::try_from(payload_len)
+             .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+         let sequence = self.snd_nxt;
+         let end_sequence = TcpSeq::new(sequence).advance(payload_len).raw();
+         let bytes_in_flight = self.recovery.bytes_in_flight();
+         let packet_number = self.recovery.next_packet_number();
+-        self.recovery.record_sent(TcpSentSegment {
++        self.recovery.record_sent(
+             packet_number,
+             sequence,
+             end_sequence,
+-            bytes: payload_len,
+-            sent_at: now,
+-            retransmitted: false,
+-            is_probe: false,
+-        });
++            payload_len,
++            now,
++            false,
++            false,
++        );
+         self.congestion
+             .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
+         self.snd_nxt = end_sequence;
+         let mut timers = TcpConnectionTimerKind::empty();
+         if self.recovery.rack_timeout_ticks().is_some() {
+             timers.insert(TcpConnectionTimerKind::RACK);
+         }
+         if self.recovery.tlp_timeout_ticks().is_some() {
+             timers.insert(TcpConnectionTimerKind::TLP);
+         }
+         Ok(timers)
+     }
+ 
+     #[inline]
+     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
+         self.close_reason = Some(TcpCloseReason::RemoteReset);
+         TcpConnection::closed_from_established(self)
+     }
+ 
+     #[inline]
+-    pub(crate) fn receive_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
++    pub(crate) fn receive_ack(
++        &mut self,
++        acknowledgment: u32,
++        advertised_window: u16,
++        sack_blocks: &[TcpSackBlock],
++    ) {
++        self.observe_ack_progress(acknowledgment, sack_blocks);
+         self.apply_ack(acknowledgment, advertised_window);
+     }
+ 
+     #[inline]
+     pub(crate) fn accept_payload(&mut self, packet: &TcpPacket) -> Option<usize> {
+         if packet.payload_len == 0 {
+             return None;
+         }
+         self.receive_in_order(packet.sequence, packet.payload_len)
+             .then_some(packet.payload_len)
+     }
+ 
+     pub(crate) fn accept_fin(
+         mut self,
+         packet: &TcpPacket,
+     ) -> (TcpConnection<CloseWait, C>, TcpSegment) {
+         if let Some(acknowledgment) = packet.acknowledgment {
+-            self.apply_ack(acknowledgment, packet.advertised_window);
++            self.receive_ack(
++                acknowledgment,
++                packet.advertised_window,
++                packet.sack_blocks.as_slice(),
++            );
+         }
+         let fin_sequence = packet.sequence.wrapping_add(packet.payload_len as u32);
+         self.receive_in_order(fin_sequence, 1);
+         self.close_reason = Some(TcpCloseReason::RemoteFin);
+         let next = TcpConnection::close_wait_from_established(self);
+         let segment = next.control_segment(packet, TcpSegmentFlags::ACK, None);
+         (next, segment)
+     }
+ }
+ 
+@@ -848,21 +874,27 @@ impl<C> TcpConnection<CloseWait, C>
+ where
+     C: CongestionController,
+ {
+     #[inline]
+     pub(crate) fn close_remote_reset(mut self) -> TcpConnection<Closed, C> {
+         self.close_reason = Some(TcpCloseReason::RemoteReset);
+         TcpConnection::closed_from_close_wait(self)
+     }
+ 
+     #[inline]
+-    pub(crate) fn receive_ack(&mut self, acknowledgment: u32, advertised_window: u16) {
++    pub(crate) fn receive_ack(
++        &mut self,
++        acknowledgment: u32,
++        advertised_window: u16,
++        sack_blocks: &[TcpSackBlock],
++    ) {
++        self.observe_ack_progress(acknowledgment, sack_blocks);
+         self.apply_ack(acknowledgment, advertised_window);
+     }
+ 
+     #[inline]
+     pub(crate) fn accept_repeated_fin(mut self, packet: &TcpPacket) -> (Self, TcpSegment) {
+         self.receive_in_order(packet.sequence, 1);
+         let segment = self.control_segment(packet, TcpSegmentFlags::ACK, None);
+         (self, segment)
+     }
+ }
+@@ -1162,18 +1194,78 @@ mod tests {
+         assert_eq!(connection.congestion.sent.as_slice(), &[(1, 5, 0, now)]);
+     }
+ 
+     #[test]
+     fn established_ack_cleans_sent_segment_and_updates_congestion() {
+         let now = Instant::now();
+         let mut connection = established_connection();
+         let end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
+ 
+         connection.commit_payload_tx(5, now).expect("commit tx");
+-        connection.receive_ack(end, u16::MAX);
++        connection.receive_ack(end, u16::MAX, &[]);
+ 
+         assert_eq!(connection.snd_una(), end);
+         assert_eq!(connection.recovery().bytes_in_flight(), 0);
+         assert_eq!(connection.congestion.acked.len(), 1);
+         assert_eq!(connection.congestion.end_acks, 1);
+     }
++
++    #[test]
++    fn established_receive_ack_with_sack_only_cleans_cumulative_range_once() {
++        let now = Instant::now();
++        let mut connection = established_connection();
++        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
++        let second_end = TcpSeq::new(first_end).advance(5).raw();
++
++        connection.commit_payload_tx(5, now).expect("first tx");
++        connection
++            .commit_payload_tx(5, now + Duration::from_millis(1))
++            .expect("second tx");
++
++        connection.receive_ack(
++            first_end,
++            u16::MAX,
++            &[TcpSackBlock {
++                left_edge: first_end,
++                right_edge: second_end,
++            }],
++        );
++
++        assert_eq!(connection.snd_una(), first_end);
++        assert_eq!(connection.recovery().bytes_in_flight(), 0);
++        assert_eq!(connection.congestion.acked.len(), 2);
++        assert_eq!(connection.congestion.end_acks, 1);
++    }
++
++    #[test]
++    fn established_duplicate_ack_with_sack_does_not_update_rto_sample() {
++        let now = Instant::now();
++        let mut connection = established_connection();
++        let first_end = TcpSeq::new(connection.snd_nxt()).advance(5).raw();
++        let second_end = TcpSeq::new(first_end).advance(5).raw();
++
++        connection.commit_payload_tx(5, now).expect("first tx");
++        connection
++            .commit_payload_tx(5, now + Duration::from_millis(1))
++            .expect("second tx");
++        connection.receive_ack(first_end, u16::MAX, &[]);
++
++        let before = connection.retransmit_timeout().smoothed_rtt();
++        let before_var = connection.retransmit_timeout().rtt_variance();
++        let before_rto = connection.retransmit_timeout().retransmit_timeout();
++        connection.receive_ack(
++            first_end,
++            u16::MAX,
++            &[TcpSackBlock {
++                left_edge: first_end,
++                right_edge: second_end,
++            }],
++        );
++
++        assert_eq!(connection.retransmit_timeout().smoothed_rtt(), before);
++        assert_eq!(connection.retransmit_timeout().rtt_variance(), before_var);
++        assert_eq!(
++            connection.retransmit_timeout().retransmit_timeout(),
++            before_rto
++        );
++    }
+ }
+diff --git a/crates/hammer-service/tests/tcp_rack_tlp.rs b/crates/hammer-service/tests/tcp_rack_tlp.rs
+deleted file mode 100644
+index efb8fb66..00000000
+--- a/crates/hammer-service/tests/tcp_rack_tlp.rs
++++ /dev/null
+@@ -1,236 +0,0 @@
+-use std::fs;
+-use std::path::Path;
+-use std::time::{Duration, Instant};
+-
+-use hammer_core::protocol::tcp::TcpSackBlock;
+-use hammer_infra::vec::Vec;
+-use hammer_service::transport::congestion::{
+-    AckedPacket, CongestionController, CongestionMetrics, LostPacket, PacketNumber, RttSample,
+-};
+-use hammer_service::transport::tcp::recovery::{TcpRecoveryAck, TcpRecoveryState, TcpSentSegment};
+-
+-#[derive(Clone, Debug, Default)]
+-struct RecordingController {
+-    acked: Vec<AckedPacket>,
+-    lost: Vec<LostPacket>,
+-    sent: Vec<PacketNumber>,
+-    end_acks: u32,
+-    last_rtt: Option<RttSample>,
+-    last_event_at: Option<Instant>,
+-    last_sent_bytes: u32,
+-    last_bytes_in_flight: u32,
+-    app_limited_end: bool,
+-    largest_acked_packet: PacketNumber,
+-    mtu: u32,
+-    pending_send_delay: Option<Duration>,
+-}
+-
+-impl CongestionController for RecordingController {
+-    fn new(max_datagram_size: u32) -> Self {
+-        Self {
+-            mtu: max_datagram_size,
+-            ..Self::default()
+-        }
+-    }
+-
+-    fn metrics(&self) -> CongestionMetrics {
+-        CongestionMetrics {
+-            congestion_window: 0,
+-            pacing_rate_bytes_per_second: None,
+-            delivered: self.acked.len() as u64,
+-            max_bandwidth_bytes_per_second: 0,
+-            min_rtt: None,
+-        }
+-    }
+-
+-    fn max_datagram_size(&self) -> u32 {
+-        self.mtu
+-    }
+-
+-    fn congestion_window(&self) -> u32 {
+-        0
+-    }
+-
+-    fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
+-        None
+-    }
+-
+-    fn delivered(&self) -> u64 {
+-        self.acked.len() as u64
+-    }
+-
+-    fn min_rtt(&self) -> Option<Duration> {
+-        None
+-    }
+-
+-    fn max_bandwidth_bytes_per_second(&self) -> u64 {
+-        0
+-    }
+-
+-    fn on_packet_sent(
+-        &mut self,
+-        packet_number: PacketNumber,
+-        bytes_sent: u32,
+-        bytes_in_flight: u32,
+-        now: Instant,
+-    ) {
+-        self.sent.push(packet_number);
+-        self.last_event_at = Some(now);
+-        self.last_sent_bytes = bytes_sent;
+-        self.last_bytes_in_flight = bytes_in_flight.saturating_add(bytes_sent);
+-        self.pending_send_delay = Some(Duration::ZERO);
+-    }
+-
+-    fn on_ack(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample, bytes_in_flight: u32) {
+-        self.pending_send_delay = Some(now.saturating_duration_since(acked.sent_at));
+-        self.last_event_at = Some(now);
+-        self.last_rtt = Some(rtt);
+-        self.last_bytes_in_flight = bytes_in_flight;
+-        self.acked.push(acked);
+-    }
+-
+-    fn on_end_acks(
+-        &mut self,
+-        now: Instant,
+-        bytes_in_flight: u32,
+-        app_limited: bool,
+-        largest_acked_packet: PacketNumber,
+-    ) {
+-        self.last_event_at = Some(now);
+-        self.pending_send_delay = Some(Duration::ZERO);
+-        self.last_bytes_in_flight = bytes_in_flight;
+-        self.app_limited_end = app_limited;
+-        self.largest_acked_packet = largest_acked_packet;
+-        self.end_acks += 1;
+-    }
+-
+-    fn on_loss(&mut self, now: Instant, lost: LostPacket, persistent_congestion: bool) {
+-        self.last_event_at = Some(now);
+-        self.pending_send_delay = Some(now.saturating_duration_since(lost.sent_at));
+-        if persistent_congestion {
+-            self.last_bytes_in_flight = 0;
+-        }
+-        self.lost.push(lost);
+-    }
+-
+-    fn on_mtu_update(&mut self, max_datagram_size: u32) {
+-        self.mtu = max_datagram_size;
+-    }
+-
+-    fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
+-        if pending_bytes == 0 {
+-            None
+-        } else {
+-            self.pending_send_delay
+-        }
+-    }
+-}
+-
+-fn segment(packet_number: u64, sequence: u32, len: u32, sent_at: Instant) -> TcpSentSegment {
+-    TcpSentSegment {
+-        packet_number,
+-        sequence,
+-        end_sequence: sequence.wrapping_add(len),
+-        bytes: len,
+-        sent_at,
+-        retransmitted: false,
+-        is_probe: false,
+-    }
+-}
+-
+-fn ack(acknowledgment: u32, now: Instant, rtt_ms: u64) -> TcpRecoveryAck {
+-    TcpRecoveryAck {
+-        acknowledgment,
+-        now,
+-        latest_rtt: Duration::from_millis(rtt_ms),
+-        min_rtt: Duration::from_millis(rtt_ms),
+-        app_limited: false,
+-        ecn_ce: false,
+-    }
+-}
+-
+-#[test]
+-fn rack_cumulative_ack_feeds_controller_ack_sample() {
+-    let now = Instant::now();
+-    let mut recovery = TcpRecoveryState::new();
+-    let mut controller = RecordingController::new(1_460);
+-    recovery.record_sent(segment(1, 1_000, 1_000, now));
+-    recovery.record_sent(segment(2, 2_000, 1_000, now + Duration::from_millis(1)));
+-
+-    recovery.on_ack(
+-        ack(2_000, now + Duration::from_millis(40), 40),
+-        &mut controller,
+-    );
+-
+-    assert_eq!(controller.acked.len(), 1);
+-    assert_eq!(controller.acked[0].packet_number, 1);
+-    assert_eq!(controller.acked[0].bytes, 1_000);
+-    assert_eq!(controller.end_acks, 1);
+-    assert_eq!(recovery.bytes_in_flight(), 1_000);
+-}
+-
+-#[test]
+-fn rack_marks_older_unacked_segment_lost_after_later_sack() {
+-    let now = Instant::now();
+-    let mut recovery = TcpRecoveryState::new();
+-    let mut controller = RecordingController::new(1_460);
+-    recovery.record_sent(segment(1, 1_000, 1_000, now));
+-    recovery.record_sent(segment(2, 2_000, 1_000, now + Duration::from_millis(1)));
+-
+-    recovery.on_sack_blocks(
+-        ack(1_000, now + Duration::from_millis(30), 40),
+-        &[TcpSackBlock {
+-            left_edge: 2_000,
+-            right_edge: 3_000,
+-        }],
+-        &mut controller,
+-    );
+-    recovery.on_rack_timeout(now + Duration::from_millis(56), &mut controller);
+-
+-    assert_eq!(controller.lost.len(), 1);
+-    assert_eq!(controller.lost[0].packet_number, 1);
+-}
+-
+-#[test]
+-fn tlp_selects_newest_outstanding_segment_as_probe() {
+-    let now = Instant::now();
+-    let mut recovery = TcpRecoveryState::new();
+-    let mut controller = RecordingController::new(1_460);
+-    recovery.record_sent(segment(1, 1_000, 1_000, now));
+-    recovery.record_sent(segment(2, 2_000, 1_000, now + Duration::from_millis(1)));
+-    recovery.on_ack(
+-        ack(2_000, now + Duration::from_millis(40), 40),
+-        &mut controller,
+-    );
+-
+-    let probe = recovery.next_tlp_probe().expect("tlp probe");
+-
+-    assert_eq!(probe.packet_number, 2);
+-    assert_eq!(probe.sequence, 2_000);
+-    assert!(probe.is_probe);
+-}
+-
+-#[test]
+-fn tcp_recovery_uses_infra_vec_and_has_no_session_app_or_bbr_types() {
+-    let source = fs::read_to_string(
+-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/tcp/recovery.rs"),
+-    )
+-    .expect("read recovery source");
+-
+-    assert!(source.contains("hammer_infra::vec::Vec"));
+-    for forbidden in [
+-        "TcpConnectionState",
+-        "TcpSession",
+-        "SessionId",
+-        "SessionQueue",
+-        "AppRing",
+-        "AppOp",
+-        "BbrController",
+-        "BbrMode",
+-    ] {
+-        assert!(
+-            !source.contains(forbidden),
+-            "tcp recovery leaked unrelated type: {forbidden}"
+-        );
+-    }
+-}
+diff --git a/docs/superpowers/sdd/2026-06-19-tcp-sack-dsack-ooo/task-2-report.md b/docs/superpowers/sdd/2026-06-19-tcp-sack-dsack-ooo/task-2-report.md
+new file mode 100644
+index 00000000..83a1e765
+--- /dev/null
++++ b/docs/superpowers/sdd/2026-06-19-tcp-sack-dsack-ooo/task-2-report.md
+@@ -0,0 +1,101 @@
++# Task 2 Report
++
++## Scope
++
++Implemented Task 2 from `docs/superpowers/sdd/2026-06-19-tcp-sack-dsack-ooo/task-2-brief.md` on top of HEAD `349ee24f2d4f48ef41b0a5838b8564974880ad0d`.
++
++## TDD record
++
++### RED
++
++1. Added `transport::tcp::recovery::tests` inside `crates/hammer-service/src/transport/tcp/recovery.rs` so recovery behavior no longer depended on an external public sent-record test fixture.
++2. Added `established_receive_ack_with_sack_only_cleans_cumulative_range_once` in `crates/hammer-service/src/transport/tcp/state_machine.rs`.
++3. Ran:
++   - `cargo test -p hammer-service transport::tcp::recovery::tests -- --nocapture`
++   - `cargo test -p hammer-service established_receive_ack_with_sack_only_cleans_cumulative_range_once -- --nocapture`
++4. Observed expected failures:
++   - `receive_ack` still only accepted `(acknowledgment, advertised_window)`.
++   - ACK+SACK handling still produced two recovery cleanup completions for one ACK event.
++
++### GREEN
++
++1. Removed public `TcpSentSegment` and replaced it with private `OutstandingSegment` in `recovery.rs`.
++2. Changed `TcpRecoveryState::record_sent(...)` to a primitive-parameter entrypoint.
++3. Removed the `TcpSentSegment` re-export from `crates/hammer-service/src/transport/tcp/mod.rs`.
++4. Updated `commit_payload_tx()` to pass primitive sent facts directly into recovery.
++5. Moved ACK/SACK event handling in established/close-wait receive paths to:
++   - update recovery exactly once per ACK event,
++   - use `on_sack_blocks()` when SACK blocks are present,
++   - use `on_ack()` otherwise.
++6. Refactored recovery ACK processing so one ACK event emits one `on_end_acks(...)` completion even when cumulative ACK and SACK block cleanup both happen in that event.
++7. Deleted `crates/hammer-service/tests/tcp_rack_tlp.rs` after migrating the relevant coverage into `recovery.rs`.
++
++### REFACTOR
++
++1. Kept sent-record ownership private to `recovery.rs`.
++2. Restricted `next_tlp_probe()` to test-only visibility with `#[cfg(test)]` instead of keeping a public probe hook alive.
++3. Ran `cargo fmt --all`.
++
++## Files changed
++
++- `crates/hammer-service/src/transport/tcp/recovery.rs`
++- `crates/hammer-service/src/transport/tcp/state_machine.rs`
++- `crates/hammer-service/src/transport/tcp/session.rs`
++- `crates/hammer-service/src/transport/tcp/mod.rs`
++- deleted `crates/hammer-service/tests/tcp_rack_tlp.rs`
++
++## Verification
++
++Ran successfully:
++
++```bash
++cargo test -p hammer-service transport::tcp::recovery::tests -- --nocapture
++cargo test -p hammer-service established_receive_ack_with_sack_only_cleans_cumulative_range_once -- --nocapture
++rg -n "TcpSentSegment" crates/hammer-service/src crates/hammer-service/tests
++```
++
++Results:
++
++- recovery self-tests passed.
++- focused ACK+SACK state-machine test passed.
++- `rg` returned no `TcpSentSegment` matches.
++
++## Boundary check
++
++- No new public sent-record type was introduced.
++- The old public sent record was not renamed and re-exposed.
++- Recovery-private helpers were not promoted onto the connection public surface.
++- No timer-kind scanning was added.
++- No helper/carrier/range/view-style public API was introduced for sent records.
++
++## Notes / concerns
++
++1. Focused verification is green, but the test commands still print pre-existing unrelated `dead_code` warnings in `crates/hammer-service/src/service.rs`.
++2. `session.rs` needed the smallest possible callsite update because established and close-wait packet handlers are the active ACK ingress paths today.
++
++## Follow-up fixes after controller review
++
++### Additional RED
++
++Added two focused regression tests after review feedback:
++
++1. `transport::tcp::recovery::tests::on_ack_reports_per_acked_segment_bytes_in_flight`
++   - locked the per-ACK-sample `bytes_in_flight` contract across multiple cumulatively acked segments in one ACK event.
++   - initial failure showed the flattened accounting bug directly: observed `[0, 0]` where the expected sequence was `[1000, 0]`.
++2. `transport::tcp::state_machine::tests::established_duplicate_ack_with_sack_does_not_update_rto_sample`
++   - locked the requirement that pure duplicate ACK + SACK must not update retransmit-timeout sampling state.
++   - initial failure showed `rtt_variance` changing from `Some(25ms)` to `Some(18.75ms)` under a non-advancing ACK.
++
++### Additional GREEN
++
++1. Fixed recovery ACK accounting so each `congestion.on_ack(..., bytes_in_flight)` call sees the flight value for that specific acked segment within the ACK event, instead of the uniform final post-cleanup remainder.
++2. Gated `retransmit_timeout.observe_ack_sample(...)` on cumulative ACK progress only, so duplicate ACK + SACK events still inform recovery loss handling without mutating RTT/RTO sampling state.
++
++### Additional verification
++
++Ran successfully after the follow-up fixes:
++
++```bash
++cargo test -p hammer-service on_ack_reports_per_acked_segment_bytes_in_flight -- --nocapture
++cargo test -p hammer-service established_duplicate_ack_with_sack_does_not_update_rto_sample -- --nocapture
++```

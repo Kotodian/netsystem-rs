@@ -1,10 +1,18 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use hammer_core::error::CoreError;
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime};
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpNegotiatedOptions};
 
+use crate::session::{
+    SessionId, SessionQueueNext, SessionTimerExpiry, SessionTimerToken,
+    node::SessionQueueOutput,
+    protocol::SessionQueueControlContext,
+    runtime::{SessionDriverRuntime, SessionQueueProtocol},
+};
 use crate::transport::congestion::CongestionController;
 
+use super::lookup::TcpWorkerOwnedState;
 use super::segment::TcpSegment;
 pub use super::state_machine::TcpConnection;
 use super::state_machine::{
@@ -36,6 +44,25 @@ impl TcpConnectionTimerKind {
     pub(crate) const fn from_timer_bit(bit: u16) -> Option<Self> {
         Self::from_bits(bit)
     }
+
+    #[inline]
+    pub(crate) fn session_timer_token(self) -> Option<SessionTimerToken> {
+        let bits = self.bits();
+        if bits == 0 || bits.count_ones() != 1 {
+            return None;
+        }
+        Some(SessionTimerToken::new(bits.trailing_zeros() + 1))
+    }
+
+    #[inline]
+    pub(crate) fn from_session_timer_token(token: SessionTimerToken) -> Option<Self> {
+        let ordinal = token.get();
+        if ordinal == 0 || ordinal > u16::BITS {
+            return None;
+        }
+        Self::from_timer_bit(1u16 << (ordinal - 1))
+    }
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +251,114 @@ impl<C> TcpConnectionState<C>
 where
     C: CongestionController,
 {
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn state(&self) -> super::TcpState {
+        match self {
+            Self::Closed(connection) => connection.state(),
+            Self::Listen(connection) => connection.state(),
+            Self::SynSent(connection) => connection.state(),
+            Self::SynRcvd(connection) => connection.state(),
+            Self::Established(connection) => connection.state(),
+            Self::CloseWait(connection) => connection.state(),
+            Self::LastAck(connection) => connection.state(),
+            Self::FinWait1(connection) => connection.state(),
+            Self::FinWait2(connection) => connection.state(),
+            Self::Closing(connection) => connection.state(),
+            Self::TimeWait(connection) => connection.state(),
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn connection_id(&self) -> Option<hammer_core::protocol::tcp::TcpConnectionId> {
+        match self {
+            Self::Closed(connection) => connection.connection_id(),
+            Self::Listen(connection) => connection.connection_id(),
+            Self::SynSent(connection) => connection.connection_id(),
+            Self::SynRcvd(connection) => connection.connection_id(),
+            Self::Established(connection) => connection.connection_id(),
+            Self::CloseWait(connection) => connection.connection_id(),
+            Self::LastAck(connection) => connection.connection_id(),
+            Self::FinWait1(connection) => connection.connection_id(),
+            Self::FinWait2(connection) => connection.connection_id(),
+            Self::Closing(connection) => connection.connection_id(),
+            Self::TimeWait(connection) => connection.connection_id(),
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn owner_worker(&self) -> hammer_adapter::DataWorkerId {
+        match self {
+            Self::Closed(connection) => connection.owner_worker(),
+            Self::Listen(connection) => connection.owner_worker(),
+            Self::SynSent(connection) => connection.owner_worker(),
+            Self::SynRcvd(connection) => connection.owner_worker(),
+            Self::Established(connection) => connection.owner_worker(),
+            Self::CloseWait(connection) => connection.owner_worker(),
+            Self::LastAck(connection) => connection.owner_worker(),
+            Self::FinWait1(connection) => connection.owner_worker(),
+            Self::FinWait2(connection) => connection.owner_worker(),
+            Self::Closing(connection) => connection.owner_worker(),
+            Self::TimeWait(connection) => connection.owner_worker(),
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn local(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Self::Closed(connection) => connection.local(),
+            Self::Listen(connection) => connection.local(),
+            Self::SynSent(connection) => connection.local(),
+            Self::SynRcvd(connection) => connection.local(),
+            Self::Established(connection) => connection.local(),
+            Self::CloseWait(connection) => connection.local(),
+            Self::LastAck(connection) => connection.local(),
+            Self::FinWait1(connection) => connection.local(),
+            Self::FinWait2(connection) => connection.local(),
+            Self::Closing(connection) => connection.local(),
+            Self::TimeWait(connection) => connection.local(),
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn remote(&self) -> std::net::SocketAddr {
+        match self {
+            Self::Closed(connection) => connection.remote(),
+            Self::Listen(connection) => connection.remote(),
+            Self::SynSent(connection) => connection.remote(),
+            Self::SynRcvd(connection) => connection.remote(),
+            Self::Established(connection) => connection.remote(),
+            Self::CloseWait(connection) => connection.remote(),
+            Self::LastAck(connection) => connection.remote(),
+            Self::FinWait1(connection) => connection.remote(),
+            Self::FinWait2(connection) => connection.remote(),
+            Self::Closing(connection) => connection.remote(),
+            Self::TimeWait(connection) => connection.remote(),
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn next_node(&self) -> super::TcpInputNext {
+        match self {
+            Self::Closed(connection) => connection.next_node(),
+            Self::Listen(connection) => connection.next_node(),
+            Self::SynSent(connection) => connection.next_node(),
+            Self::SynRcvd(connection) => connection.next_node(),
+            Self::Established(connection) => connection.next_node(),
+            Self::CloseWait(connection) => connection.next_node(),
+            Self::LastAck(connection) => connection.next_node(),
+            Self::FinWait1(connection) => connection.next_node(),
+            Self::FinWait2(connection) => connection.next_node(),
+            Self::Closing(connection) => connection.next_node(),
+            Self::TimeWait(connection) => connection.next_node(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn established_for_test(
         connection_id: Option<hammer_core::protocol::tcp::TcpConnectionId>,
@@ -300,6 +435,33 @@ where
     }
 
     #[inline]
+    pub(crate) fn on_session_close(self) -> Self {
+        match self {
+            Self::Established(connection) => connection.close_local().into(),
+            Self::CloseWait(connection) => connection.close_local().into(),
+            state => state,
+        }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn tcp_timer_is_active(&self, timer: TcpConnectionTimerKind) -> bool {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_is_active(timer),
+            Self::Listen(connection) => connection.tcp_timer_is_active(timer),
+            Self::SynSent(connection) => connection.tcp_timer_is_active(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_is_active(timer),
+            Self::Established(connection) => connection.tcp_timer_is_active(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_is_active(timer),
+            Self::LastAck(connection) => connection.tcp_timer_is_active(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_is_active(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_is_active(timer),
+            Self::Closing(connection) => connection.tcp_timer_is_active(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_is_active(timer),
+        }
+    }
+
+    #[inline]
     pub(crate) fn tcp_timer_expire(&mut self, timer: TcpConnectionTimerKind) {
         match self {
             Self::Closed(connection) => connection.tcp_timer_expire(timer),
@@ -314,6 +476,497 @@ where
             Self::Closing(connection) => connection.tcp_timer_expire(timer),
             Self::TimeWait(connection) => connection.tcp_timer_expire(timer),
         }
+    }
+
+    #[inline]
+    pub(crate) fn tcp_timer_ticks(&self, timer: TcpConnectionTimerKind) -> Option<u64> {
+        match self {
+            Self::Closed(connection) => connection.tcp_timer_ticks(timer),
+            Self::Listen(connection) => connection.tcp_timer_ticks(timer),
+            Self::SynSent(connection) => connection.tcp_timer_ticks(timer),
+            Self::SynRcvd(connection) => connection.tcp_timer_ticks(timer),
+            Self::Established(connection) => connection.tcp_timer_ticks(timer),
+            Self::CloseWait(connection) => connection.tcp_timer_ticks(timer),
+            Self::LastAck(connection) => connection.tcp_timer_ticks(timer),
+            Self::FinWait1(connection) => connection.tcp_timer_ticks(timer),
+            Self::FinWait2(connection) => connection.tcp_timer_ticks(timer),
+            Self::Closing(connection) => connection.tcp_timer_ticks(timer),
+            Self::TimeWait(connection) => connection.tcp_timer_ticks(timer),
+        }
+    }
+}
+
+impl<C> SessionQueueProtocol<TcpWorkerOwnedState> for TcpConnectionState<C>
+where
+    C: CongestionController + 'static,
+{
+    fn handle_timer_expiry(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        context: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
+        expiry: SessionTimerExpiry,
+        output_next: SessionQueueNext,
+        output: &mut SessionQueueOutput,
+    ) -> CoreResult<()> {
+        let Some(kind) = TcpConnectionTimerKind::from_session_timer_token(expiry.token()) else {
+            return Ok(());
+        };
+        self.tcp_timer_expire(kind);
+        let Some((timer, segment)) = self.on_tcp_timer(kind) else {
+            return Ok(());
+        };
+        emit_segment(runtime, context.buffers(), output_next, output, segment)?;
+        if let Some(ticks) = self.tcp_timer_ticks(timer)
+            && let Some(token) = timer.session_timer_token()
+        {
+            context.arm_timer_ticks(expiry.session_id(), token, ticks)?;
+        }
+        Ok(())
+    }
+
+    fn handle_ready_session(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        context: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
+        close_requested: bool,
+        output_next: SessionQueueNext,
+        output: &mut SessionQueueOutput,
+    ) -> CoreResult<()> {
+        if close_requested {
+            *self = self.clone().on_session_close();
+        }
+        if matches!(self, Self::Established(_)) {
+            context.flush_session_rx(context.session_id())?;
+        }
+        if let Some(segment) = self.on_tcp_ready() {
+            emit_segment(runtime, context.buffers(), output_next, output, segment)?;
+        }
+        Ok(())
+    }
+
+    fn tx_payload_len(
+        &mut self,
+        _: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
+        pending_len: usize,
+        now: Instant,
+    ) -> CoreResult<usize> {
+        Ok(match self {
+            Self::Established(connection) => connection.tx_payload_len(pending_len, now),
+            _ => 0,
+        })
+    }
+
+    fn prepare_tx(
+        &mut self,
+        context: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
+        index: BufferIndex,
+        payload_len: usize,
+        now: Instant,
+    ) -> CoreResult<()> {
+        let Self::Established(connection) = self else {
+            return Err(CoreError::internal(
+                "tcp tx prepare requires established connection",
+            ));
+        };
+        let budget = connection.tx_payload_len(payload_len, now);
+        if payload_len > budget {
+            return Err(CoreError::internal("tcp tx payload exceeds send budget"));
+        }
+        let segment = connection.tx_segment(payload_len)?;
+        write_segment(context.buffers(), index, &segment)?;
+        Ok(())
+    }
+
+    fn cancel_tx(&mut self, _: &mut TcpWorkerOwnedState, _: BufferIndex) {}
+
+    fn commit_tx(
+        &mut self,
+        context: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
+        _: BufferIndex,
+        payload_len: usize,
+        now: Instant,
+    ) -> CoreResult<()> {
+        let Self::Established(connection) = self else {
+            return Err(CoreError::internal("tcp tx commit state is missing"));
+        };
+        let timers = connection.commit_payload_tx(payload_len, now)?;
+        for timer in [TcpConnectionTimerKind::RACK, TcpConnectionTimerKind::TLP] {
+            if !timers.contains(timer) {
+                continue;
+            }
+            if let Some(ticks) = connection.tcp_timer_ticks(timer)
+                && let Some(token) = timer.session_timer_token()
+            {
+                context.arm_timer_ticks(context.session_id(), token, ticks)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_segment(buffers: &DataPlaneBuffers, index: BufferIndex, segment: &TcpSegment) -> CoreResult<()> {
+    let mut buffer = buffers.get_buffer_mut(index)?;
+    buffer.opaque_mut().write(segment);
+    buffer.opaque2_mut().write(segment);
+    Ok(())
+}
+
+fn emit_segment(
+    runtime: &DataPlaneRuntime,
+    buffers: &DataPlaneBuffers,
+    output_next: SessionQueueNext,
+    output: &mut SessionQueueOutput,
+    segment: TcpSegment,
+) -> CoreResult<()> {
+    let index = buffers.alloc_index(Default::default())?;
+    if let Err(error) = write_segment(buffers, index, &segment) {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    if let Err(error) = output.enqueue(runtime, output_next.node(), index) {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn release_acked_tx<C>(
+    queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+    session_id: SessionId,
+    previous_snd_una: u32,
+    snd_una: u32,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    let acked = hammer_core::protocol::tcp::TcpSeq::from(previous_snd_una)
+        .distance_to(hammer_core::protocol::tcp::TcpSeq::from(snd_una));
+    if acked != 0 {
+        queue.release_tx_up_to(session_id, acked as usize)?;
+    }
+    Ok(())
+}
+
+impl<C> TcpConnection<Listen, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_syn(
+        self,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        if !packet.flags.contains(hammer_core::protocol::tcp::TcpSegmentFlags::SYN)
+            || packet.flags.intersects(
+                hammer_core::protocol::tcp::TcpSegmentFlags::ACK
+                    | hammer_core::protocol::tcp::TcpSegmentFlags::RST,
+            )
+        {
+            return Ok((self.into(), None));
+        }
+        let (connection, segment) = self.accept_syn(packet);
+        Ok((connection.into(), Some(segment)))
+    }
+}
+
+impl<C> TcpConnection<SynSent, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_open_reply(
+        mut self,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+            && self.unacceptable_ack(acknowledgment)
+        {
+            if packet.flags.contains(TcpSegmentFlags::RST) {
+                return Ok((self.into(), None));
+            }
+            let segment = self.control_segment(packet, TcpSegmentFlags::RST, Some(acknowledgment));
+            return Ok((self.into(), Some(segment)));
+        }
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            if let Some(acknowledgment) = packet.acknowledgment
+                && self.accepts_segment_ack(acknowledgment)
+            {
+                let mut connection = self.close_remote_reset();
+                connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
+                return Ok((connection.into(), None));
+            }
+            return Ok((self.into(), None));
+        }
+
+        if !packet.flags.contains(TcpSegmentFlags::SYN) {
+            return Ok((self.into(), None));
+        }
+
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+        {
+            if !self.accepts_segment_ack(acknowledgment) {
+                return Ok((self.into(), None));
+            }
+            let (mut connection, segment) = self.accept_syn_ack(packet, acknowledgment);
+            connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
+            return Ok((connection.into(), Some(segment)));
+        }
+
+        let (connection, segment) = self.accept_simultaneous_syn(packet);
+        Ok((connection.into(), Some(segment)))
+    }
+}
+
+impl<C> TcpConnection<SynRcvd, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_final_ack(
+        mut self,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        let Some(acknowledgment) = packet.acknowledgment else {
+            return Ok((self.into(), None));
+        };
+        if !packet.flags.contains(TcpSegmentFlags::ACK) || !self.accepts_final_ack(acknowledgment) {
+            let segment = self.control_segment(packet, TcpSegmentFlags::RST, Some(acknowledgment));
+            return Ok((self.into(), Some(segment)));
+        }
+        let (mut connection, segment) = self.accept_final_ack(packet, acknowledgment);
+        connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
+        Ok((connection.into(), Some(segment)))
+    }
+}
+
+impl<C> TcpConnection<Established, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_data(
+        mut self,
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+        queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+        session_id: SessionId,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            if packet.payload_len != 0 {
+                runtime.free_index(index);
+            }
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+        {
+            let previous_snd_una = self.snd_una();
+            self.receive_ack(
+                acknowledgment,
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+            );
+            release_acked_tx(queue, session_id, previous_snd_una, self.snd_una())?;
+        }
+
+        let mut ack = false;
+        if packet.payload_len != 0 {
+            ack = true;
+            runtime.packet_buffers().advance(index, packet.payload_offset)?;
+            if self.accept_payload(packet).is_some() {
+                runtime.truncate_chain(index, packet.payload_len)?;
+                let _ = queue.enqueue_rx(session_id, index, false)?;
+                self.update_ack_sack_blocks(&[], None);
+            } else {
+                runtime.free_index(index);
+            }
+        }
+
+        if packet.flags.contains(TcpSegmentFlags::FIN)
+            && packet.sequence.wrapping_add(packet.payload_len as u32) == self.rcv_nxt()
+        {
+            let (connection, segment) = self.accept_fin(packet);
+            return Ok((connection.into(), Some(segment)));
+        }
+
+        let segment = ack.then(|| self.control_segment(packet, TcpSegmentFlags::ACK, None));
+        Ok((self.into(), segment))
+    }
+}
+
+impl<C> TcpConnection<CloseWait, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_close_wait(
+        mut self,
+        queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+        session_id: SessionId,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+        {
+            let previous_snd_una = self.snd_una();
+            self.receive_ack(
+                acknowledgment,
+                packet.advertised_window,
+                packet.sack_blocks.as_slice(),
+            );
+            release_acked_tx(queue, session_id, previous_snd_una, self.snd_una())?;
+        }
+        if packet.flags.contains(TcpSegmentFlags::FIN) {
+            let (connection, segment) = self.accept_repeated_fin(packet);
+            return Ok((connection.into(), Some(segment)));
+        }
+        Ok((self.into(), None))
+    }
+}
+
+impl<C> TcpConnection<FinWait1, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_fin_wait1(
+        self,
+        queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+        session_id: SessionId,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        let fin = packet.flags.contains(TcpSegmentFlags::FIN);
+        let ack = packet
+            .acknowledgment
+            .filter(|_| packet.flags.contains(TcpSegmentFlags::ACK));
+        match (fin, ack) {
+            (true, Some(acknowledgment)) => {
+                let previous_snd_una = self.snd_una();
+                let (connection, segment) = self.accept_fin_ack(packet, acknowledgment);
+                release_acked_tx(queue, session_id, previous_snd_una, connection.snd_una())?;
+                Ok((connection.into(), Some(segment)))
+            }
+            (false, Some(acknowledgment)) => {
+                let previous_snd_una = self.snd_una();
+                let connection = self.accept_ack(packet, acknowledgment);
+                release_acked_tx(queue, session_id, previous_snd_una, connection.snd_una())?;
+                Ok((connection.into(), None))
+            }
+            (true, _) => {
+                let (connection, segment) = self.accept_fin(packet);
+                Ok((connection.into(), Some(segment)))
+            }
+            _ => Ok((self.into(), None)),
+        }
+    }
+}
+
+impl<C> TcpConnection<FinWait2, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_fin_wait2(
+        self,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        if packet.flags.contains(TcpSegmentFlags::FIN) {
+            let (connection, segment) = self.accept_fin(packet);
+            return Ok((connection.into(), Some(segment)));
+        }
+        Ok((self.into(), None))
+    }
+}
+
+impl<C> TcpConnection<Closing, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_closing(
+        self,
+        queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+        session_id: SessionId,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+        {
+            let previous_snd_una = self.snd_una();
+            let connection = self.accept_ack(packet, acknowledgment);
+            release_acked_tx(queue, session_id, previous_snd_una, connection.snd_una())?;
+            return Ok((connection.into(), None));
+        }
+        Ok((self.into(), None))
+    }
+}
+
+impl<C> TcpConnection<LastAck, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_last_ack(
+        self,
+        queue: &mut SessionDriverRuntime<TcpConnectionState<C>, TcpWorkerOwnedState>,
+        session_id: SessionId,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        if let Some(acknowledgment) = packet.acknowledgment
+            && packet.flags.contains(TcpSegmentFlags::ACK)
+        {
+            let previous_snd_una = self.snd_una();
+            let connection = self.accept_ack(packet, acknowledgment);
+            release_acked_tx(queue, session_id, previous_snd_una, connection.snd_una())?;
+            return Ok((connection.into(), None));
+        }
+        Ok((self.into(), None))
+    }
+}
+
+impl<C> TcpConnection<TimeWait, C>
+where
+    C: CongestionController + 'static,
+{
+    pub(crate) fn receive_time_wait(
+        self,
+        packet: &super::segment::TcpPacket,
+    ) -> CoreResult<(TcpConnectionState<C>, Option<TcpSegment>)> {
+        use hammer_core::protocol::tcp::TcpSegmentFlags;
+
+        if packet.flags.contains(TcpSegmentFlags::RST) {
+            return Ok((self.close_remote_reset().into(), None));
+        }
+        Ok((self.into(), None))
     }
 }
 
