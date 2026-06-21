@@ -9,7 +9,6 @@ use hammer_service::transport::congestion::{
 };
 use hammer_service::transport::tcp::DEFAULT_TCP_OUTPUT_PAYLOAD_LEN;
 use hammer_service::transport::tcp::connection::TcpConnection;
-use hammer_service::transport::tcp::state_machine::Closed;
 
 const MSS: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 
@@ -120,7 +119,7 @@ impl CongestionController for TestController {
 #[test]
 fn tcp_connection_uses_left_hand_congestion_controller_type() {
     let remote = "127.0.0.1:443".parse().expect("remote");
-    let connection: TcpConnection<Closed, TestController> =
+    let connection: TcpConnection<TestController> =
         TcpConnection::new(None, DataWorkerId::new(0), 10_000, None, remote);
 
     assert_eq!(connection.congestion().max_datagram_size(), MSS);

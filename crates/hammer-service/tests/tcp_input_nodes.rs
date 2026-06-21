@@ -7,12 +7,14 @@ use hammer_adapter::{
     NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_service::data_plane::DropNode;
+use hammer_service::data_plane::{DropNode, HandoffNode};
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::congestion::BbrController;
+use hammer_service::transport::tcp::lookup::{
+    TcpIpv4ListenerAddress, TcpV4ListenerKey, TcpWorkerOwnedState,
+};
 use hammer_service::transport::tcp::{
-    TcpInputControlPlane, TcpInputError, TcpInputHandoff, TcpInputNext, TcpIpv4ListenerAddress,
-    TcpResetNext, TcpResetNode, TcpV4ListenerKey, TcpWorkerOwnedState,
+    TcpInputControlPlane, TcpInputError, TcpInputNext, TcpResetNext, TcpResetNode,
 };
 
 const LISTEN_PORT: u16 = 4_43;
@@ -232,7 +234,7 @@ fn tcp_input_routes_listen_ack_to_reset_node() {
 
 #[test]
 fn tcp_input_routes_listener_syn_locally_without_handoff() {
-    const TCP_INPUT_HANDLE: NodeHandle = NodeHandle::new(42);
+    const HANDOFF_HANDLE: NodeHandle = NodeHandle::new(42);
 
     let handoff = DataPlaneHandoff::new(2, 8);
     let first_runtime = DataPlaneRuntime::with_handoff(
@@ -246,9 +248,9 @@ fn tcp_input_routes_listener_syn_locally_without_handoff() {
         handoff.worker(DataWorkerId::new(1)),
     );
     let first_graph =
-        TcpGraph::new_with_handoff(&first_runtime, TCP_INPUT_HANDLE, DataWorkerId::new(0));
+        TcpGraph::new_with_handoff(&first_runtime, HANDOFF_HANDLE, DataWorkerId::new(0));
     let second_graph =
-        TcpGraph::new_with_handoff(&second_runtime, TCP_INPUT_HANDLE, DataWorkerId::new(1));
+        TcpGraph::new_with_handoff(&second_runtime, HANDOFF_HANDLE, DataWorkerId::new(1));
 
     let mut owner = TcpWorkerOwnedState::new(DataWorkerId::new(1));
     owner.insert_listener::<TcpIpv4ListenerAddress>(
@@ -346,24 +348,23 @@ impl TcpGraph {
         let listen = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&listen_state)));
+        if let Some((handle, _)) = handoff {
+            runtime
+                .nodes()
+                .register_internal_with_handle(handle, HandoffNode::new())
+                .expect("register handoff node with handle");
+        }
         let reset_node = TcpResetNode::new(TcpResetNext::nodes(drop, reset_sink));
         assert_internal_node(&reset_node);
         let reset = runtime.nodes().register_internal(reset_node);
-        let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
-            drop, punt, listen, drop, drop, drop, drop, drop, drop, drop, drop, drop, reset,
-        ));
-        let mut tcp_node = tcp_control.node::<BbrController>();
-        if let Some((handle, worker)) = handoff {
-            tcp_node = tcp_node.with_handoff(TcpInputHandoff::new(handle, worker));
-        }
+        let tcp_control = TcpInputControlPlane::new();
+        let tcp_node = tcp_control.node::<BbrController>(
+            TcpInputNext::nodes(drop, punt, listen, drop, drop, drop, reset),
+            None,
+            handoff,
+        );
         assert_internal_node(&tcp_node);
-        let tcp_input = match handoff {
-            Some((handle, _)) => runtime
-                .nodes()
-                .register_internal_with_handle(handle, tcp_node)
-                .expect("register tcp-input with handle"),
-            None => runtime.nodes().register_internal(tcp_node),
-        };
+        let tcp_input = runtime.nodes().register_internal(tcp_node);
         Self {
             drop,
             punt,

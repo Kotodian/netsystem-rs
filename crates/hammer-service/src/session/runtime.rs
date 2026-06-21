@@ -8,6 +8,8 @@ use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::AppOpId;
+#[cfg(test)]
+use hammer_runtime::app::AppRingHandle;
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken,
@@ -304,12 +306,10 @@ impl<S, A> SessionDriverRuntime<S, A> {
     }
 
     #[inline]
-    #[cfg(test)]
     pub(crate) fn aux_mut(&mut self) -> &mut A {
         &mut self.aux
     }
 
-    #[cfg(test)]
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<S> {
         self.pending_closes.take(id);
         self.release_session_tx(id);
@@ -321,7 +321,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
         Some(removed)
     }
 
-    #[cfg(test)]
     pub(crate) fn close_session(&mut self, id: SessionId) -> CoreResult<Option<S>> {
         if self.session(id).is_none() {
             return Ok(None);
@@ -466,7 +465,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
         Ok(())
     }
 
-    #[cfg(test)]
     fn release_session_tx(&mut self, session_id: SessionId) {
         let Some(index) = self.tx_index.remove(&session_id.get()) else {
             return;
@@ -479,7 +477,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
         }
     }
 
-    #[cfg(test)]
     fn release_session_rx(&mut self, session_id: SessionId) {
         let Some(index) = self.rx_index.remove(&session_id.get()) else {
             return;
@@ -615,156 +612,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
     }
 }
 
-fn flush_one_session_tx<S, A>(
-    runtime: &DataPlaneRuntime,
-    driver: &mut SessionDriverRuntime<S, A>,
-    session_id: SessionId,
-    output_next: crate::session::SessionQueueNext,
-    output: &mut crate::session::node::SessionQueueOutput,
-    now: Instant,
-) -> CoreResult<bool>
-where
-    S: SessionQueueProtocol<A>,
-{
-    let Some(pending_len) = driver.app().pending_send_len(session_id)? else {
-        return Ok(false);
-    };
-    let payload_len = {
-        let driver = driver as *mut SessionDriverRuntime<S, A>;
-        // SAFETY: `state` and `context` access disjoint parts of the same session queue:
-        // the state lives in `entries`, while the context exposes runtime sidecar resources.
-        unsafe {
-            let app_op = (*driver).session_app_op(session_id);
-            let state = (*driver)
-                .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("session is missing"))?;
-            let mut context = crate::session::protocol::SessionQueueControlContext::new(
-                &mut (*driver).sessions as *mut _,
-                &mut (*driver).app as *mut _,
-                &(*driver).buffers as *const _,
-                &mut (*driver).rx as *mut _,
-                &mut (*driver).rx_index as *mut _,
-                &mut (*driver).aux as *mut _,
-                session_id,
-                app_op,
-            );
-            state.tx_payload_len(&mut context, pending_len, now)?.min(pending_len)
-        }
-    };
-    if payload_len == 0 {
-        return Ok(false);
-    }
-    let payload_index = driver.buffers().alloc_index(RouteMetadata::default())?;
-    let Some(payload_len) = driver
-        .app()
-        .copy_pending_send_to_buffer(session_id, payload_len, driver.buffers(), payload_index)?
-    else {
-        driver.buffers().free_index(payload_index);
-        return Err(CoreError::internal("session app tx progress is missing"));
-    };
-    if payload_len == 0 {
-        driver.buffers().free_index(payload_index);
-        let completed = driver.app_mut().commit_pending_send_bytes(session_id, 0)?;
-        return Ok(completed);
-    }
-
-    let index = driver.buffers().alloc_index(RouteMetadata::default())?;
-    if let Err(err) = driver.buffers().attach_clone(index, payload_index) {
-        driver.buffers().free_index(index);
-        driver.buffers().free_index(payload_index);
-        return Err(err);
-    }
-
-    {
-        let driver = driver as *mut SessionDriverRuntime<S, A>;
-        // SAFETY: same reasoning as above; the current session state and runtime sidecars are
-        // accessed together to execute one transport callback.
-        unsafe {
-            let app_op = (*driver).session_app_op(session_id);
-            let state = (*driver)
-                .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("session is missing"))?;
-            let mut context = crate::session::protocol::SessionQueueControlContext::new(
-                &mut (*driver).sessions as *mut _,
-                &mut (*driver).app as *mut _,
-                &(*driver).buffers as *const _,
-                &mut (*driver).rx as *mut _,
-                &mut (*driver).rx_index as *mut _,
-                &mut (*driver).aux as *mut _,
-                session_id,
-                app_op,
-            );
-            if let Err(err) = state.prepare_tx(&mut context, index, payload_len, now) {
-                context.buffers().free_index(index);
-                context.buffers().free_index(payload_index);
-                return Err(err);
-            }
-        }
-    }
-
-    if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
-        let driver = driver as *mut SessionDriverRuntime<S, A>;
-        // SAFETY: same disjoint-access argument as above.
-        unsafe {
-            let state = (*driver)
-                .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("session is missing"))?;
-            state.cancel_tx(&mut (*driver).aux, index);
-        }
-        unsafe {
-            (*driver).buffers().free_index(index);
-        }
-        unsafe {
-            (*driver).buffers().free_index(payload_index);
-        }
-        return Err(err);
-    }
-
-    let commit_result = {
-        let driver = driver as *mut SessionDriverRuntime<S, A>;
-        // SAFETY: same disjoint-access argument as above.
-        unsafe {
-            let app_op = (*driver).session_app_op(session_id);
-            let state = (*driver)
-                .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("session is missing"))?;
-            let mut context = crate::session::protocol::SessionQueueControlContext::new(
-                &mut (*driver).sessions as *mut _,
-                &mut (*driver).app as *mut _,
-                &(*driver).buffers as *const _,
-                &mut (*driver).rx as *mut _,
-                &mut (*driver).rx_index as *mut _,
-                &mut (*driver).aux as *mut _,
-                session_id,
-                app_op,
-            );
-            state.commit_tx(&mut context, index, payload_len, now)
-        }
-    };
-    if let Err(err) = commit_result {
-        let driver = driver as *mut SessionDriverRuntime<S, A>;
-        // SAFETY: same disjoint-access argument as above.
-        unsafe {
-            let state = (*driver)
-                .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("session is missing"))?;
-            state.cancel_tx(&mut (*driver).aux, index);
-        }
-        unsafe {
-            (*driver).buffers().free_index(payload_index);
-        }
-        return Err(err);
-    }
-    let completed = driver
-        .app_mut()
-        .commit_pending_send_bytes(session_id, payload_len)?;
-    driver.retain_tx_buffer(session_id, payload_index);
-    if !completed {
-        driver.mark_ready(session_id);
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 pub(crate) fn dispatch_session_queue_for_ticks<S, A>(
     runtime: &DataPlaneRuntime,
@@ -849,14 +696,147 @@ where
     let ready_sessions = driver.take_ready_sessions();
     step.ready_sessions = ready_sessions.len();
     for session_id in ready_sessions {
-        while flush_one_session_tx(
-            runtime,
-            driver,
-            session_id,
-            output_next,
-            output,
-            now,
-        )? {}
+        loop {
+            let Some(pending_len) = driver.app().pending_send_len(session_id)? else {
+                break;
+            };
+            let payload_len = {
+                let driver = driver as *mut SessionDriverRuntime<S, A>;
+                // SAFETY: `state` and `context` access disjoint parts of the same
+                // session queue: the state lives in `entries`, while the context
+                // exposes runtime sidecar resources.
+                unsafe {
+                    let app_op = (*driver).session_app_op(session_id);
+                    let state = (*driver)
+                        .session_mut(session_id)
+                        .ok_or_else(|| CoreError::internal("session is missing"))?;
+                    let mut context = crate::session::protocol::SessionQueueControlContext::new(
+                        &mut (*driver).sessions as *mut _,
+                        &mut (*driver).app as *mut _,
+                        &(*driver).buffers as *const _,
+                        &mut (*driver).rx as *mut _,
+                        &mut (*driver).rx_index as *mut _,
+                        &mut (*driver).aux as *mut _,
+                        session_id,
+                        app_op,
+                    );
+                    state.tx_payload_len(&mut context, pending_len, now)?.min(pending_len)
+                }
+            };
+            if payload_len == 0 {
+                break;
+            }
+
+            let payload_index = driver.buffers().alloc_index(RouteMetadata::default())?;
+            let Some(payload_len) = driver.app().copy_pending_send_to_buffer(
+                session_id,
+                payload_len,
+                driver.buffers(),
+                payload_index,
+            )?
+            else {
+                driver.buffers().free_index(payload_index);
+                return Err(CoreError::internal("session app tx progress is missing"));
+            };
+            if payload_len == 0 {
+                driver.buffers().free_index(payload_index);
+                if !driver.app_mut().commit_pending_send_bytes(session_id, 0)? {
+                    break;
+                }
+                continue;
+            }
+
+            let index = driver.buffers().alloc_index(RouteMetadata::default())?;
+            if let Err(err) = driver.buffers().attach_clone(index, payload_index) {
+                driver.buffers().free_index(index);
+                driver.buffers().free_index(payload_index);
+                return Err(err);
+            }
+
+            {
+                let driver = driver as *mut SessionDriverRuntime<S, A>;
+                // SAFETY: same reasoning as above; the current session state and
+                // runtime sidecars are accessed together to execute one transport
+                // callback.
+                unsafe {
+                    let app_op = (*driver).session_app_op(session_id);
+                    let state = (*driver)
+                        .session_mut(session_id)
+                        .ok_or_else(|| CoreError::internal("session is missing"))?;
+                    let mut context = crate::session::protocol::SessionQueueControlContext::new(
+                        &mut (*driver).sessions as *mut _,
+                        &mut (*driver).app as *mut _,
+                        &(*driver).buffers as *const _,
+                        &mut (*driver).rx as *mut _,
+                        &mut (*driver).rx_index as *mut _,
+                        &mut (*driver).aux as *mut _,
+                        session_id,
+                        app_op,
+                    );
+                    if let Err(err) = state.prepare_tx(&mut context, index, payload_len, now) {
+                        context.buffers().free_index(index);
+                        context.buffers().free_index(payload_index);
+                        return Err(err);
+                    }
+                }
+            }
+
+            if let Err(err) = output.enqueue(runtime, output_next.node(), index) {
+                let driver = driver as *mut SessionDriverRuntime<S, A>;
+                // SAFETY: same disjoint-access argument as above.
+                unsafe {
+                    let state = (*driver)
+                        .session_mut(session_id)
+                        .ok_or_else(|| CoreError::internal("session is missing"))?;
+                    state.cancel_tx(&mut (*driver).aux, index);
+                    (*driver).buffers().free_index(index);
+                    (*driver).buffers().free_index(payload_index);
+                }
+                return Err(err);
+            }
+
+            let commit_result = {
+                let driver = driver as *mut SessionDriverRuntime<S, A>;
+                // SAFETY: same disjoint-access argument as above.
+                unsafe {
+                    let app_op = (*driver).session_app_op(session_id);
+                    let state = (*driver)
+                        .session_mut(session_id)
+                        .ok_or_else(|| CoreError::internal("session is missing"))?;
+                    let mut context = crate::session::protocol::SessionQueueControlContext::new(
+                        &mut (*driver).sessions as *mut _,
+                        &mut (*driver).app as *mut _,
+                        &(*driver).buffers as *const _,
+                        &mut (*driver).rx as *mut _,
+                        &mut (*driver).rx_index as *mut _,
+                        &mut (*driver).aux as *mut _,
+                        session_id,
+                        app_op,
+                    );
+                    state.commit_tx(&mut context, index, payload_len, now)
+                }
+            };
+            if let Err(err) = commit_result {
+                let driver = driver as *mut SessionDriverRuntime<S, A>;
+                // SAFETY: same disjoint-access argument as above.
+                unsafe {
+                    let state = (*driver)
+                        .session_mut(session_id)
+                        .ok_or_else(|| CoreError::internal("session is missing"))?;
+                    state.cancel_tx(&mut (*driver).aux, index);
+                    (*driver).buffers().free_index(payload_index);
+                }
+                return Err(err);
+            }
+
+            let completed = driver
+                .app_mut()
+                .commit_pending_send_bytes(session_id, payload_len)?;
+            driver.retain_tx_buffer(session_id, payload_index);
+            if !completed {
+                driver.mark_ready(session_id);
+            }
+        }
         let close_requested = driver.take_close_request(session_id);
         let driver = driver as *mut SessionDriverRuntime<S, A>;
         // SAFETY: same disjoint-access argument as above.

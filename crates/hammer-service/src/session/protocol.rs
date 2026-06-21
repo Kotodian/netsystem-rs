@@ -15,6 +15,7 @@ pub(crate) struct SessionQueueControlContext<'a, A> {
     buffers: *const DataPlaneBuffers,
     rx: *mut Pool<FifoQueue<(hammer_adapter::BufferIndex, bool)>>,
     rx_index: *mut FlatHashTable<u64, PoolIndex>,
+    aux: *mut A,
     current_session_id: SessionId,
     current_app_op: Option<AppOpId>,
     _marker: PhantomData<&'a mut A>,
@@ -29,7 +30,7 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
         buffers: *const DataPlaneBuffers,
         rx: *mut Pool<FifoQueue<(hammer_adapter::BufferIndex, bool)>>,
         rx_index: *mut FlatHashTable<u64, PoolIndex>,
-        _: *mut A,
+        aux: *mut A,
         current_session_id: SessionId,
         current_app_op: Option<AppOpId>,
     ) -> Self {
@@ -39,6 +40,7 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
             buffers,
             rx,
             rx_index,
+            aux,
             current_session_id,
             current_app_op,
             _marker: PhantomData,
@@ -105,6 +107,11 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn aux_mut(&mut self) -> &mut A {
+        unsafe { &mut *self.aux }
     }
 
     #[inline]

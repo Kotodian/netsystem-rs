@@ -10,37 +10,21 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId, Node, NodeHandle,
-    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, RouteMetadata, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId,
+    FeaturePathEntry, Node, NodeHandle, NodeId, NodeNextStorage, NodeProcessFn, NodeResult,
+    NodeRuntimeData, NodeVectorDispatch, PacketTrace, RouteMetadata, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView};
 
 use crate::transport::congestion::CongestionController;
-use super::TcpQueueHandle;
-use super::{
-    TcpInputError, TcpInputFlags, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
-    TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
+use super::lookup::{
+    TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
+    TcpV4ListenerKey, TcpV6ListenerKey,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpInputHandoff {
-    tcp_input: NodeHandle,
-    worker: DataWorkerId,
-}
-
-impl TcpInputHandoff {
-    #[inline]
-    pub fn new(tcp_input: NodeHandle, worker: DataWorkerId) -> Self {
-        Self { tcp_input, worker }
-    }
-
-    #[inline]
-    fn current_worker(self) -> DataWorkerId {
-        self.worker
-    }
-}
+use super::TcpQueueHandle;
+use super::{TcpInputError, TcpInputFlags, TcpInputNext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpInputTrace {
@@ -119,17 +103,16 @@ impl TcpInputSnapshotHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct TcpInputControlPlane {
     inner: Arc<ArcSwap<TcpInputSnapshot>>,
-    next: [NodeId; TcpInputNext::COUNT],
 }
 
 impl TcpInputControlPlane {
     #[inline]
-    pub fn new(next: [NodeId; TcpInputNext::COUNT]) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(TcpInputSnapshot::new())),
-            next,
         }
     }
 
@@ -144,14 +127,25 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub fn node<C>(&self) -> TcpInputNode<C>
+    pub fn node<C>(
+        &self,
+        next: [NodeId; TcpInputNext::COUNT],
+        session_queue: Option<TcpQueueHandle<C>>,
+        handoff: Option<(NodeHandle, DataWorkerId)>,
+    ) -> TcpInputNode<C>
     where
         C: CongestionController + 'static,
     {
-        TcpInputNode::<C>::new(
+        let mut node = TcpInputNode::<C>::new(
             TcpInputSnapshotHandle::new(Arc::clone(&self.inner)),
-            self.next,
-        )
+            next,
+        );
+        node.session_queue = session_queue;
+        if let Some((handoff, worker)) = handoff {
+            node.handoff = Some(handoff);
+            node.handoff_worker = Some(worker);
+        }
+        node
     }
 }
 
@@ -161,22 +155,13 @@ pub struct TcpInputNode<C: CongestionController + 'static> {
     runtime_data: NodeRuntimeData,
     snapshot: TcpInputSnapshotHandle,
     #[node(default)]
-    handoff: Option<TcpInputHandoff>,
+    handoff: Option<NodeHandle>,
+    #[node(default)]
+    handoff_worker: Option<DataWorkerId>,
     #[node(default)]
     session_queue: Option<TcpQueueHandle<C>>,
     #[node(default)]
     cached_next: Option<NodeId>,
-}
-
-impl<C> TcpInputNode<C>
-where
-    C: CongestionController + 'static,
-{
-    #[inline]
-    pub fn with_handoff(mut self, handoff: TcpInputHandoff) -> Self {
-        self.handoff = Some(handoff);
-        self
-    }
 }
 
 impl<C> Node for TcpInputNode<C>
@@ -201,6 +186,7 @@ where
                     &snapshot,
                     &next,
                     self.handoff,
+                    self.handoff_worker,
                     self.session_queue,
                 )
             },
@@ -221,7 +207,12 @@ where
 
     #[inline]
     fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
-        sync_tcp_input_runtime(self.runtime_data, self.handoff, self.session_queue)?;
+        sync_tcp_input_runtime(
+            self.runtime_data,
+            self.handoff,
+            self.handoff_worker,
+            self.session_queue,
+        )?;
         Ok(self.runtime_data)
     }
 }
@@ -229,7 +220,8 @@ where
 #[derive(Clone)]
 struct TcpInputRuntime {
     snapshot: TcpInputSnapshotHandle,
-    handoff: Option<TcpInputHandoff>,
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
     session_queue: Option<NodeRuntimeData>,
 }
 
@@ -245,6 +237,7 @@ fn register_tcp_input_runtime(snapshot: TcpInputSnapshotHandle) -> NodeRuntimeDa
         runtimes.push(TcpInputRuntime {
             snapshot,
             handoff: None,
+            handoff_worker: None,
             session_queue: None,
         });
         NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
@@ -266,7 +259,8 @@ where
 
 fn sync_tcp_input_runtime<C>(
     data: NodeRuntimeData,
-    handoff: Option<TcpInputHandoff>,
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueueHandle<C>>,
 ) -> CoreResult<()>
 where
@@ -279,6 +273,7 @@ where
             .get_mut(slot)
             .ok_or_else(|| CoreError::internal("TCP input runtime slot is invalid"))?;
         runtime.handoff = handoff;
+        runtime.handoff_worker = handoff_worker;
         runtime.session_queue = session_queue.map(TcpQueueHandle::runtime_data);
         Ok(())
     })
@@ -303,6 +298,7 @@ where
             &snapshot,
             &next,
             state.handoff,
+            state.handoff_worker,
             session_queue,
         )
     })?;
@@ -335,7 +331,8 @@ fn next_node_for_index<C>(
     index: BufferIndex,
     snapshot: &TcpInputSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
-    handoff: Option<TcpInputHandoff>,
+    handoff: Option<NodeHandle>,
+    handoff_worker: Option<DataWorkerId>,
     session_queue: Option<TcpQueueHandle<C>>,
 ) -> CoreResult<Option<NodeId>>
 where
@@ -370,10 +367,14 @@ where
     };
 
     if let Some(session) = session_input_entry(session_queue, &parsed)? {
-        if let Some(handoff) = handoff
-            && session.owner != handoff.current_worker()
+        let resolved = NodeNextStorage::next(next, session.next);
+        if let (Some(handoff), Some(current_worker)) = (handoff, handoff_worker)
+            && session.owner != current_worker
         {
-            runtime.handoff_index(session.owner, handoff.tcp_input, index)?;
+            runtime.with_metadata_mut(index, |metadata| {
+                metadata.set_feature_path(vec![FeaturePathEntry::new(resolved, None)]);
+            })?;
+            runtime.handoff_index(session.owner, handoff, index)?;
             return Ok(None);
         }
         return resolve_success_next(
@@ -552,11 +553,10 @@ mod tests {
     use hammer_core::protocol::tcp::TcpConnectionId;
 
     use crate::transport::congestion::BbrController;
-    use crate::transport::tcp::connection::TcpConnectionState;
-    use crate::transport::tcp::queue::TcpQueue;
-    use crate::transport::tcp::{TcpInputFlags, TcpInputHandoff, TcpInputNext};
-    use crate::transport::tcp::queue::{
-        register_tcp_session_queue, register_tcp_session_queue_with_connection_for_test,
+    use crate::transport::tcp::connection::TcpConnection;
+    use crate::transport::tcp::{
+        TcpInputFlags, TcpInputNext, TcpQueueHandle, register_tcp_session_queue,
+        register_tcp_session_queue_with_connection_for_test,
     };
 
     use super::{
@@ -564,8 +564,6 @@ mod tests {
         next_node_for_index, parse_tcp_input, register_tcp_input_runtime, session_input_entry,
     };
     use crate::net::ip::{IpProtocol, IpVersion};
-    use crate::session::node::SessionQueueHandle;
-
     #[test]
     fn tcp_input_runtime_registry_is_isolated_per_thread() {
         let main_snapshot =
@@ -672,7 +670,7 @@ mod tests {
 
     #[test]
     fn tcp_input_handoffs_existing_session_to_owner_worker() {
-        const TCP_INPUT_HANDLE: NodeHandle = NodeHandle::new(44);
+        const HANDOFF_HANDLE: NodeHandle = NodeHandle::new(44);
 
         let handoff = DataPlaneHandoff::new(2, 8);
         let runtime = DataPlaneRuntime::with_handoff(
@@ -711,24 +709,21 @@ mod tests {
             NodeId::new(5),
             NodeId::new(6),
             NodeId::new(7),
-            NodeId::new(8),
-            NodeId::new(9),
-            NodeId::new(10),
-            NodeId::new(11),
-            NodeId::new(12),
-            NodeId::new(13),
         );
         let selected = next_node_for_index(
             &runtime,
             index,
             &TcpInputSnapshot::new(),
             &next,
-            Some(TcpInputHandoff::new(TCP_INPUT_HANDLE, DataWorkerId::new(0))),
+            Some(HANDOFF_HANDLE),
+            Some(DataWorkerId::new(0)),
             Some(handle),
         )
         .expect("next node");
 
         assert_eq!(selected, None);
+        let mut metadata = runtime.metadata(index).expect("packet metadata");
+        assert_eq!(metadata.pop_feature_next(), Some(NodeId::new(6)));
         assert_eq!(
             runtime
                 .handoff_source_worker(index)
@@ -742,7 +737,8 @@ mod tests {
         runtime: &DataPlaneRuntime,
         owner: DataWorkerId,
         local_port: u16,
-    ) -> SessionQueueHandle<TcpQueue<BbrController>> {
+    ) -> TcpQueueHandle<BbrController>
+    {
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
             local_port,
@@ -751,7 +747,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
             443,
         );
-        let connection = TcpConnectionState::<BbrController>::established_for_test(
+        let connection = TcpConnection::<BbrController>::established_for_test(
             Some(TcpConnectionId::new(u64::from(local_port))),
             owner,
             local_port,

@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_adapter::DataWorkerId;
-use hammer_service::transport::tcp::{
+use hammer_service::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpV4ListenerKey, TcpV6ListenerKey,
     TcpWorkerOwnedState,
 };

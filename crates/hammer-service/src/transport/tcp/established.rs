@@ -5,10 +5,8 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
-use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
-use super::state_machine::Established;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -101,17 +99,23 @@ where
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        let state = queue
-            .session(session_id)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?
-            .clone();
-        let connection: TcpConnection<Established, _> = state.try_into()?;
-        let (next_state, control) =
-            connection.receive_data(runtime, index, &mut queue, session_id, &packet)?;
-        let state = queue
-            .session_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        *state = next_state;
+        let control = {
+            let queue_ptr: *mut crate::session::runtime::SessionDriverRuntime<
+                super::connection::TcpConnection<C>,
+                super::TcpWorkerOwnedState,
+            > = &mut *queue;
+            // SAFETY: the TCP connection lives in the session entry pool, while
+            // `receive_data` only touches queue sidecars (tx/rx/app/buffers) in
+            // addition to the current connection. This mirrors the existing
+            // session runtime split-borrow pattern.
+            unsafe {
+                let connection = (*queue_ptr)
+                    .session_mut(session_id)
+                    .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+                connection.receive_data(runtime, index, &mut *queue_ptr, session_id, &packet)?
+            }
+        };
+        queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
             if let Err(error) = segment.write_to_buffer(runtime, allocated) {

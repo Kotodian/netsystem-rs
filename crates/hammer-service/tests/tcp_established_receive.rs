@@ -8,10 +8,10 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::congestion::BbrController;
-use hammer_service::transport::tcp::TcpWorkerOwnedState;
+use hammer_service::transport::tcp::lookup::TcpWorkerOwnedState;
 use hammer_service::transport::tcp::{
     TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
-    TcpOutputNode, TcpSynRcvdNext, TcpSynRcvdNode,
+    TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -118,16 +118,15 @@ fn established_graph() -> Graph {
         .nodes()
         .register_internal(CaptureNode::new(Arc::clone(&output_state)));
     let drop = runtime.nodes().register_internal(DropNode::new());
-    let output = runtime.nodes().register_internal(TcpOutputNode::new(
-        TcpOutputNext::nodes(drop, output_capture),
-        handle,
-    ));
+    let output = runtime
+        .nodes()
+        .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
         .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
-    let syn_rcvd = runtime.nodes().register_internal(TcpSynRcvdNode::new(
+    let syn_rcvd = runtime.nodes().register_internal(TcpRcvProcessNode::new(
         handle,
-        TcpSynRcvdNext::nodes(output, drop),
+        TcpRcvProcessNext::nodes(output, drop),
     ));
     let established = runtime.nodes().register_internal(TcpEstablishedNode::new(
         handle,

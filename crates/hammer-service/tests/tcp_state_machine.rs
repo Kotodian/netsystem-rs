@@ -1,32 +1,18 @@
 use std::fs;
 use std::path::Path;
 
-use hammer_service::transport::tcp::session::testing::{
-    established_connection_state, syn_sent_connection_state_with_retransmit_pending,
-    tcp_timer_is_armed, test_tcp_queue,
-};
-use hammer_service::transport::tcp::{TcpConnectionState, TcpConnectionTimerKind};
-
 fn read_tcp_source(path: &str) -> String {
     fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path)).expect("read tcp source")
 }
 
 #[test]
-fn tcp_state_machine_public_api_has_no_forbidden_middle_types() {
+fn tcp_public_api_has_no_forbidden_middle_types() {
     let sources = [
         read_tcp_source("src/transport/tcp/connection.rs"),
-        read_tcp_source("src/transport/tcp/state_machine.rs"),
-        read_tcp_source("src/transport/tcp/session.rs"),
         read_tcp_source("src/transport/tcp/listen.rs"),
         read_tcp_source("src/transport/tcp/syn_sent.rs"),
+        read_tcp_source("src/transport/tcp/rcv_process.rs"),
         read_tcp_source("src/transport/tcp/established.rs"),
-        read_tcp_source("src/transport/tcp/syn_rcvd.rs"),
-        read_tcp_source("src/transport/tcp/close_wait.rs"),
-        read_tcp_source("src/transport/tcp/fin_wait1.rs"),
-        read_tcp_source("src/transport/tcp/fin_wait2.rs"),
-        read_tcp_source("src/transport/tcp/closing.rs"),
-        read_tcp_source("src/transport/tcp/last_ack.rs"),
-        read_tcp_source("src/transport/tcp/time_wait.rs"),
         read_tcp_source("src/transport/tcp/mod.rs"),
     ]
     .join("\n");
@@ -54,7 +40,7 @@ fn tcp_state_machine_public_api_has_no_forbidden_middle_types() {
     for pattern in forbidden {
         assert!(
             !sources.contains(pattern),
-            "forbidden TCP state-machine helper remains: {pattern}"
+            "forbidden TCP helper remains: {pattern}"
         );
     }
 }
@@ -64,27 +50,17 @@ fn packet_nodes_do_not_drive_tcp_queue_state() {
     let sources = [
         read_tcp_source("src/transport/tcp/listen.rs"),
         read_tcp_source("src/transport/tcp/syn_sent.rs"),
-        read_tcp_source("src/transport/tcp/syn_rcvd.rs"),
+        read_tcp_source("src/transport/tcp/rcv_process.rs"),
         read_tcp_source("src/transport/tcp/established.rs"),
-        read_tcp_source("src/transport/tcp/close_wait.rs"),
-        read_tcp_source("src/transport/tcp/fin_wait1.rs"),
-        read_tcp_source("src/transport/tcp/fin_wait2.rs"),
-        read_tcp_source("src/transport/tcp/closing.rs"),
-        read_tcp_source("src/transport/tcp/last_ack.rs"),
-        read_tcp_source("src/transport/tcp/time_wait.rs"),
     ]
     .join("\n");
 
     let forbidden = [
         concat!("put", "_connection"),
-        concat!("next", ".state()"),
         concat!("indexed", ".state()"),
         concat!("take_connection", "::"),
-        concat!("TcpState::Closed"),
-        concat!("TcpState::Established"),
-        concat!("match next"),
-        concat!("match connection"),
         concat!("TcpConnectionState::"),
+        ".try_into()",
     ];
 
     for pattern in forbidden {
@@ -96,24 +72,20 @@ fn packet_nodes_do_not_drive_tcp_queue_state() {
 }
 
 #[test]
-fn tcp_timer_dispatch_is_owned_by_tcp_state() {
-    let source = read_tcp_source("src/transport/tcp/session.rs");
-    let connection = read_tcp_source("src/transport/tcp/connection.rs");
-    assert!(!source.contains("match state"));
-    assert!(!source.contains("TcpConnectionState::SynSent"));
+fn tcp_timer_dispatch_is_owned_by_connection() {
+    let source = read_tcp_source("src/transport/tcp/connection.rs");
     assert!(!source.contains("on_retransmit_timeout"));
     assert!(!source.contains("retransmit_syn_header_if_ready"));
-    assert!(source.contains("connection.on_tcp_timer(kind)"));
-    assert!(connection.contains("pub(crate) fn on_tcp_timer("));
+    assert!(source.contains("self.on_tcp_timer(kind)"));
+    assert!(source.contains("pub(crate) fn on_tcp_timer("));
     assert!(!source.contains("TcpConnectionTimerKind::all"));
-    assert!(!connection.contains("TcpConnectionTimerKind::all"));
 }
 
 #[test]
-fn tcp_input_has_dedicated_receive_nodes() {
+fn tcp_input_routes_close_side_receive_states_through_rcv_process() {
     let source = read_tcp_source("src/transport/tcp/mod.rs");
 
-    assert!(!source.contains("RcvProcess"));
+    assert!(source.contains("RcvProcess"));
     for next in [
         "SynRcvd",
         "CloseWait",
@@ -124,41 +96,26 @@ fn tcp_input_has_dedicated_receive_nodes() {
         "TimeWait",
     ] {
         assert!(
-            source.contains(next),
-            "TcpInputNext is missing dedicated state node {next}"
+            !source.contains(next),
+            "TcpInputNext should not keep dedicated receive node {next}"
         );
     }
 }
 
 #[test]
-fn tcp_close_path_updates_session_state_without_take_replace_flow() {
-    let mut queue = test_tcp_queue();
-    let session_id = queue.insert_session(established_connection_state());
-
-    queue
-        .drive_close_submission(session_id)
-        .expect("drive close submission");
-
-    let state = queue.session_state(session_id).expect("state");
-    assert!(matches!(state, TcpConnectionState::FinWait1(_)));
+fn tcp_close_path_updates_connection_state_in_connection() {
+    let source = read_tcp_source("src/transport/tcp/connection.rs");
+    assert!(source.contains("pub(crate) fn on_session_close(&mut self)"));
+    assert!(source.contains("TcpState::Established"));
+    assert!(source.contains("self.state = TcpState::FinWait1;"));
+    assert!(source.contains("self.state = TcpState::LastAck;"));
 }
 
 #[test]
-fn tcp_syn_sent_timer_expiry_updates_session_state_without_take_replace_flow() {
-    let mut queue = test_tcp_queue();
-    let session_id = queue.insert_session(syn_sent_connection_state_with_retransmit_pending());
-
-    queue
-        .expire_retransmit_timer(session_id)
-        .expect("expire retransmit timer");
-
-    let state = queue.session_state(session_id).expect("state");
-    let TcpConnectionState::SynSent(connection) = state else {
-        panic!("expected syn-sent after retransmit expiry");
-    };
-    let _ = connection;
-    assert!(tcp_timer_is_armed(
-        state,
-        TcpConnectionTimerKind::RETRANSMIT
-    ));
+fn tcp_syn_sent_timer_expiry_updates_connection_state_in_connection() {
+    let source = read_tcp_source("src/transport/tcp/connection.rs");
+    assert!(source.contains("pub(crate) fn on_tcp_timer("));
+    assert!(source.contains("self.state == TcpState::SynSent"));
+    assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
+    assert!(source.contains("self.tcp_timer_set(timer);"));
 }

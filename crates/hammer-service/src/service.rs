@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
-use hammer_adapter::{DataWorkerId, NodeState};
+use hammer_adapter::{DataWorkerId, NodeHandle, NodeState};
 use hammer_control::{
     CertificateProviderManager, CertificateStore, ConnectionManager, NetworkManager, PauseManager,
     ServiceManager,
@@ -44,21 +44,26 @@ use std::time::Duration;
 #[cfg(feature = "probe")]
 use crate::ProbeManager;
 use crate::app::AppHost;
-use crate::data_plane::DropNode;
+use crate::data_plane::{DropNode, HandoffNode};
 use crate::net::{FibTableBuilder, IpLookupControlPlane};
 use crate::session::{SessionQueueNext, SessionQueueNode};
-use crate::transport::tcp::{
-    TcpInputControlPlane, TcpInputNext, TcpIpv4ListenerAddress, TcpIpv6ListenerAddress,
-    TcpListenerAddress, TcpListenerLookupAccess, TcpLookupId, TcpLookupSnapshot, TcpLookupValue,
-    TcpOutputNext, TcpOutputNode, TcpV4ListenerKey, TcpV6ListenerKey,
+use crate::session::node::SessionQueueHandle;
+use crate::transport::tcp::lookup::{
+    TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
+    TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use crate::session::node::register_session_queue;
+use crate::transport::tcp::{
+    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext, TcpListenNext,
+    TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
+    TcpResetNext, TcpResetNode, TcpSynSentNext, TcpSynSentNode, register_tcp_session_queue,
+};
 use crate::transport::congestion::BbrController;
 use crate::transport::tcp::tcp_session_queue_dispatch_fn;
 use crate::{DnsRouter, DnsTransportManager, Router};
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;
+const SERVICE_HANDOFF_HANDLE: NodeHandle = NodeHandle::new(1);
 // Data workers initialize the packet graph plus worker-local TCP/session
 // runtime state on the worker thread before entering the reactor loop.
 const DATA_WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -208,21 +213,7 @@ struct RuntimeTcpListenerSnapshot {
 
 impl RuntimeTcpListenerControlState {
     fn new() -> HammerResult<Self> {
-        let tcp_control = TcpInputControlPlane::new(TcpInputNext::nodes(
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-            unused_node_id(),
-        ));
+        let tcp_control = TcpInputControlPlane::new();
 
         Ok(Self {
             next_tcp_lookup_id: 1,
@@ -966,11 +957,6 @@ fn new_logger(factory: &Arc<Factory>, id: &str) -> Logger {
 }
 
 #[inline]
-const fn unused_node_id() -> NodeId {
-    NodeId::new(0)
-}
-
-#[inline]
 fn worker_id(worker: usize) -> HammerResult<DataWorkerId> {
     u32::try_from(worker)
         .map(DataWorkerId::new)
@@ -1003,6 +989,7 @@ impl ServicePacketGraphDeclarations {
 
 const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
     "session-queue",
+    "handoff-node",
     "tun-input-driver-node",
     "ip-input-node",
     "route-match-node",
@@ -1011,7 +998,6 @@ const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
     "ip-local-node",
     "tcp-input-node",
     "tcp-listen-node",
-    "tcp-accept-node",
     "tcp-rcv-process-node",
     "tcp-syn-sent-node",
     "tcp-established-node",
@@ -1027,12 +1013,17 @@ const SERVICE_PACKET_GRAPH_NODES: &[&str] = &[
 ];
 
 fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) -> HammerResult<()> {
+    let tcp_control = RuntimeTcpListenerControlState::new()?.tcp_control;
     data_context
-        .install_on_workers(|worker, runtime| {
+        .install_on_workers(move |worker, runtime| {
             let worker = worker_id(worker)?;
             let drop = runtime
                 .nodes()
                 .try_register_internal(DropNode::new())
+                .map_err(HammerError::from)?;
+            runtime
+                .nodes()
+                .register_internal_with_handle(SERVICE_HANDOFF_HANDLE, HandoffNode::new())
                 .map_err(HammerError::from)?;
             let lookup = runtime
                 .nodes()
@@ -1041,28 +1032,74 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 )
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
-            let queue = register_session_queue(
-                crate::session::runtime::SessionDriverRuntime::<
-                    crate::transport::tcp::TcpConnectionState<BbrController>,
-                    crate::transport::tcp::TcpWorkerOwnedState,
-                >::new(
-                    worker,
-                    runtime.packet_buffers().clone(),
-                    crate::transport::tcp::TcpWorkerOwnedState::new(worker),
-                ),
+            let queue = register_tcp_session_queue::<BbrController>(
+                worker,
+                runtime.packet_buffers().clone(),
             )
             .map_err(HammerError::from)?;
+            let session_queue = SessionQueueHandle::<
+                crate::session::runtime::SessionDriverRuntime<
+                    crate::transport::tcp::TcpConnection<BbrController>,
+                    crate::transport::tcp::lookup::TcpWorkerOwnedState,
+                >,
+            >::new(queue.runtime_data());
             let tcp_output = runtime
                 .nodes()
                 .try_register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)))
                 .map_err(HammerError::from)?;
+            let tcp_reset = runtime
+                .nodes()
+                .try_register_internal(TcpResetNode::new(TcpResetNext::nodes(drop, lookup)))
+                .map_err(HammerError::from)?;
+            let tcp_established = runtime
+                .nodes()
+                .try_register_internal(TcpEstablishedNode::new(
+                    queue,
+                    TcpEstablishedNext::nodes(tcp_output, drop),
+                ))
+                .map_err(HammerError::from)?;
+            let tcp_rcv_process = runtime
+                .nodes()
+                .try_register_internal(TcpRcvProcessNode::new(
+                    queue,
+                    TcpRcvProcessNext::nodes(tcp_output, drop),
+                ))
+                .map_err(HammerError::from)?;
+            let tcp_syn_sent = runtime
+                .nodes()
+                .try_register_internal(TcpSynSentNode::new(
+                    queue,
+                    TcpSynSentNext::nodes(tcp_output, drop),
+                ))
+                .map_err(HammerError::from)?;
+            let tcp_listen = runtime
+                .nodes()
+                .try_register_internal(TcpListenNode::new(queue, TcpListenNext::nodes(tcp_output, drop)))
+                .map_err(HammerError::from)?;
+            let tcp_input = runtime
+                .nodes()
+                .try_register_internal(tcp_control.node::<BbrController>(
+                    TcpInputNext::nodes(
+                        drop,
+                        drop,
+                        tcp_listen,
+                        tcp_rcv_process,
+                        tcp_syn_sent,
+                        tcp_established,
+                        tcp_reset,
+                    ),
+                    Some(queue),
+                    Some((SERVICE_HANDOFF_HANDLE, worker)),
+                ))
+                .map_err(HammerError::from)?;
+            let _tcp_input = tcp_input;
             let node = runtime
                 .nodes()
                 .try_register_driver(session_queue_node.clone())
                 .map_err(HammerError::from)?;
             session_queue_node
                 .attach_queue(
-                    queue,
+                    session_queue,
                     SessionQueueNext::from_node(tcp_output),
                     tcp_session_queue_dispatch_fn::<BbrController>(),
                 )
@@ -1809,6 +1846,7 @@ interval = "5s"
         let graph = ServicePacketGraphDeclarations::default();
 
         assert!(graph.resolve("session-queue").is_some());
+        assert!(graph.resolve("handoff-node").is_some());
         assert!(graph.resolve("tcp-input-node").is_some());
         assert!(graph.resolve("tcp-listen-node").is_some());
         assert!(graph.resolve("tcp-rcv-process-node").is_some());

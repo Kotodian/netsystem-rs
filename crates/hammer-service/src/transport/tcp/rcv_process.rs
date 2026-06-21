@@ -5,23 +5,22 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
-use super::connection::TcpConnection;
+
 use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
-use super::state_machine::LastAck;
 
 #[hammer_component_macros::node_next]
-pub enum TcpLastAckNext {
+pub enum TcpRcvProcessNext {
     Output,
     Drop,
 }
 
-#[hammer_component_macros::node(role = internal, next = TcpLastAckNext)]
-pub struct TcpLastAckNode<C: CongestionController + 'static> {
+#[hammer_component_macros::node(role = internal, next = TcpRcvProcessNext)]
+pub struct TcpRcvProcessNode<C: CongestionController + 'static> {
     session_queue: TcpQueueHandle<C>,
 }
 
-impl<C> Node for TcpLastAckNode<C>
+impl<C> Node for TcpRcvProcessNode<C>
 where
     C: CongestionController + 'static,
 {
@@ -32,12 +31,12 @@ where
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        tcp_last_ack_frame(runtime, frame, self.session_queue, next)
+        tcp_rcv_process_frame(runtime, frame, self.session_queue, next)
     }
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        tcp_last_ack_process::<C>
+        tcp_rcv_process_process::<C>
     }
 
     #[inline]
@@ -46,7 +45,7 @@ where
     }
 }
 
-fn tcp_last_ack_process<C>(
+fn tcp_rcv_process_process<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
@@ -54,24 +53,24 @@ fn tcp_last_ack_process<C>(
 where
     C: CongestionController + 'static,
 {
-    let next = TcpLastAckNode::<C>::runtime_nexts(runtime)?;
-    tcp_last_ack_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
+    let next = TcpRcvProcessNode::<C>::runtime_nexts(runtime)?;
+    tcp_rcv_process_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
 }
 
-fn tcp_last_ack_frame<C>(
+fn tcp_rcv_process_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
     session_queue: TcpQueueHandle<C>,
-    next: [NodeId; TcpLastAckNext::COUNT],
+    next: [NodeId; TcpRcvProcessNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
     C: CongestionController + 'static,
 {
-    let tcp_output = next[TcpLastAckNext::Output as usize];
-    let drop_next = next[TcpLastAckNext::Drop as usize];
+    let tcp_output = next[TcpRcvProcessNext::Output as usize];
+    let drop_next = next[TcpRcvProcessNext::Drop as usize];
     let mut next_frames = NodeNextFrames::default();
     frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_last_ack_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
+        match tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
             Ok(()) => Ok(None),
             Err(_) => {
                 next_frames.enqueue(runtime, drop_next, index)?;
@@ -83,7 +82,7 @@ where
     Ok(NodeResult::drop())
 }
 
-fn tcp_last_ack_index<C>(
+fn tcp_rcv_process_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
     session_queue: TcpQueueHandle<C>,
@@ -99,18 +98,21 @@ where
         let mut queue = session_queue.borrow_mut()?;
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
-            .ok_or_else(|| CoreError::internal("tcp last-ack session is missing"))?;
-        let state = queue
-            .session(session_id)
-            .ok_or_else(|| CoreError::internal("tcp last-ack session is missing"))?
-            .clone();
-        let connection: TcpConnection<LastAck, _> = state.try_into()?;
-        let (next_state, control) =
-            connection.receive_last_ack(&mut queue, session_id, &packet)?;
-        let state = queue
-            .session_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp last-ack session is missing"))?;
-        *state = next_state;
+            .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
+        let control = {
+            let queue_ptr: *mut crate::session::runtime::SessionDriverRuntime<
+                super::connection::TcpConnection<C>,
+                super::TcpWorkerOwnedState,
+            > = &mut *queue;
+            // SAFETY: same split-borrow reasoning as established receive above.
+            unsafe {
+                let connection = (*queue_ptr)
+                    .session_mut(session_id)
+                    .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
+                connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?
+            }
+        };
+        queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
             if let Err(error) = segment.write_to_buffer(runtime, allocated) {

@@ -656,6 +656,16 @@ impl TcpWorkerOwnedState {
             owner_worker: self.owner_worker,
         }
     }
+
+    pub fn register_queue<C>(
+        worker: DataWorkerId,
+        buffers: hammer_adapter::DataPlaneBuffers,
+    ) -> hammer_core::error::CoreResult<crate::transport::tcp::TcpQueueHandle<C>>
+    where
+        C: crate::transport::congestion::CongestionController + 'static,
+    {
+        crate::transport::tcp::register_tcp_session_queue::<C>(worker, buffers)
+    }
 }
 
 #[inline(always)]

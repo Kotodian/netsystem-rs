@@ -29,6 +29,18 @@ impl DropNode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HandoffNode;
+
+impl HandoffNode {
+    pub const NODE_NAME: &'static str = "handoff-node";
+
+    #[inline]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropTrace {
     pub dropped: usize,
@@ -123,6 +135,42 @@ impl InternalNode for DropNode {
     }
 }
 
+impl Node for HandoffNode {
+    #[inline(always)]
+    fn process(
+        &mut self,
+        _runtime: &DataPlaneRuntime,
+        _frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Err(CoreError::internal(
+            "handoff node must run through descriptor process",
+        ))
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        handoff_node_process
+    }
+}
+
+fn handoff_node_process(
+    runtime: &DataPlaneRuntime,
+    _data: hammer_adapter::node::NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> CoreResult<NodeResult> {
+    next_feature_frame(runtime, frame)
+}
+
+impl InternalNode for HandoffNode {
+    #[inline]
+    fn node_registration(&self) -> NodeRegistration
+    where
+        Self: Sized,
+    {
+        NodeRegistration::next(Self::NODE_NAME, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +201,30 @@ mod tests {
 
         assert_eq!(err.to_string(), "buffer slot is free");
         assert!(!frame.has_pending());
+        assert_eq!(runtime.in_use_buffers(), 0);
+    }
+
+    #[test]
+    fn handoff_node_routes_packet_to_metadata_selected_next() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 2, 4);
+        let sink = runtime.nodes().register_internal(DropNode::new());
+        let handoff = runtime.nodes().register_internal(HandoffNode::new());
+        let frame = runtime.alloc_frame_index().expect("alloc frame");
+        let mut metadata = RouteMetadata::default();
+        metadata.set_feature_path(vec![FeaturePathEntry::new(sink, None)]);
+        let packet = runtime
+            .alloc_index_with_bytes(metadata, b"handoff")
+            .expect("alloc packet");
+        runtime
+            .get_frame_mut(frame)
+            .expect("mutate frame")
+            .push_index(packet)
+            .expect("push packet");
+
+        assert!(runtime.schedule_frame(handoff, frame).expect("schedule"));
+
+        assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+        assert_eq!(runtime.frames_in_use(), 0);
         assert_eq!(runtime.in_use_buffers(), 0);
     }
 }

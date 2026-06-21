@@ -10,7 +10,6 @@ use crate::transport::congestion::CongestionController;
 use super::connection::TcpConnection;
 use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
-use super::state_machine::Listen;
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
@@ -103,25 +102,22 @@ where
         let worker = queue.worker();
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
-            let connection: TcpConnection<Listen, _> = TcpConnection::new(
+            TcpConnection::new(
                 Some(connection_id),
                 worker,
                 packet.local.port(),
                 Some(packet.local),
                 packet.remote,
-            );
-            connection.into()
+            )
         });
-        let state = queue
-            .session(session_id)
-            .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?
-            .clone();
-        let connection: TcpConnection<Listen, _> = state.try_into()?;
-        let (next_state, control) = connection.receive_syn(&packet)?;
-        let state = queue
+        let control = queue
             .session_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?;
-        *state = next_state;
+            .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?
+            .receive_syn(&packet)?;
+        let present = queue.session(session_id).is_some();
+        if present {
+            queue.refresh_session_route(session_id)?;
+        }
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
             if let Err(error) = segment.write_to_buffer(runtime, allocated) {
