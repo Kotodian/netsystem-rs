@@ -1955,6 +1955,7 @@ interval = "5s"
             timestamps: true,
             ecn: false,
             accurate_ecn: false,
+            fast_open: false,
         };
 
         let listener = service

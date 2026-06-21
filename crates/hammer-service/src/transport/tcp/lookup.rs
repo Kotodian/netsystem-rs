@@ -4,6 +4,7 @@ use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
 use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
+use hammer_infra::vec::Vec;
 
 use crate::session::SessionId;
 use crate::transport::tcp::TcpInputNext;
@@ -99,6 +100,21 @@ pub struct TcpLookupValue {
     pub id: TcpLookupId,
     pub owner_worker: DataWorkerId,
     pub capabilities: TcpCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TcpFastOpenCacheEntry {
+    local: SocketAddr,
+    remote: SocketAddr,
+    cookie: [u8; 16],
+    cookie_len: u8,
+    max_segment_size: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpFastOpenSecret {
+    listener_id: TcpLookupId,
+    secret: [u8; 16],
 }
 
 pub trait TcpListenerAddress: Copy + Eq {
@@ -534,6 +550,8 @@ pub struct TcpWorkerOwnedState {
     listeners: TcpLookupSnapshot,
     connections: TcpConnectionRouteIndex,
     pending: TcpPendingRouteIndex,
+    fast_open_cache: Vec<TcpFastOpenCacheEntry>,
+    fast_open_secrets: Vec<TcpFastOpenSecret>,
     next_iss: u32,
 }
 
@@ -545,6 +563,8 @@ impl TcpWorkerOwnedState {
             listeners: TcpLookupSnapshot::empty(),
             connections: TcpConnectionRouteIndex::empty(),
             pending: TcpPendingRouteIndex::empty(),
+            fast_open_cache: Vec::new(),
+            fast_open_secrets: Vec::new(),
             next_iss: 81_000,
         }
     }
@@ -654,6 +674,95 @@ impl TcpWorkerOwnedState {
         };
         self.next_iss = self.next_iss.wrapping_add(64_099);
         value.max(1)
+    }
+
+    pub fn fast_open_cookie(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Option<(&[u8], Option<u16>)> {
+        self.fast_open_cache
+            .iter()
+            .find(|entry| entry.local == local && entry.remote == remote)
+            .map(|entry| (&entry.cookie[..usize::from(entry.cookie_len)], entry.max_segment_size))
+    }
+
+    pub fn remember_fast_open_cookie(
+        &mut self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        cookie: &[u8],
+        max_segment_size: Option<u16>,
+    ) {
+        let mut copied = [0u8; 16];
+        let len = cookie.len().min(copied.len());
+        copied[..len].copy_from_slice(&cookie[..len]);
+        if let Some(entry) = self
+            .fast_open_cache
+            .iter_mut()
+            .find(|entry| entry.local == local && entry.remote == remote)
+        {
+            entry.cookie = copied;
+            entry.cookie_len = len as u8;
+            entry.max_segment_size = max_segment_size;
+            return;
+        }
+        self.fast_open_cache.push(TcpFastOpenCacheEntry {
+            local,
+            remote,
+            cookie: copied,
+            cookie_len: len as u8,
+            max_segment_size,
+        });
+    }
+
+    pub fn fast_open_cookie_for_listener(
+        &mut self,
+        listener_id: TcpLookupId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> [u8; 16] {
+        let secret = if let Some(secret) = self
+            .fast_open_secrets
+            .iter()
+            .find(|secret| secret.listener_id == listener_id)
+        {
+            secret.secret
+        } else {
+            let mut secret = [0u8; 16];
+            secret[..4].copy_from_slice(&listener_id.to_be_bytes());
+            secret[4..8].copy_from_slice(&self.next_iss.to_be_bytes());
+            match (local.ip(), remote.ip()) {
+                (std::net::IpAddr::V4(local_ip), std::net::IpAddr::V4(remote_ip)) => {
+                    secret[8..12].copy_from_slice(&u32::from(local_ip).to_be_bytes());
+                    secret[12..16].copy_from_slice(&u32::from(remote_ip).to_be_bytes());
+                }
+                _ => {
+                    secret[8..10].copy_from_slice(&local.port().to_be_bytes());
+                    secret[10..12].copy_from_slice(&remote.port().to_be_bytes());
+                    secret[12..16].copy_from_slice(&self.next_iss.rotate_left(11).to_be_bytes());
+                }
+            }
+            self.fast_open_secrets.push(TcpFastOpenSecret {
+                listener_id,
+                secret,
+            });
+            secret
+        };
+        let mut cookie = secret;
+        cookie[..2].copy_from_slice(&local.port().to_be_bytes());
+        cookie[2..4].copy_from_slice(&remote.port().to_be_bytes());
+        cookie
+    }
+
+    pub fn validate_fast_open_cookie(
+        &mut self,
+        listener_id: TcpLookupId,
+        local: SocketAddr,
+        remote: SocketAddr,
+        cookie: &[u8],
+    ) -> bool {
+        cookie == self.fast_open_cookie_for_listener(listener_id, local, remote)
     }
 
     #[inline]

@@ -1,4 +1,5 @@
 use super::TcpCapabilities;
+use hammer_infra::vec::Vec;
 
 const TCP_OPTION_EOL: u8 = 0;
 const TCP_OPTION_NOP: u8 = 1;
@@ -7,6 +8,7 @@ const TCP_OPTION_WINDOW_SCALE: u8 = 3;
 const TCP_OPTION_SACK_PERMITTED: u8 = 4;
 const TCP_OPTION_SACK: u8 = 5;
 const TCP_OPTION_TIMESTAMPS: u8 = 8;
+const TCP_OPTION_FAST_OPEN: u8 = 34;
 const TCP_OPTION_ACCURATE_ECN_ORDER_0: u8 = 172;
 const TCP_OPTION_ACCURATE_ECN_ORDER_1: u8 = 174;
 const TCP_OPTION_MSS_LEN: usize = 4;
@@ -16,6 +18,8 @@ const TCP_OPTION_TIMESTAMPS_LEN: usize = 10;
 const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
 const TCP_MAX_SACK_BLOCKS: usize = 4;
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
+const TCP_FAST_OPEN_COOKIE_MIN_LEN: usize = 4;
+const TCP_FAST_OPEN_COOKIE_MAX_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSackBlock {
@@ -32,8 +36,9 @@ pub struct TcpTimestampOption {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ParsedTcpOptions {
     pub capabilities: TcpCapabilities,
-    pub sack_blocks: std::vec::Vec<TcpSackBlock>,
+    pub sack_blocks: Vec<TcpSackBlock>,
     pub timestamp: Option<TcpTimestampOption>,
+    pub fast_open_cookie: Option<Vec<u8>>,
 }
 
 #[inline]
@@ -101,6 +106,15 @@ pub fn tcp_options_from_bytes(options: &[u8]) -> ParsedTcpOptions {
                             ]),
                         });
                     }
+                    TCP_OPTION_FAST_OPEN if is_valid_fast_open_option_len(len) => {
+                        parsed.capabilities.fast_open = true;
+                        let cookie_len = len - 2;
+                        if cookie_len != 0 {
+                            let mut cookie = Vec::with_capacity(cookie_len);
+                            cookie.extend_from_slice(&options[index + 2..index + len]);
+                            parsed.fast_open_cookie = Some(cookie);
+                        }
+                    }
                     TCP_OPTION_ACCURATE_ECN_ORDER_0 | TCP_OPTION_ACCURATE_ECN_ORDER_1 => {
                         parsed.capabilities.ecn = true;
                         parsed.capabilities.accurate_ecn = true;
@@ -114,50 +128,29 @@ pub fn tcp_options_from_bytes(options: &[u8]) -> ParsedTcpOptions {
     parsed
 }
 
-pub(crate) fn tcp_syn_options_from_capabilities(
-    capabilities: TcpCapabilities,
-) -> std::vec::Vec<u8> {
-    let mut options = std::vec::Vec::new();
-    if let Some(max_segment_size) = capabilities.max_segment_size {
-        options.extend([TCP_OPTION_MSS, TCP_OPTION_MSS_LEN as u8]);
-        options.extend(max_segment_size.to_be_bytes());
-    }
-    if let Some(window_scale) = capabilities.window_scale {
-        options.extend([
-            TCP_OPTION_NOP,
-            TCP_OPTION_WINDOW_SCALE,
-            TCP_OPTION_WINDOW_SCALE_LEN as u8,
-            window_scale.min(TCP_MAX_WINDOW_SCALE),
-        ]);
-    }
-    if capabilities.sack {
-        options.extend([
-            TCP_OPTION_NOP,
-            TCP_OPTION_NOP,
-            TCP_OPTION_SACK_PERMITTED,
-            TCP_OPTION_SACK_PERMITTED_LEN as u8,
-        ]);
-    }
-    if capabilities.timestamps {
-        options.extend([
-            TCP_OPTION_NOP,
-            TCP_OPTION_NOP,
-            TCP_OPTION_TIMESTAMPS,
-            TCP_OPTION_TIMESTAMPS_LEN as u8,
-        ]);
-        options.extend(0u32.to_be_bytes());
-        options.extend(0u32.to_be_bytes());
-    }
-    if capabilities.accurate_ecn {
-        options.extend([TCP_OPTION_NOP, TCP_OPTION_ACCURATE_ECN_ORDER_0, 2]);
-    }
-    while options.len() % 4 != 0 {
-        options.push(TCP_OPTION_EOL);
-    }
-    options
+#[inline]
+pub(crate) fn is_valid_sack_option_len(len: usize) -> bool {
+    len > 2 && (len - 2) % TCP_OPTION_SACK_BLOCK_BYTES == 0
 }
 
 #[inline]
-fn is_valid_sack_option_len(len: usize) -> bool {
-    len > 2 && (len - 2) % TCP_OPTION_SACK_BLOCK_BYTES == 0
+pub(crate) fn is_valid_fast_open_option_len(len: usize) -> bool {
+    let cookie_len = len.saturating_sub(2);
+    cookie_len == 0
+        || ((TCP_FAST_OPEN_COOKIE_MIN_LEN..=TCP_FAST_OPEN_COOKIE_MAX_LEN).contains(&cookie_len)
+            && cookie_len % 2 == 0)
 }
+
+pub(crate) const TCP_OPTION_EOL_VALUE: u8 = TCP_OPTION_EOL;
+pub(crate) const TCP_OPTION_NOP_VALUE: u8 = TCP_OPTION_NOP;
+pub(crate) const TCP_OPTION_MSS_VALUE: u8 = TCP_OPTION_MSS;
+pub(crate) const TCP_OPTION_WINDOW_SCALE_VALUE: u8 = TCP_OPTION_WINDOW_SCALE;
+pub(crate) const TCP_OPTION_SACK_PERMITTED_VALUE: u8 = TCP_OPTION_SACK_PERMITTED;
+pub(crate) const TCP_OPTION_TIMESTAMPS_VALUE: u8 = TCP_OPTION_TIMESTAMPS;
+pub(crate) const TCP_OPTION_FAST_OPEN_VALUE: u8 = TCP_OPTION_FAST_OPEN;
+pub(crate) const TCP_OPTION_ACCURATE_ECN_ORDER_0_VALUE: u8 = TCP_OPTION_ACCURATE_ECN_ORDER_0;
+pub(crate) const TCP_OPTION_MSS_LEN_VALUE: usize = TCP_OPTION_MSS_LEN;
+pub(crate) const TCP_OPTION_WINDOW_SCALE_LEN_VALUE: usize = TCP_OPTION_WINDOW_SCALE_LEN;
+pub(crate) const TCP_OPTION_SACK_PERMITTED_LEN_VALUE: usize = TCP_OPTION_SACK_PERMITTED_LEN;
+pub(crate) const TCP_OPTION_TIMESTAMPS_LEN_VALUE: usize = TCP_OPTION_TIMESTAMPS_LEN;
+pub(crate) const TCP_MAX_WINDOW_SCALE_VALUE: u8 = TCP_MAX_WINDOW_SCALE;

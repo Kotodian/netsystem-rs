@@ -93,13 +93,14 @@ where
     C: CongestionController + 'static,
 {
     let packet = parse_tcp_packet(runtime, index)?;
+    let mut release_input = true;
     let mut tx_index = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
-        let control = {
+        let (control, established_with_payload) = {
             let queue_ptr: *mut crate::session::runtime::SessionDriverRuntime<
                 super::connection::TcpConnection<C>,
                 super::TcpWorkerOwnedState,
@@ -109,9 +110,25 @@ where
                 let connection = (*queue_ptr)
                     .session_mut(session_id)
                     .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
-                connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?
+                let previous_state = connection.state();
+                let control = connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?;
+                (
+                    control,
+                    previous_state == crate::transport::tcp::TcpState::SynRcvd
+                        && connection.state() == crate::transport::tcp::TcpState::Established
+                        && packet.payload_len != 0,
+                )
             }
         };
+        if established_with_payload {
+            runtime.packet_buffers().advance(index, packet.payload_offset)?;
+            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
+            if enqueue.delivered_len != 0 {
+                queue.mark_ready(session_id);
+            }
+            release_input = false;
+        }
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
@@ -135,6 +152,8 @@ where
         runtime.free_index(tx_index);
         return Err(error);
     }
-    runtime.free_index(index);
+    if release_input {
+        runtime.free_index(index);
+    }
     Ok(())
 }

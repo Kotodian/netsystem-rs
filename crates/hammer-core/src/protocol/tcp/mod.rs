@@ -174,6 +174,7 @@ pub struct TcpCapabilities {
     pub timestamps: bool,
     pub ecn: bool,
     pub accurate_ecn: bool,
+    pub fast_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -186,6 +187,7 @@ pub struct TcpNegotiatedOptions {
     pub timestamps: bool,
     pub ecn: bool,
     pub accurate_ecn: bool,
+    pub fast_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +222,7 @@ impl TcpHandshakeObservation {
                 timestamps: false,
                 ecn: false,
                 accurate_ecn: false,
+                fast_open: false,
             },
         }
     }

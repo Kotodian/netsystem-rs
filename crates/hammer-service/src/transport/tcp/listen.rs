@@ -174,14 +174,34 @@ where
     C: CongestionController + 'static,
 {
     let packet = parse_tcp_packet(runtime, index)?;
-    let capabilities = control
+    let mut release_input = true;
+    let listener = control
         .lookup_listener(packet.local)
-        .map(|value| value.capabilities)
-        .unwrap_or_default();
+        .ok_or_else(|| CoreError::internal("tcp listener is missing"))?;
+    let capabilities = listener.capabilities;
     let mut tx_index = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let worker = queue.worker();
+        let fast_open_cookie = capabilities
+            .fast_open
+            .then(|| {
+                queue
+                    .aux_mut()
+                    .fast_open_cookie_for_listener(listener.id, packet.local, packet.remote)
+            });
+        let fast_open_valid = packet
+            .fast_open_cookie
+            .as_deref()
+            .is_some_and(|cookie| {
+                queue.aux_mut().validate_fast_open_cookie(
+                    listener.id,
+                    packet.local,
+                    packet.remote,
+                    cookie,
+                )
+            });
+        let accepted_payload_len = usize::from(fast_open_valid) * packet.payload_len;
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
             let mut connection = TcpConnection::new(
@@ -191,13 +211,27 @@ where
                 Some(packet.local),
                 packet.remote,
             );
-            let _ = connection.set_local_capabilities(capabilities);
+            let mut local_capabilities = capabilities;
+            local_capabilities.fast_open = capabilities.fast_open;
+            let _ = connection.set_local_capabilities(local_capabilities);
+            if let Some(cookie) = fast_open_cookie.as_ref() {
+                connection.set_fast_open_cookie(Some(cookie));
+            }
             connection
         });
         let control = queue
             .session_mut(session_id)
             .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?
-            .receive_syn(&packet)?;
+            .receive_syn(&packet, accepted_payload_len)?;
+        if fast_open_valid && packet.payload_len != 0 {
+            runtime.packet_buffers().advance(index, packet.payload_offset)?;
+            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
+            if enqueue.delivered_len != 0 {
+                queue.mark_ready(session_id);
+            }
+            release_input = false;
+        }
         let present = queue.session(session_id).is_some();
         if present {
             queue.refresh_session_route(session_id)?;
@@ -225,6 +259,8 @@ where
             return Err(error);
         }
     }
-    runtime.free_index(index);
+    if release_input {
+        runtime.free_index(index);
+    }
     Ok(())
 }

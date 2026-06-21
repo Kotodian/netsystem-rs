@@ -92,16 +92,52 @@ where
     C: CongestionController + 'static,
 {
     let packet = parse_tcp_packet(runtime, index)?;
+    let mut release_input = true;
     let mut tx_index = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let (session_id, _, _) = queue
             .pending_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
-        let control = queue
-            .session_mut(session_id)
-            .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?
-            .receive_open_reply(&packet)?;
+        let (control, acked_tx_len, established_with_payload) = {
+            let connection = queue
+                .session_mut(session_id)
+                .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
+            let previous_snd_una = connection.snd_una();
+            let previous_state = connection.state();
+            let control = connection.receive_open_reply(&packet)?;
+            (
+                control,
+                connection.take_acked_tx_len(previous_snd_una),
+                previous_state == crate::transport::tcp::TcpState::SynSent
+                    && connection.state() == crate::transport::tcp::TcpState::Established
+                    && packet.payload_len != 0,
+            )
+        };
+        if acked_tx_len != 0 {
+            queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
+        }
+        if let Some(cookie) = packet
+            .fast_open_cookie
+            .as_deref()
+            .filter(|cookie| !cookie.is_empty())
+        {
+            queue.aux_mut().remember_fast_open_cookie(
+                packet.local,
+                packet.remote,
+                cookie,
+                packet.capabilities.max_segment_size,
+            );
+        }
+        if established_with_payload {
+            runtime.packet_buffers().advance(index, packet.payload_offset)?;
+            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
+            if enqueue.delivered_len != 0 {
+                queue.mark_ready(session_id);
+            }
+            release_input = false;
+        };
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
@@ -125,7 +161,9 @@ where
         runtime.free_index(tx_index);
         return Err(error);
     }
-    runtime.free_index(index);
+    if release_input {
+        runtime.free_index(index);
+    }
     Ok(())
 }
 

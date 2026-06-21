@@ -136,10 +136,28 @@ where
     ) -> CoreResult<SessionId> {
         let owner = self.worker();
         let initial_sequence = self.aux_mut().next_initial_sequence(local, remote);
+        let cached_fast_open = self
+            .aux()
+            .fast_open_cookie(local, remote)
+            .map(|(cookie, max_segment_size)| {
+                let mut copied = [0u8; 16];
+                let len = cookie.len().min(copied.len());
+                copied[..len].copy_from_slice(&cookie[..len]);
+                (copied, len as u8, max_segment_size)
+            });
         let session_id = self.insert_session_with_id(|session_id: SessionId| {
             let connection_id = hammer_core::protocol::tcp::TcpConnectionId::new(session_id.get());
             let mut connection =
                 TcpConnection::new(Some(connection_id), owner, local.port(), Some(local), remote);
+            if let Some((cookie, len, max_segment_size)) = cached_fast_open {
+                let mut capabilities = connection.local_capabilities();
+                capabilities.fast_open = true;
+                if max_segment_size.is_some() {
+                    capabilities.max_segment_size = max_segment_size;
+                }
+                let _ = connection.set_local_capabilities(capabilities);
+                connection.set_fast_open_cookie(Some(&cookie[..usize::from(len)]));
+            }
             connection.connect_state(initial_sequence);
             connection
         });
@@ -298,7 +316,7 @@ mod tests {
     };
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
-        TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
+        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
     };
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
@@ -565,5 +583,93 @@ mod tests {
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH
         );
         assert_eq!(tcp_segment_payload(packet), b"first");
+    }
+
+    #[test]
+    fn session_tcp_syn_data_ack_releases_retained_tx() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut driver = SessionDriverRuntime::new(
+            DataWorkerId::new(0),
+            runtime.packet_buffers().clone(),
+            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+        );
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        let session_id = driver.insert_session_with_id(|session_id: SessionId| {
+            let mut connection = TcpConnection::new(
+                Some(TcpConnectionId::new(session_id.get())),
+                DataWorkerId::new(0),
+                local.port(),
+                Some(local),
+                remote,
+            );
+            let _ = connection.set_local_capabilities(TcpCapabilities {
+                max_segment_size: Some(1460),
+                window_scale: None,
+                sack: true,
+                timestamps: false,
+                ecn: false,
+                accurate_ecn: false,
+                fast_open: true,
+            });
+            connection.set_fast_open_cookie(Some(&[1, 2, 3, 4]));
+            connection.connect_state(1000);
+            connection
+        });
+        driver
+            .refresh_session_route(session_id)
+            .expect("refresh session route");
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"hello");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        assert!(driver.has_retained_tx(session_id));
+        let connection = driver.session(session_id).expect("connection");
+        assert_eq!(connection.state(), TcpState::SynSent);
+        let acknowledgment = connection.snd_nxt();
+        let packet = &lookup_state.lock().expect("lookup").packets[0];
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        let options = hammer_core::protocol::tcp::tcp_options_from_bytes(segment.options());
+        assert_eq!(tcp_segment_payload(packet), b"hello");
+        assert_eq!(options.fast_open_cookie.as_deref(), Some(&[1, 2, 3, 4][..]));
+
+        let connection = driver.session_mut(session_id).expect("connection");
+        let packet = crate::transport::tcp::segment::TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: 7_000,
+            acknowledgment: Some(acknowledgment),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::SYN | TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities {
+                max_segment_size: Some(1460),
+                window_scale: None,
+                sack: true,
+                timestamps: false,
+                ecn: false,
+                accurate_ecn: false,
+                fast_open: true,
+            },
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let previous_snd_una = connection.snd_una();
+        let _ = connection
+            .receive_open_reply(&packet)
+            .expect("receive syn-ack");
+        let acked = connection.take_acked_tx_len(previous_snd_una);
+        assert_eq!(acked, 5);
+        driver
+            .release_tx_up_to(session_id, acked as usize)
+            .expect("release tx");
+
+        assert!(!driver.has_retained_tx(session_id));
+        assert_eq!(driver.session(session_id).expect("connection").state(), TcpState::Established);
     }
 }

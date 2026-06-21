@@ -9,6 +9,7 @@ use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError,
     TcpSegmentView, tcp_options_from_bytes,
 };
+use hammer_infra::vec::Vec;
 
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 
@@ -22,7 +23,8 @@ pub(crate) struct TcpPacket {
     pub(crate) flags: TcpSegmentFlags,
     pub(crate) capabilities: TcpCapabilities,
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) sack_blocks: std::vec::Vec<TcpSackBlock>,
+    pub(crate) sack_blocks: Vec<TcpSackBlock>,
+    pub(crate) fast_open_cookie: Option<Vec<u8>>,
     pub(crate) ip_ecn: Option<IpEcnCodepoint>,
     pub(crate) payload_offset: usize,
     pub(crate) payload_len: usize,
@@ -81,6 +83,7 @@ pub(crate) fn parse_tcp_packet(
         flags: segment.flags(),
         capabilities: parsed_options.capabilities,
         sack_blocks: parsed_options.sack_blocks,
+        fast_open_cookie: parsed_options.fast_open_cookie,
         ip_ecn: metadata.ip_ecn,
         payload_offset,
         payload_len,
@@ -98,6 +101,8 @@ pub struct TcpSegment {
     capabilities: TcpCapabilities,
     sack_blocks: Option<[TcpSackBlock; 4]>,
     sack_block_count: u8,
+    fast_open_cookie: Option<[u8; 16]>,
+    fast_open_cookie_len: u8,
     ip_ecn: Option<IpEcnCodepoint>,
     payload_len: usize,
 }
@@ -113,10 +118,20 @@ impl TcpSegment {
         flags: TcpSegmentFlags,
         capabilities: TcpCapabilities,
         sack_blocks: Option<&[TcpSackBlock]>,
+        fast_open_cookie: Option<&[u8]>,
         ip_ecn: Option<IpEcnCodepoint>,
         payload_len: usize,
     ) -> Self {
         let (sack_blocks, sack_block_count) = copy_sack_blocks(sack_blocks);
+        let mut copied_fast_open_cookie = None;
+        let mut fast_open_cookie_len = 0;
+        if let Some(cookie) = fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
+            let mut copied = [0u8; 16];
+            let len = cookie.len().min(copied.len());
+            copied[..len].copy_from_slice(&cookie[..len]);
+            copied_fast_open_cookie = Some(copied);
+            fast_open_cookie_len = len as u8;
+        }
         Self {
             local,
             remote,
@@ -127,6 +142,8 @@ impl TcpSegment {
             capabilities,
             sack_blocks,
             sack_block_count,
+            fast_open_cookie: copied_fast_open_cookie,
+            fast_open_cookie_len,
             ip_ecn,
             payload_len,
         }
@@ -134,6 +151,9 @@ impl TcpSegment {
 
     #[inline]
     pub fn write_header(&self, output: &mut [u8]) -> CoreResult<usize> {
+        let fast_open_cookie = self.fast_open_cookie.as_ref().map(|cookie| {
+            &cookie[..usize::from(self.fast_open_cookie_len)]
+        });
         write_tcp_segment_header(
             output,
             TcpSegmentHeader {
@@ -144,6 +164,7 @@ impl TcpSegment {
                 flags: self.flags,
                 advertised_window: self.advertised_window,
                 capabilities: self.capabilities,
+                fast_open_cookie,
             },
             self.sack_blocks(),
         )
@@ -178,6 +199,9 @@ impl TcpSegment {
             segment.sack_blocks = secondary.sack_blocks;
             segment.sack_block_count = secondary.sack_block_count;
         }
+        if segment.fast_open_cookie_len != 0 {
+            segment.fast_open_cookie = secondary.fast_open_cookie;
+        }
         segment.ip_ecn = buffer.metadata().ip_ecn;
         Ok(segment)
     }
@@ -190,6 +214,7 @@ impl PrimaryOpaquePayload for TcpSegment {
         capabilities |= u8::from(self.capabilities.timestamps) << 1;
         capabilities |= u8::from(self.capabilities.ecn) << 2;
         capabilities |= u8::from(self.capabilities.accurate_ecn) << 3;
+        capabilities |= u8::from(self.capabilities.fast_open) << 4;
         unsafe {
             TcpSegmentHeaderOpaque {
                 fields: TcpSegmentHeaderFields {
@@ -199,6 +224,7 @@ impl PrimaryOpaquePayload for TcpSegment {
                     flags: self.flags.bits(),
                     capabilities,
                     sack_block_count: self.sack_block_count,
+                    fast_open_cookie_len: self.fast_open_cookie_len,
                     reserved: [0; 2],
                     sequence: self.sequence,
                     acknowledgment: self.acknowledgment,
@@ -225,9 +251,12 @@ impl PrimaryOpaquePayload for TcpSegment {
                 timestamps: fields.capabilities & 0x02 != 0,
                 ecn: fields.capabilities & 0x04 != 0,
                 accurate_ecn: fields.capabilities & 0x08 != 0,
+                fast_open: fields.capabilities & 0x10 != 0,
             },
             sack_blocks: None,
             sack_block_count: fields.sack_block_count,
+            fast_open_cookie: None,
+            fast_open_cookie_len: fields.fast_open_cookie_len,
             ip_ecn: None,
             payload_len: 0,
         }
@@ -243,11 +272,20 @@ impl SecondaryOpaquePayload for TcpSegment {
                     (u64::from(block.left_edge) << 32) | u64::from(block.right_edge);
             }
         }
+        let mut cookie_words = [0u64; 2];
+        if let Some(cookie) = self.fast_open_cookie.as_ref() {
+            let mut bytes = [0u8; 16];
+            let len = usize::from(self.fast_open_cookie_len);
+            bytes[..len].copy_from_slice(&cookie[..len]);
+            cookie_words[0] = u64::from_ne_bytes(bytes[..8].try_into().expect("cookie word 0"));
+            cookie_words[1] = u64::from_ne_bytes(bytes[8..16].try_into().expect("cookie word 1"));
+        }
         unsafe {
             TcpSegmentSackOpaque {
                 fields: TcpSegmentSackFields {
                     blocks,
-                    reserved: [0; 3],
+                    cookie_words,
+                    reserved: [0; 1],
                 },
             }
             .raw
@@ -276,6 +314,13 @@ impl SecondaryOpaquePayload for TcpSegment {
                 break;
             }
         }
+        let mut cookie = None;
+        if fields.cookie_words[0] != 0 || fields.cookie_words[1] != 0 {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&fields.cookie_words[0].to_ne_bytes());
+            bytes[8..16].copy_from_slice(&fields.cookie_words[1].to_ne_bytes());
+            cookie = Some(bytes);
+        }
         Self {
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
             remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -286,6 +331,8 @@ impl SecondaryOpaquePayload for TcpSegment {
             capabilities: TcpCapabilities::default(),
             sack_blocks: (count != 0).then_some(blocks),
             sack_block_count: count as u8,
+            fast_open_cookie: cookie,
+            fast_open_cookie_len: 0,
             ip_ecn: None,
             payload_len: 0,
         }
@@ -301,6 +348,7 @@ struct TcpSegmentHeaderFields {
     flags: u16,
     capabilities: u8,
     sack_block_count: u8,
+    fast_open_cookie_len: u8,
     reserved: [u8; 2],
     sequence: u32,
     acknowledgment: u32,
@@ -318,7 +366,8 @@ union TcpSegmentHeaderOpaque {
 #[repr(C)]
 struct TcpSegmentSackFields {
     blocks: [u64; 4],
-    reserved: [u64; 3],
+    cookie_words: [u64; 2],
+    reserved: [u64; 1],
 }
 
 #[derive(Clone, Copy)]
@@ -397,6 +446,7 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
     (Some(copied), len as u8)
 }
 
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -445,6 +495,7 @@ mod tests {
             TcpCapabilities::default(),
             Some(&blocks),
             None,
+            None,
             0,
         );
 
@@ -459,7 +510,41 @@ mod tests {
         assert_eq!(parsed.sack_blocks, blocks);
     }
 
-    fn ipv4_tcp_packet_with_sack() -> Vec<u8> {
+    #[test]
+    fn transport_tcp_segment_buffer_round_trip_keeps_fast_open_cookie() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
+        let index = runtime.alloc_index(Default::default()).expect("buffer");
+        let local = "192.0.2.10:50000".parse().expect("local");
+        let remote = "198.51.100.20:443".parse().expect("remote");
+        let segment = TcpSegment::new(
+            local,
+            remote,
+            100,
+            200,
+            4096,
+            TcpSegmentFlags::SYN,
+            TcpCapabilities {
+                fast_open: true,
+                ..TcpCapabilities::default()
+            },
+            None,
+            Some(&[1, 2, 3, 4]),
+            None,
+            5,
+        );
+
+        segment
+            .write_to_buffer(&runtime, index)
+            .expect("write segment");
+        let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
+
+        let mut header = [0u8; 64];
+        let written = restored.write_header(&mut header).expect("write header");
+        let parsed = tcp_options_from_bytes(&header[20..written]);
+        assert_eq!(parsed.fast_open_cookie.as_deref(), Some(&[1, 2, 3, 4][..]));
+    }
+
+    fn ipv4_tcp_packet_with_sack() -> std::vec::Vec<u8> {
         let mut packet = vec![0u8; 52];
         let packet_len = packet.len() as u16;
         let source = Ipv4Addr::new(198, 51, 100, 20);
