@@ -99,7 +99,7 @@ where
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        let control = {
+        let (control, ack_advanced) = {
             let queue_ptr: *mut crate::session::runtime::SessionDriverRuntime<
                 super::connection::TcpConnection<C>,
                 super::TcpWorkerOwnedState,
@@ -112,9 +112,18 @@ where
                 let connection = (*queue_ptr)
                     .session_mut(session_id)
                     .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-                connection.receive_data(runtime, index, &mut *queue_ptr, session_id, &packet)?
+                let previous_snd_una = connection.snd_una();
+                let control =
+                    connection.receive_data(runtime, index, &mut *queue_ptr, session_id, &packet)?;
+                (
+                    control,
+                    connection.snd_una() != previous_snd_una,
+                )
             }
         };
+        if ack_advanced && queue.app().has_pending_send(session_id) {
+            queue.mark_ready(session_id);
+        }
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index(Default::default())?;

@@ -447,7 +447,7 @@ mod tests {
         runtime: &DataPlaneRuntime,
         driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
         output_node: NodeId,
-    ) {
+    ) -> usize {
         let next = crate::session::SessionQueueNext::from_node(output_node);
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
@@ -461,7 +461,7 @@ mod tests {
         )
         .expect("dispatch tcp session queue");
         output.schedule(runtime).expect("schedule output");
-        assert_eq!(runtime.run_ready_nodes().expect("run tcp output"), 2);
+        runtime.run_ready_nodes().expect("run tcp output")
     }
 
     fn expire_tcp_timers(
@@ -498,11 +498,11 @@ mod tests {
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
 
         enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
         lookup_state.lock().expect("lookup").packets.clear();
 
         enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
         lookup_state.lock().expect("lookup").packets.clear();
         drop_state.lock().expect("drop").packets.clear();
 
@@ -536,12 +536,12 @@ mod tests {
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
 
         enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
         let second_left_edge = driver.session(session_id).expect("connection").snd_nxt();
         lookup_state.lock().expect("lookup").packets.clear();
 
         enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
         let connection = driver.session(session_id).expect("connection");
         let acknowledgment = connection.snd_una();
         let second_right_edge = connection.snd_nxt();

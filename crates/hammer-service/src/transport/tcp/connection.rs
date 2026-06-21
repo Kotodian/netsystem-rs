@@ -1103,10 +1103,16 @@ where
         let mss = self.output_payload_len();
         let bytes_in_flight = self.recovery.bytes_in_flight();
         let peer_remaining = self.snd_wnd.saturating_sub(bytes_in_flight) as usize;
-        let cc_remaining = self
-            .congestion
-            .congestion_window()
-            .saturating_sub(bytes_in_flight) as usize;
+        let cc_remaining = if let Some(recovery_remaining) = self
+            .recovery
+            .recovery_send_space(bytes_in_flight, self.congestion.max_datagram_size())
+        {
+            recovery_remaining as usize
+        } else {
+            self.congestion
+                .congestion_window()
+                .saturating_sub(bytes_in_flight) as usize
+        };
         let allowed = pending_len.min(mss).min(peer_remaining).min(cc_remaining);
         if allowed == 0 {
             return 0;
@@ -1219,6 +1225,7 @@ where
             false,
             false,
         );
+        self.recovery.on_new_data_sent(payload_len);
         self.congestion
             .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
         self.snd_nxt = end_sequence;
@@ -1715,8 +1722,10 @@ where
         if self.state == TcpState::Established {
             match kind {
                 TcpConnectionTimerKind::RACK => {
-                    self.recovery.on_rack_timeout(Instant::now(), &mut self.congestion);
+                    self.recovery
+                        .on_rack_timeout(Instant::now(), self.snd_nxt, &mut self.congestion);
                     if let Some((sequence, bytes, payload)) = self.recovery.take_rack_retransmit() {
+                        self.recovery.on_retransmit_sent(bytes);
                         emit_retained_segment(
                             runtime,
                             context.buffers(),
@@ -1737,6 +1746,9 @@ where
                 }
                 TcpConnectionTimerKind::TLP => {
                     if let Some((_, sequence, bytes, payload)) = self.recovery.take_tlp_probe() {
+                        if self.recovery.in_recovery() {
+                            self.recovery.on_retransmit_sent(bytes);
+                        }
                         emit_retained_segment(
                             runtime,
                             context.buffers(),
@@ -2074,12 +2086,96 @@ fn sack_blocks_overlap_or_touch(left: TcpSackBlock, right: TcpSackBlock) -> bool
 mod tests {
     use super::*;
     use crate::transport::congestion::BbrController;
+    use crate::transport::congestion::{
+        AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample,
+    };
     use hammer_core::protocol::tcp::TcpSegmentView;
 
     fn established_connection() -> TcpConnection<BbrController> {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
         TcpConnection::established_with_sack_for_test(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        )
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestCongestionController {
+        max_datagram_size: u32,
+        congestion_window: u32,
+    }
+
+    impl CongestionController for TestCongestionController {
+        fn new(max_datagram_size: u32) -> Self {
+            Self {
+                max_datagram_size,
+                congestion_window: max_datagram_size.saturating_mul(4),
+            }
+        }
+
+        fn metrics(&self) -> CongestionMetrics {
+            CongestionMetrics {
+                congestion_window: self.congestion_window,
+                pacing_rate_bytes_per_second: None,
+                delivered: 0,
+                max_bandwidth_bytes_per_second: 0,
+                min_rtt: None,
+            }
+        }
+
+        fn max_datagram_size(&self) -> u32 {
+            self.max_datagram_size
+        }
+
+        fn congestion_window(&self) -> u32 {
+            self.congestion_window
+        }
+
+        fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
+            None
+        }
+
+        fn delivered(&self) -> u64 {
+            0
+        }
+
+        fn min_rtt(&self) -> Option<Duration> {
+            None
+        }
+
+        fn max_bandwidth_bytes_per_second(&self) -> u64 {
+            0
+        }
+
+        fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
+
+        fn on_ack(&mut self, _: Instant, _: AckedPacket, _: RttSample, _: u32) {}
+
+        fn on_end_acks(&mut self, _: Instant, _: u32, _: bool, _: PacketNumber) {}
+
+        fn on_loss(&mut self, _: Instant, lost: LostPacket, _: bool) {
+            let halved = self.congestion_window / 2;
+            self.congestion_window = halved.max(self.max_datagram_size.max(lost.bytes));
+        }
+
+        fn on_mtu_update(&mut self, max_datagram_size: u32) {
+            self.max_datagram_size = max_datagram_size;
+            self.congestion_window = self.congestion_window.max(max_datagram_size);
+        }
+
+        fn next_send_delay(&self, _: u32) -> Option<Duration> {
+            None
+        }
+    }
+
+    fn established_connection_with_test_controller() -> TcpConnection<TestCongestionController> {
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        TcpConnection::established_for_test(
             Some(TcpConnectionId::new(1)),
             DataWorkerId::new(0),
             local.port(),
@@ -2276,6 +2372,104 @@ mod tests {
 
         assert_eq!(connection.take_acked_tx_len(connection.iss), 5);
         assert_eq!(connection.fast_open_syn_payload_len, 0);
+    }
+
+    #[test]
+    fn tcp_tx_payload_budget_is_limited_by_prr_during_recovery() {
+        let mut connection = established_connection_with_test_controller();
+        let now = Instant::now();
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.set_local_capabilities(capabilities);
+        let _ = connection.apply_peer_handshake_capabilities(capabilities);
+        connection.snd_wnd = 8_000;
+        connection.snd_una = 1_000;
+        connection.snd_nxt = 6_000;
+        connection.recovery.record_sent(1, 1_000, 2_000, 1_000, None, now, false, false);
+        connection.recovery.record_sent(
+            2,
+            2_000,
+            3_000,
+            1_000,
+            None,
+            now + Duration::from_millis(1),
+            false,
+            false,
+        );
+        connection
+            .recovery
+            .record_sent(3, 3_000, 4_000, 1_000, None, now + Duration::from_millis(2), false, false);
+        connection
+            .recovery
+            .record_sent(4, 4_000, 5_000, 1_000, None, now + Duration::from_millis(3), false, false);
+        connection
+            .recovery
+            .record_sent(5, 5_000, 6_000, 1_000, None, now + Duration::from_millis(4), false, false);
+        connection.recovery.on_sack_blocks(
+            TcpRecoveryAck {
+                acknowledgment: 1_000,
+                now: now + Duration::from_millis(30),
+                latest_rtt: Duration::from_millis(40),
+                min_rtt: Duration::from_millis(40),
+                app_limited: false,
+                ecn_ce_count: 0,
+            },
+            &[TcpSackBlock {
+                left_edge: 2_000,
+                right_edge: 3_000,
+            }],
+            &mut connection.congestion,
+        );
+        connection
+            .recovery
+            .on_rack_timeout(now + Duration::from_millis(56), connection.snd_nxt, &mut connection.congestion);
+        connection.recovery.on_retransmit_sent(1_000);
+
+        assert_eq!(connection.tx_payload_budget(1_000, now), 0);
+
+        connection.recovery.on_ack(
+            TcpRecoveryAck {
+                acknowledgment: 3_000,
+                now: now + Duration::from_millis(90),
+                latest_rtt: Duration::from_millis(40),
+                min_rtt: Duration::from_millis(40),
+                app_limited: false,
+                ecn_ce_count: 0,
+            },
+            &mut connection.congestion,
+        );
+
+        assert_eq!(connection.tx_payload_budget(1_000, now), 0);
+
+        connection.recovery.on_ack(
+            TcpRecoveryAck {
+                acknowledgment: 4_000,
+                now: now + Duration::from_millis(120),
+                latest_rtt: Duration::from_millis(40),
+                min_rtt: Duration::from_millis(40),
+                app_limited: false,
+                ecn_ce_count: 0,
+            },
+            &mut connection.congestion,
+        );
+
+        assert_eq!(
+            connection.tx_payload_budget(2_000, now),
+            connection
+                .recovery
+                .recovery_send_space(
+                    connection.recovery.bytes_in_flight(),
+                    connection.congestion.max_datagram_size(),
+                )
+                .expect("recovery send space") as usize
+        );
     }
 
     #[test]
