@@ -10,6 +10,7 @@ use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::AppOpId;
 #[cfg(test)]
 use hammer_runtime::app::AppRingHandle;
+use hammer_core::protocol::tcp::TcpSeq;
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken,
@@ -18,6 +19,21 @@ use crate::session::{
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
 const DEFAULT_SESSION_POOL_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionRxBuffer {
+    pub(crate) index: BufferIndex,
+    pub(crate) offset: u32,
+    pub(crate) len: u32,
+    pub(crate) fin: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionRxEnqueue {
+    pub(crate) delivered_len: u32,
+    pub(crate) newest_ooo_start: Option<u32>,
+    pub(crate) newest_ooo_len: u32,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionQueueStep {
@@ -149,7 +165,7 @@ pub(crate) struct SessionDriverRuntime<S, A> {
     pending_closes: SessionReadyQueue,
     tx: Pool<FifoQueue<BufferIndex>>,
     tx_index: FlatHashTable<u64, PoolIndex>,
-    rx: Pool<FifoQueue<(BufferIndex, bool)>>,
+    rx: Pool<FifoQueue<SessionRxBuffer>>,
     rx_index: FlatHashTable<u64, PoolIndex>,
 }
 
@@ -386,7 +402,7 @@ impl<S, A> SessionDriverRuntime<S, A> {
     fn rx_queue_mut_or_alloc(
         &mut self,
         session_id: SessionId,
-    ) -> &mut FifoQueue<(BufferIndex, bool)> {
+    ) -> &mut FifoQueue<SessionRxBuffer> {
         let key = session_id.get();
         let index = match self.rx_index.lookup(&key) {
             Some(index) => index,
@@ -484,8 +500,8 @@ impl<S, A> SessionDriverRuntime<S, A> {
         let Some(mut queue) = self.rx.remove(index) else {
             return;
         };
-        while let Some((buffer, _)) = queue.pop_front() {
-            self.buffers.free_index(buffer);
+        while let Some(buffer) = queue.pop_front() {
+            self.buffers.free_index(buffer.index);
         }
     }
 
@@ -519,24 +535,147 @@ impl<S, A> SessionDriverRuntime<S, A> {
         &mut self,
         session_id: SessionId,
         index: BufferIndex,
+        offset: u32,
         fin: bool,
-    ) -> CoreResult<bool> {
-        let Some(op) = self.session_app_op(session_id) else {
-            self.buffers.free_index(index);
-            return Ok(true);
+    ) -> CoreResult<SessionRxEnqueue> {
+        let len = self
+            .buffers
+            .current_len(index)?
+            .checked_add(self.buffers.total_len_not_including_first(index)?)
+            .ok_or_else(|| CoreError::internal("session rx chain length overflow"))?;
+        let len = u32::try_from(len)
+            .map_err(|_| CoreError::internal("session rx buffer length exceeds u32"))?;
+        let entry = SessionRxBuffer {
+            index,
+            offset,
+            len,
+            fin,
         };
-        if self
-            .app
-            .complete_recv(op, self.buffers.clone(), index, fin)?
-        {
-            return Ok(true);
+        let (first_future, insert_at) = {
+            let queue = self.rx_queue_mut_or_alloc(session_id);
+            let mut first_future = queue.len();
+            for (position, current) in queue.iter().enumerate() {
+                if current.offset != 0 {
+                    first_future = position;
+                    break;
+                }
+            }
+            let mut insert_at = if offset == 0 { first_future } else { queue.len() };
+            if offset != 0 {
+                for position in first_future..queue.len() {
+                    let current = queue
+                        .get(position)
+                        .copied()
+                        .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
+                    if TcpSeq::from(offset).before(TcpSeq::from(current.offset)) {
+                        insert_at = position;
+                        break;
+                    }
+                }
+            }
+            queue.insert(insert_at, entry);
+            (first_future, insert_at)
+        };
+        if offset == 0 {
+            let mut delivered_len = len;
+            let mut position = insert_at + 1;
+            loop {
+                let current = {
+                    let queue = self.rx_queue_mut_or_alloc(session_id);
+                    queue.get(position).copied()
+                };
+                let Some(current) = current else {
+                    break;
+                };
+                if TcpSeq::from(current.offset).after(TcpSeq::from(delivered_len)) {
+                    break;
+                }
+                let current_end = TcpSeq::from(current.offset).advance(current.len).raw();
+                if !TcpSeq::from(current_end).after(TcpSeq::from(delivered_len)) {
+                    let removed = self.rx_queue_mut_or_alloc(session_id).remove(position);
+                    self.buffers.free_index(removed.index);
+                    continue;
+                }
+                if TcpSeq::from(current.offset).before(TcpSeq::from(delivered_len)) {
+                    let trim = TcpSeq::from(current.offset).distance_to(TcpSeq::from(delivered_len));
+                    let trim = usize::try_from(trim)
+                        .map_err(|_| CoreError::internal("session rx trim length exceeds usize"))?;
+                    self.buffers.advance(current.index, trim)?;
+                    let queue = self.rx_queue_mut_or_alloc(session_id);
+                    let current = queue
+                        .get_mut(position)
+                        .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
+                    current.offset = 0;
+                    current.len = current.len.saturating_sub(trim as u32);
+                } else {
+                    let current = self
+                        .rx_queue_mut_or_alloc(session_id)
+                        .get_mut(position)
+                        .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
+                    current.offset = 0;
+                }
+                delivered_len = current_end;
+                position += 1;
+            }
+            let mut newest_ooo_start = None;
+            let mut newest_ooo_len = 0u32;
+            let mut position = insert_at + 1;
+            loop {
+                let current = {
+                    let queue = self.rx_queue_mut_or_alloc(session_id);
+                    queue.get(position).copied()
+                };
+                let Some(current) = current else {
+                    break;
+                };
+                if current.offset != 0 {
+                    let rebased =
+                        TcpSeq::from(delivered_len).distance_to(TcpSeq::from(current.offset));
+                    let current = self
+                        .rx_queue_mut_or_alloc(session_id)
+                        .get_mut(position)
+                        .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
+                    current.offset = rebased;
+                    if newest_ooo_start.is_none() {
+                        newest_ooo_start = Some(rebased);
+                        newest_ooo_len = current.len;
+                    }
+                }
+                position += 1;
+            }
+            return Ok(SessionRxEnqueue {
+                delivered_len,
+                newest_ooo_start,
+                newest_ooo_len,
+            });
         }
-        self.rx_queue_mut_or_alloc(session_id).push_back((index, fin));
-        Ok(true)
+        let mut newest_ooo_start = None;
+        let mut newest_ooo_len = 0u32;
+        let queue_len = self.rx_queue_mut_or_alloc(session_id).len();
+        for position in first_future..queue_len {
+            let current = self
+                .rx_queue_mut_or_alloc(session_id)
+                .get(position)
+                .copied()
+                .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
+            if current.index == index {
+                newest_ooo_start = Some(current.offset);
+                newest_ooo_len = current.len;
+                break;
+            }
+        }
+        Ok(SessionRxEnqueue {
+            delivered_len: 0,
+            newest_ooo_start,
+            newest_ooo_len,
+        })
     }
 
     pub(crate) fn flush_session_rx(&mut self, session_id: SessionId) -> CoreResult<()> {
         let Some(index) = self.rx_index.lookup(&session_id.get()) else {
+            return Ok(());
+        };
+        let Some(op) = self.session_app_op(session_id) else {
             return Ok(());
         };
         loop {
@@ -547,19 +686,16 @@ impl<S, A> SessionDriverRuntime<S, A> {
                     .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
                 queue.front().copied()
             };
-            let Some((buffer, fin)) = current else {
+            let Some(current) = current else {
                 break;
             };
-            let delivered = match self.session_app_op(session_id) {
-                Some(op) => self
-                    .app
-                    .complete_recv(op, self.buffers.clone(), buffer, fin)?,
-                None => {
-                    self.buffers.free_index(buffer);
-                    true
-                }
-            };
-            if !delivered {
+            if current.offset != 0 {
+                break;
+            }
+            let consumed = self
+                .app
+                .complete_recv(op, self.buffers.clone(), current.index, current.fin)?;
+            if !consumed {
                 break;
             }
             let queue = self
@@ -596,7 +732,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
         self.sessions.take_ready_sessions()
     }
 
-    #[cfg(test)]
     pub(crate) fn arm_timer_ticks(
         &mut self,
         session_id: SessionId,
@@ -606,7 +741,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
         self.sessions.arm_timer_ticks(session_id, token, ticks)
     }
 
-    #[cfg(test)]
     pub(crate) fn cancel_timer(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
         self.sessions.cancel_timer(session_id, token)
     }
@@ -863,6 +997,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -870,9 +1005,16 @@ mod tests {
         BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
         NodeRuntimeData,
     };
+    use hammer_core::protocol::tcp::{
+        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
+    };
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
     use crate::session::protocol::SessionQueueControlContext;
+    use crate::transport::congestion::BbrController;
+    use crate::transport::tcp::{
+        TcpConnection, TcpConnectionTimerKind, TcpOutputNext, TcpOutputNode, TcpWorkerOwnedState,
+    };
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
         let mut values = hammer_infra::vec::Vec::new();
@@ -1078,6 +1220,97 @@ mod tests {
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
+    }
+
+    fn tcp_output_graph(
+        runtime: &DataPlaneRuntime,
+    ) -> (NodeId, Arc<Mutex<CaptureState>>, Arc<Mutex<CaptureState>>) {
+        let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
+        let lookup = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
+        let drop = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
+        (output, lookup_state, drop_state)
+    }
+
+    fn established_tcp_connection() -> TcpConnection<BbrController> {
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        let mut connection = TcpConnection::established_for_test(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        );
+        let capabilities = TcpCapabilities {
+            max_segment_size: None,
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+        };
+        let _ = connection.set_local_capabilities(capabilities);
+        connection
+    }
+
+    fn enqueue_app_send(
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        ring: &AppRingHandle,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) {
+        let send: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(bytes).expect("data"))
+            .try_into()
+            .expect("transfer");
+        driver.app_mut().push_pending_send(session_id, send);
+        driver.mark_ready(session_id);
+    }
+
+    fn dispatch_tcp_session_queue(
+        runtime: &DataPlaneRuntime,
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        output_node: NodeId,
+    ) {
+        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+        dispatch_session_queue_pending(
+            runtime,
+            driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch tcp session queue");
+        output.schedule(runtime).expect("schedule output");
+        assert_eq!(runtime.run_ready_nodes().expect("run tcp output"), 2);
+    }
+
+    fn expire_tcp_timers(
+        runtime: &DataPlaneRuntime,
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        ticks: u32,
+        output_node: NodeId,
+    ) {
+        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let step = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
+            .expect("dispatch session queue for timer ticks");
+        assert!(step.expired_timers != 0);
+        assert_eq!(runtime.run_ready_nodes().expect("run timer output"), 2);
+    }
+
+    fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        &packet[segment.header_len()..]
     }
 
     #[test]
@@ -1291,5 +1524,105 @@ mod tests {
         assert_eq!(driver.aux().canceled, 0);
         assert!(driver.app().has_pending_send(session_id));
         assert!(!driver.has_retained_tx(session_id));
+    }
+
+    #[test]
+    fn session_tcp_tlp_retransmits_latest_retained_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut driver = SessionDriverRuntime::new(
+            DataWorkerId::new(0),
+            runtime.packet_buffers().clone(),
+            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+        );
+        let session_id = driver.insert_session(established_tcp_connection());
+        driver
+            .refresh_session_route(session_id)
+            .expect("refresh session route");
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"first");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        lookup_state.lock().expect("lookup").packets.clear();
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"second");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        lookup_state.lock().expect("lookup").packets.clear();
+        drop_state.lock().expect("drop").packets.clear();
+
+        expire_tcp_timers(&runtime, &mut driver, 20, output_node);
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        assert_eq!(segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH), TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
+        assert_eq!(tcp_segment_payload(packet), b"second");
+    }
+
+    #[test]
+    fn session_tcp_rack_retransmits_sacked_gap_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut driver = SessionDriverRuntime::new(
+            DataWorkerId::new(0),
+            runtime.packet_buffers().clone(),
+            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+        );
+        let session_id = driver.insert_session(established_tcp_connection());
+        driver
+            .refresh_session_route(session_id)
+            .expect("refresh session route");
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"first");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        let second_left_edge = driver
+            .session(session_id)
+            .expect("connection")
+            .snd_nxt();
+        lookup_state.lock().expect("lookup").packets.clear();
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"second");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        let connection = driver.session(session_id).expect("connection");
+        let acknowledgment = connection.snd_una();
+        let second_right_edge = connection.snd_nxt();
+        lookup_state.lock().expect("lookup").packets.clear();
+        drop_state.lock().expect("drop").packets.clear();
+
+        let timers = driver
+            .session_mut(session_id)
+            .expect("connection")
+            .receive_ack(
+                acknowledgment,
+                u16::MAX,
+                &[TcpSackBlock {
+                    left_edge: second_left_edge,
+                    right_edge: second_right_edge,
+                }],
+            );
+        if timers.contains(TcpConnectionTimerKind::RACK) {
+            driver
+                .arm_timer_ticks(
+                    session_id,
+                    TcpConnectionTimerKind::RACK
+                        .session_timer_token()
+                        .expect("rack timer token"),
+                    6,
+                )
+                .expect("arm rack timer");
+        }
+
+        expire_tcp_timers(&runtime, &mut driver, 6, output_node);
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        assert_eq!(segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH), TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
+        assert_eq!(tcp_segment_payload(packet), b"first");
     }
 }

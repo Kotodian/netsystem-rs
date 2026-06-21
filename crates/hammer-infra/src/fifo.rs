@@ -40,8 +40,41 @@ impl<T> FifoQueue<T> {
     }
 
     #[inline]
+    pub fn insert(&mut self, index: usize, value: T) {
+        assert!(index <= self.len(), "insert index out of bounds");
+        if index == self.len() {
+            self.push_back(value);
+            return;
+        }
+        let front_len = self.front.len();
+        if index < front_len {
+            let storage_index = front_len - index;
+            self.front.push(value);
+            let len = self.front.len();
+            self.front.as_mut_slice()[storage_index..len].rotate_right(1);
+            return;
+        }
+        let storage_index = index - front_len;
+        self.back.push(value);
+        let len = self.back.len();
+        self.back.as_mut_slice()[storage_index..len].rotate_right(1);
+    }
+
+    #[inline]
     pub fn front(&self) -> Option<&T> {
         self.front.last().or_else(|| self.back.as_slice().first())
+    }
+
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len() {
+            return None;
+        }
+        let front_len = self.front.len();
+        if index < front_len {
+            return self.front.as_slice().get(front_len - 1 - index);
+        }
+        self.back.as_slice().get(index - front_len)
     }
 
     #[inline]
@@ -53,6 +86,18 @@ impl<T> FifoQueue<T> {
     }
 
     #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len() {
+            return None;
+        }
+        let front_len = self.front.len();
+        if index < front_len {
+            return self.front.as_mut_slice().get_mut(front_len - 1 - index);
+        }
+        self.back.as_mut_slice().get_mut(index - front_len)
+    }
+
+    #[inline]
     pub fn pop_front(&mut self) -> Option<T> {
         if self.front.is_empty() {
             self.move_back_to_front();
@@ -61,9 +106,36 @@ impl<T> FifoQueue<T> {
     }
 
     #[inline]
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len(), "remove index out of bounds");
+        let front_len = self.front.len();
+        if index < front_len {
+            let storage_index = front_len - 1 - index;
+            return self.front.remove(storage_index);
+        }
+        self.back.remove(index - front_len)
+    }
+
+    #[inline]
     pub fn clear(&mut self) {
         self.front.clear();
         self.back.clear();
+    }
+
+    #[inline]
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter {
+            front: self.front.as_slice().iter().rev(),
+            back: self.back.as_slice().iter(),
+        }
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
+        IterMut {
+            front: self.front.as_mut_slice().iter_mut().rev(),
+            back: self.back.as_mut_slice().iter_mut(),
+        }
     }
 
     fn move_back_to_front(&mut self) {
@@ -77,6 +149,34 @@ impl<T> Default for FifoQueue<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub struct Iter<'a, T> {
+    front: core::iter::Rev<core::slice::Iter<'a, T>>,
+    back: core::slice::Iter<'a, T>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.front.next().or_else(|| self.back.next())
+    }
+}
+
+pub struct IterMut<'a, T> {
+    front: core::iter::Rev<core::slice::IterMut<'a, T>>,
+    back: core::slice::IterMut<'a, T>,
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.front.next().or_else(|| self.back.next())
     }
 }
 

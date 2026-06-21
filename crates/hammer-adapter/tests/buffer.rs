@@ -561,6 +561,29 @@ fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
 }
 
 #[test]
+fn buffer_advance_can_discard_prefix_across_chain_segments() {
+    let pool = BufferPool::with_capacity(4, 8);
+    let packet = pool
+        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .expect("alloc chained packet");
+
+    pool.advance(packet, 6).expect("advance across chain");
+
+    let buffer = pool.get(packet).expect("buffer ref");
+    assert_eq!(buffer.current_len(), 0);
+    assert_eq!(buffer.total_len_not_including_first(), 6);
+    drop(buffer);
+
+    assert_eq!(
+        pool.copy_current_chain(packet).expect("remaining packet"),
+        b"ghijkl"
+    );
+
+    pool.free_index(packet);
+    assert_eq!(pool.in_use(), 0);
+}
+
+#[test]
 fn buffer_pool_reports_single_segment_and_chained_packets() {
     let pool = BufferPool::with_capacity(4, 8);
     let single = pool

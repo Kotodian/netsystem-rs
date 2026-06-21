@@ -1,19 +1,22 @@
 use std::marker::PhantomData;
 
+use hammer_adapter::DataPlaneBuffers;
+use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_adapter::DataPlaneBuffers;
-use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::app::AppOpId;
 
-use crate::session::{SessionId, SessionTimerToken, runtime::WorkerSessionRuntime};
+use crate::session::{
+    SessionId, SessionTimerToken,
+    runtime::{SessionRxBuffer, WorkerSessionRuntime},
+};
 
 pub(crate) struct SessionQueueControlContext<'a, A> {
     sessions: *mut WorkerSessionRuntime,
     app: *mut crate::session::SessionAppRuntime,
     buffers: *const DataPlaneBuffers,
-    rx: *mut Pool<FifoQueue<(hammer_adapter::BufferIndex, bool)>>,
+    rx: *mut Pool<FifoQueue<SessionRxBuffer>>,
     rx_index: *mut FlatHashTable<u64, PoolIndex>,
     aux: *mut A,
     current_session_id: SessionId,
@@ -28,7 +31,7 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
         sessions: *mut WorkerSessionRuntime,
         app: *mut crate::session::SessionAppRuntime,
         buffers: *const DataPlaneBuffers,
-        rx: *mut Pool<FifoQueue<(hammer_adapter::BufferIndex, bool)>>,
+        rx: *mut Pool<FifoQueue<SessionRxBuffer>>,
         rx_index: *mut FlatHashTable<u64, PoolIndex>,
         aux: *mut A,
         current_session_id: SessionId,
@@ -73,6 +76,9 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
         let Some(index) = rx_index.lookup(&session_id.get()) else {
             return Ok(());
         };
+        let Some(op) = self.current_app_op else {
+            return Ok(());
+        };
         loop {
             let current = {
                 let queue = unsafe { &mut *self.rx }
@@ -80,17 +86,14 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
                     .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
                 queue.front().copied()
             };
-            let Some((buffer, fin)) = current else {
+            let Some(current) = current else {
                 break;
             };
-            let delivered = match self.current_app_op {
-                Some(op) => unsafe { &mut *self.app }
-                    .complete_recv(op, self.buffers().clone(), buffer, fin)?,
-                None => {
-                    self.buffers().free_index(buffer);
-                    true
-                }
-            };
+            if current.offset != 0 {
+                break;
+            }
+            let delivered = unsafe { &mut *self.app }
+                .complete_recv(op, self.buffers().clone(), current.index, current.fin)?;
             if !delivered {
                 break;
             }

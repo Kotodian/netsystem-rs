@@ -60,6 +60,7 @@ use crate::transport::tcp::{
 use crate::transport::congestion::BbrController;
 use crate::transport::tcp::tcp_session_queue_dispatch_fn;
 use crate::{DnsRouter, DnsTransportManager, Router};
+use hammer_core::protocol::tcp::TcpCapabilities;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
 const DATA_WORKER_THREADS: usize = 2;
@@ -157,6 +158,7 @@ struct TcpListenerRegistration {
     lookup_id: TcpLookupId,
     owner_worker: DataWorkerId,
     bind: SocketAddr,
+    capabilities: TcpCapabilities,
 }
 
 struct RuntimeTcpListenerControlState {
@@ -228,6 +230,7 @@ impl RuntimeTcpListenerControlState {
         &mut self,
         bind: SocketAddr,
         owner_worker: usize,
+        capabilities: TcpCapabilities,
     ) -> HammerResult<TcpLookupId> {
         if self
             .tcp_listeners
@@ -244,6 +247,7 @@ impl RuntimeTcpListenerControlState {
             lookup_id,
             owner_worker: worker_id(owner_worker)?,
             bind,
+            capabilities,
         });
         self.rebuild_tcp_listener_slots();
         self.publish_tcp_lookup()?;
@@ -283,6 +287,7 @@ impl RuntimeTcpListenerControlState {
             let value = TcpLookupValue {
                 id: registration.lookup_id,
                 owner_worker: registration.owner_worker,
+                capabilities: registration.capabilities,
             };
             insert_tcp_listener_key(&mut snapshot, registration.bind, value);
         }
@@ -344,11 +349,12 @@ impl RuntimeTcpListenerControlHandle {
         &self,
         bind: SocketAddr,
         owner_worker: usize,
+        capabilities: TcpCapabilities,
     ) -> HammerResult<TcpLookupId> {
         // SAFETY: callers use this only from RuntimeService::control_call, so
         // execution is already serialized on the control thread.
         let state = unsafe { self.state.get_mut() };
-        state.bind_tcp_listener(bind, owner_worker)
+        state.bind_tcp_listener(bind, owner_worker, capabilities)
     }
 
     fn close_tcp_listener_on_control(&self, lookup_id: TcpLookupId) -> HammerResult<()> {
@@ -659,6 +665,7 @@ impl RuntimeService {
         &self,
         bind: SocketAddr,
         owner_worker: usize,
+        capabilities: TcpCapabilities,
     ) -> HammerResult<TcpLookupId> {
         self.control_call(move |inner| {
             if inner.state == ServiceState::Closed {
@@ -666,7 +673,7 @@ impl RuntimeService {
             }
             inner
                 .tcp_listener_control
-                .bind_tcp_listener_on_control(bind, owner_worker)
+                .bind_tcp_listener_on_control(bind, owner_worker, capabilities)
         })?
     }
 
@@ -1074,7 +1081,11 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .map_err(HammerError::from)?;
             let tcp_listen = runtime
                 .nodes()
-                .try_register_internal(TcpListenNode::new(queue, TcpListenNext::nodes(tcp_output, drop)))
+                .try_register_internal(TcpListenNode::new(
+                    tcp_control.clone(),
+                    queue,
+                    TcpListenNext::nodes(tcp_output, drop),
+                ))
                 .map_err(HammerError::from)?;
             let tcp_input = runtime
                 .nodes()
@@ -1937,9 +1948,16 @@ interval = "5s"
     fn runtime_service_bind_tcp_listener_updates_listener_lookup() {
         let service = new_test_service("");
         let bind: SocketAddr = "127.0.0.1:7301".parse().expect("listener bind");
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1440),
+            window_scale: Some(6),
+            sack: true,
+            timestamps: true,
+            ecn: false,
+        };
 
         let listener = service
-            .bind_tcp_listener(bind, 1)
+            .bind_tcp_listener(bind, 1, capabilities)
             .expect("bind tcp listener");
         let lookup_id = {
             let state = service.tcp_listener_control_snapshot_for_test();
@@ -1958,11 +1976,12 @@ interval = "5s"
                 .expect("published listener lookup");
             assert_eq!(published.owner_worker, DataWorkerId::new(1));
             assert_eq!(published.id, registration.lookup_id);
+            assert_eq!(published.capabilities, capabilities);
             registration.lookup_id
         };
 
         let duplicate = service
-            .bind_tcp_listener(bind, 1)
+            .bind_tcp_listener(bind, 1, capabilities)
             .expect_err("duplicate tcp listener must fail");
         assert!(
             duplicate.to_string().contains("already registered"),
@@ -1993,7 +2012,7 @@ interval = "5s"
         );
 
         let rebound = service
-            .bind_tcp_listener(bind, 1)
+            .bind_tcp_listener(bind, 1, capabilities)
             .expect("rebind tcp listener");
         assert_ne!(
             rebound, lookup_id,

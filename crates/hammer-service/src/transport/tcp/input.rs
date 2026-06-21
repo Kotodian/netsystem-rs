@@ -127,6 +127,22 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
+    pub(crate) fn lookup_listener(
+        &self,
+        local: SocketAddr,
+    ) -> Option<TcpLookupValue> {
+        let snapshot = self.inner.load();
+        match local.ip() {
+            IpAddr::V4(local_addr) => snapshot.lookup.lookup_listener::<TcpIpv4ListenerAddress>(
+                TcpV4ListenerKey::new(0, local_addr, local.port()),
+            ),
+            IpAddr::V6(local_addr) => snapshot.lookup.lookup_listener::<TcpIpv6ListenerAddress>(
+                TcpV6ListenerKey::new(0, local_addr, local.port()),
+            ),
+        }
+    }
+
+    #[inline]
     pub fn node<C>(
         &self,
         next: [NodeId; TcpInputNext::COUNT],

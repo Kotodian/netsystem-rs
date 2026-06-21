@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hammer_adapter::DataWorkerId;
-use hammer_core::protocol::tcp::TcpConnectionId;
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpConnectionId};
 use hammer_core::protocol::transport::TransportConnectionKey;
 use hammer_infra::map::{FlatHashKey, FlatHashTable};
 
@@ -98,6 +98,7 @@ impl TcpPendingRouteEntry {
 pub struct TcpLookupValue {
     pub id: TcpLookupId,
     pub owner_worker: DataWorkerId,
+    pub capabilities: TcpCapabilities,
 }
 
 pub trait TcpListenerAddress: Copy + Eq {
@@ -559,11 +560,17 @@ impl TcpWorkerOwnedState {
     }
 
     #[inline]
-    pub fn insert_listener<A: TcpListenerAddress>(&mut self, key: A::Key, id: TcpLookupId)
+    pub fn insert_listener<A: TcpListenerAddress>(
+        &mut self,
+        key: A::Key,
+        id: TcpLookupId,
+        capabilities: TcpCapabilities,
+    )
     where
         TcpLookupSnapshot: TcpListenerLookupAccess<A>,
     {
-        self.listeners.insert_listener::<A>(key, self.value(id));
+        self.listeners
+            .insert_listener::<A>(key, self.value(id, capabilities));
     }
 
     #[inline]
@@ -650,10 +657,11 @@ impl TcpWorkerOwnedState {
     }
 
     #[inline]
-    fn value(&self, id: TcpLookupId) -> TcpLookupValue {
+    fn value(&self, id: TcpLookupId, capabilities: TcpCapabilities) -> TcpLookupValue {
         TcpLookupValue {
             id,
             owner_worker: self.owner_worker,
+            capabilities,
         }
     }
 

@@ -412,6 +412,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn transport_tcp_segment_buffer_round_trip_keeps_sack_blocks() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
+        let index = runtime.alloc_index(Default::default()).expect("buffer");
+        let local = "192.0.2.10:50000".parse().expect("local");
+        let remote = "198.51.100.20:443".parse().expect("remote");
+        let blocks = [TcpSackBlock {
+            left_edge: 30,
+            right_edge: 40,
+        }];
+        let segment = TcpSegment::new(
+            local,
+            remote,
+            100,
+            200,
+            4096,
+            TcpSegmentFlags::ACK,
+            TcpCapabilities::default(),
+            Some(&blocks),
+            0,
+        );
+
+        segment
+            .write_to_buffer(&runtime, index)
+            .expect("write segment");
+        let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
+
+        let mut header = [0u8; 64];
+        let written = restored.write_header(&mut header).expect("write header");
+        let parsed = tcp_options_from_bytes(&header[20..written]);
+        assert_eq!(parsed.sack_blocks, blocks);
+    }
+
     fn ipv4_tcp_packet_with_sack() -> Vec<u8> {
         let mut packet = vec![0u8; 52];
         let packet_len = packet.len() as u16;

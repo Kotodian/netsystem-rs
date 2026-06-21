@@ -587,6 +587,60 @@ where
         true
     }
 
+    fn update_ack_sack_block(&mut self, left_edge: u32, right_edge: u32) {
+        if !self.negotiated_options().sack {
+            self.sack_block_count = 0;
+            return;
+        }
+
+        let mut blocks = [TcpSackBlock {
+            left_edge: 0,
+            right_edge: 0,
+        }; 4];
+        let mut count = 0usize;
+        let mut current = TcpSackBlock {
+            left_edge,
+            right_edge,
+        };
+
+        if TcpSeq::from(self.rcv_nxt).before(TcpSeq::from(left_edge)) {
+            blocks[count] = current;
+            count += 1;
+        }
+
+        for block in self.sack_blocks.iter().take(self.sack_block_count as usize) {
+            if !TcpSeq::from(self.rcv_nxt).before(TcpSeq::from(block.left_edge)) {
+                continue;
+            }
+            if count != 0
+                && sack_blocks_overlap_or_touch(current, *block)
+            {
+                if TcpSeq::from(block.left_edge).before(TcpSeq::from(current.left_edge)) {
+                    current.left_edge = block.left_edge;
+                }
+                if TcpSeq::from(current.right_edge).before(TcpSeq::from(block.right_edge)) {
+                    current.right_edge = block.right_edge;
+                }
+                blocks[0] = current;
+                continue;
+            }
+            if count == blocks.len() {
+                break;
+            }
+            blocks[count] = *block;
+            count += 1;
+        }
+
+        self.sack_block_count = count as u8;
+        for (slot, block) in self
+            .sack_blocks
+            .iter_mut()
+            .zip(blocks.into_iter())
+        {
+            *slot = block;
+        }
+    }
+
     #[inline]
     pub(crate) fn update_ack_sack_blocks(
         &mut self,
@@ -604,6 +658,18 @@ where
             self.sack_block_count += 1;
         }
         self.pending_dsack = dsack;
+    }
+
+    #[inline]
+    fn set_duplicate_sack(&mut self, left_edge: u32, right_edge: u32) {
+        if !self.negotiated_options().sack {
+            self.pending_dsack = None;
+            return;
+        }
+        self.pending_dsack = Some(TcpSackBlock {
+            left_edge,
+            right_edge,
+        });
     }
 
     fn output_sack_blocks(&mut self, flags: TcpSegmentFlags) -> Option<([TcpSackBlock; 4], usize)> {
@@ -859,6 +925,7 @@ where
 
     pub(crate) fn commit_payload_tx(
         &mut self,
+        payload: BufferIndex,
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<TcpConnectionTimerKind> {
@@ -874,6 +941,7 @@ where
             sequence,
             end_sequence,
             payload_len,
+            Some(payload),
             now,
             false,
             false,
@@ -897,9 +965,17 @@ where
         acknowledgment: u32,
         advertised_window: u16,
         sack_blocks: &[TcpSackBlock],
-    ) {
+    ) -> TcpConnectionTimerKind {
         self.observe_ack_progress(acknowledgment, sack_blocks);
         self.apply_ack(acknowledgment, advertised_window);
+        let mut timers = TcpConnectionTimerKind::empty();
+        if self.recovery.rack_timeout_ticks().is_some() {
+            timers.insert(TcpConnectionTimerKind::RACK);
+        }
+        if self.recovery.tlp_timeout_ticks().is_some() {
+            timers.insert(TcpConnectionTimerKind::TLP);
+        }
+        timers
     }
 
     #[inline]
@@ -909,6 +985,15 @@ where
         }
         self.receive_in_order(packet.sequence, packet.payload_len)
             .then_some(packet.payload_len)
+    }
+
+    fn payload_offset_from_rcv_nxt(&self, sequence: u32) -> Option<u32> {
+        let sequence = TcpSeq::from(sequence);
+        let rcv_nxt = TcpSeq::from(self.rcv_nxt);
+        if sequence.before(rcv_nxt) {
+            return None;
+        }
+        Some(rcv_nxt.distance_to(sequence))
     }
 
     pub(crate) fn receive_data(
@@ -936,11 +1021,12 @@ where
             && packet.flags.contains(TcpSegmentFlags::ACK)
         {
             let previous_snd_una = self.snd_una();
-            self.receive_ack(
+            let timers = self.receive_ack(
                 acknowledgment,
                 packet.advertised_window,
                 packet.sack_blocks.as_slice(),
             );
+            sync_recovery_timers(queue, session_id, timers, self)?;
             release_acked_tx(queue, session_id, previous_snd_una, self.snd_una())?;
         }
 
@@ -948,11 +1034,31 @@ where
         if packet.payload_len != 0 {
             ack = true;
             runtime.packet_buffers().advance(index, packet.payload_offset)?;
+            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
             if self.accept_payload(packet).is_some() {
-                runtime.truncate_chain(index, packet.payload_len)?;
-                let _ = queue.enqueue_rx(session_id, index, false)?;
-                self.update_ack_sack_blocks(&[], None);
+                let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
+                if enqueue.delivered_len != 0 {
+                    self.rcv_nxt = TcpSeq::from(packet.sequence)
+                        .advance(enqueue.delivered_len)
+                        .raw();
+                }
+                if let Some(start) = enqueue.newest_ooo_start {
+                    let left_edge = TcpSeq::from(self.rcv_nxt).advance(start).raw();
+                    let right_edge = TcpSeq::from(left_edge).advance(enqueue.newest_ooo_len).raw();
+                    self.update_ack_sack_block(left_edge, right_edge);
+                } else {
+                    self.update_ack_sack_blocks(&[], None);
+                }
+            } else if let Some(offset) = self.payload_offset_from_rcv_nxt(packet.sequence) {
+                let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
+                if let Some(start) = enqueue.newest_ooo_start {
+                    let left_edge = TcpSeq::from(self.rcv_nxt).advance(start).raw();
+                    let right_edge = TcpSeq::from(left_edge).advance(enqueue.newest_ooo_len).raw();
+                    self.update_ack_sack_block(left_edge, right_edge);
+                }
             } else {
+                let right_edge = packet.sequence.wrapping_add(packet.payload_len as u32);
+                self.set_duplicate_sack(packet.sequence, right_edge);
                 runtime.free_index(index);
             }
         }
@@ -989,11 +1095,12 @@ where
             && packet.flags.contains(TcpSegmentFlags::ACK)
         {
             let previous_snd_una = self.snd_una();
-            self.receive_ack(
+            let timers = self.receive_ack(
                 acknowledgment,
                 packet.advertised_window,
                 packet.sack_blocks.as_slice(),
             );
+            sync_recovery_timers(queue, session_id, timers, self)?;
             release_acked_tx(queue, session_id, previous_snd_una, self.snd_una())?;
         }
         if packet.flags.contains(TcpSegmentFlags::FIN) {
@@ -1264,6 +1371,52 @@ where
             return Ok(());
         };
         self.tcp_timer_expire(kind);
+        if self.state == TcpState::Established {
+            match kind {
+                TcpConnectionTimerKind::RACK => {
+                    self.recovery.on_rack_timeout(Instant::now(), &mut self.congestion);
+                    if let Some((sequence, bytes, payload)) = self.recovery.take_rack_retransmit() {
+                        emit_retained_segment(
+                            runtime,
+                            context.buffers(),
+                            output_next,
+                            output,
+                            self,
+                            sequence,
+                            bytes,
+                            payload,
+                        )?;
+                        if let Some(ticks) = self.tcp_timer_ticks(kind)
+                            && let Some(token) = kind.session_timer_token()
+                        {
+                            context.arm_timer_ticks(expiry.session_id(), token, ticks)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                TcpConnectionTimerKind::TLP => {
+                    if let Some((_, sequence, bytes, payload)) = self.recovery.take_tlp_probe() {
+                        emit_retained_segment(
+                            runtime,
+                            context.buffers(),
+                            output_next,
+                            output,
+                            self,
+                            sequence,
+                            bytes,
+                            payload,
+                        )?;
+                        if let Some(ticks) = self.tcp_timer_ticks(kind)
+                            && let Some(token) = kind.session_timer_token()
+                        {
+                            context.arm_timer_ticks(expiry.session_id(), token, ticks)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
         let Some((timer, segment)) = self.on_tcp_timer(kind) else {
             return Ok(());
         };
@@ -1326,11 +1479,16 @@ where
     fn commit_tx(
         &mut self,
         context: &mut SessionQueueControlContext<'_, TcpWorkerOwnedState>,
-        _: BufferIndex,
+        index: BufferIndex,
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<()> {
-        let timers = self.commit_payload_tx(payload_len, now)?;
+        let payload = context
+            .buffers()
+            .get_buffer_mut(index)?
+            .next_buffer()
+            .ok_or_else(|| CoreError::internal("tcp output head is missing retained payload"))?;
+        let timers = self.commit_payload_tx(payload, payload_len, now)?;
         for timer in [TcpConnectionTimerKind::RACK, TcpConnectionTimerKind::TLP] {
             if !timers.contains(timer) {
                 continue;
@@ -1343,6 +1501,31 @@ where
         }
         Ok(())
     }
+}
+
+fn timer_segment_header<C>(
+    connection: &mut TcpConnection<C>,
+    sequence: u32,
+    bytes: u32,
+) -> CoreResult<TcpSegment>
+where
+    C: CongestionController + 'static,
+{
+    let local = connection
+        .local()
+        .ok_or_else(|| CoreError::internal("established tcp connection missing local address"))?;
+    let sack_blocks = connection.output_sack_blocks(TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
+    Ok(TcpSegment::new(
+        local,
+        connection.remote(),
+        sequence,
+        connection.rcv_nxt(),
+        connection.advertised_receive_window(connection.rcv_wnd),
+        TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
+        connection.local_capabilities(),
+        sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
+        bytes as usize,
+    ))
 }
 
 fn write_segment(buffers: &DataPlaneBuffers, index: BufferIndex, segment: &TcpSegment) -> CoreResult<()> {
@@ -1371,6 +1554,38 @@ fn emit_segment(
     Ok(())
 }
 
+fn emit_retained_segment<C>(
+    runtime: &DataPlaneRuntime,
+    buffers: &DataPlaneBuffers,
+    output_next: SessionQueueNext,
+    output: &mut SessionQueueOutput,
+    connection: &mut TcpConnection<C>,
+    sequence: u32,
+    bytes: u32,
+    payload: Option<BufferIndex>,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    let header = timer_segment_header(connection, sequence, bytes)?;
+    let payload = payload
+        .ok_or_else(|| CoreError::internal("tcp timer segment is missing retained payload"))?;
+    let index = buffers.alloc_index(Default::default())?;
+    if let Err(error) = buffers.attach_clone(index, payload) {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    if let Err(error) = write_segment(buffers, index, &header) {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    if let Err(error) = output.enqueue(runtime, output_next.node(), index) {
+        buffers.free_index(index);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn release_acked_tx<C>(
     queue: &mut SessionDriverRuntime<TcpConnection<C>, TcpWorkerOwnedState>,
     session_id: SessionId,
@@ -1383,6 +1598,30 @@ where
     let acked = TcpSeq::from(previous_snd_una).distance_to(TcpSeq::from(snd_una));
     if acked != 0 {
         queue.release_tx_up_to(session_id, acked as usize)?;
+    }
+    Ok(())
+}
+
+fn sync_recovery_timers<C>(
+    queue: &mut SessionDriverRuntime<TcpConnection<C>, TcpWorkerOwnedState>,
+    session_id: SessionId,
+    timers: TcpConnectionTimerKind,
+    connection: &TcpConnection<C>,
+) -> CoreResult<()>
+where
+    C: CongestionController + 'static,
+{
+    for timer in [TcpConnectionTimerKind::RACK, TcpConnectionTimerKind::TLP] {
+        let Some(token) = timer.session_timer_token() else {
+            continue;
+        };
+        if timers.contains(timer) {
+            if let Some(ticks) = connection.tcp_timer_ticks(timer) {
+                queue.arm_timer_ticks(session_id, token, ticks)?;
+            }
+            continue;
+        }
+        let _ = queue.cancel_timer(session_id, token);
     }
     Ok(())
 }
@@ -1448,5 +1687,96 @@ fn clamp_retransmit_timeout(timeout: Duration) -> Duration {
         TCP_MAX_RETRANSMIT_TIMEOUT
     } else {
         timeout
+    }
+}
+
+#[inline]
+fn sack_blocks_overlap_or_touch(left: TcpSackBlock, right: TcpSackBlock) -> bool {
+    !TcpSeq::from(left.right_edge).before(TcpSeq::from(right.left_edge))
+        && !TcpSeq::from(right.right_edge).before(TcpSeq::from(left.left_edge))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::congestion::BbrController;
+
+    fn established_connection() -> TcpConnection<BbrController> {
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        let mut connection = TcpConnection::established_for_test(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        );
+        let _ = connection.set_local_capabilities(TcpCapabilities {
+            max_segment_size: None,
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+        });
+        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
+            max_segment_size: None,
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+        });
+        connection
+    }
+
+    #[test]
+    fn tcp_update_sack_block_merges_and_drops_delivered_ranges() {
+        let mut connection = established_connection();
+        connection.rcv_nxt = 1_000;
+
+        connection.update_ack_sack_block(1_020, 1_030);
+        connection.update_ack_sack_block(1_040, 1_050);
+        connection.update_ack_sack_block(1_028, 1_045);
+
+        assert_eq!(connection.sack_block_count, 1);
+        assert_eq!(
+            connection.sack_blocks[0],
+            TcpSackBlock {
+                left_edge: 1_020,
+                right_edge: 1_050,
+            }
+        );
+
+        connection.rcv_nxt = 1_050;
+        connection.update_ack_sack_block(connection.rcv_nxt, connection.rcv_nxt);
+
+        assert_eq!(connection.sack_block_count, 0);
+    }
+
+    #[test]
+    fn tcp_output_sack_blocks_emits_pending_dsack_first() {
+        let mut connection = established_connection();
+        connection.update_ack_sack_block(8_000, 8_100);
+        connection.set_duplicate_sack(6_500, 6_550);
+
+        let (blocks, count) = connection
+            .output_sack_blocks(TcpSegmentFlags::ACK)
+            .expect("sack blocks");
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            blocks[0],
+            TcpSackBlock {
+                left_edge: 6_500,
+                right_edge: 6_550,
+            }
+        );
+        assert_eq!(
+            blocks[1],
+            TcpSackBlock {
+                left_edge: 8_000,
+                right_edge: 8_100,
+            }
+        );
+        assert!(connection.pending_dsack.is_none());
     }
 }

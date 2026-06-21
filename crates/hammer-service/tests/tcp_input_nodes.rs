@@ -7,6 +7,7 @@ use hammer_adapter::{
     NodeRuntimeData, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::TcpCapabilities;
 use hammer_service::data_plane::{DropNode, HandoffNode};
 use hammer_service::net::{IpLocalControlPlane, IpLocalNext};
 use hammer_service::transport::congestion::BbrController;
@@ -137,6 +138,7 @@ fn ip_local_routes_tcp_packets_into_tcp_input_listen_next() {
     owner.insert_listener::<TcpIpv4ListenerAddress>(
         TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), LISTEN_PORT),
         LISTENER_ID,
+        TcpCapabilities::default(),
     );
     graph
         .tcp_control
@@ -256,6 +258,7 @@ fn tcp_input_routes_listener_syn_locally_without_handoff() {
     owner.insert_listener::<TcpIpv4ListenerAddress>(
         TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 33), LISTEN_PORT),
         LISTENER_ID,
+        TcpCapabilities::default(),
     );
     let snapshot = owner.publish_snapshot();
     first_graph

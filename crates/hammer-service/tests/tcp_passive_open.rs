@@ -10,8 +10,8 @@ use hammer_service::data_plane::DropNode;
 use hammer_service::transport::congestion::BbrController;
 use hammer_service::transport::tcp::lookup::TcpWorkerOwnedState;
 use hammer_service::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
-    TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpListenNext, TcpListenNode,
+    TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
 };
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -102,6 +102,7 @@ fn capture_process(
 #[test]
 fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let tcp_control = TcpInputControlPlane::new();
     let handle =
         TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
@@ -118,7 +119,11 @@ fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
         .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
-        .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
+        .register_internal(TcpListenNode::new(
+            tcp_control.clone(),
+            handle,
+            TcpListenNext::nodes(output, drop),
+        ));
 
     send_packet(
         &runtime,
@@ -153,6 +158,7 @@ fn tcp_listen_syn_creates_syn_rcvd_session_and_emits_syn_ack() {
 #[test]
 fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let tcp_control = TcpInputControlPlane::new();
     let handle =
         TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
@@ -169,7 +175,11 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
         .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
-        .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
+        .register_internal(TcpListenNode::new(
+            tcp_control.clone(),
+            handle,
+            TcpListenNext::nodes(output, drop),
+        ));
     let syn_rcvd = runtime.nodes().register_internal(TcpRcvProcessNode::new(
         handle,
         TcpRcvProcessNext::nodes(output, drop),
@@ -225,6 +235,7 @@ fn tcp_syn_rcvd_final_ack_promotes_session_to_established() {
 #[test]
 fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let tcp_control = TcpInputControlPlane::new();
     let handle =
         TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
@@ -241,7 +252,11 @@ fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
         .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
-        .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
+        .register_internal(TcpListenNode::new(
+            tcp_control.clone(),
+            handle,
+            TcpListenNext::nodes(output, drop),
+        ));
     let syn_rcvd = runtime.nodes().register_internal(TcpRcvProcessNode::new(
         handle,
         TcpRcvProcessNext::nodes(output, drop),
@@ -285,6 +300,7 @@ fn tcp_syn_rcvd_fin_in_close_state_advances_rcv_nxt_and_emits_ack() {
 #[test]
 fn tcp_syn_rcvd_rst_closes_session_and_completes_app_closed() {
     let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+    let tcp_control = TcpInputControlPlane::new();
     let handle =
         TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
@@ -301,7 +317,11 @@ fn tcp_syn_rcvd_rst_closes_session_and_completes_app_closed() {
         .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
-        .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
+        .register_internal(TcpListenNode::new(
+            tcp_control.clone(),
+            handle,
+            TcpListenNext::nodes(output, drop),
+        ));
     let syn_rcvd = runtime.nodes().register_internal(TcpRcvProcessNode::new(
         handle,
         TcpRcvProcessNext::nodes(output, drop),

@@ -1705,14 +1705,7 @@ impl BufferPool {
     #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
-        let buffer = pool.buffer_mut(index)?;
-        buffer.ensure_exclusive()?;
-        if len > buffer.current_len {
-            return Err(CoreError::internal("buffer advance exceeds current length"));
-        }
-        buffer.current_data += len;
-        buffer.current_len -= len;
-        Ok(())
+        pool.advance(index, len)
     }
 
     #[inline]
@@ -2119,6 +2112,66 @@ impl DerefMut for PooledBufferFrame {
 }
 
 impl BufferPoolInner {
+    #[inline]
+    fn advance(&mut self, index: BufferIndex, len: usize) -> CoreResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+
+        let first = self.buffer(index)?;
+        if first.next_buffer().is_none() {
+            if len > first.current_len() {
+                return Err(CoreError::internal("buffer advance exceeds current length"));
+            }
+            let buffer = self.buffer_mut(index)?;
+            buffer.ensure_exclusive()?;
+            buffer.current_data += len;
+            buffer.current_len -= len;
+            return Ok(());
+        }
+
+        let total_len = first
+            .current_len()
+            .checked_add(first.total_len_not_including_first())
+            .ok_or_else(|| CoreError::internal("buffer chain length overflow"))?;
+        if len > total_len {
+            return Err(CoreError::internal("buffer advance exceeds current length"));
+        }
+
+        let mut touched = Vec::new();
+        let mut remaining = len;
+        let mut current = Some(index);
+        while remaining != 0 {
+            let current_index = current
+                .ok_or_else(|| CoreError::internal("buffer chain advance lost current segment"))?;
+            let buffer = self.buffer(current_index)?;
+            touched.push(current_index);
+            if remaining <= buffer.current_len() {
+                break;
+            }
+            remaining -= buffer.current_len();
+            current = buffer.next_buffer();
+        }
+
+        for current_index in touched.iter().copied() {
+            self.buffer(current_index)?.ensure_exclusive()?;
+        }
+
+        let mut remaining = len;
+        for current_index in touched.iter().copied() {
+            let buffer = self.buffer_mut(current_index)?;
+            let consume = remaining.min(buffer.current_len());
+            buffer.current_data += consume;
+            buffer.current_len -= consume;
+            remaining -= consume;
+            if remaining == 0 {
+                break;
+            }
+        }
+
+        self.refresh_chain_lengths(index)
+    }
+
     #[inline]
     fn alloc_chain(
         &mut self,

@@ -8,11 +8,14 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
 use hammer_service::transport::congestion::BbrController;
-use hammer_service::transport::tcp::lookup::TcpWorkerOwnedState;
-use hammer_service::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpListenNext, TcpListenNode, TcpOutputNext,
-    TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
+use hammer_service::transport::tcp::lookup::{
+    TcpIpv4ListenerAddress, TcpV4ListenerKey, TcpWorkerOwnedState,
 };
+use hammer_service::transport::tcp::{
+    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpListenNext, TcpListenNode,
+    TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
+};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentView, tcp_options_from_bytes};
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const REMOTE: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
@@ -107,6 +110,22 @@ struct Graph {
 
 fn established_graph() -> Graph {
     let runtime = DataPlaneRuntime::with_capacities(4096, 32, 8, 8);
+    let tcp_control = TcpInputControlPlane::new();
+    let mut listener_owner = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+    listener_owner.insert_listener::<TcpIpv4ListenerAddress>(
+        TcpV4ListenerKey::new(0, LOCAL, LOCAL_PORT),
+        1,
+        TcpCapabilities {
+            max_segment_size: Some(1440),
+            window_scale: Some(6),
+            sack: true,
+            timestamps: true,
+            ecn: false,
+        },
+    );
+    tcp_control
+        .publish_lookup(listener_owner.publish_snapshot())
+        .expect("publish listener snapshot");
     let handle =
         TcpWorkerOwnedState::register_queue::<BbrController>(
             DataWorkerId::new(0),
@@ -123,7 +142,11 @@ fn established_graph() -> Graph {
         .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, output_capture)));
     let listen = runtime
         .nodes()
-        .register_internal(TcpListenNode::new(handle, TcpListenNext::nodes(output, drop)));
+        .register_internal(TcpListenNode::new(
+            tcp_control.clone(),
+            handle,
+            TcpListenNext::nodes(output, drop),
+        ));
     let syn_rcvd = runtime.nodes().register_internal(TcpRcvProcessNode::new(
         handle,
         TcpRcvProcessNext::nodes(output, drop),
@@ -136,15 +159,19 @@ fn established_graph() -> Graph {
     send_packet(
         &runtime,
         listen,
-        tcp_packet(
+        tcp_syn_packet(
             REMOTE,
             REMOTE_PORT,
             LOCAL,
             LOCAL_PORT,
             CLIENT_ISN,
-            0,
-            SYN,
-            b"",
+            TcpCapabilities {
+                max_segment_size: Some(1440),
+                window_scale: Some(6),
+                sack: true,
+                timestamps: true,
+                ecn: false,
+            },
         ),
     );
     assert_eq!(runtime.run_ready_nodes().expect("run listen"), 3);
@@ -274,6 +301,173 @@ fn tcp_established_out_of_window_segment_emits_ack_without_advancing_rcv_nxt() {
         SERVER_ISN + 1,
         CLIENT_ISN + 1,
         ACK,
+    );
+}
+
+#[test]
+fn tcp_established_gap_closing_payload_advances_ack_across_buffered_ooo_data() {
+    let graph = established_graph();
+
+    send_packet(
+        &graph.runtime,
+        graph.established,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            CLIENT_ISN + 1 + 4,
+            SERVER_ISN + 1,
+            ACK,
+            b"late",
+        ),
+    );
+
+    assert_eq!(graph.runtime.run_ready_nodes().expect("run future ooo"), 3);
+    {
+        let packets = &graph.output_state.lock().unwrap().packets;
+        assert_eq!(packets.len(), 1);
+        assert_tcp_packet(
+            &packets[0],
+            LOCAL,
+            LOCAL_PORT,
+            REMOTE,
+            REMOTE_PORT,
+            SERVER_ISN + 1,
+            CLIENT_ISN + 1,
+            ACK,
+        );
+    }
+    graph.output_state.lock().unwrap().packets.clear();
+
+    send_packet(
+        &graph.runtime,
+        graph.established,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            CLIENT_ISN + 1,
+            SERVER_ISN + 1,
+            ACK,
+            b"gap-",
+        ),
+    );
+
+    assert_eq!(graph.runtime.run_ready_nodes().expect("run gap closing"), 3);
+    let packets = &graph.output_state.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    assert_tcp_packet(
+        &packets[0],
+        LOCAL,
+        LOCAL_PORT,
+        REMOTE,
+        REMOTE_PORT,
+        SERVER_ISN + 1,
+        CLIENT_ISN + 1 + 8,
+        ACK,
+    );
+}
+
+#[test]
+fn tcp_established_ooo_payload_emits_sack_block() {
+    let graph = established_graph();
+
+    send_packet(
+        &graph.runtime,
+        graph.established,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            CLIENT_ISN + 1 + 4,
+            SERVER_ISN + 1,
+            ACK,
+            b"late",
+        ),
+    );
+
+    assert_eq!(graph.runtime.run_ready_nodes().expect("run ooo"), 3);
+    let packets = &graph.output_state.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    assert_tcp_packet(
+        &packets[0],
+        LOCAL,
+        LOCAL_PORT,
+        REMOTE,
+        REMOTE_PORT,
+        SERVER_ISN + 1,
+        CLIENT_ISN + 1,
+        ACK,
+    );
+    let options = tcp_packet_options(&packets[0]);
+    assert_eq!(
+        options.sack_blocks,
+        vec![hammer_core::protocol::tcp::TcpSackBlock {
+            left_edge: CLIENT_ISN + 1 + 4,
+            right_edge: CLIENT_ISN + 1 + 8,
+        }]
+    );
+}
+
+#[test]
+fn tcp_established_duplicate_payload_emits_dsack_block() {
+    let graph = established_graph();
+
+    send_packet(
+        &graph.runtime,
+        graph.established,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            CLIENT_ISN + 1,
+            SERVER_ISN + 1,
+            ACK,
+            b"hello",
+        ),
+    );
+    assert_eq!(graph.runtime.run_ready_nodes().expect("run first payload"), 3);
+    graph.output_state.lock().unwrap().packets.clear();
+
+    send_packet(
+        &graph.runtime,
+        graph.established,
+        tcp_packet(
+            REMOTE,
+            REMOTE_PORT,
+            LOCAL,
+            LOCAL_PORT,
+            CLIENT_ISN + 1,
+            SERVER_ISN + 1,
+            ACK,
+            b"hello",
+        ),
+    );
+
+    assert_eq!(graph.runtime.run_ready_nodes().expect("run duplicate payload"), 3);
+    let packets = &graph.output_state.lock().unwrap().packets;
+    assert_eq!(packets.len(), 1);
+    assert_tcp_packet(
+        &packets[0],
+        LOCAL,
+        LOCAL_PORT,
+        REMOTE,
+        REMOTE_PORT,
+        SERVER_ISN + 1,
+        CLIENT_ISN + 1 + 5,
+        ACK,
+    );
+    let options = tcp_packet_options(&packets[0]);
+    assert_eq!(
+        options.sack_blocks,
+        vec![hammer_core::protocol::tcp::TcpSackBlock {
+            left_edge: CLIENT_ISN + 1,
+            right_edge: CLIENT_ISN + 1 + 5,
+        }]
     );
 }
 
@@ -461,6 +655,42 @@ fn tcp_packet(
     packet[36..38].copy_from_slice(&checksum.to_be_bytes());
     update_ipv4_header_checksum(&mut packet);
     packet
+}
+
+fn tcp_syn_packet(
+    source: Ipv4Addr,
+    source_port: u16,
+    destination: Ipv4Addr,
+    destination_port: u16,
+    sequence: u32,
+    capabilities: TcpCapabilities,
+) -> Vec<u8> {
+    let mut tcp = [0u8; 64];
+    let tcp_len = hammer_core::protocol::tcp::write_tcp_segment_header(
+        &mut tcp,
+        hammer_core::protocol::tcp::TcpSegmentHeader {
+            source_port,
+            destination_port,
+            sequence_number: sequence,
+            acknowledgment_number: 0,
+            flags: hammer_core::protocol::tcp::TcpSegmentFlags::SYN,
+            advertised_window: u16::MAX,
+            capabilities,
+        },
+        None,
+    )
+    .expect("write syn header");
+    let mut packet = ipv4_packet(source, destination, 6, tcp_len);
+    packet[20..20 + tcp_len].copy_from_slice(&tcp[..tcp_len]);
+    let checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
+    packet[36..38].copy_from_slice(&checksum.to_be_bytes());
+    update_ipv4_header_checksum(&mut packet);
+    packet
+}
+
+fn tcp_packet_options(packet: &[u8]) -> hammer_core::protocol::tcp::ParsedTcpOptions {
+    let segment = TcpSegmentView::parse(packet).expect("parse tcp output packet");
+    tcp_options_from_bytes(segment.options())
 }
 
 fn ipv4_packet(
