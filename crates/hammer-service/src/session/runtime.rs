@@ -10,7 +10,6 @@ use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::AppOpId;
 #[cfg(test)]
 use hammer_runtime::app::AppRingHandle;
-use hammer_core::protocol::tcp::TcpSeq;
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionReadyQueue, SessionTimerExpiry, SessionTimerToken,
@@ -567,7 +566,7 @@ impl<S, A> SessionDriverRuntime<S, A> {
                         .get(position)
                         .copied()
                         .ok_or_else(|| CoreError::internal("session rx queue slot is invalid"))?;
-                    if TcpSeq::from(offset).before(TcpSeq::from(current.offset)) {
+                    if offset < current.offset {
                         insert_at = position;
                         break;
                     }
@@ -587,17 +586,20 @@ impl<S, A> SessionDriverRuntime<S, A> {
                 let Some(current) = current else {
                     break;
                 };
-                if TcpSeq::from(current.offset).after(TcpSeq::from(delivered_len)) {
+                if current.offset > delivered_len {
                     break;
                 }
-                let current_end = TcpSeq::from(current.offset).advance(current.len).raw();
-                if !TcpSeq::from(current_end).after(TcpSeq::from(delivered_len)) {
+                let current_end = current
+                    .offset
+                    .checked_add(current.len)
+                    .ok_or_else(|| CoreError::internal("session rx end offset overflow"))?;
+                if current_end <= delivered_len {
                     let removed = self.rx_queue_mut_or_alloc(session_id).remove(position);
                     self.buffers.free_index(removed.index);
                     continue;
                 }
-                if TcpSeq::from(current.offset).before(TcpSeq::from(delivered_len)) {
-                    let trim = TcpSeq::from(current.offset).distance_to(TcpSeq::from(delivered_len));
+                if current.offset < delivered_len {
+                    let trim = delivered_len - current.offset;
                     let trim = usize::try_from(trim)
                         .map_err(|_| CoreError::internal("session rx trim length exceeds usize"))?;
                     self.buffers.advance(current.index, trim)?;
@@ -629,8 +631,10 @@ impl<S, A> SessionDriverRuntime<S, A> {
                     break;
                 };
                 if current.offset != 0 {
-                    let rebased =
-                        TcpSeq::from(delivered_len).distance_to(TcpSeq::from(current.offset));
+                    let rebased = current
+                        .offset
+                        .checked_sub(delivered_len)
+                        .ok_or_else(|| CoreError::internal("session rx rebased offset underflow"))?;
                     let current = self
                         .rx_queue_mut_or_alloc(session_id)
                         .get_mut(position)
@@ -997,7 +1001,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use super::*;
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -1005,16 +1008,9 @@ mod tests {
         BufferFrame, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
         NodeRuntimeData,
     };
-    use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
-    };
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
     use crate::session::protocol::SessionQueueControlContext;
-    use crate::transport::congestion::BbrController;
-    use crate::transport::tcp::{
-        TcpConnection, TcpConnectionTimerKind, TcpOutputNext, TcpOutputNode, TcpWorkerOwnedState,
-    };
 
     fn infra_vec<T>(items: impl IntoIterator<Item = T>) -> hammer_infra::vec::Vec<T> {
         let mut values = hammer_infra::vec::Vec::new();
@@ -1220,97 +1216,6 @@ mod tests {
             runtime.free_index(index);
         }
         Ok(NodeResult::drop())
-    }
-
-    fn tcp_output_graph(
-        runtime: &DataPlaneRuntime,
-    ) -> (NodeId, Arc<Mutex<CaptureState>>, Arc<Mutex<CaptureState>>) {
-        let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
-        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
-        let lookup = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
-        let drop = runtime
-            .nodes()
-            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
-        let output = runtime
-            .nodes()
-            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
-        (output, lookup_state, drop_state)
-    }
-
-    fn established_tcp_connection() -> TcpConnection<BbrController> {
-        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
-        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-        let mut connection = TcpConnection::established_for_test(
-            Some(TcpConnectionId::new(1)),
-            DataWorkerId::new(0),
-            local.port(),
-            Some(local),
-            remote,
-        );
-        let capabilities = TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: false,
-        };
-        let _ = connection.set_local_capabilities(capabilities);
-        connection
-    }
-
-    fn enqueue_app_send(
-        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
-        ring: &AppRingHandle,
-        session_id: SessionId,
-        bytes: &[u8],
-    ) {
-        let send: AppSendData = ring
-            .send_from_data(ring.alloc_data_for_bytes(bytes).expect("data"))
-            .try_into()
-            .expect("transfer");
-        driver.app_mut().push_pending_send(session_id, send);
-        driver.mark_ready(session_id);
-    }
-
-    fn dispatch_tcp_session_queue(
-        runtime: &DataPlaneRuntime,
-        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
-        output_node: NodeId,
-    ) {
-        let next = crate::session::SessionQueueNext::from_node(output_node);
-        let mut output = crate::session::node::SessionQueueOutput::default();
-        let mut step = driver.poll_once_for_ticks(0).expect("poll");
-        dispatch_session_queue_pending(
-            runtime,
-            driver,
-            next,
-            &mut output,
-            &mut step,
-            Instant::now(),
-        )
-        .expect("dispatch tcp session queue");
-        output.schedule(runtime).expect("schedule output");
-        assert_eq!(runtime.run_ready_nodes().expect("run tcp output"), 2);
-    }
-
-    fn expire_tcp_timers(
-        runtime: &DataPlaneRuntime,
-        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
-        ticks: u32,
-        output_node: NodeId,
-    ) {
-        let next = crate::session::SessionQueueNext::from_node(output_node);
-        let step = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
-            .expect("dispatch session queue for timer ticks");
-        assert!(step.expired_timers != 0);
-        assert_eq!(runtime.run_ready_nodes().expect("run timer output"), 2);
-    }
-
-    fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
-        &packet[segment.header_len()..]
     }
 
     #[test]
@@ -1526,103 +1431,4 @@ mod tests {
         assert!(!driver.has_retained_tx(session_id));
     }
 
-    #[test]
-    fn session_tcp_tlp_retransmits_latest_retained_payload() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
-        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
-        let mut driver = SessionDriverRuntime::new(
-            DataWorkerId::new(0),
-            runtime.packet_buffers().clone(),
-            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
-        );
-        let session_id = driver.insert_session(established_tcp_connection());
-        driver
-            .refresh_session_route(session_id)
-            .expect("refresh session route");
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-
-        enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
-        lookup_state.lock().expect("lookup").packets.clear();
-
-        enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
-        lookup_state.lock().expect("lookup").packets.clear();
-        drop_state.lock().expect("drop").packets.clear();
-
-        expire_tcp_timers(&runtime, &mut driver, 20, output_node);
-
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
-        let packets = &lookup_state.lock().expect("lookup").packets;
-        assert_eq!(packets.len(), 1);
-        let packet = &packets[0];
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
-        assert_eq!(segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH), TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
-        assert_eq!(tcp_segment_payload(packet), b"second");
-    }
-
-    #[test]
-    fn session_tcp_rack_retransmits_sacked_gap_payload() {
-        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
-        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
-        let mut driver = SessionDriverRuntime::new(
-            DataWorkerId::new(0),
-            runtime.packet_buffers().clone(),
-            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
-        );
-        let session_id = driver.insert_session(established_tcp_connection());
-        driver
-            .refresh_session_route(session_id)
-            .expect("refresh session route");
-        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
-
-        enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
-        let second_left_edge = driver
-            .session(session_id)
-            .expect("connection")
-            .snd_nxt();
-        lookup_state.lock().expect("lookup").packets.clear();
-
-        enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
-        let connection = driver.session(session_id).expect("connection");
-        let acknowledgment = connection.snd_una();
-        let second_right_edge = connection.snd_nxt();
-        lookup_state.lock().expect("lookup").packets.clear();
-        drop_state.lock().expect("drop").packets.clear();
-
-        let timers = driver
-            .session_mut(session_id)
-            .expect("connection")
-            .receive_ack(
-                acknowledgment,
-                u16::MAX,
-                &[TcpSackBlock {
-                    left_edge: second_left_edge,
-                    right_edge: second_right_edge,
-                }],
-            );
-        if timers.contains(TcpConnectionTimerKind::RACK) {
-            driver
-                .arm_timer_ticks(
-                    session_id,
-                    TcpConnectionTimerKind::RACK
-                        .session_timer_token()
-                        .expect("rack timer token"),
-                    6,
-                )
-                .expect("arm rack timer");
-        }
-
-        expire_tcp_timers(&runtime, &mut driver, 6, output_node);
-
-        assert!(drop_state.lock().expect("drop").packets.is_empty());
-        let packets = &lookup_state.lock().expect("lookup").packets;
-        assert_eq!(packets.len(), 1);
-        let packet = &packets[0];
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
-        assert_eq!(segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH), TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
-        assert_eq!(tcp_segment_payload(packet), b"first");
-    }
 }

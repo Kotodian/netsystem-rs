@@ -285,3 +285,285 @@ impl TcpInputError {
         self as u16
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+
+    use hammer_adapter::{
+        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
+        NodeRegistration, NodeResult, NodeRuntimeData,
+    };
+    use hammer_core::error::{CoreError, CoreResult};
+    use hammer_core::protocol::tcp::{
+        TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
+    };
+    use hammer_runtime::app::{AppRingHandle, AppSendData};
+
+    use super::*;
+    use crate::session::SessionId;
+    use crate::session::runtime::{
+        SessionDriverRuntime, dispatch_session_queue_for_ticks, dispatch_session_queue_pending,
+    };
+    use crate::transport::congestion::BbrController;
+
+    #[derive(Default)]
+    struct CaptureState {
+        packets: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    struct CaptureNode {
+        runtime_data: NodeRuntimeData,
+    }
+
+    impl CaptureNode {
+        fn new(state: Arc<Mutex<CaptureState>>) -> Self {
+            let mut states = capture_states().lock().expect("capture registry");
+            let slot = states.len();
+            states.push(state);
+            Self {
+                runtime_data: NodeRuntimeData::from_usize(slot).expect("capture slot"),
+            }
+        }
+    }
+
+    impl Node for CaptureNode {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
+            Err(CoreError::internal(
+                "capture node must use descriptor process",
+            ))
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            capture_process
+        }
+
+        fn node_runtime_data(&self) -> CoreResult<NodeRuntimeData> {
+            Ok(self.runtime_data)
+        }
+    }
+
+    impl InternalNode for CaptureNode {
+        fn node_registration(&self) -> NodeRegistration
+        where
+            Self: Sized,
+        {
+            NodeRegistration::Plain
+        }
+    }
+
+    fn capture_states() -> &'static Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>> {
+        static STATES: OnceLock<Mutex<std::vec::Vec<Arc<Mutex<CaptureState>>>>> = OnceLock::new();
+        STATES.get_or_init(|| Mutex::new(std::vec::Vec::new()))
+    }
+
+    fn capture_process(
+        runtime: &DataPlaneRuntime,
+        data: NodeRuntimeData,
+        frame: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        let slot = data.usize_word(0)?;
+        let state = {
+            let states = capture_states().lock().expect("capture registry");
+            Arc::clone(
+                states
+                    .get(slot)
+                    .ok_or_else(|| CoreError::internal("capture slot is invalid"))?,
+            )
+        };
+        let mut state = state.lock().expect("capture state");
+        for index in frame.drain_pending() {
+            let packet = runtime.copy_current_chain(index)?;
+            state.packets.push(packet.to_vec());
+            runtime.free_index(index);
+        }
+        Ok(NodeResult::drop())
+    }
+
+    fn tcp_output_graph(
+        runtime: &DataPlaneRuntime,
+    ) -> (NodeId, Arc<Mutex<CaptureState>>, Arc<Mutex<CaptureState>>) {
+        let lookup_state = Arc::new(Mutex::new(CaptureState::default()));
+        let drop_state = Arc::new(Mutex::new(CaptureState::default()));
+        let lookup = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&lookup_state)));
+        let drop = runtime
+            .nodes()
+            .register_internal(CaptureNode::new(Arc::clone(&drop_state)));
+        let output = runtime
+            .nodes()
+            .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, lookup)));
+        (output, lookup_state, drop_state)
+    }
+
+    fn established_tcp_connection() -> TcpConnection<BbrController> {
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        TcpConnection::established_with_sack_for_test(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        )
+    }
+
+    fn enqueue_app_send(
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        ring: &AppRingHandle,
+        session_id: SessionId,
+        bytes: &[u8],
+    ) {
+        let send: AppSendData = ring
+            .send_from_data(ring.alloc_data_for_bytes(bytes).expect("data"))
+            .try_into()
+            .expect("transfer");
+        driver.app_mut().push_pending_send(session_id, send);
+        driver.mark_ready(session_id);
+    }
+
+    fn dispatch_tcp_session_queue(
+        runtime: &DataPlaneRuntime,
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        output_node: NodeId,
+    ) {
+        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let mut output = crate::session::node::SessionQueueOutput::default();
+        let mut step = driver.poll_once_for_ticks(0).expect("poll");
+        dispatch_session_queue_pending(
+            runtime,
+            driver,
+            next,
+            &mut output,
+            &mut step,
+            Instant::now(),
+        )
+        .expect("dispatch tcp session queue");
+        output.schedule(runtime).expect("schedule output");
+        assert_eq!(runtime.run_ready_nodes().expect("run tcp output"), 2);
+    }
+
+    fn expire_tcp_timers(
+        runtime: &DataPlaneRuntime,
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
+        ticks: u32,
+        output_node: NodeId,
+    ) {
+        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let step = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
+            .expect("dispatch session queue for timer ticks");
+        assert!(step.expired_timers != 0);
+        assert_eq!(runtime.run_ready_nodes().expect("run timer output"), 2);
+    }
+
+    fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        &packet[segment.header_len()..]
+    }
+
+    #[test]
+    fn session_tcp_tlp_retransmits_latest_retained_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut driver = SessionDriverRuntime::new(
+            DataWorkerId::new(0),
+            runtime.packet_buffers().clone(),
+            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+        );
+        let session_id = driver.insert_session(established_tcp_connection());
+        driver
+            .refresh_session_route(session_id)
+            .expect("refresh session route");
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"first");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        lookup_state.lock().expect("lookup").packets.clear();
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"second");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        lookup_state.lock().expect("lookup").packets.clear();
+        drop_state.lock().expect("drop").packets.clear();
+
+        expire_tcp_timers(&runtime, &mut driver, 20, output_node);
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        assert_eq!(
+            segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
+            TcpSegmentFlags::ACK | TcpSegmentFlags::PSH
+        );
+        assert_eq!(tcp_segment_payload(packet), b"second");
+    }
+
+    #[test]
+    fn session_tcp_rack_retransmits_sacked_gap_payload() {
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8);
+        let (output_node, lookup_state, drop_state) = tcp_output_graph(&runtime);
+        let mut driver = SessionDriverRuntime::new(
+            DataWorkerId::new(0),
+            runtime.packet_buffers().clone(),
+            TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+        );
+        let session_id = driver.insert_session(established_tcp_connection());
+        driver
+            .refresh_session_route(session_id)
+            .expect("refresh session route");
+        let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"first");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        let second_left_edge = driver.session(session_id).expect("connection").snd_nxt();
+        lookup_state.lock().expect("lookup").packets.clear();
+
+        enqueue_app_send(&mut driver, &ring, session_id, b"second");
+        dispatch_tcp_session_queue(&runtime, &mut driver, output_node);
+        let connection = driver.session(session_id).expect("connection");
+        let acknowledgment = connection.snd_una();
+        let second_right_edge = connection.snd_nxt();
+        lookup_state.lock().expect("lookup").packets.clear();
+        drop_state.lock().expect("drop").packets.clear();
+
+        let timers = driver
+            .session_mut(session_id)
+            .expect("connection")
+            .receive_ack(
+                acknowledgment,
+                u16::MAX,
+                &[TcpSackBlock {
+                    left_edge: second_left_edge,
+                    right_edge: second_right_edge,
+                }],
+            );
+        if timers.contains(TcpConnectionTimerKind::RACK) {
+            driver
+                .arm_timer_ticks(
+                    session_id,
+                    TcpConnectionTimerKind::RACK
+                        .session_timer_token()
+                        .expect("rack timer token"),
+                    6,
+                )
+                .expect("arm rack timer");
+        }
+
+        expire_tcp_timers(&runtime, &mut driver, 6, output_node);
+
+        assert!(drop_state.lock().expect("drop").packets.is_empty());
+        let packets = &lookup_state.lock().expect("lookup").packets;
+        assert_eq!(packets.len(), 1);
+        let packet = &packets[0];
+        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        assert_eq!(
+            segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
+            TcpSegmentFlags::ACK | TcpSegmentFlags::PSH
+        );
+        assert_eq!(tcp_segment_payload(packet), b"first");
+    }
+}
