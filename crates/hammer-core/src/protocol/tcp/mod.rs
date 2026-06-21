@@ -16,7 +16,7 @@ pub use segment::{
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TcpSegmentFlags: u8 {
+    pub struct TcpSegmentFlags: u16 {
         const FIN = 0x01;
         const SYN = 0x02;
         const RST = 0x04;
@@ -25,6 +25,7 @@ bitflags::bitflags! {
         const URG = 0x20;
         const ECE = 0x40;
         const CWR = 0x80;
+        const NS = 0x100;
     }
 }
 
@@ -172,6 +173,7 @@ pub struct TcpCapabilities {
     pub sack: bool,
     pub timestamps: bool,
     pub ecn: bool,
+    pub accurate_ecn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -183,11 +185,12 @@ pub struct TcpNegotiatedOptions {
     pub sack: bool,
     pub timestamps: bool,
     pub ecn: bool,
+    pub accurate_ecn: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpHandshakeObservation {
-    pub flags: u8,
+    pub flags: u16,
     pub sequence: u32,
     pub acknowledgment: Option<u32>,
     pub advertised_window: u32,
@@ -198,7 +201,7 @@ pub struct TcpHandshakeObservation {
 impl TcpHandshakeObservation {
     #[inline]
     pub const fn new(
-        flags: u8,
+        flags: u16,
         sequence: u32,
         acknowledgment: Option<u32>,
         advertised_window: u32,
@@ -216,6 +219,7 @@ impl TcpHandshakeObservation {
                 sack: false,
                 timestamps: false,
                 ecn: false,
+                accurate_ecn: false,
             },
         }
     }
@@ -228,17 +232,17 @@ impl TcpHandshakeObservation {
 
     #[inline]
     pub const fn syn(self) -> bool {
-        self.flags & 0x02 != 0
+        self.flags & TcpSegmentFlags::SYN.bits() != 0
     }
 
     #[inline]
     pub const fn ack(self) -> bool {
-        self.flags & 0x10 != 0
+        self.flags & TcpSegmentFlags::ACK.bits() != 0
     }
 
     #[inline]
     pub const fn fin(self) -> bool {
-        self.flags & 0x01 != 0
+        self.flags & TcpSegmentFlags::FIN.bits() != 0
     }
 }
 

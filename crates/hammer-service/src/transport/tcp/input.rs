@@ -6,7 +6,7 @@ use crate::data_plane::set_index_node_error_code;
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
-    put_u8,
+    put_u16,
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
@@ -32,7 +32,7 @@ pub struct TcpInputTrace {
     pub protocol: Option<IpProtocol>,
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
-    pub flags: u8,
+    pub flags: u16,
     pub error: Option<u16>,
     pub next: NodeId,
 }
@@ -45,7 +45,7 @@ impl TcpInputTrace {
             protocol: cursor.read_option_ip_protocol()?,
             source_port: cursor.read_option_u16()?,
             destination_port: cursor.read_option_u16()?,
-            flags: cursor.read_u8()?,
+            flags: cursor.read_u16()?,
             error: cursor.read_option_u16()?,
             next: cursor.read_node()?,
         };
@@ -59,7 +59,7 @@ impl PacketTrace for TcpInputTrace {
         put_option_ip_protocol(out, self.protocol);
         put_option_u16(out, self.source_port);
         put_option_u16(out, self.destination_port);
-        put_u8(out, self.flags);
+        put_u16(out, self.flags);
         put_option_u16(out, self.error);
         put_node(out, self.next);
     }
@@ -402,7 +402,7 @@ where
             parsed.protocol,
             parsed.source_port,
             parsed.destination_port,
-            parsed.flags.bits(),
+            u16::from(parsed.flags.bits()),
         );
     }
 
@@ -418,7 +418,7 @@ where
             error,
             Some(parsed.version),
             Some(parsed.protocol),
-            parsed.flags.bits(),
+            u16::from(parsed.flags.bits()),
         );
     }
     let Some(_listener) = lookup else {
@@ -430,7 +430,7 @@ where
             TcpInputError::ConnectionClosed,
             Some(parsed.version),
             Some(parsed.protocol),
-            parsed.flags.bits(),
+            u16::from(parsed.flags.bits()),
         );
     };
     resolve_success_next(
@@ -442,7 +442,7 @@ where
         parsed.protocol,
         parsed.source_port,
         parsed.destination_port,
-        parsed.flags.bits(),
+        u16::from(parsed.flags.bits()),
     )
 }
 
@@ -456,7 +456,7 @@ fn resolve_success_next(
     protocol: IpProtocol,
     source_port: u16,
     destination_port: u16,
-    flags: u8,
+    flags: u16,
 ) -> CoreResult<Option<NodeId>> {
     clear_success_metadata(runtime, index)?;
     let resolved = NodeNextStorage::next(next, next_key);
@@ -485,7 +485,7 @@ fn resolve_error_next(
     error: TcpInputError,
     version: Option<IpVersion>,
     protocol: Option<IpProtocol>,
-    flags: u8,
+    flags: u16,
 ) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, error.code())?;
     let resolved = NodeNextStorage::next(next, next_key);

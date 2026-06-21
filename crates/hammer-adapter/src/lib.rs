@@ -74,8 +74,8 @@ pub use platform::{
 pub use probe::{ProbeProtocol, ProbeProtocolComponent, ProbeReport};
 pub use router::Router;
 pub use rule::{
-    FeaturePathEntry, ForwardingDpoType, ForwardingMetadata, HeadlessRule, RouteDecision,
-    RouteMetadata, RouteTarget, Rule, SocksAddr, TapEthernetMetadata,
+    FeaturePathEntry, ForwardingDpoType, ForwardingMetadata, HeadlessRule, IpEcnCodepoint,
+    RouteDecision, RouteMetadata, RouteTarget, Rule, SocksAddr, TapEthernetMetadata,
 };
 pub use service::ServiceManager;
 pub use trace::{

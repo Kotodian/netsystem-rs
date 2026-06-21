@@ -25,7 +25,7 @@ fn bbr_controller_implements_transport_congestion_controller() {
             bytes: MSS,
             sent_at: now,
             app_limited: false,
-            ecn_ce: false,
+            ecn_ce_count: 0,
         },
         RttSample {
             latest: Duration::from_millis(20),
@@ -39,6 +39,32 @@ fn bbr_controller_implements_transport_congestion_controller() {
     assert_eq!(controller.delivered(), u64::from(MSS));
     assert_eq!(controller.min_rtt(), Some(Duration::from_millis(20)));
     assert!(controller.pacing_rate_bytes_per_second().is_some());
+}
+
+#[test]
+fn bbr_controller_reduces_cwnd_when_ack_reports_ce_feedback() {
+    let now = Instant::now();
+    let mut controller = BbrController::new(MSS);
+    let initial_cwnd = controller.congestion_window();
+
+    controller.on_packet_sent(1, MSS * 4, 0, now);
+    controller.on_ack(
+        now + Duration::from_millis(20),
+        AckedPacket {
+            packet_number: 1,
+            bytes: MSS * 4,
+            sent_at: now,
+            app_limited: false,
+            ecn_ce_count: 2,
+        },
+        RttSample {
+            latest: Duration::from_millis(20),
+            min: Duration::from_millis(20),
+        },
+        MSS * 4,
+    );
+
+    assert!(controller.congestion_window() < initial_cwnd + MSS * 4);
 }
 
 #[derive(Clone, Debug)]

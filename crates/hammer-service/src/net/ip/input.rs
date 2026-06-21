@@ -1,9 +1,9 @@
 use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
-    NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace,
-    SocksAddr, TraceFormatter, add_packet_trace, unlikely,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, IpEcnCodepoint,
+    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -389,12 +389,14 @@ fn next_node_for_index_with_batch(
                     BufferPacketCursor::new()
                 };
                 *buffer.packet_cursor_mut() = cursor;
+                let ip_ecn = ip_ecn_from_packet(buffer.current(), parsed.version);
                 let metadata = buffer.metadata_mut();
                 if let Some(network) = network {
                     metadata.network = network;
                 }
                 metadata.source = Some(SocksAddr::ip(parsed.source, 0));
                 metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
+                metadata.ip_ecn = ip_ecn;
                 metadata.icmp_error = icmp_error_metadata_for_input(&parsed);
                 let resolved = match parsed.input_target {
                     IpInputTarget::Drop => NodeNextStorage::next(&next, IpInputNext::Drop),
@@ -441,6 +443,25 @@ fn next_node_for_index_with_batch(
         traces.push((index, trace));
     }
     Ok(resolved)
+}
+
+#[inline(always)]
+fn ip_ecn_from_packet(packet: &[u8], version: IpVersion) -> Option<IpEcnCodepoint> {
+    let traffic_class = match version {
+        IpVersion::V4 => packet.get(1).copied()?,
+        IpVersion::V6 => {
+            let first = *packet.first()?;
+            let second = *packet.get(1)?;
+            ((first & 0x0f) << 4) | (second >> 4)
+        }
+    };
+    match traffic_class & 0x03 {
+        0 => Some(IpEcnCodepoint::NotEct),
+        1 => Some(IpEcnCodepoint::Ect1),
+        2 => Some(IpEcnCodepoint::Ect0),
+        3 => Some(IpEcnCodepoint::Ce),
+        _ => None,
+    }
 }
 
 #[inline(always)]

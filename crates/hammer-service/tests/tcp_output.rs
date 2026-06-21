@@ -21,6 +21,7 @@ fn tcp_segment_writes_tcp_header_bytes() {
         TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
         TcpCapabilities::default(),
         None,
+        None,
         5,
     );
     let mut header = [0u8; 64];
@@ -34,11 +35,11 @@ fn tcp_segment_writes_tcp_header_bytes() {
     assert_eq!(&header[8..12], &200u32.to_be_bytes());
     assert_eq!(header[12] >> 4, 5);
     assert_eq!(
-        header[13] & TcpSegmentFlags::ACK.bits(),
+        u16::from(header[13]) & TcpSegmentFlags::ACK.bits(),
         TcpSegmentFlags::ACK.bits()
     );
     assert_eq!(
-        header[13] & TcpSegmentFlags::PSH.bits(),
+        u16::from(header[13]) & TcpSegmentFlags::PSH.bits(),
         TcpSegmentFlags::PSH.bits()
     );
     assert_eq!(&header[14..16], &4096u16.to_be_bytes());

@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use hammer_adapter::{BufferIndex, DataPlaneRuntime, PrimaryOpaquePayload, SecondaryOpaquePayload};
+use hammer_adapter::{
+    BufferIndex, DataPlaneRuntime, IpEcnCodepoint, PrimaryOpaquePayload, SecondaryOpaquePayload,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
@@ -21,6 +23,7 @@ pub(crate) struct TcpPacket {
     pub(crate) capabilities: TcpCapabilities,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) sack_blocks: std::vec::Vec<TcpSackBlock>,
+    pub(crate) ip_ecn: Option<IpEcnCodepoint>,
     pub(crate) payload_offset: usize,
     pub(crate) payload_len: usize,
 }
@@ -78,6 +81,7 @@ pub(crate) fn parse_tcp_packet(
         flags: segment.flags(),
         capabilities: parsed_options.capabilities,
         sack_blocks: parsed_options.sack_blocks,
+        ip_ecn: metadata.ip_ecn,
         payload_offset,
         payload_len,
     })
@@ -94,6 +98,7 @@ pub struct TcpSegment {
     capabilities: TcpCapabilities,
     sack_blocks: Option<[TcpSackBlock; 4]>,
     sack_block_count: u8,
+    ip_ecn: Option<IpEcnCodepoint>,
     payload_len: usize,
 }
 
@@ -108,6 +113,7 @@ impl TcpSegment {
         flags: TcpSegmentFlags,
         capabilities: TcpCapabilities,
         sack_blocks: Option<&[TcpSackBlock]>,
+        ip_ecn: Option<IpEcnCodepoint>,
         payload_len: usize,
     ) -> Self {
         let (sack_blocks, sack_block_count) = copy_sack_blocks(sack_blocks);
@@ -121,6 +127,7 @@ impl TcpSegment {
             capabilities,
             sack_blocks,
             sack_block_count,
+            ip_ecn,
             payload_len,
         }
     }
@@ -159,6 +166,7 @@ impl TcpSegment {
         let mut buffer = runtime.get_buffer_mut(index)?;
         buffer.opaque_mut().write(self);
         buffer.opaque2_mut().write(self);
+        buffer.metadata_mut().ip_ecn = self.ip_ecn;
         Ok(())
     }
 
@@ -170,6 +178,7 @@ impl TcpSegment {
             segment.sack_blocks = secondary.sack_blocks;
             segment.sack_block_count = secondary.sack_block_count;
         }
+        segment.ip_ecn = buffer.metadata().ip_ecn;
         Ok(segment)
     }
 }
@@ -180,6 +189,7 @@ impl PrimaryOpaquePayload for TcpSegment {
         capabilities |= u8::from(self.capabilities.sack);
         capabilities |= u8::from(self.capabilities.timestamps) << 1;
         capabilities |= u8::from(self.capabilities.ecn) << 2;
+        capabilities |= u8::from(self.capabilities.accurate_ecn) << 3;
         unsafe {
             TcpSegmentHeaderOpaque {
                 fields: TcpSegmentHeaderFields {
@@ -189,7 +199,7 @@ impl PrimaryOpaquePayload for TcpSegment {
                     flags: self.flags.bits(),
                     capabilities,
                     sack_block_count: self.sack_block_count,
-                    reserved: 0,
+                    reserved: [0; 2],
                     sequence: self.sequence,
                     acknowledgment: self.acknowledgment,
                     reserved_words: [0; 2],
@@ -214,9 +224,11 @@ impl PrimaryOpaquePayload for TcpSegment {
                 sack: fields.capabilities & 0x01 != 0,
                 timestamps: fields.capabilities & 0x02 != 0,
                 ecn: fields.capabilities & 0x04 != 0,
+                accurate_ecn: fields.capabilities & 0x08 != 0,
             },
             sack_blocks: None,
             sack_block_count: fields.sack_block_count,
+            ip_ecn: None,
             payload_len: 0,
         }
     }
@@ -274,6 +286,7 @@ impl SecondaryOpaquePayload for TcpSegment {
             capabilities: TcpCapabilities::default(),
             sack_blocks: (count != 0).then_some(blocks),
             sack_block_count: count as u8,
+            ip_ecn: None,
             payload_len: 0,
         }
     }
@@ -285,10 +298,10 @@ struct TcpSegmentHeaderFields {
     local_port: u16,
     remote_port: u16,
     advertised_window: u16,
-    flags: u8,
+    flags: u16,
     capabilities: u8,
     sack_block_count: u8,
-    reserved: u8,
+    reserved: [u8; 2],
     sequence: u32,
     acknowledgment: u32,
     reserved_words: [u64; 2],
@@ -431,6 +444,7 @@ mod tests {
             TcpSegmentFlags::ACK,
             TcpCapabilities::default(),
             Some(&blocks),
+            None,
             0,
         );
 
@@ -461,7 +475,7 @@ mod tests {
         packet[24..28].copy_from_slice(&0x0102_0304u32.to_be_bytes());
         packet[28..32].copy_from_slice(&0x1112_1314u32.to_be_bytes());
         packet[32] = 8 << 4;
-        packet[33] = TcpSegmentFlags::ACK.bits();
+        packet[33] = TcpSegmentFlags::ACK.bits() as u8;
         packet[34..36].copy_from_slice(&32_768u16.to_be_bytes());
         packet[40..52].copy_from_slice(&[1, 1, 5, 10, 0, 0, 0, 30, 0, 0, 0, 40]);
         let tcp_checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);

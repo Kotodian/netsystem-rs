@@ -103,6 +103,7 @@ pub fn tcp_options_from_bytes(options: &[u8]) -> ParsedTcpOptions {
                     }
                     TCP_OPTION_ACCURATE_ECN_ORDER_0 | TCP_OPTION_ACCURATE_ECN_ORDER_1 => {
                         parsed.capabilities.ecn = true;
+                        parsed.capabilities.accurate_ecn = true;
                     }
                     _ => {}
                 }
@@ -146,6 +147,9 @@ pub(crate) fn tcp_syn_options_from_capabilities(
         ]);
         options.extend(0u32.to_be_bytes());
         options.extend(0u32.to_be_bytes());
+    }
+    if capabilities.accurate_ecn {
+        options.extend([TCP_OPTION_NOP, TCP_OPTION_ACCURATE_ECN_ORDER_0, 2]);
     }
     while options.len() % 4 != 0 {
         options.push(TCP_OPTION_EOL);

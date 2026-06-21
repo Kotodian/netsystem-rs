@@ -150,7 +150,10 @@ pub fn write_tcp_segment_header(
     output[4..8].copy_from_slice(&header.sequence_number.to_be_bytes());
     output[8..12].copy_from_slice(&header.acknowledgment_number.to_be_bytes());
     output[12] = ((header_len / 4) as u8) << 4;
-    output[13] = header.flags.bits();
+    if header.flags.contains(TcpSegmentFlags::NS) {
+        output[12] |= 0x01;
+    }
+    output[13] = (header.flags.bits() & 0xff) as u8;
     output[14..16].copy_from_slice(&header.advertised_window.to_be_bytes());
     output[TCP_HEADER_MIN_LEN..header_len].copy_from_slice(&options);
     Ok(header_len)
@@ -168,6 +171,7 @@ fn tcp_segment_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> Tcp
 #[inline]
 fn tcp_segment_flags(tcp: &etherparse::TcpSlice<'_>) -> TcpSegmentFlags {
     let mut flags = TcpSegmentFlags::empty();
+    flags.set(TcpSegmentFlags::NS, tcp.ns());
     flags.set(TcpSegmentFlags::FIN, tcp.fin());
     flags.set(TcpSegmentFlags::SYN, tcp.syn());
     flags.set(TcpSegmentFlags::RST, tcp.rst());

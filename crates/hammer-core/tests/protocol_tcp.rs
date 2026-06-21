@@ -76,6 +76,7 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         sack: true,
         timestamps: true,
         ecn: false,
+        accurate_ecn: false,
     };
     let install = TcpControlPlaneAction::InstallListener {
         listener_id: TcpListenerId::new(42),

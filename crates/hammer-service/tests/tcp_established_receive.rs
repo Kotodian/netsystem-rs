@@ -121,6 +121,7 @@ fn established_graph() -> Graph {
             sack: true,
             timestamps: true,
             ecn: false,
+            accurate_ecn: false,
         },
     );
     tcp_control
@@ -171,6 +172,7 @@ fn established_graph() -> Graph {
                 sack: true,
                 timestamps: true,
                 ecn: false,
+                accurate_ecn: false,
             },
         ),
     );

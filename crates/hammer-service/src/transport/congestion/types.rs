@@ -8,7 +8,7 @@ pub struct AckedPacket {
     pub bytes: u32,
     pub sent_at: Instant,
     pub app_limited: bool,
-    pub ecn_ce: bool,
+    pub ecn_ce_count: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

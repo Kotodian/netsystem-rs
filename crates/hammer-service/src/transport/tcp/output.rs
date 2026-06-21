@@ -321,6 +321,7 @@ mod tests {
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
             TcpCapabilities::default(),
             None,
+            None,
             payload_len,
         )
     }

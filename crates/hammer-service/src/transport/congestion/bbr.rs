@@ -43,6 +43,7 @@ pub struct BbrController {
     probe_rtt_done_stamp: Option<Instant>,
     probe_rtt_round_done: bool,
     prior_mode: BbrMode,
+    ecn_alpha: u32,
 }
 
 impl BbrController {
@@ -53,6 +54,7 @@ impl BbrController {
     fn ack_sample(&mut self, now: Instant, acked: AckedPacket, rtt: RttSample) -> AckSample {
         AckSample {
             bytes_acked: acked.bytes,
+            ecn_ce_count: acked.ecn_ce_count,
             rtt: rtt.latest,
             now,
         }
@@ -65,6 +67,7 @@ impl BbrController {
 
         let prior_delivered = self.delivered;
         self.delivered = self.delivered.saturating_add(u64::from(sample.bytes_acked));
+        self.update_ecn_alpha(sample);
         self.round_start = self.round_end_marker_active
             && prior_delivered < self.next_round_delivered
             && self.delivered >= self.next_round_delivered;
@@ -115,6 +118,25 @@ impl BbrController {
             return;
         }
         self.max_bandwidth_bytes_per_second = self.max_bandwidth_bytes_per_second.max(sample_rate);
+    }
+
+    fn update_ecn_alpha(&mut self, sample: AckSample) {
+        if sample.bytes_acked == 0 {
+            return;
+        }
+        let acked_packets =
+            u64::from((sample.bytes_acked / self.max_datagram_size.max(1)).max(1));
+        let ce_packets = sample.ecn_ce_count.min(acked_packets);
+        let ce_ratio = u128::from(ce_packets).saturating_mul(1024) / u128::from(acked_packets);
+        let ce_ratio = ce_ratio.min(1024) as u32;
+        self.ecn_alpha = ((self.ecn_alpha * 7) + ce_ratio) / 8;
+        if sample.ecn_ce_count != 0 {
+            let reduction = self.congestion_window.saturating_mul(self.ecn_alpha.max(128)) / 2048;
+            self.congestion_window = self
+                .congestion_window
+                .saturating_sub(reduction.max(self.max_datagram_size))
+                .max(min_congestion_window(self.max_datagram_size));
+        }
     }
 
     fn maybe_enter_probe_rtt(&mut self, now: Instant) {
@@ -285,6 +307,7 @@ impl CongestionController for BbrController {
             probe_rtt_done_stamp: None,
             probe_rtt_round_done: false,
             prior_mode: BbrMode::Startup,
+            ecn_alpha: 0,
         }
     }
 
@@ -399,6 +422,7 @@ impl Default for BbrController {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AckSample {
     bytes_acked: u32,
+    ecn_ce_count: u64,
     rtt: Duration,
     now: Instant,
 }

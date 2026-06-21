@@ -18,7 +18,7 @@ pub struct TcpRecoveryAck {
     pub latest_rtt: Duration,
     pub min_rtt: Duration,
     pub app_limited: bool,
-    pub ecn_ce: bool,
+    pub ecn_ce_count: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,7 +295,7 @@ fn deliver_acked_segment<C: CongestionController>(
             bytes: segment.1,
             sent_at: segment.2,
             app_limited: ack.app_limited,
-            ecn_ce: ack.ecn_ce,
+            ecn_ce_count: ack.ecn_ce_count,
         },
         RttSample {
             latest: ack.latest_rtt,
@@ -391,7 +391,7 @@ mod tests {
             latest_rtt: Duration::from_millis(rtt_ms),
             min_rtt: Duration::from_millis(rtt_ms),
             app_limited: false,
-            ecn_ce: false,
+            ecn_ce_count: 0,
         }
     }
 

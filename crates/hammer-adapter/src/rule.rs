@@ -54,6 +54,7 @@ pub struct RouteMetadata {
     pub inbound: String,
     pub ingress_interface: Option<u32>,
     pub egress_interface: Option<u32>,
+    pub ip_ecn: Option<IpEcnCodepoint>,
     pub tap_ethernet: Option<TapEthernetMetadata>,
     pub feature_path: Option<FeaturePathMetadata>,
     pub feature_config: Option<Vec<u8>>,
@@ -69,6 +70,14 @@ pub struct RouteMetadata {
     pub route_decision: Option<RouteDecision>,
     pub forwarding: Option<ForwardingMetadata>,
     pub icmp_error: Option<IcmpErrorMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpEcnCodepoint {
+    NotEct,
+    Ect0,
+    Ect1,
+    Ce,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
