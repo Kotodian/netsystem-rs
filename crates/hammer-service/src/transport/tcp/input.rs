@@ -16,7 +16,7 @@ use hammer_adapter::{
     add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentParseError, TcpSegmentView};
+use hammer_core::protocol::tcp::TcpSegmentFlags;
 
 use crate::transport::congestion::CongestionController;
 use super::lookup::{
@@ -904,14 +904,25 @@ fn parse_tcp_input(
     let transport = packet
         .get(cursor.transport_header_offset()..first_len)
         .ok_or_else(|| CoreError::internal("missing TCP header"))?;
-    let segment = match TcpSegmentView::parse(transport) {
+    let segment = match etherparse::TcpSlice::from_slice(transport) {
         Ok(segment) => segment,
         Err(
-            TcpSegmentParseError::ShortHeader
-            | TcpSegmentParseError::BadDataOffset
-            | TcpSegmentParseError::InvalidSlice,
+            etherparse::err::tcp::HeaderSliceError::Len(_)
+            | etherparse::err::tcp::HeaderSliceError::Content(
+                etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
+            ),
         ) => return Ok(Err(TcpInputParseError::BadLength)),
     };
+    let mut flags = TcpSegmentFlags::empty();
+    flags.set(TcpSegmentFlags::NS, segment.ns());
+    flags.set(TcpSegmentFlags::FIN, segment.fin());
+    flags.set(TcpSegmentFlags::SYN, segment.syn());
+    flags.set(TcpSegmentFlags::RST, segment.rst());
+    flags.set(TcpSegmentFlags::PSH, segment.psh());
+    flags.set(TcpSegmentFlags::ACK, segment.ack());
+    flags.set(TcpSegmentFlags::URG, segment.urg());
+    flags.set(TcpSegmentFlags::ECE, segment.ece());
+    flags.set(TcpSegmentFlags::CWR, segment.cwr());
     Ok(Ok(ParsedTcpInput {
         version: parsed.version,
         protocol: parsed.protocol,
@@ -919,7 +930,7 @@ fn parse_tcp_input(
         destination_ip,
         source_port: segment.source_port(),
         destination_port: segment.destination_port(),
-        flags: tcp_input_flags(segment.flags()),
+        flags: tcp_input_flags(flags),
     }))
 }
 

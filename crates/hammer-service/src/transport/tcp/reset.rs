@@ -8,7 +8,7 @@ use hammer_adapter::{
     NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{TcpSegmentFlags, TcpSegmentView};
+use hammer_core::protocol::tcp::TcpSegmentFlags;
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -409,20 +409,32 @@ fn parse_reset_source_segment(
     if transport_offset > available_len || payload_offset > available_len {
         return None;
     }
-    let segment = TcpSegmentView::parse(packet.get(transport_offset..available_len)?).ok()?;
+    let segment = etherparse::TcpSlice::from_slice(packet.get(transport_offset..available_len)?).ok()?;
     if payload_offset != transport_offset.checked_add(segment.header_len())? {
         return None;
     }
     let payload_len = available_len.checked_sub(payload_offset)?;
     let segment_len = payload_len
-        .checked_add(usize::from(segment.flags().contains(TcpSegmentFlags::SYN)))?
-        .checked_add(usize::from(segment.flags().contains(TcpSegmentFlags::FIN)))?;
+        .checked_add(usize::from(segment.syn()))?
+        .checked_add(usize::from(segment.fin()))?;
     Some(ResetSourceSegment {
         source_port: segment.source_port(),
         destination_port: segment.destination_port(),
         sequence_number: segment.sequence_number(),
-        acknowledgment_number: segment.acknowledgment_number(),
-        flags: segment.flags(),
+        acknowledgment_number: segment.ack().then(|| segment.acknowledgment_number()),
+        flags: {
+            let mut flags = TcpSegmentFlags::empty();
+            flags.set(TcpSegmentFlags::NS, segment.ns());
+            flags.set(TcpSegmentFlags::FIN, segment.fin());
+            flags.set(TcpSegmentFlags::SYN, segment.syn());
+            flags.set(TcpSegmentFlags::RST, segment.rst());
+            flags.set(TcpSegmentFlags::PSH, segment.psh());
+            flags.set(TcpSegmentFlags::ACK, segment.ack());
+            flags.set(TcpSegmentFlags::URG, segment.urg());
+            flags.set(TcpSegmentFlags::ECE, segment.ece());
+            flags.set(TcpSegmentFlags::CWR, segment.cwr());
+            flags
+        },
         segment_len,
     })
 }

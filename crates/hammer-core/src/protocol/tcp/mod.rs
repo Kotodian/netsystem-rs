@@ -11,7 +11,7 @@ pub use options::{
     tcp_options_from_bytes,
 };
 pub use segment::{
-    TcpSegmentHeader, TcpSegmentParseError, TcpSegmentView, write_tcp_segment_header,
+    TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header,
 };
 
 bitflags::bitflags! {

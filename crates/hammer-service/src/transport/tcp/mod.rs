@@ -316,7 +316,7 @@ mod tests {
     };
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
-        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags, TcpSegmentView,
+        TcpCapabilities, TcpConnectionId, TcpSackBlock, TcpSegmentFlags,
     };
     use hammer_runtime::app::{AppRingHandle, AppSendData};
 
@@ -478,7 +478,7 @@ mod tests {
     }
 
     fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
         &packet[segment.header_len()..]
     }
 
@@ -512,9 +512,9 @@ mod tests {
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
         assert_eq!(
-            segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
+            tcp_flags(&segment) & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH
         );
         assert_eq!(tcp_segment_payload(packet), b"second");
@@ -577,9 +577,9 @@ mod tests {
         let packets = &lookup_state.lock().expect("lookup").packets;
         assert_eq!(packets.len(), 1);
         let packet = &packets[0];
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
         assert_eq!(
-            segment.flags() & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
+            tcp_flags(&segment) & (TcpSegmentFlags::ACK | TcpSegmentFlags::PSH),
             TcpSegmentFlags::ACK | TcpSegmentFlags::PSH
         );
         assert_eq!(tcp_segment_payload(packet), b"first");
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!(connection.state(), TcpState::SynSent);
         let acknowledgment = connection.snd_nxt();
         let packet = &lookup_state.lock().expect("lookup").packets[0];
-        let segment = TcpSegmentView::parse(packet).expect("tcp segment");
+        let segment = etherparse::TcpSlice::from_slice(packet).expect("tcp segment");
         let options = hammer_core::protocol::tcp::tcp_options_from_bytes(segment.options());
         assert_eq!(tcp_segment_payload(packet), b"hello");
         assert_eq!(options.fast_open_cookie.as_deref(), Some(&[1, 2, 3, 4][..]));
@@ -672,4 +672,19 @@ mod tests {
         assert!(!driver.has_retained_tx(session_id));
         assert_eq!(driver.session(session_id).expect("connection").state(), TcpState::Established);
     }
+}
+
+#[cfg(test)]
+fn tcp_flags(segment: &etherparse::TcpSlice<'_>) -> hammer_core::protocol::tcp::TcpSegmentFlags {
+    let mut flags = hammer_core::protocol::tcp::TcpSegmentFlags::empty();
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::NS, segment.ns());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::FIN, segment.fin());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::SYN, segment.syn());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::RST, segment.rst());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::PSH, segment.psh());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::ACK, segment.ack());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::URG, segment.urg());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::ECE, segment.ece());
+    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::CWR, segment.cwr());
+    flags
 }

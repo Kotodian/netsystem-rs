@@ -1,21 +1,21 @@
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError,
-    TcpSegmentView, tcp_options_from_bytes, write_tcp_segment_header,
+    tcp_options_from_bytes, write_tcp_segment_header,
 };
 
 #[test]
 fn core_tcp_segment_parses_header_ports_sequence_ack_flags_window_options_and_payload() {
     let bytes = tcp_segment(&[2, 4, 0x05, 0xb4], b"hello");
-
-    let segment = TcpSegmentView::parse(&bytes).expect("parse tcp segment");
+    let segment = etherparse::TcpSlice::from_slice(&bytes).expect("parse tcp segment");
 
     assert_eq!(segment.source_port(), 49_152);
     assert_eq!(segment.destination_port(), 443);
     assert_eq!(segment.sequence_number(), 0x0102_0304);
-    assert_eq!(segment.acknowledgment_number(), Some(0x1112_1314));
-    assert_eq!(segment.advertised_window(), 32_768);
-    assert!(segment.flags().contains(TcpSegmentFlags::SYN));
-    assert!(segment.flags().contains(TcpSegmentFlags::ACK));
+    assert_eq!(segment.ack(), true);
+    assert_eq!(segment.acknowledgment_number(), 0x1112_1314);
+    assert_eq!(segment.window_size(), 32_768);
+    assert!(segment.syn());
+    assert!(segment.ack());
     assert_eq!(segment.header_len(), 24);
     assert_eq!(segment.options(), &[2, 4, 0x05, 0xb4]);
     assert_eq!(segment.payload(), b"hello");
@@ -26,8 +26,8 @@ fn core_tcp_segment_parses_and_writes_ns_flag() {
     let mut bytes = tcp_segment(&[], b"");
     bytes[12] |= 0x01;
 
-    let segment = TcpSegmentView::parse(&bytes).expect("parse tcp segment");
-    assert!(segment.flags().contains(TcpSegmentFlags::NS));
+    let segment = etherparse::TcpSlice::from_slice(&bytes).expect("parse tcp segment");
+    assert!(segment.ns());
 
     let mut output = [0u8; 64];
     let written =
@@ -40,7 +40,7 @@ fn core_tcp_segment_parses_and_writes_ns_flag() {
 #[test]
 fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
     assert_eq!(
-        TcpSegmentView::parse(&[0; 19]),
+        etherparse::TcpSlice::from_slice(&[0; 19]).map(|_| ()).map_err(map_tcp_parse_error),
         Err(TcpSegmentParseError::ShortHeader)
     );
 
@@ -48,7 +48,7 @@ fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
     bytes[12] = 4 << 4;
 
     assert_eq!(
-        TcpSegmentView::parse(&bytes),
+        etherparse::TcpSlice::from_slice(&bytes).map(|_| ()).map_err(map_tcp_parse_error),
         Err(TcpSegmentParseError::BadDataOffset)
     );
 }
@@ -148,7 +148,17 @@ fn write_header_for_test(
             flags,
             advertised_window: 32_768,
             capabilities: TcpCapabilities::default(),
+            fast_open_cookie: None,
         },
         Some(sack_blocks),
     )
+}
+
+fn map_tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpSegmentParseError {
+    match error {
+        etherparse::err::tcp::HeaderSliceError::Len(_) => TcpSegmentParseError::ShortHeader,
+        etherparse::err::tcp::HeaderSliceError::Content(
+            etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
+        ) => TcpSegmentParseError::BadDataOffset,
+    }
 }

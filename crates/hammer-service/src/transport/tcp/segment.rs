@@ -6,8 +6,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError,
-    TcpSegmentView, tcp_options_from_bytes,
+    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, tcp_options_from_bytes,
 };
 use hammer_infra::vec::Vec;
 
@@ -48,12 +47,10 @@ pub(crate) fn parse_tcp_packet(
         .ok_or_else(|| CoreError::internal("tcp packet length is invalid"))?;
     let source_ip = source_ip(parsed.version, packet)?;
     let destination_ip = destination_ip(parsed.version, packet)?;
-    let segment = TcpSegmentView::parse(
-        packet
-            .get(cursor.transport_header_offset()..first_len)
-            .ok_or_else(|| CoreError::internal("tcp transport header is missing"))?,
-    )
-    .map_err(tcp_parse_error)?;
+    let transport = packet
+        .get(cursor.transport_header_offset()..first_len)
+        .ok_or_else(|| CoreError::internal("tcp transport header is missing"))?;
+    let segment = etherparse::TcpSlice::from_slice(transport).map_err(tcp_parse_error)?;
     let parsed_options = tcp_options_from_bytes(segment.options());
     let payload_offset = cursor
         .transport_header_offset()
@@ -74,13 +71,26 @@ pub(crate) fn parse_tcp_packet(
         .as_ref()
         .map(|addr| SocketAddr::new(addr.host, addr.port))
         .unwrap_or_else(|| SocketAddr::new(source_ip, segment.source_port()));
+    let acknowledgment = segment
+        .ack()
+        .then(|| segment.acknowledgment_number());
+    let mut flags = TcpSegmentFlags::empty();
+    flags.set(TcpSegmentFlags::NS, segment.ns());
+    flags.set(TcpSegmentFlags::FIN, segment.fin());
+    flags.set(TcpSegmentFlags::SYN, segment.syn());
+    flags.set(TcpSegmentFlags::RST, segment.rst());
+    flags.set(TcpSegmentFlags::PSH, segment.psh());
+    flags.set(TcpSegmentFlags::ACK, segment.ack());
+    flags.set(TcpSegmentFlags::URG, segment.urg());
+    flags.set(TcpSegmentFlags::ECE, segment.ece());
+    flags.set(TcpSegmentFlags::CWR, segment.cwr());
     Ok(TcpPacket {
         local,
         remote,
         sequence: segment.sequence_number(),
-        acknowledgment: segment.acknowledgment_number(),
-        advertised_window: segment.advertised_window(),
-        flags: segment.flags(),
+        acknowledgment,
+        advertised_window: segment.window_size(),
+        flags,
         capabilities: parsed_options.capabilities,
         sack_blocks: parsed_options.sack_blocks,
         fast_open_cookie: parsed_options.fast_open_cookie,
@@ -424,11 +434,12 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
 }
 
 #[inline]
-fn tcp_parse_error(error: TcpSegmentParseError) -> CoreError {
+fn tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> CoreError {
     match error {
-        TcpSegmentParseError::ShortHeader
-        | TcpSegmentParseError::BadDataOffset
-        | TcpSegmentParseError::InvalidSlice => CoreError::internal("tcp segment is invalid"),
+        etherparse::err::tcp::HeaderSliceError::Len(_)
+        | etherparse::err::tcp::HeaderSliceError::Content(
+            etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
+        ) => CoreError::internal("tcp segment is invalid"),
     }
 }
 

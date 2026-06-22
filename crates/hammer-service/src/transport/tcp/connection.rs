@@ -2089,8 +2089,6 @@ mod tests {
     use crate::transport::congestion::{
         AckedPacket, CongestionMetrics, LostPacket, PacketNumber, RttSample,
     };
-    use hammer_core::protocol::tcp::TcpSegmentView;
-
     fn established_connection() -> TcpConnection<BbrController> {
         let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
         let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
@@ -2289,13 +2287,11 @@ mod tests {
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
-        let flags = TcpSegmentView::parse(&header[..header_len])
-            .expect("parse tcp header")
-            .flags();
+        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
 
-        assert!(flags.contains(TcpSegmentFlags::SYN));
-        assert!(flags.contains(TcpSegmentFlags::ECE));
-        assert!(flags.contains(TcpSegmentFlags::CWR));
+        assert!(parsed.syn());
+        assert!(parsed.ece());
+        assert!(parsed.cwr());
     }
 
     #[test]
@@ -2335,11 +2331,11 @@ mod tests {
             .expect("retransmit");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
-        let parsed = TcpSegmentView::parse(&header[..header_len]).expect("parse tcp header");
+        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
         let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
 
         assert_eq!(segment.payload_len(), 5);
-        assert!(parsed.flags().contains(TcpSegmentFlags::SYN));
+        assert!(parsed.syn());
         assert_eq!(options.fast_open_cookie.as_deref(), Some(&[1, 2, 3, 4][..]));
     }
 

@@ -121,7 +121,7 @@ where
                 )
             }
         };
-        if ack_advanced && queue.app().has_pending_send(session_id) {
+        if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
             queue.mark_ready(session_id);
         }
         queue.refresh_session_route(session_id)?;

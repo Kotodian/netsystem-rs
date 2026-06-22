@@ -78,6 +78,7 @@ hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 ipnet = { workspace = true }
 nom = { workspace = true }
+etherparse = { workspace = true }
 rustls = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["signal"] }
 tokio-rustls = { workspace = true, optional = true }

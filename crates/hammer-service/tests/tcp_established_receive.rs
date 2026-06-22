@@ -15,7 +15,7 @@ use hammer_service::transport::tcp::{
     TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpListenNext, TcpListenNode,
     TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
 };
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentView, tcp_options_from_bytes};
+use hammer_core::protocol::tcp::{TcpCapabilities, tcp_options_from_bytes};
 
 const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
 const REMOTE: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
@@ -122,6 +122,7 @@ fn established_graph() -> Graph {
             timestamps: true,
             ecn: false,
             accurate_ecn: false,
+            fast_open: false,
         },
     );
     tcp_control
@@ -173,6 +174,7 @@ fn established_graph() -> Graph {
                 timestamps: true,
                 ecn: false,
                 accurate_ecn: false,
+                fast_open: false,
             },
         ),
     );
@@ -678,6 +680,7 @@ fn tcp_syn_packet(
             flags: hammer_core::protocol::tcp::TcpSegmentFlags::SYN,
             advertised_window: u16::MAX,
             capabilities,
+            fast_open_cookie: None,
         },
         None,
     )
@@ -691,7 +694,7 @@ fn tcp_syn_packet(
 }
 
 fn tcp_packet_options(packet: &[u8]) -> hammer_core::protocol::tcp::ParsedTcpOptions {
-    let segment = TcpSegmentView::parse(packet).expect("parse tcp output packet");
+    let segment = etherparse::TcpSlice::from_slice(packet).expect("parse tcp output packet");
     tcp_options_from_bytes(segment.options())
 }
 
