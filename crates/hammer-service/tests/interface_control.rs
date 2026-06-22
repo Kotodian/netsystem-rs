@@ -1,7 +1,10 @@
+use std::mem::transmute;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use hammer_adapter::{DataPlaneRuntime, TraceControlPlane, TraceInputPolicy, TracePolicy};
+use hammer_adapter::{
+    DataPlaneRuntime, NetworkOpaque, TraceControlPlane, TraceInputPolicy, TracePolicy,
+};
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::interface::{
     InterfaceConnectedRouteControl, InterfaceControlPlane, InterfaceMtu, InterfaceMtuKind,
@@ -183,7 +186,7 @@ fn interface_address_publish_installs_receive_route_in_fib() {
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_packet([10, 255, 0, 2], [10, 255, 0, 1], b"receive");
     let index = runtime
-        .alloc_index_with_bytes(hammer_adapter::RouteMetadata::default(), &packet)
+        .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
     runtime
         .get_frame_mut(frame)
@@ -260,15 +263,13 @@ fn interface_output_dispatches_to_registered_tx_node() {
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], b"interface-output");
     let index = runtime
-        .alloc_index_with_bytes(
-            {
-                let mut metadata = hammer_adapter::RouteMetadata::default();
-                metadata.egress_interface = Some(7);
-                metadata
-            },
-            &packet,
-        )
+        .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+        let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        opaque.sw_if_index[1] = 7;
+    }
     runtime
         .try_mark_trace(output_node, index)
         .expect("mark packet");
@@ -370,15 +371,13 @@ fn push_packet_with_egress(
 ) {
     let packet = ipv4_packet([10, 0, 0, 1], [198, 51, 100, 7], payload);
     let index = runtime
-        .alloc_index_with_bytes(
-            {
-                let mut metadata = hammer_adapter::RouteMetadata::default();
-                metadata.egress_interface = egress_interface;
-                metadata
-            },
-            &packet,
-        )
+        .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
+    if let Some(egress_interface) = egress_interface {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+        let opaque = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+        opaque.sw_if_index[1] = egress_interface;
+    }
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")

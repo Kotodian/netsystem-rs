@@ -1,7 +1,10 @@
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::map::FlatHashTable;
 use hammer_infra::timer_wheel::{TimerHandle, TimerStartError, TimerWheel2t1w2048};
 
 use crate::session::{SessionId, SessionReadyQueue};
+
+const DEFAULT_SESSION_TIMER_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionTimerToken(u32);
@@ -46,6 +49,7 @@ struct SessionTimerSlot {
     session_id: SessionId,
     token: SessionTimerToken,
     handle: TimerHandle,
+    version: u32,
     live: bool,
 }
 
@@ -53,7 +57,10 @@ pub struct SessionTimerWheel {
     wheel: TimerWheel2t1w2048,
     slots: hammer_infra::vec::Vec<SessionTimerSlot>,
     expired_slots: hammer_infra::vec::Vec<u32>,
-    pending: hammer_infra::vec::Vec<SessionTimerExpiry>,
+    live_slots: FlatHashTable<u128, u32>,
+    pending_versions: FlatHashTable<u128, u32>,
+    pending: hammer_infra::vec::Vec<(SessionTimerExpiry, u32)>,
+    next_version: u32,
 }
 
 impl SessionTimerWheel {
@@ -61,9 +68,12 @@ impl SessionTimerWheel {
     pub fn new() -> Self {
         Self {
             wheel: TimerWheel2t1w2048::new(0),
-            slots: hammer_infra::vec::Vec::new(),
-            expired_slots: hammer_infra::vec::Vec::new(),
-            pending: hammer_infra::vec::Vec::new(),
+            slots: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_TIMER_CAPACITY),
+            expired_slots: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_TIMER_CAPACITY),
+            live_slots: FlatHashTable::with_capacity(DEFAULT_SESSION_TIMER_CAPACITY),
+            pending_versions: FlatHashTable::with_capacity(DEFAULT_SESSION_TIMER_CAPACITY),
+            pending: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_TIMER_CAPACITY),
+            next_version: 0,
         }
     }
 
@@ -76,6 +86,8 @@ impl SessionTimerWheel {
         self.cancel(session_id, token);
         let user_handle = u32::try_from(self.slots.len())
             .map_err(|_| CoreError::internal("session timer slot overflow"))?;
+        let version = self.next_version.wrapping_add(1).max(1);
+        self.next_version = version;
         let handle = self
             .wheel
             .start(user_handle, ticks)
@@ -84,18 +96,23 @@ impl SessionTimerWheel {
             session_id,
             token,
             handle,
+            version,
             live: true,
         });
+        self.live_slots
+            .insert(timer_key(session_id, token), user_handle);
         Ok(())
     }
 
     pub fn cancel(&mut self, session_id: SessionId, token: SessionTimerToken) -> bool {
-        let Some(slot) = self.live_timer_slot(session_id, token) else {
+        let key = timer_key(session_id, token);
+        self.pending_versions.remove(&key);
+        let Some(slot) = self.live_slots.remove(&key) else {
             return false;
         };
         let timer = self
             .slots
-            .get_mut(slot)
+            .get_mut(slot as usize)
             .expect("live session timer slot should be valid");
         timer.live = false;
         self.wheel.stop(timer.handle)
@@ -105,9 +122,8 @@ impl SessionTimerWheel {
         self.expired_slots.clear();
         self.wheel.expire(ticks, &mut self.expired_slots);
         let mut expired = 0;
-        let expired_slots: hammer_infra::vec::Vec<u32> =
-            self.expired_slots.iter().copied().collect();
-        for slot in expired_slots {
+        for expired_index in 0..self.expired_slots.len() {
+            let slot = self.expired_slots[expired_index];
             let Some(timer) = self.slots.get_mut(slot as usize) else {
                 return Err(CoreError::internal("session timer slot is invalid"));
             };
@@ -115,8 +131,11 @@ impl SessionTimerWheel {
                 continue;
             }
             timer.live = false;
+            let key = timer_key(timer.session_id, timer.token);
+            self.live_slots.remove(&key);
             let expiry = SessionTimerExpiry::new(timer.session_id, timer.token);
-            self.pending.push(expiry);
+            self.pending_versions.insert(key, timer.version);
+            self.pending.push((expiry, timer.version));
             ready.mark_ready(timer.session_id);
             expired += 1;
         }
@@ -124,13 +143,16 @@ impl SessionTimerWheel {
     }
 
     pub fn take_expiries(&mut self) -> hammer_infra::vec::Vec<SessionTimerExpiry> {
-        self.pending.drain(..).collect()
-    }
-
-    fn live_timer_slot(&self, session_id: SessionId, token: SessionTimerToken) -> Option<usize> {
-        self.slots
-            .iter()
-            .position(|timer| timer.live && timer.session_id == session_id && timer.token == token)
+        let mut expiries = hammer_infra::vec::Vec::with_capacity(self.pending.len());
+        for (expiry, version) in self.pending.drain(..) {
+            let key = timer_key(expiry.session_id(), expiry.token());
+            if self.pending_versions.lookup(&key) != Some(version) {
+                continue;
+            }
+            self.pending_versions.remove(&key);
+            expiries.push(expiry);
+        }
+        expiries
     }
 }
 
@@ -143,4 +165,9 @@ impl Default for SessionTimerWheel {
 
 fn timer_start_error(error: TimerStartError) -> CoreError {
     CoreError::internal(format!("start session timer: {error:?}"))
+}
+
+#[inline]
+fn timer_key(session_id: SessionId, token: SessionTimerToken) -> u128 {
+    (u128::from(session_id.get()) << 32) | u128::from(token.get())
 }

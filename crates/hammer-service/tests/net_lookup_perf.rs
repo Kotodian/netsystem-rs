@@ -1,12 +1,13 @@
 use std::hint::black_box;
+use std::mem::transmute;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, InternalNode, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData, RouteMetadata,
+    BufferFrame, DataPlaneInstructionSet, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, SecondaryOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::data_plane::DropNode;
@@ -19,6 +20,17 @@ const FRAME_PACKETS: usize = 128;
 const FRAME_ROUNDS: usize = 512;
 const SAMPLE_COUNT: usize = 5;
 static PERF_PROBE_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct LookupPerfOpaque {
+    _tap_ethernet: Option<hammer_adapter::TapEthernetMetadata>,
+    _icmp_error: Option<hammer_core::protocol::icmp::IcmpErrorMetadata>,
+    forwarding: Option<ForwardingMetadata>,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<LookupPerfOpaque>() == core::mem::size_of::<SecondaryOpaque>());
 
 struct SinkNode {
     runtime_data: NodeRuntimeData,
@@ -89,7 +101,9 @@ fn sink_process(
     let mut packets = 0usize;
     let mut checksum = 0u64;
     for index in frame.drain_pending() {
-        if let Some(forwarding) = runtime.metadata(index)?.forwarding {
+        let buffer = runtime.get_buffer(index)?;
+        let opaque = unsafe { transmute::<_, &LookupPerfOpaque>(buffer.opaque2()) };
+        if let Some(forwarding) = opaque.forwarding {
             checksum = checksum.wrapping_add(u64::from(forwarding.load_balance_index));
             checksum = checksum.wrapping_add(u64::from(forwarding.bucket_index));
         }
@@ -254,7 +268,7 @@ fn measure_packet_scalar(scenario: Scenario) -> ProbeStats {
             {
                 let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
                 let index = runtime
-                    .alloc_index_with_bytes(RouteMetadata::default(), packet)
+                    .alloc_index_with_bytes(packet)
                     .expect("alloc packet");
                 frame_ref.push_index(index).expect("push packet");
             }
@@ -291,7 +305,7 @@ fn measure_lookup(scenario: Scenario, instruction_set: DataPlaneInstructionSet) 
             let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
             for packet in packets_by_frame.iter() {
                 let index = runtime
-                    .alloc_index_with_bytes(RouteMetadata::default(), packet)
+                    .alloc_index_with_bytes(packet)
                     .expect("alloc packet");
                 frame_ref.push_index(index).expect("push packet");
             }
@@ -331,7 +345,7 @@ fn measure_input_lookup(
             let mut frame_ref = runtime.get_frame_mut(frame).expect("mutate frame");
             for packet in packets_by_frame.iter() {
                 let index = runtime
-                    .alloc_index_with_bytes(RouteMetadata::default(), packet)
+                    .alloc_index_with_bytes(packet)
                     .expect("alloc packet");
                 frame_ref.push_index(index).expect("push packet");
             }

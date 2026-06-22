@@ -639,8 +639,21 @@ fn process_index(
         }
         if let Some(feature_arc) = feature_arc {
             let next = state.protocol_next(next, parsed.protocol);
-            let resolved = runtime
-                .with_metadata_mut(index, |metadata| feature_arc.start_or(metadata, next))?;
+            let interface_index = {
+                let buffer = runtime.get_buffer(index)?;
+                let network = unsafe {
+                    std::mem::transmute::<
+                        &hammer_adapter::PrimaryOpaque,
+                        &hammer_adapter::NetworkOpaque,
+                    >(buffer.opaque())
+                };
+                network.sw_if_index[0]
+            };
+            let resolved = if interface_index == 0 {
+                next
+            } else {
+                feature_arc.start_for_interface_or(interface_index, next)
+            };
             add_packet_trace!(
                 runtime,
                 index,
@@ -795,12 +808,6 @@ fn refresh_basic_metadata(
         }
         _ => (0, 0),
     };
-    let metadata = buffer.metadata_mut();
-    if let Some(network) = network_for_protocol(parsed.protocol) {
-        metadata.network = network;
-    }
-    metadata.source = Some(SocksAddr::ip(parsed.source, source_port));
-    metadata.destination = Some(SocksAddr::ip(parsed.destination, destination_port));
     let transport_header_len = transport_header_len.unwrap_or_default();
     buffer.set_packet_cursor(
         BufferPacketCursor::new()

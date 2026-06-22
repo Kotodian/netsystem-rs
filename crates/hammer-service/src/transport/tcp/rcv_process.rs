@@ -6,8 +6,8 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
 
-use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
+use super::segment::parse_tcp_packet;
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -111,7 +111,8 @@ where
                     .session_mut(session_id)
                     .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
                 let previous_state = connection.state();
-                let control = connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?;
+                let control =
+                    connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?;
                 (
                     control,
                     previous_state == crate::transport::tcp::TcpState::SynRcvd
@@ -121,8 +122,12 @@ where
             }
         };
         if established_with_payload {
-            runtime.packet_buffers().advance(index, packet.payload_offset)?;
-            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            runtime
+                .packet_buffers()
+                .advance(index, packet.payload_offset)?;
+            runtime
+                .packet_buffers()
+                .truncate_chain(index, packet.payload_len)?;
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
@@ -131,8 +136,8 @@ where
         }
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
-            if let Err(error) = segment.write_to_buffer(runtime, allocated) {
+            let allocated = runtime.packet_buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }

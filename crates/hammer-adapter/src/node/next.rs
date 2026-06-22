@@ -1210,7 +1210,7 @@ impl NodeVectorDispatch {
 #[inline(always)]
 pub fn default_prefetch_indices(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
     for index in indices {
-        batch.prefetch_read(*index);
+        batch.prefetch_header(*index);
     }
 }
 

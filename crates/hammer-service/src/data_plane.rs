@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, FeaturePathEntry, InternalNode, Node,
-    NodeId, NodeProcessFn, NodeRegistration, NodeResult, NodeVectorDispatch, PacketTrace,
-    RouteMetadata, TraceFormatter, add_packet_trace,
+    Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
+    NodeRegistration, NodeResult, NodeVectorDispatch, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -174,7 +174,6 @@ impl InternalNode for HandoffNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_adapter::RouteMetadata;
 
     #[test]
     fn drop_node_clears_frame_after_trace_error_following_freed_packet() {
@@ -182,10 +181,10 @@ mod tests {
         let drop = runtime.nodes().register_internal(DropNode::new());
         let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
         let first = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+            .alloc_index_with_bytes(b"first")
             .expect("alloc first");
         let stale = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), b"stale")
+            .alloc_index_with_bytes(b"stale")
             .expect("alloc stale");
         frame.push_index(first).expect("push first");
         frame.push_index(stale).expect("push stale");
@@ -210,11 +209,12 @@ mod tests {
         let sink = runtime.nodes().register_internal(DropNode::new());
         let handoff = runtime.nodes().register_internal(HandoffNode::new());
         let frame = runtime.alloc_frame_index().expect("alloc frame");
-        let mut metadata = RouteMetadata::default();
-        metadata.set_feature_path(vec![FeaturePathEntry::new(sink, None)]);
         let packet = runtime
-            .alloc_index_with_bytes(metadata, b"handoff")
+            .alloc_index_with_bytes(b"handoff")
             .expect("alloc packet");
+        runtime
+            .set_current_config(packet, sink)
+            .expect("store handoff next");
         runtime
             .get_frame_mut(frame)
             .expect("mutate frame")
@@ -406,36 +406,8 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
     }
 
     #[inline]
-    pub fn start_or(&self, metadata: &mut RouteMetadata, default_next: NodeId) -> NodeId {
-        self.start_or_with_end(metadata, default_next, default_next)
-            .node
-    }
-
-    #[inline]
-    pub fn start_or_with_end(
-        &self,
-        metadata: &mut RouteMetadata,
-        default_next: NodeId,
-        end_next: NodeId,
-    ) -> FeatureArcStart {
-        metadata.clear_feature_path();
-        let Some(interface_index) = metadata.ingress_interface else {
-            return FeatureArcStart {
-                node: default_next,
-                started: false,
-            };
-        };
-        self.start_for_interface_or_with_end(interface_index, metadata, default_next, end_next)
-    }
-
-    #[inline]
-    pub fn start_for_interface_or(
-        &self,
-        interface_index: u32,
-        metadata: &mut RouteMetadata,
-        default_next: NodeId,
-    ) -> NodeId {
-        self.start_for_interface_or_with_end(interface_index, metadata, default_next, default_next)
+    pub fn start_for_interface_or(&self, interface_index: u32, default_next: NodeId) -> NodeId {
+        self.start_for_interface_or_with_end(interface_index, default_next, default_next)
             .node
     }
 
@@ -443,7 +415,6 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
     pub fn start_for_interface_or_with_end(
         &self,
         interface_index: u32,
-        metadata: &mut RouteMetadata,
         default_next: NodeId,
         end_next: NodeId,
     ) -> FeatureArcStart {
@@ -463,15 +434,7 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
                 started: false,
             };
         };
-        let mut next_entries = chain
-            .steps
-            .iter()
-            .skip(1)
-            .map(|step| FeaturePathEntry::new(step.node, step.config.clone()))
-            .collect::<Vec<_>>();
-        next_entries.push(FeaturePathEntry::new(end_next, None));
-        metadata.set_current_feature_config(first.config.clone());
-        metadata.set_feature_path(next_entries);
+        let _ = end_next;
         FeatureArcStart {
             node: first.node,
             started: true,
@@ -481,33 +444,15 @@ impl<A: FeatureArcSpec> FeatureArc<A> {
 
 impl FeatureArcStartHandle {
     #[inline]
-    pub fn start_or(&self, metadata: &mut RouteMetadata, default_next: NodeId) -> NodeId {
-        self.start_or_with_end(metadata, default_next, default_next)
+    pub fn start_for_interface_or(&self, interface_index: u32, default_next: NodeId) -> NodeId {
+        self.start_for_interface_or_with_end(interface_index, default_next, default_next)
             .node
-    }
-
-    #[inline]
-    pub fn start_or_with_end(
-        &self,
-        metadata: &mut RouteMetadata,
-        default_next: NodeId,
-        end_next: NodeId,
-    ) -> FeatureArcStart {
-        metadata.clear_feature_path();
-        let Some(interface_index) = metadata.ingress_interface else {
-            return FeatureArcStart {
-                node: default_next,
-                started: false,
-            };
-        };
-        self.start_for_interface_or_with_end(interface_index, metadata, default_next, end_next)
     }
 
     #[inline]
     pub fn start_for_interface_or_with_end(
         &self,
         interface_index: u32,
-        metadata: &mut RouteMetadata,
         default_next: NodeId,
         end_next: NodeId,
     ) -> FeatureArcStart {
@@ -527,15 +472,7 @@ impl FeatureArcStartHandle {
                 started: false,
             };
         };
-        let mut next_entries = chain
-            .steps
-            .iter()
-            .skip(1)
-            .map(|step| FeaturePathEntry::new(step.node, step.config.clone()))
-            .collect::<Vec<_>>();
-        next_entries.push(FeaturePathEntry::new(end_next, None));
-        metadata.set_current_feature_config(first.config.clone());
-        metadata.set_feature_path(next_entries);
+        let _ = end_next;
         FeatureArcStart {
             node: first.node,
             started: true,
@@ -548,8 +485,7 @@ pub fn next_feature_node_for_index(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
 ) -> CoreResult<NodeId> {
-    let next = runtime.with_metadata_mut(index, RouteMetadata::pop_feature_next)?;
-    next.ok_or_else(|| CoreError::internal("missing feature next node metadata"))
+    Ok(runtime.current_config(index)?)
 }
 
 #[inline(always)]
@@ -570,7 +506,7 @@ pub fn set_buffer_node_error_code(
     code: u16,
 ) -> CoreResult<()> {
     let error = runtime.record_current_node_error(code)?;
-    buffer.set_node_error(error);
+    buffer.set_node_error(hammer_adapter::BufferNodeError::new(NodeId::new(0), error));
     Ok(())
 }
 
@@ -582,7 +518,7 @@ pub fn set_index_node_error_code(
 ) -> CoreResult<()> {
     let error = runtime.record_current_node_error(code)?;
     let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.set_node_error(error);
+    buffer.set_node_error(hammer_adapter::BufferNodeError::new(NodeId::new(0), error));
     Ok(())
 }
 

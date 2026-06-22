@@ -73,7 +73,7 @@ pub trait Endpoint: Lifecycle {
 
     /// Register a locally originated flow that should be consumed by
     /// `ip_local_recv_take` rather than mirrored into the default TUN
-    /// receiver. Endpoint outbound adapters use this for their own DNS
+    /// receiver. Endpoint outbound adapters use this for their own local
     /// TCP/UDP sessions.
     fn register_local_flow(&self, _flow: EndpointLocalFlow) {}
 

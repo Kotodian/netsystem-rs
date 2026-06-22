@@ -246,7 +246,6 @@ impl NetworkManager {
                 expensive: false,
                 constrained: false,
                 addresses: Vec::new(),
-                dns_servers: Vec::new(),
             });
         default.expensive |= is_expensive;
         default.constrained |= is_constrained;

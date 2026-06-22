@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use hammer_adapter::{
     BufferFrame, ComponentMeta, ComponentMetadata, DataPlaneBuffers, IcmpReply, Lifecycle, Network,
-    Outbound, OutboundComponent, OutboundManager as OutboundManagerTrait, ProbeReport,
-    ProxyIcmpConn, ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
+    Outbound, OutboundComponent, OutboundManager as AdapterOutboundManager, ProxyIcmpConn,
+    ProxyPacketConn, ProxyStream, RuntimeComponent, SocksAddr,
 };
 use hammer_core::config::{Outbound as OutboundOptions, OutboundKind};
 use hammer_core::error::{HammerError, HammerResult};
@@ -18,20 +18,12 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::ControlThreadHandle;
 use crate::RuntimePlatform;
-#[cfg(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-vless",
-    feature = "outbound-direct",
-    feature = "outbound-block",
-    feature = "outbound-urltest"
-))]
+#[cfg(any(feature = "outbound-block"))]
 use crate::component_registry::register_components;
 use crate::socket_protector::SocketProtector;
 
 #[cfg(feature = "outbound-block")]
 pub use crate::protocol::block::BlockOutbound;
-#[cfg(feature = "outbound-direct")]
-pub use crate::protocol::direct::DirectOutbound;
 
 pub(crate) type OutboundBuilder = fn(
     Logger,
@@ -96,36 +88,10 @@ impl OutboundFactorySet {
 }
 
 fn register_standard_outbound_builders(builders: &mut HashMap<&'static str, OutboundBuilder>) {
-    #[cfg(not(any(
-        feature = "outbound-hysteria2",
-        feature = "outbound-vless",
-        feature = "outbound-direct",
-        feature = "outbound-block",
-        feature = "outbound-urltest"
-    )))]
+    #[cfg(not(any(feature = "outbound-block")))]
     let _ = builders;
-    #[cfg(feature = "outbound-hysteria2")]
-    register_components!(
-        outbound,
-        builders,
-        [crate::protocol::hysteria2::Hysteria2Outbound]
-    );
-    #[cfg(feature = "outbound-vless")]
-    register_components!(outbound, builders, [crate::protocol::vless::VlessOutbound]);
-    #[cfg(feature = "outbound-direct")]
-    register_components!(
-        outbound,
-        builders,
-        [crate::protocol::direct::DirectOutbound]
-    );
     #[cfg(feature = "outbound-block")]
     register_components!(outbound, builders, [crate::protocol::block::BlockOutbound]);
-    #[cfg(feature = "outbound-urltest")]
-    register_components!(
-        outbound,
-        builders,
-        [crate::protocol::urltest::UrltestOutbound]
-    );
 }
 
 pub struct OutboundManager {
@@ -317,23 +283,6 @@ impl OutboundManager {
         RuntimeComponent::new(meta, runtime)
     }
 
-    /// Inject this manager (as a `Weak<dyn OutboundManager>`) into every
-    /// registered aggregate outbound so they can resolve their children
-    /// dynamically without owning the manager. Idempotent — leaves use the
-    /// default no-op `bind_resolver` and don't care; aggregates ignore
-    /// duplicate calls.
-    ///
-    /// Must be called **after** all outbounds are in place, otherwise
-    /// late-registered children would be invisible to the aggregate.
-    pub fn bind_aggregates(self: &Arc<Self>) {
-        let weak: Weak<Self> = Arc::downgrade(self);
-        let resolver: Weak<dyn OutboundManagerTrait> = weak;
-        let items = self.items.lock().expect("OutboundManager poisoned");
-        for outbound in items.values() {
-            outbound.runtime().bind_resolver(resolver.clone());
-        }
-    }
-
     fn spawn_post_start_hooks(&self) {
         let items: Vec<OutboundComponent> = self
             .items
@@ -455,28 +404,6 @@ impl Outbound for InstrumentedOutbound {
             }
         }
     }
-
-    fn now(&self) -> Option<String> {
-        self.inner.now()
-    }
-
-    fn probe_group_timeout(&self, timeout: Duration) -> Duration {
-        self.inner.probe_group_timeout(timeout)
-    }
-
-    fn bind_resolver(&self, resolver: Weak<dyn OutboundManagerTrait>) {
-        self.inner.bind_resolver(resolver);
-    }
-
-    async fn probe_group(&self, timeout: Duration) -> HammerResult<Vec<ProbeReport>> {
-        match self.inner.probe_group(timeout).await {
-            Ok(reports) => Ok(reports),
-            Err(err) => {
-                self.metrics.probe_group_error_total.inc();
-                Err(err)
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -484,7 +411,6 @@ struct OutboundMetrics {
     dial_error_total: NetworkCounters,
     listen_packet_error_total: MetricCounter,
     probe_latency_error_total: MetricCounter,
-    probe_group_error_total: MetricCounter,
     post_start_error_total: MetricCounter,
     ensure_connected_error_total: MetricCounter,
     stream_read_error_total: MetricCounter,
@@ -499,7 +425,6 @@ impl OutboundMetrics {
             dial_error_total: NetworkCounters::new(&scope, "dial_error_total"),
             listen_packet_error_total: scope.counter("listen_packet_error_total"),
             probe_latency_error_total: scope.counter("probe_latency_error_total"),
-            probe_group_error_total: scope.counter("probe_group_error_total"),
             post_start_error_total: scope.counter("post_start_error_total"),
             ensure_connected_error_total: scope.counter("ensure_connected_error_total"),
             stream_read_error_total: scope.counter("stream_read_error_total"),
@@ -645,7 +570,7 @@ impl Lifecycle for OutboundManager {
     }
 }
 
-impl OutboundManagerTrait for OutboundManager {
+impl AdapterOutboundManager for OutboundManager {
     fn list(&self) -> Vec<OutboundComponent> {
         self.items
             .lock()
@@ -693,27 +618,58 @@ mod tests {
         Factory::new(Instant::now(), Arc::new(DiscardWriter)).new_logger(id)
     }
 
-    #[cfg(feature = "outbound-direct")]
     #[test]
     fn register_outbound_accepts_concrete_component_arc() {
-        let manager = OutboundManager::new(test_logger("outbound-manager"), "direct-arc");
-        let outbound = Arc::new(crate::protocol::direct::DirectOutbound::new(
-            test_logger("direct"),
-            "direct-arc",
-        ));
+        let manager = OutboundManager::new(test_logger("outbound-manager"), "test-outbound-arc");
+        struct ConcreteOutbound;
+
+        #[async_trait::async_trait]
+        impl Outbound for ConcreteOutbound {
+            async fn dial(
+                &self,
+                _network: Network,
+                _destination: SocksAddr,
+                _initial_payload: &[u8],
+            ) -> CoreResult<Box<dyn ProxyStream>> {
+                Err(CoreError::internal("concrete outbound: dial not supported"))
+            }
+
+            async fn listen_packet(&self) -> CoreResult<Box<dyn ProxyPacketConn>> {
+                Err(CoreError::internal(
+                    "concrete outbound: listen_packet not supported",
+                ))
+            }
+        }
+
+        impl ComponentMetadata for ConcreteOutbound {
+            fn component_meta(&self) -> ComponentMeta {
+                ComponentMeta::new(
+                    "outbound",
+                    "concrete",
+                    "test-outbound-arc",
+                    vec![Network::Tcp],
+                    Vec::new(),
+                    None,
+                )
+            }
+        }
+
+        let outbound = Arc::new(ConcreteOutbound);
 
         manager
             .register_outbound(Arc::clone(&outbound))
             .expect("register concrete outbound");
 
-        let registered = manager.get("direct-arc").expect("registered outbound");
-        assert_eq!(registered.type_name(), "direct");
+        let registered = manager
+            .get("test-outbound-arc")
+            .expect("registered outbound");
+        assert_eq!(registered.type_name(), "concrete");
     }
 
     /// Bare-bones Outbound that only counts how many times `reset` was called
     /// so we can prove `OutboundManager::reset_network` actually fans out to
     /// every registered outbound. Required because service reset-network handling
-    /// previously skipped this fan-out, leaving cached hysteria2 clients stale
+    /// previously skipped this fan-out, leaving cached outbound clients stale
     /// after iOS sleep/wake.
     struct CountingOutbound {
         resets: AtomicUsize,

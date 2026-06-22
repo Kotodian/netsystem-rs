@@ -1,9 +1,11 @@
+use std::mem::{size_of, transmute};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeProcessFn,
-    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter, add_packet_trace,
+    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, SecondaryOpaque, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -17,6 +19,15 @@ use crate::trace::codec::{
 
 const UDP_HEADER_LEN: usize = 8;
 const UDP_PORT_COUNT: usize = u16::MAX as usize + 1;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IcmpErrorOpaque {
+    icmp_error: Option<IcmpErrorMetadata>,
+    reserved: [u64; 6],
+}
+
+const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
 #[hammer_component_macros::node_next]
 pub enum UdpInputNext {
@@ -434,9 +445,9 @@ fn resolve_unknown_port(
     snapshot: &UdpInputSnapshot,
 ) -> CoreResult<Option<NodeId>> {
     set_index_node_error_code(runtime, index, UdpInputError::UnknownPort.code())?;
-    runtime.with_metadata_mut(index, |metadata| {
-        metadata.icmp_error = port_unreachable_metadata(parsed.version);
-    })?;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
+    opaque.icmp_error = port_unreachable_metadata(parsed.version);
     let resolved = NodeNextStorage::next(snapshot, UdpInputNextKey::IcmpError(next));
     add_packet_trace!(
         runtime,
@@ -457,7 +468,8 @@ fn resolve_unknown_port(
 fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.clear_node_error();
-    buffer.metadata_mut().icmp_error = None;
+    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
+    opaque.icmp_error = None;
     Ok(())
 }
 

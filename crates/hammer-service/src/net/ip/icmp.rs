@@ -1,15 +1,17 @@
+use std::mem::{size_of, transmute};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, Network, Node,
-    NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace,
+    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, NetworkOpaque,
+    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
-    IcmpBuildError, IcmpErrorFamily, IcmpGeneratedPacket, build_echo_reply, build_icmp_error_packet,
+    IcmpBuildError, IcmpErrorFamily, IcmpErrorMetadata, IcmpGeneratedPacket, build_echo_reply,
+    build_icmp_error_packet,
 };
 use hammer_infra::vec::Vec;
 
@@ -27,6 +29,15 @@ const ICMP4_ECHO_REPLY: u8 = 0;
 const ICMP4_ECHO_REQUEST: u8 = 8;
 const ICMP6_ECHO_REQUEST: u8 = 128;
 const ICMP6_ECHO_REPLY: u8 = 129;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IcmpErrorOpaque {
+    icmp_error: Option<IcmpErrorMetadata>,
+    reserved: [u64; 6],
+}
+
+const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IcmpInputError {
@@ -1087,7 +1098,9 @@ fn next_node_for_icmp_error_index(
     next: [NodeId; IcmpErrorNext::COUNT],
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> CoreResult<NodeId> {
-    let Some(metadata) = runtime.with_metadata(index, |metadata| metadata.icmp_error)? else {
+    let buffer = runtime.get_buffer(index)?;
+    let opaque = unsafe { transmute::<_, &IcmpErrorOpaque>(buffer.opaque2()) };
+    let Some(metadata) = opaque.icmp_error else {
         let error = IcmpNodeError::MissingMetadata.code();
         set_index_node_error_code(runtime, index, error)?;
         let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
@@ -1105,9 +1118,9 @@ fn next_node_for_icmp_error_index(
         )?;
         return Ok(resolved);
     };
-    let Some(interface_index) =
-        runtime.with_metadata(index, |metadata| metadata.ingress_interface)?
-    else {
+    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let interface_index = network.sw_if_index[0];
+    if interface_index == 0 {
         let error = IcmpNodeError::MissingIngressInterface.code();
         set_index_node_error_code(runtime, index, error)?;
         let resolved = NodeNextStorage::next(&next, IcmpErrorNext::Drop);
@@ -1124,7 +1137,7 @@ fn next_node_for_icmp_error_index(
             },
         )?;
         return Ok(resolved);
-    };
+    }
     let Some(local_source) = source_table.and_then(|source_table| {
         source_table.lookup(interface_index, version_for_family(metadata.family()))
     }) else {
@@ -1215,11 +1228,8 @@ fn refresh_generated_icmp_metadata(
                 generated.transport_header_offset + ICMP_ECHO_HEADER_LEN,
             ),
     );
-    let metadata = buffer.metadata_mut();
-    metadata.network = Network::Icmp;
-    metadata.source = Some(SocksAddr::ip(generated.source, 0));
-    metadata.destination = Some(SocksAddr::ip(generated.destination, 0));
-    metadata.icmp_error = None;
+    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
+    opaque.icmp_error = None;
     Ok(())
 }
 

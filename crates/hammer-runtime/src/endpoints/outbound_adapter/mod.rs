@@ -1,17 +1,12 @@
 //! L4↔L3 outbound adapter wrapping an `Endpoint`.
 //!
-//! DNS transport (`UdpDnsTransport::exchange`, `tcp_exchange_via_or_direct`,
-//! DoH) reaches the wire through `outbound.listen_packet()` /
-//! `outbound.dial()`. After the wg endpoint refactor split `Endpoint` off
-//! from `Outbound`, an endpoint id can no longer be resolved through that
-//! API — DNS `via = "<endpoint-id>"` died with it. This adapter bridges
-//! the gap: it wraps an `Arc<dyn Endpoint>`, implements `Outbound`, and
+//! This adapter wraps an `Arc<dyn Endpoint>`, implements `Outbound`, and
 //! translates L4 sends into IPv4 packets pushed straight through
 //! `Endpoint::ip_send_clone`. Inbound replies come back via
 //! `Endpoint::ip_local_recv_take` and get demuxed into the per-flow
 //! receivers handed out from `listen_packet`.
 //!
-//! Surface: UDP via `listen_packet`, TCP / DoH via `dial(Network::Tcp, …)`.
+//! Surface: UDP via `listen_packet`, TCP via `dial(Network::Tcp, …)`.
 //! UDP packets are assembled in-place and pushed straight into the endpoint's
 //! encrypt channel; TCP gets a per-dial smoltcp termination — see the `tcp`
 //! submodule.
@@ -20,6 +15,7 @@
 
 mod tcp;
 
+use core::mem::{size_of, transmute};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -32,17 +28,17 @@ use hammer_adapter::DataPlaneRuntime;
 use hammer_adapter::{
     BufferFrame, ComponentMeta, ComponentMetadata, ComponentMetricsMeta, DataPlaneBuffers,
     Endpoint, EndpointLocalFlow, Network, Outbound, ProxyIcmpConn, ProxyPacketConn, ProxyStream,
-    RouteMetadata, SocksAddr,
+    SecondaryOpaque, SocksAddr,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
 use tokio::sync::mpsc;
 
-/// Per-flow inbound channel capacity. DNS queries are single-shot; 16
+/// Per-flow inbound channel capacity. Local request/response traffic is short-lived; 16
 /// leaves plenty of headroom against scheduler stalls without bloating
 /// resident memory.
 const FLOW_QUEUE: usize = 16;
-/// Cap on port-allocation retries before we declare exhaustion. Real DNS
+/// Cap on port-allocation retries before we declare exhaustion. Real
 /// QPS makes contention near-impossible, so this is purely a defensive
 /// loop bound.
 const PORT_ALLOC_RETRY_CAP: usize = 256;
@@ -53,16 +49,28 @@ const UDP_HEADER: usize = 8;
 const IP_PROTOCOL_UDP: u8 = 17;
 const IP_PROTOCOL_TCP: u8 = 6;
 const DEFAULT_TTL: u8 = 64;
-/// Backstop on the TCP smoltcp termination concurrency. DNS / DoH realistically
+/// Backstop on the TCP smoltcp termination concurrency. The expected
 /// runs 1-3 sockets in flight; this is a misconfiguration guardrail, not a
 /// performance knob.
 const MAX_TCP_FLOWS: usize = 8;
 /// MTU advertised to smoltcp inside the adapter. We default to a conservative
 /// value that fits inside any reasonable wg payload after `WIREGUARD_OVERHEAD`.
 const ADAPTER_TCP_MTU: usize = 1280;
-/// TCP driver ingress channel capacity (IP packets per socket). DNS / DoH
+/// TCP driver ingress channel capacity (IP packets per socket). The
 /// roundtrips are short; 16 leaves headroom for handshake bursts.
 const TCP_INGRESS_QUEUE: usize = 16;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct EndpointAdapterOpaque {
+    destination_ipv4: u32,
+    destination_port: u16,
+    destination_valid: u8,
+    reserved0: u8,
+    reserved: [u64; 6],
+}
+
+const _: () = assert!(size_of::<EndpointAdapterOpaque>() == size_of::<SecondaryOpaque>());
 
 pub struct EndpointOutboundAdapter {
     id: String,
@@ -217,7 +225,7 @@ async fn run_demux_task(
                 };
                 let map = udp_flows.lock().expect("UdpFlowMap poisoned");
                 if let Some(slot) = map.by_port.get(&dst_port) {
-                    // Backpressure: drop on full. DNS retries handle ephemeral loss.
+                    // Backpressure: drop on full. The caller is expected to retry on loss.
                     let _ = slot.try_send(datagram);
                 }
             }
@@ -261,7 +269,7 @@ fn parse_inner_ipv4_tcp_dst_port(pkt: &Bytes) -> Option<u16> {
 ///
 /// Returns the destination port (i.e. the adapter source port that the
 /// peer is replying to) and a datagram carrying the remote
-/// `src_ip:src_port` so that DNS transport sees who answered.
+/// `src_ip:src_port` so the local consumer sees who answered.
 fn parse_inner_ipv4_udp(pkt: &Bytes) -> Option<(u16, EndpointUdpDatagram)> {
     if pkt.len() < IPV4_MIN_HEADER + UDP_HEADER {
         return None;
@@ -515,10 +523,20 @@ impl ProxyPacketConn for EndpointUdpConn {
         for index in frame.drain_indices() {
             if result.is_ok() {
                 result = async {
-                    let metadata = runtime.metadata(index)?;
-                    let destination = metadata.destination.ok_or_else(|| {
-                        CoreError::internal("endpoint UDP frame missing destination")
-                    })?;
+                    let destination = {
+                        let buffer = runtime.get_buffer(index)?;
+                        let opaque =
+                            unsafe { transmute::<_, &EndpointAdapterOpaque>(buffer.opaque2()) };
+                        if opaque.destination_valid == 0 {
+                            return Err(CoreError::internal(
+                                "endpoint UDP frame missing destination",
+                            ));
+                        }
+                        SocksAddr::ip(
+                            IpAddr::V4(Ipv4Addr::from(opaque.destination_ipv4.to_be_bytes())),
+                            opaque.destination_port,
+                        )
+                    };
                     let payload = runtime.copy_current_chain(index)?;
                     self.send_payload(destination, &payload).await
                 }
@@ -544,9 +562,21 @@ impl ProxyPacketConn for EndpointUdpConn {
             .recv()
             .await
             .ok_or_else(|| CoreError::internal("endpoint UDP flow channel closed"))?;
-        let mut metadata = RouteMetadata::default();
-        metadata.destination = Some(datagram.destination);
-        let index = runtime.alloc_index_with_bytes(metadata, &datagram.payload)?;
+        let index = runtime.alloc_index_with_bytes(&datagram.payload)?;
+        {
+            let mut buffer = runtime.get_buffer_mut(index)?;
+            let opaque =
+                unsafe { transmute::<_, &mut EndpointAdapterOpaque>(buffer.opaque2_mut()) };
+            let IpAddr::V4(ipv4) = datagram.destination.host else {
+                runtime.free_index(index);
+                return Err(CoreError::internal(
+                    "endpoint UDP flow returned unsupported IPv6 destination",
+                ));
+            };
+            opaque.destination_ipv4 = u32::from_be_bytes(ipv4.octets());
+            opaque.destination_port = datagram.destination.port;
+            opaque.destination_valid = 1;
+        }
         if let Err(err) = frame.push_index(index) {
             runtime.free_index(index);
             return Err(err);
@@ -785,10 +815,23 @@ mod tests {
         destination: SocksAddr,
         payload: &[u8],
     ) -> CoreResult<()> {
-        let mut metadata = RouteMetadata::default();
-        metadata.destination = Some(destination);
         let mut frame = runtime.alloc_pooled_frame()?;
-        let index = runtime.alloc_index_with_bytes(metadata, payload)?;
+        let index = runtime.alloc_index_with_bytes(payload)?;
+        {
+            let mut buffer = runtime.get_buffer_mut(index)?;
+            let opaque =
+                unsafe { transmute::<_, &mut EndpointAdapterOpaque>(buffer.opaque2_mut()) };
+            let IpAddr::V4(ipv4) = destination.host else {
+                runtime.free_index(index);
+                let _ = runtime.release_pooled_frame(frame);
+                return Err(CoreError::internal(
+                    "test packet send does not support IPv6 destination",
+                ));
+            };
+            opaque.destination_ipv4 = u32::from_be_bytes(ipv4.octets());
+            opaque.destination_port = destination.port;
+            opaque.destination_valid = 1;
+        }
         if let Err(err) = frame.push_index(index) {
             runtime.free_index(index);
             let _ = runtime.release_pooled_frame(frame);
@@ -812,14 +855,6 @@ mod tests {
             runtime.release_pooled_frame(frame)?;
             return Err(CoreError::internal("test packet recv returned empty frame"));
         };
-        let metadata = match runtime.metadata(index) {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                runtime.free_index(index);
-                let _ = runtime.release_pooled_frame(frame);
-                return Err(err);
-            }
-        };
         let payload = match runtime.copy_current_chain(index) {
             Ok(payload) => payload,
             Err(err) => {
@@ -828,11 +863,21 @@ mod tests {
                 return Err(err);
             }
         };
+        let destination = {
+            let buffer = runtime.get_buffer(index)?;
+            let opaque = unsafe { transmute::<_, &EndpointAdapterOpaque>(buffer.opaque2()) };
+            if opaque.destination_valid == 0 {
+                runtime.free_index(index);
+                let _ = runtime.release_pooled_frame(frame);
+                return Err(CoreError::internal("test packet recv missing destination"));
+            }
+            SocksAddr::ip(
+                IpAddr::V4(Ipv4Addr::from(opaque.destination_ipv4.to_be_bytes())),
+                opaque.destination_port,
+            )
+        };
         runtime.free_index(index);
         runtime.release_pooled_frame(frame)?;
-        let destination = metadata
-            .destination
-            .ok_or_else(|| CoreError::internal("test packet recv missing destination"))?;
         Ok(TestDatagram {
             destination,
             payload,
@@ -898,7 +943,7 @@ mod tests {
         let src_port = u16::from_be_bytes([outbound[20], outbound[21]]);
         let dst_port = u16::from_be_bytes([outbound[22], outbound[23]]);
         assert!(src_port >= EPHEMERAL_MIN, "src_port = {src_port}");
-        assert_eq!(dst_port, 53, "dst_port should be DNS server port");
+        assert_eq!(dst_port, 53, "dst_port should match remote server port");
         let local_port = src_port;
         assert_eq!(&outbound[28..], b"\x00\x01query");
 
@@ -995,7 +1040,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn dial_udp_returns_descriptive_err() {
-        // Dial(Udp) is explicitly not supported — DNS UDP uses
+        // Dial(Udp) is explicitly not supported — local UDP uses
         // listen_packet — so we lock in the diagnostic.
         let (ep, _egress_rx, _local_tx) = fake_endpoint("wg-udp-dial", Ipv4Addr::new(10, 0, 0, 2));
         let adapter = EndpointOutboundAdapter::arc(

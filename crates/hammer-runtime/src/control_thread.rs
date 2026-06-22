@@ -904,7 +904,7 @@ mod tests {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
-            .scope("outbound", "outbound", "direct")
+            .scope("outbound", "outbound", "block")
             .counter_with_labels("dial_error_total", [("network", "tcp")])
             .inc();
         let (control_handle, thread) = ControlThread::new(
@@ -932,7 +932,7 @@ mod tests {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
-            .scope("outbound", "outbound", "direct")
+            .scope("outbound", "outbound", "block")
             .counter_with_labels("dial_error_total", [("network", "tcp")])
             .inc();
         let (control_handle, thread) = ControlThread::new(
@@ -1704,7 +1704,7 @@ mod tests {
     #[test]
     fn metrics_snapshot_emits_single_line_with_multiple_metrics() {
         let metrics = MetricsRegistry::new();
-        let scope = metrics.scope("outbound", "outbound", "direct");
+        let scope = metrics.scope("outbound", "outbound", "block");
         scope.counter("dial_error_total").inc();
         scope.counter("stream_read_error_total").inc();
         scope.counter("idle_total");
@@ -1720,12 +1720,12 @@ mod tests {
             .find(|line| line.starts_with("metrics_snapshot "))
             .expect("expected single-line snapshot");
         for key in [
-            "\"outbound.outbound.direct.dial_error_total.counter\":1",
-            "\"outbound.outbound.direct.idle_total.counter\":0",
-            "\"outbound.outbound.direct.stream_read_error_total.counter\":1",
+            "\"outbound.outbound.block.dial_error_total.counter\":1",
+            "\"outbound.outbound.block.idle_total.counter\":0",
+            "\"outbound.outbound.block.stream_read_error_total.counter\":1",
             // Labels sort by (key, value): ("family","v4") < ("network","tcp"),
             // so the flat key suffix is `.family.v4.network.tcp`.
-            "\"outbound.outbound.direct.packet_send_error_total.counter.family.v4.network.tcp\":1",
+            "\"outbound.outbound.block.packet_send_error_total.counter.family.v4.network.tcp\":1",
         ] {
             assert!(
                 snapshot_line.contains(key),
@@ -1768,7 +1768,7 @@ mod tests {
         let inner = Arc::new(CaptureWriter::default());
         let metrics = MetricsRegistry::new();
         metrics
-            .scope("outbound", "outbound", "direct")
+            .scope("outbound", "outbound", "block")
             .counter("dial_error_total")
             .inc();
         // Long interval → only the shutdown path can fire dump_metrics.
@@ -1795,14 +1795,14 @@ mod tests {
     fn metrics_snapshot_keeps_zero_valued_counters() {
         let metrics = MetricsRegistry::new();
         metrics
-            .scope("outbound", "outbound", "direct")
+            .scope("outbound", "outbound", "block")
             .counter("idle_total");
 
         let snapshot_lines = build_snapshot_lines(&metrics.snapshot(), 1_715_059_200);
         assert!(
             snapshot_lines
                 .iter()
-                .any(|line| line.contains("\"outbound.outbound.direct.idle_total.counter\":0")),
+                .any(|line| line.contains("\"outbound.outbound.block.idle_total.counter\":0")),
             "zero-valued counter should remain visible: {snapshot_lines:?}"
         );
     }
@@ -1837,7 +1837,7 @@ mod tests {
         // ("family","v4") < ("network","tcp"), so the flat suffix is ".v4.tcp".
         let s = sample(
             "outbound",
-            "direct",
+            "block",
             "packet_send_error_total",
             7,
             &[("family", "v4"), ("network", "tcp")],
@@ -1846,7 +1846,7 @@ mod tests {
         s.write_flat_key(&mut out);
         assert_eq!(
             out,
-            "outbound.outbound.direct.packet_send_error_total.counter.family.v4.network.tcp"
+            "outbound.outbound.block.packet_send_error_total.counter.family.v4.network.tcp"
         );
     }
 
@@ -1926,20 +1926,20 @@ mod tests {
 
     #[test]
     fn build_snapshot_lines_emits_single_line_under_threshold() {
-        let samples = vec![sample("outbound", "direct", "dial_error_total", 1, &[])];
+        let samples = vec![sample("outbound", "block", "dial_error_total", 1, &[])];
         let lines = build_snapshot_lines(&samples, 1715059200);
         assert_eq!(lines.len(), 1);
         assert!(lines[0].starts_with("metrics_snapshot {"));
         assert!(lines[0].contains("\"ts\":1715059200"));
-        assert!(lines[0].contains("\"component\":\"outbound.outbound.direct\""));
-        assert!(lines[0].contains("\"outbound.outbound.direct.dial_error_total.counter\":1"));
+        assert!(lines[0].contains("\"component\":\"outbound.outbound.block\""));
+        assert!(lines[0].contains("\"outbound.outbound.block.dial_error_total.counter\":1"));
         assert!(lines[0].ends_with('}'));
     }
 
     #[test]
     fn build_snapshot_lines_groups_output_by_component() {
         let samples = vec![
-            sample("outbound", "direct", "dial_error_total", 1, &[]),
+            sample("outbound", "block", "dial_error_total", 1, &[]),
             sample("runtime", "hammer-main", "event_dropped_full_total", 0, &[]),
         ];
         let lines = build_snapshot_lines(&samples, 1715059200);
@@ -1947,9 +1947,9 @@ mod tests {
 
         let outbound = lines
             .iter()
-            .find(|line| line.contains("\"component\":\"outbound.outbound.direct\""))
+            .find(|line| line.contains("\"component\":\"outbound.outbound.block\""))
             .expect("outbound component line");
-        assert!(outbound.contains("\"outbound.outbound.direct.dial_error_total.counter\":1"));
+        assert!(outbound.contains("\"outbound.outbound.block.dial_error_total.counter\":1"));
         assert!(
             !outbound.contains("runtime.runtime.hammer-main"),
             "component lines must not mix samples: {outbound}"
@@ -1963,7 +1963,7 @@ mod tests {
             runtime.contains("\"runtime.runtime.hammer-main.event_dropped_full_total.counter\":0")
         );
         assert!(
-            !runtime.contains("outbound.outbound.direct"),
+            !runtime.contains("outbound.outbound.block"),
             "component lines must not mix samples: {runtime}"
         );
     }
@@ -2111,7 +2111,7 @@ mod tests {
         // the real worst-case header, samples that would fit in a numbered
         // chunk get spuriously routed to .oversized — changing the output
         // schema for valid snapshots.
-        let component = "outbound.outbound.direct";
+        let component = "outbound.outbound.block";
         let ts: u64 = 1_715_059_200;
         for max_chunks in [1usize, 5, 10, 100, 999] {
             let worst_idx = max_chunks.saturating_sub(1);

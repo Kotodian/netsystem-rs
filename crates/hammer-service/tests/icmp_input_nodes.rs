@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferFrame, BufferNodeError, DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData, RouteMetadata, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion};
@@ -233,7 +233,7 @@ fn icmp_input_rejects_ipv6_echo_request_with_nonzero_code() {
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
     let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), packet)
+        .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     runtime
         .get_frame_mut(frame)
@@ -249,7 +249,7 @@ fn push_marked_packet(
     packet: &[u8],
 ) {
     let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), packet)
+        .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     runtime
         .try_mark_trace(trace_input, buffer)

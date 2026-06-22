@@ -1,11 +1,12 @@
 use std::cell::UnsafeCell;
 use std::fmt;
+use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, NetworkOpaque, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace,
+    TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
@@ -832,8 +833,10 @@ impl InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
-        let metadata = runtime.metadata(index)?;
-        let Some(interface_index) = metadata.egress_interface else {
+        let buffer = runtime.get_buffer(index)?;
+        let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+        let interface_index = network.sw_if_index[1];
+        if interface_index == 0 {
             set_index_node_error_code(
                 runtime,
                 index,
@@ -851,7 +854,7 @@ impl InterfaceOutputNode {
             )?;
             runtime.free_index(index);
             return Ok(None);
-        };
+        }
         let Some(tx) = output.tx_node(interface_index) else {
             set_index_node_error_code(
                 runtime,

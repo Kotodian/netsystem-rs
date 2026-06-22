@@ -10,9 +10,7 @@ pub use options::{
     ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
     tcp_options_from_bytes,
 };
-pub use segment::{
-    TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header,
-};
+pub use segment::{TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header};
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

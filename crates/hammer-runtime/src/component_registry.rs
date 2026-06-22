@@ -1,12 +1,6 @@
 use std::collections::HashMap;
 
-#[cfg(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-vless",
-    feature = "outbound-direct",
-    feature = "outbound-block",
-    feature = "outbound-urltest"
-))]
+#[cfg(any(feature = "outbound-block"))]
 pub(crate) trait OutboundComponentDeclaration {
     const TYPE_NAME: &'static str;
 
@@ -19,51 +13,11 @@ pub(crate) trait OutboundComponentDeclaration {
     ) -> hammer_core::error::HammerResult<hammer_adapter::outbound::OutboundComponent>;
 }
 
-#[cfg(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-vless",
-    feature = "outbound-direct",
-    feature = "outbound-block",
-    feature = "outbound-urltest"
-))]
+#[cfg(any(feature = "outbound-block"))]
 pub(crate) fn register_outbound_component<C>(
     builders: &mut HashMap<&'static str, crate::outbounds::OutboundBuilder>,
 ) where
     C: OutboundComponentDeclaration,
-{
-    builders.insert(C::TYPE_NAME, C::build);
-}
-
-#[cfg(any(
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-mixed"
-))]
-pub(crate) trait InboundComponentDeclaration {
-    const TYPE_NAME: &'static str;
-
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        id: String,
-        logger: hammer_core::log::Logger,
-        kind: &hammer_core::config::InboundKind,
-        router: std::sync::Arc<dyn hammer_adapter::Router>,
-        dns_router: Option<std::sync::Arc<crate::inbounds::RuntimeDnsRouter>>,
-        outbound: Option<std::sync::Arc<crate::OutboundManager>>,
-        platform: Option<std::sync::Arc<dyn hammer_adapter::PlatformInterface>>,
-        metrics: std::sync::Arc<hammer_core::metrics::MetricsRegistry>,
-    ) -> hammer_core::error::HammerResult<hammer_adapter::inbound::InboundComponent>;
-}
-
-#[cfg(any(
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-mixed"
-))]
-pub(crate) fn register_inbound_component<C>(
-    builders: &mut HashMap<&'static str, crate::inbounds::InboundBuilder>,
-) where
-    C: InboundComponentDeclaration,
 {
     builders.insert(C::TYPE_NAME, C::build);
 }
@@ -106,24 +60,10 @@ pub fn register_event_subscriber_component<C>(
     builders.insert(C::TYPE_NAME, C::build);
 }
 
-#[cfg(any(
-    test,
-    feature = "outbound-hysteria2",
-    feature = "outbound-vless",
-    feature = "outbound-direct",
-    feature = "outbound-block",
-    feature = "outbound-urltest",
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-mixed",
-    feature = "endpoint-wireguard",
-))]
+#[cfg(any(test, feature = "outbound-block", feature = "endpoint-wireguard",))]
 macro_rules! register_components {
     (outbound, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_outbound_component::<$component>($builders);)*
-    };
-    (inbound, $builders:expr, [$($component:path),* $(,)?]) => {
-        $(crate::component_registry::register_inbound_component::<$component>($builders);)*
     };
     (endpoint, $builders:expr, [$($component:path),* $(,)?]) => {
         $(crate::component_registry::register_endpoint_component::<$component>($builders);)*
@@ -133,17 +73,7 @@ macro_rules! register_components {
     };
 }
 
-#[cfg(any(
-    feature = "outbound-hysteria2",
-    feature = "outbound-vless",
-    feature = "outbound-direct",
-    feature = "outbound-block",
-    feature = "outbound-urltest",
-    feature = "inbound-socks",
-    feature = "inbound-http",
-    feature = "inbound-mixed",
-    feature = "endpoint-wireguard",
-))]
+#[cfg(any(feature = "outbound-block", feature = "endpoint-wireguard",))]
 pub(crate) use register_components;
 
 #[cfg(test)]

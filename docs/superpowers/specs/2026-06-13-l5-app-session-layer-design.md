@@ -34,7 +34,6 @@ crates/hammer-service/src/
   net/             # L3: IP, lookup, routing-adjacent data-plane nodes
   transport/       # L4: TCP, UDP, QUIC packet/transport state machines
   session/         # L5: app-facing session/flow orchestration
-  dns/             # L7-ish: DNS application protocol and transports
   app/             # app-facing service integration and runtime glue
   tun/             # interface/driver boundary
 ```

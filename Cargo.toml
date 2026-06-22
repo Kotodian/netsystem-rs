@@ -14,10 +14,6 @@ members = [
 ]
 exclude = [
     "third_party/boringtun",
-    "third_party/btls-sys",
-    "third_party/quinn-btls",
-    "third_party/quinn/quinn",
-    "third_party/quinn/quinn-proto",
 ]
 
 [workspace.package]
@@ -51,7 +47,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_path_to_error = "0.1"
 toml = "1.1"
 url = { version = "2.5", features = ["serde"] }
-httparse = "1.10"
 nom = "8"
 thiserror = "2.0"
 async-trait = "0.1"
@@ -59,35 +54,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 metrics = "0.24"
 metrics-derive = "0.1"
-aws-lc-rs = { version = "1.17.0", default-features = false, features = ["alloc", "non-fips"] }
 humantime-serde = "1.1"
 serde_with = { version = "3.18", default-features = false, features = ["std"] }
-hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
-hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 bytes = "1.11"
 crossbeam-queue = "0.3"
 etherparse = "0.20.1"
 arc-swap = "1"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-tcp-cubic"] }
-http = "1.4"
-hyper = { version = "1.9", default-features = false, features = ["client", "http2"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
-futures = "0.3"
-quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-quinn-btls = { version = "0.1.0", default-features = false }
-btls = { version = "0.5.6", default-features = false }
-btls-sys = { version = "0.5.6", default-features = false }
-foreign-types-shared = "0.3"
-brotli = "8.0"
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
-rustls-native-certs = "0.8"
-rustls-platform-verifier = { version = "0.7", default-features = false }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
-blake2 = "0.10"
-base64 = "0.22"
 rand = "0.8"
 socket2 = "0.6"
 boringtun = { version = "0.7", default-features = false }
@@ -104,7 +77,3 @@ rcgen = "0.14"
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }
-btls-sys = { path = "third_party/btls-sys" }
-quinn = { path = "third_party/quinn/quinn" }
-quinn-btls = { path = "third_party/quinn-btls" }
-quinn-proto = { path = "third_party/quinn/quinn-proto" }

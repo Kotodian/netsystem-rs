@@ -42,9 +42,9 @@ impl PacketBufferFlags {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct PacketBufferHeader {
+pub struct PacketBufferCacheline0 {
     pub current_data: i16,
     pub current_length: u16,
     pub flags: PacketBufferFlags,
@@ -57,7 +57,10 @@ pub struct PacketBufferHeader {
     pub opaque: PrimaryOpaque,
 }
 
-impl Default for PacketBufferHeader {
+const _: () = assert!(core::mem::size_of::<PacketBufferCacheline0>() == 64);
+const _: () = assert!(core::mem::align_of::<PacketBufferCacheline0>() == 64);
+
+impl Default for PacketBufferCacheline0 {
     fn default() -> Self {
         Self {
             current_data: 0,
@@ -74,15 +77,18 @@ impl Default for PacketBufferHeader {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C, align(64))]
-pub struct PacketBufferHeaderExt {
+pub struct PacketBufferCacheline1 {
     pub trace_handle: u32,
     pub total_length_not_including_first: u32,
     pub opaque2: SecondaryOpaque,
 }
 
-impl Default for PacketBufferHeaderExt {
+const _: () = assert!(core::mem::size_of::<PacketBufferCacheline1>() == 64);
+const _: () = assert!(core::mem::align_of::<PacketBufferCacheline1>() == 64);
+
+impl Default for PacketBufferCacheline1 {
     fn default() -> Self {
         Self {
             trace_handle: 0,

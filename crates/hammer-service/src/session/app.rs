@@ -11,6 +11,7 @@ use hammer_runtime::app::{
 use crate::session::{SessionId, SessionReadyQueue};
 
 const UNBOUND_SESSION: SessionId = SessionId::new(u64::MAX);
+const DEFAULT_APP_SESSION_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionAppCloseSubmission {
@@ -68,7 +69,9 @@ impl SessionAppTxProgress {
         let mut output = buffers.get_buffer_mut(index)?;
         let tail = output.writable_tail_mut();
         if tail.len() < len {
-            return Err(CoreError::internal("session app tx buffer tail is too small"));
+            return Err(CoreError::internal(
+                "session app tx buffer tail is too small",
+            ));
         }
         let copied = self
             .send
@@ -113,9 +116,9 @@ impl SessionAppRuntime {
     pub fn new() -> Self {
         Self {
             ring: None,
-            session_slots: FlatHashTable::new(),
-            pending_sends: Pool::with_capacity(1024),
-            pending_send_queues: FlatHashTable::new(),
+            session_slots: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
+            pending_sends: Pool::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
+            pending_send_queues: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
             ready_sessions: SessionReadyQueue::new(),
             drained_closes: hammer_infra::vec::Vec::new(),
         }
@@ -219,7 +222,9 @@ impl SessionAppRuntime {
         let Some(send) = queue.front() else {
             return Ok(None);
         };
-        Ok(Some(send.copy_pending_bytes_to_buffer(max_len, buffers, index)?))
+        Ok(Some(
+            send.copy_pending_bytes_to_buffer(max_len, buffers, index)?,
+        ))
     }
 
     pub(crate) fn commit_pending_send_bytes(
@@ -325,7 +330,6 @@ impl SessionAppRuntime {
             .lookup(&op.value())
             .filter(|session_id| *session_id != UNBOUND_SESSION)
     }
-
 }
 
 impl Default for SessionAppRuntime {
@@ -369,13 +373,16 @@ mod tests {
         app.push_pending_send(session_b, second);
 
         let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
-        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
+        let first_index = buffers.alloc_index().expect("first buffer");
         let first_len = app
             .copy_pending_send_to_buffer(session_a, 8, &buffers, first_index)
             .expect("copy first")
             .expect("first pending");
         assert_eq!(first_len, 5);
-        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"first");
+        assert_eq!(
+            buffers.copy_current_chain(first_index).expect("copied"),
+            b"first"
+        );
         buffers.free_index(first_index);
         assert!(
             app.commit_pending_send_bytes(session_a, 5)
@@ -408,7 +415,7 @@ mod tests {
                 .expect("commit first")
         );
         let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
-        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
+        let second_index = buffers.alloc_index().expect("second buffer");
         assert!(!app.has_pending_send(session_a));
         assert_eq!(
             app.copy_pending_send_to_buffer(session_b, 8, &buffers, second_index)
@@ -441,20 +448,23 @@ mod tests {
         app.push_pending_send(session, second);
 
         let buffers = DataPlaneBuffers::with_buffer_capacity(512, 8);
-        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
+        let first_index = buffers.alloc_index().expect("first buffer");
         assert_eq!(
             app.copy_pending_send_to_buffer(session, 16, &buffers, first_index)
                 .expect("copy first")
                 .expect("first pending"),
             5
         );
-        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"first");
+        assert_eq!(
+            buffers.copy_current_chain(first_index).expect("copied"),
+            b"first"
+        );
         buffers.free_index(first_index);
         assert!(
             app.commit_pending_send_bytes(session, 5)
                 .expect("commit first")
         );
-        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
+        let second_index = buffers.alloc_index().expect("second buffer");
         assert_eq!(
             app.copy_pending_send_to_buffer(session, 16, &buffers, second_index)
                 .expect("copy second")
@@ -501,26 +511,32 @@ mod tests {
 
         app.push_pending_send(session_id, send);
 
-        let first_index = buffers.alloc_index(Default::default()).expect("first buffer");
+        let first_index = buffers.alloc_index().expect("first buffer");
         let first = app
             .copy_pending_send_to_buffer(session_id, 4, &buffers, first_index)
             .expect("copy first")
             .expect("pending");
         assert_eq!(first, 4);
-        assert_eq!(buffers.copy_current_chain(first_index).expect("copied"), b"abcd");
+        assert_eq!(
+            buffers.copy_current_chain(first_index).expect("copied"),
+            b"abcd"
+        );
         buffers.free_index(first_index);
         assert!(
             !app.commit_pending_send_bytes(session_id, 4)
                 .expect("partial")
         );
 
-        let second_index = buffers.alloc_index(Default::default()).expect("second buffer");
+        let second_index = buffers.alloc_index().expect("second buffer");
         let second = app
             .copy_pending_send_to_buffer(session_id, 8, &buffers, second_index)
             .expect("copy second")
             .expect("pending after partial");
         assert_eq!(second, 2);
-        assert_eq!(buffers.copy_current_chain(second_index).expect("copied"), b"ef");
+        assert_eq!(
+            buffers.copy_current_chain(second_index).expect("copied"),
+            b"ef"
+        );
         buffers.free_index(second_index);
         assert!(
             app.commit_pending_send_bytes(session_id, 2)

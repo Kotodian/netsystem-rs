@@ -4,6 +4,7 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 use crate::align::{self, CACHE_LINE};
+use crate::bitmap::Bitmap;
 use crate::vec::Vec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,8 +37,8 @@ pub struct Pool<T, const ALIGN: usize = CACHE_LINE> {
     stride: usize,
     layout: Option<Layout>,
     free: Vec<u32>,
+    free_bitmap: Bitmap,
     generations: Vec<u32>,
-    allocated: Vec<bool>,
     _marker: PhantomData<T>,
 }
 
@@ -74,6 +75,10 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             .rev()
             .map(|slot| u32::try_from(slot).expect("pool slot index fits u32"))
             .collect::<Vec<_>>();
+        let mut free_bitmap = Bitmap::with_capacity(capacity);
+        for slot in 0..capacity {
+            free_bitmap.set(slot);
+        }
 
         Self {
             ptr,
@@ -82,8 +87,8 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
             stride,
             layout,
             free,
+            free_bitmap,
             generations: (0..capacity).map(|_| 0).collect(),
-            allocated: (0..capacity).map(|_| false).collect(),
             _marker: PhantomData,
         }
     }
@@ -107,9 +112,10 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     pub fn insert(&mut self, value: T) -> Option<Index> {
         let slot = self.free.pop()?;
         let slot_index = slot as usize;
+        debug_assert!(self.free_bitmap.is_set(slot_index));
         let generation = self.generations[slot_index].wrapping_add(1).max(1);
         self.generations[slot_index] = generation;
-        self.allocated[slot_index] = true;
+        self.free_bitmap.clear(slot_index);
         self.len += 1;
         unsafe { self.slot_ptr_unchecked(slot_index).write(value) };
         Some(Index { slot, generation })
@@ -119,9 +125,10 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     pub fn insert_with(&mut self, f: impl FnOnce(Index) -> T) -> Option<Index> {
         let slot = self.free.pop()?;
         let slot_index = slot as usize;
+        debug_assert!(self.free_bitmap.is_set(slot_index));
         let generation = self.generations[slot_index].wrapping_add(1).max(1);
         self.generations[slot_index] = generation;
-        self.allocated[slot_index] = true;
+        self.free_bitmap.clear(slot_index);
         self.len += 1;
         let index = Index { slot, generation };
         unsafe { self.slot_ptr_unchecked(slot_index).write(f(index)) };
@@ -143,7 +150,7 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     #[inline]
     pub fn remove(&mut self, index: Index) -> Option<T> {
         let slot = self.validate(index)?;
-        self.allocated[slot] = false;
+        self.free_bitmap.set(slot);
         self.free.push(slot as u32);
         self.len -= 1;
         Some(unsafe { self.slot_ptr_unchecked(slot).read() })
@@ -171,7 +178,9 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     #[inline]
     fn validate(&self, index: Index) -> Option<usize> {
         let slot = index.slot as usize;
-        (slot < self.capacity && self.allocated[slot] && self.generations[slot] == index.generation)
+        (slot < self.capacity
+            && !self.free_bitmap.is_set(slot)
+            && self.generations[slot] == index.generation)
             .then_some(slot)
     }
 
@@ -194,7 +203,7 @@ impl<'a, T, const ALIGN: usize> Iterator for PoolIter<'a, T, ALIGN> {
         while self.next_slot < self.pool.capacity {
             let slot = self.next_slot;
             self.next_slot += 1;
-            if !self.pool.allocated[slot] {
+            if self.pool.free_bitmap.is_set(slot) {
                 continue;
             }
             let index = Index::new(slot as u32, self.pool.generations[slot]);
@@ -208,7 +217,7 @@ impl<'a, T, const ALIGN: usize> Iterator for PoolIter<'a, T, ALIGN> {
 impl<T, const ALIGN: usize> Drop for Pool<T, ALIGN> {
     fn drop(&mut self) {
         for slot in 0..self.capacity {
-            if self.allocated[slot] {
+            if !self.free_bitmap.is_set(slot) {
                 unsafe { ptr::drop_in_place(self.slot_ptr_unchecked(slot)) };
             }
         }
@@ -224,5 +233,35 @@ impl<T: fmt::Debug, const ALIGN: usize> fmt::Debug for Pool<T, ALIGN> {
             .field("len", &self.len)
             .field("capacity", &self.capacity)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pool;
+
+    #[test]
+    fn remove_and_reinsert_updates_generation_and_preserves_lookup_rules() {
+        let mut pool = Pool::<u32>::with_capacity(4);
+        let first = pool.insert(7).expect("first slot");
+        assert_eq!(pool.remove(first), Some(7));
+        let second = pool.insert(9).expect("second slot");
+        assert_ne!(first.generation(), second.generation());
+        assert_eq!(pool.get(first), None);
+        assert_eq!(pool.get(second), Some(&9));
+    }
+
+    #[test]
+    fn iter_skips_free_slots() {
+        let mut pool = Pool::<u32>::with_capacity(4);
+        let first = pool.insert(7).expect("first slot");
+        let second = pool.insert(9).expect("second slot");
+        let third = pool.insert(11).expect("third slot");
+        assert_eq!(pool.remove(second), Some(9));
+
+        let values: std::vec::Vec<_> = pool.iter().map(|(_, value)| *value).collect();
+        assert_eq!(values, vec![7, 11]);
+        assert_eq!(pool.get(first), Some(&7));
+        assert_eq!(pool.get(third), Some(&11));
     }
 }

@@ -15,47 +15,12 @@ required-features = ["inbound-tun"]
 [features]
 default = [
     "inbound-tun",
-    "outbound-hysteria2",
-    "outbound-direct",
     "outbound-block",
-    "outbound-urltest",
-    "dns-udp",
-    "dns-tcp",
-    "dns-hosts",
-    "dns-local",
     "probe",
 ]
 probe = ["hammer-runtime/probe"]
 inbound-tun = ["dep:libc"]
-inbound-socks = ["hammer-runtime/inbound-socks"]
-inbound-http = ["hammer-runtime/inbound-http"]
-inbound-mixed = ["hammer-runtime/inbound-mixed"]
-tls = ["hammer-runtime/tls"]
-tls-client = ["hammer-runtime/tls-client"]
-tls-outbound = ["hammer-runtime/tls-outbound"]
-tls-outbound-stream = ["hammer-runtime/tls-outbound-stream"]
-tls-quic = ["hammer-runtime/tls-quic"]
-tls-utls-stream = ["hammer-runtime/tls-utls-stream"]
-tls-utls = ["hammer-runtime/tls-utls"]
-outbound-hysteria2 = ["hammer-runtime/outbound-hysteria2"]
-outbound-vless = ["hammer-runtime/outbound-vless"]
-outbound-direct = ["hammer-runtime/outbound-direct"]
 outbound-block = ["hammer-runtime/outbound-block"]
-outbound-urltest = ["hammer-runtime/outbound-urltest"]
-dns-udp = ["dns-tcp", "dep:bytes"]
-dns-tcp = []
-dns-https = [
-    "hammer-runtime/tls-basic-client",
-    "dep:bytes",
-    "dep:http",
-    "dep:http-body-util",
-    "dep:hyper",
-    "dep:hyper-util",
-    "dep:rustls",
-    "dep:tokio-rustls",
-]
-dns-hosts = []
-dns-local = []
 endpoint = ["hammer-runtime/endpoint"]
 endpoint-wireguard = ["hammer-runtime/endpoint-wireguard"]
 endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
@@ -71,17 +36,10 @@ hammer-adapter = { path = "../hammer-adapter" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
-hickory-proto = { workspace = true }
-http = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
 ipnet = { workspace = true }
 nom = { workspace = true }
 etherparse = { workspace = true }
-rustls = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["signal"] }
-tokio-rustls = { workspace = true, optional = true }
 tracing = { workspace = true }
 libc = { workspace = true, optional = true }
 smoltcp = { workspace = true }

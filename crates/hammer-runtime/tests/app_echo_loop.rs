@@ -32,7 +32,7 @@ fn app_echo_loop_runs_on_owner_worker_with_local_executor() {
                     .await
                     .expect("collect recv descriptor");
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"echo-from-app")
+                    .alloc_index_with_bytes(b"echo-from-app")
                     .expect("alloc app echo buffer");
                 app_runtime
                     .complete_recv_buffer(runtime.clone(), index)

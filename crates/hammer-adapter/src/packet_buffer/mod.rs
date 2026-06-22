@@ -3,10 +3,9 @@ mod network;
 mod opaque;
 
 pub use header::{
-    PACKET_BUFFER_INVALID_INDEX, PacketBufferFlags, PacketBufferHeader, PacketBufferHeaderExt,
+    PACKET_BUFFER_INVALID_INDEX, PacketBufferCacheline0, PacketBufferCacheline1, PacketBufferFlags,
 };
-pub use network::{NetworkOpaque, NetworkOpaquePayload, NetworkPayloadOpaque};
-pub use opaque::{
-    PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PrimaryOpaque, PrimaryOpaquePayload,
-    SecondaryOpaque, SecondaryOpaquePayload,
+pub use network::{
+    ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, NetworkPayloadOpaque, TapEthernetMetadata,
 };
+pub use opaque::{PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PrimaryOpaque, SecondaryOpaque};

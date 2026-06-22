@@ -1,3 +1,4 @@
+use std::mem::transmute;
 use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
@@ -295,7 +296,7 @@ fn ip_input_runtime(data: NodeRuntimeData) -> CoreResult<IpInputRuntime> {
 
 #[inline(always)]
 fn prefetch_index_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {
-    batch.prefetch_read(index);
+    batch.prefetch_header(index);
 }
 
 #[inline(always)]
@@ -338,9 +339,9 @@ fn next_node_for_index_with_batch(
     feature_arc: Option<&FeatureArcStartHandle>,
     traces: &mut std::vec::Vec<(BufferIndex, IpInputTrace)>,
 ) -> CoreResult<NodeId> {
-    let (trace, resolved) = {
+    let (trace, parsed, network) = {
         let buffer = batch.buffer_mut(index)?;
-        let traced = buffer.trace_mark().is_some();
+        let traced = buffer.trace_handle().is_some();
         match parse_ip_packet_with_chain_len(
             buffer.current(),
             buffer.total_len_not_including_first(),
@@ -348,21 +349,20 @@ fn next_node_for_index_with_batch(
             Err(_) => {
                 set_buffer_node_error_code(runtime, buffer, IpInputError::BadLength.code())?;
                 let resolved = NodeNextStorage::next(&next, IpInputNext::Drop);
-                (
-                    if unlikely(traced) {
-                        Some(IpInputTrace {
+                if unlikely(traced) {
+                    traces.push((
+                        index,
+                        IpInputTrace {
                             version: None,
                             protocol: None,
                             input_target: None,
                             input_error: Some(IpInputError::BadLength),
                             packet_len: 0,
                             next: resolved,
-                        })
-                    } else {
-                        None
-                    },
-                    resolved,
-                )
+                        },
+                    ));
+                }
+                return Ok(resolved);
             }
             Ok(parsed) => {
                 if parsed.input_error == IpInputError::None {
@@ -388,39 +388,41 @@ fn next_node_for_index_with_batch(
                 } else {
                     BufferPacketCursor::new()
                 };
-                *buffer.packet_cursor_mut() = cursor;
+                buffer.set_packet_cursor(cursor);
                 let ip_ecn = ip_ecn_from_packet(buffer.current(), parsed.version);
-                let metadata = buffer.metadata_mut();
-                if let Some(network) = network {
-                    metadata.network = network;
+                unsafe {
+                    transmute::<
+                        &mut hammer_adapter::PrimaryOpaque,
+                        &mut hammer_adapter::NetworkOpaque,
+                    >(buffer.opaque_mut())
                 }
-                metadata.source = Some(SocksAddr::ip(parsed.source, 0));
-                metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
-                metadata.ip_ecn = ip_ecn;
-                metadata.icmp_error = icmp_error_metadata_for_input(&parsed);
-                let resolved = match parsed.input_target {
-                    IpInputTarget::Drop => NodeNextStorage::next(&next, IpInputNext::Drop),
-                    IpInputTarget::Punt => NodeNextStorage::next(&next, IpInputNext::Punt),
-                    IpInputTarget::Options => NodeNextStorage::next(&next, IpInputNext::Options),
-                    IpInputTarget::Lookup => feature_arc.map_or(
-                        NodeNextStorage::next(&next, IpInputNext::Lookup),
-                        |arc| {
-                            arc.start_or(
-                                metadata,
-                                NodeNextStorage::next(&next, IpInputNext::Lookup),
-                            )
-                        },
-                    ),
-                    IpInputTarget::LookupMulticast => {
-                        NodeNextStorage::next(&next, IpInputNext::LookupMulticast)
-                    }
-                    IpInputTarget::IcmpError => {
-                        NodeNextStorage::next(&next, IpInputNext::IcmpError)
-                    }
-                    IpInputTarget::Reassembly => {
-                        NodeNextStorage::next(&next, IpInputNext::Reassembly)
-                    }
-                };
+                .ip_mut()
+                .set_ip_ecn(ip_ecn.map(|codepoint| codepoint as u8));
+                unsafe {
+                    transmute::<
+                        &mut hammer_adapter::PrimaryOpaque,
+                        &mut hammer_adapter::NetworkOpaque,
+                    >(buffer.opaque_mut())
+                }
+                .ip_mut()
+                .set_ip_version(Some(match parsed.version {
+                    IpVersion::V4 => 4,
+                    IpVersion::V6 => 6,
+                }));
+                unsafe {
+                    transmute::<
+                        &mut hammer_adapter::PrimaryOpaque,
+                        &mut hammer_adapter::NetworkOpaque,
+                    >(buffer.opaque_mut())
+                }
+                .ip_mut()
+                .set_ip_protocol(Some(match parsed.protocol {
+                    IpProtocol::Icmpv4 => 1,
+                    IpProtocol::Tcp => 6,
+                    IpProtocol::Udp => 17,
+                    IpProtocol::Icmpv6 => 58,
+                    IpProtocol::Other(value) => value,
+                }));
                 (
                     if unlikely(traced) {
                         Some(IpInputTrace {
@@ -429,18 +431,56 @@ fn next_node_for_index_with_batch(
                             input_target: Some(parsed.input_target),
                             input_error: Some(parsed.input_error),
                             packet_len: parsed.packet_len,
-                            next: resolved,
+                            next: NodeNextStorage::next(&next, IpInputNext::Drop),
                         })
                     } else {
                         None
                     },
-                    resolved,
+                    parsed,
+                    network,
                 )
             }
         }
     };
+    let resolved = match parsed.input_target {
+        IpInputTarget::Drop => NodeNextStorage::next(&next, IpInputNext::Drop),
+        IpInputTarget::Punt => NodeNextStorage::next(&next, IpInputNext::Punt),
+        IpInputTarget::Options => NodeNextStorage::next(&next, IpInputNext::Options),
+        IpInputTarget::Lookup => {
+            let default_next = NodeNextStorage::next(&next, IpInputNext::Lookup);
+            if let Some(arc) = feature_arc {
+                let Some(interface_index) = ({
+                    let buffer = batch.buffer(index)?;
+                    let network = unsafe {
+                        std::mem::transmute::<
+                            &hammer_adapter::PrimaryOpaque,
+                            &hammer_adapter::NetworkOpaque,
+                        >(buffer.opaque())
+                    };
+                    let interface_index = network.sw_if_index[0];
+                    (interface_index != 0).then_some(interface_index)
+                }) else {
+                    return Ok(default_next);
+                };
+                arc.start_for_interface_or(interface_index, default_next)
+            } else {
+                default_next
+            }
+        }
+        IpInputTarget::LookupMulticast => {
+            NodeNextStorage::next(&next, IpInputNext::LookupMulticast)
+        }
+        IpInputTarget::IcmpError => NodeNextStorage::next(&next, IpInputNext::IcmpError),
+        IpInputTarget::Reassembly => NodeNextStorage::next(&next, IpInputNext::Reassembly),
+    };
     if let Some(trace) = trace {
-        traces.push((index, trace));
+        traces.push((
+            index,
+            IpInputTrace {
+                next: resolved,
+                ..trace
+            },
+        ));
     }
     Ok(resolved)
 }

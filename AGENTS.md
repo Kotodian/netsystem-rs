@@ -7,7 +7,7 @@ This Rust workspace implements an iOS NetworkExtension VPN engine. Crates live i
 - `hammer-core`: shared config schema, errors, lifecycle, metrics, logs, and network primitives.
 - `hammer-adapter`: cross-crate traits and platform contracts.
 - `hammer-component-macros`: proc macros for runtime registration.
-- `hammer-runtime`: protocols, routing, DNS, TUN handling, and service orchestration.
+- `hammer-runtime`: routing, TUN handling, endpoint/outbound runtime, and service orchestration.
 - `hammer-ffi`: UniFFI-facing service API and `src/hammer.udl`.
 - `hammer-uniffi-bindgen`: binding generation helper binary.
 
@@ -27,7 +27,7 @@ For profiling-friendly iOS builds, use `PROFILE=release-perf ./scripts/build-xcf
 
 ## Coding Style & Naming Conventions
 
-Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case` for modules/functions, `PascalCase` for types and traits, and `SCREAMING_SNAKE_CASE` for constants. Keep dependency direction consistent: `hammer-ffi -> hammer-runtime -> {hammer-adapter, hammer-core}` and `hammer-adapter -> hammer-core`. Group modules by protocol or subsystem, matching paths such as `src/protocol/hysteria2/` and `src/config/`.
+Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case` for modules/functions, `PascalCase` for types and traits, and `SCREAMING_SNAKE_CASE` for constants. Keep dependency direction consistent: `hammer-ffi -> hammer-runtime -> {hammer-adapter, hammer-core}` and `hammer-adapter -> hammer-core`. Group modules by protocol or subsystem, matching paths such as `src/transport/tcp/` and `src/config/`.
 
 ## VPP Refactor Principles
 
@@ -60,7 +60,7 @@ For TCP, session, dataplane buffer, and recovery work:
 
 ## Testing Guidelines
 
-Add integration tests near the crate whose behavior changes. Use descriptive file names like `dns_runtime.rs`, `service_lifecycle.rs`, or `config_parse.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, and protocol edge cases. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
+Add integration tests near the crate whose behavior changes. Use descriptive file names like `service_lifecycle.rs`, `config_parse.rs`, or `tcp_output.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, and protocol edge cases. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
 
 ## Commit & Pull Request Guidelines
 
@@ -70,4 +70,4 @@ PRs should include a behavior summary, affected crates, test commands run, and a
 
 ## Security & Configuration Tips
 
-Do not commit real VPN credentials, server addresses, certificates, or generated framework output. Keep example TOML values synthetic, and document feature flags when enabling optional protocols such as WireGuard or DoH.
+Do not commit real VPN credentials, server addresses, certificates, or generated framework output. Keep example TOML values synthetic, and document feature flags when enabling optional protocols such as WireGuard.

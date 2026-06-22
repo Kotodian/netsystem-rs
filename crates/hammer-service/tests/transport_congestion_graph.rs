@@ -4,7 +4,12 @@ use std::path::Path;
 #[test]
 fn tcp_state_nodes_emit_segments_to_output_next() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport/tcp");
-    for file in ["listen.rs", "syn_sent.rs", "rcv_process.rs", "established.rs"] {
+    for file in [
+        "listen.rs",
+        "syn_sent.rs",
+        "rcv_process.rs",
+        "established.rs",
+    ] {
         let source = fs::read_to_string(root.join(file)).expect("read tcp state node");
         assert!(source.contains("Output"), "{file} must expose Output next");
         for forbidden in [

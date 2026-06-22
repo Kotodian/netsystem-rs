@@ -347,7 +347,7 @@ impl InboundFanout {
 /// endpoint consumer. Mirrors `transport::INBOUND_QUEUE` so the forwarder task
 /// doesn't impose a tighter bound than the upstream pipeline.
 const DEFAULT_RECV_QUEUE: usize = 256;
-/// Local-channel buffer for opt-in consumers (DNS roundtrip today). 64
+/// Local-channel buffer for opt-in consumers. 64
 /// leaves headroom against transient scheduler stalls without ballooning
 /// resident memory on NetExt.
 const LOCAL_RECV_QUEUE: usize = 64;

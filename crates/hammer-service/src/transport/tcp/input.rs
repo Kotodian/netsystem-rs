@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -10,21 +11,30 @@ use crate::trace::codec::{
 };
 use arc_swap::ArcSwap;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId,
-    FeaturePathEntry, Node, NodeHandle, NodeId, NodeNextStorage, NodeProcessFn, NodeResult,
-    NodeRuntimeData, NodeVectorDispatch, PacketTrace, RouteMetadata, TraceFormatter,
-    add_packet_trace,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, DataWorkerId,
+    Node, NodeHandle, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData,
+    NodeVectorDispatch, PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::tcp::TcpSegmentFlags;
 
-use crate::transport::congestion::CongestionController;
+use super::TcpQueueHandle;
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use super::TcpQueueHandle;
 use super::{TcpInputError, TcpInputFlags, TcpInputNext};
+use crate::transport::congestion::CongestionController;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct IcmpErrorOpaque {
+    icmp_error: Option<IcmpErrorMetadata>,
+    reserved: [u64; 6],
+}
+
+const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpInputTrace {
@@ -127,18 +137,27 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub(crate) fn lookup_listener(
-        &self,
-        local: SocketAddr,
-    ) -> Option<TcpLookupValue> {
+    pub(crate) fn lookup_listener(&self, local: SocketAddr) -> Option<TcpLookupValue> {
         let snapshot = self.inner.load();
         match local.ip() {
-            IpAddr::V4(local_addr) => snapshot.lookup.lookup_listener::<TcpIpv4ListenerAddress>(
-                TcpV4ListenerKey::new(0, local_addr, local.port()),
-            ),
-            IpAddr::V6(local_addr) => snapshot.lookup.lookup_listener::<TcpIpv6ListenerAddress>(
-                TcpV6ListenerKey::new(0, local_addr, local.port()),
-            ),
+            IpAddr::V4(local_addr) => {
+                snapshot
+                    .lookup
+                    .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                        0,
+                        local_addr,
+                        local.port(),
+                    ))
+            }
+            IpAddr::V6(local_addr) => {
+                snapshot
+                    .lookup
+                    .lookup_listener::<TcpIpv6ListenerAddress>(TcpV6ListenerKey::new(
+                        0,
+                        local_addr,
+                        local.port(),
+                    ))
+            }
         }
     }
 
@@ -152,10 +171,8 @@ impl TcpInputControlPlane {
     where
         C: CongestionController + 'static,
     {
-        let mut node = TcpInputNode::<C>::new(
-            TcpInputSnapshotHandle::new(Arc::clone(&self.inner)),
-            next,
-        );
+        let mut node =
+            TcpInputNode::<C>::new(TcpInputSnapshotHandle::new(Arc::clone(&self.inner)), next);
         node.session_queue = session_queue;
         if let Some((handoff, worker)) = handoff {
             node.handoff = Some(handoff);
@@ -192,19 +209,25 @@ where
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
         let next = Self::runtime_nexts(runtime)?;
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
             runtime,
             frame,
-            |index| {
-                next_node_for_index(
-                    runtime,
-                    index,
-                    &snapshot,
-                    &next,
-                    self.handoff,
-                    self.handoff_worker,
-                    self.session_queue,
-                )
+            |batch, indices| {
+                prefetch_tcp_input(batch, indices, &snapshot.lookup, self.session_queue)
+            },
+            |_, indices, nexts| {
+                for (offset, index) in indices.iter().copied().enumerate() {
+                    nexts[offset] = next_node_for_index(
+                        runtime,
+                        index,
+                        &snapshot,
+                        &next,
+                        self.handoff,
+                        self.handoff_worker,
+                        self.session_queue,
+                    )?;
+                }
+                Ok(())
             },
         )?;
         self.cached_next = cached_next;
@@ -307,17 +330,25 @@ where
     let snapshot = state.snapshot.load();
     let next = TcpInputNode::<C>::runtime_nexts(runtime)?;
     let session_queue = state.session_queue.map(TcpQueueHandle::<C>::new);
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        next_node_for_index(
-            runtime,
-            index,
-            &snapshot,
-            &next,
-            state.handoff,
-            state.handoff_worker,
-            session_queue,
-        )
-    })?;
+    let (result, _) = NodeVectorDispatch::new(None).route_frame(
+        runtime,
+        frame,
+        |batch, indices| prefetch_tcp_input(batch, indices, &snapshot.lookup, session_queue),
+        |_, indices, nexts| {
+            for (offset, index) in indices.iter().copied().enumerate() {
+                nexts[offset] = next_node_for_index(
+                    runtime,
+                    index,
+                    &snapshot,
+                    &next,
+                    state.handoff,
+                    state.handoff_worker,
+                    session_queue,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(result)
 }
 
@@ -387,9 +418,7 @@ where
         if let (Some(handoff), Some(current_worker)) = (handoff, handoff_worker)
             && session.owner != current_worker
         {
-            runtime.with_metadata_mut(index, |metadata| {
-                metadata.set_feature_path(vec![FeaturePathEntry::new(resolved, None)]);
-            })?;
+            runtime.set_current_config(index, resolved)?;
             runtime.handoff_index(session.owner, handoff, index)?;
             return Ok(None);
         }
@@ -406,8 +435,7 @@ where
         );
     }
 
-    let metadata = runtime.metadata(index)?;
-    let lookup = lookup_for_packet(&metadata, &snapshot.lookup, &parsed);
+    let lookup = lookup_for_packet(&snapshot.lookup, &parsed);
     let entry = tcp_listener_input_entry(parsed.flags);
     if let Some(error) = entry.error {
         return resolve_error_next(
@@ -576,7 +604,7 @@ mod tests {
     };
 
     use super::{
-        ParsedTcpInput, TcpInputSnapshot, TcpInputSnapshotHandle, TcpInputRouteEntry,
+        ParsedTcpInput, TcpInputRouteEntry, TcpInputSnapshot, TcpInputSnapshotHandle,
         next_node_for_index, parse_tcp_input, register_tcp_input_runtime, session_input_entry,
     };
     use crate::net::ip::{IpProtocol, IpVersion};
@@ -643,11 +671,9 @@ mod tests {
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
         let worker = DataWorkerId::new(0);
-        let handle = register_tcp_session_queue::<BbrController>(
-            worker,
-            runtime.packet_buffers().clone(),
-        )
-        .expect("register tcp queue");
+        let handle =
+            register_tcp_session_queue::<BbrController>(worker, runtime.packet_buffers().clone())
+                .expect("register tcp queue");
         let local_port = 50_077;
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
@@ -703,7 +729,7 @@ mod tests {
             50_066,
         );
         let index = runtime
-            .alloc_index_with_bytes(Default::default(), &packet)
+            .alloc_index_with_bytes(&packet)
             .expect("alloc packet");
         stamp_tcp_cursor(&runtime, index, &packet);
         assert!(
@@ -738,8 +764,10 @@ mod tests {
         .expect("next node");
 
         assert_eq!(selected, None);
-        let mut metadata = runtime.metadata(index).expect("packet metadata");
-        assert_eq!(metadata.pop_feature_next(), Some(NodeId::new(6)));
+        assert_eq!(
+            runtime.current_config(index).expect("handoff next"),
+            NodeId::new(6)
+        );
         assert_eq!(
             runtime
                 .handoff_source_worker(index)
@@ -753,8 +781,7 @@ mod tests {
         runtime: &DataPlaneRuntime,
         owner: DataWorkerId,
         local_port: u16,
-    ) -> TcpQueueHandle<BbrController>
-    {
+    ) -> TcpQueueHandle<BbrController> {
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
             local_port,
@@ -869,7 +896,8 @@ mod tests {
 fn clear_success_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.clear_node_error();
-    buffer.metadata_mut().icmp_error = None;
+    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
+    opaque.icmp_error = None;
     Ok(())
 }
 
@@ -879,13 +907,45 @@ fn parse_tcp_input(
     index: BufferIndex,
 ) -> CoreResult<Result<ParsedTcpInput, TcpInputParseError>> {
     let buffer = runtime.get_buffer(index)?;
-    let current = buffer.current();
-    let cursor = buffer.packet_cursor();
-    let parsed =
-        match parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first()) {
-            Ok(parsed) => parsed,
-            Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
-        };
+    parse_tcp_input_parts(
+        buffer.current(),
+        buffer.total_len_not_including_first(),
+        buffer.packet_cursor(),
+    )
+}
+
+#[inline(always)]
+fn prefetch_tcp_input(
+    batch: &mut BufferBatchMut<'_>,
+    indices: &[BufferIndex],
+    lookup: &TcpLookupSnapshot,
+    session_queue: Option<TcpQueueHandle<impl CongestionController + 'static>>,
+) {
+    for index in indices.iter().copied() {
+        batch.prefetch_read(index);
+        let _ = batch.with_buffer(index, |buffer| {
+            if let Ok(Ok(parsed)) = parse_tcp_input_parts(
+                buffer.current(),
+                buffer.total_len_not_including_first(),
+                buffer.packet_cursor(),
+            ) {
+                prefetch_lookup_for_packet(lookup, &parsed);
+                prefetch_session_route_for_packet(session_queue, &parsed);
+            }
+        });
+    }
+}
+
+#[inline(always)]
+fn parse_tcp_input_parts(
+    current: &[u8],
+    total_len_not_including_first: usize,
+    cursor: BufferPacketCursor,
+) -> CoreResult<Result<ParsedTcpInput, TcpInputParseError>> {
+    let parsed = match parse_ip_packet_with_chain_len(current, total_len_not_including_first) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
+    };
     if parsed.protocol != IpProtocol::Tcp {
         return Ok(Err(TcpInputParseError::WrongProtocol {
             version: parsed.version,
@@ -1007,29 +1067,59 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
 
 #[inline(always)]
 fn lookup_for_packet(
-    metadata: &RouteMetadata,
     snapshot: &TcpLookupSnapshot,
     parsed: &ParsedTcpInput,
 ) -> Option<TcpLookupValue> {
-    let local = metadata
-        .destination
-        .as_ref()
-        .map(|addr| (addr.host, addr.port))
-        .unwrap_or((parsed.destination_ip, parsed.destination_port));
-    let remote = metadata
-        .source
-        .as_ref()
-        .map(|addr| (addr.host, addr.port))
-        .unwrap_or((parsed.source_ip, parsed.source_port));
-    match (local.0, remote.0, parsed.version) {
-        (IpAddr::V4(local_addr), IpAddr::V4(_remote_addr), IpVersion::V4) => snapshot
-            .lookup_listener::<TcpIpv4ListenerAddress>(
-            TcpV4ListenerKey::new(0, local_addr, local.1),
-        ),
-        (IpAddr::V6(local_addr), IpAddr::V6(_remote_addr), IpVersion::V6) => snapshot
-            .lookup_listener::<TcpIpv6ListenerAddress>(
-            TcpV6ListenerKey::new(0, local_addr, local.1),
-        ),
+    match (parsed.destination_ip, parsed.source_ip, parsed.version) {
+        (IpAddr::V4(local_addr), IpAddr::V4(_), IpVersion::V4) => snapshot
+            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                0,
+                local_addr,
+                parsed.destination_port,
+            )),
+        (IpAddr::V6(local_addr), IpAddr::V6(_), IpVersion::V6) => snapshot
+            .lookup_listener::<TcpIpv6ListenerAddress>(TcpV6ListenerKey::new(
+                0,
+                local_addr,
+                parsed.destination_port,
+            )),
         _ => None,
     }
+}
+
+#[inline(always)]
+fn prefetch_lookup_for_packet(snapshot: &TcpLookupSnapshot, parsed: &ParsedTcpInput) {
+    match (parsed.destination_ip, parsed.source_ip, parsed.version) {
+        (IpAddr::V4(local_addr), IpAddr::V4(_), IpVersion::V4) => snapshot
+            .prefetch_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
+                0,
+                local_addr,
+                parsed.destination_port,
+            )),
+        (IpAddr::V6(local_addr), IpAddr::V6(_), IpVersion::V6) => snapshot
+            .prefetch_listener::<TcpIpv6ListenerAddress>(TcpV6ListenerKey::new(
+                0,
+                local_addr,
+                parsed.destination_port,
+            )),
+        _ => {}
+    }
+}
+
+#[inline(always)]
+fn prefetch_session_route_for_packet<C>(
+    session_queue: Option<TcpQueueHandle<C>>,
+    parsed: &ParsedTcpInput,
+) where
+    C: CongestionController + 'static,
+{
+    let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
+    let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
+    let Some(handle) = session_queue else {
+        return;
+    };
+    let Ok(queue) = handle.borrow_mut() else {
+        return;
+    };
+    queue.aux().prefetch_tuple(local, remote);
 }

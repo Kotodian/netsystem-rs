@@ -48,7 +48,10 @@ fn tcp_connections_own_independent_congestion_state() {
     let second = connection(TcpConnectionId::new(2), 50_002);
 
     assert_ne!(first.connection_id(), second.connection_id());
-    assert_eq!(first.congestion().delivered(), second.congestion().delivered());
+    assert_eq!(
+        first.congestion().delivered(),
+        second.congestion().delivered()
+    );
     assert_eq!(
         first.congestion().congestion_window(),
         second.congestion().congestion_window()
@@ -184,7 +187,9 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
     );
 
     assert_eq!(
-        index.lookup_by_tuple(local, remote).expect("IPv6 tuple lookup"),
+        index
+            .lookup_by_tuple(local, remote)
+            .expect("IPv6 tuple lookup"),
         (session_id, DataWorkerId::new(0), TcpInputNext::SynSent)
     );
     assert!(

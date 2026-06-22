@@ -9,12 +9,12 @@ use hammer_core::protocol::tcp::TcpConnectionId;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::vec::Vec;
 
-use crate::session::SessionId;
-use crate::transport::congestion::CongestionController;
+use super::TcpQueueHandle;
 use super::connection::TcpConnection;
 use super::input::TcpInputControlPlane;
 use super::segment::parse_tcp_packet;
-use super::TcpQueueHandle;
+use crate::session::SessionId;
+use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpListenNext {
@@ -95,7 +95,13 @@ where
     ) -> CoreResult<NodeResult> {
         sync_tcp_listen_control(self.session_queue, self.control.clone())?;
         let next = Self::runtime_nexts(runtime)?;
-        tcp_listen_process_frame(runtime, frame, self.control.clone(), self.session_queue, next)
+        tcp_listen_process_frame(
+            runtime,
+            frame,
+            self.control.clone(),
+            self.session_queue,
+            next,
+        )
     }
 
     #[inline]
@@ -183,24 +189,19 @@ where
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let worker = queue.worker();
-        let fast_open_cookie = capabilities
-            .fast_open
-            .then(|| {
-                queue
-                    .aux_mut()
-                    .fast_open_cookie_for_listener(listener.id, packet.local, packet.remote)
-            });
-        let fast_open_valid = packet
-            .fast_open_cookie
-            .as_deref()
-            .is_some_and(|cookie| {
-                queue.aux_mut().validate_fast_open_cookie(
-                    listener.id,
-                    packet.local,
-                    packet.remote,
-                    cookie,
-                )
-            });
+        let fast_open_cookie = capabilities.fast_open.then(|| {
+            queue
+                .aux_mut()
+                .fast_open_cookie_for_listener(listener.id, packet.local, packet.remote)
+        });
+        let fast_open_valid = packet.fast_open_cookie.as_deref().is_some_and(|cookie| {
+            queue.aux_mut().validate_fast_open_cookie(
+                listener.id,
+                packet.local,
+                packet.remote,
+                cookie,
+            )
+        });
         let accepted_payload_len = usize::from(fast_open_valid) * packet.payload_len;
         let session_id = queue.insert_session_with_id(|session_id: SessionId| {
             let connection_id = TcpConnectionId::new(session_id.get());
@@ -224,8 +225,12 @@ where
             .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?
             .receive_syn(&packet, accepted_payload_len)?;
         if fast_open_valid && packet.payload_len != 0 {
-            runtime.packet_buffers().advance(index, packet.payload_offset)?;
-            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            runtime
+                .packet_buffers()
+                .advance(index, packet.payload_offset)?;
+            runtime
+                .packet_buffers()
+                .truncate_chain(index, packet.payload_len)?;
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
@@ -237,8 +242,8 @@ where
             queue.refresh_session_route(session_id)?;
         }
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
-            if let Err(error) = segment.write_to_buffer(runtime, allocated) {
+            let allocated = runtime.packet_buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }

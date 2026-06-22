@@ -96,15 +96,11 @@ pub fn display_id(id: &str) -> String {
         .or_else(|| id.strip_prefix("hammer_core::"))
         .unwrap_or(id);
     match id {
-        "dns" => return "resolve".into(),
-        "dns-transport" => return "resolve.transport".into(),
         "router" => return "path".into(),
         _ => {}
     }
     if let Some(rest) = id.strip_prefix("outbound/") {
         return match rest {
-            "direct" => "egress.direct".into(),
-            "hysteria2" => "egress.hy2".into(),
             other => format!("egress.{other}"),
         };
     }
@@ -114,12 +110,6 @@ pub fn display_id(id: &str) -> String {
         } else {
             format!("ingress.{rest}")
         };
-    }
-    if let Some(rest) = id.strip_prefix("dns/transport/") {
-        return format!("resolve.transport.{rest}");
-    }
-    if let Some(rest) = id.strip_prefix("dns/") {
-        return format!("resolve.{rest}");
     }
     id.to_owned()
 }
@@ -189,36 +179,25 @@ mod tests {
             id: 0xdead_0042,
             created_at: formatter.base_time,
         };
-        let got = formatter.format_platform(
-            Some(id),
-            Level::Error,
-            "outbound/hysteria2",
-            "handshake failed",
-            ts,
-        );
+        let got = formatter.format_platform(Some(id), Level::Error, "handshake failed", ts);
         assert!(!got.contains("\x1b["), "got = {got}");
         assert!(
             !got.contains("INFO[") && !got.contains("ERROR["),
             "got = {got}"
         );
-        assert!(!got.contains("outbound/hysteria2"), "got = {got}");
-        assert!(got.contains("egress.hy2:"), "got = {got}");
+        assert!(!got.contains("outbound/selector"), "got = {got}");
+        assert!(got.contains("egress.selector:"), "got = {got}");
         assert!(got.contains("c#0042"), "got = {got}");
     }
 
     #[test]
     fn display_id_table() {
         let cases = [
-            ("dns", "resolve"),
-            ("dns-transport", "resolve.transport"),
             ("router", "path"),
-            ("outbound/direct", "egress.direct"),
-            ("outbound/hysteria2", "egress.hy2"),
+            ("outbound/block", "egress.block"),
             ("outbound/selector", "egress.selector"),
             ("inbound/tun", "tun.in"),
             ("inbound/mixed", "ingress.mixed"),
-            ("dns/local", "resolve.local"),
-            ("dns/transport/udp", "resolve.transport.udp"),
             ("certificate-provider", "certificate-provider"),
         ];
         for (input, want) in cases {

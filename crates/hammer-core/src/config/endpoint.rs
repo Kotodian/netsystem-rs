@@ -271,8 +271,7 @@ fn build_wireguard_peer(
 }
 
 /// Parse a `host:port`-style endpoint. WireGuard currently requires an IP
-/// literal; hostname endpoints would need lifecycle-time DNS resolution
-/// which is not wired up yet.
+/// literal; hostname endpoints are not wired up yet.
 #[cfg(feature = "wireguard")]
 fn parse_socket_addr(field: &str, host: &str, port: u16) -> Result<SocketAddr, HammerError> {
     if port == 0 {

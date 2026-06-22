@@ -38,6 +38,8 @@ fn tcp_control_plane_tracks_listener_install_and_remove() {
         sack: true,
         timestamps: true,
         ecn: false,
+        accurate_ecn: false,
+        fast_open: false,
     };
 
     assert_eq!(plane.listener_for_test(listener_id), None);

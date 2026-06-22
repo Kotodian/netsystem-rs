@@ -3,7 +3,6 @@ pub mod certificate;
 pub mod component;
 pub mod connection;
 pub mod dialer;
-pub mod dns;
 pub mod endpoint;
 pub mod handler;
 pub mod handoff;
@@ -15,8 +14,6 @@ pub mod outbound;
 pub mod packet_buffer;
 pub mod platform;
 pub mod probe;
-pub mod router;
-pub mod rule;
 pub mod service;
 pub mod trace;
 
@@ -44,10 +41,8 @@ pub use component::{
 };
 pub use connection::{ConnectionHandle, ConnectionManager};
 pub use dialer::{Dialer, Network};
-pub use dns::{
-    DnsQueryOptions, DnsRouter, DnsTransport, DnsTransportComponent, DnsTransportManager,
-};
 pub use endpoint::{Endpoint, EndpointComponent, EndpointLocalFlow, EndpointManager};
+pub use hammer_core::SocksAddr;
 pub use handler::{ConnectionHandler, PacketConnectionHandler};
 pub use inbound::{Inbound, InboundComponent, InboundManager};
 pub use network::NetworkManager;
@@ -63,22 +58,17 @@ pub use outbound::{
     ProxyStream,
 };
 pub use packet_buffer::{
-    NetworkOpaque, NetworkOpaquePayload, NetworkPayloadOpaque, PACKET_BUFFER_INVALID_INDEX,
-    PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PacketBufferFlags, PacketBufferHeader,
-    PacketBufferHeaderExt, PrimaryOpaque, PrimaryOpaquePayload, SecondaryOpaque,
-    SecondaryOpaquePayload,
+    ForwardingMetadata, IpEcnCodepoint, NetworkOpaque, NetworkPayloadOpaque,
+    PACKET_BUFFER_INVALID_INDEX, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES,
+    PacketBufferCacheline0, PacketBufferCacheline1, PacketBufferFlags, PrimaryOpaque,
+    SecondaryOpaque, TapEthernetMetadata,
 };
 pub use platform::{
     DefaultInterfaceUpdateListener, NetworkInterface, PlatformInterface, TunOptions, WifiState,
 };
 pub use probe::{ProbeProtocol, ProbeProtocolComponent, ProbeReport};
-pub use router::Router;
-pub use rule::{
-    FeaturePathEntry, ForwardingDpoType, ForwardingMetadata, HeadlessRule, IpEcnCodepoint,
-    RouteDecision, RouteMetadata, RouteTarget, Rule, SocksAddr, TapEthernetMetadata,
-};
 pub use service::ServiceManager;
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
-    TraceInputPolicy, TraceMark, TracePolicy, TraceRecord, TraceRecordSink,
+    TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,
 };

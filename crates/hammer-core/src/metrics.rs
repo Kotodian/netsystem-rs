@@ -502,7 +502,7 @@ mod tests {
     #[test]
     fn counters_reuse_the_same_registered_metric() {
         let registry = MetricsRegistry::new();
-        let scope = registry.scope("outbound", "outbound", "direct");
+        let scope = registry.scope("outbound", "outbound", "block");
 
         let first = scope.counter_with_labels("dial_total", [("network", "tcp")]);
         let second = scope.counter_with_labels("dial_total", [("network", "tcp")]);

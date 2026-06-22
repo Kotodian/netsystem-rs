@@ -8,14 +8,11 @@ const MINIMAL_CONFIG: &str = r#"
 address = ["172.19.0.1/30"]
 
 [[outbounds]]
-type = "direct"
-id = "direct"
-
-[dns]
-server = "https://1.1.1.1/dns-query"
+type = "block"
+id = "block"
 
 [route]
-final = "direct"
+final = "block"
 "#;
 
 #[test]

@@ -132,7 +132,6 @@ impl From<HammerNetworkInterface> for AdapterNetworkInterface {
             expensive: value.expensive,
             constrained: value.constrained,
             addresses: value.addresses,
-            dns_servers: value.dns_servers,
         }
     }
 }
@@ -243,8 +242,6 @@ mod tests {
         fn system_certificates(&self) -> Option<Box<dyn HammerStringIterator>> {
             None
         }
-
-        fn clear_dns_cache(&self) {}
 
         fn write_log(&self, _level: i32, _message: String) {}
     }

@@ -12,55 +12,7 @@ default = []
 # Enables runtime ICMP probe support used by hammer-service probe orchestration.
 # Off-by-default users (slim builds without diagnostic UI) can drop it.
 probe = ["dep:socket2"]
-inbound-socks = ["dep:base64"]
-inbound-http = ["dep:base64"]
-inbound-mixed = ["inbound-socks", "inbound-http"]
-tls = [
-    "dep:base64",
-    "dep:rustls",
-    "dep:rustls-native-certs",
-    "dep:rustls-platform-verifier",
-]
-tls-client = ["tls"]
-tls-basic-client = ["tls-client"]
-tls-outbound = ["tls", "hammer-core/tls", "dep:hickory-resolver"]
-tls-outbound-stream = ["tls-outbound", "dep:tokio-rustls"]
-tls-quic = ["tls-outbound", "dep:quinn"]
-tls-utls-stream = [
-    "tls-outbound-stream",
-    "dep:btls",
-    "dep:btls-sys",
-    "dep:brotli",
-    "dep:foreign-types-shared",
-]
-tls-utls = [
-    "tls-utls-stream",
-    "tls-quic",
-    "dep:quinn-btls",
-]
-outbound-hysteria2 = [
-    "tls-quic",
-    "hammer-core/hysteria2",
-    "dep:blake2",
-    "dep:futures",
-    "dep:h3",
-    "dep:h3-quinn",
-    "dep:http",
-    "dep:quinn",
-    "dep:rand",
-]
-outbound-vless = ["tls-utls-stream", "hammer-core/vless"]
-outbound-direct = ["dep:socket2"]
 outbound-block = []
-# Outbound group that probes child outbounds via HTTP HEAD over the proxied
-# stream and routes traffic through the lowest-latency child. Carries its own
-# TLS stack since the probe URL is normally https.
-outbound-urltest = [
-    "tls-client",
-    "dep:httparse",
-    "dep:tokio-rustls",
-    "dep:url",
-]
 # Enables the generic L3 endpoint domain (Endpoint trait, manager, packet-loop
 # fast path). Concrete endpoint protocols opt into this parent feature.
 endpoint = ["hammer-core/wireguard", "dep:etherparse", "dep:arc-swap", "dep:smoltcp"]
@@ -85,32 +37,10 @@ hammer-infra = { path = "../hammer-infra" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 async-trait = { workspace = true }
 boringtun = { workspace = true, optional = true }
-hickory-proto = { workspace = true }
-hickory-resolver = { workspace = true, optional = true }
 bytes = { workspace = true }
 etherparse = { workspace = true, optional = true }
 arc-swap = { workspace = true, optional = true }
 smoltcp = { workspace = true, optional = true }
-http = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-quinn = { workspace = true, optional = true }
-quinn-btls = { workspace = true, optional = true }
-btls = { workspace = true, optional = true }
-btls-sys = { workspace = true, optional = true }
-brotli = { workspace = true, optional = true }
-foreign-types-shared = { workspace = true, optional = true }
-h3 = { workspace = true, optional = true }
-h3-quinn = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
-httparse = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
-blake2 = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -119,14 +49,9 @@ metrics-derive = { workspace = true }
 socket2 = { workspace = true, optional = true }
 ipnet = { workspace = true }
 
-[target.'cfg(target_vendor = "apple")'.dependencies]
-rustls-platform-verifier = { workspace = true, optional = true }
-
 [dev-dependencies]
-aws-lc-rs = { workspace = true }
 hammer-control = { path = "../hammer-control" }
 indoc = { workspace = true }
-rcgen = { workspace = true }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
 # behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be
 # verified without sleeping for real seconds. Test-only — not pulled into

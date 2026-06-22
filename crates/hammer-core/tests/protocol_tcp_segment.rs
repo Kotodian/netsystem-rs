@@ -40,7 +40,9 @@ fn core_tcp_segment_parses_and_writes_ns_flag() {
 #[test]
 fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
     assert_eq!(
-        etherparse::TcpSlice::from_slice(&[0; 19]).map(|_| ()).map_err(map_tcp_parse_error),
+        etherparse::TcpSlice::from_slice(&[0; 19])
+            .map(|_| ())
+            .map_err(map_tcp_parse_error),
         Err(TcpSegmentParseError::ShortHeader)
     );
 
@@ -48,7 +50,9 @@ fn core_tcp_segment_rejects_short_header_and_bad_data_offset() {
     bytes[12] = 4 << 4;
 
     assert_eq!(
-        etherparse::TcpSlice::from_slice(&bytes).map(|_| ()).map_err(map_tcp_parse_error),
+        etherparse::TcpSlice::from_slice(&bytes)
+            .map(|_| ())
+            .map_err(map_tcp_parse_error),
         Err(TcpSegmentParseError::BadDataOffset)
     );
 }

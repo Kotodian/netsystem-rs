@@ -1,14 +1,15 @@
+use std::mem::transmute;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, DriverNode, FrameIndex, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, RouteMetadata, TapEthernetMetadata,
-    TraceFormatter, add_packet_trace, unlikely,
+    BufferFrame, DataPlaneRuntime, DriverNode, FrameIndex, NetworkOpaque, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque,
+    TapEthernetMetadata, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::vec::Vec;
 
-pub use crate::net::packet_route_metadata;
+use crate::net::ip::parse_ip_packet;
 
 use crate::interface::InterfaceControlHandle;
 
@@ -26,6 +27,15 @@ const DEFAULT_TUN_RECV_BATCH: usize = 256;
 const ETHERNET_HEADER_LEN: usize = 14;
 const ETHERTYPE_IP4: u16 = 0x0800;
 const ETHERTYPE_IP6: u16 = 0x86dd;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct TunOpaque {
+    tap_ethernet: Option<TapEthernetMetadata>,
+    reserved: [u64; 4],
+}
+
+const _: () = assert!(core::mem::size_of::<TunOpaque>() <= core::mem::size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
@@ -297,10 +307,9 @@ impl TunInputRuntime {
         let interface_index = self.ingress_interface_index()?;
         if let Some(interface_index) = interface_index {
             for index in frame.pending_indices()[first_new..].iter().copied() {
-                runtime
-                    .get_buffer_mut(index)?
-                    .metadata_mut()
-                    .ingress_interface = Some(interface_index);
+                let mut buffer = runtime.get_buffer_mut(index)?;
+                let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+                network.sw_if_index[0] = interface_index;
             }
         }
         if let Some(current_node) = runtime.current_node()
@@ -562,10 +571,7 @@ where
         }
         let mut received = 0usize;
         while received < max {
-            let index = runtime.alloc_index(RouteMetadata {
-                inbound: interface_id.to_owned(),
-                ..Default::default()
-            })?;
+            let index = runtime.alloc_index()?;
             let len = match self.recv_into_buffer(runtime, index) {
                 Ok(Some(len)) => len,
                 Ok(None) => {
@@ -620,18 +626,14 @@ where
         &self,
         runtime: &DataPlaneRuntime,
         index: hammer_adapter::BufferIndex,
-        interface_id: &str,
+        _: &str,
     ) -> CoreResult<()> {
-        let metadata = {
-            let buffer = runtime.get_buffer(index)?;
-            packet_route_metadata(interface_id, buffer.current()).unwrap_or_else(|_| {
-                RouteMetadata {
-                    inbound: interface_id.to_owned(),
-                    ..Default::default()
-                }
-            })
-        };
-        *runtime.get_buffer_mut(index)?.metadata_mut() = metadata;
+        let buffer = runtime.get_buffer(index)?;
+        if parse_ip_packet(buffer.current()).is_err() {
+            return Err(CoreError::internal(
+                "received TUN packet has invalid IP header",
+            ));
+        }
         Ok(())
     }
 }
@@ -1691,20 +1693,21 @@ impl TunPacketSink for MemoryTunOutput {
 fn push_packet_to_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    interface_id: &str,
+    _: &str,
     mode: TunDriverMode,
     packet: &[u8],
 ) -> CoreResult<bool> {
     let Some((packet, tap_ethernet)) = packet_for_mode(mode, packet) else {
         return Ok(false);
     };
-    let mut metadata =
-        packet_route_metadata(interface_id, packet).unwrap_or_else(|_| RouteMetadata {
-            inbound: interface_id.to_owned(),
-            ..Default::default()
-        });
-    metadata.tap_ethernet = tap_ethernet;
-    let index = runtime.alloc_index_with_bytes(metadata, packet)?;
+    let index = runtime.alloc_index_with_bytes(packet)?;
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    if parse_ip_packet(packet).is_err() {
+        runtime.free_index(index);
+        return Ok(false);
+    }
+    let opaque = unsafe { transmute::<_, &mut TunOpaque>(buffer.opaque2_mut()) };
+    opaque.tap_ethernet = tap_ethernet;
     if let Err(err) = frame.push_index(index) {
         runtime.free_index(index);
         return Err(err);
@@ -1747,8 +1750,9 @@ fn tun_output_packet(
     if !mode.is_tap() {
         return Ok(packet);
     }
-    let metadata = runtime.metadata(index)?;
-    let Some(tap) = metadata.tap_ethernet else {
+    let buffer = runtime.get_buffer(index)?;
+    let opaque = unsafe { transmute::<_, &TunOpaque>(buffer.opaque2()) };
+    let Some(tap) = opaque.tap_ethernet else {
         return Ok(packet);
     };
     if tap.header_present {

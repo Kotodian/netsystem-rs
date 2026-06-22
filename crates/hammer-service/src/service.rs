@@ -23,17 +23,15 @@ use hammer_runtime::adapter::NodeErrorCounters;
 #[cfg(feature = "probe")]
 use hammer_runtime::adapter::ProbeProtocolComponent;
 use hammer_runtime::adapter::node::NodeRuntimeStatsRow;
-use hammer_runtime::adapter::{
-    DnsRouter as AdapterDnsRouter, Lifecycle, NetworkManager as _, NodeId, OutboundManager as _,
-    PlatformInterface, ProbeReport, TraceControlPlane, TraceRecordSink,
-};
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
+use hammer_runtime::adapter::{
+    Lifecycle, NetworkManager as _, NodeId, OutboundManager as _, PlatformInterface, ProbeReport,
+    TraceControlPlane, TraceRecordSink,
+};
 use hammer_runtime::app::AppContext;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::endpoints::EndpointOutboundAdapter;
-#[cfg(feature = "endpoint")]
-use hammer_runtime::inbounds::RuntimeDnsRouter;
 use hammer_runtime::spawn::{DataPlaneExecutor, DataRuntime, DataRuntimeContext};
 use hammer_runtime::{
     ControlEventSubscriptionHandle, ControlThread, ControlThreadHandle, ControlTimerHandle,
@@ -46,20 +44,19 @@ use crate::ProbeManager;
 use crate::app::AppHost;
 use crate::data_plane::{DropNode, HandoffNode};
 use crate::net::{FibTableBuilder, IpLookupControlPlane};
-use crate::session::{SessionQueueNext, SessionQueueNode};
 use crate::session::node::SessionQueueHandle;
+use crate::session::{SessionQueueNext, SessionQueueNode};
+use crate::transport::congestion::BbrController;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
+use crate::transport::tcp::tcp_session_queue_dispatch_fn;
 use crate::transport::tcp::{
     TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext, TcpListenNext,
     TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
     TcpResetNext, TcpResetNode, TcpSynSentNext, TcpSynSentNode, register_tcp_session_queue,
 };
-use crate::transport::congestion::BbrController;
-use crate::transport::tcp::tcp_session_queue_dispatch_fn;
-use crate::{DnsRouter, DnsTransportManager, Router};
 use hammer_core::protocol::tcp::TcpCapabilities;
 
 const CONTROL_THREAD_STACK_SIZE: usize = 512 * 1024;
@@ -78,7 +75,7 @@ const TRACE_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 /// feel stuck on the FFI side.
 const CONTROL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Time budget the data-plane runtime gets to abort in-flight tasks
-/// during `close()`. Data tasks (TCP/UDP forwarders, DNS, probes) are
+/// during `close()`. Data tasks (TCP/UDP forwarders, probe tasks) are
 /// expected to drop fast once their lifecycles are closed; tasks still
 /// running past this deadline are forcibly aborted by the runtime.
 const DATA_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -134,7 +131,6 @@ struct ServiceInner {
     lifecycles: Vec<Arc<dyn Lifecycle>>,
     pause: Arc<PauseManager>,
     network: Arc<NetworkManager>,
-    dns_router: Arc<DnsRouter>,
     outbound: Arc<OutboundManager>,
     #[cfg(feature = "endpoint")]
     endpoint: Arc<EndpointManager>,
@@ -402,8 +398,6 @@ impl RuntimeService {
         writer: Arc<dyn LogWriter>,
         build_event_subscribers: EventSubscriberBuilder,
     ) -> HammerResult<Arc<Self>> {
-        hammer_runtime::install_default_crypto_provider();
-
         let options = config::parse_config(config_content)?;
         let metrics = MetricsRegistry::new();
         let trace = TraceControlPlane::new(options.trace.record_capacity);
@@ -496,59 +490,13 @@ impl RuntimeService {
             )?,
         );
         // Auto-register an `EndpointOutboundAdapter` for every declared
-        // endpoint **before** `bind_aggregates`: urltest and friends will
-        // resolve `<endpoint-id>` against the same OutboundManager when
-        // their children include endpoint ids, and DNS `via = "<endpoint-id>"`
-        // requires the adapter to be findable through `outbound.get()`.
+        // endpoint so endpoint-backed egress stays reachable through the
+        // same outbound lookup path as the rest of the dataplane.
         #[cfg(feature = "endpoint")]
         register_endpoint_outbound_adapters(&outbound, &endpoint, &log_factory)?;
-        // Aggregate outbounds (urltest) need a `Weak<dyn OutboundManager>`
-        // before any children can be looked up. Bind once here, after every
-        // declared outbound has been registered, so the urltest's first dial /
-        // probe can resolve every outbound child without races.
-        outbound.bind_aggregates();
-        let default_domain_resolver = options
-            .route
-            .default_domain_resolver
-            .as_ref()
-            .map(|d| d.server.as_str());
-        let dns_transport = Arc::new(DnsTransportManager::from_options_with_runtime(
-            new_logger(&log_factory, "dns-transport"),
-            &options.dns,
-            Arc::clone(&outbound),
-            Arc::clone(&platform),
-            default_domain_resolver,
-        )?);
-        let dns_router = Arc::new(
-            DnsRouter::new_with_manager(
-                new_logger(&log_factory, "dns-router"),
-                Arc::clone(&dns_transport),
-                options.dns.strategy,
-            )
-            .with_rules(&options.dns.rules)?
-            .with_control_handle(Arc::clone(&control_handle))?,
-        );
-        #[cfg(feature = "endpoint")]
-        let router = Arc::new(Router::from_options_with_metrics_and_endpoint_ids(
-            new_logger(&log_factory, "router"),
-            options.route.clone(),
-            Arc::clone(&outbound),
-            Arc::clone(&metrics),
-            options.endpoints.iter().map(|endpoint| endpoint.id.clone()),
-        )?);
-        #[cfg(not(feature = "endpoint"))]
-        let router = Arc::new(Router::from_options_with_metrics(
-            new_logger(&log_factory, "router"),
-            options.route.clone(),
-            Arc::clone(&outbound),
-            Arc::clone(&metrics),
-        )?);
-        let inbound_dns_router: Arc<dyn AdapterDnsRouter> = dns_router.clone();
         let inbound = Arc::new(InboundManager::from_options_with_runtime_and_metrics(
             new_logger(&log_factory, "inbound"),
             &options.inbounds,
-            Arc::clone(&router),
-            inbound_dns_router,
             Arc::clone(&outbound),
             Arc::clone(&platform),
             Arc::clone(&metrics),
@@ -560,10 +508,7 @@ impl RuntimeService {
         #[cfg(feature = "endpoint")]
         registry.set::<EndpointManager>(Arc::clone(&endpoint));
         registry.set::<NetworkManager>(Arc::clone(&network));
-        registry.set::<DnsTransportManager>(Arc::clone(&dns_transport));
         registry.set::<OutboundManager>(Arc::clone(&outbound));
-        registry.set::<DnsRouter>(Arc::clone(&dns_router));
-        registry.set::<Router>(Arc::clone(&router));
         registry.set::<InboundManager>(Arc::clone(&inbound));
         registry.set::<ServiceManager>(Arc::clone(&service_mgr));
         registry.set::<ConnectionManager>(Arc::clone(&connection));
@@ -578,10 +523,7 @@ impl RuntimeService {
         lifecycles.push(Arc::clone(&endpoint) as Arc<dyn Lifecycle>);
         lifecycles.extend([
             Arc::clone(&network) as Arc<dyn Lifecycle>,
-            dns_transport as Arc<dyn Lifecycle>,
             Arc::clone(&outbound) as Arc<dyn Lifecycle>,
-            Arc::clone(&dns_router) as Arc<dyn Lifecycle>,
-            router as Arc<dyn Lifecycle>,
             inbound as Arc<dyn Lifecycle>,
             service_mgr as Arc<dyn Lifecycle>,
             connection as Arc<dyn Lifecycle>,
@@ -637,7 +579,6 @@ impl RuntimeService {
                 lifecycles,
                 pause,
                 network,
-                dns_router,
                 outbound,
                 #[cfg(feature = "endpoint")]
                 endpoint,
@@ -671,9 +612,11 @@ impl RuntimeService {
             if inner.state == ServiceState::Closed {
                 return Err(HammerError::service_closed());
             }
-            inner
-                .tcp_listener_control
-                .bind_tcp_listener_on_control(bind, owner_worker, capabilities)
+            inner.tcp_listener_control.bind_tcp_listener_on_control(
+                bind,
+                owner_worker,
+                capabilities,
+            )
         })?
     }
 
@@ -715,64 +658,6 @@ impl RuntimeService {
             data.execute(async move {
                 let reports = batch.run(timeout).await;
                 let _ = done.send(Ok(reports));
-            });
-            Ok(())
-        })
-    }
-
-    /// Return the id of the child currently selected by an aggregate
-    /// outbound (e.g. urltest). Leaf outbounds — and any unknown id —
-    /// return `None` so the FFI layer can map it to a nullable string.
-    pub fn current_selection(&self, outbound_id: &str) -> Option<String> {
-        let outbound_id = outbound_id.to_owned();
-        self.control_call(move |inner| {
-            if inner.state == ServiceState::Closed {
-                return None;
-            }
-            inner
-                .outbound
-                .get(&outbound_id)
-                .and_then(|o| o.runtime().now())
-        })
-        .ok()
-        .flatten()
-    }
-
-    /// Trigger a one-shot probe sweep on an aggregate outbound and
-    /// collect per-child latency reports. Mirrors sing-box's
-    /// `URLTest()`: the call drives the same probe path used by the
-    /// PostStart kickoff, then returns the resulting samples.
-    ///
-    /// `timeout` is forwarded to each per-child probe. A zero value
-    /// means "use the value baked into the outbound config".
-    pub fn urltest(&self, outbound_id: &str, timeout: Duration) -> HammerResult<Vec<ProbeReport>> {
-        let timeout_outbound_id = outbound_id.to_owned();
-        let effective_timeout = self.control_call(move |inner| {
-            if inner.state == ServiceState::Closed {
-                return Err(HammerError::service_closed());
-            }
-            let outbound = inner.outbound.get(&timeout_outbound_id).ok_or_else(|| {
-                HammerError::config_validation(format!(
-                    "outbound '{timeout_outbound_id}' is not registered"
-                ))
-            })?;
-            Ok(outbound.runtime().probe_group_timeout(timeout))
-        })??;
-
-        let outbound_id = outbound_id.to_owned();
-        let outer_timeout = effective_timeout.saturating_add(CONTROL_ASYNC_BUFFER);
-        self.control_async_call(outer_timeout, move |inner, data, done| {
-            if inner.state == ServiceState::Closed {
-                return Err(HammerError::service_closed());
-            }
-            let outbound = inner.outbound.get(&outbound_id).ok_or_else(|| {
-                HammerError::config_validation(format!(
-                    "outbound '{outbound_id}' is not registered"
-                ))
-            })?;
-            data.execute(async move {
-                let reports = outbound.runtime().probe_group(timeout).await;
-                let _ = done.send(reports);
             });
             Ok(())
         })
@@ -823,15 +708,13 @@ impl RuntimeService {
                 return;
             }
             inner.network.reset_network();
-            // Drop cached outbound clients (e.g. hysteria2 QUIC connections)
-            // alongside the inbound + DNS reset. Without this, sing-box-style
+            // Drop cached outbound clients alongside the inbound reset. Without this, sing-box-style
             // `InterfaceUpdated` semantics never reach our outbounds, so a
             // stale cached_client survives every network reset and the next
             // dial blocks on the dead QUIC connection's max_idle_timeout.
             inner.outbound.reset_network();
             #[cfg(feature = "endpoint")]
             inner.endpoint.reset_network();
-            inner.dns_router.reset_network();
             inner.outbound.ensure_connected();
         });
     }
@@ -1232,13 +1115,11 @@ fn compare_runtime_rows(a: &NodeRuntimeStatsRow, b: &NodeRuntimeStatsRow) -> std
 
 /// Wraps every declared `Endpoint` in an `EndpointOutboundAdapter` and
 /// registers it into the `OutboundManager` under the endpoint's id. This
-/// is what lets `[[dns.servers]] via = "<endpoint-id>"` resolve through
-/// the same `outbound.get(...)` path used by every other transport.
+/// keeps endpoint-backed egress reachable through the same `outbound.get(...)`
+/// path used by every other transport.
 ///
-/// Must run after the user's `[[outbounds]]` are loaded (so duplicate-id
-/// validation lines up with the parse-time `validate_unique_ids` check)
-/// and before `bind_aggregates()` (so urltest children that reference an
-/// endpoint id resolve to the adapter rather than an empty slot).
+/// Must run after the user's `[[outbounds]]` are loaded so duplicate-id
+/// validation lines up with the parse-time `validate_unique_ids` check.
 #[cfg(feature = "endpoint")]
 fn register_endpoint_outbound_adapters(
     outbound: &Arc<OutboundManager>,
@@ -1646,15 +1527,13 @@ auto_route = false
 strict_route = true
 mtu = 1400
 stack = "disabled"
-[dns]
-server = "udp://1.1.1.1"
 
 [[outbounds]]
-type = "direct"
-id = "direct"
+type = "block"
+id = "block"
 
 [route]
-final = "direct"
+final = "block"
 
 {extra}
 "#
@@ -1914,7 +1793,7 @@ interval = "5s"
                         .expect("recv sqe descriptor");
                     let runtime = with_data_plane_buffers(Clone::clone);
                     let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"service-app-context")
+                        .alloc_index_with_bytes(b"service-app-context")
                         .expect("alloc buffer");
                     worker
                         .runtime()

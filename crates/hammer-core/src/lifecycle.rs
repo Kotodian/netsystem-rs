@@ -27,17 +27,14 @@ pub const ALL_STAGES: [StartStage; 4] = [
 ];
 
 /// Order MUST match `hammer/service.go` `lifecycles` slice in the Go reference.
-/// Reordering will silently break dependencies (e.g. network manager must
-/// initialize before dns-transport opens its first socket).
+/// Reordering will silently break dependencies between managers.
 #[cfg(feature = "wireguard")]
-pub const LIFECYCLE_ORDER: [&str; 11] = [
+pub const LIFECYCLE_ORDER: [&str; 9] = [
     "certificate-store",
     "certificate-provider",
     "endpoint",
     "network",
-    "dns-transport",
     "outbound",
-    "dns-router",
     "router",
     "inbound",
     "service",
@@ -45,13 +42,11 @@ pub const LIFECYCLE_ORDER: [&str; 11] = [
 ];
 
 #[cfg(not(feature = "wireguard"))]
-pub const LIFECYCLE_ORDER: [&str; 10] = [
+pub const LIFECYCLE_ORDER: [&str; 8] = [
     "certificate-store",
     "certificate-provider",
     "network",
-    "dns-transport",
     "outbound",
-    "dns-router",
     "router",
     "inbound",
     "service",

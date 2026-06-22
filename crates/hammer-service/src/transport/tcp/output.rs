@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
@@ -114,9 +114,24 @@ fn tcp_output_node_process_frame(
     drop: NodeId,
     cached_next: Option<NodeId>,
 ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    NodeVectorDispatch::new(cached_next).route_frame_index(runtime, frame, |index| {
-        Ok(Some(tcp_output_next_for_index(runtime, index, lookup, drop)?))
-    })
+    NodeVectorDispatch::new(cached_next).route_frame(
+        runtime,
+        frame,
+        prefetch_tcp_output,
+        |_, indices, nexts| {
+            for (offset, index) in indices.iter().copied().enumerate() {
+                nexts[offset] = Some(tcp_output_next_for_index(runtime, index, lookup, drop)?);
+            }
+            Ok(())
+        },
+    )
+}
+
+#[inline(always)]
+fn prefetch_tcp_output(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+    for index in indices.iter().copied() {
+        batch.prefetch_read(index);
+    }
 }
 
 fn tcp_output_next_for_index(
@@ -202,7 +217,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{BufferFrame, NodeProcessFn, RouteMetadata};
+    use hammer_adapter::{BufferFrame, NodeProcessFn};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
 
     use super::*;
@@ -330,12 +345,10 @@ mod tests {
     #[test]
     fn tcp_output_prepends_segment_header_and_routes_lookup() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
-        let index = runtime
-            .alloc_index(RouteMetadata::default())
-            .expect("buffer");
+        let index = runtime.alloc_index().expect("buffer");
         runtime.append(index, b"hello").expect("payload");
         test_segment(5)
-            .write_to_buffer(&runtime, index)
+            .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
 
         send_to_output(&runtime, output, index);
@@ -359,9 +372,7 @@ mod tests {
     #[test]
     fn tcp_output_missing_intent_routes_drop() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
-        let index = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
-            .expect("buffer");
+        let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
 
         send_to_output(&runtime, output, index);
         assert_eq!(runtime.run_ready_nodes().expect("run output"), 2);
@@ -373,16 +384,14 @@ mod tests {
     #[test]
     fn tcp_output_routes_drop_when_prepend_fails() {
         let (runtime, lookup_state, drop_state, output) = output_graph();
-        let index = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
-            .expect("buffer");
+        let index = runtime.alloc_index_with_bytes(b"hello").expect("buffer");
         let current_data = runtime.current_data(index).expect("current data");
         runtime
             .packet_buffers()
             .advance(index, current_data)
             .expect("consume headroom");
         test_segment(5)
-            .write_to_buffer(&runtime, index)
+            .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
 
         send_to_output(&runtime, output, index);

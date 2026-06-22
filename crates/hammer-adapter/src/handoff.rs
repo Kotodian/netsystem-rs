@@ -186,16 +186,14 @@ impl DataPlaneHandoffWorker {
 
 #[cfg(test)]
 mod tests {
-    use crate::{DataPlaneRuntime, RouteMetadata};
+    use crate::DataPlaneRuntime;
 
     use super::*;
 
     #[test]
     fn enqueue_index_uses_inline_handoff_payload() {
         let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(64, 1);
-        let index = runtime
-            .alloc_index(RouteMetadata::default())
-            .expect("alloc index");
+        let index = runtime.alloc_index().expect("alloc index");
         let handoff = DataPlaneHandoff::new(2, 4);
         let source = handoff.worker(DataWorkerId::new(0));
         let target = handoff.worker(DataWorkerId::new(1));

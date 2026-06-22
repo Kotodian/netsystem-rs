@@ -1,6 +1,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::fmt;
 use std::future::Future;
+use std::mem::transmute;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::rc::Rc;
@@ -8,14 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::{boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
+use hammer_infra::{align::CacheLine, boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
 
-use crate::RouteMetadata;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
 use crate::node::{NodeHandle, NodeId, NodeNext, NodeRuntime};
-use crate::packet_buffer::{PrimaryOpaque, SecondaryOpaque};
-use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle, TraceMark};
+use crate::packet_buffer::NetworkOpaque;
+use crate::packet_buffer::{
+    PACKET_BUFFER_INVALID_INDEX, PacketBufferCacheline0, PacketBufferCacheline1, PacketBufferFlags,
+    PrimaryOpaque, SecondaryOpaque,
+};
+use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
 pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
@@ -65,41 +69,16 @@ impl BufferIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BufferFlags(u32);
-
-impl BufferFlags {
-    pub const NEXT_PRESENT: Self = Self(1 << 0);
-
-    #[inline]
-    pub fn empty() -> Self {
-        Self(0)
-    }
-
-    #[inline]
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    #[inline]
-    fn insert(&mut self, other: Self) {
-        self.0 |= other.0;
-    }
-
-    #[inline]
-    fn remove(&mut self, other: Self) {
-        self.0 &= !other.0;
-    }
-}
+pub type BufferFlags = PacketBufferFlags;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct BufferPacketCursor {
-    packet_len: usize,
-    network_header_offset: usize,
-    network_header_len: usize,
-    transport_header_offset: usize,
-    transport_header_len: usize,
-    transport_payload_offset: usize,
+    pub(crate) packet_len: u32,
+    pub(crate) network_header_offset: u16,
+    pub(crate) network_header_len: u16,
+    pub(crate) transport_header_offset: u16,
+    pub(crate) transport_header_len: u16,
+    pub(crate) transport_payload_offset: u16,
 }
 
 impl BufferPacketCursor {
@@ -110,57 +89,61 @@ impl BufferPacketCursor {
 
     #[inline]
     pub fn packet_len(self) -> usize {
-        self.packet_len
+        self.packet_len as usize
     }
 
     #[inline]
     pub fn network_header_offset(self) -> usize {
-        self.network_header_offset
+        self.network_header_offset as usize
     }
 
     #[inline]
     pub fn network_header_len(self) -> usize {
-        self.network_header_len
+        usize::from(self.network_header_len)
     }
 
     #[inline]
     pub fn transport_header_offset(self) -> usize {
-        self.transport_header_offset
+        usize::from(self.transport_header_offset)
     }
 
     #[inline]
     pub fn transport_header_len(self) -> usize {
-        self.transport_header_len
+        usize::from(self.transport_header_len)
     }
 
     #[inline]
     pub fn transport_payload_offset(self) -> usize {
-        self.transport_payload_offset
+        usize::from(self.transport_payload_offset)
     }
 
     #[inline]
     pub fn with_packet_len(mut self, packet_len: usize) -> Self {
-        self.packet_len = packet_len;
+        self.packet_len = u32::try_from(packet_len).expect("packet length exceeds u32");
         self
     }
 
     #[inline]
     pub fn with_network_header(mut self, offset: usize, len: usize) -> Self {
-        self.network_header_offset = offset;
-        self.network_header_len = len;
+        self.network_header_offset =
+            u16::try_from(offset).expect("network header offset exceeds u16");
+        self.network_header_len = u16::try_from(len).expect("network header length exceeds u16");
         self
     }
 
     #[inline]
     pub fn with_transport_header(mut self, offset: usize, len: usize) -> Self {
-        self.transport_header_offset = offset;
-        self.transport_header_len = len;
+        self.transport_header_offset =
+            u16::try_from(offset).expect("transport header offset exceeds u16");
+        self.transport_header_len =
+            u16::try_from(len).expect("transport header length exceeds u16");
         self
     }
 
     #[inline]
     pub fn with_transport_payload_offset(mut self, offset: usize) -> Self {
-        self.transport_payload_offset = offset;
+        self.transport_payload_offset =
+            u16::try_from(offset).expect("transport payload offset exceeds u16");
         self
     }
 }
@@ -191,47 +174,25 @@ impl BufferNodeError {
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct Buffer {
-    metadata: RouteMetadata,
-    opaque: PrimaryOpaque,
-    opaque2: SecondaryOpaque,
-    packet_cursor: BufferPacketCursor,
-    node_error: Option<BufferNodeError>,
-    handoff_source_worker: Option<DataWorkerId>,
-    trace_mark: Option<TraceMark>,
-    flags: BufferFlags,
-    ref_count: usize,
-    current_data: usize,
-    current_len: usize,
-    data_len: usize,
-    next_buffer: Option<BufferIndex>,
-    total_len_not_including_first: usize,
+    cacheline0: PacketBufferCacheline0,
+    cacheline1: PacketBufferCacheline1,
     storage: Slice<u8>,
 }
+
+const _: () = assert!(std::mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
 
 impl Buffer {
     #[inline]
     fn with_slot_capacity(slot_capacity: usize) -> Self {
         Self {
-            metadata: RouteMetadata::default(),
-            opaque: PrimaryOpaque::default(),
-            opaque2: SecondaryOpaque::default(),
-            packet_cursor: BufferPacketCursor::default(),
-            node_error: None,
-            handoff_source_worker: None,
-            trace_mark: None,
-            flags: BufferFlags::empty(),
-            ref_count: 0,
-            current_data: 0,
-            current_len: 0,
-            data_len: 0,
-            next_buffer: None,
-            total_len_not_including_first: 0,
+            cacheline0: PacketBufferCacheline0::default(),
+            cacheline1: PacketBufferCacheline1::default(),
             storage: Slice::from_elem(slot_capacity, 0),
         }
     }
 
     #[inline]
-    fn reset(&mut self, metadata: RouteMetadata, bytes: &[u8]) -> CoreResult<()> {
+    fn reset(&mut self, bytes: &[u8]) -> CoreResult<()> {
         if bytes.len() > self.storage.len() {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
@@ -239,149 +200,137 @@ impl Buffer {
                 self.storage.len()
             )));
         }
-        self.metadata = metadata;
-        self.opaque.clear();
-        self.opaque2.clear();
-        self.packet_cursor = BufferPacketCursor::default();
-        self.node_error = None;
-        self.handoff_source_worker = None;
-        self.trace_mark = None;
-        self.flags = BufferFlags::empty();
-        self.ref_count = 1;
-        self.current_data = 0;
-        self.current_len = bytes.len();
-        self.data_len = bytes.len();
-        self.next_buffer = None;
-        self.total_len_not_including_first = 0;
+        let current_len = u16::try_from(bytes.len())
+            .map_err(|_| CoreError::internal("buffer length exceeds u16"))?;
+        self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline0.current_length = current_len;
+        self.cacheline0.ref_count = 1;
+        self.cacheline1 = PacketBufferCacheline1::default();
         self.storage.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 
     #[inline]
     fn reset_for_free(&mut self) {
-        self.metadata = RouteMetadata::default();
-        self.opaque.clear();
-        self.opaque2.clear();
-        self.packet_cursor = BufferPacketCursor::default();
-        self.node_error = None;
-        self.handoff_source_worker = None;
-        self.trace_mark = None;
-        self.flags = BufferFlags::empty();
-        self.ref_count = 0;
-        self.current_data = 0;
-        self.current_len = 0;
-        self.data_len = 0;
-        self.next_buffer = None;
-        self.total_len_not_including_first = 0;
-    }
-
-    #[inline]
-    pub fn metadata(&self) -> &RouteMetadata {
-        &self.metadata
-    }
-
-    #[inline]
-    pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
-        self.assert_exclusive();
-        &mut self.metadata
+        self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline1 = PacketBufferCacheline1::default();
     }
 
     #[inline]
     pub fn opaque(&self) -> &PrimaryOpaque {
-        &self.opaque
+        &self.cacheline0.opaque
     }
 
     #[inline]
     pub fn opaque_mut(&mut self) -> &mut PrimaryOpaque {
         self.assert_exclusive();
-        &mut self.opaque
+        &mut self.cacheline0.opaque
     }
 
     #[inline]
     pub fn opaque2(&self) -> &SecondaryOpaque {
-        &self.opaque2
+        &self.cacheline1.opaque2
     }
 
     #[inline]
     pub fn opaque2_mut(&mut self) -> &mut SecondaryOpaque {
         self.assert_exclusive();
-        &mut self.opaque2
+        &mut self.cacheline1.opaque2
     }
 
     #[inline]
     pub fn packet_cursor(&self) -> BufferPacketCursor {
-        self.packet_cursor
+        unsafe { transmute::<&PrimaryOpaque, &NetworkOpaque>(&self.cacheline0.opaque) }
+            .packet_cursor()
     }
 
     #[inline]
-    pub fn packet_cursor_mut(&mut self) -> &mut BufferPacketCursor {
+    pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
         self.assert_exclusive();
-        &mut self.packet_cursor
+        unsafe { transmute::<&mut PrimaryOpaque, &mut NetworkOpaque>(&mut self.cacheline0.opaque) }
+            .set_packet_cursor(cursor)
     }
 
     #[inline]
-    pub fn node_error(&self) -> Option<BufferNodeError> {
-        self.node_error
+    pub fn current_config(&self) -> crate::NodeId {
+        crate::NodeId::new(self.cacheline0.current_config_or_punt)
+    }
+
+    #[inline]
+    pub fn set_current_config(&mut self, next: crate::NodeId) {
+        self.assert_exclusive();
+        self.cacheline0.current_config_or_punt = next.slot();
+    }
+
+    #[inline]
+    pub fn node_error_code(&self) -> Option<u16> {
+        (self.cacheline0.error != 0).then_some(self.cacheline0.error)
     }
 
     #[inline]
     pub fn handoff_source_worker(&self) -> Option<DataWorkerId> {
-        self.handoff_source_worker
+        unsafe { transmute::<&PrimaryOpaque, &NetworkOpaque>(&self.cacheline0.opaque) }
+            .handoff_source_worker()
+            .map(|worker| DataWorkerId::new(u32::from(worker)))
     }
 
     #[inline]
-    pub fn trace_mark(&self) -> Option<TraceMark> {
-        self.trace_mark
+    pub fn trace_handle(&self) -> Option<u32> {
+        (self.cacheline1.trace_handle != 0).then_some(self.cacheline1.trace_handle)
     }
 
     #[inline]
     pub fn set_handoff_source_worker(&mut self, worker: DataWorkerId) {
         self.assert_exclusive();
-        self.handoff_source_worker = Some(worker);
+        unsafe { transmute::<&mut PrimaryOpaque, &mut NetworkOpaque>(&mut self.cacheline0.opaque) }
+            .set_handoff_source_worker(Some(worker.slot() as u16));
     }
 
     #[inline]
-    pub fn set_trace_mark(&mut self, mark: TraceMark) {
+    pub fn set_trace_handle(&mut self, handle: u32) {
         self.assert_exclusive();
-        self.trace_mark = Some(mark);
+        self.cacheline1.trace_handle = handle;
     }
 
     #[inline]
-    pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+    pub fn take_trace_handle(&mut self) -> Option<u32> {
         self.assert_exclusive();
-        self.trace_mark.take()
+        let handle = self.trace_handle();
+        self.cacheline1.trace_handle = 0;
+        handle
     }
 
     #[inline]
     pub fn set_node_error(&mut self, error: BufferNodeError) {
         self.assert_exclusive();
-        self.node_error = Some(error);
+        self.cacheline0.error = error.code();
     }
 
     #[inline]
     pub fn clear_node_error(&mut self) {
         self.assert_exclusive();
-        self.node_error = None;
+        self.cacheline0.error = 0;
     }
 
     #[inline]
     pub fn flags(&self) -> BufferFlags {
-        self.flags
+        self.cacheline0.flags
     }
 
     #[inline]
     pub fn current_data(&self) -> usize {
-        self.current_data
+        usize::try_from(self.cacheline0.current_data)
+            .expect("buffer current_data must remain non-negative")
     }
 
     #[inline]
     fn ref_count(&self) -> usize {
-        self.ref_count
+        usize::from(self.cacheline0.ref_count)
     }
 
     #[inline]
     fn ensure_exclusive(&self) -> CoreResult<()> {
-        if self.ref_count != 1 {
+        if self.ref_count() != 1 {
             return Err(CoreError::internal(
                 "shared buffer segment requires exclusive ownership",
             ));
@@ -392,34 +341,34 @@ impl Buffer {
     #[inline]
     fn assert_exclusive(&self) {
         assert_eq!(
-            self.ref_count, 1,
+            self.ref_count(),
+            1,
             "shared buffer segment requires exclusive ownership"
         );
     }
 
     #[inline]
     pub fn current_len(&self) -> usize {
-        self.current_len
+        usize::from(self.cacheline0.current_length)
     }
 
     #[inline]
-    pub fn data_len(&self) -> usize {
-        self.data_len
-    }
-
-    #[inline]
-    pub fn next_buffer(&self) -> Option<BufferIndex> {
-        self.next_buffer
+    pub fn next_buffer_slot(&self) -> Option<u32> {
+        self.flags()
+            .contains(BufferFlags::NEXT_PRESENT)
+            .then_some(self.cacheline0.next_buffer)
     }
 
     #[inline]
     pub fn total_len_not_including_first(&self) -> usize {
-        self.total_len_not_including_first
+        self.cacheline1.total_length_not_including_first as usize
     }
 
     #[inline]
     pub fn current(&self) -> &[u8] {
-        &self.storage.as_slice()[self.current_data..self.current_data + self.current_len]
+        let start = self.current_data();
+        let end = start + self.current_len();
+        &self.storage.as_slice()[start..end]
     }
 
     #[inline]
@@ -430,15 +379,15 @@ impl Buffer {
     #[inline]
     pub fn current_mut(&mut self) -> &mut [u8] {
         self.assert_exclusive();
-        let start = self.current_data;
-        let end = start + self.current_len;
+        let start = self.current_data();
+        let end = start + self.current_len();
         &mut self.storage.as_mut_slice()[start..end]
     }
 
     #[inline]
     pub fn writable_tail_mut(&mut self) -> &mut [u8] {
         self.assert_exclusive();
-        let start = self.current_data + self.current_len;
+        let start = self.current_data() + self.current_len();
         &mut self.storage.as_mut_slice()[start..]
     }
 
@@ -448,8 +397,7 @@ impl Buffer {
         if len > self.available_tail() {
             return Err(CoreError::internal("buffer commit exceeds writable tail"));
         }
-        self.current_len += len;
-        self.data_len = self.data_len.max(self.current_data + self.current_len);
+        self.set_current_len(self.current_len() + len)?;
         Ok(())
     }
 
@@ -462,7 +410,7 @@ impl Buffer {
     fn available_tail(&self) -> usize {
         self.storage
             .len()
-            .saturating_sub(self.current_data + self.current_len)
+            .saturating_sub(self.current_data() + self.current_len())
     }
 
     #[inline]
@@ -472,16 +420,62 @@ impl Buffer {
         if take == 0 {
             return 0;
         }
-        let start = self.current_data + self.current_len;
+        let start = self.current_data() + self.current_len();
         let end = start + take;
         self.storage.as_mut_slice()[start..end].copy_from_slice(&bytes[..take]);
-        self.current_len += take;
-        self.data_len = self.data_len.max(end);
+        self.set_current_len(self.current_len() + take)
+            .expect("buffer append keeps current length within u16");
         take
+    }
+
+    #[inline]
+    fn set_current_data(&mut self, len: usize) -> CoreResult<()> {
+        self.cacheline0.current_data = i16::try_from(len)
+            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn set_current_len(&mut self, len: usize) -> CoreResult<()> {
+        self.cacheline0.current_length = u16::try_from(len)
+            .map_err(|_| CoreError::internal("buffer current_length exceeds u16"))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn set_ref_count(&mut self, count: usize) -> CoreResult<()> {
+        self.cacheline0.ref_count =
+            u8::try_from(count).map_err(|_| CoreError::internal("buffer ref_count exceeds u8"))?;
+        Ok(())
+    }
+
+    #[inline]
+    fn set_next_buffer(&mut self, next: Option<BufferIndex>) {
+        self.cacheline0.next_buffer = next.map_or(PACKET_BUFFER_INVALID_INDEX, BufferIndex::slot);
+        if next.is_some() {
+            self.cacheline0.flags.insert(BufferFlags::NEXT_PRESENT);
+        } else {
+            self.cacheline0.flags.remove(BufferFlags::NEXT_PRESENT);
+        }
+    }
+
+    #[inline]
+    fn take_next_buffer_slot(&mut self) -> Option<u32> {
+        let next = self.next_buffer_slot();
+        self.set_next_buffer(None);
+        next
+    }
+
+    #[inline]
+    fn set_total_len_not_including_first(&mut self, len: usize) -> CoreResult<()> {
+        self.cacheline1.total_length_not_including_first = u32::try_from(len)
+            .map_err(|_| CoreError::internal("buffer chain tail length exceeds u32"))?;
+        Ok(())
     }
 }
 
 #[derive(Debug)]
+#[repr(C, align(64))]
 struct BufferSlot {
     generation: u32,
     allocated: bool,
@@ -492,7 +486,7 @@ struct BufferSlot {
 struct BufferPoolInner {
     pool_id: u64,
     slot_capacity: usize,
-    slots: Vec<BufferSlot>,
+    slots: Vec<CacheLine<BufferSlot>>,
     free: Vec<u32>,
     in_use: usize,
 }
@@ -709,34 +703,35 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
-        self.buffers.alloc_index(metadata)
+    pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
+        self.buffers.alloc_index()
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(
-        &self,
-        metadata: RouteMetadata,
-        bytes: &[u8],
-    ) -> CoreResult<BufferIndex> {
-        self.buffers.alloc_index_with_bytes(metadata, bytes)
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
+        self.buffers.alloc_index_with_bytes(bytes)
     }
 
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         let mut cache = self.buffers.thread_cache.borrow_mut();
-        let marks = self
+        let handles = self
             .buffers
             .arena
             .inner
             .borrow_mut()
-            .free_chain_collect_trace_marks(&mut cache, index);
-        self.finalize_trace_marks(marks);
+            .free_chain_collect_trace_handles(&mut cache, index);
+        self.finalize_trace_handles(handles);
     }
 
     #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         self.buffers.attach_clone(head, tail)
+    }
+
+    #[inline]
+    pub fn prefetch_header(&self, index: BufferIndex) {
+        self.buffers.prefetch_header(index);
     }
 
     #[inline]
@@ -847,11 +842,6 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
-        self.buffers.metadata(index)
-    }
-
-    #[inline]
     pub fn get_buffer(&self, index: BufferIndex) -> CoreResult<BufferRef<'_>> {
         self.buffers.get(index)
     }
@@ -874,29 +864,6 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         self.buffers.advance(index, len)
-    }
-
-    #[inline]
-    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
-        self.buffers.node_error(index)
-    }
-
-    #[inline]
-    pub fn with_metadata<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&RouteMetadata) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_metadata(index, f)
-    }
-
-    #[inline]
-    pub fn with_metadata_mut<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&mut RouteMetadata) -> R,
-    ) -> CoreResult<R> {
-        self.buffers.with_metadata_mut(index, f)
     }
 
     #[inline]
@@ -925,6 +892,11 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
+    pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
+        self.buffers.node_error_code(index)
+    }
+
+    #[inline]
     pub fn handoff_source_worker(&self, index: BufferIndex) -> CoreResult<Option<DataWorkerId>> {
         self.buffers.handoff_source_worker(index)
     }
@@ -936,6 +908,16 @@ impl DataPlaneBuffers {
         worker: DataWorkerId,
     ) -> CoreResult<()> {
         self.buffers.mark_handoff_source_worker(index, worker)
+    }
+
+    #[inline]
+    pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
+        self.buffers.current_config(index)
+    }
+
+    #[inline]
+    pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
+        self.buffers.set_current_config(index, next)
     }
 
     #[inline]
@@ -1002,14 +984,23 @@ impl DataPlaneBuffers {
         self.buffers.with_current_chain_io_segments(index, f)
     }
 
-    fn finalize_trace_marks(&self, marks: Vec<TraceMark>) {
-        for mark in marks {
-            self.trace.finalize(mark);
+    fn finalize_trace_handles(&self, handles: Vec<u32>) {
+        for handle in handles {
+            self.trace.finalize(handle);
         }
     }
 }
 
 impl DataPlaneRuntime {
+    #[inline]
+    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
+        let code = self.buffers.node_error_code(index)?;
+        match code {
+            Some(code) => self.nodes.decode_node_error(code),
+            None => Ok(None),
+        }
+    }
+
     #[inline]
     pub fn with_buffer_capacity(slot_capacity: usize, slots: usize) -> Self {
         Self::with_capacities_and_instruction_set(
@@ -1158,12 +1149,12 @@ impl DataPlaneRuntime {
         if !self.buffers.trace.may_mark(node) {
             return Ok(());
         }
-        if self.get_buffer(index)?.trace_mark().is_some() {
+        if self.get_buffer(index)?.trace_handle().is_some() {
             return Ok(());
         }
         let node_name = self.nodes.node_name(node)?;
-        if let Some(mark) = self.buffers.trace.try_mark(node, node_name) {
-            self.get_buffer_mut(index)?.set_trace_mark(mark);
+        if let Some(handle) = self.buffers.trace.try_mark(node, node_name) {
+            self.get_buffer_mut(index)?.set_trace_handle(handle);
         }
         Ok(())
     }
@@ -1173,7 +1164,7 @@ impl DataPlaneRuntime {
         let Some(node) = self.current_node() else {
             return Ok(());
         };
-        let Some(mark) = self.get_buffer(index)?.trace_mark() else {
+        let Some(handle) = self.get_buffer(index)?.trace_handle() else {
             return Ok(());
         };
         let node_name = self.nodes.node_name(node)?;
@@ -1182,14 +1173,14 @@ impl DataPlaneRuntime {
         trace.encode_trace(&mut payload_bytes);
         self.buffers
             .trace
-            .add_entry(mark, node, node_name, formatter, payload_bytes);
+            .add_entry(handle, node, node_name, formatter, payload_bytes);
         Ok(())
     }
 
     #[inline(always)]
     pub fn should_trace_packet(&self, index: BufferIndex) -> CoreResult<bool> {
         Ok(crate::unlikely(
-            self.get_buffer(index)?.trace_mark().is_some(),
+            self.get_buffer(index)?.trace_handle().is_some(),
         ))
     }
 
@@ -1210,12 +1201,11 @@ impl DataPlaneRuntime {
     }
 
     #[inline]
-    pub fn record_current_node_error(&self, code: u16) -> CoreResult<BufferNodeError> {
+    pub fn record_current_node_error(&self, code: u16) -> CoreResult<u16> {
         let node = self
             .current_node()
             .ok_or_else(|| CoreError::internal("node error set outside node processing"))?;
-        self.nodes.increment_node_error(node, code)?;
-        Ok(BufferNodeError::new(node, code))
+        self.nodes.increment_node_error(node, code)
     }
 
     #[inline]
@@ -1472,10 +1462,12 @@ impl BufferPoolArena {
             .map(|slot| u32::try_from(slot).expect("buffer slot index fits u32"))
             .collect();
         let slots = (0..slots)
-            .map(|_| BufferSlot {
-                generation: 0,
-                allocated: false,
-                buffer: Buffer::with_slot_capacity(slot_capacity),
+            .map(|_| {
+                CacheLine::new(BufferSlot {
+                    generation: 0,
+                    allocated: false,
+                    buffer: Buffer::with_slot_capacity(slot_capacity),
+                })
             })
             .collect();
         Self {
@@ -1542,21 +1534,17 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn alloc_index(&self, metadata: RouteMetadata) -> CoreResult<BufferIndex> {
+    pub fn alloc_index(&self) -> CoreResult<BufferIndex> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.borrow_mut();
-        arena.alloc_empty_chain(&mut cache, metadata)
+        arena.alloc_empty_chain(&mut cache)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(
-        &self,
-        metadata: RouteMetadata,
-        bytes: &[u8],
-    ) -> CoreResult<BufferIndex> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> CoreResult<BufferIndex> {
         let mut cache = self.thread_cache.borrow_mut();
         let mut arena = self.arena.inner.borrow_mut();
-        arena.alloc_chain(&mut cache, metadata, bytes)
+        arena.alloc_chain(&mut cache, bytes)
     }
 
     #[inline]
@@ -1566,12 +1554,17 @@ impl BufferPool {
             .arena
             .inner
             .borrow_mut()
-            .free_chain_collect_trace_marks(&mut cache, index);
+            .free_chain_collect_trace_handles(&mut cache, index);
     }
 
     #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         self.arena.inner.borrow_mut().attach_clone(head, tail)
+    }
+
+    #[inline]
+    pub fn prefetch_header(&self, index: BufferIndex) {
+        self.arena.inner.borrow().prefetch_header(index);
     }
 
     #[inline]
@@ -1584,7 +1577,7 @@ impl BufferPool {
         let mut cache = self.thread_cache.borrow_mut();
         let mut pool = self.arena.inner.borrow_mut();
         for index in frame.drain_indices() {
-            let _ = pool.free_chain_collect_trace_marks(&mut cache, index);
+            let _ = pool.free_chain_collect_trace_handles(&mut cache, index);
         }
     }
 
@@ -1670,36 +1663,21 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn node_error(&self, index: BufferIndex) -> CoreResult<Option<BufferNodeError>> {
-        Ok(self.arena.inner.borrow().buffer(index)?.node_error())
+    pub fn current_config(&self, index: BufferIndex) -> CoreResult<crate::NodeId> {
+        Ok(self.arena.inner.borrow().buffer(index)?.current_config())
     }
 
     #[inline]
-    pub fn metadata(&self, index: BufferIndex) -> CoreResult<RouteMetadata> {
-        Ok(self.arena.inner.borrow().buffer(index)?.metadata().clone())
+    pub fn set_current_config(&self, index: BufferIndex, next: crate::NodeId) -> CoreResult<()> {
+        let mut guard = self.arena.inner.borrow_mut();
+        guard.buffer(index)?.ensure_exclusive()?;
+        guard.buffer_mut(index)?.set_current_config(next);
+        Ok(())
     }
 
     #[inline]
-    pub fn with_metadata<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&RouteMetadata) -> R,
-    ) -> CoreResult<R> {
-        let pool = self.arena.inner.borrow();
-        let metadata = pool.buffer(index)?.metadata();
-        Ok(f(metadata))
-    }
-
-    #[inline]
-    pub fn with_metadata_mut<R>(
-        &self,
-        index: BufferIndex,
-        f: impl FnOnce(&mut RouteMetadata) -> R,
-    ) -> CoreResult<R> {
-        let mut pool = self.arena.inner.borrow_mut();
-        pool.buffer(index)?.ensure_exclusive()?;
-        let metadata = pool.buffer_mut(index)?.metadata_mut();
-        Ok(f(metadata))
+    pub fn node_error_code(&self, index: BufferIndex) -> CoreResult<Option<u16>> {
+        Ok(self.arena.inner.borrow().buffer(index)?.node_error_code())
     }
 
     #[inline]
@@ -1713,12 +1691,12 @@ impl BufferPool {
         let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         buffer.ensure_exclusive()?;
-        if len > buffer.current_len {
+        if len > buffer.current_len() {
             return Err(CoreError::internal(
                 "buffer truncate extends current length",
             ));
         }
-        buffer.current_len = len;
+        buffer.set_current_len(len)?;
         Ok(())
     }
 
@@ -1727,14 +1705,14 @@ impl BufferPool {
         let mut pool = self.arena.inner.borrow_mut();
         let buffer = pool.buffer_mut(index)?;
         buffer.ensure_exclusive()?;
-        if bytes.len() > buffer.current_data {
+        if bytes.len() > buffer.current_data() {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
         }
-        buffer.current_data -= bytes.len();
-        let start = buffer.current_data;
+        let start = buffer.current_data() - bytes.len();
+        buffer.set_current_data(start)?;
         let end = start + bytes.len();
         buffer.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
-        buffer.current_len += bytes.len();
+        buffer.set_current_len(buffer.current_len() + bytes.len())?;
         Ok(())
     }
 
@@ -1789,20 +1767,14 @@ impl BufferPool {
 
     #[inline]
     pub fn is_chained(&self, index: BufferIndex) -> CoreResult<bool> {
-        Ok(self
-            .arena
-            .inner
-            .borrow()
-            .buffer(index)?
-            .next_buffer()
-            .is_some())
+        Ok(self.arena.inner.borrow().next_buffer(index)?.is_some())
     }
 
     #[inline]
     pub fn copy_packet(&self, index: BufferIndex) -> CoreResult<Vec<u8>> {
         let inner = self.arena.inner.borrow();
         let buffer = inner.buffer(index)?;
-        if buffer.next_buffer().is_none() {
+        if inner.next_buffer(index)?.is_none() {
             return Ok(buffer.current().iter().copied().collect());
         }
         inner.copy_current_chain(index)
@@ -2113,20 +2085,47 @@ impl DerefMut for PooledBufferFrame {
 
 impl BufferPoolInner {
     #[inline]
+    fn index_from_slot(&self, slot: u32) -> Option<BufferIndex> {
+        Some(BufferIndex {
+            pool_id: self.pool_id,
+            slot,
+            generation: self.next_buffer_generation(slot)?,
+        })
+    }
+
+    #[inline]
+    fn next_buffer_generation(&self, slot: u32) -> Option<u32> {
+        let slot = slot as usize;
+        if slot >= self.slots.len() {
+            return None;
+        }
+        let entry = &self.slots[slot];
+        entry.allocated.then_some(entry.generation)
+    }
+
+    #[inline]
+    fn next_buffer(&self, index: BufferIndex) -> CoreResult<Option<BufferIndex>> {
+        Ok(self
+            .buffer(index)?
+            .next_buffer_slot()
+            .and_then(|slot| self.index_from_slot(slot)))
+    }
+
+    #[inline]
     fn advance(&mut self, index: BufferIndex, len: usize) -> CoreResult<()> {
         if len == 0 {
             return Ok(());
         }
 
         let first = self.buffer(index)?;
-        if first.next_buffer().is_none() {
+        if self.next_buffer(index)?.is_none() {
             if len > first.current_len() {
                 return Err(CoreError::internal("buffer advance exceeds current length"));
             }
             let buffer = self.buffer_mut(index)?;
             buffer.ensure_exclusive()?;
-            buffer.current_data += len;
-            buffer.current_len -= len;
+            buffer.set_current_data(buffer.current_data() + len)?;
+            buffer.set_current_len(buffer.current_len() - len)?;
             return Ok(());
         }
 
@@ -2150,7 +2149,7 @@ impl BufferPoolInner {
                 break;
             }
             remaining -= buffer.current_len();
-            current = buffer.next_buffer();
+            current = self.next_buffer(current_index)?;
         }
 
         for current_index in touched.iter().copied() {
@@ -2161,8 +2160,8 @@ impl BufferPoolInner {
         for current_index in touched.iter().copied() {
             let buffer = self.buffer_mut(current_index)?;
             let consume = remaining.min(buffer.current_len());
-            buffer.current_data += consume;
-            buffer.current_len -= consume;
+            buffer.set_current_data(buffer.current_data() + consume)?;
+            buffer.set_current_len(buffer.current_len() - consume)?;
             remaining -= consume;
             if remaining == 0 {
                 break;
@@ -2176,53 +2175,47 @@ impl BufferPoolInner {
     fn alloc_chain(
         &mut self,
         cache: &mut BufferThreadCache,
-        metadata: RouteMetadata,
         bytes: &[u8],
     ) -> CoreResult<BufferIndex> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
         if bytes.len() <= self.slot_capacity {
-            return self.alloc_slot(cache, metadata, bytes);
+            return self.alloc_slot(cache, bytes);
         }
 
         let first_len = self.slot_capacity;
-        let first = self.alloc_slot(cache, metadata, &bytes[..first_len])?;
+        let first = self.alloc_slot(cache, &bytes[..first_len])?;
         let mut tail = first;
         let mut offset = first_len;
         let mut total_tail_len = 0usize;
 
         while offset < bytes.len() {
             let end = (offset + self.slot_capacity).min(bytes.len());
-            let next = self.alloc_slot(cache, RouteMetadata::default(), &bytes[offset..end])?;
+            let next = self.alloc_slot(cache, &bytes[offset..end])?;
             {
                 let tail_buffer = self.buffer_mut(tail)?;
-                tail_buffer.next_buffer = Some(next);
-                tail_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+                tail_buffer.set_next_buffer(Some(next));
             }
             total_tail_len += end - offset;
             tail = next;
             offset = end;
         }
-        self.buffer_mut(first)?.total_len_not_including_first = total_tail_len;
+        self.buffer_mut(first)?
+            .set_total_len_not_including_first(total_tail_len)?;
         Ok(first)
     }
 
     #[inline]
-    fn alloc_empty_chain(
-        &mut self,
-        cache: &mut BufferThreadCache,
-        metadata: RouteMetadata,
-    ) -> CoreResult<BufferIndex> {
+    fn alloc_empty_chain(&mut self, cache: &mut BufferThreadCache) -> CoreResult<BufferIndex> {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
-        let index = self.alloc_slot(cache, metadata, &[])?;
+        let index = self.alloc_slot(cache, &[])?;
         let headroom = DEFAULT_PACKET_HEADROOM.min(self.slot_capacity);
         {
             let buffer = self.buffer_mut(index)?;
-            buffer.current_data = headroom;
-            buffer.data_len = headroom;
+            buffer.set_current_data(headroom)?;
         }
         Ok(index)
     }
@@ -2231,7 +2224,6 @@ impl BufferPoolInner {
     fn alloc_slot(
         &mut self,
         cache: &mut BufferThreadCache,
-        metadata: RouteMetadata,
         bytes: &[u8],
     ) -> CoreResult<BufferIndex> {
         if bytes.len() > self.slot_capacity {
@@ -2252,7 +2244,7 @@ impl BufferPoolInner {
             .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
         entry.generation = entry.generation.wrapping_add(1).max(1);
         entry.allocated = true;
-        entry.buffer.reset(metadata, bytes)?;
+        entry.buffer.reset(bytes)?;
         self.in_use += 1;
         Ok(BufferIndex {
             pool_id: self.pool_id,
@@ -2302,54 +2294,68 @@ impl BufferPoolInner {
     }
 
     #[inline]
+    fn prefetch_header(&self, index: BufferIndex) {
+        let Ok(buffer) = self.buffer(index) else {
+            return;
+        };
+        prefetch_buffer_header(buffer);
+    }
+
+    #[inline]
     fn prefetch_read(&self, index: BufferIndex) {
         let Ok(buffer) = self.buffer(index) else {
             return;
         };
-        prefetch_buffer_read(buffer);
-        prefetch_next_buffer_read(self, buffer);
+        prefetch_buffer_header(buffer);
+        prefetch_buffer_cacheline1(buffer);
+        prefetch_buffer_data(buffer);
     }
 
     #[inline]
     fn free_chain(&mut self, cache: &mut BufferThreadCache, index: BufferIndex) {
-        let _ = self.free_chain_collect_trace_marks(cache, index);
+        let _ = self.free_chain_collect_trace_handles(cache, index);
     }
 
     #[inline]
-    fn free_chain_collect_trace_marks(
+    fn free_chain_collect_trace_handles(
         &mut self,
         cache: &mut BufferThreadCache,
         index: BufferIndex,
-    ) -> Vec<TraceMark> {
-        let mut released_trace_marks = Vec::new();
+    ) -> Vec<u32> {
+        let mut released_trace_handles = Vec::new();
         let mut next = Some(index);
         while let Some(index) = next {
             if index.pool_id != self.pool_id {
-                return released_trace_marks;
+                return released_trace_handles;
             }
             let Some(entry) = self.slots.get_mut(index.slot as usize) else {
-                return released_trace_marks;
+                return released_trace_handles;
             };
             if entry.generation != index.generation {
-                return released_trace_marks;
+                return released_trace_handles;
             }
             if entry.allocated {
-                next = entry.buffer.next_buffer();
-                entry.buffer.ref_count = entry.buffer.ref_count.saturating_sub(1);
+                let next_slot = entry.buffer.next_buffer_slot();
+                let next_ref_count = entry.buffer.ref_count().saturating_sub(1);
+                let _ = entry.buffer.set_ref_count(next_ref_count);
                 if entry.buffer.ref_count() == 0 {
-                    if let Some(mark) = entry.buffer.trace_mark.take() {
-                        released_trace_marks.push(mark);
+                    let handle = (entry.buffer.cacheline1.trace_handle != 0)
+                        .then_some(entry.buffer.cacheline1.trace_handle);
+                    entry.buffer.cacheline1.trace_handle = 0;
+                    if let Some(handle) = handle {
+                        released_trace_handles.push(handle);
                     }
                     entry.allocated = false;
                     entry.buffer.reset_for_free();
                     self.in_use = self.in_use.saturating_sub(1);
                     cache.free.push(index.slot);
                 }
+                next = next_slot.and_then(|slot| self.index_from_slot(slot));
             } else {
                 next = None;
             }
         }
-        released_trace_marks
+        released_trace_handles
     }
 
     #[inline]
@@ -2361,7 +2367,7 @@ impl BufferPoolInner {
         }
         let head_buffer = self.buffer(head)?;
         head_buffer.ensure_exclusive()?;
-        if head_buffer.next_buffer().is_some() {
+        if self.next_buffer(head)?.is_some() {
             return Err(CoreError::internal(
                 "buffer attach clone requires head without next buffer",
             ));
@@ -2370,17 +2376,19 @@ impl BufferPoolInner {
         let mut next = Some(tail);
         while let Some(index) = next {
             let buffer = self.buffer_mut(index)?;
-            buffer.ref_count = buffer
-                .ref_count
+            let next_ref_count = buffer
+                .ref_count()
                 .checked_add(1)
                 .ok_or_else(|| CoreError::internal("buffer refcount overflow"))?;
-            next = buffer.next_buffer();
+            buffer.set_ref_count(next_ref_count)?;
+            next = buffer
+                .next_buffer_slot()
+                .and_then(|slot| self.index_from_slot(slot));
         }
 
         {
             let head_buffer = self.buffer_mut(head)?;
-            head_buffer.next_buffer = Some(tail);
-            head_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+            head_buffer.set_next_buffer(Some(tail));
         }
         self.refresh_chain_lengths(head)
     }
@@ -2392,7 +2400,7 @@ impl BufferPoolInner {
         while let Some(index) = next {
             let buffer = self.buffer(index)?;
             bytes.extend_from_copy_slice(buffer.current());
-            next = buffer.next_buffer;
+            next = self.next_buffer(index)?;
         }
         Ok(bytes)
     }
@@ -2421,7 +2429,7 @@ impl BufferPoolInner {
             let buffer = self.buffer(index)?;
             segments[segment_count] = buffer.current();
             segment_count += 1;
-            next = buffer.next_buffer;
+            next = self.next_buffer(index)?;
         }
         f(&segments[..segment_count], total_len)
     }
@@ -2435,7 +2443,7 @@ impl BufferPoolInner {
     ) -> CoreResult<()> {
         self.buffer(index)?.ensure_exclusive()?;
         let mut tail = index;
-        while let Some(next) = self.buffer(tail)?.next_buffer {
+        while let Some(next) = self.next_buffer(tail)? {
             tail = next;
         }
 
@@ -2443,11 +2451,10 @@ impl BufferPoolInner {
         let mut remaining = &bytes[taken..];
         while !remaining.is_empty() {
             let take = remaining.len().min(self.slot_capacity);
-            let next = self.alloc_slot(cache, RouteMetadata::default(), &remaining[..take])?;
+            let next = self.alloc_slot(cache, &remaining[..take])?;
             {
                 let tail_buffer = self.buffer_mut(tail)?;
-                tail_buffer.next_buffer = Some(next);
-                tail_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+                tail_buffer.set_next_buffer(Some(next));
             }
             tail = next;
             remaining = &remaining[take..];
@@ -2460,11 +2467,11 @@ impl BufferPoolInner {
         let next = {
             let buffer = self.buffer_mut(index)?;
             buffer.ensure_exclusive()?;
-            let next = buffer.next_buffer.take();
-            buffer.flags.remove(BufferFlags::NEXT_PRESENT);
-            buffer.total_len_not_including_first = 0;
-            next
+            let next_slot = buffer.take_next_buffer_slot();
+            buffer.set_total_len_not_including_first(0)?;
+            next_slot
         };
+        let next = next.and_then(|slot| self.index_from_slot(slot));
         self.refresh_chain_lengths(index)?;
         Ok(next)
     }
@@ -2474,14 +2481,13 @@ impl BufferPoolInner {
         self.buffer(head)?.ensure_exclusive()?;
         self.buffer(tail)?;
         let mut current = head;
-        while let Some(next) = self.buffer(current)?.next_buffer {
+        while let Some(next) = self.next_buffer(current)? {
             current = next;
         }
         {
             let current_buffer = self.buffer_mut(current)?;
             current_buffer.ensure_exclusive()?;
-            current_buffer.next_buffer = Some(tail);
-            current_buffer.flags.insert(BufferFlags::NEXT_PRESENT);
+            current_buffer.set_next_buffer(Some(tail));
         }
         self.refresh_chain_lengths(head)
     }
@@ -2497,21 +2503,21 @@ impl BufferPoolInner {
         let mut current = Some(index);
         while let Some(current_index) = current {
             self.buffer(current_index)?.ensure_exclusive()?;
-            let current_len = self.buffer(current_index)?.current_len;
+            let current_len = self.buffer(current_index)?.current_len();
             if remaining > current_len {
                 remaining -= current_len;
-                current = self.buffer(current_index)?.next_buffer;
+                current = self.next_buffer(current_index)?;
                 continue;
             }
 
             let tail = {
                 let buffer = self.buffer_mut(current_index)?;
-                buffer.current_len = remaining;
-                let tail = buffer.next_buffer.take();
-                buffer.flags.remove(BufferFlags::NEXT_PRESENT);
-                buffer.total_len_not_including_first = 0;
-                tail
+                buffer.set_current_len(remaining)?;
+                let tail_slot = buffer.take_next_buffer_slot();
+                buffer.set_total_len_not_including_first(0)?;
+                tail_slot
             };
+            let tail = tail.and_then(|slot| self.index_from_slot(slot));
             if let Some(tail) = tail {
                 self.free_chain(cache, tail);
             }
@@ -2523,37 +2529,33 @@ impl BufferPoolInner {
     #[inline]
     fn refresh_chain_lengths(&mut self, index: BufferIndex) -> CoreResult<()> {
         let mut total = 0usize;
-        let mut next = self.buffer(index)?.next_buffer;
+        let mut next = self.next_buffer(index)?;
         while let Some(index) = next {
             let buffer = self.buffer(index)?;
-            total += buffer.current_len;
-            next = buffer.next_buffer;
+            total += buffer.current_len();
+            next = self.next_buffer(index)?;
         }
         let buffer = self.buffer_mut(index)?;
         buffer.ensure_exclusive()?;
-        buffer.total_len_not_including_first = total;
+        buffer.set_total_len_not_including_first(total)?;
         Ok(())
     }
 }
 
 #[inline(always)]
-fn prefetch_buffer_read(buffer: &Buffer) {
-    prefetch_read_l1(std::ptr::from_ref(buffer).cast::<u8>());
-    prefetch_read_l1(std::ptr::from_ref(buffer.metadata()).cast::<u8>());
-    if !buffer.current().is_empty() {
-        prefetch_read_l1(buffer.current().as_ptr());
-        if buffer.current().len() > 64 {
-            prefetch_read_l1(unsafe { buffer.current().as_ptr().add(64) });
-        }
-    }
+fn prefetch_buffer_header(buffer: &Buffer) {
+    prefetch_read_l1(std::ptr::from_ref(&buffer.cacheline0).cast::<u8>());
 }
 
 #[inline(always)]
-fn prefetch_next_buffer_read(pool: &BufferPoolInner, buffer: &Buffer) {
-    if let Some(next) = buffer.next_buffer()
-        && let Ok(next_buffer) = pool.buffer(next)
-    {
-        prefetch_read_l1(std::ptr::from_ref(next_buffer).cast::<u8>());
+fn prefetch_buffer_cacheline1(buffer: &Buffer) {
+    prefetch_read_l1(std::ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+}
+
+#[inline(always)]
+fn prefetch_buffer_data(buffer: &Buffer) {
+    if !buffer.current().is_empty() {
+        prefetch_read_l1(buffer.current().as_ptr());
     }
 }
 
@@ -3509,7 +3511,7 @@ impl BufferFramePairBatchCursor<'_> {
     #[inline]
     pub fn prefetch_next_pair(&self, runtime: &DataPlaneRuntime) {
         for index in self.indices[self.offset..].iter().take(2).copied() {
-            runtime.prefetch_read(index);
+            runtime.prefetch_header(index);
         }
     }
 }
@@ -3541,7 +3543,7 @@ impl BufferFrameQuadBatchCursor<'_> {
     #[inline]
     pub fn prefetch_next_quad(&self, runtime: &DataPlaneRuntime) {
         for index in self.indices[self.offset..].iter().take(4).copied() {
-            runtime.prefetch_read(index);
+            runtime.prefetch_header(index);
         }
     }
 }
@@ -3586,7 +3588,7 @@ impl BufferFrameBatchCursor<'_> {
             FrameBatchWidth::Pair => 2,
         };
         for index in self.indices[self.offset..].iter().take(width).copied() {
-            runtime.prefetch_read(index);
+            runtime.prefetch_header(index);
         }
     }
 }
@@ -3709,6 +3711,11 @@ pub struct BufferBatchMut<'pool> {
 
 impl BufferBatchMut<'_> {
     #[inline]
+    pub fn prefetch_header(&self, index: BufferIndex) {
+        self.guard.prefetch_header(index);
+    }
+
+    #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.guard.prefetch_read(index);
     }
@@ -3753,13 +3760,23 @@ pub struct BufferRef<'pool> {
 
 impl BufferRef<'_> {
     #[inline]
+    pub fn prefetch_header(&self) {
+        let buffer = self
+            .guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer");
+        prefetch_buffer_header(buffer);
+    }
+
+    #[inline]
     pub fn prefetch_read(&self) {
         let buffer = self
             .guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer");
-        prefetch_buffer_read(buffer);
-        prefetch_next_buffer_read(&self.guard, buffer);
+        prefetch_buffer_header(buffer);
+        prefetch_buffer_cacheline1(buffer);
+        prefetch_buffer_data(buffer);
     }
 
     #[inline]
@@ -3767,14 +3784,6 @@ impl BufferRef<'_> {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer") as *const Buffer
-    }
-
-    #[inline]
-    pub fn metadata(&self) -> &RouteMetadata {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .metadata()
     }
 
     #[inline]
@@ -3802,19 +3811,28 @@ impl BufferRef<'_> {
     }
 
     #[inline]
+    pub fn current_config(&self) -> crate::NodeId {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_config()
+    }
+
+    #[inline]
     pub fn node_error(&self) -> Option<BufferNodeError> {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
-            .node_error()
+            .node_error_code()
+            .map(|code| BufferNodeError::new(crate::NodeId::new(0), code))
     }
 
     #[inline]
-    pub fn trace_mark(&self) -> Option<TraceMark> {
+    pub fn trace_handle(&self) -> Option<u32> {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
-            .trace_mark()
+            .trace_handle()
     }
 
     #[inline]
@@ -3865,22 +3883,6 @@ pub struct BufferRefMut<'pool> {
 
 impl BufferRefMut<'_> {
     #[inline]
-    pub fn metadata(&self) -> &RouteMetadata {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .metadata()
-    }
-
-    #[inline]
-    pub fn metadata_mut(&mut self) -> &mut RouteMetadata {
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .metadata_mut()
-    }
-
-    #[inline]
     pub fn packet_cursor(&self) -> BufferPacketCursor {
         self.guard
             .buffer(self.index)
@@ -3893,7 +3895,8 @@ impl BufferRefMut<'_> {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
-            .node_error()
+            .node_error_code()
+            .map(|code| BufferNodeError::new(crate::NodeId::new(0), code))
     }
 
     #[inline]
@@ -3912,13 +3915,12 @@ impl BufferRefMut<'_> {
     #[inline]
     pub fn next_buffer(&self) -> Option<BufferIndex> {
         self.guard
-            .buffer(self.index)
+            .next_buffer(self.index)
             .expect("buffer ref points to valid buffer")
-            .next_buffer()
     }
 
     #[inline]
-    pub fn set_trace_mark(&mut self, mark: TraceMark) {
+    pub fn set_trace_handle(&mut self, handle: u32) {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
@@ -3927,11 +3929,11 @@ impl BufferRefMut<'_> {
         self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
-            .set_trace_mark(mark);
+            .set_trace_handle(handle);
     }
 
     #[inline]
-    pub fn take_trace_mark(&mut self) -> Option<TraceMark> {
+    pub fn take_trace_handle(&mut self) -> Option<u32> {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
@@ -3940,7 +3942,7 @@ impl BufferRefMut<'_> {
         self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
-            .take_trace_mark()
+            .take_trace_handle()
     }
 
     #[inline]
@@ -3963,11 +3965,10 @@ impl BufferRefMut<'_> {
             .expect("buffer ref points to valid buffer")
             .ensure_exclusive()
             .expect("buffer ref mut requires exclusive ownership");
-        *self
-            .guard
+        self.guard
             .buffer_mut(self.index)
             .expect("buffer ref points to valid buffer")
-            .packet_cursor_mut() = cursor;
+            .set_packet_cursor(cursor);
     }
 
     #[inline]
@@ -3997,6 +3998,27 @@ impl BufferRefMut<'_> {
             .buffer(self.index)
             .expect("buffer ref points to valid buffer")
             .opaque2()
+    }
+
+    #[inline]
+    pub fn current_config(&self) -> crate::NodeId {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .current_config()
+    }
+
+    #[inline]
+    pub fn set_current_config(&mut self, next: crate::NodeId) {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+            .ensure_exclusive()
+            .expect("buffer ref mut requires exclusive ownership");
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+            .set_current_config(next);
     }
 
     #[inline]

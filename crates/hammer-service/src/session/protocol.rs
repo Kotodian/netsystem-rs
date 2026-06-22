@@ -2,21 +2,20 @@ use std::marker::PhantomData;
 
 use hammer_adapter::DataPlaneBuffers;
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_runtime::app::AppOpId;
 
 use crate::session::{
     SessionId, SessionTimerToken,
-    runtime::{SessionRxBuffer, WorkerSessionRuntime},
+    runtime::{SessionRxQueue, WorkerSessionRuntime},
 };
 
 pub(crate) struct SessionQueueControlContext<'a, A> {
     sessions: *mut WorkerSessionRuntime,
     app: *mut crate::session::SessionAppRuntime,
     buffers: *const DataPlaneBuffers,
-    rx: *mut Pool<FifoQueue<SessionRxBuffer>>,
+    rx: *mut Pool<SessionRxQueue>,
     rx_index: *mut FlatHashTable<u64, PoolIndex>,
     aux: *mut A,
     current_session_id: SessionId,
@@ -31,7 +30,7 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
         sessions: *mut WorkerSessionRuntime,
         app: *mut crate::session::SessionAppRuntime,
         buffers: *const DataPlaneBuffers,
-        rx: *mut Pool<FifoQueue<SessionRxBuffer>>,
+        rx: *mut Pool<SessionRxQueue>,
         rx_index: *mut FlatHashTable<u64, PoolIndex>,
         aux: *mut A,
         current_session_id: SessionId,
@@ -72,16 +71,20 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
                 "session rx flush must target current session",
             ));
         }
+        let key = session_id.get();
         let rx_index = unsafe { &mut *self.rx_index };
-        let Some(index) = rx_index.lookup(&session_id.get()) else {
+        let Some(index) = rx_index.lookup(&key) else {
             return Ok(());
         };
         let Some(op) = self.current_app_op else {
             return Ok(());
         };
+        let rx = unsafe { &mut *self.rx };
+        let app = unsafe { &mut *self.app };
+        let buffers = self.buffers().clone();
         loop {
             let current = {
-                let queue = unsafe { &mut *self.rx }
+                let queue = rx
                     .get_mut(index)
                     .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
                 queue.front().copied()
@@ -92,20 +95,19 @@ impl<'a, A> SessionQueueControlContext<'a, A> {
             if current.offset != 0 {
                 break;
             }
-            let delivered = unsafe { &mut *self.app }
-                .complete_recv(op, self.buffers().clone(), current.index, current.fin)?;
+            let delivered = app.complete_recv(op, buffers.clone(), current.index, current.fin)?;
             if !delivered {
                 break;
             }
-            let queue = unsafe { &mut *self.rx }
+            let queue = rx
                 .get_mut(index)
                 .ok_or_else(|| CoreError::internal("session rx queue index is invalid"))?;
             let _ = queue
                 .pop_front()
                 .ok_or_else(|| CoreError::internal("session rx buffer is missing"))?;
             if queue.is_empty() {
-                rx_index.remove(&session_id.get());
-                let _ = unsafe { &mut *self.rx }.remove(index);
+                rx_index.remove(&key);
+                let _ = rx.remove(index);
                 break;
             }
         }

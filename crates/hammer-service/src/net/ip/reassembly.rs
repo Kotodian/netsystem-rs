@@ -963,7 +963,9 @@ impl ReassemblyContext {
                     let packet = buffer.current_mut();
                     packet.copy_within(
                         IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
-                            ..IPV6_HEADER_LEN + (fragment.end - fragment.start) + IPV6_FRAGMENT_HEADER_LEN,
+                            ..IPV6_HEADER_LEN
+                                + (fragment.end - fragment.start)
+                                + IPV6_FRAGMENT_HEADER_LEN,
                         IPV6_HEADER_LEN,
                     );
                 }
@@ -972,7 +974,10 @@ impl ReassemblyContext {
                     .copy_from_slice(&(payload_len as u16).to_be_bytes());
                 header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
                 drop(buffer);
-                runtime.truncate_current(complete, IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
+                runtime.truncate_current(
+                    complete,
+                    IPV6_HEADER_LEN + (fragment.end - fragment.start),
+                )?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.append_existing_chain(complete, fragment.index)?;
@@ -1022,8 +1027,8 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResul
     let parsed =
         parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())?;
     drop(buffer);
-    let network = match network_for_protocol(parsed.protocol) {
-        Some(network) => network,
+    match network_for_protocol(parsed.protocol) {
+        Some(_) => Ok(()),
         None => {
             let IpProtocol::Other(protocol) = parsed.protocol else {
                 return Err(CoreError::internal(format!(
@@ -1031,17 +1036,11 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResul
                     parsed.protocol
                 )));
             };
-            return Err(CoreError::internal(format!(
+            Err(CoreError::internal(format!(
                 "unsupported reassembled transport protocol: {protocol}"
-            )));
+            )))
         }
-    };
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    let metadata = buffer.metadata_mut();
-    metadata.network = network;
-    metadata.source = Some(SocksAddr::ip(parsed.source, 0));
-    metadata.destination = Some(SocksAddr::ip(parsed.destination, 0));
-    Ok(())
+    }
 }
 
 #[inline(always)]

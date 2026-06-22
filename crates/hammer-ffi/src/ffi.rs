@@ -34,7 +34,7 @@ pub fn hammer_new_service(
 /// KVC fd path.
 ///
 /// A NetworkExtension process may hold multiple `utun*` sockets at once
-/// (NWPathMonitor, NEDNSProxy, stale tunnels from previous runs). Picking the
+/// (NWPathMonitor, stale tunnels from previous runs). Picking the
 /// first match is unsafe — on iOS 16 the OS frequently leaves earlier utun
 /// fds open while `NEPacketTunnelProvider.packetFlow` owns a different one,
 /// and reading from the wrong device makes the real utun queue overflow with

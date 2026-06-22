@@ -1,13 +1,14 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::net::IpAddr;
+use std::mem::{size_of, transmute};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
-    ForwardingMetadata, InternalNode, Network, Node, NodeId, NodeProcessFn, NodeRegistration,
-    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, RouteMetadata, TraceFormatter,
-    add_packet_trace, unlikely,
+    ForwardingMetadata, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
+    NodeRuntimeData, NodeVectorDispatch, PacketTrace, SecondaryOpaque, TapEthernetMetadata,
+    TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -19,6 +20,7 @@ pub use hammer_core::forwarding::{
     AdjacencyIndex, Dpo, DpoClass, DpoProto, DpoStackRegistry, DpoType, DpoTypeRegistry,
     FibRouteDpoError, LoadBalanceError, LoadBalanceIndex,
 };
+use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
 };
@@ -37,6 +39,16 @@ pub type FibLookupResult = CoreFibLookupResult<NodeId>;
 pub type FibTable = CoreFibTable<NodeId>;
 pub type FibTableBuilder = CoreFibTableBuilder<NodeId>;
 pub type LoadBalance = CoreLoadBalance<NodeId>;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct LookupOpaque {
+    tap_ethernet: Option<TapEthernetMetadata>,
+    icmp_error: Option<IcmpErrorMetadata>,
+    forwarding: Option<ForwardingMetadata>,
+}
+
+const _: () = assert!(size_of::<LookupOpaque>() == size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpLookupTrace {
@@ -275,28 +287,63 @@ pub struct IpLookupNode {
 
 impl IpLookupNode {
     #[inline(always)]
+    fn prefetch_buffer_with_batch(batch: &mut BufferBatchMut<'_>, index: BufferIndex) {
+        batch.prefetch_header(index);
+    }
+
+    #[inline(always)]
+    fn cached_packet_for_index(
+        batch: &mut BufferBatchMut<'_>,
+        index: BufferIndex,
+    ) -> Option<ParsedIpPacket> {
+        let buffer = batch.buffer(index).ok()?;
+        packet_from_cached_metadata(
+            unsafe { transmute::<_, &hammer_adapter::NetworkOpaque>(buffer.opaque()) },
+            buffer.packet_cursor(),
+            buffer.current_ptr(),
+            buffer.current_len(),
+            buffer.total_len_not_including_first(),
+        )
+    }
+
+    #[inline(always)]
+    fn prefetch_lookup_with_batch(
+        batch: &mut BufferBatchMut<'_>,
+        table: &FibTable,
+        index: BufferIndex,
+    ) {
+        let Some(parsed) = Self::cached_packet_for_index(batch, index) else {
+            return;
+        };
+        table.prefetch_packet(&parsed);
+    }
+
+    #[inline(always)]
     fn process_index_with_batch(
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         index: BufferIndex,
         traces: &mut std::vec::Vec<(BufferIndex, IpLookupTrace)>,
     ) -> CoreResult<NodeId> {
-        let buffer = batch.buffer_mut(index)?;
-        let traced = buffer.trace_mark().is_some();
-        let parsed = match packet_from_cached_metadata(
-            buffer.metadata(),
-            buffer.packet_cursor(),
-            buffer.current_ptr(),
-            buffer.current_len(),
-            buffer.total_len_not_including_first(),
-        )
-        .or_else(|| {
-            parse_ip_packet_with_chain_len(buffer.current(), buffer.total_len_not_including_first())
+        let parsed = Self::cached_packet_for_index(batch, index);
+        let (traced, parsed) = {
+            let buffer = batch.buffer(index)?;
+            let traced = buffer.trace_handle().is_some();
+            let parsed = parsed.or_else(|| {
+                parse_ip_packet_with_chain_len(
+                    buffer.current(),
+                    buffer.total_len_not_including_first(),
+                )
                 .ok()
-        }) {
+            });
+            (traced, parsed)
+        };
+        let parsed = match parsed {
             Some(parsed) => parsed,
             None => {
-                buffer.metadata_mut().forwarding = None;
+                let buffer = batch.buffer_mut(index)?;
+                let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
+                opaque.forwarding = None;
                 let next = table.drop_next();
                 if unlikely(traced) {
                     traces.push((
@@ -319,7 +366,9 @@ impl IpLookupNode {
         let result = table
             .lookup_packet(&parsed)
             .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
-        buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
+        let buffer = batch.buffer_mut(index)?;
+        let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
             fib_index: 0,
             route_dpo_type: result.route_dpo.kind(),
             route_dpo_index: result.route_dpo.forwarding_index(),
@@ -347,29 +396,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn prefetch_index_with_batch(
-        batch: &mut BufferBatchMut<'_>,
-        table: &FibTable,
-        index: BufferIndex,
-    ) {
-        batch.prefetch_read(index);
-        let Ok(buffer) = batch.buffer(index) else {
-            return;
-        };
-        let Some(parsed) = packet_from_cached_metadata(
-            buffer.metadata(),
-            buffer.packet_cursor(),
-            buffer.current_ptr(),
-            buffer.current_len(),
-            buffer.total_len_not_including_first(),
-        ) else {
-            return;
-        };
-        table.prefetch_packet(&parsed);
-    }
-
-    #[inline(always)]
-    fn prefetch_range_with_batch(
+    fn prefetch_lookup_range_with_batch(
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         indices: &[BufferIndex],
@@ -381,18 +408,41 @@ impl IpLookupNode {
         }
         let end = (offset + width).min(indices.len());
         for index in indices[offset..end].iter().copied() {
-            Self::prefetch_index_with_batch(batch, table, index);
+            Self::prefetch_lookup_with_batch(batch, table, index);
         }
     }
 
     #[inline(always)]
-    fn prefetch_indices_with_batch(
+    fn prefetch_buffer_range_with_batch(
+        batch: &mut BufferBatchMut<'_>,
+        indices: &[BufferIndex],
+        offset: usize,
+        width: usize,
+    ) {
+        if offset >= indices.len() {
+            return;
+        }
+        let end = (offset + width).min(indices.len());
+        for index in indices[offset..end].iter().copied() {
+            Self::prefetch_buffer_with_batch(batch, index);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_buffer_indices_with_batch(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+        for index in indices.iter().copied() {
+            Self::prefetch_buffer_with_batch(batch, index);
+        }
+    }
+
+    #[inline(always)]
+    fn prefetch_lookup_indices_with_batch(
         batch: &mut BufferBatchMut<'_>,
         table: &FibTable,
         indices: &[BufferIndex],
     ) {
         for index in indices.iter().copied() {
-            Self::prefetch_index_with_batch(batch, table, index);
+            Self::prefetch_lookup_with_batch(batch, table, index);
         }
     }
 }
@@ -413,7 +463,8 @@ impl Node for IpLookupNode {
         let mut traces = std::vec::Vec::new();
         let first_next = {
             let mut batch = runtime.buffer_batch_mut();
-            Self::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
+            Self::prefetch_buffer_range_with_batch(&mut batch, indices, 0, width);
+            Self::prefetch_lookup_range_with_batch(&mut batch, &table, indices, 0, width);
             Self::process_index_with_batch(&mut batch, &table, first, &mut traces)?
         };
         let mut first_chunk = true;
@@ -421,7 +472,8 @@ impl Node for IpLookupNode {
             runtime,
             frame,
             |batch, indices| {
-                Self::prefetch_indices_with_batch(batch, &table, indices);
+                Self::prefetch_buffer_indices_with_batch(batch, indices);
+                Self::prefetch_lookup_indices_with_batch(batch, &table, indices);
             },
             |batch, indices, nexts| {
                 let start_offset = if first_chunk {
@@ -509,8 +561,12 @@ impl AdjacencyRewriteNode {
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
     ) -> CoreResult<Option<NodeId>> {
-        let metadata = runtime.metadata(index)?;
-        let Some(forwarding) = metadata.forwarding else {
+        let forwarding = {
+            let buffer = runtime.get_buffer(index)?;
+            let opaque = unsafe { transmute::<_, &LookupOpaque>(buffer.opaque2()) };
+            opaque.forwarding
+        };
+        let Some(forwarding) = forwarding else {
             set_index_node_error_code(
                 runtime,
                 index,
@@ -703,7 +759,8 @@ fn ip_lookup_process(
     let mut traces = std::vec::Vec::new();
     let first_next = {
         let mut batch = runtime.buffer_batch_mut();
-        IpLookupNode::prefetch_range_with_batch(&mut batch, &table, indices, 0, width);
+        IpLookupNode::prefetch_buffer_range_with_batch(&mut batch, indices, 0, width);
+        IpLookupNode::prefetch_lookup_range_with_batch(&mut batch, &table, indices, 0, width);
         IpLookupNode::process_index_with_batch(&mut batch, &table, first, &mut traces)?
     };
     let mut first_chunk = true;
@@ -711,7 +768,8 @@ fn ip_lookup_process(
         runtime,
         frame,
         |batch, indices| {
-            IpLookupNode::prefetch_indices_with_batch(batch, &table, indices);
+            IpLookupNode::prefetch_buffer_indices_with_batch(batch, indices);
+            IpLookupNode::prefetch_lookup_indices_with_batch(batch, &table, indices);
         },
         |batch, indices, nexts| {
             let start_offset = if first_chunk {
@@ -773,10 +831,11 @@ fn apply_adjacency_rewrite(
         let cursor = buffer.packet_cursor();
         buffer.set_packet_cursor(shift_packet_cursor(cursor, rewrite.len()));
     }
-    let metadata = buffer.metadata_mut();
-    metadata.egress_interface = adjacency.egress_interface;
+    unsafe { transmute::<_, &mut hammer_adapter::NetworkOpaque>(buffer.opaque_mut()) }.sw_if_index
+        [1] = adjacency.egress_interface.unwrap_or(0);
     if !rewrite.is_empty() {
-        metadata.tap_ethernet = None;
+        let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
+        opaque.tap_ethernet = None;
     }
     Ok(())
 }
@@ -809,7 +868,7 @@ fn frame_batch_width(runtime: &DataPlaneRuntime) -> usize {
 
 #[inline(always)]
 fn packet_from_cached_metadata(
-    metadata: &RouteMetadata,
+    network: &hammer_adapter::NetworkOpaque,
     cursor: BufferPacketCursor,
     current_ptr: *const u8,
     current_len: usize,
@@ -822,16 +881,63 @@ fn packet_from_cached_metadata(
     if cursor.network_header_offset() > current_len || cursor.packet_len() > chain_len {
         return None;
     }
-    let source = metadata.source.as_ref()?.host;
-    let destination = metadata.destination.as_ref()?.host;
-    let version = match (source, destination) {
-        (IpAddr::V4(_), IpAddr::V4(_)) => IpVersion::V4,
-        (IpAddr::V6(_), IpAddr::V6(_)) => IpVersion::V6,
+    let version = match network.ip().ip_version()? {
+        4 => IpVersion::V4,
+        6 => IpVersion::V6,
         _ => return None,
+    };
+    let protocol = match network.ip().ip_protocol()? {
+        1 => IpProtocol::Icmpv4,
+        6 => IpProtocol::Tcp,
+        17 => IpProtocol::Udp,
+        58 => IpProtocol::Icmpv6,
+        other => IpProtocol::Other(other),
+    };
+    let (source, destination) = match version {
+        IpVersion::V4 => {
+            let source_offset = cursor.network_header_offset() + 12;
+            let destination_offset = cursor.network_header_offset() + 16;
+            if destination_offset + 4 > current_len {
+                return None;
+            }
+            (
+                IpAddr::V4(Ipv4Addr::new(
+                    unsafe { *current_ptr.add(source_offset) },
+                    unsafe { *current_ptr.add(source_offset + 1) },
+                    unsafe { *current_ptr.add(source_offset + 2) },
+                    unsafe { *current_ptr.add(source_offset + 3) },
+                )),
+                IpAddr::V4(Ipv4Addr::new(
+                    unsafe { *current_ptr.add(destination_offset) },
+                    unsafe { *current_ptr.add(destination_offset + 1) },
+                    unsafe { *current_ptr.add(destination_offset + 2) },
+                    unsafe { *current_ptr.add(destination_offset + 3) },
+                )),
+            )
+        }
+        IpVersion::V6 => {
+            let source_offset = cursor.network_header_offset() + 8;
+            let destination_offset = cursor.network_header_offset() + 24;
+            if destination_offset + 16 > current_len {
+                return None;
+            }
+            let mut source_bytes = [0u8; 16];
+            let mut destination_bytes = [0u8; 16];
+            for (index, byte) in source_bytes.iter_mut().enumerate() {
+                *byte = unsafe { *current_ptr.add(source_offset + index) };
+            }
+            for (index, byte) in destination_bytes.iter_mut().enumerate() {
+                *byte = unsafe { *current_ptr.add(destination_offset + index) };
+            }
+            (
+                IpAddr::V6(Ipv6Addr::from(source_bytes)),
+                IpAddr::V6(Ipv6Addr::from(destination_bytes)),
+            )
+        }
     };
     Some(ParsedIpPacket {
         version,
-        protocol: protocol_from_network(metadata.network, version),
+        protocol,
         input_target: hammer_core::protocol::ip::IpInputTarget::Lookup,
         input_error: hammer_core::protocol::ip::IpInputError::None,
         source,
@@ -845,13 +951,66 @@ fn packet_from_cached_metadata(
 }
 
 #[inline(always)]
-fn protocol_from_network(network: Network, version: IpVersion) -> IpProtocol {
-    match network {
-        Network::Tcp => IpProtocol::Tcp,
-        Network::Udp => IpProtocol::Udp,
-        Network::Icmp => match version {
-            IpVersion::V4 => IpProtocol::Icmpv4,
-            IpVersion::V6 => IpProtocol::Icmpv6,
-        },
+fn protocol_from_cursor(
+    current_ptr: *const u8,
+    network_offset: usize,
+    version: IpVersion,
+) -> Option<IpProtocol> {
+    let protocol = match version {
+        IpVersion::V4 => unsafe { *current_ptr.add(network_offset + 9) },
+        IpVersion::V6 => unsafe { *current_ptr.add(network_offset + 6) },
+    };
+    Some(match protocol {
+        1 => IpProtocol::Icmpv4,
+        6 => IpProtocol::Tcp,
+        17 => IpProtocol::Udp,
+        58 => IpProtocol::Icmpv6,
+        other => IpProtocol::Other(other),
+    })
+}
+
+#[inline(always)]
+fn source_addr_from_cursor(
+    current_ptr: *const u8,
+    network_offset: usize,
+    version: IpVersion,
+) -> Option<IpAddr> {
+    match version {
+        IpVersion::V4 => Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            unsafe { *current_ptr.add(network_offset + 12) },
+            unsafe { *current_ptr.add(network_offset + 13) },
+            unsafe { *current_ptr.add(network_offset + 14) },
+            unsafe { *current_ptr.add(network_offset + 15) },
+        ))),
+        IpVersion::V6 => {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(current_ptr.add(network_offset + 8), 16) };
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(bytes).ok()?,
+            )))
+        }
+    }
+}
+
+#[inline(always)]
+fn destination_addr_from_cursor(
+    current_ptr: *const u8,
+    network_offset: usize,
+    version: IpVersion,
+) -> Option<IpAddr> {
+    match version {
+        IpVersion::V4 => Some(IpAddr::V4(std::net::Ipv4Addr::new(
+            unsafe { *current_ptr.add(network_offset + 16) },
+            unsafe { *current_ptr.add(network_offset + 17) },
+            unsafe { *current_ptr.add(network_offset + 18) },
+            unsafe { *current_ptr.add(network_offset + 19) },
+        ))),
+        IpVersion::V6 => {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(current_ptr.add(network_offset + 24), 16) };
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(
+                <[u8; 16]>::try_from(bytes).ok()?,
+            )))
+        }
     }
 }

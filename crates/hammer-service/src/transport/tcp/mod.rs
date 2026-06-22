@@ -41,9 +41,7 @@ pub use output::{
 };
 pub use rcv_process::{TcpRcvProcessNext, TcpRcvProcessNode};
 pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
-pub use reply::{
-    TcpControlFlags, queue_tcp_control_packet, synthesize_ipv4_tcp_control, tcp_control_metadata,
-};
+pub use reply::{TcpControlFlags, synthesize_ipv4_tcp_control, tcp_control_cursor};
 pub use reset::{TcpResetNext, TcpResetNode};
 pub use state::TcpInputFlags;
 pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
@@ -136,19 +134,24 @@ where
     ) -> CoreResult<SessionId> {
         let owner = self.worker();
         let initial_sequence = self.aux_mut().next_initial_sequence(local, remote);
-        let cached_fast_open = self
-            .aux()
-            .fast_open_cookie(local, remote)
-            .map(|(cookie, max_segment_size)| {
-                let mut copied = [0u8; 16];
-                let len = cookie.len().min(copied.len());
-                copied[..len].copy_from_slice(&cookie[..len]);
-                (copied, len as u8, max_segment_size)
-            });
+        let cached_fast_open =
+            self.aux()
+                .fast_open_cookie(local, remote)
+                .map(|(cookie, max_segment_size)| {
+                    let mut copied = [0u8; 16];
+                    let len = cookie.len().min(copied.len());
+                    copied[..len].copy_from_slice(&cookie[..len]);
+                    (copied, len as u8, max_segment_size)
+                });
         let session_id = self.insert_session_with_id(|session_id: SessionId| {
             let connection_id = hammer_core::protocol::tcp::TcpConnectionId::new(session_id.get());
-            let mut connection =
-                TcpConnection::new(Some(connection_id), owner, local.port(), Some(local), remote);
+            let mut connection = TcpConnection::new(
+                Some(connection_id),
+                owner,
+                local.port(),
+                Some(local),
+                remote,
+            );
             if let Some((cookie, len, max_segment_size)) = cached_fast_open {
                 let mut capabilities = connection.local_capabilities();
                 capabilities.fast_open = true;
@@ -208,9 +211,7 @@ where
                 state.next_node(),
             ),
         }
-        if completed_active_open
-            && let Some(op) = self.session_app_op(session_id)
-        {
+        if completed_active_open && let Some(op) = self.session_app_op(session_id) {
             self.app().complete_connected(op)?;
         }
         Ok(())
@@ -242,13 +243,14 @@ pub(crate) fn register_tcp_session_queue<C>(
 where
     C: CongestionController + 'static,
 {
-    let handle = crate::session::node::register_session_queue(
-        SessionDriverRuntime::<TcpConnection<C>, TcpWorkerOwnedState>::new(
-            worker,
-            buffers,
-            TcpWorkerOwnedState::new(worker),
-        ),
-    )?;
+    let handle = crate::session::node::register_session_queue(SessionDriverRuntime::<
+        TcpConnection<C>,
+        TcpWorkerOwnedState,
+    >::new(
+        worker,
+        buffers,
+        TcpWorkerOwnedState::new(worker),
+    ))?;
     Ok(TcpQueueHandle::new(handle.runtime_data()))
 }
 
@@ -498,11 +500,17 @@ mod tests {
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
 
         enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
+        assert_eq!(
+            dispatch_tcp_session_queue(&runtime, &mut driver, output_node),
+            2
+        );
         lookup_state.lock().expect("lookup").packets.clear();
 
         enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
+        assert_eq!(
+            dispatch_tcp_session_queue(&runtime, &mut driver, output_node),
+            2
+        );
         lookup_state.lock().expect("lookup").packets.clear();
         drop_state.lock().expect("drop").packets.clear();
 
@@ -536,12 +544,18 @@ mod tests {
         let ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("ring");
 
         enqueue_app_send(&mut driver, &ring, session_id, b"first");
-        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
+        assert_eq!(
+            dispatch_tcp_session_queue(&runtime, &mut driver, output_node),
+            2
+        );
         let second_left_edge = driver.session(session_id).expect("connection").snd_nxt();
         lookup_state.lock().expect("lookup").packets.clear();
 
         enqueue_app_send(&mut driver, &ring, session_id, b"second");
-        assert_eq!(dispatch_tcp_session_queue(&runtime, &mut driver, output_node), 2);
+        assert_eq!(
+            dispatch_tcp_session_queue(&runtime, &mut driver, output_node),
+            2
+        );
         let connection = driver.session(session_id).expect("connection");
         let acknowledgment = connection.snd_una();
         let second_right_edge = connection.snd_nxt();
@@ -670,21 +684,51 @@ mod tests {
             .expect("release tx");
 
         assert!(!driver.has_retained_tx(session_id));
-        assert_eq!(driver.session(session_id).expect("connection").state(), TcpState::Established);
+        assert_eq!(
+            driver.session(session_id).expect("connection").state(),
+            TcpState::Established
+        );
     }
 }
 
 #[cfg(test)]
 fn tcp_flags(segment: &etherparse::TcpSlice<'_>) -> hammer_core::protocol::tcp::TcpSegmentFlags {
     let mut flags = hammer_core::protocol::tcp::TcpSegmentFlags::empty();
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::NS, segment.ns());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::FIN, segment.fin());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::SYN, segment.syn());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::RST, segment.rst());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::PSH, segment.psh());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::ACK, segment.ack());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::URG, segment.urg());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::ECE, segment.ece());
-    flags.set(hammer_core::protocol::tcp::TcpSegmentFlags::CWR, segment.cwr());
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::NS,
+        segment.ns(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::FIN,
+        segment.fin(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::SYN,
+        segment.syn(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::RST,
+        segment.rst(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::PSH,
+        segment.psh(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
+        segment.ack(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::URG,
+        segment.urg(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::ECE,
+        segment.ece(),
+    );
+    flags.set(
+        hammer_core::protocol::tcp::TcpSegmentFlags::CWR,
+        segment.cwr(),
+    );
     flags
 }

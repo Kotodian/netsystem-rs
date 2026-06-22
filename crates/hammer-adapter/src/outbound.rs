@@ -1,5 +1,4 @@
 use std::net::IpAddr;
-use std::sync::Weak;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::RuntimeComponent;
 use crate::buffer::{BufferFrame, DataPlaneBuffers};
 use crate::dialer::Network;
-use crate::rule::SocksAddr;
+use hammer_core::SocksAddr;
 
 pub type OutboundComponent = RuntimeComponent<dyn Outbound>;
 
@@ -56,9 +55,7 @@ pub trait ProxyIcmpConn: Send + Sync + 'static {
     async fn recv_reply(&mut self) -> CoreResult<IcmpReply>;
 }
 
-/// `adapter.Outbound` in Go — represents a single dialable egress
-/// (hysteria2, direct, block, …). DNS queries use DnsRouter/DnsTransport
-/// instead of pretending to be a normal outbound.
+/// `adapter.Outbound` in Go — represents a single dialable egress.
 #[async_trait]
 pub trait Outbound: Send + Sync + 'static {
     fn reset(&self) {}
@@ -81,7 +78,7 @@ pub trait Outbound: Send + Sync + 'static {
 
     /// Open an ICMP echo conduit on this outbound. The default impl
     /// reports unsupported, so only outbounds that genuinely carry ICMP
-    /// (today: `direct`) override; the tun stack converts the resulting
+    /// override; the tun stack converts the resulting
     /// `Err` into an ICMP Destination Unreachable response written back
     /// to the client.
     async fn listen_icmp(&self) -> CoreResult<Box<dyn ProxyIcmpConn>> {
@@ -108,35 +105,6 @@ pub trait Outbound: Send + Sync + 'static {
     async fn post_start(&self) -> CoreResult<()> {
         Ok(())
     }
-
-    /// Aggregate outbounds (urltest, future selectors) report the id of
-    /// the child currently selected. Returning `None` (the default) means
-    /// the outbound is a leaf and no inner choice exists.
-    fn now(&self) -> Option<String> {
-        None
-    }
-
-    /// Resolve the effective per-probe timeout for an aggregate probe sweep.
-    /// Leaf/default implementations simply echo the caller value; aggregate
-    /// outbounds with configured defaults can override zero-duration calls.
-    fn probe_group_timeout(&self, timeout: Duration) -> Duration {
-        timeout
-    }
-
-    /// Inject the resolver an aggregate outbound uses to look up its
-    /// children at run time. The runtime walks every registered outbound
-    /// after the manager is `Arc`-wrapped and calls this once with a
-    /// `Weak` so aggregates can fan out without owning the manager.
-    /// Default is a no-op for leaves.
-    fn bind_resolver(&self, _resolver: Weak<dyn OutboundManager>) {}
-
-    /// Run an aggregate outbound's group-probe sweep on demand. Reports
-    /// land in declaration order with `outbound_id` set to each child's
-    /// id and `protocol` to a sweep-kind tag (e.g. `"urltest"`). Leaf
-    /// outbounds reject the call by default since they have no children.
-    async fn probe_group(&self, _timeout: Duration) -> CoreResult<Vec<crate::probe::ProbeReport>> {
-        Err(CoreError::internal(format!("outbound has no group probe")))
-    }
 }
 
 /// `adapter.OutboundManager` — owns the live set of outbounds and a default
@@ -151,7 +119,6 @@ pub trait OutboundManager: Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RouteMetadata;
     use crate::buffer::DataPlaneRuntime;
     use hammer_infra::vec::Vec;
 
@@ -189,12 +156,10 @@ mod tests {
     async fn packet_conn_send_uses_borrowed_frame() {
         let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(128, 1);
         let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
-        let mut metadata = RouteMetadata::default();
-        metadata.destination = Some(SocksAddr::ip("127.0.0.1".parse().unwrap(), 53));
         frame
             .push_index(
                 runtime
-                    .alloc_index_with_bytes(metadata, b"borrowed udp payload")
+                    .alloc_index_with_bytes(b"borrowed udp payload")
                     .expect("alloc UDP payload"),
             )
             .expect("push UDP payload");

@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use super::TcpInputError;
 use hammer_adapter::{
-    BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Network, Node, NodeId,
-    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, RouteMetadata, SocksAddr,
+    BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
+    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::ip::parse_ip_packet;
 use hammer_core::protocol::tcp::TcpSegmentFlags;
 
 #[hammer_component_macros::node_next]
@@ -46,7 +47,6 @@ pub struct TcpResetObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpSynthesizedReset {
-    pub metadata: RouteMetadata,
     pub packet: std::vec::Vec<u8>,
 }
 
@@ -277,11 +277,21 @@ impl Node for TcpResetNode {
         let next = Self::runtime_nexts(runtime)?;
         let drop_next = next[TcpResetNext::Drop as usize];
         let lookup_next = next[TcpResetNext::Lookup as usize];
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
+        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
             runtime,
             frame,
-            |index| {
-                tcp_reset_next_for_index(runtime, index, drop_next, lookup_next, &self.observer)
+            prefetch_tcp_reset,
+            |_, indices, nexts| {
+                for (offset, index) in indices.iter().copied().enumerate() {
+                    nexts[offset] = tcp_reset_next_for_index(
+                        runtime,
+                        index,
+                        drop_next,
+                        lookup_next,
+                        &self.observer,
+                    )?;
+                }
+                Ok(())
             },
         )?;
         self.cached_next = cached_next;
@@ -309,10 +319,31 @@ fn tcp_reset_process(
     let next = TcpResetNode::runtime_nexts(runtime)?;
     let drop_next = next[TcpResetNext::Drop as usize];
     let lookup_next = next[TcpResetNext::Lookup as usize];
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        tcp_reset_next_for_index(runtime, index, drop_next, lookup_next, &state.observer)
-    })?;
+    let (result, _) = NodeVectorDispatch::new(None).route_frame(
+        runtime,
+        frame,
+        prefetch_tcp_reset,
+        |_, indices, nexts| {
+            for (offset, index) in indices.iter().copied().enumerate() {
+                nexts[offset] = tcp_reset_next_for_index(
+                    runtime,
+                    index,
+                    drop_next,
+                    lookup_next,
+                    &state.observer,
+                )?;
+            }
+            Ok(())
+        },
+    )?;
     Ok(result)
+}
+
+#[inline(always)]
+fn prefetch_tcp_reset(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+    for index in indices.iter().copied() {
+        batch.prefetch_read(index);
+    }
 }
 
 fn tcp_reset_next_for_index(
@@ -338,16 +369,10 @@ fn tcp_reset_observation(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
 ) -> CoreResult<TcpResetObservation> {
-    let metadata = runtime.metadata(index)?;
-    let synthesized_reset = tcp_reset_reply(runtime, index, &metadata);
-    let remote = socket_addr(
-        metadata.source.clone(),
-        "tcp reset observer requires remote source metadata",
-    )?;
-    let local = socket_addr(
-        metadata.destination.clone(),
-        "tcp reset observer requires local destination metadata",
-    )?;
+    let packet = runtime.copy_current_chain(index)?;
+    let cursor = runtime.packet_cursor(index)?;
+    let (local, remote) = tcp_packet_addrs(&packet, cursor)?;
+    let synthesized_reset = tcp_reset_reply_from_packet(&packet, cursor);
     let reason =
         TcpResetReason::from_node_error_code(runtime.node_error(index)?.map(|error| error.code()));
     Ok(TcpResetObservation {
@@ -358,22 +383,10 @@ fn tcp_reset_observation(
     })
 }
 
-fn socket_addr(value: Option<SocksAddr>, missing: &'static str) -> CoreResult<SocketAddr> {
-    let value = value.ok_or_else(|| CoreError::internal(missing))?;
-    Ok(SocketAddr::new(value.host, value.port))
-}
-
-fn tcp_reset_reply(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-    metadata: &RouteMetadata,
+fn tcp_reset_reply_from_packet(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
 ) -> Option<TcpSynthesizedReset> {
-    let packet: std::vec::Vec<u8> = runtime
-        .copy_current_chain(index)
-        .ok()?
-        .into_iter()
-        .collect();
-    let cursor = runtime.packet_cursor(index).ok()?;
     let source_segment = parse_reset_source_segment(&packet, cursor)?;
     if source_segment.flags.contains(TcpSegmentFlags::RST) {
         return None;
@@ -383,10 +396,30 @@ fn tcp_reset_reply(
         .copied()
         .map(|byte| byte >> 4)
     {
-        Some(4) => synthesize_ipv4_tcp_reset(&packet, cursor, source_segment, metadata),
-        Some(6) => synthesize_ipv6_tcp_reset(&packet, cursor, source_segment, metadata),
+        Some(4) => synthesize_ipv4_tcp_reset(&packet, cursor, source_segment),
+        Some(6) => synthesize_ipv6_tcp_reset(&packet, cursor, source_segment),
         _ => None,
     }
+}
+
+fn tcp_packet_addrs(
+    packet: &[u8],
+    cursor: BufferPacketCursor,
+) -> CoreResult<(SocketAddr, SocketAddr)> {
+    let parsed = parse_ip_packet(packet)
+        .map_err(|_| CoreError::internal("tcp reset observation requires valid IP packet"))?;
+    let transport = packet
+        .get(parsed.transport_header_offset..parsed.packet_len)
+        .ok_or_else(|| CoreError::internal("tcp reset observation requires transport header"))?;
+    let segment = etherparse::TcpSlice::from_slice(transport)
+        .map_err(|_| CoreError::internal("tcp reset observation requires TCP header"))?;
+    if cursor.transport_header_offset() != parsed.transport_header_offset {
+        return Err(CoreError::internal("tcp reset cursor mismatch"));
+    }
+    Ok((
+        SocketAddr::new(parsed.destination, segment.destination_port()),
+        SocketAddr::new(parsed.source, segment.source_port()),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -409,7 +442,8 @@ fn parse_reset_source_segment(
     if transport_offset > available_len || payload_offset > available_len {
         return None;
     }
-    let segment = etherparse::TcpSlice::from_slice(packet.get(transport_offset..available_len)?).ok()?;
+    let segment =
+        etherparse::TcpSlice::from_slice(packet.get(transport_offset..available_len)?).ok()?;
     if payload_offset != transport_offset.checked_add(segment.header_len())? {
         return None;
     }
@@ -443,7 +477,6 @@ fn synthesize_ipv4_tcp_reset(
     packet: &[u8],
     cursor: BufferPacketCursor,
     source_segment: ResetSourceSegment,
-    metadata: &RouteMetadata,
 ) -> Option<TcpSynthesizedReset> {
     const IPV4_MIN_HEADER_LEN: usize = 20;
     const TCP_MIN_HEADER_LEN: usize = 20;
@@ -519,21 +552,13 @@ fn synthesize_ipv4_tcp_reset(
     let header_checksum = internet_checksum(&reset[..IPV4_MIN_HEADER_LEN]);
     reset[10..12].copy_from_slice(&header_checksum.to_be_bytes());
 
-    let mut response_metadata = metadata.clone();
-    response_metadata.source = metadata.destination.clone();
-    response_metadata.destination = metadata.source.clone();
-
-    Some(TcpSynthesizedReset {
-        metadata: response_metadata,
-        packet: reset,
-    })
+    Some(TcpSynthesizedReset { packet: reset })
 }
 
 fn synthesize_ipv6_tcp_reset(
     packet: &[u8],
     cursor: BufferPacketCursor,
     source_segment: ResetSourceSegment,
-    metadata: &RouteMetadata,
 ) -> Option<TcpSynthesizedReset> {
     const IPV6_HEADER_LEN: usize = 40;
     const TCP_MIN_HEADER_LEN: usize = 20;
@@ -605,14 +630,7 @@ fn synthesize_ipv6_tcp_reset(
     let checksum = ipv6_l4_checksum(source, destination, 6, &reset[40..]);
     reset[56..58].copy_from_slice(&checksum.to_be_bytes());
 
-    let mut response_metadata = metadata.clone();
-    response_metadata.source = metadata.destination.clone();
-    response_metadata.destination = metadata.source.clone();
-
-    Some(TcpSynthesizedReset {
-        metadata: response_metadata,
-        packet: reset,
-    })
+    Some(TcpSynthesizedReset { packet: reset })
 }
 
 fn ipv4_l4_checksum(source: [u8; 4], destination: [u8; 4], protocol: u8, segment: &[u8]) -> u16 {
@@ -697,9 +715,5 @@ fn refresh_synthesized_reset_metadata(
             .with_transport_header(network_header_len, TCP_HEADER_LEN)
             .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
     );
-    let metadata = buffer.metadata_mut();
-    *metadata = synthesized_reset.metadata.clone();
-    metadata.network = Network::Tcp;
-    metadata.icmp_error = None;
     Ok(())
 }

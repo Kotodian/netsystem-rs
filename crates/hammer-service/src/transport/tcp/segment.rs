@@ -1,7 +1,8 @@
+use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hammer_adapter::{
-    BufferIndex, DataPlaneRuntime, IpEcnCodepoint, PrimaryOpaquePayload, SecondaryOpaquePayload,
+    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, IpEcnCodepoint, NetworkOpaque,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
@@ -60,20 +61,9 @@ pub(crate) fn parse_tcp_packet(
         .packet_len
         .checked_sub(payload_offset)
         .ok_or_else(|| CoreError::internal("tcp payload offset exceeds packet length"))?;
-    let metadata = runtime.metadata(index)?;
-    let local = metadata
-        .destination
-        .as_ref()
-        .map(|addr| SocketAddr::new(addr.host, addr.port))
-        .unwrap_or_else(|| SocketAddr::new(destination_ip, segment.destination_port()));
-    let remote = metadata
-        .source
-        .as_ref()
-        .map(|addr| SocketAddr::new(addr.host, addr.port))
-        .unwrap_or_else(|| SocketAddr::new(source_ip, segment.source_port()));
-    let acknowledgment = segment
-        .ack()
-        .then(|| segment.acknowledgment_number());
+    let local = SocketAddr::new(destination_ip, segment.destination_port());
+    let remote = SocketAddr::new(source_ip, segment.source_port());
+    let acknowledgment = segment.ack().then(|| segment.acknowledgment_number());
     let mut flags = TcpSegmentFlags::empty();
     flags.set(TcpSegmentFlags::NS, segment.ns());
     flags.set(TcpSegmentFlags::FIN, segment.fin());
@@ -94,7 +84,10 @@ pub(crate) fn parse_tcp_packet(
         capabilities: parsed_options.capabilities,
         sack_blocks: parsed_options.sack_blocks,
         fast_open_cookie: parsed_options.fast_open_cookie,
-        ip_ecn: metadata.ip_ecn,
+        ip_ecn: unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+            .ip()
+            .ip_ecn()
+            .map(Into::into),
         payload_offset,
         payload_len,
     })
@@ -161,9 +154,10 @@ impl TcpSegment {
 
     #[inline]
     pub fn write_header(&self, output: &mut [u8]) -> CoreResult<usize> {
-        let fast_open_cookie = self.fast_open_cookie.as_ref().map(|cookie| {
-            &cookie[..usize::from(self.fast_open_cookie_len)]
-        });
+        let fast_open_cookie = self
+            .fast_open_cookie
+            .as_ref()
+            .map(|cookie| &cookie[..usize::from(self.fast_open_cookie_len)]);
         write_tcp_segment_header(
             output,
             TcpSegmentHeader {
@@ -193,60 +187,63 @@ impl TcpSegment {
         Some(&sack_blocks[..usize::from(self.sack_block_count)])
     }
 
-    pub(crate) fn write_to_buffer(&self, runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<()> {
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        buffer.opaque_mut().write(self);
-        buffer.opaque2_mut().write(self);
-        buffer.metadata_mut().ip_ecn = self.ip_ecn;
+    pub(crate) fn write_to_buffer(
+        &self,
+        buffers: &DataPlaneBuffers,
+        index: BufferIndex,
+    ) -> CoreResult<()> {
+        let mut buffer = buffers.get_buffer_mut(index)?;
+        buffer.opaque_mut().write(self.primary_opaque());
+        buffer.opaque2_mut().write(self.secondary_opaque());
+        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+            .ip_mut()
+            .set_ip_ecn(self.ip_ecn.map(Into::into));
         Ok(())
     }
 
-    pub(crate) fn read_from_buffer(runtime: &DataPlaneRuntime, index: BufferIndex) -> CoreResult<Self> {
+    pub(crate) fn read_from_buffer(
+        runtime: &DataPlaneRuntime,
+        index: BufferIndex,
+    ) -> CoreResult<Self> {
         let buffer = runtime.get_buffer(index)?;
-        let mut segment = buffer.opaque().read::<Self>();
-        let secondary = buffer.opaque2().read::<Self>();
-        if secondary.sack_block_count != 0 {
-            segment.sack_blocks = secondary.sack_blocks;
-            segment.sack_block_count = secondary.sack_block_count;
-        }
-        if segment.fast_open_cookie_len != 0 {
-            segment.fast_open_cookie = secondary.fast_open_cookie;
-        }
-        segment.ip_ecn = buffer.metadata().ip_ecn;
+        let mut segment =
+            Self::from_primary_opaque(buffer.opaque().read::<TcpSegmentHeaderOpaque>());
+        segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
+        segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+            .ip()
+            .ip_ecn()
+            .map(Into::into);
         Ok(segment)
     }
-}
 
-impl PrimaryOpaquePayload for TcpSegment {
-    fn encode_primary(&self) -> [u64; 5] {
+    #[inline]
+    fn primary_opaque(&self) -> TcpSegmentHeaderOpaque {
         let mut capabilities = 0u8;
         capabilities |= u8::from(self.capabilities.sack);
         capabilities |= u8::from(self.capabilities.timestamps) << 1;
         capabilities |= u8::from(self.capabilities.ecn) << 2;
         capabilities |= u8::from(self.capabilities.accurate_ecn) << 3;
         capabilities |= u8::from(self.capabilities.fast_open) << 4;
-        unsafe {
-            TcpSegmentHeaderOpaque {
-                fields: TcpSegmentHeaderFields {
-                    local_port: self.local.port(),
-                    remote_port: self.remote.port(),
-                    advertised_window: self.advertised_window,
-                    flags: self.flags.bits(),
-                    capabilities,
-                    sack_block_count: self.sack_block_count,
-                    fast_open_cookie_len: self.fast_open_cookie_len,
-                    reserved: [0; 2],
-                    sequence: self.sequence,
-                    acknowledgment: self.acknowledgment,
-                    reserved_words: [0; 2],
-                },
-            }
-            .raw
+        TcpSegmentHeaderOpaque {
+            fields: TcpSegmentHeaderFields {
+                local_port: self.local.port(),
+                remote_port: self.remote.port(),
+                advertised_window: self.advertised_window,
+                flags: self.flags.bits(),
+                capabilities,
+                sack_block_count: self.sack_block_count,
+                fast_open_cookie_len: self.fast_open_cookie_len,
+                reserved: [0; 2],
+                sequence: self.sequence,
+                acknowledgment: self.acknowledgment,
+                reserved_words: [0; 2],
+            },
         }
     }
 
-    fn decode_primary(words: [u64; 5]) -> Self {
-        let fields = unsafe { TcpSegmentHeaderOpaque { raw: words }.fields };
+    #[inline]
+    fn from_primary_opaque(opaque: TcpSegmentHeaderOpaque) -> Self {
+        let fields = unsafe { opaque.fields };
         Self {
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.local_port),
             remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.remote_port),
@@ -271,15 +268,13 @@ impl PrimaryOpaquePayload for TcpSegment {
             payload_len: 0,
         }
     }
-}
 
-impl SecondaryOpaquePayload for TcpSegment {
-    fn encode_secondary(&self) -> [u64; 7] {
+    #[inline]
+    fn secondary_opaque(&self) -> TcpSegmentSackOpaque {
         let mut blocks = [0u64; 4];
         if let Some(sack_blocks) = self.sack_blocks() {
             for (slot, block) in sack_blocks.iter().take(blocks.len()).enumerate() {
-                blocks[slot] =
-                    (u64::from(block.left_edge) << 32) | u64::from(block.right_edge);
+                blocks[slot] = (u64::from(block.left_edge) << 32) | u64::from(block.right_edge);
             }
         }
         let mut cookie_words = [0u64; 2];
@@ -290,20 +285,18 @@ impl SecondaryOpaquePayload for TcpSegment {
             cookie_words[0] = u64::from_ne_bytes(bytes[..8].try_into().expect("cookie word 0"));
             cookie_words[1] = u64::from_ne_bytes(bytes[8..16].try_into().expect("cookie word 1"));
         }
-        unsafe {
-            TcpSegmentSackOpaque {
-                fields: TcpSegmentSackFields {
-                    blocks,
-                    cookie_words,
-                    reserved: [0; 1],
-                },
-            }
-            .raw
+        TcpSegmentSackOpaque {
+            fields: TcpSegmentSackFields {
+                blocks,
+                cookie_words,
+                reserved: [0; 1],
+            },
         }
     }
 
-    fn decode_secondary(words: [u64; 7]) -> Self {
-        let fields = unsafe { TcpSegmentSackOpaque { raw: words }.fields };
+    #[inline]
+    fn apply_secondary_opaque(&mut self, opaque: TcpSegmentSackOpaque) {
+        let fields = unsafe { opaque.fields };
         let mut blocks = [TcpSackBlock {
             left_edge: 0,
             right_edge: 0,
@@ -331,21 +324,9 @@ impl SecondaryOpaquePayload for TcpSegment {
             bytes[8..16].copy_from_slice(&fields.cookie_words[1].to_ne_bytes());
             cookie = Some(bytes);
         }
-        Self {
-            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            sequence: 0,
-            acknowledgment: 0,
-            advertised_window: 0,
-            flags: TcpSegmentFlags::empty(),
-            capabilities: TcpCapabilities::default(),
-            sack_blocks: (count != 0).then_some(blocks),
-            sack_block_count: count as u8,
-            fast_open_cookie: cookie,
-            fast_open_cookie_len: 0,
-            ip_ecn: None,
-            payload_len: 0,
-        }
+        self.sack_blocks = (count != 0).then_some(blocks);
+        self.sack_block_count = count as u8;
+        self.fast_open_cookie = cookie;
     }
 }
 
@@ -457,12 +438,11 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
     (Some(copied), len as u8)
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, Network, RouteMetadata, SocksAddr};
+    use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, NetworkOpaque};
 
     use super::*;
 
@@ -470,9 +450,7 @@ mod tests {
     fn transport_tcp_parse_packet_keeps_inbound_sack_blocks() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
         let packet = ipv4_tcp_packet_with_sack();
-        let index = runtime
-            .alloc_index_with_bytes(tcp_metadata(), &packet)
-            .expect("packet");
+        let index = runtime.alloc_index_with_bytes(&packet).expect("packet");
         stamp_tcp_cursor(&runtime, index, &packet);
 
         let parsed = parse_tcp_packet(&runtime, index).expect("parse tcp packet");
@@ -489,7 +467,7 @@ mod tests {
     #[test]
     fn transport_tcp_segment_buffer_round_trip_keeps_sack_blocks() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
-        let index = runtime.alloc_index(Default::default()).expect("buffer");
+        let index = runtime.alloc_index().expect("buffer");
         let local = "192.0.2.10:50000".parse().expect("local");
         let remote = "198.51.100.20:443".parse().expect("remote");
         let blocks = [TcpSackBlock {
@@ -511,7 +489,7 @@ mod tests {
         );
 
         segment
-            .write_to_buffer(&runtime, index)
+            .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
         let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
 
@@ -524,7 +502,7 @@ mod tests {
     #[test]
     fn transport_tcp_segment_buffer_round_trip_keeps_fast_open_cookie() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
-        let index = runtime.alloc_index(Default::default()).expect("buffer");
+        let index = runtime.alloc_index().expect("buffer");
         let local = "192.0.2.10:50000".parse().expect("local");
         let remote = "198.51.100.20:443".parse().expect("remote");
         let segment = TcpSegment::new(
@@ -545,7 +523,7 @@ mod tests {
         );
 
         segment
-            .write_to_buffer(&runtime, index)
+            .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
         let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
 
@@ -581,35 +559,21 @@ mod tests {
         packet
     }
 
-    fn tcp_metadata() -> RouteMetadata {
-        RouteMetadata {
-            network: Network::Tcp,
-            source: Some(SocksAddr::ip(
-                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
-                443,
-            )),
-            destination: Some(SocksAddr::ip(
-                IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)),
-                50_000,
-            )),
-            ..RouteMetadata::default()
-        }
-    }
-
     fn stamp_tcp_cursor(runtime: &DataPlaneRuntime, index: BufferIndex, packet: &[u8]) {
         let network_header_len = ((*packet.first().expect("ipv4 version") & 0x0f) as usize) * 4;
         let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
         let tcp_header_len = ((packet[network_header_len + 12] >> 4) as usize) * 4;
-        runtime
-            .get_buffer_mut(index)
-            .expect("buffer mut")
-            .set_packet_cursor(
-                BufferPacketCursor::new()
-                    .with_packet_len(packet_len)
-                    .with_network_header(0, network_header_len)
-                    .with_transport_header(network_header_len, tcp_header_len)
-                    .with_transport_payload_offset(network_header_len + tcp_header_len),
-            );
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
+        buffer.set_packet_cursor(
+            BufferPacketCursor::new()
+                .with_packet_len(packet_len)
+                .with_network_header(0, network_header_len)
+                .with_transport_header(network_header_len, tcp_header_len)
+                .with_transport_payload_offset(network_header_len + tcp_header_len),
+        );
+        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+            .ip_mut()
+            .set_ip_ecn(Some(0));
     }
 
     fn ipv4_l4_checksum(

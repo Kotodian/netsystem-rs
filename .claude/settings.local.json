@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/lqk/go/src/github.com/Kotodian/**)",
+      "Read(//home/lqk/rust/src/github.com/Kotodian/**)",
+      "Bash(ssh *)",
+      "Bash(rsync *)",
+      "Bash(cargo check *)",
+      "Bash(grep -E \"\\\\.\\(rs|toml\\)$\")",
+      "Bash(git add *)",
+      "Bash(git commit -m 'docs\\(Spec\\): add tcp complete implementation and echo e2e design *)",
+      "Bash(git commit -m 'docs\\(Spec\\): fix self-review gaps in tcp design *)",
+      "Bash(git commit -q -m 'docs\\(Plan\\): add tcp phase 1 core state machine plan *)",
+      "Bash(sed -n '546,660p' crates/hammer-service/src/transport/tcp/output.rs)",
+      "Bash(sed -n '134,170p' crates/hammer-service/src/transport/tcp/output.rs)",
+      "Bash(sed -n '1,80p' crates/hammer-service/src/transport/tcp/listen.rs)",
+      "Bash(sed -n '1,12p' crates/hammer-service/tests/tcp_reply_nodes.rs)",
+      "Bash(cargo build *)",
+      "Bash(echo \"=== exit: $? ===\")",
+      "Bash(cargo test *)",
+      "Bash(git commit -q -m 'hammer-service\\(Feat\\): passive-open service backend emits syn-ack *)",
+      "Bash(sed -n '3935,3945p' crates/hammer-service/src/service.rs)",
+      "Bash(awk 'NR>=3935 && NR<=4260 && /register_internal|register_driver|\\\\.node\\\\\\(\\\\\\)|TcpInput|IpInputNode|TunInput|graph\\\\.build|spawn_app_on_worker/' crates/hammer-service/src/service.rs)",
+      "Bash(git commit -q -m 'docs\\(Plan\\): record missing production tcp graph as phase 1 prerequisite *)",
+      "Bash(sed -n '174,195p' crates/hammer-service/src/service.rs)",
+      "Bash(sed -n '795,825p' crates/hammer-service/src/service.rs)"
+    ]
+  }
+}

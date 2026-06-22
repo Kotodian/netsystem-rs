@@ -452,6 +452,8 @@ struct NodeRuntimeInner {
     node_states: Vec<NodeState>,
     interrupt_pending: Vec<bool>,
     error_counters: Vec<NodeErrorCounters>,
+    error_ids: HashMap<u64, u16>,
+    error_slots: Vec<crate::BufferNodeError>,
     runtime_stats: Vec<NodeRuntimeStats>,
     queue: VecDeque<ScheduledFrame>,
     handles: HashMap<NodeHandle, NodeId>,
@@ -547,6 +549,11 @@ struct ScheduledFrame {
 }
 
 impl NodeRuntimeInner {
+    #[inline]
+    fn error_key(node: NodeId, code: u16) -> u64 {
+        (u64::from(node.slot()) << 16) | u64::from(code)
+    }
+
     fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
         let id = NodeId(u32::try_from(self.nodes.len()).expect("node index fits u32"));
         self.nodes.push(slot);
@@ -726,6 +733,8 @@ impl Default for NodeRuntime {
                 node_states: Vec::new(),
                 interrupt_pending: Vec::new(),
                 error_counters: Vec::new(),
+                error_ids: HashMap::new(),
+                error_slots: Vec::new(),
                 runtime_stats: Vec::new(),
                 queue: VecDeque::new(),
                 handles: HashMap::new(),
@@ -1002,14 +1011,28 @@ impl NodeRuntime {
     }
 
     #[inline]
-    pub fn increment_node_error(&self, node: NodeId, code: u16) -> CoreResult<()> {
-        self.inner
-            .borrow_mut()
+    pub fn increment_node_error(&self, node: NodeId, code: u16) -> CoreResult<u16> {
+        let mut inner = self.inner.borrow_mut();
+        inner
             .error_counters
             .get_mut(node.0 as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?
             .increment(code);
-        Ok(())
+        let key = NodeRuntimeInner::error_key(node, code);
+        if let Some(encoded) = inner.error_ids.get(&key).copied() {
+            return Ok(encoded);
+        }
+        let next = inner
+            .error_slots
+            .len()
+            .checked_add(1)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| CoreError::internal("node error slot overflow"))?;
+        inner
+            .error_slots
+            .push(crate::BufferNodeError::new(node, code));
+        inner.error_ids.insert(key, next);
+        Ok(next)
     }
 
     #[inline]
@@ -1021,6 +1044,19 @@ impl NodeRuntime {
             .get(node.0 as usize)
             .ok_or_else(|| CoreError::internal("node id out of bounds"))?
             .get(code))
+    }
+
+    #[inline]
+    pub fn decode_node_error(&self, encoded: u16) -> CoreResult<Option<crate::BufferNodeError>> {
+        if encoded == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .borrow()
+            .error_slots
+            .get(encoded as usize - 1)
+            .copied())
     }
 
     #[inline]
@@ -1378,7 +1414,7 @@ mod tests {
 
     fn push_packet(runtime: &DataPlaneRuntime, frame: FrameIndex, payload: &[u8]) {
         let buffer = runtime
-            .alloc_index_with_bytes(crate::RouteMetadata::default(), payload)
+            .alloc_index_with_bytes(payload)
             .expect("alloc packet");
         runtime
             .get_frame_mut(frame)

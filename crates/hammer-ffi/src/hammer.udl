@@ -58,7 +58,6 @@ dictionary HammerNetworkInterface {
   boolean expensive;
   boolean constrained;
   sequence<string> addresses;
-  sequence<string> dns_servers;
 };
 
 dictionary HammerWIFIState {
@@ -102,7 +101,6 @@ callback interface HammerPlatform {
   boolean include_all_networks();
   HammerWIFIState? read_wifi_state();
   HammerStringIterator? system_certificates();
-  void clear_dns_cache();
   void write_log(i32 level, string message);
 };
 
@@ -124,19 +122,6 @@ interface HammerService {
   [Throws=HammerError]
   sequence<HammerProbeReport> probe_outbounds(
     string protocol,
-    u64 timeout_ms
-  );
-
-  // Return the id of the child outbound currently selected by an
-  // aggregate outbound (e.g. urltest). Leaves and unknown ids return null.
-  string? current_selection(string outbound_id);
-
-  // Trigger an on-demand probe sweep on an aggregate outbound (urltest).
-  // `timeout_ms = 0` means "use the configured per-probe timeout". Each
-  // child contributes one HammerProbeReport with `protocol = "urltest"`.
-  [Throws=HammerError]
-  sequence<HammerProbeReport> urltest(
-    string outbound_id,
     u64 timeout_ms
   );
 

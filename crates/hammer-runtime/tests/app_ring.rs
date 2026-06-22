@@ -269,7 +269,7 @@ fn app_runtime_send_enqueues_op_owned_send_sqe_descriptor() {
                     .await
                     .expect("recv sqe descriptor");
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"runtime-send-sqe")
+                    .alloc_index_with_bytes(b"runtime-send-sqe")
                     .expect("alloc app send buffer");
 
                 app_runtime
@@ -332,7 +332,7 @@ fn app_context_try_complete_recv_buffer_enqueues_op_owned_cqe() {
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let before_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"complete-recv")
+                    .alloc_index_with_bytes(b"complete-recv")
                     .expect("alloc app recv buffer");
 
                 app_for_worker
@@ -392,7 +392,7 @@ fn app_context_try_complete_recv_buffer_requires_pending_recv_submission() {
             app.spawn_on_op(op, 0, move |_worker| async move {
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"missing-recv-sqe")
+                    .alloc_index_with_bytes(b"missing-recv-sqe")
                     .expect("alloc app recv buffer");
 
                 let err = app_for_worker
@@ -437,7 +437,7 @@ fn app_context_failed_recv_completion_keeps_pending_recv_submission() {
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let first = runtime
-                    .alloc_index_with_bytes(Default::default(), b"first")
+                    .alloc_index_with_bytes(b"first")
                     .expect("alloc first recv buffer");
 
                 app_for_worker
@@ -445,7 +445,7 @@ fn app_context_failed_recv_completion_keeps_pending_recv_submission() {
                     .expect("first recv completion");
 
                 let second = runtime
-                    .alloc_index_with_bytes(Default::default(), b"second")
+                    .alloc_index_with_bytes(b"second")
                     .expect("alloc second recv buffer");
                 app_for_worker
                     .try_complete_recv_buffer(op, runtime.clone(), second, false)
@@ -488,7 +488,7 @@ fn app_runtime_reuses_one_ring_handle_for_sq_and_cq() {
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"shared-ring")
+                    .alloc_index_with_bytes(b"shared-ring")
                     .expect("alloc shared ring buffer");
 
                 app_for_worker
@@ -766,7 +766,7 @@ fn app_recv_cqe_descriptor_uses_result_flags_and_data_address() {
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"descriptor-cqe")
+                    .alloc_index_with_bytes(b"descriptor-cqe")
                     .expect("alloc app recv buffer");
                 app_runtime
                     .complete_recv_buffer(runtime, index)
@@ -832,7 +832,7 @@ fn app_ring_copies_recv_into_app_data_and_keeps_stable_op_owner() {
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let before_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"ring-app-data-copy")
+                    .alloc_index_with_bytes(b"ring-app-data-copy")
                     .expect("alloc app recv buffer");
 
                 app_runtime
@@ -914,7 +914,7 @@ fn app_recv_drop_releases_app_data_chunk() {
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let before_in_use = with_data_plane_buffers(|runtime| runtime.in_use_buffers());
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"drop-recv")
+                    .alloc_index_with_bytes(b"drop-recv")
                     .expect("alloc app recv buffer");
 
                 app_runtime
@@ -962,7 +962,7 @@ fn same_op_reuses_runtime_ring_across_spawn_calls() {
                     .expect("recv sqe descriptor");
                 let runtime = with_data_plane_buffers(Clone::clone);
                 let index = runtime
-                    .alloc_index_with_bytes(Default::default(), b"persisted-runtime")
+                    .alloc_index_with_bytes(b"persisted-runtime")
                     .expect("alloc app recv buffer");
 
                 app_runtime

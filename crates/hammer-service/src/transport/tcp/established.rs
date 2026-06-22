@@ -4,9 +4,9 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::transport::congestion::CongestionController;
-use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
+use super::segment::parse_tcp_packet;
+use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpEstablishedNext {
@@ -113,12 +113,14 @@ where
                     .session_mut(session_id)
                     .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
                 let previous_snd_una = connection.snd_una();
-                let control =
-                    connection.receive_data(runtime, index, &mut *queue_ptr, session_id, &packet)?;
-                (
-                    control,
-                    connection.snd_una() != previous_snd_una,
-                )
+                let control = connection.receive_data(
+                    runtime,
+                    index,
+                    &mut *queue_ptr,
+                    session_id,
+                    &packet,
+                )?;
+                (control, connection.snd_una() != previous_snd_una)
             }
         };
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
@@ -126,8 +128,8 @@ where
         }
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
-            if let Err(error) = segment.write_to_buffer(runtime, allocated) {
+            let allocated = runtime.packet_buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }

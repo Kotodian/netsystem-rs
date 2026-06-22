@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneInstructionSet, DataPlaneRuntime, DriverNode, InternalNode,
-    Node, NodeId, NodeNextEnqueue, NodeResult, RouteMetadata,
+    Node, NodeId, NodeNextEnqueue, NodeResult,
 };
 use hammer_core::error::CoreResult;
 
@@ -153,7 +153,7 @@ fn alloc_indices(runtime: &DataPlaneRuntime) -> Vec<BufferIndex> {
     let mut indices = Vec::with_capacity(FRAME_PACKETS);
     for index in 0..FRAME_PACKETS {
         let buffer = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), &[index as u8])
+            .alloc_index_with_bytes(&[index as u8])
             .expect("alloc packet");
         indices.push(buffer);
     }

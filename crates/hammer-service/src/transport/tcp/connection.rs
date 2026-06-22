@@ -1,14 +1,6 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, IpEcnCodepoint};
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSackBlock,
-    TcpSegmentFlags, TcpSeq, TcpState,
-};
-use hammer_infra::vec::Vec;
-
 use crate::session::{
     SessionId, SessionQueueNext, SessionTimerExpiry, SessionTimerToken,
     node::SessionQueueOutput,
@@ -16,12 +8,21 @@ use crate::session::{
     runtime::{SessionDriverRuntime, SessionQueueProtocol},
 };
 use crate::transport::congestion::CongestionController;
+use hammer_adapter::{
+    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, IpEcnCodepoint,
+};
+use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::protocol::tcp::{
+    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSackBlock,
+    TcpSegmentFlags, TcpSeq, TcpState,
+};
+use hammer_infra::vec::Vec;
 
+use super::TcpInputNext;
 use super::lookup::TcpWorkerOwnedState;
 use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::segment::{TcpPacket, TcpSegment};
-use super::TcpInputNext;
 
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
@@ -619,7 +620,9 @@ where
 
     #[inline]
     fn pending_ece_ack(&self) -> bool {
-        self.ecn.pending_signals.contains(TcpPendingSignals::ECE_ACK)
+        self.ecn
+            .pending_signals
+            .contains(TcpPendingSignals::ECE_ACK)
     }
 
     #[inline]
@@ -638,7 +641,8 @@ where
             && packet.flags.contains(TcpSegmentFlags::ECE)
             && packet.flags.contains(TcpSegmentFlags::ACK)
         {
-            self.ecn.pending_signals
+            self.ecn
+                .pending_signals
                 .insert(TcpPendingSignals::ECN_CE | TcpPendingSignals::CWR);
             self.ecn.pending_ce_feedback = self.ecn.pending_ce_feedback.saturating_add(1);
         }
@@ -658,7 +662,10 @@ where
             let next_ace = ace_counter(packet.flags);
             let ce_delta = ace_delta(self.ecn.peer_ace_counter, next_ace);
             self.ecn.peer_ace_counter = next_ace;
-            self.ecn.pending_ce_feedback = self.ecn.pending_ce_feedback.saturating_add(u64::from(ce_delta));
+            self.ecn.pending_ce_feedback = self
+                .ecn
+                .pending_ce_feedback
+                .saturating_add(u64::from(ce_delta));
             if ce_delta != 0 {
                 self.ecn
                     .pending_signals
@@ -756,9 +763,7 @@ where
             if !TcpSeq::from(self.rcv_nxt).before(TcpSeq::from(block.left_edge)) {
                 continue;
             }
-            if count != 0
-                && sack_blocks_overlap_or_touch(current, *block)
-            {
+            if count != 0 && sack_blocks_overlap_or_touch(current, *block) {
                 if TcpSeq::from(block.left_edge).before(TcpSeq::from(current.left_edge)) {
                     current.left_edge = block.left_edge;
                 }
@@ -869,7 +874,8 @@ where
             flags,
             self.options.local_capabilities(),
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
-            flags.contains(TcpSegmentFlags::SYN)
+            flags
+                .contains(TcpSegmentFlags::SYN)
                 .then(|| self.fast_open_cookie())
                 .flatten(),
             None,
@@ -991,7 +997,8 @@ where
         }
 
         if packet.flags.contains(TcpSegmentFlags::RST) {
-            if let Some(acknowledgment) = packet.acknowledgment && self.accepts_ack(acknowledgment)
+            if let Some(acknowledgment) = packet.acknowledgment
+                && self.accepts_ack(acknowledgment)
             {
                 self.close_reason = Some(TcpCloseReason::RemoteReset);
                 self.state = TcpState::Closed;
@@ -1028,7 +1035,11 @@ where
                     .advance(1 + packet.payload_len as u32)
                     .raw();
             }
-            return Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)));
+            return Ok(Some(self.control_segment(
+                packet,
+                TcpSegmentFlags::ACK,
+                None,
+            )));
         }
 
         self.state = TcpState::SynRcvd;
@@ -1053,8 +1064,9 @@ where
         );
         let payload_acked = acked.saturating_sub(syn_control);
         let fast_open_acked = payload_acked.min(self.fast_open_syn_payload_len);
-        self.fast_open_syn_payload_len =
-            self.fast_open_syn_payload_len.saturating_sub(fast_open_acked);
+        self.fast_open_syn_payload_len = self
+            .fast_open_syn_payload_len
+            .saturating_sub(fast_open_acked);
         payload_acked
     }
 
@@ -1083,7 +1095,11 @@ where
                 .advance(1 + packet.payload_len as u32)
                 .raw();
         }
-        Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)))
+        Ok(Some(self.control_segment(
+            packet,
+            TcpSegmentFlags::ACK,
+            None,
+        )))
     }
 
     #[inline]
@@ -1125,9 +1141,9 @@ where
 
     pub(crate) fn tx_segment(&mut self, payload_len: usize) -> CoreResult<TcpSegment> {
         if self.state == TcpState::SynSent {
-            let local = self
-                .local()
-                .ok_or_else(|| CoreError::internal("syn-sent tcp connection missing local address"))?;
+            let local = self.local().ok_or_else(|| {
+                CoreError::internal("syn-sent tcp connection missing local address")
+            })?;
             let flags = if self.options.local_capabilities().ecn {
                 TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
             } else {
@@ -1147,10 +1163,13 @@ where
                 payload_len,
             ));
         }
-        self.ensure_state(TcpState::Established, "tcp tx segment requires established state")?;
-        let local = self
-            .local()
-            .ok_or_else(|| CoreError::internal("established tcp connection missing local address"))?;
+        self.ensure_state(
+            TcpState::Established,
+            "tcp tx segment requires established state",
+        )?;
+        let local = self.local().ok_or_else(|| {
+            CoreError::internal("established tcp connection missing local address")
+        })?;
         let mut flags = self.output_flags(TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
         if self.ecn.pending_signals.contains(TcpPendingSignals::CWR) {
             flags.insert(TcpSegmentFlags::CWR);
@@ -1174,7 +1193,7 @@ where
 
     pub(crate) fn commit_payload_tx(
         &mut self,
-        payload: BufferIndex,
+        _: BufferIndex,
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<TcpConnectionTimerKind> {
@@ -1191,11 +1210,9 @@ where
                 packet_number,
                 sequence,
                 end_sequence,
-                payload_len.saturating_add(1),
-                Some(payload),
+                payload_len,
+                None,
                 now,
-                false,
-                false,
             );
             self.congestion.on_packet_sent(
                 packet_number,
@@ -1208,7 +1225,10 @@ where
             self.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
             return Ok(TcpConnectionTimerKind::empty());
         }
-        self.ensure_state(TcpState::Established, "tcp tx commit requires established state")?;
+        self.ensure_state(
+            TcpState::Established,
+            "tcp tx commit requires established state",
+        )?;
         let payload_len = u32::try_from(payload_len)
             .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
         let sequence = self.snd_nxt;
@@ -1220,10 +1240,8 @@ where
             sequence,
             end_sequence,
             payload_len,
-            Some(payload),
+            None,
             now,
-            false,
-            false,
         );
         self.recovery.on_new_data_sent(payload_len);
         self.congestion
@@ -1267,15 +1285,6 @@ where
             .then_some(packet.payload_len)
     }
 
-    fn payload_offset_from_rcv_nxt(&self, sequence: u32) -> Option<u32> {
-        let sequence = TcpSeq::from(sequence);
-        let rcv_nxt = TcpSeq::from(self.rcv_nxt);
-        if sequence.before(rcv_nxt) {
-            return None;
-        }
-        Some(rcv_nxt.distance_to(sequence))
-    }
-
     pub(crate) fn receive_data(
         &mut self,
         runtime: &DataPlaneRuntime,
@@ -1287,7 +1296,10 @@ where
     where
         C: 'static,
     {
-        self.ensure_state(TcpState::Established, "tcp data receive requires established state")?;
+        self.ensure_state(
+            TcpState::Established,
+            "tcp data receive requires established state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
 
         if packet.flags.contains(TcpSegmentFlags::RST) {
@@ -1314,8 +1326,12 @@ where
         let mut ack = false;
         if packet.payload_len != 0 {
             ack = true;
-            runtime.packet_buffers().advance(index, packet.payload_offset)?;
-            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            runtime
+                .packet_buffers()
+                .advance(index, packet.payload_offset)?;
+            runtime
+                .packet_buffers()
+                .truncate_chain(index, packet.payload_len)?;
             if self.accept_payload(packet).is_some() {
                 let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
                 if enqueue.delivered_len != 0 {
@@ -1325,22 +1341,40 @@ where
                 }
                 if let Some(start) = enqueue.newest_ooo_start {
                     let left_edge = TcpSeq::from(self.rcv_nxt).advance(start).raw();
-                    let right_edge = TcpSeq::from(left_edge).advance(enqueue.newest_ooo_len).raw();
+                    let right_edge = TcpSeq::from(left_edge)
+                        .advance(enqueue.newest_ooo_len)
+                        .raw();
                     self.update_ack_sack_block(left_edge, right_edge);
                 } else {
                     self.update_ack_sack_blocks(&[], None);
                 }
-            } else if let Some(offset) = self.payload_offset_from_rcv_nxt(packet.sequence) {
+            } else {
+                let sequence = TcpSeq::from(packet.sequence);
+                let rcv_nxt = TcpSeq::from(self.rcv_nxt);
+                let end = sequence.advance(packet.payload_len as u32);
+                let offset = if !end.after(rcv_nxt) {
+                    None
+                } else if sequence.before(rcv_nxt) {
+                    Some(0)
+                } else {
+                    Some(rcv_nxt.distance_to(sequence))
+                };
+                let Some(offset) = offset else {
+                    let right_edge = packet.sequence.wrapping_add(packet.payload_len as u32);
+                    self.set_duplicate_sack(packet.sequence, right_edge);
+                    runtime.free_index(index);
+                    return Ok(
+                        ack.then(|| self.control_segment(packet, TcpSegmentFlags::ACK, None))
+                    );
+                };
                 let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
                 if let Some(start) = enqueue.newest_ooo_start {
                     let left_edge = TcpSeq::from(self.rcv_nxt).advance(start).raw();
-                    let right_edge = TcpSeq::from(left_edge).advance(enqueue.newest_ooo_len).raw();
+                    let right_edge = TcpSeq::from(left_edge)
+                        .advance(enqueue.newest_ooo_len)
+                        .raw();
                     self.update_ack_sack_block(left_edge, right_edge);
                 }
-            } else {
-                let right_edge = packet.sequence.wrapping_add(packet.payload_len as u32);
-                self.set_duplicate_sack(packet.sequence, right_edge);
-                runtime.free_index(index);
             }
         }
 
@@ -1351,7 +1385,11 @@ where
             self.receive_in_order(fin_sequence, 1);
             self.close_reason = Some(TcpCloseReason::RemoteFin);
             self.state = TcpState::CloseWait;
-            return Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)));
+            return Ok(Some(self.control_segment(
+                packet,
+                TcpSegmentFlags::ACK,
+                None,
+            )));
         }
 
         Ok(ack.then(|| self.control_segment(packet, TcpSegmentFlags::ACK, None)))
@@ -1366,7 +1404,10 @@ where
     where
         C: 'static,
     {
-        self.ensure_state(TcpState::CloseWait, "tcp close-wait receive requires close-wait state")?;
+        self.ensure_state(
+            TcpState::CloseWait,
+            "tcp close-wait receive requires close-wait state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1387,7 +1428,11 @@ where
         }
         if packet.flags.contains(TcpSegmentFlags::FIN) {
             self.receive_in_order(packet.sequence, 1);
-            return Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)));
+            return Ok(Some(self.control_segment(
+                packet,
+                TcpSegmentFlags::ACK,
+                None,
+            )));
         }
         Ok(None)
     }
@@ -1401,7 +1446,10 @@ where
     where
         C: 'static,
     {
-        self.ensure_state(TcpState::FinWait1, "tcp fin-wait1 receive requires fin-wait1 state")?;
+        self.ensure_state(
+            TcpState::FinWait1,
+            "tcp fin-wait1 receive requires fin-wait1 state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1419,7 +1467,11 @@ where
                 self.receive_in_order(packet.sequence, 1);
                 self.state = TcpState::TimeWait;
                 release_acked_tx(queue, session_id, self.take_acked_tx_len(previous_snd_una))?;
-                Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)))
+                Ok(Some(self.control_segment(
+                    packet,
+                    TcpSegmentFlags::ACK,
+                    None,
+                )))
             }
             (false, Some(acknowledgment)) => {
                 let previous_snd_una = self.snd_una();
@@ -1432,14 +1484,21 @@ where
                 self.apply_ack(self.snd_una, packet.advertised_window);
                 self.receive_in_order(packet.sequence, 1);
                 self.state = TcpState::Closing;
-                Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)))
+                Ok(Some(self.control_segment(
+                    packet,
+                    TcpSegmentFlags::ACK,
+                    None,
+                )))
             }
             _ => Ok(None),
         }
     }
 
     fn receive_fin_wait2(&mut self, packet: &TcpPacket) -> CoreResult<Option<TcpSegment>> {
-        self.ensure_state(TcpState::FinWait2, "tcp fin-wait2 receive requires fin-wait2 state")?;
+        self.ensure_state(
+            TcpState::FinWait2,
+            "tcp fin-wait2 receive requires fin-wait2 state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1450,7 +1509,11 @@ where
             self.apply_ack(self.snd_una, packet.advertised_window);
             self.receive_in_order(packet.sequence, 1);
             self.state = TcpState::TimeWait;
-            return Ok(Some(self.control_segment(packet, TcpSegmentFlags::ACK, None)));
+            return Ok(Some(self.control_segment(
+                packet,
+                TcpSegmentFlags::ACK,
+                None,
+            )));
         }
         Ok(None)
     }
@@ -1464,7 +1527,10 @@ where
     where
         C: 'static,
     {
-        self.ensure_state(TcpState::Closing, "tcp closing receive requires closing state")?;
+        self.ensure_state(
+            TcpState::Closing,
+            "tcp closing receive requires closing state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1491,7 +1557,10 @@ where
     where
         C: 'static,
     {
-        self.ensure_state(TcpState::LastAck, "tcp last-ack receive requires last-ack state")?;
+        self.ensure_state(
+            TcpState::LastAck,
+            "tcp last-ack receive requires last-ack state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1511,7 +1580,10 @@ where
     }
 
     fn receive_time_wait(&mut self, packet: &TcpPacket) -> CoreResult<Option<TcpSegment>> {
-        self.ensure_state(TcpState::TimeWait, "tcp time-wait receive requires time-wait state")?;
+        self.ensure_state(
+            TcpState::TimeWait,
+            "tcp time-wait receive requires time-wait state",
+        )?;
         self.observe_peer_ecn_feedback(packet);
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.close_reason = Some(TcpCloseReason::RemoteReset);
@@ -1722,8 +1794,11 @@ where
         if self.state == TcpState::Established {
             match kind {
                 TcpConnectionTimerKind::RACK => {
-                    self.recovery
-                        .on_rack_timeout(Instant::now(), self.snd_nxt, &mut self.congestion);
+                    self.recovery.on_rack_timeout(
+                        Instant::now(),
+                        self.snd_nxt,
+                        &mut self.congestion,
+                    );
                     if let Some((sequence, bytes, payload)) = self.recovery.take_rack_retransmit() {
                         self.recovery.on_retransmit_sent(bytes);
                         emit_retained_segment(
@@ -1884,11 +1959,12 @@ where
     ))
 }
 
-fn write_segment(buffers: &DataPlaneBuffers, index: BufferIndex, segment: &TcpSegment) -> CoreResult<()> {
-    let mut buffer = buffers.get_buffer_mut(index)?;
-    buffer.opaque_mut().write(segment);
-    buffer.opaque2_mut().write(segment);
-    Ok(())
+fn write_segment(
+    buffers: &DataPlaneBuffers,
+    index: BufferIndex,
+    segment: &TcpSegment,
+) -> CoreResult<()> {
+    segment.write_to_buffer(buffers, index)
 }
 
 fn emit_segment(
@@ -1898,7 +1974,7 @@ fn emit_segment(
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
 ) -> CoreResult<()> {
-    let index = buffers.alloc_index(Default::default())?;
+    let index = buffers.alloc_index()?;
     if let Err(error) = write_segment(buffers, index, &segment) {
         buffers.free_index(index);
         return Err(error);
@@ -1926,7 +2002,7 @@ where
     let header = timer_segment_header(connection, sequence, bytes)?;
     let payload = payload
         .ok_or_else(|| CoreError::internal("tcp timer segment is missing retained payload"))?;
-    let index = buffers.alloc_index(Default::default())?;
+    let index = buffers.alloc_index()?;
     if let Err(error) = buffers.attach_clone(index, payload) {
         buffers.free_index(index);
         return Err(error);
@@ -2287,7 +2363,8 @@ mod tests {
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
-        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
+        let parsed =
+            etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
 
         assert!(parsed.syn());
         assert!(parsed.ece());
@@ -2319,7 +2396,7 @@ mod tests {
         let now = Instant::now();
         let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
         let buffers = runtime.packet_buffers();
-        let payload = buffers.alloc_index(Default::default()).expect("payload");
+        let payload = buffers.alloc_index().expect("payload");
         buffers.append(payload, b"hello").expect("payload bytes");
         let _ = connection
             .commit_payload_tx(payload, 5, now)
@@ -2331,7 +2408,8 @@ mod tests {
             .expect("retransmit");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
-        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
+        let parsed =
+            etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp header");
         let options = hammer_core::protocol::tcp::tcp_options_from_bytes(parsed.options());
 
         assert_eq!(segment.payload_len(), 5);
@@ -2388,7 +2466,9 @@ mod tests {
         connection.snd_wnd = 8_000;
         connection.snd_una = 1_000;
         connection.snd_nxt = 6_000;
-        connection.recovery.record_sent(1, 1_000, 2_000, 1_000, None, now, false, false);
+        connection
+            .recovery
+            .record_sent(1, 1_000, 2_000, 1_000, None, now);
         connection.recovery.record_sent(
             2,
             2_000,
@@ -2396,18 +2476,31 @@ mod tests {
             1_000,
             None,
             now + Duration::from_millis(1),
-            false,
-            false,
         );
-        connection
-            .recovery
-            .record_sent(3, 3_000, 4_000, 1_000, None, now + Duration::from_millis(2), false, false);
-        connection
-            .recovery
-            .record_sent(4, 4_000, 5_000, 1_000, None, now + Duration::from_millis(3), false, false);
-        connection
-            .recovery
-            .record_sent(5, 5_000, 6_000, 1_000, None, now + Duration::from_millis(4), false, false);
+        connection.recovery.record_sent(
+            3,
+            3_000,
+            4_000,
+            1_000,
+            None,
+            now + Duration::from_millis(2),
+        );
+        connection.recovery.record_sent(
+            4,
+            4_000,
+            5_000,
+            1_000,
+            None,
+            now + Duration::from_millis(3),
+        );
+        connection.recovery.record_sent(
+            5,
+            5_000,
+            6_000,
+            1_000,
+            None,
+            now + Duration::from_millis(4),
+        );
         connection.recovery.on_sack_blocks(
             TcpRecoveryAck {
                 acknowledgment: 1_000,
@@ -2423,9 +2516,11 @@ mod tests {
             }],
             &mut connection.congestion,
         );
-        connection
-            .recovery
-            .on_rack_timeout(now + Duration::from_millis(56), connection.snd_nxt, &mut connection.congestion);
+        connection.recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            connection.snd_nxt,
+            &mut connection.congestion,
+        );
         connection.recovery.on_retransmit_sent(1_000);
 
         assert_eq!(connection.tx_payload_budget(1_000, now), 0);

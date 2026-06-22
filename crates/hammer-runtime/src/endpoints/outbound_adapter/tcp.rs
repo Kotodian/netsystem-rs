@@ -4,12 +4,12 @@
 //! smoltcp `Interface` per dial: the driver task owns the smoltcp state,
 //! feeds outbound IP packets into the endpoint's encrypt channel, and
 //! consumes inbound IP packets the adapter demux routes our way. The
-//! `EndpointTcpStream` returned to the DNS / DoH transport implements
+//! `EndpointTcpStream` returned to the local endpoint adapter implements
 //! `AsyncRead` + `AsyncWrite` and talks to the driver via two byte
 //! channels.
 //!
 //! Why per-dial drivers instead of one shared `SocketSet`: Phase 1's
-//! workload is 1-3 concurrent sockets (DNS UDP retries + DoH), so the
+//! workload is 1-3 concurrent sockets, so the
 //! overhead of an extra task per dial is negligible and we sidestep the
 //! locking/handle-bookkeeping shared-set would require.
 
@@ -451,7 +451,7 @@ impl AsyncWrite for EndpointTcpStream {
         }
         // Phase 1 trade-off: tokio 1.52's `mpsc::Sender` doesn't expose
         // `poll_reserve` on stable, so we use `try_send` and re-poll on
-        // Full. DNS / DoH traffic stays well under the channel capacity,
+        // Full. The expected local TCP control traffic stays well under the channel capacity,
         // so the wake_by_ref spin path is hit rarely in practice; a
         // proper permit state machine is a Phase 2 polish if profiling
         // ever shows it on the hot path.

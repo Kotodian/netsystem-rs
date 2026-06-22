@@ -64,12 +64,6 @@ impl TraceEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TraceMark {
-    pub handle: u32,
-    pub epoch: u64,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct DataPlaneTrace {
     inner: std::rc::Rc<std::cell::RefCell<DataPlaneTraceState>>,
@@ -268,7 +262,7 @@ impl DataPlaneTrace {
         state.control = control;
     }
 
-    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<TraceMark> {
+    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
         let control = self.inner.borrow().control.clone()?;
         control.try_mark(node, node_name)
     }
@@ -283,7 +277,7 @@ impl DataPlaneTrace {
 
     pub fn add_entry(
         &self,
-        mark: TraceMark,
+        handle: u32,
         node: NodeId,
         node_name: Option<&'static str>,
         formatter: Option<TraceFormatter>,
@@ -292,14 +286,14 @@ impl DataPlaneTrace {
         let Some(control) = self.inner.borrow().control.clone() else {
             return;
         };
-        control.add_entry(mark, node, node_name, formatter, payload_bytes);
+        control.add_entry(handle, node, node_name, formatter, payload_bytes);
     }
 
-    pub fn finalize(&self, mark: TraceMark) {
+    pub fn finalize(&self, handle: u32) {
         let Some(control) = self.inner.borrow().control.clone() else {
             return;
         };
-        control.finalize(mark);
+        control.finalize(handle);
     }
 }
 
@@ -318,7 +312,7 @@ impl TraceControlHandle {
             && state.quotas.lookup(&node.slot()).unwrap_or(0) > 0
     }
 
-    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<TraceMark> {
+    pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
         if self.inner.marking_inputs.load(Ordering::Acquire) == 0 {
             return None;
         }
@@ -349,12 +343,12 @@ impl TraceControlHandle {
                 entries: Vec::new(),
             },
         );
-        Some(TraceMark { handle, epoch })
+        Some(handle)
     }
 
     pub fn add_entry(
         &self,
-        mark: TraceMark,
+        handle: u32,
         node: NodeId,
         node_name: Option<&'static str>,
         formatter: Option<TraceFormatter>,
@@ -365,12 +359,9 @@ impl TraceControlHandle {
             .state
             .lock()
             .expect("trace control lock poisoned");
-        let Some(packet) = state.active.get_mut(&mark.handle) else {
+        let Some(packet) = state.active.get_mut(&handle) else {
             return;
         };
-        if packet.epoch != mark.epoch {
-            return;
-        }
         packet.entries.push(TraceEntry {
             node,
             node_name,
@@ -379,22 +370,19 @@ impl TraceControlHandle {
         });
     }
 
-    pub fn finalize(&self, mark: TraceMark) {
+    pub fn finalize(&self, handle: u32) {
         let packet = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .expect("trace control lock poisoned");
-            let Some(packet) = state.active.get(&mark.handle) else {
-                return;
-            };
-            if packet.epoch != mark.epoch {
+            if !state.active.contains_key(&handle) {
                 return;
             }
             state
                 .active
-                .remove(&mark.handle)
+                .remove(&handle)
                 .expect("active trace packet disappeared")
         };
         if packet.entries.is_empty() {
@@ -406,15 +394,6 @@ impl TraceControlHandle {
             input_node_name: packet.input_node_name,
             entries: packet.entries,
         });
-    }
-
-    pub fn is_epoch_writable(&self, epoch: u64) -> bool {
-        let state = self
-            .inner
-            .state
-            .lock()
-            .expect("trace control lock poisoned");
-        state.epoch == epoch
     }
 
     fn next_trace_handle(&self, active: &HashMap<u32, PacketTraceState>) -> u32 {

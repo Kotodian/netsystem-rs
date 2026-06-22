@@ -11,7 +11,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 
 - iOS 优先。Swift 端通过 uniffi 调 Rust；整套运行时围绕 NEPacketTunnelProvider extension 能给的预算来设计。
 - 热路径围着 NetExt 的约束转——内存上限、个位数 worker 线程、生命周期 suspend / wake、网络接口切换。
-- 内建出口协议（hysteria2 / direct / urltest / block，可选 wireguard）+ DNS 传输（udp / tcp / doh / hosts / local）+ 一个 TUN 入口，全部由一份 TOML 配置驱动。
+- 当前保留一个 TUN 入口、`block` outbound，以及可选的 WireGuard endpoint；其余旧代理 / DNS 传输面已移除。
 
 <!-- TODO: 快速上手 / 配置参考 / FFI 用法 / 开发指南 / 许可证 -->
 
@@ -24,9 +24,9 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 | crate | 角色 |
 |---|---|
 | hammer-core | 基础类型——配置 schema、错误、生命周期、metrics、log、网络原语。零业务逻辑 |
-| hammer-adapter | 跨 crate 的契约层——出入口、DNS、平台接口、各类管理器的抽象。让实现层跟 FFI 调用方解耦 |
+| hammer-adapter | 跨 crate 的契约层——出入口、平台接口、数据面 buffer / node / handoff 抽象。让实现层跟 FFI 调用方解耦 |
 | hammer-component-macros | 一个 proc macro，把出入口实现登记到 runtime 注册表 |
-| hammer-runtime | 所有业务实现——出口协议、DNS 传输、router、TUN 入口、user-space IP 栈、双 tokio runtime |
+| hammer-runtime | 所有业务实现——路由、TUN 入口、user-space IP 栈、endpoint / outbound 运行时、双 tokio runtime |
 | hammer-ffi | uniffi 生成的 Swift FFI——服务句柄、平台回调接口、文件描述符桥接 |
 | hammer-uniffi-bindgen | 工具二进制，负责生成 Swift binding + xcframework |
 
@@ -52,8 +52,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
         │       └──────────────────────────────────────┘      │
         │       ┌──────────────────────────────────────┐      │
         │       │ 数据面 (多线程)                       │      │
-        │       │   入口 → 路由 → 出口 → 远端           │      │
-        │       │   DNS 查询任务                        │      │
+        │       │   入口 → 路由 → 出口/端点 → 远端      │      │
         │       └──────────────────────────────────────┘      │
         └──────────┬───────────────────────┬──────────────────┘
                    ▼                       ▼
@@ -69,7 +68,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 
 **控制面**：单线程 runtime，负责生命周期阶段调度（启动、关闭、暂停、唤醒、网络重置）、周期 metrics 汇总、log 序列化、FFI 命令处理。设计目标只有一个——永远不被业务任务阻塞。即使某个代理连接卡住，log 和指标还能照常上报、FFI 命令照常响应。
 
-**数据面**：多线程 runtime，跑所有"跟流量相关"的任务：TUN 设备读写、路由分发、出口拨号、DNS 查询、IP 栈轮询、隧道加解密。NetExt 上 worker 通常配 1–2 个，省 CPU 也省内存。
+**数据面**：多线程 runtime，跑所有"跟流量相关"的任务：TUN 设备读写、路由分发、出口拨号、IP 栈轮询、隧道加解密。NetExt 上 worker 通常配 1–2 个，省 CPU 也省内存。
 
 写代码不用关心当前在哪条 runtime——内部有自动机制把每个新任务投到数据面上。
 
@@ -84,7 +83,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 | 启动后 | spawn 后台任务——出口探测、warm-up 拨号、定时 metrics |
 | 已运行 | 每个子系统把"对外可服务"旗标拨亮 |
 
-各子系统之间还有先后顺序：证书要先于网络，网络要先于 DNS，DNS 要先于路由器，等等。
+各子系统之间还有先后顺序：证书要先于网络，网络要先于路由器，等等。
 
 ### 概念
 
@@ -97,7 +96,7 @@ TODO badges: CI / license / crates.io —— 等对应基础设施落地后再�
 | **Endpoint** | 比 outbound 高一层——同一个"协议端点"**同时具备 inbound 和 outbound 能力**。典型：WireGuard。隧道两头各是一个 endpoint，对端发来的流量从这里"入"，本端要发出去的流量从这里"出" |
 | **Router** | 流量决策器。按规则匹配每条进来的流量（协议、域名、目的 IP、来自哪个 inbound 等），决定走哪个 outbound，或者直接拒绝。整个 hammer 的"分流"语义都集中在这里 |
 
-其他细节（DNS 传输、boringtun L3 fast path 等）在下面对应章节随上下文解读。
+其他细节（boringtun L3 fast path 等）在下面对应章节随上下文解读。
 
 ### Dispatch 路径
 
@@ -114,40 +113,19 @@ Router 匹配规则
   ↓
 选定 Outbound 或 Endpoint
   ↓
-  ├─ hysteria2  →  QUIC 隧道                       →  远端
-  ├─ direct     →  系统 socket                     →  远端
   ├─ wireguard  →  L3DispatchTable → boringtun     →  远端 peer
-  └─ urltest    →  转交给当前最快的子 outbound
+  └─ block      →  本地拒绝
 ```
 
-WireGuard 走 **L3 fast path**：TUN packet loop 在 NAT 前先查 `L3DispatchTable` —— 把 inner IP 包按目的 IP 直接送进 boringtun 的 encrypt 通道，不经 user-space TCP/UDP 重组。hysteria2 / direct / urltest 仍然走 outbound dial / listen_packet 系统 socket 路径。
-
-> DNS `via = "<endpoint-id>"`（demo wg 模式默认就用这条）走的是另一条独立路径：runtime 会自动为每个 endpoint 注册一个 `EndpointOutboundAdapter` 进 OutboundManager。DNS UDP query 通过 adapter `listen_packet` 拼成 IPv4+UDP 包直接灌进 endpoint 的 encrypt 通道；TCP / DoH 路径同 endpoint 但 adapter 内部用一个仅 DNS 用的微 smoltcp 做 L4↔L3 翻译。这条路径不经过 TUN packet_loop，避免被 `hijack_dns` 自己 sniff 形成循环。
-
-**DNS 查询**
-
-```
-DNS 查询 (被 hijack 的 53 端口，或者上层直接调)
-  ↓
-DNS 路由匹配 (按域名规则、带 LRU)
-  ↓
-选定 DNS 传输 (UDP / TCP / DoH / hosts / local)
-  ↓
-上游
-  ↓
-按 TTL 缓存 + 写入反向映射 (ip → 域名)
-  ↓
-返回调用方
-```
+WireGuard 走 **L3 fast path**：TUN packet loop 在 NAT 前先查 `L3DispatchTable` —— 把 inner IP 包按目的 IP 直接送进 boringtun 的 encrypt 通道，不经 user-space TCP/UDP 重组。
 
 ### Feature 模型
 
 cargo feature 分四组：
 
 - **入口**：`inbound-tun`（默认开）。
-- **出口**：runtime feature 为 `outbound-hysteria2 / outbound-direct / outbound-block / outbound-urltest`（默认全开）；core 的 Hysteria2 协议/config feature 为 `hysteria2`。WireGuard 是 endpoint 协议，runtime feature 为 `endpoint-wireguard`，core 协议/config feature 为 `wireguard`（默认关，iOS xcframework 默认不带，省体积）。
-- **DNS**：`dns-udp / dns-tcp / dns-hosts / dns-local`（默认开），`dns-https`（默认关）。
-- **基础设施**：`endpoint`（endpoint 协议的公共依赖，自动拉 `arc-swap` + `smoltcp` —— 后者**仅给 `EndpointOutboundAdapter` 的 TCP DNS 用**，不在 TUN 数据路径上）、`probe`（出口延迟探测，默认开）。
+- **出口/端点**：`outbound-block` 默认开启。WireGuard 是 endpoint 协议，runtime feature 为 `endpoint-wireguard`，core 协议/config feature 为 `wireguard`（默认关，iOS xcframework 默认不带，省体积）。
+- **基础设施**：`endpoint`（endpoint 协议的公共依赖，自动拉 `arc-swap` + `smoltcp`，不在 TUN 数据路径上）、`probe`（出口延迟探测，默认开）。
 
 设计原则：
 - 任何独立出口 / 协议都挂在自己的 cargo feature 后面。
@@ -162,9 +140,9 @@ iOS 的 path-update / wake 事件应当触发一次网络重置——它会扇�
 
 ### 配置示例
 
-格式是 **TOML**。下面三个例子按典型出口拆开，每个都带完整的 DNS 分流规则，字段名与 production demo（`HammerVPNDemo-rs-wg`）对齐。
+格式是 **TOML**。下面三个例子按典型出口拆开，字段名与 production demo（`HammerVPNDemo-rs-wg`）对齐。
 
-**例 1 —— Hysteria2 代理（默认走代理 + 国内直连 + 拦截广告 + DNS 同步分流）**
+**例 1 —— `block` outbound（拦截指定域名，其余流量交给 endpoint）**
 
 ```toml
 [log]
@@ -180,56 +158,17 @@ mtu = 1408
 stack = "system"
 auto_route = true
 sniff = true
-hijack_dns = true
-
-[dns]
-final = "remote"
-strategy = "ipv4_only"
-
-[[dns.servers]]
-type = "https"
-id = "remote"
-server = "https://1.1.1.1/dns-query"
-via = "proxy"
-
-[[dns.servers]]
-type = "udp"
-id = "domestic"
-server = "223.5.5.5"
-
-[[dns.rules]]
-domain_keyword = ["doubleclick", "analytics"]
-action = "reject"
-
-[[dns.rules]]
-domain_suffix = [".cn", "baidu.com"]
-server = "domestic"
-
-[[outbounds]]
-type = "hysteria2"
-id = "proxy"
-server = "example.com"
-server_port = 443
-password = "demo"
-
-[[outbounds]]
-type = "direct"
-id = "direct"
 
 [[outbounds]]
 type = "block"
-id = "reject"
+id = "block"
 
 [[route.rules]]
 domain_keyword = ["doubleclick", "analytics"]
-outbound = "reject"
-
-[[route.rules]]
-domain_suffix = [".cn", "baidu.com"]
-outbound = "direct"
+outbound = "block"
 
 [route]
-final = "proxy"
+final = "block"
 auto_detect_interface = true
 ```
 
@@ -249,26 +188,6 @@ mtu = 1400
 stack = "system"
 auto_route = true
 sniff = true
-hijack_dns = true
-
-[dns]
-final = "default"
-strategy = "ipv4_only"
-
-[[dns.servers]]
-type = "udp"
-id = "default"
-server = "223.5.5.5"
-via = "wg-out"
-
-[[dns.servers]]
-type = "udp"
-id = "direct-dns"
-server = "8.8.8.8"
-
-[[dns.rules]]
-domain_suffix = ["ifconfig.so"]
-server = "direct-dns"
 
 [[endpoints]]
 type = "wireguard"
@@ -283,23 +202,19 @@ allowed_ips = ["0.0.0.0/0"]
 persistent_keepalive_interval = 25
 
 [[outbounds]]
-type = "direct"
-id = "direct"
-
-[[outbounds]]
 type = "block"
 id = "block"
 
 [[route.rules]]
 domain_suffix = ["ifconfig.so"]
-outbound = "direct"
+outbound = "block"
 
 [route]
 final = "wg-out"
 auto_detect_interface = true
 ```
 
-**例 3 —— Direct 直连（不挂代理；本地域名走 local 解析、广告关键词拦截）**
+**例 3 —— 最小 `block` 配置**
 
 ```toml
 [log]
@@ -315,32 +230,6 @@ mtu = 1408
 stack = "system"
 auto_route = true
 sniff = true
-hijack_dns = true
-
-[dns]
-final = "default"
-strategy = "ipv4_only"
-
-[[dns.servers]]
-type = "udp"
-id = "default"
-server = "223.5.5.5"
-
-[[dns.servers]]
-type = "local"
-id = "local"
-
-[[dns.rules]]
-domain_suffix = [".lan", ".local"]
-server = "local"
-
-[[dns.rules]]
-domain_keyword = ["doubleclick", "analytics"]
-action = "reject"
-
-[[outbounds]]
-type = "direct"
-id = "direct"
 
 [[outbounds]]
 type = "block"
@@ -351,7 +240,7 @@ domain_keyword = ["doubleclick", "analytics"]
 outbound = "block"
 
 [route]
-final = "direct"
+final = "block"
 auto_detect_interface = true
 ```
 
@@ -408,28 +297,21 @@ dist/ios/
 | `OUTPUT_DIR` / `BUILD_DIR` | `dist/ios` | 改输出目录 |
 | `IPHONEOS_DEPLOYMENT_TARGET` | `15.0` | 调最低 iOS 版本——要和 aws-lc-sys / ring 等 C 依赖编译时的目标对齐，否则可能链接出 `___chkstk_darwin` 之类未解析符号 |
 
-`hammer-ffi` 的默认 features 只带 **TUN 入口 + DNS 传输 + direct / block / urltest 三个出口 + probe**。
-代理协议都是 opt-in，要打进包必须显式开 feature：
+`hammer-ffi` 的默认 features 带 **TUN 入口 + block outbound + probe**。可选协议按 feature 显式打开：
 
 ```bash
-# 默认基线：不带任何代理协议（适合纯 direct / block 使用）
+# 默认基线：TUN + block
 make xcframework
-
-# 只开 Hysteria2
-FEATURES=hysteria2 make xcframework
 
 # 只开 WireGuard endpoint
 FEATURES=wireguard make xcframework
 
-# 同时开 Hysteria2 + WireGuard（demo / 生产典型组合）
-FEATURES="hysteria2 wireguard" make xcframework
-
 # 上面任一组合 + Instruments 友好包（保留 debuginfo、不 strip）
-FEATURES="hysteria2 wireguard" PROFILE=release-perf make xcframework
+FEATURES=wireguard PROFILE=release-perf make xcframework
 ```
 
 > Feature 名对齐 `crates/hammer-ffi/Cargo.toml`——`wireguard` 会自动拉上 `endpoint`
-> 与 `hammer-core/wireguard`；`hysteria2` 会拉上 `hammer-runtime/outbound-hysteria2`。
+> 与 `hammer-core/wireguard`。
 > 不需要手动把 runtime / core 的子 feature 一个个写出来。
 
 ### Xcode 端集成

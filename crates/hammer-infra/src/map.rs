@@ -139,6 +139,14 @@ impl<K: FlatHashKey, V: Copy> FlatHashTable<K, V> {
     }
 
     #[inline]
+    pub fn clear(&mut self) {
+        for bucket in self.buckets.iter_mut() {
+            bucket.entry = None;
+        }
+        self.len = 0;
+    }
+
+    #[inline]
     fn grow(&mut self) {
         let next_capacity = self.buckets.len() * 2;
         let old_buckets = std::mem::replace(
@@ -265,4 +273,31 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlatHashTable;
+
+    #[test]
+    fn clear_removes_entries_and_preserves_bucket_count() {
+        let mut table = FlatHashTable::with_capacity(64);
+        table.insert(1u64, 11u32);
+        table.insert(2u64, 22u32);
+        let buckets = table.bucket_count();
+        let bucket_ptr = table.bucket_ptr();
+
+        table.clear();
+
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.lookup(&1), None);
+        assert_eq!(table.lookup(&2), None);
+        assert_eq!(table.bucket_count(), buckets);
+        assert_eq!(table.bucket_ptr(), bucket_ptr);
+
+        table.insert(3u64, 33u32);
+        assert_eq!(table.lookup(&3), Some(33));
+        assert_eq!(table.bucket_count(), buckets);
+        assert_eq!(table.bucket_ptr(), bucket_ptr);
+    }
 }

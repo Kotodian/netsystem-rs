@@ -1,6 +1,5 @@
 pub mod ip;
 mod lookup;
-mod route_metadata;
 
 pub use ip::{
     IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
@@ -18,4 +17,3 @@ pub use lookup::{
     FibTableHandle, IpLookupControlPlane, IpLookupNode, IpLookupTrace, LoadBalance,
     LoadBalanceError, LoadBalanceIndex,
 };
-pub use route_metadata::packet_route_metadata;

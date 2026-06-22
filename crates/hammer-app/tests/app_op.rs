@@ -45,7 +45,7 @@ fn app_op_echo_copies_recv_into_app_data_and_enqueues_send_descriptor() {
                 let buffers = with_data_plane_buffers(Clone::clone);
                 let before = buffers.in_use_buffers();
                 let index = buffers
-                    .alloc_index_with_bytes(Default::default(), b"hammer-app-echo")
+                    .alloc_index_with_bytes(b"hammer-app-echo")
                     .expect("alloc recv buffer");
 
                 runtime

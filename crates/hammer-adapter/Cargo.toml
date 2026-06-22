@@ -13,6 +13,5 @@ hammer-infra = { path = "../hammer-infra" }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 crossbeam-queue = { workspace = true }
-hickory-proto = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }

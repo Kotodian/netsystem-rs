@@ -4,9 +4,9 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use crate::transport::congestion::CongestionController;
-use super::segment::parse_tcp_packet;
 use super::TcpQueueHandle;
+use super::segment::parse_tcp_packet;
+use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -130,8 +130,12 @@ where
             );
         }
         if established_with_payload {
-            runtime.packet_buffers().advance(index, packet.payload_offset)?;
-            runtime.packet_buffers().truncate_chain(index, packet.payload_len)?;
+            runtime
+                .packet_buffers()
+                .advance(index, packet.payload_offset)?;
+            runtime
+                .packet_buffers()
+                .truncate_chain(index, packet.payload_len)?;
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
@@ -140,8 +144,8 @@ where
         };
         queue.refresh_session_route(session_id)?;
         if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index(Default::default())?;
-            if let Err(error) = segment.write_to_buffer(runtime, allocated) {
+            let allocated = runtime.packet_buffers().alloc_index()?;
+            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
                 runtime.free_index(allocated);
                 return Err(error);
             }
@@ -172,18 +176,14 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex, OnceLock};
 
-    use hammer_adapter::{
-        BufferPacketCursor, DataWorkerId, InternalNode, Network, NodeId, RouteMetadata, SocksAddr,
-    };
+    use hammer_adapter::{BufferPacketCursor, DataWorkerId, InternalNode, NodeId};
     use hammer_core::error::CoreError;
     use hammer_runtime::app::{AppCqeKind, AppOpId, AppRingHandle};
 
     use crate::data_plane::DropNode;
     use crate::transport::congestion::BbrController;
-    use crate::transport::tcp::{
-        TcpInputNext, TcpQueueHandle, register_tcp_session_queue,
-    };
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
+    use crate::transport::tcp::{TcpInputNext, TcpQueueHandle, register_tcp_session_queue};
 
     use super::*;
 
@@ -293,9 +293,10 @@ mod tests {
         let output = runtime
             .nodes()
             .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
-        let syn_sent = runtime
-            .nodes()
-            .register_internal(TcpSynSentNode::new(handle, TcpSynSentNext::nodes(output, drop)));
+        let syn_sent = runtime.nodes().register_internal(TcpSynSentNode::new(
+            handle,
+            TcpSynSentNext::nodes(output, drop),
+        ));
 
         send_packet(
             &runtime,
@@ -327,7 +328,10 @@ mod tests {
         {
             let queue = handle.borrow_mut().expect("tcp queue");
             let connection = queue.session(session_id).expect("tcp session is missing");
-            assert_eq!(connection.state(), crate::transport::tcp::TcpState::Established);
+            assert_eq!(
+                connection.state(),
+                crate::transport::tcp::TcpState::Established
+            );
             assert_eq!(connection.snd_una(), client_isn + 1);
             assert_eq!(connection.rcv_nxt(), SERVER_ISN + 1);
             assert_eq!(
@@ -369,9 +373,10 @@ mod tests {
         let output = runtime
             .nodes()
             .register_internal(TcpOutputNode::new(TcpOutputNext::nodes(drop, capture)));
-        let syn_sent = runtime
-            .nodes()
-            .register_internal(TcpSynSentNode::new(handle, TcpSynSentNext::nodes(output, drop)));
+        let syn_sent = runtime.nodes().register_internal(TcpSynSentNode::new(
+            handle,
+            TcpSynSentNext::nodes(output, drop),
+        ));
 
         send_packet(
             &runtime,
@@ -433,9 +438,7 @@ mod tests {
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {
         let frame = runtime.alloc_frame_index().expect("frame");
-        let buffer = runtime
-            .alloc_index_with_bytes(tcp_metadata(), &packet)
-            .expect("packet");
+        let buffer = runtime.alloc_index_with_bytes(&packet).expect("packet");
         stamp_tcp_cursor(runtime, buffer, &packet);
         runtime
             .get_frame_mut(frame)
@@ -443,15 +446,6 @@ mod tests {
             .push_index(buffer)
             .expect("push packet");
         assert!(runtime.schedule_frame(node, frame).expect("schedule"));
-    }
-
-    fn tcp_metadata() -> RouteMetadata {
-        RouteMetadata {
-            network: Network::Tcp,
-            source: Some(SocksAddr::ip(IpAddr::V4(REMOTE), REMOTE_PORT)),
-            destination: Some(SocksAddr::ip(IpAddr::V4(LOCAL), LOCAL_PORT)),
-            ..RouteMetadata::default()
-        }
     }
 
     fn stamp_tcp_cursor(

@@ -124,14 +124,16 @@ impl BbrController {
         if sample.bytes_acked == 0 {
             return;
         }
-        let acked_packets =
-            u64::from((sample.bytes_acked / self.max_datagram_size.max(1)).max(1));
+        let acked_packets = u64::from((sample.bytes_acked / self.max_datagram_size.max(1)).max(1));
         let ce_packets = sample.ecn_ce_count.min(acked_packets);
         let ce_ratio = u128::from(ce_packets).saturating_mul(1024) / u128::from(acked_packets);
         let ce_ratio = ce_ratio.min(1024) as u32;
         self.ecn_alpha = ((self.ecn_alpha * 7) + ce_ratio) / 8;
         if sample.ecn_ce_count != 0 {
-            let reduction = self.congestion_window.saturating_mul(self.ecn_alpha.max(128)) / 2048;
+            let reduction = self
+                .congestion_window
+                .saturating_mul(self.ecn_alpha.max(128))
+                / 2048;
             self.congestion_window = self
                 .congestion_window
                 .saturating_sub(reduction.max(self.max_datagram_size))

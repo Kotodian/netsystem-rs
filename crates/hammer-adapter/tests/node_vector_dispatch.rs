@@ -5,7 +5,7 @@ use std::rc::Rc;
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, DataPlaneInstructionSet, DataPlaneRuntime,
     DriverNode, NextFrame, Node, NodeId, NodeProcessFn, NodeResult, NodeRuntimeData,
-    NodeVectorDispatch, PooledBufferFrame, RouteMetadata,
+    NodeVectorDispatch, PooledBufferFrame,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -219,7 +219,7 @@ fn route_frame_prefetch_matches_custom_prefetch_routing_behavior() {
             &mut custom_frame,
             |batch, indices| {
                 for index in indices {
-                    batch.prefetch_read(*index);
+                    batch.prefetch_header(*index);
                 }
             },
             route_by_packet_id(route.clone()),
@@ -676,9 +676,7 @@ fn sink_process(
 fn packet_frame(runtime: &DataPlaneRuntime, count: u8) -> PooledBufferFrame {
     let mut frame = runtime.alloc_pooled_frame().expect("alloc frame");
     for id in 0..count {
-        let index = runtime
-            .alloc_index_with_bytes(RouteMetadata::default(), &[id])
-            .expect("alloc packet");
+        let index = runtime.alloc_index_with_bytes(&[id]).expect("alloc packet");
         frame.push_index(index).expect("push packet");
     }
     frame

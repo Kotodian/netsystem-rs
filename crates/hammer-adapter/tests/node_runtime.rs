@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hammer_adapter::{
     BufferFrame, DataPlaneRuntime, DriverNode, InternalNode, Node, NodeDescriptor, NodeHandle,
     NodeId, NodeKind, NodeNext, NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
-    NodeState, RouteMetadata, TraceFormatter,
+    NodeState, TraceFormatter,
 };
 use hammer_core::error::{CoreError, CoreResult};
 
@@ -593,7 +593,7 @@ fn node_descriptor_exposes_public_snapshot_accessors() {
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, payload: &[u8]) {
     let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), payload)
+        .alloc_index_with_bytes(payload)
         .expect("alloc packet");
     runtime
         .get_frame_mut(frame)

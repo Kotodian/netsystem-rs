@@ -97,23 +97,6 @@ impl HammerService {
         Ok(reports.into_iter().map(probe_report_to_ffi).collect())
     }
 
-    pub fn current_selection(&self, outbound_id: String) -> Option<String> {
-        self.inner.current_selection(&outbound_id)
-    }
-
-    pub fn urltest(
-        &self,
-        outbound_id: String,
-        timeout_ms: u64,
-    ) -> Result<Vec<HammerProbeReport>, HammerError> {
-        let timeout = Duration::from_millis(timeout_ms);
-        let reports = self
-            .inner
-            .urltest(&outbound_id, timeout)
-            .map_err(HammerError::from)?;
-        Ok(reports.into_iter().map(probe_report_to_ffi).collect())
-    }
-
     pub fn metrics(&self) -> Vec<HammerMetricSample> {
         self.inner
             .metrics_snapshot()

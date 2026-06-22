@@ -35,10 +35,6 @@ impl EventSubscriberFactorySet {
 fn register_standard_event_subscriber_builders(
     _builders: &mut HashMap<&'static str, EventSubscriberBuilder>,
 ) {
-    #[cfg(feature = "outbound-hysteria2")]
-    hammer_runtime::register_event_subscriber_component::<
-        hammer_runtime::hysteria2::Hysteria2AuthLogSubscriber,
-    >(_builders);
     #[cfg(feature = "endpoint-wireguard")]
     {
         hammer_runtime::register_event_subscriber_component::<

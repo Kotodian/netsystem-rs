@@ -7,22 +7,6 @@ pub mod adapter {
 
 pub use hammer_core::error::{HammerError, HammerResult};
 
-/// Install the aws-lc-rs CryptoProvider as the rustls process-wide default.
-///
-/// Some rustls code paths may use the process-wide provider instead of an
-/// explicit builder provider. Idempotent — subsequent calls are no-ops when a
-/// provider is already installed.
-#[cfg(feature = "tls")]
-pub fn install_default_crypto_provider() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
-
-#[cfg(not(feature = "tls"))]
-pub fn install_default_crypto_provider() {}
-
 pub mod app;
 mod component_registry;
 mod control_thread;
@@ -34,29 +18,6 @@ pub mod outbounds;
 pub mod protocol;
 mod socket_protector;
 pub mod spawn;
-#[cfg(any(
-    feature = "tls-basic-client",
-    feature = "outbound-urltest",
-    feature = "tls-outbound",
-    feature = "tls-quic"
-))]
-pub mod tls;
-
-#[cfg(feature = "outbound-hysteria2")]
-pub mod hysteria2 {
-    pub use crate::protocol::hysteria2::*;
-}
-
-#[cfg(feature = "outbound-vless")]
-pub mod vless {
-    pub use crate::protocol::vless::*;
-}
-
-#[cfg(feature = "outbound-hysteria2")]
-pub mod congestion {
-    pub use crate::protocol::congestion::*;
-}
-
 #[cfg(feature = "endpoint-wireguard")]
 pub mod wireguard {
     pub use crate::protocol::endpoint::wireguard::*;
@@ -76,7 +37,5 @@ pub use hammer_core::{
 };
 pub use inbounds::InboundManager;
 pub use outbounds::OutboundManager;
-#[cfg(feature = "outbound-hysteria2")]
-pub use protocol::hysteria2::{Hysteria2AuthFailureArgs, Hysteria2AuthSuccessArgs};
 pub use socket_protector::{RuntimePlatform, SocketProtector};
 pub use spawn::{DataPlaneBarrierGuard, DataPlaneBarrierHandle};

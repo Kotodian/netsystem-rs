@@ -2,27 +2,23 @@
 //! runtime crates. Keep this small — it's the only place where utilities
 //! that don't naturally belong to a single section live.
 //!
-//! The first inhabitant is `normalize_domain`. Both `[[route.rules]]` and
-//! `[[dns.rules]]` accept user-typed domain strings, and the runtime
-//! sniffers / reverse-DNS path also write into `metadata.domain`. Anywhere a
-//! domain is produced or consumed we want the same canonical form so
-//! matchers are pure byte equality at runtime.
+//! The first inhabitant is `normalize_domain`. Route rules and runtime
+//! sniffers both consume user-typed domain strings, so we keep a single
+//! canonical form and let runtime matchers stay pure byte equality.
 
 /// Canonicalise a user / wire-typed domain string:
 ///
 /// - trim ASCII whitespace,
-/// - strip a single trailing dot (DNS canonical names are commonly written
-///   either way; hickory hands names back with the trailing dot, sniffers
-///   don't),
-/// - ASCII-lowercase (DNS labels are case-insensitive on the wire).
+/// - strip a single trailing dot (canonical names are commonly written
+///   either way; sniffers don't keep the trailing dot),
+/// - ASCII-lowercase (domain labels are case-insensitive on the wire).
 ///
 /// Idempotent. Cheap enough to call on every config-load value and on every
 /// sniffed name; allocates one new `String`.
 ///
-/// `#[inline]`: this is called from hammer-runtime sniffers
-/// (`sniff_http` / `sniff_tls_sni`) on every TCP connection's first
-/// payload; cross-crate inlining via workspace `lto = "fat"` avoids a
-/// function call on the hot path.
+/// `#[inline]`: this is called from hammer-runtime sniffers on every TCP
+/// connection's first payload; cross-crate inlining via workspace
+/// `lto = "fat"` avoids a function call on the hot path.
 #[inline]
 pub fn normalize_domain(input: &str) -> String {
     input.trim().trim_end_matches('.').to_ascii_lowercase()

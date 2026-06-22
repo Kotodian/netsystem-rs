@@ -58,7 +58,10 @@ fn fifo_queue_insert_places_value_at_requested_position() {
     queue.insert(0, 0);
     queue.insert(4, 4);
 
-    assert_eq!(queue.iter().copied().collect::<std::vec::Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    assert_eq!(
+        queue.iter().copied().collect::<std::vec::Vec<_>>(),
+        vec![0, 1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -75,7 +78,10 @@ fn fifo_queue_iter_mut_updates_values_in_queue_order() {
         *value *= 10;
     }
 
-    assert_eq!(queue.iter().copied().collect::<std::vec::Vec<_>>(), vec![20, 30, 40]);
+    assert_eq!(
+        queue.iter().copied().collect::<std::vec::Vec<_>>(),
+        vec![20, 30, 40]
+    );
 }
 
 #[test]
@@ -94,5 +100,8 @@ fn fifo_queue_get_and_get_mut_follow_queue_order() {
     assert_eq!(queue.get(3), None);
 
     *queue.get_mut(1).expect("queue slot") = 30;
-    assert_eq!(queue.iter().copied().collect::<std::vec::Vec<_>>(), vec![2, 30, 4]);
+    assert_eq!(
+        queue.iter().copied().collect::<std::vec::Vec<_>>(),
+        vec![2, 30, 4]
+    );
 }

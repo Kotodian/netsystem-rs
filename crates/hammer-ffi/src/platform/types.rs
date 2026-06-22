@@ -38,7 +38,6 @@ pub struct HammerNetworkInterface {
     pub expensive: bool,
     pub constrained: bool,
     pub addresses: Vec<String>,
-    pub dns_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +100,5 @@ pub trait HammerPlatform: Send + Sync {
     fn include_all_networks(&self) -> bool;
     fn read_wifi_state(&self) -> Option<HammerWIFIState>;
     fn system_certificates(&self) -> Option<Box<dyn HammerStringIterator>>;
-    fn clear_dns_cache(&self);
     fn write_log(&self, level: i32, message: String);
 }

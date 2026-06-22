@@ -1565,7 +1565,7 @@ mod tests {
                 let stats = with_data_plane_runtime(|runtime| {
                     let before = runtime.in_use_buffers();
                     let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");
                     let during = runtime.in_use_buffers();
                     runtime.free_index(index);
@@ -1609,7 +1609,7 @@ mod tests {
             .for_each_worker(|_| {
                 DATA_PLANE_RUNTIME.with(|runtime| {
                     let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .alloc_index_with_bytes(b"packet")
                         .expect("alloc packet");
                     runtime
                         .try_mark_trace(NodeId::new(0), index)
@@ -1617,7 +1617,7 @@ mod tests {
                     let marked = runtime
                         .get_buffer(index)
                         .expect("buffer")
-                        .trace_mark()
+                        .trace_handle()
                         .is_some();
                     runtime.free_index(index);
                     marked
@@ -1762,7 +1762,7 @@ mod tests {
                         let buffer = with_data_plane_runtime(|runtime| {
                             let before = runtime.in_use_buffers();
                             let buffer = runtime
-                                .alloc_index_with_bytes(Default::default(), b"packet")
+                                .alloc_index_with_bytes(b"packet")
                                 .expect("alloc local data buffer");
                             let during = runtime.in_use_buffers();
                             (before, during, buffer)
@@ -1822,7 +1822,7 @@ mod tests {
                             .unwrap_or_default();
                         let buffer = with_data_plane_runtime(|runtime| {
                             runtime
-                                .alloc_index_with_bytes(Default::default(), b"packet")
+                                .alloc_index_with_bytes(b"packet")
                                 .expect("alloc local data buffer")
                         });
                         yield_local_now().await;
@@ -1913,7 +1913,7 @@ mod tests {
                         runtime.alloc_pooled_frame().expect("alloc pooled frame"),
                     ));
                     let index = runtime
-                        .alloc_index_with_bytes(Default::default(), b"packet")
+                        .alloc_index_with_bytes(b"packet")
                         .expect("alloc data buffer");
                     let consumer_frame = std::rc::Rc::clone(&frame);
                     let consumer_runtime = runtime.clone();

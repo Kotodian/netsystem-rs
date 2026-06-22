@@ -12,32 +12,17 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 # `cli` feature of uniffi does not get unified into the iOS staticlib build.
 
 [features]
-# Default is the iOS NetExt baseline: TUN inbound, DNS transports, the
-# outbounds the route engine always reaches for (direct/block/urltest), and
-# outbound probing. All proxy protocols (wireguard, hysteria2, ...) are
-# opt-in modules layered on top.
+# Default is the iOS NetExt baseline: TUN inbound, the outbounds the route
+# engine always reaches for, and outbound probing.
 default = [
     "hammer-service/inbound-tun",
-    "hammer-service/outbound-direct",
     "hammer-service/outbound-block",
-    "hammer-service/outbound-urltest",
-    "hammer-service/dns-udp",
-    "hammer-service/dns-tcp",
-    "hammer-service/dns-hosts",
-    "hammer-service/dns-local",
     "hammer-service/probe",
 ]
 # Generic endpoint config/service wiring; required by endpoint-style protocols.
 endpoint = ["hammer-service/endpoint"]
 # WireGuard endpoint stack. Opt-in.
 wireguard = ["endpoint", "hammer-core/wireguard", "hammer-service/endpoint-wireguard"]
-# Hysteria2 outbound. Opt-in.
-hysteria2 = ["hammer-service/outbound-hysteria2"]
-# VLESS outbound. Opt-in.
-vless = ["hammer-service/outbound-vless"]
-# BoringSSL-backed uTLS ClientHello shaping for QUIC outbounds.
-utls = ["hammer-service/tls-utls"]
-
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-adapter = { path = "../hammer-adapter" }

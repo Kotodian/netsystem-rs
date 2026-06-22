@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::mem::{align_of, size_of};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7,7 +8,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use hammer_adapter::{
     BufferFrame, BufferFramePairBatch, BufferFrameQuadBatch, BufferIndex, BufferPacketCursor,
     BufferPool, BufferPoolArena, DataPlaneBuffers, DataPlaneHandoff, DataPlaneInstructionSet,
-    DataPlaneRuntime, DataWorkerId, FrameBatchWidth, RouteMetadata, TraceMark,
+    DataPlaneRuntime, DataWorkerId, FrameBatchWidth,
 };
 
 #[derive(Default)]
@@ -26,10 +27,16 @@ impl Wake for WakeCounter {
 }
 
 #[test]
+fn buffer_header_keeps_hot_metadata_in_first_cacheline() {
+    assert_eq!(align_of::<hammer_adapter::Buffer>(), 64);
+    assert!(size_of::<BufferPacketCursor>() <= 32);
+}
+
+#[test]
 fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
     let pool = BufferPool::with_capacity(128, 1);
     let first_index = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"hello")
+        .alloc_index_with_bytes(b"hello")
         .expect("alloc first buffer");
     assert_eq!(pool.in_use(), 1);
     assert_eq!(
@@ -41,7 +48,7 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
     assert_eq!(pool.in_use(), 0);
 
     let second_index = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"world")
+        .alloc_index_with_bytes(b"world")
         .expect("alloc second buffer");
 
     assert_eq!(second_index.slot(), first_index.slot());
@@ -58,7 +65,7 @@ fn buffer_pool_free_index_releases_slot_for_reuse_with_new_generation() {
 fn buffer_cursor_headroom_and_append_manage_current_bytes() {
     let pool = BufferPool::with_capacity(16, 2);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .alloc_index_with_bytes(b"payload")
         .expect("alloc buffer");
 
     pool.advance(buffer, 3).expect("advance current");
@@ -90,9 +97,7 @@ fn buffer_cursor_headroom_and_append_manage_current_bytes() {
 #[test]
 fn empty_buffer_allocation_reserves_default_packet_headroom() {
     let pool = BufferPool::with_capacity(512, 1);
-    let buffer = pool
-        .alloc_index(RouteMetadata::default())
-        .expect("alloc empty buffer");
+    let buffer = pool.alloc_index().expect("alloc empty buffer");
 
     pool.append(buffer, b"payload").expect("append payload");
     pool.prepend(buffer, b"header").expect("prepend header");
@@ -108,10 +113,10 @@ fn empty_buffer_allocation_reserves_default_packet_headroom() {
 fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 2);
     let first = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
+        .alloc_index_with_bytes(b"alpha")
         .expect("alloc first buffer");
     let second = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"bravo")
+        .alloc_index_with_bytes(b"bravo")
         .expect("alloc second buffer");
 
     {
@@ -144,7 +149,7 @@ fn buffer_batch_mut_processes_multiple_buffers_under_one_borrow() {
 fn buffer_batch_mut_exposes_direct_buffer_refs() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_buffer_capacity(32, 1);
     let index = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"alpha")
+        .alloc_index_with_bytes(b"alpha")
         .expect("alloc buffer");
 
     {
@@ -162,7 +167,7 @@ fn buffer_batch_mut_exposes_direct_buffer_refs() {
 fn buffer_header_and_packet_data_start_cacheline_aligned() {
     let pool = BufferPool::with_capacity(128, 1);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .alloc_index_with_bytes(b"packet")
         .expect("alloc buffer");
 
     {
@@ -178,7 +183,7 @@ fn buffer_header_and_packet_data_start_cacheline_aligned() {
 fn buffer_exposes_vpp_style_current_pointer_and_advance() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(128, 1, 1, 1);
     let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"network-transport")
+        .alloc_index_with_bytes(b"network-transport")
         .expect("alloc buffer");
     {
         let buffer_ref = runtime.get_buffer(buffer).expect("buffer ref");
@@ -210,7 +215,7 @@ fn buffer_exposes_vpp_style_current_pointer_and_advance() {
 fn buffer_packet_cursor_lives_in_buffer_control_area() {
     let pool = BufferPool::with_capacity(128, 1);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .alloc_index_with_bytes(b"packet")
         .expect("alloc buffer");
     let cursor = BufferPacketCursor::new()
         .with_packet_len(64)
@@ -223,10 +228,6 @@ fn buffer_packet_cursor_lives_in_buffer_control_area() {
         .set_packet_cursor(cursor);
 
     assert_eq!(pool.packet_cursor(buffer).expect("read cursor"), cursor);
-    assert_eq!(
-        pool.metadata(buffer).expect("metadata"),
-        RouteMetadata::default()
-    );
 
     pool.free_index(buffer);
 }
@@ -235,7 +236,7 @@ fn buffer_packet_cursor_lives_in_buffer_control_area() {
 fn append_beyond_one_slot_creates_and_frees_chain() {
     let pool = BufferPool::with_capacity(8, 4);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"123456")
+        .alloc_index_with_bytes(b"123456")
         .expect("alloc buffer");
 
     pool.append(buffer, b"7890abcdef").expect("append chain");
@@ -255,7 +256,7 @@ fn append_beyond_one_slot_creates_and_frees_chain() {
 fn alloc_with_bytes_beyond_one_slot_creates_chain() {
     let pool = BufferPool::with_capacity(4, 4);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained buffer");
 
     assert!(pool.is_chained(buffer).expect("buffer is chained"));
@@ -270,11 +271,9 @@ fn alloc_with_bytes_beyond_one_slot_creates_chain() {
 #[test]
 fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
     let pool = BufferPool::with_capacity(8, 8);
-    let head = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
-        .expect("alloc head");
+    let head = pool.alloc_index_with_bytes(b"head").expect("alloc head");
     let tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"taildata")
+        .alloc_index_with_bytes(b"taildata")
         .expect("alloc tail chain");
     let tail_ptr = pool.current_ptr(tail).expect("tail ptr") as usize;
 
@@ -310,7 +309,7 @@ fn buffer_chain_can_detach_and_append_existing_chain_without_copying_payload() {
 fn buffer_chain_io_segments_expose_full_chain_without_copying_or_mutation() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained packet");
 
     let (segments, total_len) = pool
@@ -325,9 +324,13 @@ fn buffer_chain_io_segments_expose_full_chain_without_copying_or_mutation() {
         })
         .expect("io segments");
     assert_eq!(total_len, 12);
-    assert_eq!(segments, vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ijkl".to_vec()]);
     assert_eq!(
-        pool.copy_current_chain(packet).expect("packet remains unchanged"),
+        segments,
+        vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ijkl".to_vec()]
+    );
+    assert_eq!(
+        pool.copy_current_chain(packet)
+            .expect("packet remains unchanged"),
         b"abcdefghijkl"
     );
     assert_eq!(pool.in_use(), 3);
@@ -340,10 +343,10 @@ fn buffer_chain_io_segments_expose_full_chain_without_copying_or_mutation() {
 fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
     let pool = BufferPool::with_capacity(8, 8);
     let session_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"taildata")
+        .alloc_index_with_bytes(b"taildata")
         .expect("alloc session tail");
     let output_head = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .alloc_index_with_bytes(b"head")
         .expect("alloc output head");
     let tail_ptr = pool.current_ptr(session_tail).expect("tail ptr");
 
@@ -382,11 +385,9 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
 fn freeing_head_with_attached_clone_does_not_free_session_tail() {
     let pool = BufferPool::with_capacity(8, 8);
     let session_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
-    let output_head = pool
-        .alloc_index(RouteMetadata::default())
-        .expect("alloc output head");
+    let output_head = pool.alloc_index().expect("alloc output head");
 
     pool.prepend(output_head, b"hdr").expect("write head bytes");
     pool.attach_clone(output_head, session_tail)
@@ -409,10 +410,10 @@ fn freeing_head_with_attached_clone_does_not_free_session_tail() {
 fn freeing_original_tail_after_output_head_returns_storage_once() {
     let pool = BufferPool::with_capacity(8, 8);
     let session_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
     let output_head = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .alloc_index_with_bytes(b"head")
         .expect("alloc output head");
 
     pool.attach_clone(output_head, session_tail)
@@ -431,7 +432,7 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
     assert_eq!(pool.in_use(), 0);
 
     let reused = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"reuse")
+        .alloc_index_with_bytes(b"reuse")
         .expect("reuse freed storage");
     assert_eq!(pool.in_use(), 1);
     pool.free_index(reused);
@@ -442,19 +443,16 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
 fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
     let buffers = DataPlaneBuffers::with_buffer_capacity(8, 8);
     let session_tail = buffers
-        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
     let output_head = buffers
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .alloc_index_with_bytes(b"head")
         .expect("alloc output head");
 
     buffers
         .get_buffer_mut(session_tail)
         .expect("tail buffer mut")
-        .set_trace_mark(TraceMark {
-            handle: 7,
-            epoch: 11,
-        });
+        .set_trace_handle(7);
     buffers
         .attach_clone(output_head, session_tail)
         .expect("attach clone");
@@ -465,11 +463,8 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
         buffers
             .get_buffer(session_tail)
             .expect("tail buffer")
-            .trace_mark(),
-        Some(TraceMark {
-            handle: 7,
-            epoch: 11,
-        })
+            .trace_handle(),
+        Some(7)
     );
 
     buffers.free_index(session_tail);
@@ -479,26 +474,24 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
 fn shared_tail_rejects_control_area_and_payload_mutation() {
     let pool = BufferPool::with_capacity(8, 8);
     let session_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"payload")
+        .alloc_index_with_bytes(b"payload")
         .expect("alloc session tail");
     let output_head = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .alloc_index_with_bytes(b"head")
         .expect("alloc output head");
 
     pool.attach_clone(output_head, session_tail)
         .expect("attach clone");
 
-    let metadata_err = pool.with_metadata_mut(session_tail, |metadata| {
-        metadata.override_destination = true;
-    });
-    assert!(metadata_err.is_err());
+    assert!(pool.get_mut(session_tail).is_err());
     assert!(pool.advance(session_tail, 1).is_err());
     assert!(pool.truncate_current(session_tail, 1).is_err());
     assert!(pool.prepend(session_tail, b"x").is_err());
     assert!(pool.append(session_tail, b"x").is_err());
 
     assert_eq!(
-        pool.copy_current_chain(session_tail).expect("tail unchanged"),
+        pool.copy_current_chain(session_tail)
+            .expect("tail unchanged"),
         b"payload"
     );
 
@@ -510,22 +503,25 @@ fn shared_tail_rejects_control_area_and_payload_mutation() {
 fn shared_tail_rejects_chain_header_mutation() {
     let pool = BufferPool::with_capacity(4, 8);
     let session_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefgh")
+        .alloc_index_with_bytes(b"abcdefgh")
         .expect("alloc session tail");
     let output_head = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"head")
+        .alloc_index_with_bytes(b"head")
         .expect("alloc output head");
 
     pool.attach_clone(output_head, session_tail)
         .expect("attach clone");
 
     let extra_tail = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"tail")
+        .alloc_index_with_bytes(b"tail")
         .expect("alloc extra tail");
 
     assert!(pool.detach_next(session_tail).is_err());
     assert!(pool.truncate_chain(session_tail, 4).is_err());
-    assert!(pool.append_existing_chain(session_tail, extra_tail).is_err());
+    assert!(
+        pool.append_existing_chain(session_tail, extra_tail)
+            .is_err()
+    );
 
     assert_eq!(
         pool.copy_current_chain(session_tail)
@@ -542,7 +538,7 @@ fn shared_tail_rejects_chain_header_mutation() {
 fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained packet");
 
     assert_eq!(pool.in_use(), 3);
@@ -564,7 +560,7 @@ fn buffer_chain_truncate_current_chain_frees_tail_beyond_limit() {
 fn buffer_advance_can_discard_prefix_across_chain_segments() {
     let pool = BufferPool::with_capacity(4, 8);
     let packet = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghijkl")
+        .alloc_index_with_bytes(b"abcdefghijkl")
         .expect("alloc chained packet");
 
     pool.advance(packet, 6).expect("advance across chain");
@@ -587,10 +583,10 @@ fn buffer_advance_can_discard_prefix_across_chain_segments() {
 fn buffer_pool_reports_single_segment_and_chained_packets() {
     let pool = BufferPool::with_capacity(4, 8);
     let single = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abc")
+        .alloc_index_with_bytes(b"abc")
         .expect("alloc single buffer");
     let chained = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefghij")
+        .alloc_index_with_bytes(b"abcdefghij")
         .expect("alloc chained buffer");
 
     assert!(!pool.is_chained(single).expect("single chain state"));
@@ -614,7 +610,7 @@ fn buffer_pool_reports_single_segment_and_chained_packets() {
 fn buffer_pool_prefetch_read_is_best_effort_for_live_and_stale_indices() {
     let pool = BufferPool::with_capacity(4, 4);
     let buffer = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"abcdefgh")
+        .alloc_index_with_bytes(b"abcdefgh")
         .expect("alloc chained buffer");
 
     pool.prefetch_read(buffer);
@@ -674,10 +670,10 @@ fn buffer_pool_rejects_index_from_another_runtime() {
     let first_pool = BufferPool::with_capacity(8, 2);
     let second_pool = BufferPool::with_capacity(8, 2);
     let first_index = first_pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .alloc_index_with_bytes(b"packet")
         .expect("alloc first pool buffer");
     let second_index = second_pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"other")
+        .alloc_index_with_bytes(b"other")
         .expect("alloc second pool buffer");
 
     assert_eq!(first_index.slot(), second_index.slot());
@@ -711,10 +707,10 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     );
 
     let first_buffer = first
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first worker buffer");
     let second_buffer = second
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second worker buffer");
 
     assert_eq!(first_buffer.pool_id(), second_buffer.pool_id());
@@ -729,10 +725,10 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     assert_eq!(first.in_use_buffers(), 0);
 
     let first_reused = first
-        .alloc_index_with_bytes(RouteMetadata::default(), b"uno")
+        .alloc_index_with_bytes(b"uno")
         .expect("first worker reuses its cache");
     let second_reused = second
-        .alloc_index_with_bytes(RouteMetadata::default(), b"dos")
+        .alloc_index_with_bytes(b"dos")
         .expect("second worker reuses its cache");
 
     assert_eq!(first_reused.slot(), first_buffer.slot());
@@ -759,10 +755,10 @@ fn legacy_handoff_constructor_uses_first_runtime_buffer_arena() {
     );
 
     let first_buffer = first
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first worker buffer");
     let second_buffer = second
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second worker buffer");
 
     assert_eq!(first_buffer.pool_id(), second_buffer.pool_id());
@@ -780,10 +776,10 @@ fn buffer_frame_reset_does_not_free_buffers() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second frame buffer");
     frame.push_index(first).expect("push first frame index");
     frame.push_index(second).expect("push second frame index");
@@ -819,10 +815,10 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second frame buffer");
     frame.push_index(first).expect("push first frame index");
     frame.push_index(second).expect("push second frame index");
@@ -837,7 +833,7 @@ fn buffer_pool_free_frame_releases_all_indices_and_reuses_frame() {
     assert!(pool.get(second).is_err());
 
     let next = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"next")
+        .alloc_index_with_bytes(b"next")
         .expect("alloc after free_frame");
     frame.push_index(next).expect("reuse frame allocation");
     assert_eq!(frame.indices(), &[next]);
@@ -853,10 +849,10 @@ fn buffer_frame_drain_indices_preserves_order_without_freeing() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
     frame.push_index(first).expect("push first frame index");
     frame.push_index(second).expect("push second frame index");
@@ -892,10 +888,10 @@ fn buffer_frame_tracks_pending_indices_until_drained() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
 
     assert!(!frame.has_pending());
@@ -929,7 +925,7 @@ fn buffer_frame_pending_future_wakes_when_index_is_pushed() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let index = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"packet")
+        .alloc_index_with_bytes(b"packet")
         .expect("alloc frame buffer");
     let wake_counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(Arc::clone(&wake_counter));
@@ -962,10 +958,10 @@ fn buffer_frame_push_indices_batches_one_wake() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
     let wake_counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(Arc::clone(&wake_counter));
@@ -997,7 +993,7 @@ fn buffer_frame_pair_batch_cursor_splits_into_pairs_then_tail() {
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..5)
         .map(|value| {
-            pool.alloc_index_with_bytes(RouteMetadata::default(), &[value])
+            pool.alloc_index_with_bytes(&[value])
                 .expect("alloc packet buffer")
         })
         .collect::<Vec<_>>();
@@ -1029,7 +1025,7 @@ fn buffer_frame_quad_batch_cursor_splits_into_quad_pair_then_tail() {
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let indices = (0..7)
         .map(|value| {
-            pool.alloc_index_with_bytes(RouteMetadata::default(), &[value])
+            pool.alloc_index_with_bytes(&[value])
                 .expect("alloc packet buffer")
         })
         .collect::<Vec<_>>();
@@ -1161,10 +1157,10 @@ fn buffer_frame_pending_future_observes_reset_before_processing() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
     let wake_counter = Arc::new(WakeCounter::default());
     let waker = Waker::from(Arc::clone(&wake_counter));
@@ -1204,10 +1200,10 @@ fn buffer_frame_push_index_respects_preallocated_capacity() {
     let pool = runtime.buffers();
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let first = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"first")
+        .alloc_index_with_bytes(b"first")
         .expect("alloc first frame buffer");
     let second = pool
-        .alloc_index_with_bytes(RouteMetadata::default(), b"second")
+        .alloc_index_with_bytes(b"second")
         .expect("alloc second frame buffer");
 
     frame.push_index(first).expect("push first frame index");
@@ -1227,10 +1223,10 @@ fn data_plane_runtime_allocates_frame_indices_from_reusable_pool() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
     let first = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
     let second = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second buffer");
 
     runtime
@@ -1277,10 +1273,10 @@ fn frame_ref_mut_push_indices_batches_into_pooled_frame() {
     let runtime: DataPlaneRuntime = DataPlaneRuntime::with_capacities(8, 4, 2, 1);
     let frame_index = runtime.alloc_frame_index().expect("alloc pooled frame");
     let first = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"one")
+        .alloc_index_with_bytes(b"one")
         .expect("alloc first buffer");
     let second = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"two")
+        .alloc_index_with_bytes(b"two")
         .expect("alloc second buffer");
 
     {
@@ -1308,7 +1304,7 @@ fn data_plane_runtime_checks_out_pooled_frame_for_packet_interfaces() {
     let mut frame = runtime.alloc_pooled_frame().expect("alloc pooled frame");
     let frame_index = frame.index();
     let buffer = runtime
-        .alloc_index_with_bytes(RouteMetadata::default(), b"pkt")
+        .alloc_index_with_bytes(b"pkt")
         .expect("alloc packet buffer");
 
     frame.push_index(buffer).expect("push packet buffer");
@@ -1371,7 +1367,7 @@ fn push_numbered_indices(
     let indices = (0..count)
         .map(|value| {
             runtime
-                .alloc_index_with_bytes(RouteMetadata::default(), &[value])
+                .alloc_index_with_bytes(&[value])
                 .expect("alloc numbered buffer")
         })
         .collect::<Vec<_>>();

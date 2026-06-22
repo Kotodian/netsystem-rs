@@ -1619,7 +1619,7 @@ fn publish_start_handshake(
 ) {
     let Some(control_handle) = control_handle else {
         if let Err(err) = tunnel_control.start_handshake(peer_index) {
-            warn!("wireguard direct start handshake failed: {err}");
+            warn!("wireguard local start handshake failed: {err}");
         }
         return;
     };

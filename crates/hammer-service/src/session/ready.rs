@@ -1,5 +1,7 @@
 use crate::session::SessionId;
 
+const DEFAULT_READY_QUEUE_CAPACITY: usize = 1024;
+
 #[derive(Debug)]
 pub struct SessionReadyQueue {
     ready: hammer_infra::vec::Vec<SessionId>,
@@ -10,8 +12,8 @@ impl SessionReadyQueue {
     #[inline]
     pub fn new() -> Self {
         Self {
-            ready: hammer_infra::vec::Vec::new(),
-            slots: hammer_infra::map::FlatHashTable::new(),
+            ready: hammer_infra::vec::Vec::with_capacity(DEFAULT_READY_QUEUE_CAPACITY),
+            slots: hammer_infra::map::FlatHashTable::with_capacity(DEFAULT_READY_QUEUE_CAPACITY),
         }
     }
 
@@ -52,7 +54,7 @@ impl SessionReadyQueue {
     pub fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
         let ready = self.ready.iter().copied().collect();
         self.ready.clear();
-        self.slots = hammer_infra::map::FlatHashTable::new();
+        self.slots.clear();
         ready
     }
 }

@@ -22,6 +22,7 @@ fn tcp_segment_writes_tcp_header_bytes() {
         TcpCapabilities::default(),
         None,
         None,
+        None,
         5,
     );
     let mut header = [0u8; 64];

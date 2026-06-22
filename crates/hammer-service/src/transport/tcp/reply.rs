@@ -1,8 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hammer_adapter::{
-    BufferIndex, BufferPacketCursor, DataPlaneBuffers, Network, RouteMetadata, SocksAddr,
-};
+use hammer_adapter::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
 
 pub const TCP_FLAG_FIN: u8 = 0x01;
@@ -81,35 +79,7 @@ pub fn synthesize_ipv4_tcp_control(
     Ok(packet)
 }
 
-pub fn tcp_control_metadata(local: SocketAddr, remote: SocketAddr) -> RouteMetadata {
-    RouteMetadata {
-        network: Network::Tcp,
-        source: Some(SocksAddr::ip(local.ip(), local.port())),
-        destination: Some(SocksAddr::ip(remote.ip(), remote.port())),
-        ..RouteMetadata::default()
-    }
-}
-
-pub fn queue_tcp_control_packet(
-    buffers: &DataPlaneBuffers,
-    packet: &[u8],
-    metadata: RouteMetadata,
-    enqueue: fn(&DataPlaneBuffers, BufferIndex) -> CoreResult<()>,
-) -> CoreResult<()> {
-    let index = buffers.alloc_index_with_bytes(metadata, packet)?;
-    let result = (|| {
-        set_ipv4_tcp_cursor(buffers, index, packet)?;
-        enqueue(buffers, index)
-    })();
-    buffers.free_index(index);
-    result
-}
-
-fn set_ipv4_tcp_cursor(
-    buffers: &DataPlaneBuffers,
-    index: BufferIndex,
-    packet: &[u8],
-) -> CoreResult<()> {
+pub fn tcp_control_cursor(packet: &[u8]) -> CoreResult<BufferPacketCursor> {
     let Some(version_ihl) = packet.first().copied() else {
         return Err(CoreError::internal("tcp control packet is empty"));
     };
@@ -129,14 +99,11 @@ fn set_ipv4_tcp_cursor(
     if tcp_header_len < 20 || tcp_offset + tcp_header_len > packet_len {
         return Err(CoreError::internal("tcp control header length is invalid"));
     }
-    buffers.get_buffer_mut(index)?.set_packet_cursor(
-        BufferPacketCursor::new()
-            .with_packet_len(packet_len)
-            .with_network_header(0, network_header_len)
-            .with_transport_header(tcp_offset, tcp_header_len)
-            .with_transport_payload_offset(tcp_offset + tcp_header_len),
-    );
-    Ok(())
+    Ok(BufferPacketCursor::new()
+        .with_packet_len(packet_len)
+        .with_network_header(0, network_header_len)
+        .with_transport_header(tcp_offset, tcp_header_len)
+        .with_transport_payload_offset(tcp_offset + tcp_header_len))
 }
 
 fn ipv4_l4_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {

@@ -300,7 +300,12 @@ impl AppDataArea {
         Ok(out)
     }
 
-    pub fn copy_to(&self, addr: AppDataAddr, offset: usize, output: &mut [u8]) -> HammerResult<usize> {
+    pub fn copy_to(
+        &self,
+        addr: AppDataAddr,
+        offset: usize,
+        output: &mut [u8],
+    ) -> HammerResult<usize> {
         self.validate(addr)?;
         let end = offset
             .checked_add(output.len())
@@ -310,14 +315,20 @@ impl AppDataArea {
         }
         let available = self.validate_read(addr)?;
         if end > available {
-            return Err(HammerError::internal("app data copy exceeds published length"));
+            return Err(HammerError::internal(
+                "app data copy exceeds published length",
+            ));
         }
         let start = addr
             .offset()
             .checked_add(offset)
             .ok_or_else(|| HammerError::internal("app data copy start overflow"))?;
         unsafe {
-            ptr::copy_nonoverlapping(self.storage.as_ptr().add(start), output.as_mut_ptr(), output.len());
+            ptr::copy_nonoverlapping(
+                self.storage.as_ptr().add(start),
+                output.as_mut_ptr(),
+                output.len(),
+            );
         }
         Ok(output.len())
     }
@@ -379,9 +390,7 @@ impl AppDataArea {
         if chunk_start.saturating_add(addr.capacity()) > self.storage.len() {
             return Err(HammerError::internal("app data chunk range out of bounds"));
         }
-        Ok(addr
-            .len()
-            .min(chunk.len.load(Ordering::Acquire) as usize))
+        Ok(addr.len().min(chunk.len.load(Ordering::Acquire) as usize))
     }
 }
 

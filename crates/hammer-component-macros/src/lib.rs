@@ -13,9 +13,6 @@ enum ComponentKind {
     Outbound,
     Inbound,
     Endpoint,
-    DnsTransport,
-    Router,
-    Matcher,
     Probe,
     Event,
 }
@@ -26,15 +23,12 @@ impl ComponentKind {
             "outbound" => Ok(Self::Outbound),
             "inbound" => Ok(Self::Inbound),
             "endpoint" => Ok(Self::Endpoint),
-            "dns_transport" => Ok(Self::DnsTransport),
-            "router" => Ok(Self::Router),
-            "matcher" => Ok(Self::Matcher),
             "probe" => Ok(Self::Probe),
             "event" => Ok(Self::Event),
             other => Err(Error::new(
                 ident.span(),
                 format!(
-                    "unknown component kind `{other}`; expected outbound, inbound, endpoint, dns_transport, router, matcher, probe, or event"
+                    "unknown component kind `{other}`; expected outbound, inbound, endpoint, probe, or event"
                 ),
             )),
         }
@@ -45,21 +39,13 @@ impl ComponentKind {
             Self::Outbound => quote!(crate::component_registry::OutboundComponentDeclaration),
             Self::Inbound => quote!(crate::component_registry::InboundComponentDeclaration),
             Self::Endpoint => quote!(crate::component_registry::EndpointComponentDeclaration),
-            Self::DnsTransport => {
-                quote!(crate::component_registry::DnsTransportComponentDeclaration)
-            }
-            Self::Router => quote!(crate::component_registry::RouterComponentDeclaration),
-            Self::Matcher => quote!(crate::component_registry::RouteMatcherComponentDeclaration),
             Self::Probe => quote!(crate::component_registry::ProbeComponentDeclaration),
             Self::Event => quote!(crate::component_registry::EventSubscriberComponentDeclaration),
         }
     }
 
     fn has_instance_metadata(self) -> bool {
-        matches!(
-            self,
-            Self::Outbound | Self::Inbound | Self::Endpoint | Self::DnsTransport
-        )
+        matches!(self, Self::Outbound | Self::Inbound | Self::Endpoint)
     }
 
     fn has_network_metadata(self) -> bool {
@@ -67,7 +53,7 @@ impl ComponentKind {
     }
 
     fn has_dependency_metadata(self) -> bool {
-        matches!(self, Self::Outbound | Self::Endpoint | Self::DnsTransport)
+        matches!(self, Self::Outbound | Self::Endpoint)
     }
 
     fn kind_name(self) -> &'static str {
@@ -75,9 +61,6 @@ impl ComponentKind {
             Self::Outbound => "outbound",
             Self::Inbound => "inbound",
             Self::Endpoint => "endpoint",
-            Self::DnsTransport => "dns_transport",
-            Self::Router => "router",
-            Self::Matcher => "matcher",
             Self::Probe => "probe",
             Self::Event => "event",
         }
@@ -523,14 +506,12 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                     id: String,
                     logger: ::hammer_core::log::Logger,
                     kind: &::hammer_core::config::InboundKind,
-                    router: ::std::sync::Arc<dyn ::hammer_adapter::Router>,
-                    dns_router: Option<::std::sync::Arc<crate::inbounds::RuntimeDnsRouter>>,
                     outbound: Option<::std::sync::Arc<crate::OutboundManager>>,
                     platform: Option<::std::sync::Arc<dyn ::hammer_adapter::PlatformInterface>>,
                     metrics: ::std::sync::Arc<::hammer_core::metrics::MetricsRegistry>,
                 ) -> ::hammer_core::error::HammerResult<::hammer_adapter::inbound::InboundComponent> {
                     let runtime: ::std::sync::Arc<#declaration_ty> = #builder(
-                        id, logger, kind, router, dns_router, outbound, platform, metrics
+                        id, logger, kind, outbound, platform, metrics
                     )?;
                     let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
                     let runtime: ::std::sync::Arc<dyn ::hammer_adapter::Inbound> = runtime;
@@ -552,52 +533,6 @@ pub fn hammer_component(args: TokenStream, input: TokenStream) -> TokenStream {
                     let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
                     let endpoint: ::std::sync::Arc<dyn ::hammer_adapter::Endpoint> = runtime;
                     Ok(::hammer_adapter::RuntimeComponent::new(meta, endpoint))
-                }
-            }
-        },
-        ComponentKind::DnsTransport => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build(
-                    id: String,
-                    kind: &::hammer_core::config::DnsServerKind,
-                    logger: ::hammer_core::log::Logger,
-                    outbound: Option<::std::sync::Arc<crate::OutboundManager>>,
-                    bootstrap: Option<::hammer_adapter::dns::DnsTransportComponent>,
-                    protector: crate::socket_protector::SocketProtector,
-                ) -> ::hammer_core::error::HammerResult<::hammer_adapter::dns::DnsTransportComponent> {
-                    let runtime: ::std::sync::Arc<#declaration_ty> = #builder(
-                        id, kind, logger, outbound, bootstrap, protector
-                    )?;
-                    let meta = ::hammer_adapter::ComponentMetadata::component_meta(runtime.as_ref());
-                    let runtime: ::std::sync::Arc<dyn ::hammer_adapter::DnsTransport> = runtime;
-                    Ok(::hammer_adapter::RuntimeComponent::new(meta, runtime))
-                }
-            }
-        },
-        ComponentKind::Router => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build(
-                    logger: ::hammer_core::log::Logger,
-                    options: ::hammer_core::config::RouteOptions,
-                    outbound: ::std::sync::Arc<crate::OutboundManager>,
-                    metrics: ::std::sync::Arc<::hammer_core::metrics::MetricsRegistry>,
-                ) -> ::hammer_core::error::HammerResult<crate::Router> {
-                    #builder(logger, options, outbound, metrics)
-                }
-            }
-        },
-        ComponentKind::Matcher => quote! {
-            #declaration_impl_head {
-                const TYPE_NAME: &'static str = #name;
-
-                fn build(
-                    matcher: ::hammer_core::config::RuleMatcher,
-                ) -> ::hammer_core::error::HammerResult<crate::route::RuntimeMatcher> {
-                    #builder(matcher)
                 }
             }
         },

@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use hammer_adapter::{
-    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, Node, NodeProcessFn,
-    NodeResult, NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
+    BufferFrame, DataPlaneRuntime, ForwardingMetadata, InternalNode, NetworkOpaque, Node,
+    NodeProcessFn, NodeResult, NodeRuntimeData, SecondaryOpaque, TraceControlPlane,
+    TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
+use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_runtime::spawn::DataRuntime;
 use hammer_service::data_plane::DropNode;
 use hammer_service::net::{
@@ -16,6 +18,18 @@ use hammer_service::net::{
     IpLookupTrace, IpUnicastArc,
 };
 use ipnet::{Ipv4Net, Ipv6Net};
+use std::mem::transmute;
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct LookupTestOpaque {
+    _tap_ethernet: Option<hammer_adapter::TapEthernetMetadata>,
+    _icmp_error: Option<IcmpErrorMetadata>,
+    forwarding: Option<ForwardingMetadata>,
+}
+
+const _: () =
+    assert!(core::mem::size_of::<LookupTestOpaque>() == core::mem::size_of::<SecondaryOpaque>());
 
 #[derive(Default)]
 struct SinkState {
@@ -128,14 +142,22 @@ fn sink_process(
         .frame_lens
         .push(frame.pending_len());
     for buffer in frame.drain_pending() {
-        let metadata = runtime.metadata(buffer)?;
         let payload = runtime.copy_current_chain(buffer)?;
+        let (egress_interface, forwarding) = {
+            let buffer_ref = runtime.get_buffer(buffer)?;
+            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer_ref.opaque()) };
+            let opaque = unsafe { transmute::<_, &LookupTestOpaque>(buffer_ref.opaque2()) };
+            (
+                Some(network.sw_if_index[1]).filter(|value| *value != 0),
+                opaque.forwarding,
+            )
+        };
         runtime.free_index(buffer);
         let mut state = state
             .lock()
             .map_err(|_| CoreError::internal("sink state poisoned"))?;
-        state.forwarding.push(metadata.forwarding);
-        state.egress_interfaces.push(metadata.egress_interface);
+        state.forwarding.push(forwarding);
+        state.egress_interfaces.push(egress_interface);
         state.payloads.push(payload);
     }
     Ok(NodeResult::drop())
@@ -610,14 +632,15 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, b"rewrite");
     let index = runtime
-        .alloc_index_with_bytes(Default::default(), &packet)
+        .alloc_index_with_bytes(&packet)
         .expect("alloc packet");
     runtime
         .try_mark_trace(rewrite_node, index)
         .expect("mark packet");
     {
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
-        buffer.metadata_mut().forwarding = Some(ForwardingMetadata {
+        let opaque = unsafe { transmute::<_, &mut LookupTestOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
             fib_index: 0,
             route_dpo_type: DpoType::ADJACENCY,
             route_dpo_index: adjacency.get(),
@@ -695,23 +718,29 @@ fn adjacency_rewrite_node_drops_missing_forwarding_and_missing_adjacency() {
         &ipv4_udp_packet([10, 0, 0, 1], 30_015, [192, 0, 2, 31], 53, b"missing-meta"),
     );
     let missing_adjacency = runtime
-        .alloc_index_with_bytes(
-            {
-                let mut metadata = hammer_adapter::RouteMetadata::default();
-                metadata.forwarding = Some(ForwardingMetadata {
-                    fib_index: 0,
-                    route_dpo_type: DpoType::ADJACENCY,
-                    route_dpo_index: 99,
-                    load_balance_index: u32::MAX,
-                    bucket_index: u16::MAX,
-                    dpo_type: DpoType::ADJACENCY,
-                    dpo_index: 99,
-                });
-                metadata
-            },
-            &ipv4_udp_packet([10, 0, 0, 1], 30_016, [192, 0, 2, 32], 53, b"missing-adj"),
-        )
+        .alloc_index_with_bytes(&ipv4_udp_packet(
+            [10, 0, 0, 1],
+            30_016,
+            [192, 0, 2, 32],
+            53,
+            b"missing-adj",
+        ))
         .expect("alloc missing adjacency");
+    {
+        let mut buffer = runtime
+            .get_buffer_mut(missing_adjacency)
+            .expect("missing adjacency");
+        let opaque = unsafe { transmute::<_, &mut LookupTestOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            route_dpo_type: DpoType::ADJACENCY,
+            route_dpo_index: 99,
+            load_balance_index: u32::MAX,
+            bucket_index: u16::MAX,
+            dpo_type: DpoType::ADJACENCY,
+            dpo_index: 99,
+        });
+    }
     runtime
         .get_frame_mut(frame)
         .expect("mutate frame")
@@ -942,7 +971,7 @@ fn add_single_path(
 
 fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, packet: &[u8]) {
     let index = runtime
-        .alloc_index_with_bytes(Default::default(), packet)
+        .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     runtime
         .get_frame_mut(frame)
@@ -958,7 +987,7 @@ fn push_marked_packet(
     packet: &[u8],
 ) {
     let index = runtime
-        .alloc_index_with_bytes(Default::default(), packet)
+        .alloc_index_with_bytes(packet)
         .expect("alloc packet");
     runtime
         .try_mark_trace(trace_input, index)

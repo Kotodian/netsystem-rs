@@ -12,7 +12,6 @@ pub struct NetworkInterface {
     pub expensive: bool,
     pub constrained: bool,
     pub addresses: Vec<String>,
-    pub dns_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
