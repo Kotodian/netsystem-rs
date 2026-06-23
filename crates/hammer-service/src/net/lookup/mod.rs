@@ -831,8 +831,8 @@ fn apply_adjacency_rewrite(
         let cursor = buffer.packet_cursor();
         buffer.set_packet_cursor(shift_packet_cursor(cursor, rewrite.len()));
     }
-    unsafe { transmute::<_, &mut hammer_adapter::NetworkOpaque>(buffer.opaque_mut()) }.sw_if_index
-        [1] = adjacency.egress_interface.unwrap_or(0);
+    unsafe { transmute::<_, &mut hammer_adapter::NetworkOpaque>(buffer.opaque_mut()) }
+        .sw_if_index[1] = adjacency.egress_interface.unwrap_or(0);
     if !rewrite.is_empty() {
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.tap_ethernet = None;

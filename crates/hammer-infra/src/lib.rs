@@ -1,6 +1,7 @@
 pub mod align;
 pub mod bitmap;
 pub mod boxed;
+pub mod checksum;
 pub mod descriptor;
 pub mod fifo;
 pub mod hint;

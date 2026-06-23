@@ -66,6 +66,11 @@ impl<T> FifoQueue<T> {
     }
 
     #[inline]
+    pub fn back(&self) -> Option<&T> {
+        self.back.last().or_else(|| self.front.as_slice().first())
+    }
+
+    #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len() {
             return None;

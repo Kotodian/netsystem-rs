@@ -10,6 +10,7 @@ use hammer_adapter::{
     SocksAddr, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::checksum::internet_checksum;
 use hammer_infra::vec::Vec;
 
 use crate::trace::codec::{
@@ -1062,21 +1063,4 @@ fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
     let checksum = internet_checksum(&packet[..header_len]);
     packet[IPV4_HEADER_CHECKSUM_OFFSET..IPV4_HEADER_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&checksum.to_be_bytes());
-}
-
-#[inline(always)]
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
 }

@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags};
+use hammer_core::protocol::tcp::{TcpCapabilities, TcpSegmentFlags, tcp_options_from_bytes};
 use hammer_service::transport::tcp::output::{
     tcp_available_send_window, tcp_output_next_sequence, tcp_output_sequence_len,
     tcp_payload_len_in_send_window,
@@ -20,6 +20,7 @@ fn tcp_segment_writes_tcp_header_bytes() {
         4096,
         TcpSegmentFlags::ACK | TcpSegmentFlags::PSH,
         TcpCapabilities::default(),
+        None,
         None,
         None,
         None,
@@ -93,4 +94,39 @@ fn tcp_output_payload_len_is_zero_when_congestion_window_is_full() {
         tcp_payload_len_in_send_window(1000, 2000, 8000, 1000, 512, 0),
         0
     );
+}
+
+#[test]
+fn tcp_segment_writes_nonzero_timestamp_when_enabled() {
+    let local: SocketAddr = "192.0.2.10:50000".parse().expect("local");
+    let remote: SocketAddr = "198.51.100.20:443".parse().expect("remote");
+    let segment = TcpSegment::new(
+        local,
+        remote,
+        100,
+        200,
+        4096,
+        TcpSegmentFlags::ACK,
+        TcpCapabilities {
+            timestamps: true,
+            ..TcpCapabilities::default()
+        },
+        None,
+        Some(hammer_core::protocol::tcp::TcpTimestampOption {
+            tsval: 7,
+            tsecr: 3,
+        }),
+        None,
+        None,
+        0,
+    );
+    let mut header = [0u8; 64];
+
+    let written = segment.write_header(&mut header).expect("write header");
+    let slice = etherparse::TcpSlice::from_slice(&header[..written]).expect("parse tcp");
+    let options = tcp_options_from_bytes(slice.options());
+    let timestamp = options.timestamp.expect("timestamp");
+
+    assert_eq!(timestamp.tsval, 7);
+    assert_eq!(timestamp.tsecr, 3);
 }

@@ -10,7 +10,7 @@ fn expired_values(expired: &Vec<u32>) -> std::vec::Vec<u32> {
 
 #[test]
 fn timer_wheel_starts_relative_timers_and_expires_in_tick_order() {
-    let mut wheel = TimerWheel1t1w32::new(0);
+    let mut wheel = TimerWheel1t1w32::<u32>::new(0);
     let mut expired = Vec::new();
 
     wheel.start(30, 3).unwrap();
@@ -33,7 +33,7 @@ fn timer_wheel_starts_relative_timers_and_expires_in_tick_order() {
 
 #[test]
 fn timer_wheel_stop_update_and_stale_handles_are_generation_checked() {
-    let mut wheel = TimerWheel1t1w32::new(0);
+    let mut wheel = TimerWheel1t1w32::<u32>::new(0);
     let mut expired = Vec::new();
 
     let stopped = wheel.start(1, 2).unwrap();
@@ -59,8 +59,8 @@ fn timer_wheel_stop_update_and_stale_handles_are_generation_checked() {
 
 #[test]
 fn timer_wheel_rejects_zero_and_out_of_range_intervals_without_overflow() {
-    let mut one_ring = TimerWheel1t1w32::new(0);
-    let mut two_ring = TimerWheel2w32::new(0);
+    let mut one_ring = TimerWheel1t1w32::<u32>::new(0);
+    let mut two_ring = TimerWheel2w32::<u32>::new(0);
 
     assert_eq!(one_ring.start(1, 0), Err(TimerStartError::ZeroInterval));
     assert!(one_ring.start(2, 32).is_ok());
@@ -92,7 +92,7 @@ fn timer_wheel_cascades_from_slow_ring_to_fast_ring() {
 
 #[test]
 fn timer_wheel_cascades_from_glacier_ring_through_slow_ring_to_fast_ring() {
-    type ThreeRingWheel = TimerWheel<3, 8, false, false, true>;
+    type ThreeRingWheel = TimerWheel<u32, 3, 8, false, false, true>;
 
     let mut wheel = ThreeRingWheel::new(0);
     let mut expired = Vec::new();
@@ -111,7 +111,7 @@ fn timer_wheel_cascades_from_glacier_ring_through_slow_ring_to_fast_ring() {
 
 #[test]
 fn timer_wheel_overflow_parks_until_three_ring_horizon_then_reinserts() {
-    type OverflowWheel = TimerWheel<3, 8, false, true, true>;
+    type OverflowWheel = TimerWheel<u32, 3, 8, false, true, true>;
 
     let mut wheel = OverflowWheel::new(0);
     let mut expired = Vec::new();
@@ -132,7 +132,7 @@ fn timer_wheel_overflow_parks_until_three_ring_horizon_then_reinserts() {
 
 #[test]
 fn timer_wheel_2048_slot_alias_handles_full_fast_ring_revolution() {
-    let mut wheel = TimerWheel2t1w2048::new(0);
+    let mut wheel = TimerWheel2t1w2048::<u32>::new(0);
     let mut expired = Vec::new();
 
     wheel.start(2_048, 2_048).unwrap();
@@ -145,7 +145,7 @@ fn timer_wheel_2048_slot_alias_handles_full_fast_ring_revolution() {
 
 #[test]
 fn timer_wheel_max_expirations_stops_expire_call_between_ticks() {
-    let mut wheel = TimerWheel1t1w32::new(2);
+    let mut wheel = TimerWheel1t1w32::<u32>::new(2);
     let mut expired = Vec::new();
 
     wheel.start(1, 1).unwrap();
@@ -163,7 +163,7 @@ fn timer_wheel_max_expirations_stops_expire_call_between_ticks() {
 
 #[test]
 fn timer_wheel_fast_hint_is_approximate_and_slot_based() {
-    let mut wheel = TimerWheel1w32FastHint::new(0);
+    let mut wheel = TimerWheel1w32FastHint::<u32>::new(0);
     let mut expired = Vec::new();
 
     assert_eq!(wheel.first_expires_in_ticks(), Some(32));
@@ -181,7 +181,7 @@ fn timer_wheel_fast_hint_is_approximate_and_slot_based() {
 
 #[test]
 fn timer_wheel_without_fast_hint_reports_no_hint() {
-    let wheel = TimerWheel1t1w32::new(0);
+    let wheel = TimerWheel1t1w32::<u32>::new(0);
 
     assert_eq!(wheel.first_expires_in_ticks(), None);
 }

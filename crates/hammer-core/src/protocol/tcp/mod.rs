@@ -134,17 +134,6 @@ impl TcpSeq {
     }
 
     #[inline]
-    pub const fn before(self, other: Self) -> bool {
-        // TCP sequence ordering is only well-defined inside the RFC half-space.
-        (self.0.wrapping_sub(other.0) as i32) < 0
-    }
-
-    #[inline]
-    pub const fn after(self, other: Self) -> bool {
-        (self.0.wrapping_sub(other.0) as i32) > 0
-    }
-
-    #[inline]
     pub const fn distance_to(self, other: Self) -> u32 {
         other.0.wrapping_sub(self.0)
     }
@@ -161,6 +150,27 @@ impl From<TcpSeq> for u32 {
     #[inline]
     fn from(value: TcpSeq) -> Self {
         value.0
+    }
+}
+
+impl Ord for TcpSeq {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self == other {
+            Ordering::Equal
+        // TCP sequence ordering is only well-defined inside the RFC half-space.
+        } else if (self.0.wrapping_sub(other.0) as i32) < 0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        }
+    }
+}
+
+impl PartialOrd for TcpSeq {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -441,3 +451,4 @@ fn splitmix64(mut value: u64) -> u64 {
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
 }
+use std::cmp::Ordering;

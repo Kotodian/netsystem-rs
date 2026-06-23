@@ -5,6 +5,10 @@ const MINIMAL_CONFIG: &str = r#"
 [tun]
 address = ["172.19.0.1/30"]
 route_address = ["0.0.0.0/0"]
+
+[[outbounds]]
+id = "block"
+type = "block"
 "#;
 
 #[test]

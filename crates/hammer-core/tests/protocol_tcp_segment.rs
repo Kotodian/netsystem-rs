@@ -1,5 +1,5 @@
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError,
+    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSegmentParseError, TcpSeq,
     tcp_options_from_bytes, write_tcp_segment_header,
 };
 
@@ -80,8 +80,8 @@ fn core_tcp_write_ack_with_sack_blocks() {
     let written = write_ack_for_test(
         &mut output,
         &[TcpSackBlock {
-            left_edge: 30,
-            right_edge: 40,
+            left_edge: TcpSeq::from(30),
+            right_edge: TcpSeq::from(40),
         }],
     )
     .expect("write ack with sack");
@@ -90,8 +90,8 @@ fn core_tcp_write_ack_with_sack_blocks() {
     assert_eq!(
         parsed.sack_blocks,
         vec![TcpSackBlock {
-            left_edge: 30,
-            right_edge: 40,
+            left_edge: TcpSeq::from(30),
+            right_edge: TcpSeq::from(40),
         }]
     );
 }
@@ -104,8 +104,8 @@ fn core_tcp_non_ack_does_not_write_sack_blocks() {
         &mut output,
         TcpSegmentFlags::PSH,
         &[TcpSackBlock {
-            left_edge: 30,
-            right_edge: 40,
+            left_edge: TcpSeq::from(30),
+            right_edge: TcpSeq::from(40),
         }],
     )
     .expect("write non-ack without sack option");
@@ -152,6 +152,7 @@ fn write_header_for_test(
             flags,
             advertised_window: 32_768,
             capabilities: TcpCapabilities::default(),
+            timestamp: None,
             fast_open_cookie: None,
         },
         Some(sack_blocks),

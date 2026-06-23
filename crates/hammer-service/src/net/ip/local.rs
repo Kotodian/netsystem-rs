@@ -8,6 +8,7 @@ use hammer_adapter::{
     TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibTableHandle};
@@ -873,53 +874,32 @@ fn default_protocol_next(next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtoc
 fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &[u8]) -> u16 {
     match parsed.version {
         IpVersion::V4 => {
-            let mut pseudo = Vec::with_capacity(12 + segment.len());
             match (parsed.source, parsed.destination) {
-                (IpAddr::V4(source), IpAddr::V4(destination)) => {
-                    pseudo.extend_from_slice(&source.octets());
-                    pseudo.extend_from_slice(&destination.octets());
-                }
+                (IpAddr::V4(source), IpAddr::V4(destination)) => internet_checksum_parts(&[
+                    &source.octets(),
+                    &destination.octets(),
+                    &[0, protocol],
+                    &(segment.len() as u16).to_be_bytes(),
+                    segment,
+                ]),
                 _ => return 1,
             }
-            pseudo.push(0);
-            pseudo.push(protocol);
-            pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-            pseudo.extend_from_slice(segment);
-            internet_checksum(&pseudo)
         }
         IpVersion::V6 => {
-            let mut pseudo = Vec::with_capacity(40 + segment.len());
             match (parsed.source, parsed.destination) {
-                (IpAddr::V6(source), IpAddr::V6(destination)) => {
-                    pseudo.extend_from_slice(&source.octets());
-                    pseudo.extend_from_slice(&destination.octets());
-                }
+                (IpAddr::V6(source), IpAddr::V6(destination)) => internet_checksum_parts(&[
+                    &source.octets(),
+                    &destination.octets(),
+                    &(segment.len() as u32).to_be_bytes(),
+                    &[0, 0, 0, protocol],
+                    segment,
+                ]),
                 _ => return 1,
             }
-            pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-            pseudo.extend_from_slice(&[0, 0, 0, protocol]);
-            pseudo.extend_from_slice(segment);
-            internet_checksum(&pseudo)
         }
     }
 }
 
-#[inline(always)]
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
-}
 
 #[cfg(test)]
 mod tests {

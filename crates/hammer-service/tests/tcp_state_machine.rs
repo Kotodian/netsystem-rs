@@ -76,8 +76,10 @@ fn tcp_timer_dispatch_is_owned_by_connection() {
     let source = read_tcp_source("src/transport/tcp/connection.rs");
     assert!(!source.contains("on_retransmit_timeout"));
     assert!(!source.contains("retransmit_syn_header_if_ready"));
-    assert!(source.contains("self.on_tcp_timer(kind)"));
-    assert!(source.contains("pub(crate) fn on_tcp_timer("));
+    assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
+    assert!(source.contains("timer_dispatch_pending(timer_id)"));
+    assert!(source.contains("match (self.state, timer_id)"));
+    assert!(source.contains("match timer_id"));
     assert!(!source.contains("TcpConnectionTimerKind::all"));
 }
 
@@ -114,8 +116,7 @@ fn tcp_close_path_updates_connection_state_in_connection() {
 #[test]
 fn tcp_syn_sent_timer_expiry_updates_connection_state_in_connection() {
     let source = read_tcp_source("src/transport/tcp/connection.rs");
-    assert!(source.contains("pub(crate) fn on_tcp_timer("));
     assert!(source.contains("self.state == TcpState::SynSent"));
     assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
-    assert!(source.contains("self.tcp_timer_set(timer);"));
+    assert!(source.contains("self.timer_set(TCP_TIMER_RETRANSMIT);"));
 }

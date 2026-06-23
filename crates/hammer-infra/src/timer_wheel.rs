@@ -1,3 +1,4 @@
+use crate::bitmap::Bitmap;
 use crate::vec::Vec;
 
 const INVALID_INDEX: u32 = u32::MAX;
@@ -27,10 +28,13 @@ pub enum TimerStartError {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TimerEntry {
+struct TimerEntry<T>
+where
+    T: Copy,
+{
     next: u32,
     prev: u32,
-    user_handle: u32,
+    payload: Option<T>,
     generation: u32,
     live: bool,
     fast_ring_offset: u32,
@@ -38,13 +42,16 @@ struct TimerEntry {
     expiration_tick: u64,
 }
 
-impl TimerEntry {
+impl<T> TimerEntry<T>
+where
+    T: Copy,
+{
     #[inline]
     fn list_head(index: u32) -> Self {
         Self {
             next: index,
             prev: index,
-            user_handle: 0,
+            payload: None,
             generation: 0,
             live: false,
             fast_ring_offset: 0,
@@ -54,11 +61,11 @@ impl TimerEntry {
     }
 
     #[inline]
-    fn timer(generation: u32, user_handle: u32, expiration_tick: u64) -> Self {
+    fn timer(generation: u32, payload: T, expiration_tick: u64) -> Self {
         Self {
             next: INVALID_INDEX,
             prev: INVALID_INDEX,
-            user_handle,
+            payload: Some(payload),
             generation,
             live: true,
             fast_ring_offset: 0,
@@ -69,35 +76,47 @@ impl TimerEntry {
 }
 
 pub struct TimerWheel<
+    T,
     const WHEELS: usize,
     const SLOTS: usize,
     const FAST_BITMAP: bool,
     const OVERFLOW: bool,
     const DUPLICATE_STOP: bool,
-> {
+>
+where
+    T: Copy,
+{
     current_tick: u64,
     current_index: [u32; 3],
     slot_heads: Vec<u32>,
     overflow_head: u32,
-    entries: Vec<TimerEntry>,
+    entries: Vec<TimerEntry<T>>,
     free: Vec<u32>,
-    fast_slot_bitmap: Vec<bool>,
+    fast_slot_bitmap: Bitmap,
+    slot_generations: Vec<u32>,
+    timer_slots: Vec<u32>,
+    timer_entry_generations: Vec<u32>,
+    timer_bitmap: Bitmap,
+    timers_per_slot: usize,
     len: usize,
     max_expirations: usize,
 }
 
-pub type TimerWheel1t1w32 = TimerWheel<1, 32, false, false, true>;
-pub type TimerWheel1w32FastHint = TimerWheel<1, 32, true, false, true>;
-pub type TimerWheel2w32 = TimerWheel<2, 32, false, false, true>;
-pub type TimerWheel2t1w2048 = TimerWheel<1, 2048, false, false, true>;
+pub type TimerWheel1t1w32<T> = TimerWheel<T, 1, 32, false, false, true>;
+pub type TimerWheel1w32FastHint<T> = TimerWheel<T, 1, 32, true, false, true>;
+pub type TimerWheel2w32<T> = TimerWheel<T, 2, 32, false, false, true>;
+pub type TimerWheel2t1w2048<T> = TimerWheel<T, 1, 2048, false, false, true>;
 
 impl<
+    T,
     const WHEELS: usize,
     const SLOTS: usize,
     const FAST_BITMAP: bool,
     const OVERFLOW: bool,
     const DUPLICATE_STOP: bool,
-> TimerWheel<WHEELS, SLOTS, FAST_BITMAP, OVERFLOW, DUPLICATE_STOP>
+> TimerWheel<T, WHEELS, SLOTS, FAST_BITMAP, OVERFLOW, DUPLICATE_STOP>
+where
+    T: Copy,
 {
     pub fn new(max_expirations: usize) -> Self {
         Self::validate_geometry();
@@ -115,9 +134,9 @@ impl<
         };
 
         let fast_slot_bitmap = if FAST_BITMAP {
-            (0..SLOTS).map(|_| false).collect()
+            Bitmap::with_capacity(SLOTS)
         } else {
-            Vec::new()
+            Bitmap::new()
         };
 
         Self {
@@ -128,6 +147,11 @@ impl<
             entries,
             free: Vec::new(),
             fast_slot_bitmap,
+            slot_generations: Vec::new(),
+            timer_slots: Vec::new(),
+            timer_entry_generations: Vec::new(),
+            timer_bitmap: Bitmap::new(),
+            timers_per_slot: 0,
             len: 0,
             max_expirations,
         }
@@ -148,17 +172,13 @@ impl<
         self.len == 0
     }
 
-    pub fn start(
-        &mut self,
-        user_handle: u32,
-        interval: u64,
-    ) -> Result<TimerHandle, TimerStartError> {
+    pub fn start(&mut self, payload: T, interval: u64) -> Result<TimerHandle, TimerStartError> {
         self.validate_interval(interval)?;
         let expiration_tick = self
             .current_tick
             .checked_add(interval)
             .ok_or(TimerStartError::IntervalOutOfRange)?;
-        let slot = self.allocate_timer(user_handle, expiration_tick);
+        let slot = self.allocate_timer(payload, expiration_tick);
         self.place_timer(slot, interval);
         let generation = self.entries[slot as usize].generation;
         Ok(TimerHandle { slot, generation })
@@ -197,7 +217,7 @@ impl<
         self.live_slot(handle).is_some()
     }
 
-    pub fn expire(&mut self, ticks: u32, expired: &mut Vec<u32>) -> usize {
+    pub fn expire(&mut self, ticks: u32, expired: &mut Vec<T>) -> usize {
         let initial_len = expired.len();
         let max_expirations = self.expiration_budget();
 
@@ -219,7 +239,7 @@ impl<
         let current = self.current_index[0] as usize;
         for offset in 0..SLOTS {
             let slot = (current + offset) & (SLOTS - 1);
-            if self.fast_slot_bitmap[slot] {
+            if self.fast_slot_bitmap.is_set(slot) {
                 return Some(offset as u32);
             }
         }
@@ -236,7 +256,7 @@ impl<
         }
     }
 
-    fn advance_one_tick(&mut self, expired: &mut Vec<u32>) {
+    fn advance_one_tick(&mut self, expired: &mut Vec<T>) {
         self.current_tick = self
             .current_tick
             .checked_add(1)
@@ -278,7 +298,7 @@ impl<
         }
     }
 
-    fn process_overflow(&mut self, expired: &mut Vec<u32>) {
+    fn process_overflow(&mut self, expired: &mut Vec<T>) {
         debug_assert!(OVERFLOW);
         let head = self.overflow_head;
         let mut next = self.take_list(head);
@@ -302,7 +322,7 @@ impl<
         }
     }
 
-    fn cascade_glacier(&mut self, expired: &mut Vec<u32>) {
+    fn cascade_glacier(&mut self, expired: &mut Vec<T>) {
         let head = self.slot_head(2, self.current_index[2]);
         let mut next = self.take_list(head);
         while next != head {
@@ -322,7 +342,7 @@ impl<
         }
     }
 
-    fn cascade_slow(&mut self, expired: &mut Vec<u32>) {
+    fn cascade_slow(&mut self, expired: &mut Vec<T>) {
         let head = self.slot_head(1, self.current_index[1]);
         let mut next = self.take_list(head);
         while next != head {
@@ -339,7 +359,7 @@ impl<
         }
     }
 
-    fn expire_fast_slot(&mut self, expired: &mut Vec<u32>) {
+    fn expire_fast_slot(&mut self, expired: &mut Vec<T>) {
         let fast_slot = self.current_index[0];
         let head = self.slot_head(0, fast_slot);
         let mut next = self.take_list(head);
@@ -351,21 +371,24 @@ impl<
         }
 
         if FAST_BITMAP {
-            self.fast_slot_bitmap[fast_slot as usize] = false;
+            self.fast_slot_bitmap.clear(fast_slot as usize);
         }
     }
 
-    fn expire_timer(&mut self, slot: u32, expired: &mut Vec<u32>) {
+    fn expire_timer(&mut self, slot: u32, expired: &mut Vec<T>) {
         debug_assert!(self.entries[slot as usize].live);
-        expired.push(self.entries[slot as usize].user_handle);
+        let payload = self.entries[slot as usize]
+            .payload
+            .expect("live timer must carry payload");
+        expired.push(payload);
         self.free_timer(slot);
     }
 
-    fn allocate_timer(&mut self, user_handle: u32, expiration_tick: u64) -> u32 {
+    fn allocate_timer(&mut self, payload: T, expiration_tick: u64) -> u32 {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.entries[slot as usize];
             let generation = entry.generation.wrapping_add(1).max(1);
-            *entry = TimerEntry::timer(generation, user_handle, expiration_tick);
+            *entry = TimerEntry::timer(generation, payload, expiration_tick);
             self.len += 1;
             return slot;
         }
@@ -375,8 +398,7 @@ impl<
             u32::try_from(slot).is_ok(),
             "timer wheel entry index overflow"
         );
-        self.entries
-            .push(TimerEntry::timer(1, user_handle, expiration_tick));
+        self.entries.push(TimerEntry::timer(1, payload, expiration_tick));
         self.len += 1;
         slot as u32
     }
@@ -387,7 +409,7 @@ impl<
         entry.live = false;
         entry.next = INVALID_INDEX;
         entry.prev = INVALID_INDEX;
-        entry.user_handle = 0;
+        entry.payload = None;
         self.len -= 1;
         self.free.push(slot);
     }
@@ -470,7 +492,7 @@ impl<
     fn add_to_fast_slot(&mut self, fast_offset: u32, slot: u32) {
         self.add_to_list(self.slot_head(0, fast_offset), slot);
         if FAST_BITMAP {
-            self.fast_slot_bitmap[fast_offset as usize] = true;
+            self.fast_slot_bitmap.set(fast_offset as usize);
         }
     }
 
@@ -581,7 +603,172 @@ impl<
     }
 }
 
-fn push_list_head(entries: &mut Vec<TimerEntry>) -> u32 {
+impl<
+    const WHEELS: usize,
+    const SLOTS: usize,
+    const FAST_BITMAP: bool,
+    const OVERFLOW: bool,
+    const DUPLICATE_STOP: bool,
+> TimerWheel<u32, WHEELS, SLOTS, FAST_BITMAP, OVERFLOW, DUPLICATE_STOP>
+{
+    #[inline]
+    pub fn with_timer_ids(max_expirations: usize, timers_per_slot: usize) -> Self {
+        let mut wheel = Self::new(max_expirations);
+        assert!(timers_per_slot > 0, "timers per slot must be non-zero");
+        wheel.timers_per_slot = timers_per_slot;
+        wheel
+    }
+
+    pub fn arm_timer(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        timer_id: u32,
+        interval: u64,
+    ) -> Result<(), TimerStartError> {
+        self.prepare_slot(slot, generation);
+        let flat = self.timer_flat_index(slot, timer_id);
+        let _ = self.cancel_timer(slot, generation, timer_id);
+        let handle = self.start(flat as u32, interval)?;
+        self.timer_slots[flat] = handle.slot();
+        self.timer_entry_generations[flat] = handle.generation();
+        self.timer_bitmap.set(flat);
+        Ok(())
+    }
+
+    pub fn cancel_timer(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        timer_id: u32,
+    ) -> bool {
+        if self.timers_per_slot == 0 {
+            return false;
+        }
+        let slot = slot as usize;
+        if slot >= self.slot_generations.len() || self.slot_generations[slot] != generation
+        {
+            return false;
+        }
+        let flat = self.timer_flat_index(slot as u32, timer_id);
+        if !self.timer_bitmap.is_set(flat) {
+            return false;
+        }
+        let handle = TimerHandle {
+            slot: self.timer_slots[flat],
+            generation: self.timer_entry_generations[flat],
+        };
+        self.clear_timer_slot(flat);
+        self.stop(handle)
+    }
+
+    pub fn update_timer(
+        &mut self,
+        slot: u32,
+        generation: u32,
+        timer_id: u32,
+        interval: u64,
+    ) -> Result<(), TimerStartError> {
+        self.prepare_slot(slot, generation);
+        let flat = self.timer_flat_index(slot, timer_id);
+        if self.timer_bitmap.is_set(flat) {
+            let handle = TimerHandle {
+                slot: self.timer_slots[flat],
+                generation: self.timer_entry_generations[flat],
+            };
+            if self.update(handle, interval)? {
+                return Ok(());
+            }
+            self.clear_timer_slot(flat);
+        }
+        self.arm_timer(slot, generation, timer_id, interval)
+    }
+
+    pub fn take_expired_timer(&mut self, payload: u32) -> Option<(u32, u32, u32)> {
+        if self.timers_per_slot == 0 {
+            return None;
+        }
+        let flat = payload as usize;
+        if flat >= self.timer_slots.len() || !self.timer_bitmap.is_set(flat) {
+            return None;
+        }
+        let slot = flat / self.timers_per_slot;
+        let timer_id = (flat % self.timers_per_slot) as u32;
+        let generation = *self.slot_generations.get(slot)?;
+        self.clear_timer_slot(flat);
+        Some((slot as u32, generation, timer_id))
+    }
+
+    fn prepare_slot(&mut self, slot: u32, generation: u32) {
+        assert!(self.timers_per_slot > 0, "timers per slot are not configured");
+        let slot = slot as usize;
+        if slot >= self.slot_generations.len() {
+            let additional = slot + 1 - self.slot_generations.len();
+            self.slot_generations.reserve(additional);
+            while self.slot_generations.len() <= slot {
+                self.slot_generations.push(0);
+            }
+            let required = (slot + 1) * self.timers_per_slot;
+            let additional = required.saturating_sub(self.timer_slots.len());
+            self.timer_slots.reserve(additional);
+            self.timer_entry_generations.reserve(additional);
+            while self.timer_slots.len() < required {
+                self.timer_slots.push(INVALID_INDEX);
+                self.timer_entry_generations.push(0);
+            }
+        }
+        if self.slot_generations[slot] == generation {
+            return;
+        }
+        self.reset_slot(slot);
+        self.slot_generations[slot] = generation;
+    }
+
+    fn reset_slot(&mut self, slot: usize) {
+        if self.timers_per_slot == 0 {
+            return;
+        }
+        let start = slot * self.timers_per_slot;
+        let end = start + self.timers_per_slot;
+        if end > self.timer_slots.len() {
+            return;
+        }
+        for flat in start..end {
+            if !self.timer_bitmap.is_set(flat) {
+                continue;
+            }
+            let handle = TimerHandle {
+                slot: self.timer_slots[flat],
+                generation: self.timer_entry_generations[flat],
+            };
+            self.clear_timer_slot(flat);
+            let _ = self.stop(handle);
+        }
+    }
+
+    #[inline]
+    fn timer_flat_index(&self, slot: u32, timer_id: u32) -> usize {
+        assert!(self.timers_per_slot > 0, "timers per slot are not configured");
+        let timer_id = timer_id as usize;
+        assert!(
+            timer_id < self.timers_per_slot,
+            "timer id exceeds configured timers per slot"
+        );
+        slot as usize * self.timers_per_slot + timer_id
+    }
+
+    #[inline]
+    fn clear_timer_slot(&mut self, flat: usize) {
+        self.timer_bitmap.clear(flat);
+        self.timer_slots[flat] = INVALID_INDEX;
+        self.timer_entry_generations[flat] = 0;
+    }
+}
+
+fn push_list_head<T>(entries: &mut Vec<TimerEntry<T>>) -> u32
+where
+    T: Copy,
+{
     let slot = entries.len();
     assert!(
         u32::try_from(slot).is_ok(),

@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use hammer_adapter::BufferPacketCursor;
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;
@@ -107,14 +108,13 @@ pub fn tcp_control_cursor(packet: &[u8]) -> CoreResult<BufferPacketCursor> {
 }
 
 fn ipv4_l4_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.push(0);
-    pseudo.push(protocol);
-    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
+    internet_checksum_parts(&[
+        &source.octets(),
+        &destination.octets(),
+        &[0, protocol],
+        &(segment.len() as u16).to_be_bytes(),
+        segment,
+    ])
 }
 
 fn update_ipv4_header_checksum(packet: &mut [u8]) {
@@ -122,20 +122,4 @@ fn update_ipv4_header_checksum(packet: &mut [u8]) {
     packet[11] = 0;
     let checksum = internet_checksum(&packet[..20]);
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-}
-
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = match chunk {
-            [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
-            [hi] => u16::from_be_bytes([*hi, 0]) as u32,
-            _ => unreachable!(),
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
 }

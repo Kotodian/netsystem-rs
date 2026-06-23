@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::error::{CoreError, CoreResult};
+use hammer_infra::checksum::internet_checksum;
 use nom::IResult;
 use nom::Parser;
 use nom::bytes::complete::take;
@@ -121,12 +122,9 @@ pub enum IpFragmentKey {
     },
 }
 
-#[inline(always)]
 pub fn parse_ip_packet(packet: &[u8]) -> CoreResult<ParsedIpPacket> {
     parse_ip_packet_with_chain_len(packet, 0)
 }
-
-#[inline(always)]
 pub fn parse_ip_packet_with_chain_len(
     packet: &[u8],
     tail_len: usize,
@@ -151,13 +149,9 @@ pub fn parse_ip_packet_with_chain_len(
     }
     Ok(parsed.parsed)
 }
-
-#[inline(always)]
 pub fn parse_ip_fragment(packet: &[u8]) -> CoreResult<ParsedIpFragment> {
     parse_ip_fragment_with_chain_len(packet, 0)
 }
-
-#[inline(always)]
 pub fn parse_ip_fragment_with_chain_len(
     packet: &[u8],
     tail_len: usize,
@@ -493,21 +487,4 @@ fn parse_ipv6_addr(input: &[u8]) -> ParseResult<'_, Ipv6Addr> {
     let (input, bytes) = take(16usize).parse(input)?;
     let bytes = <[u8; 16]>::try_from(bytes).expect("nom take returned sixteen bytes");
     Ok((input, Ipv6Addr::from(bytes)))
-}
-
-#[inline(always)]
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
 }

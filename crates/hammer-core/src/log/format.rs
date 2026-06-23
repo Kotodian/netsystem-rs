@@ -179,7 +179,13 @@ mod tests {
             id: 0xdead_0042,
             created_at: formatter.base_time,
         };
-        let got = formatter.format_platform(Some(id), Level::Error, "handshake failed", ts);
+        let got = formatter.format_platform(
+            Some(id),
+            Level::Error,
+            "outbound/selector",
+            "handshake failed",
+            ts,
+        );
         assert!(!got.contains("\x1b["), "got = {got}");
         assert!(
             !got.contains("INFO[") && !got.contains("ERROR["),

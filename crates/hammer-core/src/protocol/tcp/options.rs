@@ -1,4 +1,4 @@
-use super::TcpCapabilities;
+use super::{TcpCapabilities, TcpSeq};
 use hammer_infra::vec::Vec;
 
 const TCP_OPTION_EOL: u8 = 0;
@@ -23,8 +23,8 @@ const TCP_FAST_OPEN_COOKIE_MAX_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSackBlock {
-    pub left_edge: u32,
-    pub right_edge: u32,
+    pub left_edge: TcpSeq,
+    pub right_edge: TcpSeq,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,12 +80,12 @@ pub fn tcp_options_from_bytes(options: &[u8]) -> ParsedTcpOptions {
                             .take(TCP_MAX_SACK_BLOCKS)
                         {
                             parsed.sack_blocks.push(TcpSackBlock {
-                                left_edge: u32::from_be_bytes([
+                                left_edge: TcpSeq::from(u32::from_be_bytes([
                                     block[0], block[1], block[2], block[3],
-                                ]),
-                                right_edge: u32::from_be_bytes([
+                                ])),
+                                right_edge: TcpSeq::from(u32::from_be_bytes([
                                     block[4], block[5], block[6], block[7],
-                                ]),
+                                ])),
                             });
                         }
                     }

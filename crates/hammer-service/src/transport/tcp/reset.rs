@@ -10,6 +10,7 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::ip::parse_ip_packet;
 use hammer_core::protocol::tcp::TcpSegmentFlags;
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -634,40 +635,23 @@ fn synthesize_ipv6_tcp_reset(
 }
 
 fn ipv4_l4_checksum(source: [u8; 4], destination: [u8; 4], protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
-    pseudo.extend_from_slice(&source);
-    pseudo.extend_from_slice(&destination);
-    pseudo.push(0);
-    pseudo.push(protocol);
-    pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
-}
-
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = match chunk {
-            [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
-            [hi] => u16::from_be_bytes([*hi, 0]) as u32,
-            _ => unreachable!(),
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
+    internet_checksum_parts(&[
+        &source,
+        &destination,
+        &[0, protocol],
+        &(segment.len() as u16).to_be_bytes(),
+        segment,
+    ])
 }
 
 fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + segment.len() + (segment.len() & 1));
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, protocol]);
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
+    internet_checksum_parts(&[
+        &source.octets(),
+        &destination.octets(),
+        &(segment.len() as u32).to_be_bytes(),
+        &[0, 0, 0, protocol],
+        segment,
+    ])
 }
 
 #[inline(always)]

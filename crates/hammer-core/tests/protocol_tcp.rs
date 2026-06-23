@@ -13,8 +13,8 @@ fn tcp_seq_wraparound_order_and_advance_are_safe() {
     let after_wrap = before_wrap.advance(8);
 
     assert_eq!(after_wrap.raw(), 4);
-    assert!(before_wrap.before(after_wrap));
-    assert!(after_wrap.after(before_wrap));
+    assert!(before_wrap < after_wrap);
+    assert!(after_wrap > before_wrap);
     assert_eq!(before_wrap.distance_to(after_wrap), 8);
 }
 
@@ -77,6 +77,7 @@ fn tcp_control_and_worker_messages_share_the_same_contract_types() {
         timestamps: true,
         ecn: false,
         accurate_ecn: false,
+        fast_open: false,
     };
     let install = TcpControlPlaneAction::InstallListener {
         listener_id: TcpListenerId::new(42),

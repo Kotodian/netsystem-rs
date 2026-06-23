@@ -557,14 +557,13 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
-        let mut pseudo = std::vec::Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
-        pseudo.extend_from_slice(&source.octets());
-        pseudo.extend_from_slice(&destination.octets());
-        pseudo.push(0);
-        pseudo.push(protocol);
-        pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-        pseudo.extend_from_slice(segment);
-        internet_checksum(&pseudo)
+        internet_checksum_parts(&[
+            &source.octets(),
+            &destination.octets(),
+            &[0, protocol],
+            &(segment.len() as u16).to_be_bytes(),
+            segment,
+        ])
     }
 
     fn update_ipv4_header_checksum(packet: &mut [u8]) {
@@ -583,6 +582,43 @@ mod tests {
                 _ => unreachable!(),
             };
             sum += word;
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+        }
+        !(sum as u16)
+    }
+
+    fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
+        let mut sum = 0u32;
+        let mut high = None;
+        for part in parts {
+            let mut index = 0usize;
+            if let Some(hi) = high.take() {
+                if let Some(&lo) = part.first() {
+                    sum += u16::from_be_bytes([hi, lo]) as u32;
+                    while sum > 0xffff {
+                        sum = (sum & 0xffff) + (sum >> 16);
+                    }
+                    index = 1;
+                } else {
+                    high = Some(hi);
+                    continue;
+                }
+            }
+            let mut chunks = part[index..].chunks_exact(2);
+            for chunk in &mut chunks {
+                sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+                while sum > 0xffff {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+            }
+            if let [hi] = chunks.remainder() {
+                high = Some(*hi);
+            }
+        }
+        if let Some(hi) = high {
+            sum += u16::from_be_bytes([hi, 0]) as u32;
             while sum > 0xffff {
                 sum = (sum & 0xffff) + (sum >> 16);
             }

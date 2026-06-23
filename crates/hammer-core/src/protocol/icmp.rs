@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::num::NonZeroU64;
 
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+
 use super::ip::{IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 
 const ICMP_ECHO_HEADER_LEN: usize = 8;
@@ -366,30 +368,13 @@ fn icmpv6_checksum(
     let destination = packet
         .get(IPV6_DESTINATION_OFFSET..IPV6_DESTINATION_OFFSET + 16)
         .ok_or(IcmpBuildError::BadLength)?;
-    let mut pseudo = Vec::with_capacity(40 + icmp.len());
-    pseudo.extend_from_slice(source);
-    pseudo.extend_from_slice(destination);
-    pseudo.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, ICMP_PROTOCOL_V6]);
-    pseudo.extend_from_slice(icmp);
-    Ok(internet_checksum(&pseudo))
-}
-
-#[inline(always)]
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
+    Ok(internet_checksum_parts(&[
+        source,
+        destination,
+        &(icmp.len() as u32).to_be_bytes(),
+        &[0, 0, 0, ICMP_PROTOCOL_V6],
+        icmp,
+    ]))
 }
 
 #[cfg(test)]
@@ -648,13 +633,13 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
-        let mut pseudo = Vec::new();
-        pseudo.extend_from_slice(&source.octets());
-        pseudo.extend_from_slice(&destination.octets());
-        pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-        pseudo.extend_from_slice(&[0, 0, 0, protocol]);
-        pseudo.extend_from_slice(segment);
-        internet_checksum(&pseudo)
+        internet_checksum_parts(&[
+            &source.octets(),
+            &destination.octets(),
+            &(segment.len() as u32).to_be_bytes(),
+            &[0, 0, 0, protocol],
+            segment,
+        ])
     }
 
     fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -666,6 +651,43 @@ mod tests {
                 (chunk[0] as u32) << 8
             };
             sum += word;
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+        }
+        !(sum as u16)
+    }
+
+    fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
+        let mut sum = 0u32;
+        let mut high = None;
+        for part in parts {
+            let mut index = 0usize;
+            if let Some(hi) = high.take() {
+                if let Some(&lo) = part.first() {
+                    sum += u16::from_be_bytes([hi, lo]) as u32;
+                    while sum > 0xffff {
+                        sum = (sum & 0xffff) + (sum >> 16);
+                    }
+                    index = 1;
+                } else {
+                    high = Some(hi);
+                    continue;
+                }
+            }
+            let mut chunks = part[index..].chunks_exact(2);
+            for chunk in &mut chunks {
+                sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+                while sum > 0xffff {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+            }
+            if let [hi] = chunks.remainder() {
+                high = Some(*hi);
+            }
+        }
+        if let Some(hi) = high {
+            sum += u16::from_be_bytes([hi, 0]) as u32;
             while sum > 0xffff {
                 sum = (sum & 0xffff) + (sum >> 16);
             }

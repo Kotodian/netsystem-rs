@@ -6,7 +6,7 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
 
-use super::TcpQueueHandle;
+use super::{TCP_TIMER_DELAYED_ACK, TCP_TIMER_PERSIST, TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpQueueHandle, refresh_tcp_timers_for_session};
 use super::segment::parse_tcp_packet;
 
 #[hammer_component_macros::node_next]
@@ -94,32 +94,23 @@ where
 {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
-    let mut tx_index = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
         let (session_id, _, _) = queue
             .session_route_by_tuple(packet.local, packet.remote)
             .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
         let (control, established_with_payload) = {
-            let queue_ptr: *mut crate::session::runtime::SessionDriverRuntime<
-                super::connection::TcpConnection<C>,
-                super::TcpWorkerOwnedState,
-            > = &mut *queue;
-            // SAFETY: same split-borrow reasoning as established receive above.
-            unsafe {
-                let connection = (*queue_ptr)
-                    .session_mut(session_id)
-                    .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
-                let previous_state = connection.state();
-                let control =
-                    connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?;
-                (
-                    control,
-                    previous_state == crate::transport::tcp::TcpState::SynRcvd
-                        && connection.state() == crate::transport::tcp::TcpState::Established
-                        && packet.payload_len != 0,
-                )
-            }
+            let connection = queue
+                .session_mut(session_id)
+                .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
+            let previous_state = connection.state();
+            let control = connection.receive_close_side(&packet)?;
+            (
+                control,
+                previous_state == crate::transport::tcp::TcpState::SynRcvd
+                    && connection.state() == crate::transport::tcp::TcpState::Established
+                    && packet.payload_len != 0,
+            )
         };
         if established_with_payload {
             runtime
@@ -134,28 +125,30 @@ where
             }
             release_input = false;
         }
+        refresh_tcp_timers_for_session(
+            &mut queue,
+            session_id,
+            (1u16 << TCP_TIMER_RETRANSMIT)
+                | (1u16 << TCP_TIMER_RACK)
+                | (1u16 << TCP_TIMER_TLP)
+                | (1u16 << TCP_TIMER_DELAYED_ACK)
+                | (1u16 << TCP_TIMER_PERSIST)
+                | (1u16 << TCP_TIMER_TIME_WAIT),
+        )?;
         queue.refresh_session_route(session_id)?;
-        if let Some(segment) = control {
-            let allocated = runtime.packet_buffers().alloc_index()?;
-            if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
-                runtime.free_index(allocated);
-                return Err(error);
-            }
-            tx_index = Some(allocated);
-        }
-        Ok(())
+        Ok(control)
     };
-    if let Err(error) = result {
-        if let Some(tx_index) = tx_index.take() {
-            runtime.free_index(tx_index);
+    let control = result?;
+    if let Some(segment) = control {
+        let allocated = runtime.packet_buffers().alloc_index()?;
+        if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
+            runtime.free_index(allocated);
+            return Err(error);
         }
-        return Err(error);
-    }
-    if let Some(tx_index) = tx_index.take()
-        && let Err(error) = next_frames.enqueue(runtime, tcp_output, tx_index)
-    {
-        runtime.free_index(tx_index);
-        return Err(error);
+        if let Err(error) = next_frames.enqueue(runtime, tcp_output, allocated) {
+            runtime.free_index(allocated);
+            return Err(error);
+        }
     }
     if release_input {
         runtime.free_index(index);

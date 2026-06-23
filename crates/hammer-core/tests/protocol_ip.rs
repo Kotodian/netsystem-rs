@@ -167,18 +167,4 @@ fn update_ipv4_checksum(packet: &mut [u8]) {
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
 }
 
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
-}
+use hammer_infra::checksum::internet_checksum;

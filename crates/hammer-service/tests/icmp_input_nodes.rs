@@ -6,6 +6,7 @@ use hammer_adapter::{
     NodeRuntimeData, TraceControlPlane, TraceInputPolicy, TracePolicy,
 };
 use hammer_core::error::{CoreError, CoreResult};
+use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_service::net::{IcmpInputControlPlane, IcmpInputError, IcmpInputTrace, IpVersion};
 
 #[derive(Default)]
@@ -336,28 +337,12 @@ fn update_ipv4_header_checksum(packet: &mut [u8]) {
     packet[10..12].copy_from_slice(&checksum.to_be_bytes());
 }
 
-fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]]) as u32
-        } else {
-            (chunk[0] as u32) << 8
-        };
-        sum += word;
-        while sum > 0xffff {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-    }
-    !(sum as u16)
-}
-
 fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segment: &[u8]) -> u16 {
-    let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.extend_from_slice(&(segment.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, protocol]);
-    pseudo.extend_from_slice(segment);
-    internet_checksum(&pseudo)
+    internet_checksum_parts(&[
+        &source.octets(),
+        &destination.octets(),
+        &(segment.len() as u32).to_be_bytes(),
+        &[0, 0, 0, protocol],
+        segment,
+    ])
 }

@@ -9,7 +9,7 @@ use hammer_service::transport::congestion::{BbrController, CongestionController}
 use hammer_service::transport::tcp::connection::TcpConnection;
 use hammer_service::transport::tcp::lookup::TcpConnectionRouteIndex;
 use hammer_service::transport::tcp::{
-    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpConnectionTimerKind, TcpInputNext,
+    DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_TIMER_RETRANSMIT, TcpInputNext,
 };
 
 fn connection(connection_id: TcpConnectionId, local_port: u16) -> TcpConnection<BbrController> {
@@ -206,45 +206,51 @@ fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
 fn tcp_connection_owns_timer_active_and_pending_bits() {
     let mut connection = connection(TcpConnectionId::new(303), 50_303);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+    assert!(!connection.timer_is_pending(TCP_TIMER_RETRANSMIT));
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
+    connection.timer_set(TCP_TIMER_RETRANSMIT);
 
-    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+    assert!(!connection.timer_is_pending(TCP_TIMER_RETRANSMIT));
 
-    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
+    connection.timer_expire(TCP_TIMER_RETRANSMIT);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(connection.tcp_timer_is_live(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+    assert!(connection.timer_is_pending(TCP_TIMER_RETRANSMIT));
+    assert!(
+        connection.timer_is_active(TCP_TIMER_RETRANSMIT)
+            || connection.timer_is_pending(TCP_TIMER_RETRANSMIT)
+    );
 
-    assert!(connection.tcp_timer_take_pending(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(!connection.tcp_timer_is_live(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(connection.timer_dispatch_pending(TCP_TIMER_RETRANSMIT));
+    assert!(
+        !connection.timer_is_active(TCP_TIMER_RETRANSMIT)
+            && !connection.timer_is_pending(TCP_TIMER_RETRANSMIT)
+    );
 }
 
 #[test]
 fn tcp_connection_timer_dispatch_skips_rearmed_pending_timer() {
     let mut connection = connection(TcpConnectionId::new(304), 50_304);
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
-    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
-    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
+    connection.timer_set(TCP_TIMER_RETRANSMIT);
+    connection.timer_expire(TCP_TIMER_RETRANSMIT);
+    connection.timer_set(TCP_TIMER_RETRANSMIT);
 
-    assert!(!connection.tcp_timer_dispatch_pending(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.timer_dispatch_pending(TCP_TIMER_RETRANSMIT));
+    assert!(connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+    assert!(!connection.timer_is_pending(TCP_TIMER_RETRANSMIT));
 }
 
 #[test]
 fn tcp_connection_timer_reset_clears_pending_dispatch() {
     let mut connection = connection(TcpConnectionId::new(305), 50_305);
 
-    connection.tcp_timer_set(TcpConnectionTimerKind::RETRANSMIT);
-    connection.tcp_timer_expire(TcpConnectionTimerKind::RETRANSMIT);
-    connection.tcp_timer_reset(TcpConnectionTimerKind::RETRANSMIT);
+    connection.timer_set(TCP_TIMER_RETRANSMIT);
+    connection.timer_expire(TCP_TIMER_RETRANSMIT);
+    connection.timer_reset(TCP_TIMER_RETRANSMIT);
 
-    assert!(!connection.tcp_timer_is_active(TcpConnectionTimerKind::RETRANSMIT));
-    assert!(!connection.tcp_timer_is_pending(TcpConnectionTimerKind::RETRANSMIT));
+    assert!(!connection.timer_is_active(TCP_TIMER_RETRANSMIT));
+    assert!(!connection.timer_is_pending(TCP_TIMER_RETRANSMIT));
 }

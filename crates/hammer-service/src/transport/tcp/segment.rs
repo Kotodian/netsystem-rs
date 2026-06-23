@@ -7,23 +7,27 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, tcp_options_from_bytes,
+    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpTimestampOption,
+    tcp_options_from_bytes,
 };
 use hammer_infra::vec::Vec;
 
 use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 
+const TCP_SEGMENT_OPAQUE_PRESENT: u8 = 1 << 7;
+
 #[derive(Debug, Clone)]
 pub(crate) struct TcpPacket {
     pub(crate) local: SocketAddr,
     pub(crate) remote: SocketAddr,
-    pub(crate) sequence: u32,
-    pub(crate) acknowledgment: Option<u32>,
+    pub(crate) sequence: TcpSeq,
+    pub(crate) acknowledgment: Option<TcpSeq>,
     pub(crate) advertised_window: u16,
     pub(crate) flags: TcpSegmentFlags,
     pub(crate) capabilities: TcpCapabilities,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) sack_blocks: Vec<TcpSackBlock>,
+    pub(crate) timestamp: Option<TcpTimestampOption>,
     pub(crate) fast_open_cookie: Option<Vec<u8>>,
     pub(crate) ip_ecn: Option<IpEcnCodepoint>,
     pub(crate) payload_offset: usize,
@@ -77,12 +81,13 @@ pub(crate) fn parse_tcp_packet(
     Ok(TcpPacket {
         local,
         remote,
-        sequence: segment.sequence_number(),
-        acknowledgment,
+        sequence: TcpSeq::from(segment.sequence_number()),
+        acknowledgment: acknowledgment.map(TcpSeq::from),
         advertised_window: segment.window_size(),
         flags,
         capabilities: parsed_options.capabilities,
         sack_blocks: parsed_options.sack_blocks,
+        timestamp: parsed_options.timestamp,
         fast_open_cookie: parsed_options.fast_open_cookie,
         ip_ecn: unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
             .ip()
@@ -104,6 +109,7 @@ pub struct TcpSegment {
     capabilities: TcpCapabilities,
     sack_blocks: Option<[TcpSackBlock; 4]>,
     sack_block_count: u8,
+    timestamp: Option<TcpTimestampOption>,
     fast_open_cookie: Option<[u8; 16]>,
     fast_open_cookie_len: u8,
     ip_ecn: Option<IpEcnCodepoint>,
@@ -121,6 +127,7 @@ impl TcpSegment {
         flags: TcpSegmentFlags,
         capabilities: TcpCapabilities,
         sack_blocks: Option<&[TcpSackBlock]>,
+        timestamp: Option<TcpTimestampOption>,
         fast_open_cookie: Option<&[u8]>,
         ip_ecn: Option<IpEcnCodepoint>,
         payload_len: usize,
@@ -145,6 +152,7 @@ impl TcpSegment {
             capabilities,
             sack_blocks,
             sack_block_count,
+            timestamp,
             fast_open_cookie: copied_fast_open_cookie,
             fast_open_cookie_len,
             ip_ecn,
@@ -168,6 +176,7 @@ impl TcpSegment {
                 flags: self.flags,
                 advertised_window: self.advertised_window,
                 capabilities: self.capabilities,
+                timestamp: self.timestamp,
                 fast_open_cookie,
             },
             self.sack_blocks(),
@@ -207,7 +216,7 @@ impl TcpSegment {
     ) -> CoreResult<Self> {
         let buffer = runtime.get_buffer(index)?;
         let mut segment =
-            Self::from_primary_opaque(buffer.opaque().read::<TcpSegmentHeaderOpaque>());
+            Self::from_primary_opaque(buffer.opaque().read::<TcpSegmentHeaderOpaque>())?;
         segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
         segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
             .ip()
@@ -224,6 +233,7 @@ impl TcpSegment {
         capabilities |= u8::from(self.capabilities.ecn) << 2;
         capabilities |= u8::from(self.capabilities.accurate_ecn) << 3;
         capabilities |= u8::from(self.capabilities.fast_open) << 4;
+        capabilities |= TCP_SEGMENT_OPAQUE_PRESENT;
         TcpSegmentHeaderOpaque {
             fields: TcpSegmentHeaderFields {
                 local_port: self.local.port(),
@@ -242,9 +252,12 @@ impl TcpSegment {
     }
 
     #[inline]
-    fn from_primary_opaque(opaque: TcpSegmentHeaderOpaque) -> Self {
+    fn from_primary_opaque(opaque: TcpSegmentHeaderOpaque) -> CoreResult<Self> {
         let fields = unsafe { opaque.fields };
-        Self {
+        if (fields.capabilities & TCP_SEGMENT_OPAQUE_PRESENT) == 0 {
+            return Err(CoreError::internal("tcp segment intent is missing"));
+        }
+        Ok(Self {
             local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.local_port),
             remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.remote_port),
             sequence: fields.sequence,
@@ -262,11 +275,12 @@ impl TcpSegment {
             },
             sack_blocks: None,
             sack_block_count: fields.sack_block_count,
+            timestamp: None,
             fast_open_cookie: None,
             fast_open_cookie_len: fields.fast_open_cookie_len,
             ip_ecn: None,
             payload_len: 0,
-        }
+        })
     }
 
     #[inline]
@@ -274,10 +288,12 @@ impl TcpSegment {
         let mut blocks = [0u64; 4];
         if let Some(sack_blocks) = self.sack_blocks() {
             for (slot, block) in sack_blocks.iter().take(blocks.len()).enumerate() {
-                blocks[slot] = (u64::from(block.left_edge) << 32) | u64::from(block.right_edge);
+                blocks[slot] =
+                    (u64::from(u32::from(block.left_edge)) << 32) | u64::from(u32::from(block.right_edge));
             }
         }
         let mut cookie_words = [0u64; 2];
+        let timestamp = self.timestamp.unwrap_or(TcpTimestampOption { tsval: 0, tsecr: 0 });
         if let Some(cookie) = self.fast_open_cookie.as_ref() {
             let mut bytes = [0u8; 16];
             let len = usize::from(self.fast_open_cookie_len);
@@ -288,8 +304,8 @@ impl TcpSegment {
         TcpSegmentSackOpaque {
             fields: TcpSegmentSackFields {
                 blocks,
+                timestamp: [timestamp.tsval, timestamp.tsecr],
                 cookie_words,
-                reserved: [0; 1],
             },
         }
     }
@@ -298,8 +314,8 @@ impl TcpSegment {
     fn apply_secondary_opaque(&mut self, opaque: TcpSegmentSackOpaque) {
         let fields = unsafe { opaque.fields };
         let mut blocks = [TcpSackBlock {
-            left_edge: 0,
-            right_edge: 0,
+            left_edge: TcpSeq::from(0),
+            right_edge: TcpSeq::from(0),
         }; 4];
         let mut count = 0usize;
         for word in fields.blocks {
@@ -309,8 +325,8 @@ impl TcpSegment {
                 continue;
             }
             blocks[count] = TcpSackBlock {
-                left_edge: left,
-                right_edge: right,
+                left_edge: TcpSeq::from(left),
+                right_edge: TcpSeq::from(right),
             };
             count += 1;
             if count == blocks.len() {
@@ -326,6 +342,13 @@ impl TcpSegment {
         }
         self.sack_blocks = (count != 0).then_some(blocks);
         self.sack_block_count = count as u8;
+        self.timestamp = self
+            .capabilities
+            .timestamps
+            .then_some(TcpTimestampOption {
+                tsval: fields.timestamp[0],
+                tsecr: fields.timestamp[1],
+            });
         self.fast_open_cookie = cookie;
     }
 }
@@ -357,8 +380,8 @@ union TcpSegmentHeaderOpaque {
 #[repr(C)]
 struct TcpSegmentSackFields {
     blocks: [u64; 4],
+    timestamp: [u32; 2],
     cookie_words: [u64; 2],
-    reserved: [u64; 1],
 }
 
 #[derive(Clone, Copy)]
@@ -430,8 +453,8 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
         return (None, 0);
     };
     let mut copied = [TcpSackBlock {
-        left_edge: 0,
-        right_edge: 0,
+        left_edge: TcpSeq::from(0),
+        right_edge: TcpSeq::from(0),
     }; 4];
     let len = sack_blocks.len().min(copied.len());
     copied[..len].copy_from_slice(&sack_blocks[..len]);
@@ -458,8 +481,8 @@ mod tests {
         assert_eq!(
             parsed.sack_blocks,
             vec![TcpSackBlock {
-                left_edge: 30,
-                right_edge: 40,
+                left_edge: TcpSeq::from(30),
+                right_edge: TcpSeq::from(40),
             }]
         );
     }
@@ -471,8 +494,8 @@ mod tests {
         let local = "192.0.2.10:50000".parse().expect("local");
         let remote = "198.51.100.20:443".parse().expect("remote");
         let blocks = [TcpSackBlock {
-            left_edge: 30,
-            right_edge: 40,
+            left_edge: TcpSeq::from(30),
+            right_edge: TcpSeq::from(40),
         }];
         let segment = TcpSegment::new(
             local,
@@ -483,6 +506,7 @@ mod tests {
             TcpSegmentFlags::ACK,
             TcpCapabilities::default(),
             Some(&blocks),
+            None,
             None,
             None,
             0,
@@ -516,6 +540,7 @@ mod tests {
                 fast_open: true,
                 ..TcpCapabilities::default()
             },
+            None,
             None,
             Some(&[1, 2, 3, 4]),
             None,
@@ -582,14 +607,13 @@ mod tests {
         protocol: u8,
         segment: &[u8],
     ) -> u16 {
-        let mut pseudo = Vec::with_capacity(12 + segment.len() + (segment.len() & 1));
-        pseudo.extend_from_slice(&source.octets());
-        pseudo.extend_from_slice(&destination.octets());
-        pseudo.push(0);
-        pseudo.push(protocol);
-        pseudo.extend_from_slice(&(segment.len() as u16).to_be_bytes());
-        pseudo.extend_from_slice(segment);
-        internet_checksum(&pseudo)
+        internet_checksum_parts(&[
+            &source.octets(),
+            &destination.octets(),
+            &[0, protocol],
+            &(segment.len() as u16).to_be_bytes(),
+            segment,
+        ])
     }
 
     fn internet_checksum(bytes: &[u8]) -> u16 {
@@ -601,6 +625,43 @@ mod tests {
                 _ => unreachable!(),
             };
             sum += word;
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+        }
+        !(sum as u16)
+    }
+
+    fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
+        let mut sum = 0u32;
+        let mut high = None;
+        for part in parts {
+            let mut index = 0usize;
+            if let Some(hi) = high.take() {
+                if let Some(&lo) = part.first() {
+                    sum += u16::from_be_bytes([hi, lo]) as u32;
+                    while sum > 0xffff {
+                        sum = (sum & 0xffff) + (sum >> 16);
+                    }
+                    index = 1;
+                } else {
+                    high = Some(hi);
+                    continue;
+                }
+            }
+            let mut chunks = part[index..].chunks_exact(2);
+            for chunk in &mut chunks {
+                sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+                while sum > 0xffff {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+            }
+            if let [hi] = chunks.remainder() {
+                high = Some(*hi);
+            }
+        }
+        if let Some(hi) = high {
+            sum += u16::from_be_bytes([hi, 0]) as u32;
             while sum > 0xffff {
                 sum = (sum & 0xffff) + (sum >> 16);
             }
