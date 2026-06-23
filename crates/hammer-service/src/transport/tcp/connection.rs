@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use crate::transport::congestion::CongestionController;
-use hammer_adapter::{BufferIndex, DataWorkerId, IpEcnCodepoint};
+use hammer_adapter::{DataWorkerId, IpEcnCodepoint};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpNegotiatedOptions, TcpSackBlock,
@@ -571,12 +571,6 @@ where
                     self.snd_nxt
                 }
             })
-    }
-
-    #[inline]
-    pub(crate) fn tx_intent_payload_len(&self) -> Option<usize> {
-        self.tx_intent
-            .map(|intent| usize::try_from(intent.payload_len).expect("payload len fits usize"))
     }
 
     #[inline]
@@ -1184,8 +1178,6 @@ where
 
     pub(crate) fn commit_payload_tx(
         &mut self,
-        payload: BufferIndex,
-        payload_offset: u32,
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<u16> {
@@ -1207,8 +1199,6 @@ where
                 TcpSeq::from(sequence),
                 TcpSeq::from(end_sequence),
                 payload_len,
-                Some(payload),
-                payload_offset,
                 payload_len,
                 now,
             );
@@ -1253,8 +1243,6 @@ where
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             payload_len,
-            Some(payload),
-            payload_offset,
             payload_len,
             now,
         );
@@ -2046,12 +2034,8 @@ mod tests {
         connection.set_fast_open_cookie(Some(&[1, 2, 3, 4]));
         connection.connect_state(100);
         let now = Instant::now();
-        let runtime = DataPlaneRuntime::with_capacities(2048, 4, 4, 4);
-        let buffers = runtime.packet_buffers();
-        let payload = buffers.alloc_index().expect("payload");
-        buffers.append(payload, b"hello").expect("payload bytes");
         let _ = connection
-            .commit_payload_tx(payload, 0, 5, now)
+            .commit_payload_tx(5, now)
             .expect("commit syn payload");
         connection.timer_expire(TCP_TIMER_RETRANSMIT);
 
@@ -2417,8 +2401,6 @@ mod tests {
                 TcpSeq::from(1_000),
                 TcpSeq::from(2_000),
                 1_000,
-                None,
-                0,
                 0,
                 now,
             );
@@ -2479,8 +2461,6 @@ mod tests {
                 TcpSeq::from(sequence),
                 TcpSeq::from(end_sequence),
                 1,
-                None,
-                0,
                 0,
                 now,
             );
@@ -2537,8 +2517,6 @@ mod tests {
                 TcpSeq::from(1_000),
                 TcpSeq::from(2_000),
                 1_000,
-                None,
-                0,
                 0,
                 now,
             );
@@ -2547,8 +2525,6 @@ mod tests {
             TcpSeq::from(2_000),
             TcpSeq::from(3_000),
             1_000,
-            None,
-            0,
             0,
             now + Duration::from_millis(1),
         );
@@ -2557,8 +2533,6 @@ mod tests {
             TcpSeq::from(3_000),
             TcpSeq::from(4_000),
             1_000,
-            None,
-            0,
             0,
             now + Duration::from_millis(2),
         );
@@ -2567,8 +2541,6 @@ mod tests {
             TcpSeq::from(4_000),
             TcpSeq::from(5_000),
             1_000,
-            None,
-            0,
             0,
             now + Duration::from_millis(3),
         );
@@ -2577,8 +2549,6 @@ mod tests {
             TcpSeq::from(5_000),
             TcpSeq::from(6_000),
             1_000,
-            None,
-            0,
             0,
             now + Duration::from_millis(4),
         );

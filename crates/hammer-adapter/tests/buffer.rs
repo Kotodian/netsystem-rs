@@ -362,7 +362,7 @@ fn attach_clone_keeps_tail_alive_until_both_chains_are_freed() {
             .expect("tail ptr after attach"),
         tail_ptr
     );
-    assert_eq!(pool.in_use(), 2);
+    assert_eq!(pool.in_use(), 3);
 
     pool.free_index(output_head);
 
@@ -426,16 +426,17 @@ fn freeing_original_tail_after_output_head_returns_storage_once() {
             .expect("head keeps tail alive"),
         b"headpayload"
     );
-    assert_eq!(pool.in_use(), 2);
+    assert_eq!(pool.in_use(), 3);
 
     pool.free_index(output_head);
-    assert_eq!(pool.in_use(), 0);
+    assert_eq!(pool.in_use(), 1);
 
     let reused = pool
         .alloc_index_with_bytes(b"reuse")
         .expect("reuse freed storage");
-    assert_eq!(pool.in_use(), 1);
+    assert_eq!(pool.in_use(), 2);
     pool.free_index(reused);
+    pool.free_index(session_tail);
     assert_eq!(pool.in_use(), 0);
 }
 
@@ -471,7 +472,7 @@ fn freeing_cloned_head_keeps_shared_tail_trace_mark_live() {
 }
 
 #[test]
-fn shared_tail_rejects_control_area_and_payload_mutation() {
+fn shared_tail_rejects_payload_mutation_but_allows_independent_header_views() {
     let pool = BufferPool::with_capacity(8, 8);
     let session_tail = pool
         .alloc_index_with_bytes(b"payload")
@@ -484,14 +485,18 @@ fn shared_tail_rejects_control_area_and_payload_mutation() {
         .expect("attach clone");
 
     assert!(pool.get_mut(session_tail).is_err());
-    assert!(pool.advance(session_tail, 1).is_err());
     assert!(pool.truncate_current(session_tail, 1).is_err());
     assert!(pool.prepend(session_tail, b"x").is_err());
     assert!(pool.append(session_tail, b"x").is_err());
-
+    pool.advance(output_head, 2).expect("advance cloned header view");
+    assert_eq!(
+        pool.copy_current_chain(output_head)
+            .expect("cloned view advanced"),
+        b"adpayload"
+    );
     assert_eq!(
         pool.copy_current_chain(session_tail)
-            .expect("tail unchanged"),
+            .expect("original view intact"),
         b"payload"
     );
 
@@ -500,7 +505,7 @@ fn shared_tail_rejects_control_area_and_payload_mutation() {
 }
 
 #[test]
-fn shared_tail_rejects_chain_header_mutation() {
+fn shared_tail_rejects_chain_link_mutation_but_allows_truncate_on_clone_view() {
     let pool = BufferPool::with_capacity(4, 8);
     let session_tail = pool
         .alloc_index_with_bytes(b"abcdefgh")
@@ -516,17 +521,20 @@ fn shared_tail_rejects_chain_header_mutation() {
         .alloc_index_with_bytes(b"tail")
         .expect("alloc extra tail");
 
-    assert!(pool.detach_next(session_tail).is_err());
-    assert!(pool.truncate_chain(session_tail, 4).is_err());
-    assert!(
-        pool.append_existing_chain(session_tail, extra_tail)
-            .is_err()
+    pool.append_existing_chain(session_tail, extra_tail)
+        .expect("append original chain header");
+    pool.truncate_chain(output_head, 4)
+        .expect("truncate cloned chain view");
+    assert_eq!(
+        pool.copy_current_chain(output_head)
+            .expect("truncated clone view"),
+        b"head"
     );
 
     assert_eq!(
         pool.copy_current_chain(session_tail)
             .expect("tail chain unchanged"),
-        b"abcdefgh"
+        b"abcdefghtail"
     );
 
     pool.free_index(extra_tail);

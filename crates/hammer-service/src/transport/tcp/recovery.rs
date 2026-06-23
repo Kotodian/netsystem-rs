@@ -1,6 +1,5 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::BufferIndex;
 use hammer_core::protocol::tcp::{TcpSackBlock, TcpSeq};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
@@ -19,8 +18,6 @@ pub(crate) struct TcpSentSample {
     pub(crate) sequence: TcpSeq,
     pub(crate) end_sequence: TcpSeq,
     pub(crate) bytes: u32,
-    pub(crate) payload: Option<BufferIndex>,
-    pub(crate) payload_offset: u32,
     pub(crate) payload_len: u32,
     pub(crate) retransmitted: bool,
     pub(crate) sent_at: Instant,
@@ -88,8 +85,6 @@ impl TcpRecoveryState {
         sequence: TcpSeq,
         end_sequence: TcpSeq,
         bytes: u32,
-        payload: Option<BufferIndex>,
-        payload_offset: u32,
         payload_len: u32,
         sent_at: Instant,
     ) {
@@ -101,8 +96,6 @@ impl TcpRecoveryState {
                 sequence,
                 end_sequence,
                 bytes,
-                payload,
-                payload_offset,
                 payload_len,
                 retransmitted: false,
                 sent_at,
@@ -498,8 +491,6 @@ impl Clone for TcpRecoveryState {
                 sample.sequence,
                 sample.end_sequence,
                 sample.bytes,
-                sample.payload,
-                sample.payload_offset,
                 sample.payload_len,
                 sample.sent_at,
             );
@@ -675,8 +666,6 @@ mod tests {
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             bytes,
-            None,
-            0,
             0,
             sent_at,
         );

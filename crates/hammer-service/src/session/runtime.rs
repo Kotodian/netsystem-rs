@@ -808,7 +808,7 @@ impl<S, A> SessionDriverRuntime<S, A> {
         self.sessions.take_ready_sessions()
     }
 
-    fn copy_session_tx_payload(
+    fn clone_session_tx_payload(
         &self,
         tx_head: BufferIndex,
         tx_offset: usize,
@@ -816,61 +816,17 @@ impl<S, A> SessionDriverRuntime<S, A> {
     ) -> CoreResult<BufferIndex> {
         let buffers = self.buffers();
         let index = buffers.alloc_index()?;
-        let (output_ptr, output_capacity) = {
-            let mut buffer = buffers.get_buffer_mut(index)?;
-            let tail = buffer.writable_tail_mut();
-            (tail.as_mut_ptr(), tail.len())
-        };
-        if payload_len > output_capacity {
-            buffers.free_index(index);
-            return Err(CoreError::internal(
-                "session tx payload exceeds output buffer tail capacity",
-            ));
-        }
-        let copy_result = buffers.with_current_chain_io_segments(tx_head, |segments, total_len| {
-            let end = tx_offset
-                .checked_add(payload_len)
-                .ok_or_else(|| CoreError::internal("session tx payload range overflow"))?;
-            if end > total_len {
-                return Err(CoreError::internal("session tx payload range is invalid"));
-            }
-            let mut skip = tx_offset;
-            let mut remaining = payload_len;
-            let mut copied = 0usize;
-            for segment in segments {
-                if remaining == 0 {
-                    break;
-                }
-                if skip >= segment.len() {
-                    skip -= segment.len();
-                    continue;
-                }
-                let start = skip;
-                let available = segment.len() - start;
-                let take = available.min(remaining);
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        segment[start..start + take].as_ptr(),
-                        output_ptr.add(copied),
-                        take,
-                    );
-                }
-                copied += take;
-                remaining -= take;
-                skip = 0;
-            }
-            if remaining != 0 {
-                return Err(CoreError::internal("session tx payload copy is incomplete"));
-            }
-            Ok(())
-        });
-        if let Err(error) = copy_result {
+        if let Err(error) = buffers.attach_clone(index, tx_head) {
             buffers.free_index(index);
             return Err(error);
         }
-        {
-            let mut buffer = buffers.get_buffer_mut(index)?;
-            buffer.commit_writable_tail(payload_len)?;
+        if let Err(error) = buffers.advance(index, tx_offset) {
+            buffers.free_index(index);
+            return Err(error);
+        }
+        if let Err(error) = buffers.truncate_chain(index, payload_len) {
+            buffers.free_index(index);
+            return Err(error);
         }
         Ok(index)
     }
@@ -1039,7 +995,7 @@ where
                 break;
             }
 
-            let index = driver.copy_session_tx_payload(tx_head, tx_offset, payload_len)?;
+            let index = driver.clone_session_tx_payload(tx_head, tx_offset, payload_len)?;
 
             {
                 let driver = driver as *mut SessionDriverRuntime<S, A>;

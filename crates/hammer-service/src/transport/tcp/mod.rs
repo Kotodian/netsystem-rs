@@ -440,14 +440,12 @@ where
     fn commit_tx(
         &mut self,
         context: &mut SessionQueueControlContext,
-        index: hammer_adapter::BufferIndex,
-        tx_offset: usize,
+        _: hammer_adapter::BufferIndex,
+        _: usize,
         payload_len: usize,
         now: std::time::Instant,
     ) -> CoreResult<()> {
-        let payload_offset = u32::try_from(tx_offset)
-            .map_err(|_| CoreError::internal("tcp tx offset exceeds u32"))?;
-        let timer_mask = self.commit_payload_tx(index, payload_offset, payload_len, now)?;
+        let timer_mask = self.commit_payload_tx(payload_len, now)?;
         refresh_tcp_timers(self, context, timer_mask | (1u16 << TCP_TIMER_RETRANSMIT))?;
         Ok(())
     }
