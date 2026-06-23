@@ -774,7 +774,7 @@ mod tests {
         driver: &mut SessionDriverRuntime<TcpConnection<BbrController>, TcpWorkerOwnedState>,
         output_node: NodeId,
     ) -> usize {
-        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let next: crate::session::SessionQueueNext = output_node.into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
         dispatch_session_queue_pending(
@@ -796,7 +796,7 @@ mod tests {
         ticks: u32,
         output_node: NodeId,
     ) {
-        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let next: crate::session::SessionQueueNext = output_node.into();
         let _ = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
             .expect("dispatch session queue for timer ticks");
         let _ = dispatch_session_queue_for_ticks(runtime, driver, 0, next)
@@ -912,14 +912,18 @@ mod tests {
             assert!(!connection.on_clean_in_order_payload());
             control
         };
-        runtime
-            .packet_buffers()
-            .advance(payload, packet.payload_offset)
-            .expect("advance payload");
-        runtime
-            .packet_buffers()
-            .truncate_chain(payload, packet.payload_len)
-            .expect("truncate payload");
+        {
+            let mut buffer = runtime
+                .packet_buffers()
+                .get_buffer_mut(payload)
+                .expect("payload buffer");
+            buffer
+                .advance(packet.payload_offset)
+                .expect("advance payload");
+            buffer
+                .truncate_chain(packet.payload_len)
+                .expect("truncate payload");
+        }
         let enqueue = driver
             .enqueue_rx(session_id, payload, 0, false)
             .expect("enqueue rx");
@@ -1176,14 +1180,18 @@ mod tests {
                 let (trim, offset) = connection.accept_payload(&packet).expect("accept payload");
                 (control, trim, offset)
             };
-            runtime
-                .packet_buffers()
-                .advance(payload, packet.payload_offset.saturating_add(trim))
-                .expect("advance payload");
-            runtime
-                .packet_buffers()
-                .truncate_chain(payload, packet.payload_len.saturating_sub(trim))
-                .expect("truncate payload");
+            {
+                let mut buffer = runtime
+                    .packet_buffers()
+                    .get_buffer_mut(payload)
+                    .expect("payload buffer");
+                buffer
+                    .advance(packet.payload_offset.saturating_add(trim))
+                    .expect("advance payload");
+                buffer
+                    .truncate_chain(packet.payload_len.saturating_sub(trim))
+                    .expect("truncate payload");
+            }
             let enqueue = driver
                 .enqueue_rx(session_id, payload, offset, false)
                 .expect("enqueue rx");
@@ -1247,14 +1255,18 @@ mod tests {
                     .expect("receive gap closer");
                 connection.accept_payload(&gap_packet).expect("accept gap closer")
             };
-            runtime
-                .packet_buffers()
-                .advance(gap_closer, gap_packet.payload_offset.saturating_add(trim))
-                .expect("advance gap closer");
-            runtime
-                .packet_buffers()
-                .truncate_chain(gap_closer, gap_packet.payload_len.saturating_sub(trim))
-                .expect("truncate gap closer");
+            {
+                let mut buffer = runtime
+                    .packet_buffers()
+                    .get_buffer_mut(gap_closer)
+                    .expect("gap closer buffer");
+                buffer
+                    .advance(gap_packet.payload_offset.saturating_add(trim))
+                    .expect("advance gap closer");
+                buffer
+                    .truncate_chain(gap_packet.payload_len.saturating_sub(trim))
+                    .expect("truncate gap closer");
+            }
             let enqueue = driver
                 .enqueue_rx(session_id, gap_closer, offset, false)
                 .expect("enqueue gap closer");

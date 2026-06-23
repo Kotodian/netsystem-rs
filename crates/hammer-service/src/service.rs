@@ -26,8 +26,8 @@ use hammer_runtime::adapter::node::NodeRuntimeStatsRow;
 #[cfg(feature = "endpoint")]
 use hammer_runtime::adapter::{EndpointManager as _, InboundManager as _};
 use hammer_runtime::adapter::{
-    Lifecycle, NetworkManager as _, NodeId, OutboundManager as _, PlatformInterface, ProbeReport,
-    TraceControlPlane, TraceRecordSink,
+    Lifecycle, NetworkManager as _, NodeId, PlatformInterface, ProbeReport, TraceControlPlane,
+    TraceRecordSink,
 };
 use hammer_runtime::app::AppContext;
 #[cfg(feature = "endpoint")]
@@ -45,7 +45,7 @@ use crate::app::AppHost;
 use crate::data_plane::{DropNode, HandoffNode};
 use crate::net::{FibTableBuilder, IpLookupControlPlane};
 use crate::session::node::SessionQueueHandle;
-use crate::session::{SessionQueueNext, SessionQueueNode};
+use crate::session::SessionQueueNode;
 use crate::transport::congestion::BbrController;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
@@ -994,7 +994,7 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
             session_queue_node
                 .attach_queue(
                     session_queue,
-                    SessionQueueNext::from_node(tcp_output),
+                    tcp_output.into(),
                     tcp_session_queue_dispatch_fn::<BbrController>(),
                 )
                 .map_err(HammerError::from)?;

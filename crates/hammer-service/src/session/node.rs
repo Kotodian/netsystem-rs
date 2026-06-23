@@ -63,13 +63,15 @@ pub struct SessionQueueNext(NodeId);
 
 impl SessionQueueNext {
     #[inline]
-    pub const fn from_node(node: NodeId) -> Self {
-        Self(node)
-    }
-
-    #[inline]
     pub const fn node(self) -> NodeId {
         self.0
+    }
+}
+
+impl From<NodeId> for SessionQueueNext {
+    #[inline]
+    fn from(node: NodeId) -> Self {
+        Self(node)
     }
 }
 

@@ -1590,7 +1590,12 @@ impl BufferPool {
         let mut guard = self.arena.inner.borrow_mut();
         guard.ensure_storage_exclusive(index)?;
         guard.buffer_mut(index)?;
-        Ok(BufferRefMut { guard, index })
+        let thread_cache = self.thread_cache.borrow_mut();
+        Ok(BufferRefMut {
+            guard,
+            thread_cache,
+            index,
+        })
     }
 
     #[inline]
@@ -3991,10 +3996,27 @@ impl BufferRef<'_> {
 
 pub struct BufferRefMut<'pool> {
     guard: RefMut<'pool, BufferPoolInner>,
+    thread_cache: RefMut<'pool, BufferThreadCache>,
     index: BufferIndex,
 }
 
 impl BufferRefMut<'_> {
+    #[inline]
+    pub fn attach_clone(&mut self, tail: BufferIndex) -> CoreResult<()> {
+        self.guard.attach_clone(&mut self.thread_cache, self.index, tail)
+    }
+
+    #[inline]
+    pub fn advance(&mut self, len: usize) -> CoreResult<()> {
+        self.guard.advance(self.index, len)
+    }
+
+    #[inline]
+    pub fn truncate_chain(&mut self, len: usize) -> CoreResult<()> {
+        self.guard
+            .truncate_chain(&mut self.thread_cache, self.index, len)
+    }
+
     #[inline]
     pub fn packet_cursor(&self) -> BufferPacketCursor {
         self.guard

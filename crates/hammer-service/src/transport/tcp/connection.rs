@@ -9,8 +9,6 @@ use hammer_core::protocol::tcp::{
     TcpSegmentFlags, TcpSeq, TcpState, TcpTimestampOption,
 };
 #[cfg(test)]
-use hammer_adapter::DataPlaneRuntime;
-#[cfg(test)]
 use hammer_infra::vec::Vec;
 use super::TcpInputNext;
 use super::output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, tcp_effective_output_payload_len};

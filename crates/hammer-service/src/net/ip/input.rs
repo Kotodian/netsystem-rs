@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, IpEcnCodepoint,
     Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, SocksAddr, TraceFormatter, add_packet_trace, unlikely,
+    PacketTrace, TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -339,7 +339,7 @@ fn next_node_for_index_with_batch(
     feature_arc: Option<&FeatureArcStartHandle>,
     traces: &mut std::vec::Vec<(BufferIndex, IpInputTrace)>,
 ) -> CoreResult<NodeId> {
-    let (trace, parsed, network) = {
+    let (trace, parsed, _) = {
         let buffer = batch.buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();
         match parse_ip_packet_with_chain_len(

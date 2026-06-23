@@ -141,7 +141,6 @@ pub(crate) fn is_valid_fast_open_option_len(len: usize) -> bool {
             && cookie_len % 2 == 0)
 }
 
-pub(crate) const TCP_OPTION_EOL_VALUE: u8 = TCP_OPTION_EOL;
 pub(crate) const TCP_OPTION_NOP_VALUE: u8 = TCP_OPTION_NOP;
 pub(crate) const TCP_OPTION_MSS_VALUE: u8 = TCP_OPTION_MSS;
 pub(crate) const TCP_OPTION_WINDOW_SCALE_VALUE: u8 = TCP_OPTION_WINDOW_SCALE;

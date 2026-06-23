@@ -512,33 +512,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
     }
 
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn with_timer_clock(
-        worker: DataWorkerId,
-        buffers: DataPlaneBuffers,
-        timer_tick_duration: Duration,
-        last_timer_tick: Instant,
-        aux: A,
-    ) -> Self {
-        let app = SessionAppRuntime::new(buffers.clone());
-        Self {
-            sessions: WorkerSessionRuntime::with_timer_clock(
-                worker,
-                timer_tick_duration,
-                last_timer_tick,
-            ),
-            entries: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            buffers,
-            rx: Pool::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            rx_index: FlatHashTable::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            pending_closes: SessionReadyQueue::new(),
-            app,
-            app_ops: FlatHashTable::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
-            aux,
-        }
-    }
-
-    #[inline]
     pub(crate) fn worker(&self) -> DataWorkerId {
         self.sessions.worker()
     }
@@ -816,15 +789,13 @@ impl<S, A> SessionDriverRuntime<S, A> {
     ) -> CoreResult<BufferIndex> {
         let buffers = self.buffers();
         let index = buffers.alloc_index()?;
-        if let Err(error) = buffers.attach_clone(index, tx_head) {
-            buffers.free_index(index);
-            return Err(error);
-        }
-        if let Err(error) = buffers.advance(index, tx_offset) {
-            buffers.free_index(index);
-            return Err(error);
-        }
-        if let Err(error) = buffers.truncate_chain(index, payload_len) {
+        let clone_result = (|| {
+            let mut buffer = buffers.get_buffer_mut(index)?;
+            buffer.attach_clone(tx_head)?;
+            buffer.advance(tx_offset)?;
+            buffer.truncate_chain(payload_len)
+        })();
+        if let Err(error) = clone_result {
             buffers.free_index(index);
             return Err(error);
         }
@@ -1839,7 +1810,7 @@ mod tests {
         let output_node = runtime
             .nodes()
             .register_internal(CaptureNode::new(Arc::clone(&capture)));
-        let next = crate::session::SessionQueueNext::from_node(output_node);
+        let next: crate::session::SessionQueueNext = output_node.into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
 
@@ -1884,7 +1855,7 @@ mod tests {
         );
         let session_id = driver.insert_session(FakeTxProtocol::default());
         driver.mark_ready(session_id);
-        let next = crate::session::SessionQueueNext::from_node(NodeId::new(9));
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
 
@@ -1923,7 +1894,7 @@ mod tests {
         driver.app_mut().push_pending_send(session_id, send);
         driver.mark_ready(session_id);
 
-        let next = crate::session::SessionQueueNext::from_node(NodeId::new(9));
+        let next: crate::session::SessionQueueNext = NodeId::new(9).into();
         let mut output = crate::session::node::SessionQueueOutput::default();
         let mut step = driver.poll_once_for_ticks(0).expect("poll");
 

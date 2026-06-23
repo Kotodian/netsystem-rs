@@ -123,12 +123,11 @@ where
         let mut immediate_ack = immediate_ack;
         if let Some((trim, offset)) = accept_payload {
             let accepted_len = packet.payload_len.saturating_sub(trim);
-            runtime
-                .packet_buffers()
-                .advance(index, packet.payload_offset.saturating_add(trim))?;
-            runtime
-                .packet_buffers()
-                .truncate_chain(index, accepted_len)?;
+            {
+                let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
+                buffer.advance(packet.payload_offset.saturating_add(trim))?;
+                buffer.truncate_chain(accepted_len)?;
+            }
             let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
             {
                 let connection = queue

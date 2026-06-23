@@ -12,12 +12,14 @@ impl TcpSackRange {
     const fn new(left: TcpSeq, right: TcpSeq) -> Self {
         Self { left, right }
     }
+}
 
+impl From<TcpSackRange> for TcpSackBlock {
     #[inline]
-    const fn into_block(self) -> TcpSackBlock {
-        TcpSackBlock {
-            left_edge: self.left,
-            right_edge: self.right,
+    fn from(range: TcpSackRange) -> Self {
+        Self {
+            left_edge: range.left,
+            right_edge: range.right,
         }
     }
 }
@@ -89,11 +91,11 @@ impl TcpSackState {
         }; 4];
         let mut count = 0usize;
         if let Some(dsack) = self.pending_dsack.take() {
-            output[count] = dsack.into_block();
+            output[count] = dsack.into();
             count += 1;
         }
         for block in self.blocks.iter().take(output.len().saturating_sub(count)) {
-            output[count] = block.into_block();
+            output[count] = (*block).into();
             count += 1;
         }
         (count != 0).then_some((output, count))
@@ -137,12 +139,12 @@ impl TcpSackState {
 
     #[cfg(test)]
     pub(crate) fn block(&self, index: usize) -> TcpSackBlock {
-        self.blocks[index].into_block()
+        self.blocks[index].into()
     }
 
     #[cfg(test)]
     pub(crate) fn pending_dsack(&self) -> Option<TcpSackBlock> {
-        self.pending_dsack.map(TcpSackRange::into_block)
+        self.pending_dsack.map(Into::into)
     }
 }
 

@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, DataWorkerId, Node, NodeHandle, NodeId,
     NodeNextFrames, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
-    SocksAddr, TraceFormatter, add_packet_trace,
+    TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::internet_checksum;

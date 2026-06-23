@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, SocksAddr,
-    TraceFormatter, add_packet_trace,
+    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -14,7 +14,7 @@ use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibTableHandle};
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
-use super::{network_for_protocol, parse_ip_packet_with_chain_len};
+use super::parse_ip_packet_with_chain_len;
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u8, put_usize,
@@ -797,18 +797,6 @@ fn refresh_basic_metadata(
     transport_header_len: Option<usize>,
 ) -> CoreResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
-    let (source_port, destination_port) = match parsed.protocol {
-        IpProtocol::Tcp | IpProtocol::Udp => {
-            let current = buffer.current();
-            let transport = current
-                .get(parsed.transport_header_offset..parsed.packet_len)
-                .ok_or_else(|| CoreError::internal("invalid transport packet cursor"))?;
-            let source_port = u16::from_be_bytes([transport[0], transport[1]]);
-            let destination_port = u16::from_be_bytes([transport[2], transport[3]]);
-            (source_port, destination_port)
-        }
-        _ => (0, 0),
-    };
     let transport_header_len = transport_header_len.unwrap_or_default();
     buffer.set_packet_cursor(
         BufferPacketCursor::new()

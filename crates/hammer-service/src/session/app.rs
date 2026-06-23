@@ -28,11 +28,6 @@ impl SessionAppCloseSubmission {
         self.session_id
     }
 
-    #[inline]
-    #[cfg(test)]
-    pub(crate) const fn op(self) -> AppOpId {
-        self.op
-    }
 }
 
 #[derive(Debug)]

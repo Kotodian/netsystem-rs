@@ -26,9 +26,9 @@ pub enum TcpResetReason {
     MissingNodeError,
 }
 
-impl TcpResetReason {
+impl From<Option<u16>> for TcpResetReason {
     #[inline]
-    fn from_node_error_code(code: Option<u16>) -> Self {
+    fn from(code: Option<u16>) -> Self {
         match code {
             Some(code) if code == TcpInputError::AckInvalid.code() => Self::AckInvalid,
             Some(code) if code == TcpInputError::ConnectionClosed.code() => Self::ConnectionClosed,
@@ -374,8 +374,7 @@ fn tcp_reset_observation(
     let cursor = runtime.packet_cursor(index)?;
     let (local, remote) = tcp_packet_addrs(&packet, cursor)?;
     let synthesized_reset = tcp_reset_reply_from_packet(&packet, cursor);
-    let reason =
-        TcpResetReason::from_node_error_code(runtime.node_error(index)?.map(|error| error.code()));
+    let reason: TcpResetReason = runtime.node_error(index)?.map(|error| error.code()).into();
     Ok(TcpResetObservation {
         local,
         remote,

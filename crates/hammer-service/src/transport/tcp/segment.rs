@@ -215,8 +215,7 @@ impl TcpSegment {
         index: BufferIndex,
     ) -> CoreResult<Self> {
         let buffer = runtime.get_buffer(index)?;
-        let mut segment =
-            Self::from_primary_opaque(buffer.opaque().read::<TcpSegmentHeaderOpaque>())?;
+        let mut segment: Self = buffer.opaque().read::<TcpSegmentHeaderOpaque>().try_into()?;
         segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
         segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
             .ip()
@@ -251,8 +250,13 @@ impl TcpSegment {
         }
     }
 
+}
+
+impl TryFrom<TcpSegmentHeaderOpaque> for TcpSegment {
+    type Error = CoreError;
+
     #[inline]
-    fn from_primary_opaque(opaque: TcpSegmentHeaderOpaque) -> CoreResult<Self> {
+    fn try_from(opaque: TcpSegmentHeaderOpaque) -> CoreResult<Self> {
         let fields = unsafe { opaque.fields };
         if (fields.capabilities & TCP_SEGMENT_OPAQUE_PRESENT) == 0 {
             return Err(CoreError::internal("tcp segment intent is missing"));
@@ -282,7 +286,9 @@ impl TcpSegment {
             payload_len: 0,
         })
     }
+}
 
+impl TcpSegment {
     #[inline]
     fn secondary_opaque(&self) -> TcpSegmentSackOpaque {
         let mut blocks = [0u64; 4];
@@ -463,7 +469,7 @@ fn copy_sack_blocks(sack_blocks: Option<&[TcpSackBlock]>) -> (Option<[TcpSackBlo
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     use hammer_adapter::{BufferPacketCursor, DataPlaneRuntime, NetworkOpaque};
 

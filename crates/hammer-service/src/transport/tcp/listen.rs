@@ -225,12 +225,11 @@ where
             .ok_or_else(|| CoreError::internal("tcp listen session is missing"))?
             .receive_syn(&packet, accepted_payload_len)?;
         if fast_open_valid && packet.payload_len != 0 {
-            runtime
-                .packet_buffers()
-                .advance(index, packet.payload_offset)?;
-            runtime
-                .packet_buffers()
-                .truncate_chain(index, packet.payload_len)?;
+            {
+                let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
+                buffer.advance(packet.payload_offset)?;
+                buffer.truncate_chain(packet.payload_len)?;
+            }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
