@@ -105,6 +105,100 @@ where
     tcp_session_queue_dispatch::<C>
 }
 
+pub struct TimeWaitSessionHarness<C: CongestionController + 'static> {
+    driver: SessionDriverRuntime<TcpConnection<C>, TcpWorkerOwnedState>,
+}
+
+impl<C> TimeWaitSessionHarness<C>
+where
+    C: CongestionController + 'static,
+{
+    pub fn session(&self, session_id: SessionId) -> Option<&TcpConnection<C>> {
+        self.driver.session(session_id)
+    }
+
+    pub fn session_route_by_tuple(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+        self.driver.session_route_by_tuple(local, remote)
+    }
+
+    pub fn drive_fin_ack_to_time_wait(&mut self, session_id: SessionId) -> CoreResult<()> {
+        let (local, remote, ack) = {
+            let connection = self
+                .driver
+                .session(session_id)
+                .ok_or_else(|| hammer_core::error::CoreError::internal("tcp session is missing"))?;
+            (
+                connection.local().expect("local"),
+                connection.remote(),
+                connection.snd_nxt(),
+            )
+        };
+        let packet = crate::transport::tcp::segment::TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: 7_000,
+            acknowledgment: Some(ack),
+            advertised_window: u16::MAX,
+            flags: hammer_core::protocol::tcp::TcpSegmentFlags::FIN
+                | hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
+            capabilities: hammer_core::protocol::tcp::TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let queue_ptr: *mut SessionDriverRuntime<TcpConnection<C>, TcpWorkerOwnedState> =
+            &mut self.driver;
+        unsafe {
+            let connection = (*queue_ptr)
+                .session_mut(session_id)
+                .ok_or_else(|| hammer_core::error::CoreError::internal("tcp session is missing"))?;
+            connection.on_session_close();
+            let _ = connection.receive_rcv_process(&mut *queue_ptr, session_id, &packet)?;
+        }
+        self.driver.refresh_session_route(session_id)?;
+        Ok(())
+    }
+}
+
+pub fn time_wait_session_for_test<C>() -> (
+    TimeWaitSessionHarness<C>,
+    SessionId,
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+)
+where
+    C: CongestionController + 'static,
+{
+    let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
+    let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+    let mut driver = SessionDriverRuntime::new(
+        DataWorkerId::new(0),
+        hammer_adapter::DataPlaneBuffers::with_capacities(2048, 4, 4, 4),
+        TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+    );
+    let session_id = driver.insert_session_with_id(|session_id: SessionId| {
+        TcpConnection::established_for_time_wait_test(
+            Some(hammer_core::protocol::tcp::TcpConnectionId::new(
+                session_id.get(),
+            )),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        )
+    });
+    driver
+        .refresh_session_route(session_id)
+        .expect("refresh session route");
+    (TimeWaitSessionHarness { driver }, session_id, local, remote)
+}
+
 fn tcp_session_queue_dispatch<C>(
     runtime: &DataPlaneRuntime,
     data: NodeRuntimeData,

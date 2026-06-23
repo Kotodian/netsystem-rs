@@ -31,6 +31,7 @@ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
+pub const TCP_TIME_WAIT_TICKS: u64 = 120;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -528,6 +529,9 @@ where
         }
         if timer == TcpConnectionTimerKind::TLP {
             return self.recovery.tlp_timeout_ticks();
+        }
+        if timer == TcpConnectionTimerKind::TIME_WAIT {
+            return Some(TCP_TIME_WAIT_TICKS);
         }
         None
     }
@@ -1466,6 +1470,7 @@ where
                 self.apply_ack(acknowledgment, packet.advertised_window);
                 self.receive_in_order(packet.sequence, 1);
                 self.state = TcpState::TimeWait;
+                self.tcp_timer_set(TcpConnectionTimerKind::TIME_WAIT);
                 release_acked_tx(queue, session_id, self.take_acked_tx_len(previous_snd_una))?;
                 Ok(Some(self.control_segment(
                     packet,
@@ -1509,6 +1514,7 @@ where
             self.apply_ack(self.snd_una, packet.advertised_window);
             self.receive_in_order(packet.sequence, 1);
             self.state = TcpState::TimeWait;
+            self.tcp_timer_set(TcpConnectionTimerKind::TIME_WAIT);
             return Ok(Some(self.control_segment(
                 packet,
                 TcpSegmentFlags::ACK,
@@ -1543,6 +1549,7 @@ where
             let previous_snd_una = self.snd_una();
             self.apply_ack(acknowledgment, packet.advertised_window);
             self.state = TcpState::TimeWait;
+            self.tcp_timer_set(TcpConnectionTimerKind::TIME_WAIT);
             release_acked_tx(queue, session_id, self.take_acked_tx_len(previous_snd_una))?;
         }
         Ok(None)
@@ -1772,6 +1779,23 @@ where
                 fast_open: false,
             },
         )
+    }
+
+    pub(crate) fn established_for_time_wait_test(
+        connection_id: Option<TcpConnectionId>,
+        owner_worker: DataWorkerId,
+        local_port: u16,
+        local: Option<SocketAddr>,
+        remote: SocketAddr,
+    ) -> Self {
+        let mut connection = Self::new(connection_id, owner_worker, local_port, local, remote);
+        connection.state = TcpState::Established;
+        connection.iss = 1_000;
+        connection.irs = 7_000;
+        connection.snd_una = 1_500;
+        connection.snd_nxt = 1_500;
+        connection.rcv_nxt = 7_000;
+        connection
     }
 }
 
