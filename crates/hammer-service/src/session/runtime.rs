@@ -653,6 +653,11 @@ impl<S, A> SessionDriverRuntime<S, A> {
         &mut self.sessions.timers
     }
 
+    #[inline]
+    pub(crate) fn ready_mut_ptr(&mut self) -> *mut SessionReadyQueue {
+        &mut self.sessions.ready as *mut _
+    }
+
     #[cfg(test)]
     pub(crate) fn has_session_tx(&self, session_id: SessionId) -> bool {
         self.app.has_pending_send(session_id)
@@ -927,8 +932,10 @@ where
                 .ok_or_else(|| CoreError::internal("session is missing"))?;
             let mut context = crate::session::protocol::SessionQueueControlContext::new(
                 &mut (*driver).sessions.timers as *mut _,
+                &mut (*driver).sessions.ready as *mut _,
                 &(*driver).buffers as *const _,
                 expired_timer.session_id,
+                (*driver).app.pending_send_head(expired_timer.session_id).is_some(),
             );
             let close_current = state.handle_expired_timer(
                 runtime,
@@ -957,8 +964,10 @@ where
                 .ok_or_else(|| CoreError::internal("session is missing"))?;
             let mut context = crate::session::protocol::SessionQueueControlContext::new(
                 &mut (*driver_ptr).sessions.timers as *mut _,
+                &mut (*driver_ptr).sessions.ready as *mut _,
                 &(*driver_ptr).buffers as *const _,
                 session_id,
+                (*driver_ptr).app.pending_send_head(session_id).is_some(),
             );
             let close_current = state.handle_ready_session(
                 runtime,
@@ -993,8 +1002,10 @@ where
                         .ok_or_else(|| CoreError::internal("session is missing"))?;
                     let context = crate::session::protocol::SessionQueueControlContext::new(
                         &mut (*driver).sessions.timers as *mut _,
+                        &mut (*driver).sessions.ready as *mut _,
                         &(*driver).buffers as *const _,
                         session_id,
+                        (*driver).app.pending_send_head(session_id).is_some(),
                     );
                     state.tx_offset(&context)?
                 }
@@ -1014,8 +1025,10 @@ where
                         .ok_or_else(|| CoreError::internal("session is missing"))?;
                     let mut context = crate::session::protocol::SessionQueueControlContext::new(
                         &mut (*driver).sessions.timers as *mut _,
+                        &mut (*driver).sessions.ready as *mut _,
                         &(*driver).buffers as *const _,
                         session_id,
+                        (*driver).app.pending_send_head(session_id).is_some(),
                     );
                     state
                         .tx_payload_len(&mut context, tx_offset, pending_len, now)?
@@ -1039,8 +1052,10 @@ where
                         .ok_or_else(|| CoreError::internal("session is missing"))?;
                     let mut context = crate::session::protocol::SessionQueueControlContext::new(
                         &mut (*driver).sessions.timers as *mut _,
+                        &mut (*driver).sessions.ready as *mut _,
                         &(*driver).buffers as *const _,
                         session_id,
+                        (*driver).app.pending_send_head(session_id).is_some(),
                     );
                     if let Err(err) =
                         state.prepare_tx(&mut context, index, tx_offset, payload_len, now)
@@ -1073,8 +1088,10 @@ where
                         .ok_or_else(|| CoreError::internal("session is missing"))?;
                     let mut context = crate::session::protocol::SessionQueueControlContext::new(
                         &mut (*driver).sessions.timers as *mut _,
+                        &mut (*driver).sessions.ready as *mut _,
                         &(*driver).buffers as *const _,
                         session_id,
+                        (*driver).app.pending_send_head(session_id).is_some(),
                     );
                     state.commit_tx(&mut context, index, tx_offset, payload_len, now)
                 }

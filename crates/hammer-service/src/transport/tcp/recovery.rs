@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use hammer_adapter::BufferIndex;
-use hammer_core::protocol::tcp::TcpSackBlock;
+use hammer_core::protocol::tcp::{TcpSackBlock, TcpSeq};
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
 use hammer_infra::vec::Vec;
@@ -14,23 +14,24 @@ const DEFAULT_RACK_TIMEOUT_TICKS: u64 = 6;
 const DEFAULT_TLP_TIMEOUT_TICKS: u64 = 20;
 
 #[derive(Clone, Copy, Debug)]
-struct TcpSentSample {
-    packet_number: PacketNumber,
-    sequence: u32,
-    end_sequence: u32,
-    bytes: u32,
-    payload: Option<BufferIndex>,
-    sent_at: Instant,
-    prev: Option<PoolIndex>,
-    next: Option<PoolIndex>,
+pub(crate) struct TcpSentSample {
+    pub(crate) packet_number: PacketNumber,
+    pub(crate) sequence: TcpSeq,
+    pub(crate) end_sequence: TcpSeq,
+    pub(crate) bytes: u32,
+    pub(crate) payload: Option<BufferIndex>,
+    pub(crate) payload_offset: u32,
+    pub(crate) payload_len: u32,
+    pub(crate) retransmitted: bool,
+    pub(crate) sent_at: Instant,
+    pub(crate) prev: Option<PoolIndex>,
+    pub(crate) next: Option<PoolIndex>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TcpRecoveryAck {
-    pub acknowledgment: u32,
+    pub acknowledgment: TcpSeq,
     pub now: Instant,
-    pub latest_rtt: Duration,
-    pub min_rtt: Duration,
     pub app_limited: bool,
     pub ecn_ce_count: u64,
 }
@@ -39,7 +40,7 @@ pub struct TcpRecoveryAck {
 pub struct TcpRecoveryState {
     next_packet_number: PacketNumber,
     sent_samples: Pool<TcpSentSample>,
-    sample_lookup: RbTree<u32, PoolIndex>,
+    sample_lookup: RbTree<TcpSeq, PoolIndex>,
     sample_head: Option<PoolIndex>,
     sample_tail: Option<PoolIndex>,
     rack_pending_loss: Vec<PoolIndex>,
@@ -51,7 +52,7 @@ pub struct TcpRecoveryState {
     recovery_delivered: u32,
     recovery_retransmitted: u32,
     recovery_new_data: u32,
-    recovery_end_sequence: u32,
+    recovery_end_sequence: TcpSeq,
 }
 
 impl TcpRecoveryState {
@@ -71,7 +72,7 @@ impl TcpRecoveryState {
             recovery_delivered: 0,
             recovery_retransmitted: 0,
             recovery_new_data: 0,
-            recovery_end_sequence: 0,
+            recovery_end_sequence: TcpSeq::from(0),
         }
     }
 
@@ -84,10 +85,12 @@ impl TcpRecoveryState {
     pub fn record_sent(
         &mut self,
         packet_number: PacketNumber,
-        sequence: u32,
-        end_sequence: u32,
+        sequence: TcpSeq,
+        end_sequence: TcpSeq,
         bytes: u32,
         payload: Option<BufferIndex>,
+        payload_offset: u32,
+        payload_len: u32,
         sent_at: Instant,
     ) {
         let prev = self.sample_tail;
@@ -99,6 +102,9 @@ impl TcpRecoveryState {
                 end_sequence,
                 bytes,
                 payload,
+                payload_offset,
+                payload_len,
+                retransmitted: false,
                 sent_at,
                 prev,
                 next: None,
@@ -141,12 +147,16 @@ impl TcpRecoveryState {
         (self.tlp_timer_armed && self.has_unacked_data()).then_some(DEFAULT_TLP_TIMEOUT_TICKS)
     }
 
-    pub fn on_ack<C: CongestionController>(&mut self, ack: TcpRecoveryAck, congestion: &mut C) {
+    pub fn on_ack<C: CongestionController>(
+        &mut self,
+        ack: TcpRecoveryAck,
+        congestion: &mut C,
+    ) -> Option<Duration> {
         let acked = self.take_acked_segments(|_, end_sequence| {
-            seq_before_or_equal(end_sequence, ack.acknowledgment)
+            end_sequence <= ack.acknowledgment
         });
         let advanced = !acked.is_empty();
-        self.deliver_acked_segments(ack, acked, congestion);
+        let latest_rtt = self.deliver_acked_segments(ack, acked, congestion);
         self.maybe_finish_recovery(ack.acknowledgment);
         if self.recovery_active && advanced {
             if let Some(head) = self.sample_head
@@ -160,6 +170,7 @@ impl TcpRecoveryState {
             }
         }
         self.tlp_timer_armed = self.has_unacked_data();
+        latest_rtt
     }
 
     pub fn on_sack_blocks<C: CongestionController>(
@@ -167,27 +178,28 @@ impl TcpRecoveryState {
         ack: TcpRecoveryAck,
         blocks: &[TcpSackBlock],
         congestion: &mut C,
-    ) {
+    ) -> Option<Duration> {
         let mut acked = self.take_acked_segments(|_, end_sequence| {
-            seq_before_or_equal(end_sequence, ack.acknowledgment)
+            end_sequence <= ack.acknowledgment
         });
         let mut highest_sacked_right = ack.acknowledgment;
         for block in blocks {
             highest_sacked_right = highest_sacked_right.max(block.right_edge);
             acked.extend(self.take_sacked_segments(*block));
         }
-        self.deliver_acked_segments(ack, acked, congestion);
+        let latest_rtt = self.deliver_acked_segments(ack, acked, congestion);
         self.maybe_finish_recovery(ack.acknowledgment);
         if highest_sacked_right != ack.acknowledgment {
             self.mark_rack_candidates(highest_sacked_right);
         }
         self.tlp_timer_armed = self.has_unacked_data();
+        latest_rtt
     }
 
     pub fn on_rack_timeout<C: CongestionController>(
         &mut self,
         now: Instant,
-        snd_nxt: u32,
+        snd_nxt: TcpSeq,
         congestion: &mut C,
     ) {
         let recovery_prev_window = congestion.congestion_window();
@@ -267,30 +279,32 @@ impl TcpRecoveryState {
         Some(space)
     }
 
-    pub fn take_rack_retransmit(&mut self) -> Option<(u32, u32, Option<BufferIndex>)> {
+    pub(crate) fn take_rack_retransmit(&mut self) -> Option<TcpSentSample> {
         let sample_index = self.rack_pending_loss.pop()?;
-        let sample = self.sent_samples.get(sample_index).copied()?;
+        let sample = self.sent_samples.get_mut(sample_index)?;
+        sample.retransmitted = true;
         self.rack_timer_armed = !self.rack_pending_loss.is_empty();
-        Some((sample.sequence, sample.bytes, sample.payload))
+        Some(*sample)
     }
 
-    pub fn take_tlp_probe(&mut self) -> Option<(PacketNumber, u32, u32, Option<BufferIndex>)> {
+    pub(crate) fn take_tlp_probe(&mut self) -> Option<TcpSentSample> {
         let index = self.sample_tail?;
-        let sample = self.sent_samples.get(index).copied()?;
+        let sample = self.sent_samples.get_mut(index)?;
+        sample.retransmitted = true;
         self.tlp_timer_armed = false;
-        Some((
-            sample.packet_number,
-            sample.sequence,
-            sample.bytes,
-            sample.payload,
-        ))
+        Some(*sample)
     }
 
-    fn mark_rack_candidates(&mut self, highest_sacked_right: u32) {
+    pub(crate) fn oldest_unacked_sample(&self) -> Option<TcpSentSample> {
+        let index = self.sample_head?;
+        Some(self.sent_sample(index))
+    }
+
+    fn mark_rack_candidates(&mut self, highest_sacked_right: TcpSeq) {
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
-            if seq_before(sample.end_sequence, highest_sacked_right)
+            if sample.end_sequence < highest_sacked_right
                 && !self
                     .rack_pending_loss
                     .iter()
@@ -305,8 +319,8 @@ impl TcpRecoveryState {
 
     fn take_acked_segments(
         &mut self,
-        mut is_acked: impl FnMut(u32, u32) -> bool,
-    ) -> Vec<(PacketNumber, u32, Instant)> {
+        mut is_acked: impl FnMut(TcpSeq, TcpSeq) -> bool,
+    ) -> Vec<TcpSentSample> {
         let mut acked = Vec::new();
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
@@ -322,17 +336,22 @@ impl TcpRecoveryState {
         acked
     }
 
-    fn take_sacked_segments(&mut self, block: TcpSackBlock) -> Vec<(PacketNumber, u32, Instant)> {
+    fn take_sacked_segments(
+        &mut self,
+        block: TcpSackBlock,
+    ) -> Vec<TcpSentSample> {
         let mut matched = Vec::new();
-        let mut cursor = self.first_sample_at_or_after(block.left_edge);
+        let left_edge = block.left_edge;
+        let right_edge = block.right_edge;
+        let mut cursor = self.first_sample_at_or_after(left_edge);
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
-            if seq_before(block.right_edge, sample.sequence) {
+            if right_edge < sample.sequence {
                 break;
             }
             cursor = self.next_sample_after(sample.sequence);
-            if seq_before_or_equal(block.left_edge, sample.sequence)
-                && seq_before_or_equal(sample.end_sequence, block.right_edge)
+            if left_edge <= sample.sequence
+                && sample.end_sequence <= right_edge
             {
                 matched.push(index);
             }
@@ -346,27 +365,34 @@ impl TcpRecoveryState {
     fn deliver_acked_segments<C: CongestionController>(
         &mut self,
         ack: TcpRecoveryAck,
-        acked: Vec<(PacketNumber, u32, Instant)>,
+        acked: Vec<TcpSentSample>,
         congestion: &mut C,
-    ) {
+    ) -> Option<Duration> {
         let mut largest_acked = 0;
         let mut any_acked = false;
+        let mut latest_rtt = None;
         let mut bytes_in_flight_after_ack = self.bytes_in_flight();
         let total_acked_bytes = acked
             .iter()
-            .fold(0u32, |total, segment| total.saturating_add(segment.1));
+            .fold(0u32, |total, segment| total.saturating_add(segment.bytes));
         if self.recovery_active && total_acked_bytes != 0 {
             self.recovery_delivered = self.recovery_delivered.saturating_add(total_acked_bytes);
         }
         let mut bytes_in_flight_before_next_ack =
             bytes_in_flight_after_ack.saturating_add(total_acked_bytes);
         for segment in acked {
-            largest_acked = largest_acked.max(segment.0);
+            largest_acked = largest_acked.max(segment.packet_number);
             any_acked = true;
             bytes_in_flight_before_next_ack =
-                bytes_in_flight_before_next_ack.saturating_sub(segment.1);
+                bytes_in_flight_before_next_ack.saturating_sub(segment.bytes);
             bytes_in_flight_after_ack = bytes_in_flight_before_next_ack;
-            deliver_acked_segment(bytes_in_flight_after_ack, ack, segment, congestion);
+            latest_rtt = deliver_acked_segment(
+                bytes_in_flight_after_ack,
+                ack,
+                segment,
+                congestion,
+            )
+            .or(latest_rtt);
         }
         if any_acked {
             congestion.on_end_acks(
@@ -376,6 +402,7 @@ impl TcpRecoveryState {
                 largest_acked,
             );
         }
+        latest_rtt
     }
 
     fn sent_sample(&self, index: PoolIndex) -> TcpSentSample {
@@ -391,7 +418,7 @@ impl TcpRecoveryState {
             .expect("tcp recovery sample index is valid")
     }
 
-    fn first_sample_at_or_after(&self, sequence: u32) -> Option<PoolIndex> {
+    fn first_sample_at_or_after(&self, sequence: TcpSeq) -> Option<PoolIndex> {
         if let Some(index) = self.sample_lookup.get(&sequence).copied() {
             return Some(index);
         }
@@ -400,28 +427,28 @@ impl TcpRecoveryState {
             .map(|(_, index)| *index)
     }
 
-    fn next_sample_after(&self, sequence: u32) -> Option<PoolIndex> {
+    fn next_sample_after(&self, sequence: TcpSeq) -> Option<PoolIndex> {
         self.sample_lookup
             .successor(&sequence)
             .map(|(_, index)| *index)
     }
 
-    fn maybe_finish_recovery(&mut self, acknowledgment: u32) {
+    fn maybe_finish_recovery(&mut self, acknowledgment: TcpSeq) {
         if !self.recovery_active {
             return;
         }
-        if !seq_before(acknowledgment, self.recovery_end_sequence) {
+        if acknowledgment >= self.recovery_end_sequence {
             self.recovery_active = false;
             self.recovery_window = 0;
             self.recovery_prev_window = 0;
             self.recovery_delivered = 0;
             self.recovery_retransmitted = 0;
             self.recovery_new_data = 0;
-            self.recovery_end_sequence = 0;
+            self.recovery_end_sequence = TcpSeq::from(0);
         }
     }
 
-    fn take_sent(&mut self, index: PoolIndex) -> (PacketNumber, u32, Instant) {
+    fn take_sent(&mut self, index: PoolIndex) -> TcpSentSample {
         let sample = self.sent_sample(index);
         let mut pending_index = 0;
         while pending_index < self.rack_pending_loss.len() {
@@ -445,11 +472,9 @@ impl TcpRecoveryState {
         } else {
             self.sample_tail = sample.prev;
         }
-        let removed = self
-            .sent_samples
+        self.sent_samples
             .remove(index)
-            .expect("tcp recovery sample index is valid");
-        (removed.packet_number, removed.bytes, removed.sent_at)
+            .expect("tcp recovery sample index is valid")
     }
 }
 
@@ -474,6 +499,8 @@ impl Clone for TcpRecoveryState {
                 sample.end_sequence,
                 sample.bytes,
                 sample.payload,
+                sample.payload_offset,
+                sample.payload_len,
                 sample.sent_at,
             );
             cursor = sample.next;
@@ -509,37 +536,34 @@ impl Default for TcpRecoveryState {
     }
 }
 
-#[inline]
-fn seq_before(left: u32, right: u32) -> bool {
-    left.wrapping_sub(right) > (1 << 31)
-}
-
-#[inline]
-fn seq_before_or_equal(left: u32, right: u32) -> bool {
-    left == right || seq_before(left, right)
-}
-
 fn deliver_acked_segment<C: CongestionController>(
     bytes_in_flight: u32,
     ack: TcpRecoveryAck,
-    segment: (PacketNumber, u32, Instant),
+    segment: TcpSentSample,
     congestion: &mut C,
-) {
+) -> Option<Duration> {
+    let latest_rtt = ack.now.saturating_duration_since(segment.sent_at);
+    let rtt_sample = if segment.retransmitted {
+        Duration::ZERO
+    } else {
+        latest_rtt
+    };
     congestion.on_ack(
         ack.now,
         AckedPacket {
-            packet_number: segment.0,
-            bytes: segment.1,
-            sent_at: segment.2,
+            packet_number: segment.packet_number,
+            bytes: segment.bytes,
+            sent_at: segment.sent_at,
             app_limited: ack.app_limited,
             ecn_ce_count: ack.ecn_ce_count,
         },
         RttSample {
-            latest: ack.latest_rtt,
-            min: ack.min_rtt,
+            latest: rtt_sample,
+            min: rtt_sample,
         },
         bytes_in_flight,
     );
+    (!segment.retransmitted).then_some(latest_rtt)
 }
 
 #[cfg(test)]
@@ -629,11 +653,10 @@ mod tests {
     }
 
     fn ack(acknowledgment: u32, now: Instant, rtt_ms: u64) -> TcpRecoveryAck {
+        let _ = rtt_ms;
         TcpRecoveryAck {
-            acknowledgment,
+            acknowledgment: TcpSeq::from(acknowledgment),
             now,
-            latest_rtt: Duration::from_millis(rtt_ms),
-            min_rtt: Duration::from_millis(rtt_ms),
             app_limited: false,
             ecn_ce_count: 0,
         }
@@ -647,7 +670,16 @@ mod tests {
         bytes: u32,
         sent_at: Instant,
     ) {
-        recovery.record_sent(packet_number, sequence, end_sequence, bytes, None, sent_at);
+        recovery.record_sent(
+            packet_number,
+            TcpSeq::from(sequence),
+            TcpSeq::from(end_sequence),
+            bytes,
+            None,
+            0,
+            0,
+            sent_at,
+        );
     }
 
     #[test]
@@ -720,12 +752,16 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_000,
-                right_edge: 3_000,
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
             }],
             &mut controller,
         );
-        recovery.on_rack_timeout(now + Duration::from_millis(56), 3_000, &mut controller);
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            TcpSeq::from(3_000),
+            &mut controller,
+        );
 
         assert_eq!(controller.lost.len(), 1);
         assert_eq!(controller.lost[0].packet_number, 1);
@@ -749,8 +785,8 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_500,
-                right_edge: 4_000,
+                left_edge: TcpSeq::from(2_500),
+                right_edge: TcpSeq::from(4_000),
             }],
             &mut controller,
         );
@@ -776,7 +812,7 @@ mod tests {
 
         let probe = recovery.take_tlp_probe().expect("tlp probe");
 
-        assert_eq!(probe.0, 2);
+        assert_eq!(probe.packet_number, 2);
     }
 
     #[test]
@@ -797,8 +833,8 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_000,
-                right_edge: 3_000,
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
             }],
             &mut controller,
         );
@@ -807,8 +843,8 @@ mod tests {
             .take_tlp_probe()
             .expect("tlp probe should use remaining tail");
 
-        assert_eq!(probe.0, 1);
-        assert_eq!(probe.1, 1_000);
+        assert_eq!(probe.packet_number, 1);
+        assert_eq!(probe.sequence, TcpSeq::from(1_000));
     }
 
     #[test]
@@ -828,13 +864,17 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_000,
-                right_edge: 3_000,
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
             }],
             &mut controller,
         );
 
-        recovery.on_rack_timeout(now + Duration::from_millis(56), 3_000, &mut controller);
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            TcpSeq::from(3_000),
+            &mut controller,
+        );
 
         assert_eq!(
             recovery.recovery_send_space(recovery.bytes_in_flight(), 1_000),
@@ -883,12 +923,16 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_000,
-                right_edge: 3_000,
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
             }],
             &mut controller,
         );
-        recovery.on_rack_timeout(now + Duration::from_millis(56), 6_000, &mut controller);
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            TcpSeq::from(6_000),
+            &mut controller,
+        );
 
         assert_eq!(
             recovery.recovery_send_space(recovery.bytes_in_flight(), 1_000),
@@ -948,17 +992,21 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 2_000,
-                right_edge: 3_000,
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
             }],
             &mut controller,
         );
-        recovery.on_rack_timeout(now + Duration::from_millis(56), 4_000, &mut controller);
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            TcpSeq::from(4_000),
+            &mut controller,
+        );
 
         let first = recovery
             .take_rack_retransmit()
             .expect("first recovery retransmit");
-        assert_eq!(first.0, 1_000);
+        assert_eq!(first.sequence, TcpSeq::from(1_000));
 
         recovery.on_retransmit_sent(1_000);
         recovery.on_ack(
@@ -969,7 +1017,7 @@ mod tests {
         let second = recovery
             .take_rack_retransmit()
             .expect("partial ack should schedule new head");
-        assert_eq!(second.0, 3_000);
+        assert_eq!(second.sequence, TcpSeq::from(3_000));
     }
 
     #[test]
@@ -998,8 +1046,8 @@ mod tests {
         recovery.on_sack_blocks(
             ack(1_000, now + Duration::from_millis(30), 40),
             &[TcpSackBlock {
-                left_edge: 3_000,
-                right_edge: 4_000,
+                left_edge: TcpSeq::from(3_000),
+                right_edge: TcpSeq::from(4_000),
             }],
             &mut controller,
         );
@@ -1012,7 +1060,10 @@ mod tests {
             .take_rack_retransmit()
             .expect("second pending retransmit");
 
-        assert_eq!((first.0, second.0), (2_000, 1_000));
+        assert_eq!(
+            (first.sequence, second.sequence),
+            (TcpSeq::from(2_000), TcpSeq::from(1_000))
+        );
     }
 
     #[test]

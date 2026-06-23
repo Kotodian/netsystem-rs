@@ -36,7 +36,7 @@ pub const TCP_TIMER_PERSIST: u32 = 5;
 pub const TCP_TIMER_KEEP_ALIVE: u32 = 6;
 pub const TCP_TIMER_TIME_WAIT: u32 = 7;
 pub const TCP_TIMER_COUNT: u32 = 8;
-const TCP_DELAYED_ACK_TICKS: u64 = 2;
+const TCP_DELAYED_ACK_TICKS: u64 = 1;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,6 +77,13 @@ struct TcpTimestampState {
     recent_remote_at: Option<Instant>,
     local_origin: Option<Instant>,
     last_local: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpTxIntent {
+    sequence: TcpSeq,
+    payload_len: u32,
+    retransmit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +280,7 @@ where
     ecn: TcpEcnState,
     timers: TcpTimerState,
     timestamps: TcpTimestampState,
+    tx_intent: Option<TcpTxIntent>,
 }
 
 impl<C> TcpConnection<C>
@@ -363,6 +371,7 @@ where
             ecn: TcpEcnState::default(),
             timers: TcpTimerState::default(),
             timestamps: TcpTimestampState::default(),
+            tx_intent: None,
         }
     }
 
@@ -549,6 +558,30 @@ where
             (TcpState::TimeWait, TCP_TIMER_TIME_WAIT) => Some(TCP_TIME_WAIT_TICKS),
             _ => None,
         }
+    }
+
+    #[inline]
+    pub(crate) fn tx_payload_sequence(&self) -> TcpSeq {
+        self.tx_intent
+            .map(|intent| intent.sequence)
+            .unwrap_or_else(|| {
+                if self.state == TcpState::SynSent {
+                    self.iss
+                } else {
+                    self.snd_nxt
+                }
+            })
+    }
+
+    #[inline]
+    pub(crate) fn tx_intent_payload_len(&self) -> Option<usize> {
+        self.tx_intent
+            .map(|intent| usize::try_from(intent.payload_len).expect("payload len fits usize"))
+    }
+
+    #[inline]
+    pub(crate) fn clear_tx_intent(&mut self) {
+        self.tx_intent = None;
     }
 
     #[inline]
@@ -1055,6 +1088,9 @@ where
 
     #[inline]
     pub(crate) fn tx_payload_budget(&self, pending_len: usize, _: Instant) -> usize {
+        if let Some(intent) = self.tx_intent {
+            return pending_len.min(intent.payload_len as usize);
+        }
         if pending_len == 0 {
             return 0;
         }
@@ -1100,10 +1136,11 @@ where
             } else {
                 TcpSegmentFlags::SYN
             };
+            let sequence = self.tx_payload_sequence();
             return Ok(TcpSegment::new(
                 local,
                 self.remote(),
-                self.iss(),
+                sequence.raw(),
                 self.rcv_nxt(),
                 self.advertised_receive_window(self.rcv_wnd),
                 flags,
@@ -1111,7 +1148,7 @@ where
                 None,
                 self.next_local_timestamp(),
                 self.fast_open_cookie(),
-                self.output_ip_ecn(payload_len, false),
+                self.output_ip_ecn(payload_len, self.tx_intent.is_some()),
                 payload_len,
             ));
         }
@@ -1128,10 +1165,11 @@ where
             self.ecn.pending_signals.remove(TcpPendingSignals::CWR);
         }
         let sack_blocks = self.sack.take_output(self.negotiated_options().sack, flags);
+        let sequence = self.tx_payload_sequence();
         Ok(TcpSegment::new(
             local,
             self.remote(),
-            self.snd_nxt(),
+            sequence.raw(),
             self.rcv_nxt(),
             self.advertised_receive_window(self.rcv_wnd),
             flags,
@@ -1139,7 +1177,7 @@ where
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
             self.next_local_timestamp(),
             None,
-            self.output_ip_ecn(payload_len, false),
+            self.output_ip_ecn(payload_len, self.tx_intent.is_some()),
             payload_len,
         ))
     }
@@ -1152,6 +1190,10 @@ where
         now: Instant,
     ) -> CoreResult<u16> {
         if self.state == TcpState::SynSent {
+            if self.tx_intent.is_some() {
+                self.clear_tx_intent();
+                return Ok(timer_bit(TCP_TIMER_RETRANSMIT));
+            }
             let payload_len = u32::try_from(payload_len)
                 .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
             let sequence = self.iss;
@@ -1185,6 +1227,21 @@ where
             TcpState::Established,
             "tcp tx commit requires established state",
         )?;
+        if self.tx_intent.is_some() {
+            self.clear_tx_intent();
+            let mut timers = 0;
+            if self.recovery.rack_timeout_ticks().is_some() {
+                timers |= timer_bit(TCP_TIMER_RACK);
+            }
+            if self.recovery.tlp_timeout_ticks().is_some() {
+                timers |= timer_bit(TCP_TIMER_TLP);
+            }
+            if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
+                self.timer_set(TCP_TIMER_PERSIST);
+                timers |= timer_bit(TCP_TIMER_PERSIST);
+            }
+            return Ok(timers);
+        }
         let payload_len = u32::try_from(payload_len)
             .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
         let sequence = self.snd_nxt;
@@ -1207,10 +1264,16 @@ where
         self.snd_nxt = TcpSeq::from(end_sequence);
         let mut timers = 0;
         if self.recovery.rack_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_RACK);
             timers |= timer_bit(TCP_TIMER_RACK);
+        } else {
+            self.timer_reset(TCP_TIMER_RACK);
         }
         if self.recovery.tlp_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_TLP);
             timers |= timer_bit(TCP_TIMER_TLP);
+        } else {
+            self.timer_reset(TCP_TIMER_TLP);
         }
         Ok(timers)
     }
@@ -1234,10 +1297,16 @@ where
         }
         let mut timers = 0;
         if self.recovery.rack_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_RACK);
             timers |= timer_bit(TCP_TIMER_RACK);
+        } else {
+            self.timer_reset(TCP_TIMER_RACK);
         }
         if self.recovery.tlp_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_TLP);
             timers |= timer_bit(TCP_TIMER_TLP);
+        } else {
+            self.timer_reset(TCP_TIMER_TLP);
         }
         timers
     }
@@ -1411,8 +1480,8 @@ where
     }
 
     #[inline]
-    pub(crate) fn on_tcp_ready(&mut self) -> Option<TcpSegment> {
-        if self.state == TcpState::SynSent && !self.recovery.has_unacked_data() {
+    pub(crate) fn on_tcp_ready(&mut self, has_pending_tx: bool) -> Option<TcpSegment> {
+        if self.state == TcpState::SynSent && !has_pending_tx && !self.recovery.has_unacked_data() {
             return self.tx_segment(0).ok();
         }
         let local = self.local?;
@@ -1457,16 +1526,26 @@ where
         if !self.timer_is_supported(timer_id) || !self.timer_dispatch_pending(timer_id) {
             return None;
         }
+        match (self.state, timer_id) {
+            (TcpState::SynSent, _) | (TcpState::Established, _) | (TcpState::TimeWait, _) => {}
+            _ => return None,
+        }
         match timer_id {
             TCP_TIMER_RETRANSMIT => self.on_retransmit_timer_expiry(),
+            TCP_TIMER_RACK => self.on_rack_timer_expiry(),
+            TCP_TIMER_TLP => self.on_tlp_timer_expiry(),
+            TCP_TIMER_DELAYED_ACK => self.on_delayed_ack_timer_expiry(),
+            TCP_TIMER_PERSIST => self.on_persist_timer_expiry(),
             TCP_TIMER_TIME_WAIT => self.on_time_wait_timer_expiry(),
             _ => None,
         }
     }
 
     fn on_retransmit_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.observe_retransmit_timeout();
-        self.timer_set(TCP_TIMER_RETRANSMIT);
+        if self.state == TcpState::SynSent {
+            self.observe_retransmit_timeout();
+            self.timer_set(TCP_TIMER_RETRANSMIT);
+        }
         let local = self.local?;
         let flags = if self.options.local_capabilities().ecn {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
@@ -1487,6 +1566,82 @@ where
             None,
             self.fast_open_syn_payload_len as usize,
         ))
+    }
+
+    fn on_rack_timer_expiry(&mut self) -> Option<TcpSegment> {
+        self.ensure_state(TcpState::Established, "rack timer requires established state")
+            .ok()?;
+        self.recovery
+            .on_rack_timeout(Instant::now(), self.snd_nxt, &mut self.congestion);
+        let sample = self.recovery.take_rack_retransmit()?;
+        if self.recovery.rack_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_RACK);
+        }
+        self.recovery.on_retransmit_sent(sample.bytes);
+        self.tx_intent = Some(TcpTxIntent {
+            sequence: sample.sequence,
+            payload_len: sample.payload_len,
+            retransmit: true,
+        });
+        self.tx_segment(sample.payload_len as usize).ok()
+    }
+
+    fn on_tlp_timer_expiry(&mut self) -> Option<TcpSegment> {
+        self.ensure_state(TcpState::Established, "tlp timer requires established state")
+            .ok()?;
+        let sample = self.recovery.take_tlp_probe()?;
+        if self.recovery.tlp_timeout_ticks().is_some() {
+            self.timer_set(TCP_TIMER_TLP);
+        }
+        if self.recovery.in_recovery() {
+            self.recovery.on_retransmit_sent(sample.bytes);
+        }
+        self.tx_intent = Some(TcpTxIntent {
+            sequence: sample.sequence,
+            payload_len: sample.payload_len,
+            retransmit: true,
+        });
+        self.tx_segment(sample.payload_len as usize).ok()
+    }
+
+    fn on_delayed_ack_timer_expiry(&mut self) -> Option<TcpSegment> {
+        self.ensure_state(
+            TcpState::Established,
+            "delayed ack timer requires established state",
+        )
+        .ok()?;
+        let local = self.local?;
+        Some(TcpSegment::new(
+            local,
+            self.remote(),
+            self.snd_nxt(),
+            self.rcv_nxt(),
+            self.advertised_receive_window(self.rcv_wnd),
+            self.output_flags(TcpSegmentFlags::ACK),
+            self.local_capabilities(),
+            None,
+            self.next_local_timestamp(),
+            None,
+            None,
+            0,
+        ))
+    }
+
+    fn on_persist_timer_expiry(&mut self) -> Option<TcpSegment> {
+        self.ensure_state(TcpState::Established, "persist timer requires established state")
+            .ok()?;
+        let sample = self.recovery.oldest_unacked_sample()?;
+        let payload_len = sample.payload_len.min(1);
+        if payload_len == 0 {
+            return self.on_delayed_ack_timer_expiry();
+        }
+        self.timer_set(TCP_TIMER_PERSIST);
+        self.tx_intent = Some(TcpTxIntent {
+            sequence: sample.sequence,
+            payload_len,
+            retransmit: true,
+        });
+        self.tx_segment(payload_len as usize).ok()
     }
 
     fn on_time_wait_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -1856,7 +2011,7 @@ mod tests {
         connection.connect_state(100);
 
         let segment = connection
-            .on_tcp_ready()
+            .on_tcp_ready(false)
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");

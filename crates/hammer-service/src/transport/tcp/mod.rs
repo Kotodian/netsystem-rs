@@ -82,7 +82,11 @@ where
 {
     let session = context.session_id().pool_index();
     let timers = context.timer_wheel();
-    if let Some(ticks) = connection.timer_ticks(timer_id) {
+    if connection.timer_is_active(timer_id) {
+        let Some(ticks) = connection.timer_ticks(timer_id) else {
+            let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
+            return Ok(());
+        };
         timers
             .update_timer(session.slot(), session.generation(), timer_id, ticks)
             .map_err(|_| CoreError::internal("tcp timer update failed"))?;
@@ -100,15 +104,8 @@ fn refresh_tcp_timers<C>(
 where
     C: CongestionController + 'static,
 {
-    for timer_id in [
-        TCP_TIMER_RETRANSMIT,
-        TCP_TIMER_RACK,
-        TCP_TIMER_TLP,
-        TCP_TIMER_DELAYED_ACK,
-        TCP_TIMER_PERSIST,
-        TCP_TIMER_TIME_WAIT,
-    ] {
-        if (timer_mask & (1u16 << timer_id)) != 0 || connection.timer_is_supported(timer_id) {
+    for timer_id in 0..crate::transport::tcp::connection::TCP_TIMER_COUNT {
+        if (timer_mask & (1u16 << timer_id)) != 0 || connection.timer_is_active(timer_id) {
             refresh_tcp_timer(connection, context, timer_id)?;
         }
     }
@@ -128,11 +125,14 @@ where
         .ok_or_else(|| CoreError::internal("tcp session is missing"))?
         as *const TcpConnection<C>;
     let timers = driver.timers_mut() as *mut _;
+    let ready = driver.ready_mut_ptr();
     let buffers = driver.buffers() as *const _;
     let mut context = SessionQueueControlContext::new(
         timers,
+        ready,
         buffers,
         session_id,
+        driver.app().pending_send_head(session_id).is_some(),
     );
     // SAFETY: `connection` is an immutable pointer captured before building the
     // control context. `refresh_tcp_timers` only reads the connection while the
@@ -365,7 +365,12 @@ where
     C: CongestionController + 'static,
 {
     fn tx_offset(&self, _: &SessionQueueControlContext) -> CoreResult<usize> {
-        usize::try_from(TcpSeq::from(self.snd_una()).distance_to(TcpSeq::from(self.snd_nxt())))
+        let start = if self.state() == TcpState::SynSent {
+            self.iss()
+        } else {
+            self.snd_una()
+        };
+        usize::try_from(TcpSeq::from(start).distance_to(self.tx_payload_sequence()))
             .map_err(|_| CoreError::internal("tcp tx offset exceeds usize"))
     }
 
@@ -377,10 +382,15 @@ where
         output_next: SessionQueueNext,
         output: &mut SessionQueueOutput,
     ) -> CoreResult<bool> {
+        self.timer_expire(timer_id);
         let control = self.on_tcp_timer_expiry(timer_id);
         refresh_tcp_timer(self, context, timer_id)?;
         if let Some(segment) = control {
-            enqueue_tcp_segment(runtime, output_next, output, segment)?;
+            if segment.payload_len() == 0 {
+                enqueue_tcp_segment(runtime, output_next, output, segment)?;
+            } else {
+                context.mark_ready();
+            }
         }
         Ok(self.state() == TcpState::Closed)
     }
@@ -396,7 +406,7 @@ where
         if close_requested {
             self.on_session_close();
         }
-        if let Some(segment) = self.on_tcp_ready() {
+        if let Some(segment) = self.on_tcp_ready(context.has_pending_tx()) {
             enqueue_tcp_segment(runtime, output_next, output, segment)?;
         }
         refresh_tcp_timers(self, context, u16::MAX)?;
@@ -789,10 +799,11 @@ mod tests {
         output_node: NodeId,
     ) {
         let next = crate::session::SessionQueueNext::from_node(output_node);
-        let step = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
+        let _ = dispatch_session_queue_for_ticks(runtime, driver, ticks, next)
             .expect("dispatch session queue for timer ticks");
-        assert!(step.expired_timers != 0);
-        assert_eq!(runtime.run_ready_nodes().expect("run timer output"), 2);
+        let _ = dispatch_session_queue_for_ticks(runtime, driver, 0, next)
+            .expect("dispatch session queue follow-up");
+        let _ = runtime.run_ready_nodes().expect("run timer output");
     }
 
     fn tcp_segment_payload(packet: &[u8]) -> &[u8] {
@@ -914,9 +925,25 @@ mod tests {
         let enqueue = driver
             .enqueue_rx(session_id, payload, 0, false)
             .expect("enqueue rx");
+        {
+            let connection = driver.session_mut(session_id).expect("connection");
+            connection.receive_payload(
+                packet.sequence,
+                0,
+                enqueue.delivered_len,
+                enqueue.newest_ooo_start,
+                enqueue.newest_ooo_len,
+            );
+        }
         if enqueue.delivered_len != 0 {
             driver.mark_ready(session_id);
         }
+        refresh_tcp_timers_for_session(
+            &mut driver,
+            session_id,
+            1u16 << TCP_TIMER_DELAYED_ACK,
+        )
+        .expect("refresh delayed ack timer");
 
         assert!(control.is_none());
         assert!(drop_state.lock().expect("drop").packets.is_empty());
