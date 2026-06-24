@@ -1,16 +1,170 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ds::FlatHashKey;
+use crate::protocol::ip_ecn::IpEcnCodepoint;
 use crate::protocol::transport::TransportConnectionKey;
 
+pub mod control;
 pub mod options;
+pub mod reset;
 pub mod segment;
 
+pub use control::synthesize_ipv4_tcp_control;
 pub use options::{
-    ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
-    tcp_options_from_bytes,
+    tcp_capabilities_from_options, tcp_options_from_bytes, ParsedTcpOptions, TcpSackBlock,
+    TcpTimestampOption,
 };
-pub use segment::{TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header};
+pub use reset::{
+    tcp_reset_network_header_len, tcp_reset_remote_reply_addrs,
+    tcp_reset_reply_from_current_packet, TcpResetPacketCursor, TcpResetReply,
+};
+pub use segment::{write_tcp_segment_header, TcpSegmentHeader, TcpSegmentParseError};
+
+pub const TCP_FLAG_FIN: u8 = 0x01;
+pub const TCP_FLAG_SYN: u8 = 0x02;
+pub const TCP_FLAG_RST: u8 = 0x04;
+pub const TCP_FLAG_PSH: u8 = 0x08;
+pub const TCP_FLAG_ACK: u8 = 0x10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct TcpControlFlags(pub u8);
+
+impl TcpControlFlags {
+    #[inline]
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TcpInputFlags: u8 {
+        const FIN = 0x01;
+        const SYN = 0x02;
+        const RST = 0x04;
+        const ACK = 0x10;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpPacket {
+    pub local: std::net::SocketAddr,
+    pub remote: std::net::SocketAddr,
+    pub sequence: TcpSeq,
+    pub acknowledgment: Option<TcpSeq>,
+    pub advertised_window: u16,
+    pub flags: TcpSegmentFlags,
+    pub capabilities: TcpCapabilities,
+    pub sack_blocks: hammer_infra::vec::Vec<TcpSackBlock>,
+    pub timestamp: Option<TcpTimestampOption>,
+    pub fast_open_cookie: Option<TcpFastOpenCookie>,
+    pub ip_ecn: Option<IpEcnCodepoint>,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TcpFastOpenCookie {
+    bytes: [u8; Self::MAX_LEN],
+    len: u8,
+}
+
+impl TcpFastOpenCookie {
+    pub const MIN_LEN: usize = 4;
+    pub const MAX_LEN: usize = 16;
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len()]
+    }
+
+    #[inline]
+    pub fn epoch(&self) -> Option<u32> {
+        (self.len() == Self::MAX_LEN && self.bytes[0] == 1).then(|| {
+            u32::from_be_bytes([self.bytes[1], self.bytes[2], self.bytes[3], self.bytes[4]])
+        })
+    }
+
+    #[inline]
+    pub fn constant_time_eq(&self, other: &Self) -> bool {
+        let lhs = self.as_slice();
+        let rhs = other.as_slice();
+        if lhs.len() != rhs.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        let mut index = 0usize;
+        while index < lhs.len() {
+            diff |= lhs[index] ^ rhs[index];
+            index += 1;
+        }
+        diff == 0
+    }
+
+    #[inline]
+    pub const fn is_valid_len(len: usize) -> bool {
+        len >= Self::MIN_LEN && len <= Self::MAX_LEN && len % 2 == 0
+    }
+}
+
+impl AsRef<[u8]> for TcpFastOpenCookie {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::Deref for TcpFastOpenCookie {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl TryFrom<&[u8]> for TcpFastOpenCookie {
+    type Error = ();
+
+    #[inline]
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if !Self::is_valid_len(value.len()) {
+            return Err(());
+        }
+        let mut cookie = Self {
+            bytes: [0; Self::MAX_LEN],
+            len: value.len() as u8,
+        };
+        cookie.bytes[..value.len()].copy_from_slice(value);
+        Ok(cookie)
+    }
+}
+
+impl From<[u8; TcpFastOpenCookie::MAX_LEN]> for TcpFastOpenCookie {
+    #[inline]
+    fn from(bytes: [u8; TcpFastOpenCookie::MAX_LEN]) -> Self {
+        Self {
+            bytes,
+            len: TcpFastOpenCookie::MAX_LEN as u8,
+        }
+    }
+}
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

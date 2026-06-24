@@ -1,11 +1,11 @@
 use crate::session::ready::SessionReadyQueue;
 use hammer_adapter::DataPlaneBuffers;
-use hammer_infra::timer_wheel::TimerWheel2t1w2048;
+use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 
 use crate::session::SessionId;
 
 pub(crate) struct SessionQueueControlContext {
-    timer_wheel: *mut TimerWheel2t1w2048<u32>,
+    timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
     ready: *mut SessionReadyQueue,
     buffers: *const DataPlaneBuffers,
     current_session_id: SessionId,
@@ -15,7 +15,7 @@ pub(crate) struct SessionQueueControlContext {
 impl SessionQueueControlContext {
     #[inline]
     pub(crate) fn new(
-        timer_wheel: *mut TimerWheel2t1w2048<u32>,
+        timer_wheel: *mut TimerWheel1t2w2048sl<u32>,
         ready: *mut SessionReadyQueue,
         buffers: *const DataPlaneBuffers,
         current_session_id: SessionId,
@@ -36,7 +36,7 @@ impl SessionQueueControlContext {
     }
 
     #[inline]
-    pub(crate) fn timer_wheel(&mut self) -> &mut TimerWheel2t1w2048<u32> {
+    pub(crate) fn timer_wheel(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
         unsafe { &mut *self.timer_wheel }
     }
 

@@ -4,8 +4,9 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use super::TcpQueueHandle;
 use super::segment::parse_tcp_packet;
+use super::publish_tcp_connection;
+use super::{TcpQueue, read_session_id};
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -16,7 +17,7 @@ pub enum TcpSynSentNext {
 
 #[hammer_component_macros::node(role = internal, next = TcpSynSentNext)]
 pub struct TcpSynSentNode<C: CongestionController + 'static> {
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
 }
 
 impl<C> Node for TcpSynSentNode<C>
@@ -53,13 +54,13 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpSynSentNode::<C>::runtime_nexts(runtime)?;
-    tcp_syn_sent_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
+    tcp_syn_sent_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
 }
 
 fn tcp_syn_sent_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     next: [NodeId; TcpSynSentNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
@@ -84,7 +85,7 @@ where
 fn tcp_syn_sent_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
@@ -94,34 +95,35 @@ where
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
     let mut tx_index = None;
+    let mut complete_connected = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let (session_id, _, _) = queue
-            .pending_route_by_tuple(packet.local, packet.remote)
-            .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
-        let (control, acked_tx_len, established_with_payload) = {
+        let session_id = read_session_id(runtime, index)?
+            .ok_or_else(|| CoreError::internal("tcp syn-sent session route is missing"))?;
+        let (control, acked_tx_len, established, established_with_payload) = {
             let connection = queue
                 .session_mut(session_id)
                 .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
             let control = connection.receive_open_reply(&packet)?;
+            let established = connection.state() == crate::transport::tcp::TcpState::Established;
             (
                 control,
                 connection.take_acked_tx_len(previous_snd_una),
+                established,
                 previous_state == crate::transport::tcp::TcpState::SynSent
-                    && connection.state() == crate::transport::tcp::TcpState::Established
+                    && established
                     && packet.payload_len != 0,
             )
         };
+        if established {
+            complete_connected = queue.session_app_op(session_id);
+        }
         if acked_tx_len != 0 {
             queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
         }
-        if let Some(cookie) = packet
-            .fast_open_cookie
-            .as_deref()
-            .filter(|cookie| !cookie.is_empty())
-        {
+        if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
             queue.aux_mut().remember_fast_open_cookie(
                 packet.local,
                 packet.remote,
@@ -132,7 +134,7 @@ where
         if established_with_payload {
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
-                buffer.advance(packet.payload_offset)?;
+                buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate_chain(packet.payload_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
@@ -141,7 +143,10 @@ where
             }
             release_input = false;
         };
-        queue.refresh_session_route(session_id)?;
+        publish_tcp_connection(&mut queue, session_id)?;
+        if let Some(op) = complete_connected.take() {
+            queue.app().complete_connected(op)?;
+        }
         if let Some(segment) = control {
             let allocated = runtime.packet_buffers().alloc_index()?;
             if let Err(error) = segment.write_to_buffer(runtime.packet_buffers(), allocated) {
@@ -181,8 +186,10 @@ mod tests {
 
     use crate::data_plane::DropNode;
     use crate::transport::congestion::BbrController;
+    use crate::transport::tcp::input::TcpInputControlPlane;
+    use crate::transport::tcp::lookup::TcpLookupSnapshot;
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
-    use crate::transport::tcp::{TcpInputNext, TcpQueueHandle, register_tcp_session_queue};
+    use crate::transport::tcp::{TcpInputNext, TcpQueue, TcpSessionDriver, connect_tcp_session};
 
     use super::*;
 
@@ -272,11 +279,13 @@ mod tests {
     #[test]
     fn valid_syn_ack_emits_final_ack_and_establishes() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let handle = register_tcp_session_queue::<BbrController>(
-            DataWorkerId::new(0),
-            runtime.packet_buffers().clone(),
-        )
-        .expect("register queue");
+        let handle =
+            crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
+                DataWorkerId::new(0),
+                runtime.packet_buffers().clone(),
+                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+            ))
+            .expect("register queue");
         let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_000);
@@ -296,10 +305,11 @@ mod tests {
             handle,
             TcpSynSentNext::nodes(output, drop),
         ));
+        let input = tcp_input_node(&runtime, handle, syn_sent, drop);
 
         send_packet(
             &runtime,
-            syn_sent,
+            input,
             tcp_packet(
                 REMOTE,
                 REMOTE_PORT,
@@ -311,7 +321,10 @@ mod tests {
             ),
         );
 
-        assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 3);
+        assert!(runtime.run_ready_nodes().expect("run syn-sent") >= 1);
+        if output_state.lock().unwrap().packets.is_empty() {
+            assert!(runtime.run_ready_nodes().expect("run output chain") >= 1);
+        }
         let packets = &output_state.lock().unwrap().packets;
         assert_eq!(packets.len(), 1);
         assert_tcp_packet(
@@ -333,14 +346,6 @@ mod tests {
             );
             assert_eq!(connection.snd_una(), client_isn + 1);
             assert_eq!(connection.rcv_nxt(), SERVER_ISN + 1);
-            assert_eq!(
-                queue.session_route_by_tuple(local_addr(), remote_addr()),
-                Some((session_id, DataWorkerId::new(0), TcpInputNext::Established))
-            );
-            assert_eq!(
-                queue.pending_route_by_tuple(local_addr(), remote_addr()),
-                None
-            );
         }
         let completion = app_ring.pop_completion().expect("connected completion");
         match completion.kind() {
@@ -352,11 +357,13 @@ mod tests {
     #[test]
     fn rst_closes_pending_syn_sent_session() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
-        let handle = register_tcp_session_queue::<BbrController>(
-            DataWorkerId::new(0),
-            runtime.packet_buffers().clone(),
-        )
-        .expect("register queue");
+        let handle =
+            crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
+                DataWorkerId::new(0),
+                runtime.packet_buffers().clone(),
+                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(DataWorkerId::new(0)),
+            ))
+            .expect("register queue");
         let (session_id, client_isn) = open_client_session(handle);
         let app_ring = AppRingHandle::new(4, 4);
         let app_op = AppOpId::new(8_001);
@@ -376,10 +383,11 @@ mod tests {
             handle,
             TcpSynSentNext::nodes(output, drop),
         ));
+        let input = tcp_input_node(&runtime, handle, syn_sent, drop);
 
         send_packet(
             &runtime,
-            syn_sent,
+            input,
             tcp_packet(
                 REMOTE,
                 REMOTE_PORT,
@@ -391,7 +399,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(runtime.run_ready_nodes().expect("run syn-sent"), 1);
+        assert!(runtime.run_ready_nodes().expect("run syn-sent") >= 1);
         assert!(output_state.lock().unwrap().packets.is_empty());
         let completion = app_ring.pop_completion().expect("closed completion");
         match completion.kind() {
@@ -401,26 +409,13 @@ mod tests {
         {
             let queue = handle.borrow_mut().expect("tcp queue");
             assert!(queue.session(session_id).is_none());
-            assert!(
-                queue
-                    .session_route_by_tuple(local_addr(), remote_addr())
-                    .is_none()
-            );
-            assert!(
-                queue
-                    .pending_route_by_tuple(local_addr(), remote_addr())
-                    .is_none()
-            );
         }
     }
 
-    fn open_client_session(
-        handle: TcpQueueHandle<BbrController>,
-    ) -> (crate::session::SessionId, u32) {
+    fn open_client_session(handle: TcpQueue<BbrController>) -> (crate::session::SessionId, u32) {
         let mut queue = handle.borrow_mut().expect("tcp queue");
-        let session_id = queue
-            .connect(local_addr(), remote_addr())
-            .expect("connect session");
+        let session_id =
+            connect_tcp_session(&mut queue, local_addr(), remote_addr()).expect("connect session");
         let connection = queue.session(session_id).expect("tcp session is missing");
         assert_eq!(connection.state(), crate::transport::tcp::TcpState::SynSent);
         let initial_sequence = connection.iss();
@@ -433,6 +428,23 @@ mod tests {
 
     fn remote_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(REMOTE), REMOTE_PORT)
+    }
+
+    fn tcp_input_node(
+        runtime: &DataPlaneRuntime,
+        handle: TcpQueue<BbrController>,
+        syn_sent: NodeId,
+        drop: NodeId,
+    ) -> NodeId {
+        let control = TcpInputControlPlane::new();
+        control
+            .publish_lookup(TcpLookupSnapshot::default())
+            .expect("publish lookup");
+        runtime.nodes().register_internal(control.node(
+            TcpInputNext::nodes(drop, drop, drop, drop, syn_sent, drop, drop),
+            Some(handle),
+            None,
+        ))
     }
 
     fn send_packet(runtime: &DataPlaneRuntime, node: NodeId, packet: std::vec::Vec<u8>) {

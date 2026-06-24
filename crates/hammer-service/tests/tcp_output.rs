@@ -112,10 +112,7 @@ fn tcp_segment_writes_nonzero_timestamp_when_enabled() {
             ..TcpCapabilities::default()
         },
         None,
-        Some(hammer_core::protocol::tcp::TcpTimestampOption {
-            tsval: 7,
-            tsecr: 3,
-        }),
+        Some(hammer_core::protocol::tcp::TcpTimestampOption { tsval: 7, tsecr: 3 }),
         None,
         None,
         0,

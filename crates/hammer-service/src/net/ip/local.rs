@@ -13,8 +13,8 @@ use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use crate::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
 use crate::net::{DpoType, FibLookupResult, FibTableHandle};
 
-use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
 use super::parse_ip_packet_with_chain_len;
+use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket};
 use crate::trace::codec::{
     TraceDecodeCursor, put_node, put_option_ip_protocol, put_option_ip_version, put_option_u16,
     put_u8, put_usize,
@@ -861,33 +861,28 @@ fn default_protocol_next(next: &[NodeId; IpLocalNext::COUNT], protocol: IpProtoc
 #[inline(always)]
 fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &[u8]) -> u16 {
     match parsed.version {
-        IpVersion::V4 => {
-            match (parsed.source, parsed.destination) {
-                (IpAddr::V4(source), IpAddr::V4(destination)) => internet_checksum_parts(&[
-                    &source.octets(),
-                    &destination.octets(),
-                    &[0, protocol],
-                    &(segment.len() as u16).to_be_bytes(),
-                    segment,
-                ]),
-                _ => return 1,
-            }
-        }
-        IpVersion::V6 => {
-            match (parsed.source, parsed.destination) {
-                (IpAddr::V6(source), IpAddr::V6(destination)) => internet_checksum_parts(&[
-                    &source.octets(),
-                    &destination.octets(),
-                    &(segment.len() as u32).to_be_bytes(),
-                    &[0, 0, 0, protocol],
-                    segment,
-                ]),
-                _ => return 1,
-            }
-        }
+        IpVersion::V4 => match (parsed.source, parsed.destination) {
+            (IpAddr::V4(source), IpAddr::V4(destination)) => internet_checksum_parts(&[
+                &source.octets(),
+                &destination.octets(),
+                &[0, protocol],
+                &(segment.len() as u16).to_be_bytes(),
+                segment,
+            ]),
+            _ => return 1,
+        },
+        IpVersion::V6 => match (parsed.source, parsed.destination) {
+            (IpAddr::V6(source), IpAddr::V6(destination)) => internet_checksum_parts(&[
+                &source.octets(),
+                &destination.octets(),
+                &(segment.len() as u32).to_be_bytes(),
+                &[0, 0, 0, protocol],
+                segment,
+            ]),
+            _ => return 1,
+        },
     }
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -7,8 +7,8 @@ use hammer_adapter::{
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::write_tcp_segment_header;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpTimestampOption,
-    tcp_options_from_bytes,
+    TcpCapabilities, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
+    TcpSegmentHeader, TcpSeq, TcpTimestampOption, tcp_options_from_bytes,
 };
 use hammer_infra::vec::Vec;
 
@@ -16,83 +16,99 @@ use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_c
 
 const TCP_SEGMENT_OPAQUE_PRESENT: u8 = 1 << 7;
 
-#[derive(Debug, Clone)]
-pub(crate) struct TcpPacket {
-    pub(crate) local: SocketAddr,
-    pub(crate) remote: SocketAddr,
-    pub(crate) sequence: TcpSeq,
-    pub(crate) acknowledgment: Option<TcpSeq>,
-    pub(crate) advertised_window: u16,
-    pub(crate) flags: TcpSegmentFlags,
-    pub(crate) capabilities: TcpCapabilities,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) sack_blocks: Vec<TcpSackBlock>,
-    pub(crate) timestamp: Option<TcpTimestampOption>,
-    pub(crate) fast_open_cookie: Option<Vec<u8>>,
-    pub(crate) ip_ecn: Option<IpEcnCodepoint>,
-    pub(crate) payload_offset: usize,
-    pub(crate) payload_len: usize,
-}
-
 pub(crate) fn parse_tcp_packet(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
 ) -> CoreResult<TcpPacket> {
-    let buffer = runtime.get_buffer(index)?;
-    let current = buffer.current();
-    let cursor = buffer.packet_cursor();
-    let parsed = parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first())
-        .map_err(|_| CoreError::internal("tcp packet has invalid IP header"))?;
-    if parsed.protocol != IpProtocol::Tcp || parsed.input_error != IpInputError::None {
-        return Err(CoreError::internal("packet is not TCP"));
-    }
-    let first_len = current.len().min(parsed.packet_len);
-    let packet = current
-        .get(..first_len)
-        .ok_or_else(|| CoreError::internal("tcp packet length is invalid"))?;
-    let source_ip = source_ip(parsed.version, packet)?;
-    let destination_ip = destination_ip(parsed.version, packet)?;
-    let transport = packet
-        .get(cursor.transport_header_offset()..first_len)
-        .ok_or_else(|| CoreError::internal("tcp transport header is missing"))?;
-    let segment = etherparse::TcpSlice::from_slice(transport).map_err(tcp_parse_error)?;
-    let parsed_options = tcp_options_from_bytes(segment.options());
-    let payload_offset = cursor
-        .transport_header_offset()
-        .checked_add(segment.header_len())
-        .ok_or_else(|| CoreError::internal("tcp payload offset overflow"))?;
-    let payload_len = parsed
-        .packet_len
-        .checked_sub(payload_offset)
-        .ok_or_else(|| CoreError::internal("tcp payload offset exceeds packet length"))?;
-    let local = SocketAddr::new(destination_ip, segment.destination_port());
-    let remote = SocketAddr::new(source_ip, segment.source_port());
-    let acknowledgment = segment.ack().then(|| segment.acknowledgment_number());
-    let mut flags = TcpSegmentFlags::empty();
-    flags.set(TcpSegmentFlags::NS, segment.ns());
-    flags.set(TcpSegmentFlags::FIN, segment.fin());
-    flags.set(TcpSegmentFlags::SYN, segment.syn());
-    flags.set(TcpSegmentFlags::RST, segment.rst());
-    flags.set(TcpSegmentFlags::PSH, segment.psh());
-    flags.set(TcpSegmentFlags::ACK, segment.ack());
-    flags.set(TcpSegmentFlags::URG, segment.urg());
-    flags.set(TcpSegmentFlags::ECE, segment.ece());
-    flags.set(TcpSegmentFlags::CWR, segment.cwr());
+    let (
+        local,
+        remote,
+        sequence,
+        acknowledgment,
+        advertised_window,
+        flags,
+        capabilities,
+        sack_blocks,
+        timestamp,
+        fast_open_cookie,
+        ip_ecn,
+        payload_offset,
+        payload_len,
+    ) = {
+        let buffer = runtime.get_buffer(index)?;
+        let current = buffer.current();
+        let cursor = buffer.packet_cursor();
+        let parsed =
+            parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first())
+                .map_err(|_| CoreError::internal("tcp packet has invalid IP header"))?;
+        if parsed.protocol != IpProtocol::Tcp || parsed.input_error != IpInputError::None {
+            return Err(CoreError::internal("packet is not TCP"));
+        }
+        let first_len = current.len().min(parsed.packet_len);
+        let packet = current
+            .get(..first_len)
+            .ok_or_else(|| CoreError::internal("tcp packet length is invalid"))?;
+        let source_ip = source_ip(parsed.version, packet)?;
+        let destination_ip = destination_ip(parsed.version, packet)?;
+        let transport = packet
+            .get(cursor.transport_header_offset()..first_len)
+            .ok_or_else(|| CoreError::internal("tcp transport header is missing"))?;
+        let segment = etherparse::TcpSlice::from_slice(transport).map_err(tcp_parse_error)?;
+        let parsed_options = tcp_options_from_bytes(segment.options());
+        let payload_offset = cursor
+            .transport_header_offset()
+            .checked_add(segment.header_len())
+            .ok_or_else(|| CoreError::internal("tcp payload offset overflow"))?;
+        let payload_len = parsed
+            .packet_len
+            .checked_sub(payload_offset)
+            .ok_or_else(|| CoreError::internal("tcp payload offset exceeds packet length"))?;
+        let local = SocketAddr::new(destination_ip, segment.destination_port());
+        let remote = SocketAddr::new(source_ip, segment.source_port());
+        let acknowledgment = segment
+            .ack()
+            .then(|| TcpSeq::from(segment.acknowledgment_number()));
+        let mut flags = TcpSegmentFlags::empty();
+        flags.set(TcpSegmentFlags::NS, segment.ns());
+        flags.set(TcpSegmentFlags::FIN, segment.fin());
+        flags.set(TcpSegmentFlags::SYN, segment.syn());
+        flags.set(TcpSegmentFlags::RST, segment.rst());
+        flags.set(TcpSegmentFlags::PSH, segment.psh());
+        flags.set(TcpSegmentFlags::ACK, segment.ack());
+        flags.set(TcpSegmentFlags::URG, segment.urg());
+        flags.set(TcpSegmentFlags::ECE, segment.ece());
+        flags.set(TcpSegmentFlags::CWR, segment.cwr());
+        (
+            local,
+            remote,
+            TcpSeq::from(segment.sequence_number()),
+            acknowledgment,
+            segment.window_size(),
+            flags,
+            parsed_options.capabilities,
+            parsed_options.sack_blocks,
+            parsed_options.timestamp,
+            parsed_options.fast_open_cookie,
+            unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+                .ip()
+                .ip_ecn()
+                .map(Into::into),
+            payload_offset,
+            payload_len,
+        )
+    };
     Ok(TcpPacket {
         local,
         remote,
-        sequence: TcpSeq::from(segment.sequence_number()),
-        acknowledgment: acknowledgment.map(TcpSeq::from),
-        advertised_window: segment.window_size(),
+        sequence,
+        acknowledgment,
+        advertised_window,
         flags,
-        capabilities: parsed_options.capabilities,
-        sack_blocks: parsed_options.sack_blocks,
-        timestamp: parsed_options.timestamp,
-        fast_open_cookie: parsed_options.fast_open_cookie,
-        ip_ecn: unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
-            .ip()
-            .ip_ecn()
-            .map(Into::into),
+        capabilities,
+        sack_blocks,
+        timestamp,
+        fast_open_cookie,
+        ip_ecn,
         payload_offset,
         payload_len,
     })
@@ -100,8 +116,8 @@ pub(crate) fn parse_tcp_packet(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpSegment {
-    local: SocketAddr,
-    remote: SocketAddr,
+    local_port: u16,
+    remote_port: u16,
     sequence: u32,
     acknowledgment: u32,
     advertised_window: u16,
@@ -110,7 +126,7 @@ pub struct TcpSegment {
     sack_blocks: Option<[TcpSackBlock; 4]>,
     sack_block_count: u8,
     timestamp: Option<TcpTimestampOption>,
-    fast_open_cookie: Option<[u8; 16]>,
+    fast_open_cookie: Option<TcpFastOpenCookie>,
     fast_open_cookie_len: u8,
     ip_ecn: Option<IpEcnCodepoint>,
     payload_len: usize,
@@ -128,23 +144,17 @@ impl TcpSegment {
         capabilities: TcpCapabilities,
         sack_blocks: Option<&[TcpSackBlock]>,
         timestamp: Option<TcpTimestampOption>,
-        fast_open_cookie: Option<&[u8]>,
+        fast_open_cookie: Option<TcpFastOpenCookie>,
         ip_ecn: Option<IpEcnCodepoint>,
         payload_len: usize,
     ) -> Self {
         let (sack_blocks, sack_block_count) = copy_sack_blocks(sack_blocks);
-        let mut copied_fast_open_cookie = None;
-        let mut fast_open_cookie_len = 0;
-        if let Some(cookie) = fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
-            let mut copied = [0u8; 16];
-            let len = cookie.len().min(copied.len());
-            copied[..len].copy_from_slice(&cookie[..len]);
-            copied_fast_open_cookie = Some(copied);
-            fast_open_cookie_len = len as u8;
-        }
+        let fast_open_cookie_len = fast_open_cookie
+            .as_ref()
+            .map_or(0, |cookie| cookie.len() as u8);
         Self {
-            local,
-            remote,
+            local_port: local.port(),
+            remote_port: remote.port(),
             sequence,
             acknowledgment,
             advertised_window,
@@ -153,7 +163,7 @@ impl TcpSegment {
             sack_blocks,
             sack_block_count,
             timestamp,
-            fast_open_cookie: copied_fast_open_cookie,
+            fast_open_cookie,
             fast_open_cookie_len,
             ip_ecn,
             payload_len,
@@ -162,22 +172,18 @@ impl TcpSegment {
 
     #[inline]
     pub fn write_header(&self, output: &mut [u8]) -> CoreResult<usize> {
-        let fast_open_cookie = self
-            .fast_open_cookie
-            .as_ref()
-            .map(|cookie| &cookie[..usize::from(self.fast_open_cookie_len)]);
         write_tcp_segment_header(
             output,
             TcpSegmentHeader {
-                source_port: self.local.port(),
-                destination_port: self.remote.port(),
+                source_port: self.local_port,
+                destination_port: self.remote_port,
                 sequence_number: self.sequence,
                 acknowledgment_number: self.acknowledgment,
                 flags: self.flags,
                 advertised_window: self.advertised_window,
                 capabilities: self.capabilities,
                 timestamp: self.timestamp,
-                fast_open_cookie,
+                fast_open_cookie: self.fast_open_cookie.as_ref(),
             },
             self.sack_blocks(),
         )
@@ -210,12 +216,24 @@ impl TcpSegment {
         Ok(())
     }
 
-    pub(crate) fn read_from_buffer(
-        runtime: &DataPlaneRuntime,
-        index: BufferIndex,
-    ) -> CoreResult<Self> {
-        let buffer = runtime.get_buffer(index)?;
-        let mut segment: Self = buffer.opaque().read::<TcpSegmentHeaderOpaque>().try_into()?;
+    pub(crate) fn read_from_buffer(buffer: &hammer_adapter::Buffer) -> CoreResult<Self> {
+        let mut segment: Self = buffer
+            .opaque()
+            .read::<TcpSegmentHeaderOpaque>()
+            .try_into()?;
+        segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
+        segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+            .ip()
+            .ip_ecn()
+            .map(Into::into);
+        Ok(segment)
+    }
+
+    pub(crate) fn read_from_buffer_ref(buffer: &hammer_adapter::BufferRef<'_>) -> CoreResult<Self> {
+        let mut segment: Self = buffer
+            .opaque()
+            .read::<TcpSegmentHeaderOpaque>()
+            .try_into()?;
         segment.apply_secondary_opaque(buffer.opaque2().read::<TcpSegmentSackOpaque>());
         segment.ip_ecn = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
             .ip()
@@ -235,8 +253,8 @@ impl TcpSegment {
         capabilities |= TCP_SEGMENT_OPAQUE_PRESENT;
         TcpSegmentHeaderOpaque {
             fields: TcpSegmentHeaderFields {
-                local_port: self.local.port(),
-                remote_port: self.remote.port(),
+                local_port: self.local_port,
+                remote_port: self.remote_port,
                 advertised_window: self.advertised_window,
                 flags: self.flags.bits(),
                 capabilities,
@@ -249,7 +267,6 @@ impl TcpSegment {
             },
         }
     }
-
 }
 
 impl TryFrom<TcpSegmentHeaderOpaque> for TcpSegment {
@@ -262,8 +279,8 @@ impl TryFrom<TcpSegmentHeaderOpaque> for TcpSegment {
             return Err(CoreError::internal("tcp segment intent is missing"));
         }
         Ok(Self {
-            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.local_port),
-            remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), fields.remote_port),
+            local_port: fields.local_port,
+            remote_port: fields.remote_port,
             sequence: fields.sequence,
             acknowledgment: fields.acknowledgment,
             advertised_window: fields.advertised_window,
@@ -294,16 +311,18 @@ impl TcpSegment {
         let mut blocks = [0u64; 4];
         if let Some(sack_blocks) = self.sack_blocks() {
             for (slot, block) in sack_blocks.iter().take(blocks.len()).enumerate() {
-                blocks[slot] =
-                    (u64::from(u32::from(block.left_edge)) << 32) | u64::from(u32::from(block.right_edge));
+                blocks[slot] = (u64::from(u32::from(block.left_edge)) << 32)
+                    | u64::from(u32::from(block.right_edge));
             }
         }
         let mut cookie_words = [0u64; 2];
-        let timestamp = self.timestamp.unwrap_or(TcpTimestampOption { tsval: 0, tsecr: 0 });
+        let timestamp = self
+            .timestamp
+            .unwrap_or(TcpTimestampOption { tsval: 0, tsecr: 0 });
         if let Some(cookie) = self.fast_open_cookie.as_ref() {
-            let mut bytes = [0u8; 16];
-            let len = usize::from(self.fast_open_cookie_len);
-            bytes[..len].copy_from_slice(&cookie[..len]);
+            let mut bytes = [0u8; TcpFastOpenCookie::MAX_LEN];
+            let len = cookie.len();
+            bytes[..len].copy_from_slice(cookie.as_slice());
             cookie_words[0] = u64::from_ne_bytes(bytes[..8].try_into().expect("cookie word 0"));
             cookie_words[1] = u64::from_ne_bytes(bytes[8..16].try_into().expect("cookie word 1"));
         }
@@ -340,21 +359,20 @@ impl TcpSegment {
             }
         }
         let mut cookie = None;
-        if fields.cookie_words[0] != 0 || fields.cookie_words[1] != 0 {
-            let mut bytes = [0u8; 16];
+        if self.fast_open_cookie_len != 0 {
+            let mut bytes = [0u8; TcpFastOpenCookie::MAX_LEN];
             bytes[..8].copy_from_slice(&fields.cookie_words[0].to_ne_bytes());
             bytes[8..16].copy_from_slice(&fields.cookie_words[1].to_ne_bytes());
-            cookie = Some(bytes);
+            cookie = (&bytes[..usize::from(self.fast_open_cookie_len)])
+                .try_into()
+                .ok();
         }
         self.sack_blocks = (count != 0).then_some(blocks);
         self.sack_block_count = count as u8;
-        self.timestamp = self
-            .capabilities
-            .timestamps
-            .then_some(TcpTimestampOption {
-                tsval: fields.timestamp[0],
-                tsecr: fields.timestamp[1],
-            });
+        self.timestamp = self.capabilities.timestamps.then_some(TcpTimestampOption {
+            tsval: fields.timestamp[0],
+            tsecr: fields.timestamp[1],
+        });
         self.fast_open_cookie = cookie;
     }
 }
@@ -521,7 +539,9 @@ mod tests {
         segment
             .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
-        let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
+        let restored =
+            TcpSegment::read_from_buffer_ref(&runtime.get_buffer(index).expect("buffer"))
+                .expect("read segment");
 
         let mut header = [0u8; 64];
         let written = restored.write_header(&mut header).expect("write header");
@@ -548,7 +568,7 @@ mod tests {
             },
             None,
             None,
-            Some(&[1, 2, 3, 4]),
+            Some((&[1, 2, 3, 4][..]).try_into().expect("cookie")),
             None,
             5,
         );
@@ -556,12 +576,20 @@ mod tests {
         segment
             .write_to_buffer(runtime.packet_buffers(), index)
             .expect("write segment");
-        let restored = TcpSegment::read_from_buffer(&runtime, index).expect("read segment");
+        let restored =
+            TcpSegment::read_from_buffer_ref(&runtime.get_buffer(index).expect("buffer"))
+                .expect("read segment");
 
         let mut header = [0u8; 64];
         let written = restored.write_header(&mut header).expect("write header");
         let parsed = tcp_options_from_bytes(&header[20..written]);
-        assert_eq!(parsed.fast_open_cookie.as_deref(), Some(&[1, 2, 3, 4][..]));
+        assert_eq!(
+            parsed
+                .fast_open_cookie
+                .as_ref()
+                .map(TcpFastOpenCookie::as_slice),
+            Some(&[1, 2, 3, 4][..])
+        );
     }
 
     fn ipv4_tcp_packet_with_sack() -> std::vec::Vec<u8> {

@@ -4,13 +4,17 @@ use std::future::Future;
 use std::mem::transmute;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_infra::{align::CacheLine, boxed::Slice, prefetch::prefetch_read_l1, vec::Vec};
+use hammer_infra::{
+    align::CacheLine,
+    boxed::Slice,
+    prefetch::{prefetch_read_l1, prefetch_write_l1},
+    vec::Vec,
+};
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
@@ -178,9 +182,6 @@ pub struct Buffer {
     cacheline0: PacketBufferCacheline0,
     cacheline1: PacketBufferCacheline1,
     storage: Slice<u8>,
-    storage_view: NonNull<u8>,
-    storage_capacity: usize,
-    storage_owner_slot: u32,
 }
 
 const _: () = assert!(std::mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
@@ -188,25 +189,21 @@ const _: () = assert!(std::mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
 impl Buffer {
     #[inline]
     fn with_slot_capacity(slot_capacity: usize) -> Self {
-        let mut storage = Slice::from_elem(slot_capacity, 0);
+        let storage = Slice::from_elem(slot_capacity, 0);
         Self {
             cacheline0: PacketBufferCacheline0::default(),
             cacheline1: PacketBufferCacheline1::default(),
-            storage_view: NonNull::new(storage.as_mut_ptr()).unwrap_or_else(NonNull::dangling),
-            storage_capacity: storage.len(),
-            storage_owner_slot: PACKET_BUFFER_INVALID_INDEX,
             storage,
         }
     }
 
     #[inline]
-    fn reset(&mut self, slot: u32, bytes: &[u8]) -> CoreResult<()> {
-        self.reset_storage_view(slot);
-        if bytes.len() > self.storage_capacity {
+    fn reset(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        if bytes.len() > self.storage.len() {
             return Err(CoreError::internal(format!(
                 "buffer bytes exceed slot capacity: {} > {}",
                 bytes.len(),
-                self.storage_capacity
+                self.storage.len()
             )));
         }
         let headroom = 0usize;
@@ -220,7 +217,7 @@ impl Buffer {
         self.cacheline1 = PacketBufferCacheline1::default();
         let start = headroom;
         let end = start + bytes.len();
-        self.storage_view_mut()[start..end].copy_from_slice(bytes);
+        self.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
         Ok(())
     }
 
@@ -228,14 +225,6 @@ impl Buffer {
     fn reset_for_free(&mut self) {
         self.cacheline0 = PacketBufferCacheline0::default();
         self.cacheline1 = PacketBufferCacheline1::default();
-        self.storage_owner_slot = PACKET_BUFFER_INVALID_INDEX;
-    }
-
-    #[inline]
-    fn reset_storage_view(&mut self, slot: u32) {
-        self.storage_view = NonNull::new(self.storage.as_mut_ptr()).unwrap_or_else(NonNull::dangling);
-        self.storage_capacity = self.storage.len();
-        self.storage_owner_slot = slot;
     }
 
     #[inline]
@@ -337,8 +326,8 @@ impl Buffer {
     }
 
     #[inline]
-    fn storage_owner_slot(&self) -> u32 {
-        self.storage_owner_slot
+    pub fn ref_count(&self) -> u8 {
+        self.cacheline0.ref_count
     }
 
     #[inline]
@@ -362,7 +351,7 @@ impl Buffer {
     pub fn current(&self) -> &[u8] {
         let start = self.current_data();
         let end = start + self.current_len();
-        &self.storage_view()[start..end]
+        &self.storage.as_slice()[start..end]
     }
 
     #[inline]
@@ -374,13 +363,13 @@ impl Buffer {
     pub fn current_mut(&mut self) -> &mut [u8] {
         let start = self.current_data();
         let end = start + self.current_len();
-        &mut self.storage_view_mut()[start..end]
+        &mut self.storage.as_mut_slice()[start..end]
     }
 
     #[inline]
     pub fn writable_tail_mut(&mut self) -> &mut [u8] {
         let start = self.current_data() + self.current_len();
-        &mut self.storage_view_mut()[start..]
+        &mut self.storage.as_mut_slice()[start..]
     }
 
     #[inline]
@@ -398,8 +387,22 @@ impl Buffer {
     }
 
     #[inline]
+    pub fn prepend(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        if bytes.len() > self.current_data() {
+            return Err(CoreError::internal("buffer prepend exceeds headroom"));
+        }
+        let start = self.current_data() - bytes.len();
+        self.set_current_data(start)?;
+        let end = start + bytes.len();
+        self.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
+        self.set_current_len(self.current_len() + bytes.len())?;
+        Ok(())
+    }
+
+    #[inline]
     fn available_tail(&self) -> usize {
-        self.storage_capacity
+        self.storage
+            .len()
             .saturating_sub(self.current_data() + self.current_len())
     }
 
@@ -411,7 +414,7 @@ impl Buffer {
         }
         let start = self.current_data() + self.current_len();
         let end = start + take;
-        self.storage_view_mut()[start..end].copy_from_slice(&bytes[..take]);
+        self.storage.as_mut_slice()[start..end].copy_from_slice(&bytes[..take]);
         self.set_current_len(self.current_len() + take)
             .expect("buffer append keeps current length within u16");
         take
@@ -429,16 +432,6 @@ impl Buffer {
         self.cacheline0.current_length = u16::try_from(len)
             .map_err(|_| CoreError::internal("buffer current_length exceeds u16"))?;
         Ok(())
-    }
-
-    #[inline]
-    fn storage_view(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.storage_view.as_ptr(), self.storage_capacity) }
-    }
-
-    #[inline]
-    fn storage_view_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.storage_view.as_ptr(), self.storage_capacity) }
     }
 
     #[inline]
@@ -471,8 +464,6 @@ impl Buffer {
 struct BufferSlot {
     generation: u32,
     allocated: bool,
-    header_live: bool,
-    storage_ref_count: u8,
     buffer: Buffer,
 }
 
@@ -856,8 +847,8 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        self.buffers.advance(index, len)
+    pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
+        self.buffers.advance(index, displacement)
     }
 
     #[inline]
@@ -1460,8 +1451,6 @@ impl BufferPoolArena {
                 CacheLine::new(BufferSlot {
                     generation: 0,
                     allocated: false,
-                    header_live: false,
-                    storage_ref_count: 0,
                     buffer: Buffer::with_slot_capacity(slot_capacity),
                 })
             })
@@ -1555,8 +1544,7 @@ impl BufferPool {
 
     #[inline]
     pub fn attach_clone(&self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
-        let mut cache = self.thread_cache.borrow_mut();
-        self.arena.inner.borrow_mut().attach_clone(&mut cache, head, tail)
+        self.arena.inner.borrow_mut().attach_clone(head, tail)
     }
 
     #[inline]
@@ -1567,6 +1555,11 @@ impl BufferPool {
     #[inline]
     pub fn prefetch_read(&self, index: BufferIndex) {
         self.arena.inner.borrow().prefetch_read(index);
+    }
+
+    #[inline]
+    pub fn prefetch_write(&self, index: BufferIndex) {
+        self.arena.inner.borrow().prefetch_write(index);
     }
 
     #[inline]
@@ -1588,7 +1581,7 @@ impl BufferPool {
     #[inline]
     pub fn get_mut(&self, index: BufferIndex) -> CoreResult<BufferRefMut<'_>> {
         let mut guard = self.arena.inner.borrow_mut();
-        guard.ensure_storage_exclusive(index)?;
+        guard.ensure_writable(index)?;
         guard.buffer_mut(index)?;
         let thread_cache = self.thread_cache.borrow_mut();
         Ok(BufferRefMut {
@@ -1638,7 +1631,7 @@ impl BufferPool {
     #[inline]
     pub fn current_mut_ptr(&self, index: BufferIndex) -> CoreResult<*mut u8> {
         let mut guard = self.arena.inner.borrow_mut();
-        guard.ensure_storage_exclusive(index)?;
+        guard.ensure_writable(index)?;
         Ok(guard.buffer_mut(index)?.current_mut_ptr())
     }
 
@@ -1683,15 +1676,15 @@ impl BufferPool {
     }
 
     #[inline]
-    pub fn advance(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
+    pub fn advance(&self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
-        pool.advance(index, len)
+        pool.advance(index, displacement)
     }
 
     #[inline]
     pub fn truncate_current(&self, index: BufferIndex, len: usize) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
-        pool.ensure_storage_exclusive(index)?;
+        pool.ensure_writable(index)?;
         let buffer = pool.buffer_mut(index)?;
         if len > buffer.current_len() {
             return Err(CoreError::internal(
@@ -1705,7 +1698,7 @@ impl BufferPool {
     #[inline]
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
-        pool.ensure_storage_exclusive(index)?;
+        pool.ensure_writable(index)?;
         let buffer = pool.buffer_mut(index)?;
         if bytes.len() > buffer.current_data() {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
@@ -2114,10 +2107,26 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn advance(&mut self, index: BufferIndex, len: usize) -> CoreResult<()> {
-        if len == 0 {
+    fn advance(&mut self, index: BufferIndex, displacement: isize) -> CoreResult<()> {
+        if displacement == 0 {
             return Ok(());
         }
+
+        if displacement < 0 {
+            let rewind = displacement.unsigned_abs();
+            let buffer = self.buffer(index)?;
+            if rewind > buffer.current_data() {
+                return Err(CoreError::internal("buffer rewind exceeds headroom"));
+            }
+            self.ensure_header_exclusive(index)?;
+            let buffer = self.buffer_mut(index)?;
+            buffer.set_current_data(buffer.current_data() - rewind)?;
+            buffer.set_current_len(buffer.current_len() + rewind)?;
+            return Ok(());
+        }
+
+        let len = usize::try_from(displacement)
+            .map_err(|_| CoreError::internal("buffer advance displacement overflow"))?;
 
         let first = self.buffer(index)?;
         if self.next_buffer(index)?.is_none() {
@@ -2246,9 +2255,7 @@ impl BufferPoolInner {
             .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
         entry.generation = entry.generation.wrapping_add(1).max(1);
         entry.allocated = true;
-        entry.header_live = true;
-        entry.storage_ref_count = 1;
-        entry.buffer.reset(slot, bytes)?;
+        entry.buffer.reset(bytes)?;
         self.in_use += 1;
         Ok(BufferIndex {
             pool_id: self.pool_id,
@@ -2299,36 +2306,18 @@ impl BufferPoolInner {
 
     #[inline]
     fn ensure_header_exclusive(&self, index: BufferIndex) -> CoreResult<()> {
-        self.buffer(index)?;
-        if self
-            .slots
-            .get(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?
-            .header_live
-        {
-            return Ok(());
-        }
-        Err(CoreError::internal("buffer header is not live"))
-    }
-
-    #[inline]
-    fn ensure_storage_exclusive(&self, index: BufferIndex) -> CoreResult<()> {
-        self.ensure_header_exclusive(index)?;
-        let entry = self
-            .slots
-            .get(index.slot as usize)
-            .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
-        let owner_slot = entry.buffer.storage_owner_slot() as usize;
-        let owner = self
-            .slots
-            .get(owner_slot)
-            .ok_or_else(|| CoreError::internal("buffer storage owner is invalid"))?;
-        if owner.storage_ref_count == 1 {
+        let buffer = self.buffer(index)?;
+        if buffer.ref_count() == 1 {
             return Ok(());
         }
         Err(CoreError::internal(
-            "shared buffer segment requires exclusive ownership",
+            "shared buffer requires exclusive header ownership",
         ))
+    }
+
+    #[inline]
+    fn ensure_writable(&self, index: BufferIndex) -> CoreResult<()> {
+        self.ensure_header_exclusive(index)
     }
 
     #[inline]
@@ -2347,6 +2336,16 @@ impl BufferPoolInner {
         prefetch_buffer_header(buffer);
         prefetch_buffer_cacheline1(buffer);
         prefetch_buffer_data(buffer);
+    }
+
+    #[inline]
+    fn prefetch_write(&self, index: BufferIndex) {
+        let Ok(buffer) = self.buffer(index) else {
+            return;
+        };
+        prefetch_buffer_header_write(buffer);
+        prefetch_buffer_cacheline1_write(buffer);
+        prefetch_buffer_data_write(buffer);
     }
 
     #[inline]
@@ -2375,43 +2374,20 @@ impl BufferPoolInner {
             }
             if entry.allocated {
                 let next_slot = entry.buffer.next_buffer_slot();
-                let owner_slot = entry.buffer.storage_owner_slot() as usize;
-                let handle = (entry.buffer.cacheline1.trace_handle != 0)
-                    .then_some(entry.buffer.cacheline1.trace_handle);
-                {
-                    let entry = self
-                        .slots
-                        .get_mut(slot)
-                        .expect("buffer slot remains valid");
-                    entry.header_live = false;
+                let ref_count = entry.buffer.ref_count();
+                if ref_count > 1 {
+                    if let Some(entry) = self.slots.get_mut(slot) {
+                        entry.buffer.cacheline0.ref_count =
+                            entry.buffer.cacheline0.ref_count.saturating_sub(1);
+                    }
+                } else {
+                    let handle = (entry.buffer.cacheline1.trace_handle != 0)
+                        .then_some(entry.buffer.cacheline1.trace_handle);
+                    if let Some(handle) = handle {
+                        released_trace_handles.push(handle);
+                    }
+                    let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
                     entry.buffer.cacheline1.trace_handle = 0;
-                }
-                if let Some(handle) = handle {
-                    released_trace_handles.push(handle);
-                }
-                let release_storage = {
-                    let owner = self
-                        .slots
-                        .get_mut(owner_slot)
-                        .and_then(|owner| owner.allocated.then_some(owner))
-                        .expect("buffer storage owner must be live");
-                    owner.storage_ref_count = owner.storage_ref_count.saturating_sub(1);
-                    owner.storage_ref_count == 0
-                };
-                if release_storage {
-                    let owner = self
-                        .slots
-                        .get_mut(owner_slot)
-                        .expect("buffer storage owner slot");
-                    owner.storage_ref_count = 0;
-                    owner.buffer.reset_storage_view(owner_slot as u32);
-                }
-                let can_free_header = owner_slot != slot || release_storage;
-                if can_free_header {
-                    let entry = self
-                        .slots
-                        .get_mut(slot)
-                        .expect("buffer slot remains valid");
                     entry.allocated = false;
                     entry.buffer.reset_for_free();
                     self.in_use = self.in_use.saturating_sub(1);
@@ -2426,88 +2402,33 @@ impl BufferPoolInner {
     }
 
     #[inline]
-    fn attach_clone(
-        &mut self,
-        cache: &mut BufferThreadCache,
-        head: BufferIndex,
-        tail: BufferIndex,
-    ) -> CoreResult<()> {
+    fn attach_clone(&mut self, head: BufferIndex, tail: BufferIndex) -> CoreResult<()> {
         if head == tail {
             return Err(CoreError::internal(
                 "buffer attach clone requires distinct head and tail",
             ));
         }
         self.ensure_header_exclusive(head)?;
+        self.ensure_header_exclusive(tail)?;
         if self.next_buffer(head)?.is_some() {
             return Err(CoreError::internal(
                 "buffer attach clone requires head without next buffer",
             ));
         }
-        let mut source = Some(tail);
-        let mut clone_tail = head;
-        while let Some(source_index) = source {
-            let source_next = self.next_buffer(source_index)?;
-            let (
-                current_data,
-                current_length,
-                flags,
-                flow_id,
-                error,
-                current_config_or_punt,
-                opaque,
-                total_length_not_including_first,
-                opaque2,
-                storage_owner_slot,
-                storage_view,
-                storage_capacity,
-            ) = {
-                let source_buffer = self.buffer(source_index)?;
-                (
-                    source_buffer.cacheline0.current_data,
-                    source_buffer.cacheline0.current_length,
-                    source_buffer.cacheline0.flags,
-                    source_buffer.cacheline0.flow_id,
-                    source_buffer.cacheline0.error,
-                    source_buffer.cacheline0.current_config_or_punt,
-                    source_buffer.cacheline0.opaque,
-                    source_buffer.cacheline1.total_length_not_including_first,
-                    source_buffer.cacheline1.opaque2,
-                    source_buffer.storage_owner_slot(),
-                    source_buffer.storage_view,
-                    source_buffer.storage_capacity,
-                )
-            };
-            let next_clone = self.alloc_empty_chain(cache)?;
-            self.buffer_mut(clone_tail)?
-                .set_next_buffer(Some(next_clone));
-            let clone_buffer = self.buffer_mut(next_clone)?;
-            clone_buffer.cacheline0.current_data = current_data;
-            clone_buffer.cacheline0.current_length = current_length;
-            clone_buffer.cacheline0.flags = flags;
-            clone_buffer.cacheline0.flow_id = flow_id;
-            clone_buffer.cacheline0.error = error;
-            clone_buffer.cacheline0.current_config_or_punt = current_config_or_punt;
-            clone_buffer.cacheline0.opaque = opaque;
-            clone_buffer.cacheline1.total_length_not_including_first =
-                total_length_not_including_first;
-            clone_buffer.cacheline1.opaque2 = opaque2;
-            clone_buffer.storage_owner_slot = storage_owner_slot;
-            clone_buffer.storage_view = storage_view;
-            clone_buffer.storage_capacity = storage_capacity;
-            let owner = self
-                .slots
-                .get_mut(storage_owner_slot as usize)
-                .ok_or_else(|| CoreError::internal("buffer storage owner is invalid"))?;
-            owner.storage_ref_count = owner
-                .storage_ref_count
+        {
+            let head_buffer = self.buffer_mut(head)?;
+            head_buffer.set_next_buffer(Some(tail));
+        }
+        let mut current = Some(tail);
+        while let Some(current_index) = current {
+            let next = self.next_buffer(current_index)?;
+            let buffer = self.buffer_mut(current_index)?;
+            buffer.cacheline0.ref_count = buffer
+                .cacheline0
+                .ref_count
                 .checked_add(1)
                 .ok_or_else(|| CoreError::internal("buffer refcount overflow"))?;
-            if let Some(next_source) = source_next {
-                clone_tail = next_clone;
-                source = Some(next_source);
-            } else {
-                source = None;
-            }
+            current = next;
         }
         self.refresh_chain_lengths(head)
     }
@@ -2560,9 +2481,10 @@ impl BufferPoolInner {
         index: BufferIndex,
         bytes: &[u8],
     ) -> CoreResult<()> {
-        self.ensure_storage_exclusive(index)?;
+        self.ensure_writable(index)?;
         let mut tail = index;
         while let Some(next) = self.next_buffer(tail)? {
+            self.ensure_writable(next)?;
             tail = next;
         }
 
@@ -2666,14 +2588,31 @@ fn prefetch_buffer_header(buffer: &Buffer) {
 }
 
 #[inline(always)]
+fn prefetch_buffer_header_write(buffer: &Buffer) {
+    prefetch_write_l1(std::ptr::from_ref(&buffer.cacheline0).cast::<u8>());
+}
+
+#[inline(always)]
 fn prefetch_buffer_cacheline1(buffer: &Buffer) {
     prefetch_read_l1(std::ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+}
+
+#[inline(always)]
+fn prefetch_buffer_cacheline1_write(buffer: &Buffer) {
+    prefetch_write_l1(std::ptr::from_ref(&buffer.cacheline1).cast::<u8>());
 }
 
 #[inline(always)]
 fn prefetch_buffer_data(buffer: &Buffer) {
     if !buffer.current().is_empty() {
         prefetch_read_l1(buffer.current().as_ptr());
+    }
+}
+
+#[inline(always)]
+fn prefetch_buffer_data_write(buffer: &Buffer) {
+    if !buffer.current().is_empty() {
+        prefetch_write_l1(buffer.current().as_ptr());
     }
 }
 
@@ -3839,13 +3778,18 @@ impl BufferBatchMut<'_> {
     }
 
     #[inline]
+    pub fn prefetch_write(&self, index: BufferIndex) {
+        self.guard.prefetch_write(index);
+    }
+
+    #[inline]
     pub fn buffer(&self, index: BufferIndex) -> CoreResult<&Buffer> {
         self.guard.buffer(index)
     }
 
     #[inline]
     pub fn buffer_mut(&mut self, index: BufferIndex) -> CoreResult<&mut Buffer> {
-        self.guard.ensure_storage_exclusive(index)?;
+        self.guard.ensure_writable(index)?;
         self.guard.buffer_mut(index)
     }
 
@@ -3865,7 +3809,7 @@ impl BufferBatchMut<'_> {
         index: BufferIndex,
         f: impl FnOnce(&mut Buffer) -> R,
     ) -> CoreResult<R> {
-        self.guard.ensure_storage_exclusive(index)?;
+        self.guard.ensure_writable(index)?;
         let buffer = self.guard.buffer_mut(index)?;
         Ok(f(buffer))
     }
@@ -3874,6 +3818,17 @@ impl BufferBatchMut<'_> {
 pub struct BufferRef<'pool> {
     guard: Ref<'pool, BufferPoolInner>,
     index: BufferIndex,
+}
+
+impl Deref for BufferRef<'_> {
+    type Target = Buffer;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+    }
 }
 
 impl BufferRef<'_> {
@@ -3898,42 +3853,21 @@ impl BufferRef<'_> {
     }
 
     #[inline]
+    pub fn prefetch_write(&self) {
+        let buffer = self
+            .guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer");
+        prefetch_buffer_header_write(buffer);
+        prefetch_buffer_cacheline1_write(buffer);
+        prefetch_buffer_data_write(buffer);
+    }
+
+    #[inline]
     pub fn buffer_ptr(&self) -> *const Buffer {
         self.guard
             .buffer(self.index)
             .expect("buffer ref points to valid buffer") as *const Buffer
-    }
-
-    #[inline]
-    pub fn packet_cursor(&self) -> BufferPacketCursor {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .packet_cursor()
-    }
-
-    #[inline]
-    pub fn opaque(&self) -> &crate::PrimaryOpaque {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque()
-    }
-
-    #[inline]
-    pub fn opaque2(&self) -> &crate::SecondaryOpaque {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque2()
-    }
-
-    #[inline]
-    pub fn current_config(&self) -> crate::NodeId {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_config()
     }
 
     #[inline]
@@ -3946,51 +3880,10 @@ impl BufferRef<'_> {
     }
 
     #[inline]
-    pub fn trace_handle(&self) -> Option<u32> {
+    pub fn next_buffer(&self) -> Option<BufferIndex> {
         self.guard
-            .buffer(self.index)
+            .next_buffer(self.index)
             .expect("buffer ref points to valid buffer")
-            .trace_handle()
-    }
-
-    #[inline]
-    pub fn current(&self) -> &[u8] {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current()
-    }
-
-    #[inline]
-    pub fn current_ptr(&self) -> *const u8 {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_ptr()
-    }
-
-    #[inline]
-    pub fn current_data(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_data()
-    }
-
-    #[inline]
-    pub fn current_len(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_len()
-    }
-
-    #[inline]
-    pub fn total_len_not_including_first(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .total_len_not_including_first()
     }
 }
 
@@ -4000,15 +3893,44 @@ pub struct BufferRefMut<'pool> {
     index: BufferIndex,
 }
 
+impl Deref for BufferRefMut<'_> {
+    type Target = Buffer;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .buffer(self.index)
+            .expect("buffer ref points to valid buffer")
+    }
+}
+
+impl DerefMut for BufferRefMut<'_> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .ensure_header_exclusive(self.index)
+            .expect("buffer ref mut requires exclusive header ownership");
+        self.guard
+            .buffer_mut(self.index)
+            .expect("buffer ref points to valid buffer")
+    }
+}
+
 impl BufferRefMut<'_> {
     #[inline]
-    pub fn attach_clone(&mut self, tail: BufferIndex) -> CoreResult<()> {
-        self.guard.attach_clone(&mut self.thread_cache, self.index, tail)
+    pub fn prepend(&mut self, bytes: &[u8]) -> CoreResult<()> {
+        self.deref_mut().prepend(bytes)
     }
 
     #[inline]
-    pub fn advance(&mut self, len: usize) -> CoreResult<()> {
-        self.guard.advance(self.index, len)
+    pub fn attach_clone(&mut self, tail: BufferIndex) -> CoreResult<()> {
+        let _ = &self.thread_cache;
+        self.guard.attach_clone(self.index, tail)
+    }
+
+    #[inline]
+    pub fn advance(&mut self, displacement: isize) -> CoreResult<()> {
+        self.guard.advance(self.index, displacement)
     }
 
     #[inline]
@@ -4018,11 +3940,9 @@ impl BufferRefMut<'_> {
     }
 
     #[inline]
-    pub fn packet_cursor(&self) -> BufferPacketCursor {
+    pub fn append(&mut self, bytes: &[u8]) -> CoreResult<()> {
         self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .packet_cursor()
+            .append_chain(&mut self.thread_cache, self.index, bytes)
     }
 
     #[inline]
@@ -4035,193 +3955,32 @@ impl BufferRefMut<'_> {
     }
 
     #[inline]
-    pub fn set_node_error(&mut self, error: BufferNodeError) {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .set_node_error(error);
-    }
-
-    #[inline]
     pub fn next_buffer(&self) -> Option<BufferIndex> {
         self.guard
             .next_buffer(self.index)
             .expect("buffer ref points to valid buffer")
     }
+}
 
-    #[inline]
-    pub fn set_trace_handle(&mut self, handle: u32) {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .set_trace_handle(handle);
-    }
+#[cfg(test)]
+mod tests {
+    use super::DataPlaneRuntime;
 
-    #[inline]
-    pub fn take_trace_handle(&mut self) -> Option<u32> {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .take_trace_handle()
-    }
+    #[test]
+    fn advance_with_negative_displacement_rewinds_into_headroom() {
+        let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let index = runtime.alloc_index().expect("alloc buffer");
+        runtime.append(index, b"hello").expect("append payload");
 
-    #[inline]
-    pub fn clear_node_error(&mut self) {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .clear_node_error();
-    }
+        runtime.advance(index, -4).expect("rewind into headroom");
 
-    #[inline]
-    pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .set_packet_cursor(cursor);
-    }
-
-    #[inline]
-    pub fn opaque(&self) -> &crate::PrimaryOpaque {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque()
-    }
-
-    #[inline]
-    pub fn opaque_mut(&mut self) -> &mut crate::PrimaryOpaque {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque_mut()
-    }
-
-    #[inline]
-    pub fn opaque2(&self) -> &crate::SecondaryOpaque {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque2()
-    }
-
-    #[inline]
-    pub fn current_config(&self) -> crate::NodeId {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_config()
-    }
-
-    #[inline]
-    pub fn set_current_config(&mut self, next: crate::NodeId) {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .set_current_config(next);
-    }
-
-    #[inline]
-    pub fn opaque2_mut(&mut self) -> &mut crate::SecondaryOpaque {
-        self.guard
-            .ensure_header_exclusive(self.index)
-            .expect("buffer ref mut requires live header");
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .opaque2_mut()
-    }
-
-    #[inline]
-    pub fn current(&self) -> &[u8] {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current()
-    }
-
-    #[inline]
-    pub fn current_mut(&mut self) -> &mut [u8] {
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_mut()
-    }
-
-    #[inline]
-    pub fn writable_tail_mut(&mut self) -> &mut [u8] {
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .writable_tail_mut()
-    }
-
-    #[inline]
-    pub fn commit_writable_tail(&mut self, len: usize) -> CoreResult<()> {
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .commit_writable_tail(len)
-    }
-
-    #[inline]
-    pub fn current_ptr(&self) -> *const u8 {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_ptr()
-    }
-
-    #[inline]
-    pub fn current_mut_ptr(&mut self) -> *mut u8 {
-        self.guard
-            .buffer_mut(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_mut_ptr()
-    }
-
-    #[inline]
-    pub fn current_data(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_data()
-    }
-
-    #[inline]
-    pub fn current_len(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .current_len()
-    }
-
-    #[inline]
-    pub fn total_len_not_including_first(&self) -> usize {
-        self.guard
-            .buffer(self.index)
-            .expect("buffer ref points to valid buffer")
-            .total_len_not_including_first()
+        let buffer = runtime.get_buffer(index).expect("buffer");
+        assert_eq!(buffer.current_len(), 4);
+        assert_eq!(buffer.total_len_not_including_first(), 5);
+        assert_eq!(runtime.copy_current_chain(index).expect("packet").len(), 9);
+        assert_eq!(
+            &runtime.copy_current_chain(index).expect("packet")[4..],
+            b"hello"
+        );
     }
 }

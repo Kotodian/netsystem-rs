@@ -1,4 +1,6 @@
-use super::{TcpCapabilities, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption};
+use super::{
+    TcpCapabilities, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
+};
 use crate::error::{CoreError, CoreResult};
 
 const TCP_HEADER_MIN_LEN: usize = 20;
@@ -25,7 +27,7 @@ pub struct TcpSegmentHeader<'a> {
     pub advertised_window: u16,
     pub capabilities: TcpCapabilities,
     pub timestamp: Option<TcpTimestampOption>,
-    pub fast_open_cookie: Option<&'a [u8]>,
+    pub fast_open_cookie: Option<&'a TcpFastOpenCookie>,
 }
 
 pub fn write_tcp_segment_header(
@@ -74,7 +76,7 @@ fn tcp_options_len(header: TcpSegmentHeader<'_>, sack_blocks: Option<&[TcpSackBl
             len += 12;
         }
         if header.capabilities.fast_open {
-            len += 2 + header.fast_open_cookie.map_or(0, <[u8]>::len);
+            len += 2 + header.fast_open_cookie.map_or(0, TcpFastOpenCookie::len);
         }
         if header.capabilities.accurate_ecn {
             len += 3;
@@ -132,7 +134,9 @@ fn write_tcp_options(
             written = write_tcp_timestamp_option(output, written, header.timestamp);
         }
         if header.capabilities.fast_open {
-            let cookie = header.fast_open_cookie.unwrap_or(&[]);
+            let cookie = header
+                .fast_open_cookie
+                .map_or(&[][..], TcpFastOpenCookie::as_slice);
             output[written] = super::options::TCP_OPTION_FAST_OPEN_VALUE;
             output[written + 1] = (2 + cookie.len()) as u8;
             output[written + 2..written + 2 + cookie.len()].copy_from_slice(cookie);
@@ -194,4 +198,49 @@ fn write_tcp_timestamp_option(
 #[inline]
 const fn round_tcp_options_len(len: usize) -> usize {
     (len + 3) & !3
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_segment_header_writes_fast_open_cookie_from_value_type() {
+        let cookie: TcpFastOpenCookie = (&[1, 2, 3, 4][..]).try_into().expect("cookie");
+        let mut output = [0u8; 64];
+
+        let written = write_tcp_segment_header(
+            &mut output,
+            TcpSegmentHeader {
+                source_port: 1000,
+                destination_port: 2000,
+                sequence_number: 1,
+                acknowledgment_number: 0,
+                flags: TcpSegmentFlags::SYN,
+                advertised_window: 4096,
+                capabilities: TcpCapabilities {
+                    fast_open: true,
+                    ..TcpCapabilities::default()
+                },
+                timestamp: None,
+                fast_open_cookie: Some(&cookie),
+            },
+            None,
+        )
+        .expect("write header");
+
+        assert_eq!(
+            &output[TCP_HEADER_MIN_LEN..written],
+            &[
+                super::super::options::TCP_OPTION_FAST_OPEN_VALUE,
+                6,
+                1,
+                2,
+                3,
+                4,
+                0,
+                0
+            ]
+        );
+    }
 }

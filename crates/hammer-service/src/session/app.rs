@@ -27,7 +27,6 @@ impl SessionAppCloseSubmission {
     pub(crate) const fn session_id(self) -> SessionId {
         self.session_id
     }
-
 }
 
 #[derive(Debug)]
@@ -162,7 +161,8 @@ impl SessionAppRuntime {
             self.buffers().free_index(head);
             return Ok(true);
         }
-        buffers.advance(head, len)?;
+        let mut buffer = buffers.get_buffer_mut(head)?;
+        buffer.advance(len as isize)?;
         Ok(false)
     }
 
@@ -343,10 +343,7 @@ mod tests {
             Some(5)
         );
         let first = app.pending_send_head(session_a).expect("first pending");
-        assert_eq!(
-            buffers.copy_current_chain(first).expect("copied"),
-            b"first"
-        );
+        assert_eq!(buffers.copy_current_chain(first).expect("copied"), b"first");
         app.free_pending_send(session_a);
         assert!(!app.has_pending_send(session_a));
         assert!(app.has_pending_send(session_b));

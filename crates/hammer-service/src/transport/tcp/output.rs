@@ -1,6 +1,6 @@
 use hammer_adapter::{
-    BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
@@ -114,27 +114,43 @@ fn tcp_output_node_process_frame(
     drop: NodeId,
     cached_next: Option<NodeId>,
 ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    NodeVectorDispatch::new(cached_next).route_frame_index(runtime, frame, |index| {
-        tcp_output_next_for_index(runtime, index, lookup, drop).map(Some)
-    })
+    NodeVectorDispatch::new(cached_next).route_frame(
+        runtime,
+        frame,
+        prefetch_tcp_output,
+        |batch, indices, nexts| {
+            for (offset, index) in indices.iter().copied().enumerate() {
+                nexts[offset] = Some(tcp_output_next_for_index(batch, index, lookup, drop)?);
+            }
+            Ok(())
+        },
+    )
 }
 
 fn tcp_output_next_for_index(
-    runtime: &DataPlaneRuntime,
+    batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
     lookup: NodeId,
     drop: NodeId,
 ) -> CoreResult<NodeId> {
-    let Ok(segment) = TcpSegment::read_from_buffer(runtime, index) else {
+    let buffer = batch.buffer_mut(index)?;
+    let Ok(segment) = TcpSegment::read_from_buffer(&buffer) else {
         return Ok(drop);
     };
     let mut header = [0u8; 64];
     let header_len = segment.write_header(&mut header)?;
     let header = &header[..header_len];
-    if runtime.packet_buffers().prepend(index, header).is_err() {
+    if buffer.prepend(header).is_err() {
         return Ok(drop);
     }
     Ok(lookup)
+}
+
+#[inline(always)]
+fn prefetch_tcp_output(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+    for index in indices.iter().copied() {
+        batch.prefetch_write(index);
+    }
 }
 
 #[inline]

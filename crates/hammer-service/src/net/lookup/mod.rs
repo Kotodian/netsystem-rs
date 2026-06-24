@@ -815,18 +815,14 @@ fn apply_adjacency_rewrite(
     adjacency: Adjacency,
 ) -> CoreResult<()> {
     let rewrite = adjacency.rewrite.as_slice();
-    if !rewrite.is_empty() {
-        if runtime.current_data(index)? >= rewrite.len() {
-            runtime.prepend(index, rewrite)?;
-        } else {
-            let packet = runtime.copy_current_chain(index)?;
-            runtime.truncate_chain(index, 0)?;
-            runtime.append(index, rewrite)?;
-            runtime.append(index, &packet)?;
-        }
-    }
-
     let mut buffer = runtime.get_buffer_mut(index)?;
+    if !rewrite.is_empty() {
+        buffer.advance(
+            -isize::try_from(rewrite.len())
+                .map_err(|_| CoreError::internal("adjacency rewrite length exceeds isize"))?,
+        )?;
+        buffer.current_mut()[..rewrite.len()].copy_from_slice(rewrite);
+    }
     if !rewrite.is_empty() {
         let cursor = buffer.packet_cursor();
         buffer.set_packet_cursor(shift_packet_cursor(cursor, rewrite.len()));

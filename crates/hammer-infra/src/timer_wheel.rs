@@ -82,8 +82,7 @@ pub struct TimerWheel<
     const FAST_BITMAP: bool,
     const OVERFLOW: bool,
     const DUPLICATE_STOP: bool,
->
-where
+> where
     T: Copy,
 {
     current_tick: u64,
@@ -102,10 +101,11 @@ where
     max_expirations: usize,
 }
 
-pub type TimerWheel1t1w32<T> = TimerWheel<T, 1, 32, false, false, true>;
+pub type TimerWheel1t1w32sl<T> = TimerWheel<T, 1, 32, false, false, true>;
 pub type TimerWheel1w32FastHint<T> = TimerWheel<T, 1, 32, true, false, true>;
-pub type TimerWheel2w32<T> = TimerWheel<T, 2, 32, false, false, true>;
-pub type TimerWheel2t1w2048<T> = TimerWheel<T, 1, 2048, false, false, true>;
+pub type TimerWheel1t2w32sl<T> = TimerWheel<T, 2, 32, false, false, true>;
+pub type TimerWheel2t1w2048sl<T> = TimerWheel<T, 1, 2048, false, false, true>;
+pub type TimerWheel1t2w2048sl<T> = TimerWheel<T, 2, 2048, false, false, true>;
 
 impl<
     T,
@@ -398,7 +398,8 @@ where
             u32::try_from(slot).is_ok(),
             "timer wheel entry index overflow"
         );
-        self.entries.push(TimerEntry::timer(1, payload, expiration_tick));
+        self.entries
+            .push(TimerEntry::timer(1, payload, expiration_tick));
         self.len += 1;
         slot as u32
     }
@@ -636,18 +637,12 @@ impl<
         Ok(())
     }
 
-    pub fn cancel_timer(
-        &mut self,
-        slot: u32,
-        generation: u32,
-        timer_id: u32,
-    ) -> bool {
+    pub fn cancel_timer(&mut self, slot: u32, generation: u32, timer_id: u32) -> bool {
         if self.timers_per_slot == 0 {
             return false;
         }
         let slot = slot as usize;
-        if slot >= self.slot_generations.len() || self.slot_generations[slot] != generation
-        {
+        if slot >= self.slot_generations.len() || self.slot_generations[slot] != generation {
             return false;
         }
         let flat = self.timer_flat_index(slot as u32, timer_id);
@@ -700,7 +695,10 @@ impl<
     }
 
     fn prepare_slot(&mut self, slot: u32, generation: u32) {
-        assert!(self.timers_per_slot > 0, "timers per slot are not configured");
+        assert!(
+            self.timers_per_slot > 0,
+            "timers per slot are not configured"
+        );
         let slot = slot as usize;
         if slot >= self.slot_generations.len() {
             let additional = slot + 1 - self.slot_generations.len();
@@ -748,7 +746,10 @@ impl<
 
     #[inline]
     fn timer_flat_index(&self, slot: u32, timer_id: u32) -> usize {
-        assert!(self.timers_per_slot > 0, "timers per slot are not configured");
+        assert!(
+            self.timers_per_slot > 0,
+            "timers per slot are not configured"
+        );
         let timer_id = timer_id as usize;
         assert!(
             timer_id < self.timers_per_slot,

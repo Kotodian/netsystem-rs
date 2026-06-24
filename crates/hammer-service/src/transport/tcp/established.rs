@@ -4,8 +4,14 @@ use hammer_adapter::{
 };
 use hammer_core::error::{CoreError, CoreResult};
 
-use super::{TCP_TIMER_DELAYED_ACK, TCP_TIMER_PERSIST, TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpQueueHandle, refresh_tcp_timers_for_session};
 use super::segment::parse_tcp_packet;
+use super::{
+    refresh_tcp_timers,
+    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
+    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpQueue, TcpWorkerOwnedState,
+    read_session_id,
+};
+use crate::session::protocol::SessionQueueControlContext;
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -16,7 +22,7 @@ pub enum TcpEstablishedNext {
 
 #[hammer_component_macros::node(role = internal, next = TcpEstablishedNext)]
 pub struct TcpEstablishedNode<C: CongestionController + 'static> {
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
 }
 
 impl<C> Node for TcpEstablishedNode<C>
@@ -53,13 +59,13 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpEstablishedNode::<C>::runtime_nexts(runtime)?;
-    tcp_established_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
+    tcp_established_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
 }
 
 fn tcp_established_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     next: [NodeId; TcpEstablishedNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
@@ -84,7 +90,7 @@ where
 fn tcp_established_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
@@ -96,22 +102,30 @@ where
     let mut tx_segment = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let (session_id, _, _) = queue
-            .session_route_by_tuple(packet.local, packet.remote)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-        let (control, ack_advanced, acked_tx_len, accept_payload, immediate_ack) = {
+        let session_id = read_session_id(runtime, index)?
+            .ok_or_else(|| CoreError::internal("tcp established session route is missing"))?;
+        let (
+            control,
+            acked_tx_len,
+            ack_advanced,
+            accept_payload,
+            accepted_sequence,
+            duplicate_payload,
+        ) = {
             let connection = queue
                 .session_mut(session_id)
                 .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
             let previous_snd_una = connection.snd_una();
             let (control, _) = connection.receive_established(&packet)?;
-            let acked_tx_len = connection.take_acked_tx_len(previous_snd_una);
+            let accept_payload = connection.accept_payload(&packet);
+            let duplicate_payload = accept_payload.is_none() && packet.payload_len != 0;
             (
                 control,
+                connection.take_acked_tx_len(previous_snd_una),
                 connection.snd_una() != previous_snd_una,
-                acked_tx_len,
-                connection.accept_payload(&packet),
-                false,
+                accept_payload,
+                packet.sequence,
+                duplicate_payload,
             )
         };
         if acked_tx_len != 0 {
@@ -120,49 +134,48 @@ where
         if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
             queue.mark_ready(session_id);
         }
-        let mut immediate_ack = immediate_ack;
+        let mut immediate_ack = false;
         if let Some((trim, offset)) = accept_payload {
             let accepted_len = packet.payload_len.saturating_sub(trim);
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
-                buffer.advance(packet.payload_offset.saturating_add(trim))?;
+                buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
                 buffer.truncate_chain(accepted_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
-            {
-                let connection = queue
-                    .session_mut(session_id)
-                    .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
-                connection.receive_payload(
-                    packet.sequence,
-                    trim as u32,
-                    enqueue.delivered_len,
-                    enqueue.newest_ooo_start,
-                    enqueue.newest_ooo_len,
-                );
-                let clean_in_order = trim == 0
-                    && offset == 0
-                    && enqueue.delivered_len == accepted_len as u32
-                    && enqueue.newest_ooo_start.is_none();
-                immediate_ack = if clean_in_order {
-                    connection.on_clean_in_order_payload()
-                } else {
-                    true
-                };
-            }
+            let connection = queue
+                .session_mut(session_id)
+                .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+            connection.receive_payload(
+                accepted_sequence,
+                trim as u32,
+                enqueue.delivered_len,
+                enqueue.newest_ooo_start,
+                enqueue.newest_ooo_len,
+            );
+            let clean_in_order = trim == 0
+                && offset == 0
+                && enqueue.delivered_len == accepted_len as u32
+                && enqueue.newest_ooo_start.is_none();
+            immediate_ack = if clean_in_order {
+                connection.on_clean_in_order_payload()
+            } else {
+                true
+            };
             if enqueue.delivered_len != 0 {
                 queue.mark_ready(session_id);
             }
             release_input = false;
-        } else if packet.payload_len != 0 {
-            let sequence = packet.sequence;
-            let end_sequence = sequence.advance(packet.payload_len as u32);
+        } else if duplicate_payload {
             let connection = queue
                 .session_mut(session_id)
                 .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+            let sequence = packet.sequence;
+            let end_sequence = sequence.advance(packet.payload_len as u32);
             connection.observe_duplicate_payload(sequence, end_sequence);
             immediate_ack = true;
         }
+
         if immediate_ack {
             let connection = queue
                 .session_mut(session_id)
@@ -173,16 +186,37 @@ where
                 None,
             ));
         }
-        refresh_tcp_timers_for_session(
-            &mut queue,
+        let has_pending_tx = queue.app().pending_send_head(session_id).is_some();
+        let connection = queue
+            .session(session_id)
+            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?
+            as *const _;
+        let mut context = SessionQueueControlContext::new(
+            queue.timers_mut() as *mut _,
+            queue.ready_mut_ptr(),
+            queue.buffers() as *const _,
             session_id,
+            has_pending_tx,
+        );
+        refresh_tcp_timers(
+            unsafe { &*connection },
+            &mut context,
             (1u16 << TCP_TIMER_RETRANSMIT)
                 | (1u16 << TCP_TIMER_RACK)
                 | (1u16 << TCP_TIMER_TLP)
                 | (1u16 << TCP_TIMER_DELAYED_ACK)
-                | (1u16 << TCP_TIMER_PERSIST),
+                | (1u16 << TCP_TIMER_PERSIST)
+                | (1u16 << TCP_TIMER_KEEP_ALIVE)
+                | (1u16 << TCP_TIMER_PACING),
         )?;
-        queue.refresh_session_route(session_id)?;
+        let connection = queue
+            .session(session_id)
+            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?
+            as *const _;
+        let aux = queue.aux_mut() as *mut TcpWorkerOwnedState;
+        if unsafe { (*aux).publish_connection(session_id, &*connection) } {
+            let _ = queue.close_session(session_id)?;
+        }
         if tx_segment.is_none() {
             tx_segment = control;
         }

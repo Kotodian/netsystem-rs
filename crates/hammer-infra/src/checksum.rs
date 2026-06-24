@@ -78,7 +78,7 @@ fn accumulate_even_words(bytes: &[u8]) -> u64 {
 fn accumulate_even_words(bytes: &[u8]) -> u64 {
     use core::arch::aarch64::{
         uint16x8_t, uint32x4_t, vaddlvq_u32, vaddq_u32, vget_high_u16, vget_low_u16, vld1q_u8,
-        vreinterpretq_u16_u8, vrev16q_u8, vmovl_u16,
+        vmovl_u16, vreinterpretq_u16_u8, vrev16q_u8,
     };
 
     unsafe {
@@ -120,7 +120,10 @@ fn accumulate_u64_words(bytes: &[u8]) -> u64 {
         index += 8;
     }
     while index + 2 <= bytes.len() {
-        sum = sum.wrapping_add(u64::from(u16::from_be_bytes([bytes[index], bytes[index + 1]])));
+        sum = sum.wrapping_add(u64::from(u16::from_be_bytes([
+            bytes[index],
+            bytes[index + 1],
+        ])));
         index += 2;
     }
     sum
@@ -154,7 +157,10 @@ mod tests {
     #[test]
     fn internet_checksum_matches_scalar_reference() {
         let payload: Vec<u8> = (0..197).map(|value| value as u8).collect();
-        assert_eq!(internet_checksum(&payload), scalar_internet_checksum(&payload));
+        assert_eq!(
+            internet_checksum(&payload),
+            scalar_internet_checksum(&payload)
+        );
     }
 
     #[test]

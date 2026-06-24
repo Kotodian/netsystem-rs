@@ -6,8 +6,13 @@ use hammer_core::error::{CoreError, CoreResult};
 
 use crate::transport::congestion::CongestionController;
 
-use super::{TCP_TIMER_DELAYED_ACK, TCP_TIMER_PERSIST, TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpQueueHandle, refresh_tcp_timers_for_session};
 use super::segment::parse_tcp_packet;
+use super::{
+    publish_tcp_connection, refresh_tcp_timers_for_session,
+    TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
+    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpQueue,
+    read_session_id,
+};
 
 #[hammer_component_macros::node_next]
 pub enum TcpRcvProcessNext {
@@ -17,7 +22,7 @@ pub enum TcpRcvProcessNext {
 
 #[hammer_component_macros::node(role = internal, next = TcpRcvProcessNext)]
 pub struct TcpRcvProcessNode<C: CongestionController + 'static> {
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
 }
 
 impl<C> Node for TcpRcvProcessNode<C>
@@ -54,13 +59,13 @@ where
     C: CongestionController + 'static,
 {
     let next = TcpRcvProcessNode::<C>::runtime_nexts(runtime)?;
-    tcp_rcv_process_frame::<C>(runtime, frame, TcpQueueHandle::new(data), next)
+    tcp_rcv_process_frame::<C>(runtime, frame, TcpQueue::<C>::new(data), next)
 }
 
 fn tcp_rcv_process_frame<C>(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     next: [NodeId; TcpRcvProcessNext::COUNT],
 ) -> CoreResult<NodeResult>
 where
@@ -85,7 +90,7 @@ where
 fn tcp_rcv_process_index<C>(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    session_queue: TcpQueueHandle<C>,
+    session_queue: TcpQueue<C>,
     tcp_output: NodeId,
     next_frames: &mut NodeNextFrames,
 ) -> CoreResult<()>
@@ -94,28 +99,42 @@ where
 {
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
+    let mut complete_connected = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let (session_id, _, _) = queue
-            .session_route_by_tuple(packet.local, packet.remote)
-            .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
-        let (control, established_with_payload) = {
+        let session_id = read_session_id(runtime, index)?
+            .ok_or_else(|| CoreError::internal("tcp rcv-process session route is missing"))?;
+        let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
             let connection = queue
                 .session_mut(session_id)
                 .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
             let previous_state = connection.state();
+            let previous_snd_una = connection.snd_una();
             let control = connection.receive_close_side(&packet)?;
+            let established = connection.state() == crate::transport::tcp::TcpState::Established;
             (
                 control,
+                connection.snd_una() != previous_snd_una,
+                connection.take_acked_tx_len(previous_snd_una),
+                established,
                 previous_state == crate::transport::tcp::TcpState::SynRcvd
-                    && connection.state() == crate::transport::tcp::TcpState::Established
+                    && established
                     && packet.payload_len != 0,
             )
         };
+        if acked_tx_len != 0 {
+            queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
+        }
+        if ack_advanced && queue.app().pending_send_len(session_id)?.is_some() {
+            queue.mark_ready(session_id);
+        }
+        if established {
+            complete_connected = queue.session_app_op(session_id);
+        }
         if established_with_payload {
             {
                 let mut buffer = runtime.packet_buffers().get_buffer_mut(index)?;
-                buffer.advance(packet.payload_offset)?;
+                buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate_chain(packet.payload_len)?;
             }
             let enqueue = queue.enqueue_rx(session_id, index, 0, false)?;
@@ -132,9 +151,14 @@ where
                 | (1u16 << TCP_TIMER_TLP)
                 | (1u16 << TCP_TIMER_DELAYED_ACK)
                 | (1u16 << TCP_TIMER_PERSIST)
+                | (1u16 << TCP_TIMER_KEEP_ALIVE)
+                | (1u16 << TCP_TIMER_PACING)
                 | (1u16 << TCP_TIMER_TIME_WAIT),
         )?;
-        queue.refresh_session_route(session_id)?;
+        publish_tcp_connection(&mut queue, session_id)?;
+        if let Some(op) = complete_connected.take() {
+            queue.app().complete_connected(op)?;
+        }
         Ok(control)
     };
     let control = result?;

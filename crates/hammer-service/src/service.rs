@@ -44,18 +44,19 @@ use crate::ProbeManager;
 use crate::app::AppHost;
 use crate::data_plane::{DropNode, HandoffNode};
 use crate::net::{FibTableBuilder, IpLookupControlPlane};
-use crate::session::node::SessionQueueHandle;
 use crate::session::SessionQueueNode;
+use crate::session::node::SessionQueueHandle;
+use crate::session::runtime::dispatch_registered_session_queue_once_at;
 use crate::transport::congestion::BbrController;
 use crate::transport::tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerAddress, TcpListenerLookupAccess,
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use crate::transport::tcp::tcp_session_queue_dispatch_fn;
 use crate::transport::tcp::{
-    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext, TcpListenNext,
-    TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
-    TcpResetNext, TcpResetNode, TcpSynSentNext, TcpSynSentNode, register_tcp_session_queue,
+    TcpConnection, TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext,
+    TcpListenNext, TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext,
+    TcpRcvProcessNode, TcpResetNext, TcpResetNode, TcpSessionDriver, TcpSynSentNext,
+    TcpSynSentNode,
 };
 use hammer_core::protocol::tcp::TcpCapabilities;
 
@@ -922,10 +923,13 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 )
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
-            let queue = register_tcp_session_queue::<BbrController>(
+            let queue = crate::session::node::register_session_queue(TcpSessionDriver::<
+                BbrController,
+            >::new(
                 worker,
                 runtime.packet_buffers().clone(),
-            )
+                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(worker),
+            ))
             .map_err(HammerError::from)?;
             let session_queue = SessionQueueHandle::<
                 crate::session::runtime::SessionDriverRuntime<
@@ -967,7 +971,7 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .try_register_internal(TcpListenNode::new(
                     tcp_control.clone(),
                     queue,
-                    TcpListenNext::nodes(tcp_output, drop),
+                    TcpListenNext::nodes(tcp_output, tcp_established, drop),
                 ))
                 .map_err(HammerError::from)?;
             let tcp_input = runtime
@@ -995,7 +999,10 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 .attach_queue(
                     session_queue,
                     tcp_output.into(),
-                    tcp_session_queue_dispatch_fn::<BbrController>(),
+                    dispatch_registered_session_queue_once_at::<
+                        crate::transport::tcp::TcpConnection<BbrController>,
+                        crate::transport::tcp::lookup::TcpWorkerOwnedState,
+                    >,
                 )
                 .map_err(HammerError::from)?;
             runtime

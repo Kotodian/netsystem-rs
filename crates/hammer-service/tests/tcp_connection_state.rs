@@ -1,13 +1,11 @@
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 
 use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{TcpConnectionId, TcpState};
-use hammer_service::session::SessionId;
 use hammer_service::transport::congestion::{BbrController, CongestionController};
 use hammer_service::transport::tcp::connection::TcpConnection;
-use hammer_service::transport::tcp::lookup::TcpConnectionRouteIndex;
 use hammer_service::transport::tcp::{
     DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TCP_TIMER_RETRANSMIT, TcpInputNext,
 };
@@ -97,109 +95,6 @@ fn tcp_connection_does_not_keep_private_pacing_deadline() {
 
     assert!(!source.contains("next_output_at"));
     assert!(!source.contains("schedule_next_output"));
-}
-
-#[test]
-fn tcp_connection_index_resolves_connection_id_and_tuple_to_route() {
-    let first = connection(TcpConnectionId::new(101), 50_011);
-    let second = connection(TcpConnectionId::new(102), 50_012);
-    let first_session = SessionId::new(1_011);
-    let second_session = SessionId::new(1_012);
-    let first_local = first.local().expect("first local socket");
-    let first_remote = first.remote();
-    let second_local = second.local().expect("second local socket");
-    let second_remote = second.remote();
-    let mut index = TcpConnectionRouteIndex::empty();
-
-    index.upsert(
-        first_session,
-        first.connection_id(),
-        first.local(),
-        first.remote(),
-        first.owner_worker(),
-        first.next_node(),
-    );
-    index.upsert(
-        second_session,
-        second.connection_id(),
-        second.local(),
-        second.remote(),
-        second.owner_worker(),
-        second.next_node(),
-    );
-
-    assert_eq!(
-        index
-            .lookup_by_connection_id(TcpConnectionId::new(102))
-            .expect("id connection"),
-        second_session
-    );
-    assert_eq!(
-        index
-            .lookup_by_tuple(first_local, first_remote)
-            .expect("tuple connection"),
-        (first_session, DataWorkerId::new(0), TcpInputNext::SynSent)
-    );
-
-    index.forget_session(first_session);
-    assert!(
-        index
-            .lookup_by_connection_id(TcpConnectionId::new(101))
-            .is_none()
-    );
-    assert!(index.lookup_by_tuple(first_local, first_remote).is_none());
-    assert_eq!(
-        index
-            .lookup_by_tuple(second_local, second_remote)
-            .expect("second tuple remains"),
-        (second_session, DataWorkerId::new(0), TcpInputNext::SynSent)
-    );
-}
-
-#[test]
-fn tcp_connection_index_resolves_ipv6_tuple_without_compressing_key() {
-    let local = SocketAddr::new(
-        IpAddr::V6("2001:db8:200::10".parse::<Ipv6Addr>().expect("local")),
-        50_123,
-    );
-    let remote = SocketAddr::new(
-        IpAddr::V6("2001:db8:100::20".parse::<Ipv6Addr>().expect("remote")),
-        443,
-    );
-    let mut connection: TcpConnection<BbrController> = TcpConnection::new(
-        Some(TcpConnectionId::new(202)),
-        DataWorkerId::new(0),
-        local.port(),
-        Some(local),
-        remote,
-    );
-    connection.connect_state(1);
-    let session_id = SessionId::new(2_022);
-    let mut index = TcpConnectionRouteIndex::empty();
-
-    index.upsert(
-        session_id,
-        connection.connection_id(),
-        connection.local(),
-        connection.remote(),
-        connection.owner_worker(),
-        connection.next_node(),
-    );
-
-    assert_eq!(
-        index
-            .lookup_by_tuple(local, remote)
-            .expect("IPv6 tuple lookup"),
-        (session_id, DataWorkerId::new(0), TcpInputNext::SynSent)
-    );
-    assert!(
-        index
-            .lookup_by_tuple(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), local.port()),
-                remote
-            )
-            .is_none()
-    );
 }
 
 #[test]

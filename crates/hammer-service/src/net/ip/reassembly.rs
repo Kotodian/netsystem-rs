@@ -894,7 +894,9 @@ impl ReassemblyContext {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
         let header_len = first.header_len;
-        if header_len < IPV4_HEADER_MIN_LEN || runtime.current_len(first.index)? < header_len {
+        if header_len < IPV4_HEADER_MIN_LEN
+            || runtime.get_buffer(first.index)?.current_len() < header_len
+        {
             return Err(CoreError::internal("invalid IPv4 fragment header"));
         }
         let total_len = header_len
@@ -909,16 +911,16 @@ impl ReassemblyContext {
         fragments.sort_by_key(|fragment| fragment.start);
         for fragment in fragments.iter().copied() {
             if fragment.index == complete {
-                runtime.truncate_chain(
-                    complete,
-                    fragment.header_len + (fragment.end - fragment.start),
-                )?;
+                let mut buffer = runtime.get_buffer_mut(complete)?;
+                buffer.truncate_chain(fragment.header_len + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.append_existing_chain(complete, fragment.index)?;
             }
         }
-        runtime.truncate_chain(complete, total_len)?;
+        runtime
+            .get_buffer_mut(complete)?
+            .truncate_chain(total_len)?;
         {
             let mut buffer = runtime.get_buffer_mut(complete)?;
             let header = buffer.current();
@@ -943,7 +945,9 @@ impl ReassemblyContext {
     ) -> CoreResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
-        if runtime.current_len(first.index)? < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
+        if runtime.get_buffer(first.index)?.current_len()
+            < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
+        {
             return Err(CoreError::internal("invalid IPv6 fragment header"));
         }
         let payload_len = total_payload_len;
@@ -975,10 +979,9 @@ impl ReassemblyContext {
                     .copy_from_slice(&(payload_len as u16).to_be_bytes());
                 header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
                 drop(buffer);
-                runtime.truncate_current(
-                    complete,
-                    IPV6_HEADER_LEN + (fragment.end - fragment.start),
-                )?;
+                runtime
+                    .get_buffer_mut(complete)?
+                    .truncate_chain(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.append_existing_chain(complete, fragment.index)?;
@@ -987,7 +990,9 @@ impl ReassemblyContext {
         let total_len = IPV6_HEADER_LEN
             .checked_add(payload_len)
             .ok_or_else(|| CoreError::internal("IPv6 reassembled length overflow"))?;
-        runtime.truncate_chain(complete, total_len)?;
+        runtime
+            .get_buffer_mut(complete)?
+            .truncate_chain(total_len)?;
         Ok(ReassemblyInsert::Reassembled(complete))
     }
 
@@ -1050,10 +1055,9 @@ fn trim_fragment_payload_chain(
     fragment: ReassemblyFragment,
 ) -> CoreResult<()> {
     let payload_len = fragment.end - fragment.start;
-    runtime
-        .packet_buffers()
-        .advance(fragment.index, fragment.header_len)?;
-    runtime.truncate_chain(fragment.index, payload_len)
+    let mut buffer = runtime.get_buffer_mut(fragment.index)?;
+    buffer.advance(fragment.header_len as isize)?;
+    buffer.truncate_chain(payload_len)
 }
 
 #[inline(always)]

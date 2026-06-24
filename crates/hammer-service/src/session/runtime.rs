@@ -1,18 +1,18 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId};
+use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
-use hammer_infra::timer_wheel::TimerWheel2t1w2048;
+use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::AppOpId;
 #[cfg(test)]
 use hammer_runtime::app::AppRingHandle;
 
 use crate::session::{
-    SessionAppRuntime, SessionId, SessionReadyQueue,
+    SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
 };
 
 const DEFAULT_SESSION_TIMER_TICK: Duration = Duration::from_millis(10);
@@ -157,10 +157,13 @@ impl SessionRxQueue {
             }
             if predecessor_end > start {
                 let trim = predecessor_end - start;
-                buffers.advance(
-                    entry.index,
-                    usize::try_from(trim).map_err(|_| {
+                let mut buffer = buffers.get_buffer_mut(entry.index)?;
+                buffer.advance(
+                    isize::try_from(usize::try_from(trim).map_err(|_| {
                         CoreError::internal("session rx predecessor trim exceeds usize")
+                    })?)
+                    .map_err(|_| {
+                        CoreError::internal("session rx predecessor trim exceeds isize")
                     })?,
                 )?;
                 start = predecessor_end;
@@ -211,10 +214,13 @@ impl SessionRxQueue {
                     .ooo_entries
                     .get_mut(candidate_index)
                     .expect("session rx OOO candidate entry is valid");
-                buffers.advance(
-                    current.index,
-                    usize::try_from(trim).map_err(|_| {
+                let mut buffer = buffers.get_buffer_mut(current.index)?;
+                buffer.advance(
+                    isize::try_from(usize::try_from(trim).map_err(|_| {
                         CoreError::internal("session rx OOO successor trim exceeds usize")
+                    })?)
+                    .map_err(|_| {
+                        CoreError::internal("session rx OOO successor trim exceeds isize")
                     })?,
                 )?;
                 current.offset = end;
@@ -275,11 +281,12 @@ impl SessionRxQueue {
             }
             if candidate.offset < boundary {
                 let trim = boundary - candidate.offset;
-                buffers.advance(
-                    candidate.index,
-                    usize::try_from(trim).map_err(|_| {
+                let mut buffer = buffers.get_buffer_mut(candidate.index)?;
+                buffer.advance(
+                    isize::try_from(usize::try_from(trim).map_err(|_| {
                         CoreError::internal("session rx contiguous trim exceeds usize")
-                    })?,
+                    })?)
+                    .map_err(|_| CoreError::internal("session rx contiguous trim exceeds isize"))?,
                 )?;
                 candidate.offset = boundary;
                 candidate.len = candidate.len.saturating_sub(trim);
@@ -328,7 +335,7 @@ pub(crate) struct SessionQueueStep {
 pub struct WorkerSessionRuntime {
     worker: DataWorkerId,
     ready: SessionReadyQueue,
-    timers: TimerWheel2t1w2048<u32>,
+    timers: TimerWheel1t2w2048sl<u32>,
     expired_timers: hammer_infra::vec::Vec<u32>,
     pending_timers: hammer_infra::vec::Vec<ExpiredTimer>,
     timer_tick_duration: Duration,
@@ -349,7 +356,7 @@ impl WorkerSessionRuntime {
         Self {
             worker,
             ready: SessionReadyQueue::new(),
-            timers: TimerWheel2t1w2048::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
+            timers: TimerWheel1t2w2048sl::with_timer_ids(0, SESSION_TIMER_KIND_COUNT),
             expired_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             pending_timers: hammer_infra::vec::Vec::with_capacity(DEFAULT_SESSION_POOL_CAPACITY),
             timer_tick_duration,
@@ -377,8 +384,7 @@ impl WorkerSessionRuntime {
         let expired_timers = self.timers.expire(timer_ticks, &mut self.expired_timers);
         for index in 0..self.expired_timers.len() {
             let payload = self.expired_timers[index];
-            let Some((slot, generation, timer_id)) = self.timers.take_expired_timer(payload)
-            else {
+            let Some((slot, generation, timer_id)) = self.timers.take_expired_timer(payload) else {
                 continue;
             };
             let session_id = SessionId::from(PoolIndex::new(slot, generation));
@@ -478,6 +484,8 @@ pub(crate) trait SessionQueueProtocol<A>: Sized {
         payload_len: usize,
         now: Instant,
     ) -> CoreResult<()>;
+
+    fn on_close(&mut self, aux: &mut A, session_id: SessionId);
 }
 
 pub(crate) trait SessionStateFactory<S> {
@@ -532,15 +540,15 @@ impl<S, A> SessionDriverRuntime<S, A> {
     }
 
     #[inline]
-    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> SessionId
+    pub(crate) fn insert_session_with_id<F>(&mut self, f: F) -> CoreResult<SessionId>
     where
         F: SessionStateFactory<S>,
     {
         let index = self
             .entries
             .insert_with(|index| f.build(SessionId::from(index)))
-            .expect("session pool capacity exhausted");
-        SessionId::from(index)
+            .ok_or_else(|| CoreError::internal("session pool capacity exhausted"))?;
+        Ok(SessionId::from(index))
     }
 
     #[inline]
@@ -622,7 +630,7 @@ impl<S, A> SessionDriverRuntime<S, A> {
     }
 
     #[inline]
-    pub(crate) fn timers_mut(&mut self) -> &mut TimerWheel2t1w2048<u32> {
+    pub(crate) fn timers_mut(&mut self) -> &mut TimerWheel1t2w2048sl<u32> {
         &mut self.sessions.timers
     }
 
@@ -780,27 +788,6 @@ impl<S, A> SessionDriverRuntime<S, A> {
     pub(crate) fn take_ready_sessions(&mut self) -> hammer_infra::vec::Vec<SessionId> {
         self.sessions.take_ready_sessions()
     }
-
-    fn clone_session_tx_payload(
-        &self,
-        tx_head: BufferIndex,
-        tx_offset: usize,
-        payload_len: usize,
-    ) -> CoreResult<BufferIndex> {
-        let buffers = self.buffers();
-        let index = buffers.alloc_index()?;
-        let clone_result = (|| {
-            let mut buffer = buffers.get_buffer_mut(index)?;
-            buffer.attach_clone(tx_head)?;
-            buffer.advance(tx_offset)?;
-            buffer.truncate_chain(payload_len)
-        })();
-        if let Err(error) = clone_result {
-            buffers.free_index(index);
-            return Err(error);
-        }
-        Ok(index)
-    }
 }
 
 #[cfg(test)]
@@ -836,6 +823,22 @@ where
     Ok(step)
 }
 
+pub(crate) fn dispatch_registered_session_queue_once_at<S, A>(
+    runtime: &DataPlaneRuntime,
+    data: NodeRuntimeData,
+    output_next: SessionQueueNext,
+    now: Instant,
+    output: &mut crate::session::node::SessionQueueOutput,
+) -> CoreResult<()>
+where
+    S: SessionQueueProtocol<A> + 'static,
+    A: 'static,
+{
+    let mut driver = SessionQueueHandle::<SessionDriverRuntime<S, A>>::new(data).borrow_mut()?;
+    dispatch_session_queue_once_at(runtime, &mut driver, now, output_next, output)?;
+    Ok(())
+}
+
 pub(crate) fn dispatch_session_queue_pending<S, A>(
     runtime: &DataPlaneRuntime,
     driver: &mut SessionDriverRuntime<S, A>,
@@ -862,7 +865,10 @@ where
                 &mut (*driver).sessions.ready as *mut _,
                 &(*driver).buffers as *const _,
                 expired_timer.session_id,
-                (*driver).app.pending_send_head(expired_timer.session_id).is_some(),
+                (*driver)
+                    .app
+                    .pending_send_head(expired_timer.session_id)
+                    .is_some(),
             );
             let close_current = state.handle_expired_timer(
                 runtime,
@@ -872,6 +878,7 @@ where
                 output,
             )?;
             if close_current {
+                state.on_close(&mut (*driver).aux, expired_timer.session_id);
                 let _ = (*driver).close_session(expired_timer.session_id)?;
             }
         }
@@ -904,6 +911,7 @@ where
                 output,
             )?;
             if close_current {
+                state.on_close(&mut (*driver_ptr).aux, session_id);
                 let _ = (*driver_ptr).close_session(session_id)?;
                 continue;
             }
@@ -915,11 +923,7 @@ where
             let total_len = driver
                 .buffers()
                 .current_len(tx_head)?
-                .checked_add(
-                    driver
-                        .buffers()
-                        .total_len_not_including_first(tx_head)?,
-                )
+                .checked_add(driver.buffers().total_len_not_including_first(tx_head)?)
                 .ok_or_else(|| CoreError::internal("session tx chain length overflow"))?;
             let tx_offset = {
                 let driver = driver as *mut SessionDriverRuntime<S, A>;
@@ -938,7 +942,9 @@ where
                 }
             };
             if tx_offset > total_len {
-                return Err(CoreError::internal("session tx offset exceeds chain length"));
+                return Err(CoreError::internal(
+                    "session tx offset exceeds chain length",
+                ));
             }
             let pending_len = total_len.saturating_sub(tx_offset);
             let payload_len = {
@@ -966,7 +972,47 @@ where
                 break;
             }
 
-            let index = driver.clone_session_tx_payload(tx_head, tx_offset, payload_len)?;
+            let index = driver.buffers().alloc_index()?;
+            let append_result = (|| {
+                let mut skip = tx_offset;
+                let mut remaining = payload_len;
+                let mut current = Some(tx_head);
+                while remaining != 0 {
+                    let current_index = current
+                        .ok_or_else(|| CoreError::internal("session tx chain ended early"))?;
+                    let (segment_len, copy_ptr, copy_len, next) = {
+                        let buffer = driver.buffers().get_buffer(current_index)?;
+                        let segment_len = buffer.current_len();
+                        if skip >= segment_len {
+                            (segment_len, std::ptr::null(), 0, buffer.next_buffer())
+                        } else {
+                            let take = remaining.min(segment_len - skip);
+                            (
+                                segment_len,
+                                unsafe { buffer.current_ptr().add(skip) },
+                                take,
+                                buffer.next_buffer(),
+                            )
+                        }
+                    };
+                    if copy_len != 0 {
+                        // SAFETY: source bytes remain valid for the duration of this
+                        // copy because session TX ownership stays in the source chain.
+                        let bytes = unsafe { std::slice::from_raw_parts(copy_ptr, copy_len) };
+                        driver.buffers().append(index, bytes)?;
+                        remaining -= copy_len;
+                        skip = 0;
+                    } else {
+                        skip -= segment_len;
+                    }
+                    current = next;
+                }
+                Ok(())
+            })();
+            if let Err(error) = append_result {
+                driver.buffers().free_index(index);
+                return Err(error);
+            }
 
             {
                 let driver = driver as *mut SessionDriverRuntime<S, A>;
@@ -1143,6 +1189,8 @@ mod tests {
             self.committed += payload_len;
             Ok(())
         }
+
+        fn on_close(&mut self, _: &mut FakeTxState, _: SessionId) {}
     }
 
     struct NoTxPayloadProtocol;
@@ -1207,6 +1255,8 @@ mod tests {
         ) -> CoreResult<()> {
             Err(CoreError::internal("transport tx commit must not run"))
         }
+
+        fn on_close(&mut self, _: &mut FakeTxState, _: SessionId) {}
     }
 
     #[derive(Default)]
@@ -1296,14 +1346,20 @@ mod tests {
             .expect("arm session timer");
 
         assert_eq!(
-            runtime.poll_once_for_ticks(2).expect("expire before deadline").expired_timers,
+            runtime
+                .poll_once_for_ticks(2)
+                .expect("expire before deadline")
+                .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
         assert!(runtime.take_ready_sessions().is_empty());
 
         assert_eq!(
-            runtime.poll_once_for_ticks(1).expect("expire at deadline").expired_timers,
+            runtime
+                .poll_once_for_ticks(1)
+                .expect("expire at deadline")
+                .expired_timers,
             1
         );
         assert_eq!(
@@ -1334,14 +1390,20 @@ mod tests {
             .expect("rearm timer");
 
         assert_eq!(
-            runtime.poll_once_for_ticks(2).expect("expire stale timer").expired_timers,
+            runtime
+                .poll_once_for_ticks(2)
+                .expect("expire stale timer")
+                .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
         assert!(runtime.take_ready_sessions().is_empty());
 
         assert_eq!(
-            runtime.poll_once_for_ticks(3).expect("expire rearmed timer").expired_timers,
+            runtime
+                .poll_once_for_ticks(3)
+                .expect("expire rearmed timer")
+                .expired_timers,
             1
         );
         assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
@@ -1359,12 +1421,17 @@ mod tests {
             .timers
             .arm_timer(session.slot(), session.generation(), timer_id, 2)
             .expect("arm timer");
-        assert!(runtime
-            .timers
-            .cancel_timer(session.slot(), session.generation(), timer_id));
+        assert!(
+            runtime
+                .timers
+                .cancel_timer(session.slot(), session.generation(), timer_id)
+        );
 
         assert_eq!(
-            runtime.poll_once_for_ticks(2).expect("expire canceled timer").expired_timers,
+            runtime
+                .poll_once_for_ticks(2)
+                .expect("expire canceled timer")
+                .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
@@ -1384,7 +1451,10 @@ mod tests {
             .arm_timer(session.slot(), session.generation(), timer_id, 1)
             .expect("arm first timer");
         assert_eq!(
-            runtime.poll_once_for_ticks(1).expect("expire first timer").expired_timers,
+            runtime
+                .poll_once_for_ticks(1)
+                .expect("expire first timer")
+                .expired_timers,
             1
         );
         assert_eq!(runtime.take_ready_sessions(), infra_vec([session_id]));
@@ -1397,13 +1467,19 @@ mod tests {
         assert!(runtime.pending_timers.is_empty());
 
         assert_eq!(
-            runtime.poll_once_for_ticks(1).expect("before second deadline").expired_timers,
+            runtime
+                .poll_once_for_ticks(1)
+                .expect("before second deadline")
+                .expired_timers,
             0
         );
         assert!(runtime.pending_timers.is_empty());
 
         assert_eq!(
-            runtime.poll_once_for_ticks(1).expect("expire second timer").expired_timers,
+            runtime
+                .poll_once_for_ticks(1)
+                .expect("expire second timer")
+                .expired_timers,
             1
         );
         assert_eq!(

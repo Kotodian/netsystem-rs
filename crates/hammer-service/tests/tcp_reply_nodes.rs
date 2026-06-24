@@ -1,6 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use hammer_service::transport::tcp::{TcpControlFlags, synthesize_ipv4_tcp_control};
+use hammer_core::protocol::tcp::TcpControlFlags;
+use hammer_service::transport::tcp::synthesize_ipv4_tcp_control;
 
 const ACK: u8 = 0x10;
 

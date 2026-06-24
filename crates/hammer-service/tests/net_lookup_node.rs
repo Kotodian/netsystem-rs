@@ -631,9 +631,7 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
     runtime.set_trace_control(Some(trace.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");
     let packet = ipv4_udp_packet([10, 0, 0, 1], 30_014, [192, 0, 2, 30], 53, b"rewrite");
-    let index = runtime
-        .alloc_index_with_bytes(&packet)
-        .expect("alloc packet");
+    let index = alloc_packet_with_headroom(&runtime, &packet);
     runtime
         .try_mark_trace(rewrite_node, index)
         .expect("mark packet");
@@ -699,6 +697,78 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
             next: Some(sink),
         }
     );
+    assert_eq!(runtime.frames_in_use(), 0);
+    assert_eq!(runtime.in_use_buffers(), 0);
+}
+
+#[test]
+fn adjacency_rewrite_node_prepends_rewrite_when_packet_has_headroom() {
+    let runtime = DataPlaneRuntime::with_capacities(256, 16, 8, 4);
+    let state = Arc::new(Mutex::new(SinkState::default()));
+    let sink = register_sink(&runtime, &state);
+    let drop_node = runtime.nodes().register_internal(DropNode::new());
+    let mut builder = FibTableBuilder::new(drop_node);
+    let rewrite = [0xaa, 0xbb, 0xcc, 0xdd];
+    let dpo = builder.add_interface_adjacency_dpo(
+        DpoProto::IP4,
+        9,
+        AdjacencyRewrite::try_new(&rewrite).expect("rewrite fits"),
+        drop_node,
+        sink,
+    );
+    let adjacency = dpo.adjacency_index().expect("adjacency index");
+    let control = IpLookupControlPlane::new(builder.build());
+    let rewrite_node = runtime
+        .nodes()
+        .register_internal(AdjacencyRewriteNode::new(control.table_handle()));
+    let frame = runtime.alloc_frame_index().expect("alloc frame");
+    let packet = ipv4_udp_packet(
+        [10, 0, 0, 1],
+        30_114,
+        [192, 0, 2, 130],
+        53,
+        b"rewrite-chained-payload",
+    );
+    let index = alloc_packet_with_headroom(&runtime, &packet);
+    {
+        let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+        let opaque = unsafe { transmute::<_, &mut LookupTestOpaque>(buffer.opaque2_mut()) };
+        opaque.forwarding = Some(ForwardingMetadata {
+            fib_index: 0,
+            route_dpo_type: DpoType::ADJACENCY,
+            route_dpo_index: adjacency.get(),
+            load_balance_index: u32::MAX,
+            bucket_index: u16::MAX,
+            dpo_type: DpoType::ADJACENCY,
+            dpo_index: adjacency.get(),
+        });
+        buffer.set_packet_cursor(
+            hammer_adapter::BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, 20)
+                .with_transport_header(20, 8)
+                .with_transport_payload_offset(28),
+        );
+    }
+    runtime
+        .get_frame_mut(frame)
+        .expect("mutate frame")
+        .push_index(index)
+        .expect("push packet");
+
+    assert!(
+        runtime
+            .schedule_frame(rewrite_node, frame)
+            .expect("schedule")
+    );
+
+    assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
+    let state_ref = state.lock().unwrap();
+    assert_eq!(state_ref.payloads.len(), 1);
+    assert_eq!(&state_ref.payloads[0][..rewrite.len()], &rewrite);
+    assert_eq!(&state_ref.payloads[0][rewrite.len()..], packet.as_slice());
+    assert_eq!(state_ref.egress_interfaces[0], Some(9));
+    std::mem::drop(state_ref);
     assert_eq!(runtime.frames_in_use(), 0);
     assert_eq!(runtime.in_use_buffers(), 0);
 }
@@ -978,6 +1048,16 @@ fn push_packet(runtime: &DataPlaneRuntime, frame: hammer_adapter::FrameIndex, pa
         .expect("mutate frame")
         .push_index(index)
         .expect("push packet");
+}
+
+fn alloc_packet_with_headroom(
+    runtime: &DataPlaneRuntime,
+    packet: &[u8],
+) -> hammer_adapter::BufferIndex {
+    let index = runtime.alloc_index().expect("alloc packet with headroom");
+    let mut buffer = runtime.get_buffer_mut(index).expect("buffer");
+    buffer.append(packet).expect("append packet bytes");
+    index
 }
 
 fn push_marked_packet(

@@ -1206,8 +1206,9 @@ fn replace_current_chain(
     index: BufferIndex,
     packet: &[u8],
 ) -> CoreResult<()> {
-    runtime.truncate_chain(index, 0)?;
-    runtime.append(index, packet)
+    let mut buffer = runtime.get_buffer_mut(index)?;
+    buffer.truncate_chain(0)?;
+    buffer.append(packet)
 }
 
 #[inline(always)]
