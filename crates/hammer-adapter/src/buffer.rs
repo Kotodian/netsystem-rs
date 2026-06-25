@@ -2648,10 +2648,10 @@ impl BufferPoolInner {
     /// header lands in L2 (and is promoted to L1 by the time it is touched).
     #[inline]
     fn prefetch_next_cached_slot(&self, cache: &BufferThreadCache) {
-        if let Some(&next_slot) = cache.free.last() {
-            if let Some(entry) = self.slots.get(next_slot as usize) {
-                prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
-            }
+        if let Some(&next_slot) = cache.free.last()
+            && let Some(entry) = self.slots.get(next_slot as usize)
+        {
+            prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
         }
     }
 
@@ -4245,5 +4245,225 @@ mod tests {
             &runtime.copy_current_chain(index).expect("packet")[4..],
             b"hello"
         );
+    }
+
+    use super::{Buffer, BufferFlags, BufferPool, BufferPoolInner, BufferThreadCache};
+    use hammer_core::error::CoreResult;
+
+    fn fresh_pool(slot_capacity: usize, slots: usize) -> BufferPool {
+        BufferPool::with_capacity(slot_capacity, slots)
+    }
+
+    #[test]
+    fn slot_clean_set_after_alloc_and_free_cycle() {
+        let pool = fresh_pool(64, 4);
+        let index = pool.alloc_index().expect("alloc");
+        // After a clean alloc the slot must be marked clean (cacheline1 zeroed).
+        {
+            let inner = pool.arena.inner.borrow();
+            let entry = inner.slots.get(index.slot() as usize).unwrap();
+            assert!(
+                entry
+                    .buffer
+                    .cacheline0
+                    .flags
+                    .contains(BufferFlags::SLOT_CLEAN),
+                "alloc must mark slot clean"
+            );
+        }
+        pool.free_index(index);
+        // After a clean free the slot must still be marked clean so the next
+        // alloc fast path can skip the cacheline1 reset.
+        {
+            let inner = pool.arena.inner.borrow();
+            let entry = inner.slots.get(index.slot() as usize).unwrap();
+            assert!(
+                entry
+                    .buffer
+                    .cacheline0
+                    .flags
+                    .contains(BufferFlags::SLOT_CLEAN),
+                "free fast path must keep slot clean"
+            );
+        }
+    }
+
+    #[test]
+    fn dirtying_cacheline1_clears_slot_clean() {
+        let pool = fresh_pool(64, 4);
+        let index = pool.alloc_index().expect("alloc");
+        // Mutating a cacheline1 field must drop the clean invariant.
+        {
+            let mut guard = pool.arena.inner.borrow_mut();
+            let entry = guard.slots.get_mut(index.slot() as usize).unwrap();
+            entry.buffer.set_total_len_not_including_first(7).unwrap();
+            assert!(
+                !entry
+                    .buffer
+                    .cacheline0
+                    .flags
+                    .contains(BufferFlags::SLOT_CLEAN),
+                "cacheline1 mutator must clear SLOT_CLEAN"
+            );
+        }
+        pool.free_index(index);
+        // The free slow path must rebuild the clean invariant.
+        let inner = pool.arena.inner.borrow();
+        let entry = inner.slots.get(index.slot() as usize).unwrap();
+        assert!(
+            entry
+                .buffer
+                .cacheline0
+                .flags
+                .contains(BufferFlags::SLOT_CLEAN),
+            "free slow path must restore SLOT_CLEAN"
+        );
+        assert_eq!(entry.buffer.cacheline1.total_length_not_including_first, 0);
+    }
+
+    #[test]
+    fn set_trace_handle_clears_slot_clean() {
+        let pool = fresh_pool(64, 4);
+        let index = pool.alloc_index().expect("alloc");
+        {
+            let mut guard = pool.arena.inner.borrow_mut();
+            let entry = guard.slots.get_mut(index.slot() as usize).unwrap();
+            entry.buffer.set_trace_handle(42);
+            assert!(!entry
+                .buffer
+                .cacheline0
+                .flags
+                .contains(BufferFlags::SLOT_CLEAN));
+        }
+        pool.free_index(index);
+    }
+
+    #[test]
+    fn generation_advances_across_alloc_free_cycles() {
+        let pool = fresh_pool(64, 4);
+        let first = pool.alloc_index().expect("alloc");
+        let first_gen = first.generation();
+        pool.free_index(first);
+        let second = pool.alloc_index().expect("realloc same slot");
+        assert_eq!(second.slot(), first.slot());
+        assert_ne!(second.generation(), first_gen);
+        // Stale index must be rejected.
+        assert!(pool.get(first).is_err());
+        assert!(pool.get(second).is_ok());
+        pool.free_index(second);
+    }
+
+    #[test]
+    fn batch_refill_does_not_starve_shared_arena() {
+        // Two pools share one arena; each worker must be able to alloc even
+        // though the per-thread cache grabs a batch on first use.
+        use super::BufferPoolArena;
+        let arena = BufferPoolArena::with_capacity(64, 4);
+        let pool_a = BufferPool::with_arena(arena.clone());
+        let pool_b = BufferPool::with_arena(arena);
+        let a = pool_a.alloc_index().expect("pool a alloc");
+        let b = pool_b.alloc_index().expect("pool b alloc");
+        assert_eq!(a.pool_id(), b.pool_id());
+        assert_ne!(a.slot(), b.slot());
+        pool_a.free_index(a);
+        pool_b.free_index(b);
+    }
+
+    #[test]
+    fn lazy_in_use_count_matches_synchronous_count() {
+        let pool = fresh_pool(64, 8);
+        let mut indices = std::vec::Vec::new();
+        for _ in 0..5 {
+            indices.push(pool.alloc_index().expect("alloc"));
+        }
+        // in_use() folds the lazy delta and returns the accurate count.
+        assert_eq!(pool.in_use(), 5);
+        for index in indices.drain(..) {
+            pool.free_index(index);
+        }
+        pool.arena.inner.borrow_mut().fold_in_use();
+        assert_eq!(pool.arena.inner.borrow().in_use, 0);
+    }
+
+    #[test]
+    fn refcount_gt_one_free_takes_slow_path_and_stays_allocated() {
+        let pool = fresh_pool(64, 8);
+        let head = pool.alloc_index().expect("alloc head");
+        let tail = pool.alloc_index().expect("alloc tail");
+        pool.attach_clone(head, tail).expect("attach clone");
+        // tail now has ref_count == 2; freeing the chain drops one ref but
+        // keeps the slot allocated (slow path).
+        pool.free_index(head);
+        let inner = pool.arena.inner.borrow();
+        let tail_entry = inner.slots.get(tail.slot() as usize).unwrap();
+        assert!(tail_entry.allocated, "shared tail must remain allocated");
+    }
+
+    #[test]
+    fn chain_alloc_free_roundtrips() {
+        let pool = fresh_pool(32, 16);
+        let payload = vec![0xABu8; 96]; // spans 3 slots of 32
+        let head = pool.alloc_index_with_bytes(&payload).expect("chain alloc");
+        assert!(pool.is_chained(head).unwrap());
+        let copied = pool.copy_packet(head).expect("copy chain");
+        assert_eq!(copied, payload);
+        pool.free_index(head);
+        assert_eq!(pool.in_use(), 0);
+    }
+
+    #[test]
+    fn alloc_index_with_bytes_resets_slot_clean() {
+        let pool = fresh_pool(64, 4);
+        let index = pool
+            .alloc_index_with_bytes(b"payload")
+            .expect("alloc with bytes");
+        let inner = pool.arena.inner.borrow();
+        let entry = inner.slots.get(index.slot() as usize).unwrap();
+        assert!(
+            entry
+                .buffer
+                .cacheline0
+                .flags
+                .contains(BufferFlags::SLOT_CLEAN),
+            "reset(bytes) must set SLOT_CLEAN"
+        );
+        assert_eq!(entry.buffer.current_len(), 7);
+    }
+
+    #[test]
+    fn buffer_remains_64_byte_aligned() {
+        assert_eq!(core::mem::align_of::<Buffer>(), 64);
+    }
+
+    #[test]
+    fn thread_cache_capacity_preallocated() {
+        let cache = BufferThreadCache::new();
+        // The cache starts empty but preallocated to the high-water mark so
+        // release pushes never trigger a Vec grow on the hot path.
+        assert_eq!(cache.cached_free_len(), 0);
+        assert!(cache.free.capacity() >= super::BUFFER_THREAD_CACHE_HIGH_WATER);
+    }
+
+    #[test]
+    fn pool_inner_has_in_use_delta_field() {
+        // Compile-time sanity that the lazy counter field exists.
+        fn _assert_field(inner: &BufferPoolInner) {
+            let _ = inner.in_use_delta;
+        }
+    }
+
+    #[test]
+    fn alloc_then_free_many_keeps_in_use_consistent() -> CoreResult<()> {
+        let pool = fresh_pool(64, 32);
+        let mut indices = std::vec::Vec::new();
+        for _ in 0..32 {
+            indices.push(pool.alloc_index()?);
+        }
+        assert_eq!(pool.in_use(), 32);
+        for index in indices {
+            pool.free_index(index);
+        }
+        assert_eq!(pool.in_use(), 0);
+        Ok(())
     }
 }

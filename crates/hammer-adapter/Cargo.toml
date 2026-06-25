@@ -16,3 +16,10 @@ crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 ipnet = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "buffer_alloc_free"
+harness = false

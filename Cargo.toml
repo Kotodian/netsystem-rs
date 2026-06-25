@@ -75,6 +75,7 @@ rustc-hash = "2"
 uniffi = "0.31"
 indoc = "2.0"
 rcgen = "0.14"
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 
 [patch.crates-io]
 boringtun = { path = "third_party/boringtun" }
