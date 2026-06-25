@@ -176,6 +176,17 @@ impl<T, const ALIGN: usize> Pool<T, ALIGN> {
     }
 
     #[inline]
+    pub fn prefetch_slot(&self, index: Index) {
+        let slot = index.slot() as usize;
+        if slot >= self.capacity {
+            return;
+        }
+        // SAFETY: slot < capacity checked above; pointer arithmetic stays inbounds.
+        let ptr = self.slot_ptr_unchecked(slot);
+        crate::prefetch::prefetch_read_l1(ptr);
+    }
+
+    #[inline]
     fn validate(&self, index: Index) -> Option<usize> {
         let slot = index.slot as usize;
         (slot < self.capacity
@@ -263,5 +274,22 @@ mod tests {
         assert_eq!(values, vec![7, 11]);
         assert_eq!(pool.get(first), Some(&7));
         assert_eq!(pool.get(third), Some(&11));
+    }
+
+    #[test]
+    fn prefetch_slot_does_not_panic_on_invalid() {
+        let pool = Pool::<u64>::with_capacity(4);
+        let invalid = super::Index::new(999, 0);
+        pool.prefetch_slot(invalid);
+        let vacant = super::Index::new(2, 0);
+        pool.prefetch_slot(vacant);
+    }
+
+    #[test]
+    fn prefetch_slot_runs_on_occupied_slot() {
+        let mut pool = Pool::<u64>::with_capacity(4);
+        let idx = pool.insert(42).expect("insert");
+        pool.prefetch_slot(idx);
+        assert_eq!(pool.get(idx), Some(&42));
     }
 }

@@ -65,6 +65,45 @@ where
     }
 
     #[inline]
+    pub fn prefetch_first(&self) {
+        let Some(root) = self.root else {
+            return;
+        };
+        if let Some(ptr) = self.nodes.slot_ptr(root) {
+            crate::prefetch::prefetch_read_l1(ptr);
+        }
+    }
+
+    #[inline]
+    pub fn prefetch_node(&self, key: &K) {
+        let mut cursor = self.root;
+        while let Some(index) = cursor {
+            let node = self.node(index);
+            match key.cmp(&node.key) {
+                core::cmp::Ordering::Less => {
+                    let left = node.left;
+                    if let Some(child) = left
+                        && let Some(ptr) = self.nodes.slot_ptr(child)
+                    {
+                        crate::prefetch::prefetch_read_l1(ptr);
+                    }
+                    cursor = left;
+                }
+                core::cmp::Ordering::Greater => {
+                    let right = node.right;
+                    if let Some(child) = right
+                        && let Some(ptr) = self.nodes.slot_ptr(child)
+                    {
+                        crate::prefetch::prefetch_read_l1(ptr);
+                    }
+                    cursor = right;
+                }
+                core::cmp::Ordering::Equal => return,
+            }
+        }
+    }
+
+    #[inline]
     pub fn get(&self, key: &K) -> Option<&V> {
         let index = self.find_node(*key)?;
         Some(&self.node(index).value)
@@ -613,5 +652,25 @@ mod tests {
         *value = 22;
 
         assert_eq!(tree.get(&20), Some(&22));
+    }
+
+    #[test]
+    fn prefetch_first_does_not_panic_on_empty() {
+        let tree: RbTree<u32, u32> = RbTree::new();
+        tree.prefetch_first();
+        tree.prefetch_node(&u32::MAX);
+    }
+
+    #[test]
+    fn prefetch_first_and_node_do_not_mutate_tree() {
+        let mut tree = RbTree::new();
+        tree.insert(10u32, "a");
+        tree.insert(20u32, "b");
+        tree.insert(30u32, "c");
+        tree.prefetch_first();
+        tree.prefetch_node(&20);
+        tree.prefetch_node(&999);
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.get(&20), Some(&"b"));
     }
 }
