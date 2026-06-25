@@ -220,6 +220,7 @@ pub struct TcpConnectionCacheline0 {
     tx_intent_sequence: Option<TcpSeq>,
     tx_intent_payload_len: u32,
     fast_open_syn_payload_len: u32,
+    bytes_in_flight_cached: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +334,7 @@ where
                 tx_intent_sequence: None,
                 tx_intent_payload_len: 0,
                 fast_open_syn_payload_len: 0,
+                bytes_in_flight_cached: 0,
             }),
             cacheline1: CachePadded::new(TcpConnectionCacheline1 {
                 connection_id,
@@ -693,6 +695,11 @@ where
         Some(IpEcnCodepoint::Ect0)
     }
 
+    #[inline]
+    fn refresh_bytes_in_flight_cached(&mut self) {
+        self.cacheline0.bytes_in_flight_cached = self.recovery.bytes_in_flight();
+    }
+
     fn observe_ack_progress(
         &mut self,
         packet: &TcpPacket,
@@ -725,6 +732,7 @@ where
             self.ecn.pending_signals.remove(TcpPendingSignals::ECN_CE);
             self.ecn.pending_ce_feedback = 0;
         }
+        self.refresh_bytes_in_flight_cached();
         latest_rtt
     }
 
@@ -1142,7 +1150,7 @@ where
             return 0;
         }
         let mss = self.output_payload_len();
-        let bytes_in_flight = self.recovery.bytes_in_flight();
+        let bytes_in_flight = self.bytes_in_flight_cached;
         let peer_remaining = self.snd_wnd.saturating_sub(bytes_in_flight) as usize;
         let cc_remaining = if let Some(recovery_remaining) = self
             .recovery
@@ -1245,7 +1253,7 @@ where
             let end_sequence = TcpSeq::from(sequence)
                 .advance(payload_len.saturating_add(1))
                 .raw();
-            let bytes_in_flight = self.recovery.bytes_in_flight();
+            let bytes_in_flight = self.bytes_in_flight_cached;
             let packet_number = self.recovery.next_packet_number();
             self.recovery.record_sent(
                 packet_number,
@@ -1255,6 +1263,7 @@ where
                 payload_len,
                 now,
             );
+            self.refresh_bytes_in_flight_cached();
             self.congestion.on_packet_sent(
                 packet_number,
                 payload_len.saturating_add(1),
@@ -1309,7 +1318,7 @@ where
             u32::try_from(payload_len).map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
         let sequence = self.snd_nxt;
         let end_sequence = TcpSeq::from(sequence).advance(payload_len).raw();
-        let bytes_in_flight = self.recovery.bytes_in_flight();
+        let bytes_in_flight = self.bytes_in_flight_cached;
         let packet_number = self.recovery.next_packet_number();
         self.recovery.record_sent(
             packet_number,
@@ -1320,6 +1329,7 @@ where
             now,
         );
         self.recovery.on_new_data_sent(payload_len);
+        self.refresh_bytes_in_flight_cached();
         self.congestion
             .on_packet_sent(packet_number, payload_len, bytes_in_flight, now);
         self.snd_nxt = TcpSeq::from(end_sequence);
@@ -3130,9 +3140,8 @@ mod tests {
     }
 
     #[test]
-    fn tcp_tx_payload_budget_is_limited_by_prr_during_recovery() {
+    fn bytes_in_flight_cached_matches_recovery_after_record_and_take() {
         let mut connection = established_connection_with_test_controller();
-        let now = Instant::now();
         let capabilities = TcpCapabilities {
             max_segment_size: Some(1_000),
             window_scale: None,
@@ -3145,94 +3154,188 @@ mod tests {
         let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
         connection.snd_wnd = 8_000;
         connection.snd_una = TcpSeq::from(1_000);
-        connection.snd_nxt = TcpSeq::from(6_000);
-        connection
-            .recovery
-            .record_sent(1, TcpSeq::from(1_000), TcpSeq::from(2_000), 1_000, 0, now);
-        connection.recovery.record_sent(
-            2,
-            TcpSeq::from(2_000),
-            TcpSeq::from(3_000),
-            1_000,
-            0,
-            now + Duration::from_millis(1),
-        );
-        connection.recovery.record_sent(
-            3,
-            TcpSeq::from(3_000),
-            TcpSeq::from(4_000),
-            1_000,
-            0,
-            now + Duration::from_millis(2),
-        );
-        connection.recovery.record_sent(
-            4,
-            TcpSeq::from(4_000),
-            TcpSeq::from(5_000),
-            1_000,
-            0,
-            now + Duration::from_millis(3),
-        );
-        connection.recovery.record_sent(
-            5,
-            TcpSeq::from(5_000),
-            TcpSeq::from(6_000),
-            1_000,
-            0,
-            now + Duration::from_millis(4),
-        );
-        connection.recovery.on_sack_blocks(
-            TcpRecoveryAck {
-                acknowledgment: TcpSeq::from(1_000),
-                now: now + Duration::from_millis(30),
-                app_limited: false,
-                ecn_ce_count: 0,
-                reordering_window: Duration::from_millis(10),
-            },
-            &[TcpSackBlock {
+        connection.snd_nxt = TcpSeq::from(1_000);
+
+        let now = Instant::now();
+        for i in 0..5u32 {
+            let _ = connection
+                .commit_payload_tx(1_000, now + Duration::from_millis(i as u64))
+                .expect("commit payload tx");
+            assert_eq!(
+                connection.bytes_in_flight_cached,
+                connection.recovery.bytes_in_flight(),
+                "mirror must match recovery after commit {i}"
+            );
+        }
+        assert_eq!(connection.snd_nxt, TcpSeq::from(6_000));
+        assert_eq!(connection.recovery.bytes_in_flight(), 5_000);
+
+        let sack_packet = TcpPacket {
+            local: connection.remote(),
+            remote: connection.local().expect("local"),
+            sequence: connection.rcv_nxt().into(),
+            acknowledgment: Some(1_000.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: std::vec::Vec::from([TcpSackBlock {
                 left_edge: TcpSeq::from(2_000),
                 right_edge: TcpSeq::from(3_000),
-            }],
-            &mut connection.congestion,
+            }])
+            .into(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let _ = connection.receive_ack(&sack_packet, 1_000, 8_000, &sack_packet.sack_blocks);
+        assert_eq!(
+            connection.bytes_in_flight_cached,
+            connection.recovery.bytes_in_flight(),
+            "mirror must match recovery after sack"
         );
+        assert_eq!(connection.recovery.bytes_in_flight(), 4_000);
+
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let rcv_nxt = connection.rcv_nxt().into();
+        let ack_packet = |ack: u32| TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt,
+            acknowledgment: Some(ack.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: std::vec::Vec::new().into(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+
+        let _ = connection.receive_ack(&ack_packet(3_000), 3_000, 8_000, &[]);
+        assert_eq!(
+            connection.bytes_in_flight_cached,
+            connection.recovery.bytes_in_flight(),
+            "mirror must match recovery after partial ack to 3k"
+        );
+        assert_eq!(connection.recovery.bytes_in_flight(), 3_000);
+
+        for i in 0..3u32 {
+            let _ = connection
+                .commit_payload_tx(500, now + Duration::from_millis(10 + i as u64))
+                .expect("commit payload tx mid-recovery");
+            assert_eq!(
+                connection.bytes_in_flight_cached,
+                connection.recovery.bytes_in_flight(),
+                "mirror must match recovery after mid-recovery commit {i}"
+            );
+        }
+
+        let _ = connection.receive_ack(&ack_packet(4_000), 4_000, 8_000, &[]);
+        assert_eq!(
+            connection.bytes_in_flight_cached,
+            connection.recovery.bytes_in_flight(),
+            "mirror must match recovery after ack to 4k"
+        );
+    }
+
+    #[test]
+    fn tcp_tx_payload_budget_is_limited_by_prr_during_recovery() {
+        let mut connection = established_connection_with_test_controller();
+        let capabilities = TcpCapabilities {
+            max_segment_size: Some(1_000),
+            window_scale: None,
+            sack: true,
+            timestamps: false,
+            ecn: false,
+            accurate_ecn: false,
+            fast_open: false,
+        };
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
+        connection.snd_wnd = 8_000;
+        connection.snd_una = TcpSeq::from(1_000);
+        connection.snd_nxt = TcpSeq::from(1_000);
+
+        let now = Instant::now();
+        for i in 0..5u32 {
+            let _ = connection
+                .commit_payload_tx(1_000, now + Duration::from_millis(i as u64))
+                .expect("commit payload tx");
+        }
+        assert_eq!(connection.snd_nxt, TcpSeq::from(6_000));
+        assert_eq!(connection.recovery.bytes_in_flight(), 5_000);
+
+        let sack_blocks = [TcpSackBlock {
+            left_edge: TcpSeq::from(2_000),
+            right_edge: TcpSeq::from(3_000),
+        }];
+        let sack_packet = TcpPacket {
+            local: connection.remote(),
+            remote: connection.local().expect("local"),
+            sequence: connection.rcv_nxt().into(),
+            acknowledgment: Some(1_000.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: std::vec::Vec::from(sack_blocks).into(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        let _ = connection.receive_ack(&sack_packet, 1_000, 8_000, &sack_blocks);
+        assert_eq!(connection.recovery.bytes_in_flight(), 4_000);
+        assert_eq!(connection.bytes_in_flight_cached, 4_000);
+
         connection.recovery.on_rack_timeout(
-            now + Duration::from_millis(56),
+            now + Duration::from_secs(60),
             TcpSeq::from(connection.snd_nxt),
             &mut connection.congestion,
         );
+        connection.refresh_bytes_in_flight_cached();
         connection.recovery.on_retransmit_sent(1_000);
+        assert_eq!(connection.bytes_in_flight_cached, 4_000);
+        assert!(connection.recovery.in_recovery());
 
         assert_eq!(
             connection.tx_payload_budget(1_000, now, TcpCapabilities::default()),
             0
         );
 
-        connection.recovery.on_ack(
-            TcpRecoveryAck {
-                acknowledgment: TcpSeq::from(3_000),
-                now: now + Duration::from_millis(90),
-                app_limited: false,
-                ecn_ce_count: 0,
-                reordering_window: Duration::from_millis(10),
-            },
-            &mut connection.congestion,
-        );
+        let local = connection.local().expect("local");
+        let remote = connection.remote();
+        let rcv_nxt = connection.rcv_nxt().into();
+        let ack_packet = |ack: u32| TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt,
+            acknowledgment: Some(ack.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: std::vec::Vec::new().into(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+
+        let _ = connection.receive_ack(&ack_packet(3_000), 3_000, 8_000, &[]);
+        assert_eq!(connection.bytes_in_flight_cached, 3_000);
 
         assert_eq!(
             connection.tx_payload_budget(1_000, now, TcpCapabilities::default()),
             0
         );
 
-        connection.recovery.on_ack(
-            TcpRecoveryAck {
-                acknowledgment: TcpSeq::from(4_000),
-                now: now + Duration::from_millis(120),
-                app_limited: false,
-                ecn_ce_count: 0,
-                reordering_window: Duration::from_millis(10),
-            },
-            &mut connection.congestion,
-        );
+        let _ = connection.receive_ack(&ack_packet(4_000), 4_000, 8_000, &[]);
+        assert_eq!(connection.bytes_in_flight_cached, 2_000);
 
         assert_eq!(
             connection.tx_payload_budget(2_000, now, TcpCapabilities::default()),
