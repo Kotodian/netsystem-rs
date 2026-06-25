@@ -1,4 +1,3 @@
-use std::cmp::min;
 use std::time::{Duration, Instant};
 
 use hammer_core::protocol::tcp::{TcpSackBlock, TcpSeq};
@@ -124,6 +123,11 @@ impl TcpScoreboard {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RackDeadlineIndex {
+    earliest: Option<Instant>,
+}
+
 #[derive(Debug)]
 pub struct TcpRecoveryState {
     next_packet_number: PacketNumber,
@@ -134,6 +138,7 @@ pub struct TcpRecoveryState {
     bytes_in_flight: u32,
     ack_floor: TcpSeq,
     scoreboard: TcpScoreboard,
+    rack_index: RackDeadlineIndex,
     rack_timer_armed: bool,
     tlp_timer_armed: bool,
     recovery_active: bool,
@@ -156,6 +161,7 @@ impl TcpRecoveryState {
             bytes_in_flight: 0,
             ack_floor: 0u32.into(),
             scoreboard: TcpScoreboard::new(),
+            rack_index: RackDeadlineIndex::default(),
             rack_timer_armed: false,
             tlp_timer_armed: false,
             recovery_active: false,
@@ -228,21 +234,9 @@ impl TcpRecoveryState {
     }
 
     pub fn rack_timeout(&self, now: Instant) -> Option<Duration> {
-        let mut deadline = None;
-        let mut cursor = self.sample_head;
-        while let Some(index) = cursor {
-            let sample = self.sent_sample(index);
-            if !self.sample_is_lost(sample)
-                && let Some(sample_deadline) = sample.rack_deadline
-            {
-                deadline = Some(match deadline {
-                    Some(current) => min(current, sample_deadline),
-                    None => sample_deadline,
-                });
-            }
-            cursor = sample.next;
-        }
-        deadline.map(|deadline| deadline.saturating_duration_since(now))
+        self.rack_index
+            .earliest
+            .map(|deadline| deadline.saturating_duration_since(now))
     }
 
     pub fn tlp_timeout(&self, srtt: Option<Duration>, rto: Duration) -> Option<Duration> {
@@ -349,6 +343,7 @@ impl TcpRecoveryState {
             self.recovery_window = self.recovery_window.min(congestion.congestion_window());
         }
         self.refresh_lost_bytes();
+        self.rack_rescan_earliest();
         self.rack_timer_armed = self.has_pending_rack_deadline();
         self.tlp_timer_armed = self.has_unacked_data();
     }
@@ -410,11 +405,13 @@ impl TcpRecoveryState {
         }
         let bytes = start.distance_to(end);
         let payload_len = proportional_payload_len(sample.bytes, sample.payload_len, bytes);
+        let cleared = sample.rack_deadline;
         {
             let current = self.sent_sample_mut(sample_index);
             current.retransmitted = true;
             current.rack_deadline = None;
         }
+        self.rack_invalidate_cleared(cleared);
         self.scoreboard.high_rxt = end;
         self.rack_timer_armed = self.has_pending_rack_deadline();
         Some(TcpSentSample {
@@ -473,7 +470,9 @@ impl TcpRecoveryState {
         }
         let current = self.sent_sample_mut(head);
         current.retransmitted = true;
+        let cleared = current.rack_deadline;
         current.rack_deadline = None;
+        self.rack_invalidate_cleared(cleared);
         self.rack_timer_armed = false;
         self.tlp_timer_armed = self.has_unacked_data();
         Some(sample)
@@ -503,6 +502,7 @@ impl TcpRecoveryState {
             }
             cursor = sample.next;
         }
+        self.rack_note_deadline(deadline);
         self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
@@ -660,6 +660,7 @@ impl TcpRecoveryState {
 
     fn take_sent(&mut self, index: PoolIndex) -> TcpSentSample {
         let sample = self.sent_sample(index);
+        let cleared = sample.rack_deadline;
         let _ = self
             .sample_lookup
             .remove(&sample.sequence)
@@ -679,6 +680,7 @@ impl TcpRecoveryState {
             .remove(index)
             .expect("tcp recovery sample index is valid");
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sample.bytes);
+        self.rack_invalidate_cleared(cleared);
         sample
     }
 
@@ -702,8 +704,11 @@ impl TcpRecoveryState {
         debug_assert!(replaced.is_none());
 
         let prefix_index = self.insert_sample_before(index, prefix);
-        if sample.rack_deadline.is_some() && !self.sample_is_lost(sample) {
-            self.sent_sample_mut(prefix_index).rack_deadline = sample.rack_deadline;
+        if !self.sample_is_lost(sample)
+            && let Some(deadline) = sample.rack_deadline
+        {
+            self.sent_sample_mut(prefix_index).rack_deadline = Some(deadline);
+            self.rack_note_deadline(deadline);
         }
     }
 
@@ -725,6 +730,7 @@ impl TcpRecoveryState {
         let replaced = self.sample_lookup.insert(suffix.sequence, index);
         debug_assert!(replaced.is_none());
 
+        self.rack_invalidate_cleared(sample.rack_deadline);
         prefix
     }
 
@@ -761,6 +767,7 @@ impl TcpRecoveryState {
         self.scoreboard.high_sacked = high_sacked.max(acknowledgment);
         self.scoreboard.high_rxt = acknowledgment;
         if self.sample_head.is_none() || self.scoreboard.high_sacked <= acknowledgment {
+            self.rack_rescan_earliest();
             return;
         }
 
@@ -798,6 +805,7 @@ impl TcpRecoveryState {
             );
         }
         self.update_scoreboard_loss(max_datagram_size.max(1));
+        self.rack_rescan_earliest();
     }
 
     fn update_scoreboard_loss(&mut self, max_datagram_size: u32) {
@@ -874,10 +882,13 @@ impl TcpRecoveryState {
         if sample.rack_deadline.is_some() || self.sample_is_lost(sample) {
             return;
         }
+        let cleared = sample.rack_deadline;
         let current = self.sent_sample_mut(head);
         current.rack_deadline = None;
+        self.rack_invalidate_cleared(cleared);
         self.mark_hole_lost(sample.sequence);
         self.refresh_lost_bytes();
+        self.rack_rescan_earliest();
         self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
@@ -953,15 +964,59 @@ impl TcpRecoveryState {
     }
 
     fn has_pending_rack_deadline(&self) -> bool {
+        self.rack_index.earliest.is_some()
+    }
+
+    #[inline]
+    fn rack_note_deadline(&mut self, deadline: Instant) {
+        self.rack_index.earliest = Some(match self.rack_index.earliest {
+            None => deadline,
+            Some(current) => current.min(deadline),
+        });
+    }
+
+    fn rack_invalidate_cleared(&mut self, cleared: Option<Instant>) {
+        let Some(cleared) = cleared else {
+            return;
+        };
+        if self.rack_index.earliest != Some(cleared) {
+            return;
+        }
+        self.rack_rescan_earliest();
+    }
+
+    #[cold]
+    fn rack_rescan_earliest(&mut self) {
+        let mut earliest = None;
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
-            if !self.sample_is_lost(sample) && sample.rack_deadline.is_some() {
-                return true;
+            if !self.sample_is_lost(sample)
+                && let Some(deadline) = sample.rack_deadline
+                && earliest.is_none_or(|current| deadline < current)
+            {
+                earliest = Some(deadline);
             }
             cursor = sample.next;
         }
-        false
+        self.rack_index.earliest = earliest;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rack_earliest_full_scan(&self) -> Option<Instant> {
+        let mut earliest = None;
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index);
+            if !self.sample_is_lost(sample)
+                && let Some(deadline) = sample.rack_deadline
+                && earliest.is_none_or(|current| deadline < current)
+            {
+                earliest = Some(deadline);
+            }
+            cursor = sample.next;
+        }
+        earliest
     }
 }
 
@@ -1010,6 +1065,8 @@ impl Clone for TcpRecoveryState {
         }
         cloned.rack_timer_armed = self.rack_timer_armed;
         cloned.tlp_timer_armed = self.tlp_timer_armed;
+        cloned.rack_index = RackDeadlineIndex::default();
+        cloned.rack_rescan_earliest();
         cloned
     }
 }
@@ -1853,6 +1910,122 @@ mod tests {
         assert_eq!(
             (first.sequence, second.sequence),
             (TcpSeq::from(2_000), TcpSeq::from(1_000))
+        );
+    }
+
+    #[test]
+    fn rack_earliest_deadline_is_o1_after_record_and_take() {
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_000);
+        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
+        record_sent_for_test(
+            &mut recovery,
+            2,
+            2_000,
+            3_000,
+            1_000,
+            now + Duration::from_millis(1),
+        );
+        assert_eq!(recovery.rack_timeout(now), None);
+
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 40),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
+            }],
+            &mut controller,
+        );
+        // reordering_window = 40/4 = 10ms; deadline = (now+30ms)+10ms = now+40ms
+        let rto = recovery
+            .rack_timeout(now + Duration::from_millis(30))
+            .expect("rack deadline");
+        assert_eq!(rto, Duration::from_millis(10));
+
+        recovery.on_ack(
+            ack(2_000, now + Duration::from_millis(50), 40),
+            &mut controller,
+        );
+        assert_eq!(
+            recovery.rack_timeout(now + Duration::from_millis(50)),
+            None
+        );
+    }
+
+    #[test]
+    fn rack_index_matches_full_scan_after_mixed_ops() {
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_000);
+
+        fn assert_rack_matches_scan(recovery: &TcpRecoveryState, at: Instant, label: &str) {
+            let indexed = recovery.rack_timeout(at);
+            let scanned = recovery
+                .rack_earliest_full_scan()
+                .map(|deadline| deadline.saturating_duration_since(at));
+            assert_eq!(indexed, scanned, "{label}: rack index mismatch");
+        }
+
+        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
+        record_sent_for_test(
+            &mut recovery,
+            2,
+            2_000,
+            3_000,
+            1_000,
+            now + Duration::from_millis(1),
+        );
+        record_sent_for_test(
+            &mut recovery,
+            3,
+            3_000,
+            4_000,
+            1_000,
+            now + Duration::from_millis(2),
+        );
+        assert_rack_matches_scan(&recovery, now, "after record");
+
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 40),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(3_000),
+                right_edge: TcpSeq::from(4_000),
+            }],
+            &mut controller,
+        );
+        assert_rack_matches_scan(
+            &recovery,
+            now + Duration::from_millis(30),
+            "after sack",
+        );
+
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(60),
+            TcpSeq::from(4_000),
+            &mut controller,
+        );
+        assert_rack_matches_scan(
+            &recovery,
+            now + Duration::from_millis(60),
+            "after rack timeout",
+        );
+
+        let _ = recovery.take_rack_retransmit();
+        assert_rack_matches_scan(
+            &recovery,
+            now + Duration::from_millis(60),
+            "after take rack retransmit",
+        );
+
+        recovery.on_ack(
+            ack(2_000, now + Duration::from_millis(70), 40),
+            &mut controller,
+        );
+        assert_rack_matches_scan(
+            &recovery,
+            now + Duration::from_millis(70),
+            "after ack",
         );
     }
 
