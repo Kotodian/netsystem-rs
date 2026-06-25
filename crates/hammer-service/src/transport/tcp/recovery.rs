@@ -20,6 +20,7 @@ pub(crate) struct TcpSentSample {
     pub(crate) bytes: u32,
     pub(crate) payload_len: u32,
     pub(crate) retransmitted: bool,
+    pub(crate) lost: bool,
     pub(crate) rack_deadline: Option<Instant>,
     pub(crate) sent_at: Instant,
     pub(crate) prev: Option<PoolIndex>,
@@ -199,6 +200,7 @@ impl TcpRecoveryState {
                 bytes,
                 payload_len,
                 retransmitted: false,
+                lost: false,
                 rack_deadline: None,
                 sent_at,
                 prev,
@@ -328,6 +330,7 @@ impl TcpRecoveryState {
             );
             let current = self.sent_sample_mut(sample_index);
             current.rack_deadline = None;
+            current.lost = true;
             self.mark_hole_lost(sample.sequence);
             recovery_started |= !self.recovery_active;
         }
@@ -394,38 +397,51 @@ impl TcpRecoveryState {
         Some(space)
     }
 
+    /// Retransmit the lowest lost, not-yet-retransmitted sample.
+    ///
+    /// Walks `sample_head` ascending (samples are linked in increasing sequence
+    /// order) and retransmits the first sample with `lost && !retransmitted`.
+    /// Ascending order matches VPP `scoreboard_next_rxt_hole` (walks forward from
+    /// the first hole) and RFC 6675 §4.3 ("retransmit the segment starting with
+    /// HighACK + 1"). Per-sample `lost` is the authoritative RACK-loss signal and
+    /// is also set by `update_scoreboard_loss` for SACK-gap-driven loss, giving a
+    /// single unified retransmit path.
     pub(crate) fn take_rack_retransmit(&mut self) -> Option<TcpSentSample> {
-        let (hole_start, hole_end) = self.next_lost_hole()?;
-        let sample_index = self.sample_at_or_after(hole_start, true)?;
-        let sample = self.sent_sample(sample_index);
-        let start = hole_start.max(sample.sequence);
-        let end = hole_end.min(sample.end_sequence);
-        if end <= start {
-            return None;
+        let mut cursor = self.sample_head;
+        while let Some(sample_index) = cursor {
+            let sample = self.sent_sample(sample_index);
+            cursor = sample.next;
+            if !sample.lost || sample.retransmitted {
+                continue;
+            }
+            let start = sample.sequence;
+            let end = sample.end_sequence;
+            let bytes = sample.bytes;
+            let payload_len = sample.payload_len;
+            let cleared = sample.rack_deadline;
+            {
+                let current = self.sent_sample_mut(sample_index);
+                current.retransmitted = true;
+                current.rack_deadline = None;
+            }
+            self.rack_invalidate_cleared(cleared);
+            self.scoreboard.high_rxt = end;
+            self.rack_timer_armed = self.has_pending_rack_deadline();
+            return Some(TcpSentSample {
+                packet_number: sample.packet_number,
+                sequence: start,
+                end_sequence: end,
+                bytes,
+                payload_len,
+                retransmitted: true,
+                lost: false,
+                rack_deadline: None,
+                sent_at: sample.sent_at,
+                prev: sample.prev,
+                next: sample.next,
+            });
         }
-        let bytes = start.distance_to(end);
-        let payload_len = proportional_payload_len(sample.bytes, sample.payload_len, bytes);
-        let cleared = sample.rack_deadline;
-        {
-            let current = self.sent_sample_mut(sample_index);
-            current.retransmitted = true;
-            current.rack_deadline = None;
-        }
-        self.rack_invalidate_cleared(cleared);
-        self.scoreboard.high_rxt = end;
-        self.rack_timer_armed = self.has_pending_rack_deadline();
-        Some(TcpSentSample {
-            packet_number: sample.packet_number,
-            sequence: start,
-            end_sequence: end,
-            bytes,
-            payload_len,
-            retransmitted: true,
-            rack_deadline: None,
-            sent_at: sample.sent_at,
-            prev: sample.prev,
-            next: sample.next,
-        })
+        None
     }
 
     pub(crate) fn take_tlp_probe(&mut self) -> Option<TcpSentSample> {
@@ -699,7 +715,6 @@ impl TcpRecoveryState {
             current.payload_len = suffix.payload_len;
             current.rack_deadline = sample.rack_deadline;
         }
-        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(prefix.bytes);
         let _ = self
             .sample_lookup
             .remove(&sample.sequence)
@@ -734,6 +749,7 @@ impl TcpRecoveryState {
         let replaced = self.sample_lookup.insert(suffix.sequence, index);
         debug_assert!(replaced.is_none());
 
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(prefix.bytes);
         self.rack_invalidate_cleared(sample.rack_deadline);
         prefix
     }
@@ -813,26 +829,51 @@ impl TcpRecoveryState {
     }
 
     fn update_scoreboard_loss(&mut self, max_datagram_size: u32) {
-        self.scoreboard.lost_bytes = 0;
         let reorder_limit = self.scoreboard.reorder.max(TCP_DUPACK_THRESHOLD);
+        // Collect hole starts to evaluate, then apply, so we never hold a hole
+        // borrow while mutating samples via sent_sample_mut.
+        let mut hole_starts: Vec<TcpSeq> = Vec::with_capacity(self.scoreboard.holes.len());
         let mut cursor = self.scoreboard.holes.first().map(|(start, _)| *start);
         while let Some(start) = cursor {
+            hole_starts.push(start);
             cursor = self
                 .scoreboard
                 .holes
                 .successor(&start)
                 .map(|(next_start, _)| *next_start);
+        }
+        for start in hole_starts {
             let should_mark_lost =
                 self.should_mark_hole_lost(start, max_datagram_size, reorder_limit);
             let Some(hole) = self.scoreboard.holes.get_mut(&start) else {
                 continue;
             };
+            hole.lost = should_mark_lost;
+            let hole_end = hole.end;
             if should_mark_lost {
-                let hole_bytes = start.distance_to(hole.end);
-                self.scoreboard.lost_bytes = self.scoreboard.lost_bytes.saturating_add(hole_bytes);
-                hole.lost = true;
-            } else {
-                hole.lost = false;
+                // Unify: a SACK-gap hole declared lost also marks the samples it
+                // covers as lost so the single per-sample retransmit walk in
+                // take_rack_retransmit reaches them. RACK-driven loss sets
+                // sample.lost directly in on_rack_timeout / queue_recovery_head.
+                self.mark_samples_in_range_lost(start, hole_end);
+            }
+        }
+        self.refresh_lost_bytes();
+    }
+
+    fn mark_samples_in_range_lost(&mut self, range_start: TcpSeq, range_end: TcpSeq) {
+        if range_end <= range_start {
+            return;
+        }
+        let mut cursor = self.sample_at_or_after(range_start, true);
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index);
+            if sample.sequence >= range_end {
+                break;
+            }
+            cursor = sample.next;
+            if sample.end_sequence > range_start && sample.sequence < range_end {
+                self.sent_sample_mut(index).lost = true;
             }
         }
     }
@@ -886,37 +927,15 @@ impl TcpRecoveryState {
         if sample.rack_deadline.is_some() || self.sample_is_lost(sample) {
             return;
         }
-        let current = self.sent_sample_mut(head);
-        current.rack_deadline = None;
+        {
+            let current = self.sent_sample_mut(head);
+            current.rack_deadline = None;
+            current.lost = true;
+        }
         self.mark_hole_lost(sample.sequence);
         self.refresh_lost_bytes();
         self.rack_rescan_earliest();
         self.rack_timer_armed = self.has_pending_rack_deadline();
-    }
-
-    fn next_lost_hole(&self) -> Option<(TcpSeq, TcpSeq)> {
-        let mut cursor = self.scoreboard.high_rxt.max(self.ack_floor);
-        if let Some((start, hole)) = self.hole_covering_or_after(cursor) {
-            if hole.lost && start < self.scoreboard.high_sacked {
-                let begin = cursor.max(start);
-                if hole.end > begin {
-                    return Some((begin, hole.end));
-                }
-            }
-            if start > self.scoreboard.high_rxt {
-                cursor = start;
-            }
-        }
-        for (start, hole) in self.scoreboard.holes.iter() {
-            if *start < cursor || !hole.lost || *start >= self.scoreboard.high_sacked {
-                continue;
-            }
-            let begin = (*start).max(cursor);
-            if hole.end > begin {
-                return Some((begin, hole.end));
-            }
-        }
-        None
     }
 
     fn hole_covering_or_after(&self, sequence: TcpSeq) -> Option<(TcpSeq, TcpScoreboardHole)> {
@@ -947,22 +966,20 @@ impl TcpRecoveryState {
     }
 
     fn refresh_lost_bytes(&mut self) {
-        self.scoreboard.lost_bytes = 0;
-        for (start, hole) in self.scoreboard.holes.iter() {
-            if hole.lost {
-                self.scoreboard.lost_bytes = self
-                    .scoreboard
-                    .lost_bytes
-                    .saturating_add(start.distance_to(hole.end));
+        let mut lost_bytes = 0u32;
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index);
+            if sample.lost {
+                lost_bytes = lost_bytes.saturating_add(sample.bytes);
             }
+            cursor = sample.next;
         }
+        self.scoreboard.lost_bytes = lost_bytes;
     }
 
     fn sample_is_lost(&self, sample: TcpSentSample) -> bool {
-        self.hole_covering_or_after(sample.sequence)
-            .is_some_and(|(start, hole)| {
-                hole.lost && start <= sample.sequence && hole.end > sample.sequence
-            })
+        sample.lost
     }
 
     fn has_pending_rack_deadline(&self) -> bool {
@@ -1061,6 +1078,7 @@ impl Clone for TcpRecoveryState {
             {
                 let cloned_sample = cloned.sent_sample_mut(cloned_index);
                 cloned_sample.retransmitted = sample.retransmitted;
+                cloned_sample.lost = sample.lost;
                 cloned_sample.rack_deadline = sample.rack_deadline;
             }
             cursor = next;
@@ -1627,7 +1645,9 @@ mod tests {
         );
 
         let first = recovery.take_rack_retransmit().expect("first retransmit");
-        assert_eq!(first.packet_number, 2);
+        // Bottom-up retransmit order per RFC 6675 §4.3 / VPP scoreboard_next_rxt_hole:
+        // the lowest lost sequence (sample 1) is retransmitted first.
+        assert_eq!(first.packet_number, 1);
 
         recovery.on_ack(
             ack(2_500, now + Duration::from_millis(90), 90),
@@ -1909,9 +1929,11 @@ mod tests {
             .take_rack_retransmit()
             .expect("second pending retransmit");
 
+        // Bottom-up retransmit order per RFC 6675 §4.3 / VPP scoreboard_next_rxt_hole:
+        // lowest lost sequence (sample 1, seq 1000) first, then sample 2 (seq 2000).
         assert_eq!(
             (first.sequence, second.sequence),
-            (TcpSeq::from(2_000), TcpSeq::from(1_000))
+            (TcpSeq::from(1_000), TcpSeq::from(2_000))
         );
     }
 
