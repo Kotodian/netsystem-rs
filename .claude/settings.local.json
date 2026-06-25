@@ -23,7 +23,13 @@
       "Bash(awk 'NR>=3935 && NR<=4260 && /register_internal|register_driver|\\\\.node\\\\\\(\\\\\\)|TcpInput|IpInputNode|TunInput|graph\\\\.build|spawn_app_on_worker/' crates/hammer-service/src/service.rs)",
       "Bash(git commit -q -m 'docs\\(Plan\\): record missing production tcp graph as phase 1 prerequisite *)",
       "Bash(sed -n '174,195p' crates/hammer-service/src/service.rs)",
-      "Bash(sed -n '795,825p' crates/hammer-service/src/service.rs)"
+      "Bash(sed -n '795,825p' crates/hammer-service/src/service.rs)",
+      "Bash(echo \"=== exit $? ===\")",
+      "Bash(git -C /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs branch --show-current)",
+      "Bash(git -C /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs log --oneline -10)",
+      "Bash(awk 'NR>=900 && NR<=1135 && \\(/^#\\\\[cfg\\\\\\(test\\\\\\)\\\\]/ || /^mod tests/ || /^    fn / || /^    #\\\\[test\\\\]/\\)' /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-service/src/transport/tcp/mod.rs)",
+      "Bash(awk -F: '$2 ~ /test|tests/ || $1 > 2400')",
+      "Bash(awk '/fn control_segment/,/^    }/' /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-service/src/transport/tcp/connection.rs)"
     ]
   }
 }
