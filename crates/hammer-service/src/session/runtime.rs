@@ -940,6 +940,7 @@ where
                 continue;
             }
         }
+        #[allow(clippy::never_loop)]
         loop {
             let Some(tx_head) = driver.app_state.app.pending_send_head(session_id) else {
                 break;

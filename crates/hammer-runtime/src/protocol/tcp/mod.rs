@@ -34,6 +34,7 @@ impl TcpControlPlaneCell {
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut TcpControlPlaneState {
         unsafe { &mut *self.inner.get() }
     }

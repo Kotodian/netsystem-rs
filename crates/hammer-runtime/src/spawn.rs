@@ -1599,7 +1599,8 @@ mod tests {
             inputs: vec![TraceInputPolicy {
                 node: NodeId::new(0),
                 count: 2,
-            }],
+            }]
+            .into(),
         });
 
         context
@@ -1644,9 +1645,10 @@ mod tests {
             entries: vec![TraceEntry {
                 node: NodeId::new(1),
                 node_name: Some("trace-node"),
-                payload_bytes: b"test".to_vec(),
+                payload_bytes: b"test".to_vec().into(),
                 formatter: None,
-            }],
+            }]
+            .into(),
         });
         let writer = Arc::new(CaptureWriter {
             lines: StdMutex::new(std::vec::Vec::new()),

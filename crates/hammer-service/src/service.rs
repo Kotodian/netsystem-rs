@@ -178,6 +178,7 @@ impl RuntimeTcpListenerControlCell {
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     unsafe fn get_mut(&self) -> &mut RuntimeTcpListenerControlState {
         unsafe { &mut *self.inner.get() }
     }
