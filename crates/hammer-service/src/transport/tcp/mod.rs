@@ -427,24 +427,11 @@ where
                 context.mark_ready();
             }
         }
-        let session = context.session_id().pool_index();
         let now = std::time::Instant::now();
-        {
-            let timers = context.timer_wheel();
-            for timer_id in 0..crate::transport::tcp::connection::TCP_TIMER_COUNT {
-                if !self.timer_is_active(timer_id) {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                }
-                let Some(ticks) = self.timer_ticks(timer_id, now) else {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                };
-                timers
-                    .update_timer(session.slot(), session.generation(), timer_id, ticks)
-                    .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-            }
-        }
+        // Prior per-site predicate was just `self.timer_is_active(id)`, i.e.
+        // keep_mask = active mask. `timer_ticks` self-gates on active, so an
+        // active-but-not-yieldable timer yields `None` and is cancelled.
+        context.refresh_tcp_timers(self, self.active_timer_mask(), now)?;
         Ok(self.state() == TcpState::Closed)
     }
 
@@ -492,27 +479,12 @@ where
         now: std::time::Instant,
     ) -> CoreResult<()> {
         let timer_mask = self.commit_payload_tx(payload_len, now)?;
-        let session = context.session_id().pool_index();
         let now = std::time::Instant::now();
-        {
-            let timers = context.timer_wheel();
-            for timer_id in 0..crate::transport::tcp::connection::TCP_TIMER_COUNT {
-                if (timer_mask & (1u16 << timer_id)) == 0
-                    && !self.timer_is_active(timer_id)
-                    && timer_id != TCP_TIMER_RETRANSMIT
-                {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                }
-                let Some(ticks) = self.timer_ticks(timer_id, now) else {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                };
-                timers
-                    .update_timer(session.slot(), session.generation(), timer_id, ticks)
-                    .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-            }
-        }
+        // Prior per-site predicate was `(timer_mask & bit) != 0 ||
+        // timer_is_active(id) || id == RETRANSMIT`, i.e.
+        // keep_mask = timer_mask | active | (1 << RETRANSMIT).
+        let keep_mask = timer_mask | self.active_timer_mask() | (1u16 << TCP_TIMER_RETRANSMIT);
+        context.refresh_tcp_timers(self, keep_mask, now)?;
         Ok(())
     }
 

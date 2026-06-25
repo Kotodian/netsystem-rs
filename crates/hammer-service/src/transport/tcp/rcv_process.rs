@@ -94,6 +94,10 @@ where
         let mut queue = session_queue.borrow_mut()?;
         let session_id =
             read_session_id(runtime, index)?.ok_or(TcpNodeError::RcvProcessSessionRouteMissing)?;
+        // Warm the session pool slot cacheline before the `session_mut`
+        // borrow; the `receive_close_side` work below gives the prefetch
+        // lead time.
+        queue.prefetch_session(session_id);
         let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
             let connection = queue
                 .session_mut(session_id)
@@ -147,23 +151,18 @@ where
                 .session(session_id)
                 .ok_or(TcpNodeError::RcvProcessSessionMissing)? as *const _;
         let connection = unsafe { &*connection };
-        let session = session_id.pool_index();
-        {
-            let timers = queue.timers_mut();
-            for timer_id in 0..crate::transport::tcp::connection::TCP_TIMER_COUNT {
-                if (timer_mask & (1u16 << timer_id)) == 0 && !connection.timer_is_active(timer_id) {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                }
-                let Some(ticks) = connection.timer_ticks(timer_id, now) else {
-                    let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
-                    continue;
-                };
-                timers
-                    .update_timer(session.slot(), session.generation(), timer_id, ticks)
-                    .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
-            }
-        }
+        // Prior per-site predicate was `(timer_mask & bit) != 0 ||
+        // timer_is_active(id)`, i.e. keep_mask = timer_mask | active.
+        // `timer_ticks` self-gates on active, so an allowlisted-but-inactive
+        // timer yields `None` and is cancelled.
+        let keep_mask = timer_mask | connection.active_timer_mask();
+        crate::session::protocol::refresh_tcp_timers(
+            queue.timers_mut(),
+            connection,
+            session_id.pool_index(),
+            keep_mask,
+            now,
+        )?;
         publish_tcp_connection(&mut queue, session_id)?;
         if let Some(op) = complete_connected.take() {
             queue.app().complete_connected(op)?;

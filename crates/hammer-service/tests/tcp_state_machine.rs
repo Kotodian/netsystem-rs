@@ -120,3 +120,71 @@ fn tcp_syn_sent_timer_expiry_updates_connection_state_in_connection() {
     assert!(source.contains("pub(crate) fn on_tcp_timer_expiry("));
     assert!(source.contains("self.timer_set(TCP_TIMER_RETRANSMIT);"));
 }
+
+#[test]
+fn established_node_delegates_timer_refresh_to_shared_helper() {
+    // Source-level guard: after the timer-refresh dedup, the established node
+    // must not iterate a raw `0..TCP_TIMER_COUNT` literal inline. The literal
+    // legitimately remains in connection.rs (the const def + the shared
+    // helper). Here we assert established.rs delegates rather than reopening
+    // the cancel-or-update loop per-site.
+    let source = read_tcp_source("src/transport/tcp/established.rs");
+    assert!(
+        !source.contains("0..crate::transport::tcp::connection::TCP_TIMER_COUNT")
+            && !source.contains("0..TCP_TIMER_COUNT"),
+        "established.rs must delegate timer refresh to the shared helper, \
+         not iterate 0..TCP_TIMER_COUNT inline"
+    );
+}
+
+#[test]
+fn timer_refresh_loops_consolidated_into_shared_helper() {
+    // The cancel-or-update body must live in one shared helper, not be
+    // re-opened at each call site. Assert that rcv_process.rs and the TCP
+    // session-protocol impl in mod.rs no longer carry the raw literal; only
+    // connection.rs (const def + helper) keeps it.
+    for path in [
+        "src/transport/tcp/rcv_process.rs",
+        "src/transport/tcp/mod.rs",
+    ] {
+        let source = read_tcp_source(path);
+        assert!(
+            !source.contains("0..crate::transport::tcp::connection::TCP_TIMER_COUNT")
+                && !source.contains("0..TCP_TIMER_COUNT"),
+            "{path} must delegate timer refresh to the shared helper, \
+             not iterate 0..TCP_TIMER_COUNT inline"
+        );
+    }
+    let connection = read_tcp_source("src/transport/tcp/connection.rs");
+    assert!(
+        connection.contains("pub const TCP_TIMER_COUNT"),
+        "TCP_TIMER_COUNT const definition must remain in connection.rs"
+    );
+}
+
+#[test]
+fn input_path_session_slot_prefetch_is_wired() {
+    // Source-level smoke guard: the established and rcv_process input nodes
+    // must call `queue.prefetch_session(session_id)` after resolving the
+    // session id and before the `session_mut` borrow, warming the
+    // cache-cold session pool slot via the T3 `Pool::prefetch_slot`
+    // pass-through. We assert the call is present; the underlying
+    // `Pool::prefetch_slot` no-panic behavior is covered by hammer-infra's
+    // own tests.
+    for path in [
+        "src/transport/tcp/established.rs",
+        "src/transport/tcp/rcv_process.rs",
+    ] {
+        let source = read_tcp_source(path);
+        assert!(
+            source.contains("queue.prefetch_session(session_id)"),
+            "{path} must warm the session slot via queue.prefetch_session \
+             before the session_mut borrow"
+        );
+    }
+    let runtime = read_tcp_source("src/session/runtime.rs");
+    assert!(
+        runtime.contains("pub(crate) fn prefetch_session"),
+        "SessionDriverRuntime must expose the prefetch_session pass-through"
+    );
+}

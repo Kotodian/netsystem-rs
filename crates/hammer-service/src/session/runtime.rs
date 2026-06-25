@@ -577,6 +577,19 @@ impl<S> SessionDriverRuntime<S> {
         self.runtime.entries.get_mut(id.pool_index())
     }
 
+    /// Prefetch the session pool slot cacheline for `id`.
+    ///
+    /// Thin pass-through to `hammer_infra::pool::Pool::prefetch_slot`,
+    /// mirroring how `session`/`session_mut` expose `Pool::get`/`get_mut`.
+    /// Intended to be called as soon as a `SessionId` is resolved on the
+    /// input path (after `read_session_id`, before the `session_mut`
+    /// borrow), so the packet-parse work in between gives the prefetch lead
+    /// time to warm the cache-cold session slot.
+    #[inline]
+    pub(crate) fn prefetch_session(&self, id: SessionId) {
+        self.runtime.entries.prefetch_slot(id.pool_index());
+    }
+
     pub(crate) fn remove_session(&mut self, id: SessionId) -> Option<S> {
         self.runtime.pending_closes.take(id);
         self.app_state.app.free_pending_send(id);

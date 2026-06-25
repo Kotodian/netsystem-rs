@@ -150,6 +150,15 @@ fn tcp_output_next_for_index(
 
 #[inline(always)]
 fn prefetch_tcp_output(batch: &mut BufferBatchMut<'_>, indices: &[BufferIndex]) {
+    // `BufferBatchMut::prefetch_write` already issues L1-write prefetches for
+    // the output buffer's opaque cacheline (`prefetch_buffer_header_write`,
+    // cacheline0) and opaque2 cacheline (`prefetch_buffer_cacheline1_write`,
+    // cacheline1), plus the data cacheline. The TCP output node only touches
+    // header/opaque state on these buffers, so an additional L2-read prefetch
+    // of the same opaque cachelines here would be redundant with the existing
+    // L1-write prefetch. No extra prefetch is added on this path; if a future
+    // caller needs to warm opaque state earlier (e.g. L2 ahead of a deep
+    // pipeline), extend `BufferBatchMut` rather than duplicating here.
     for index in indices.iter().copied() {
         batch.prefetch_write(index);
     }

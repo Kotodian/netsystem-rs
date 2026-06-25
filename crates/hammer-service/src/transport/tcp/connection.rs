@@ -317,6 +317,17 @@ where
         timer_mask_contains(self.timers.active, timer_id)
     }
 
+    /// Bulk read of the active-timer bitmask (`self.timers.active`).
+    ///
+    /// One load replaces up to 8 `timer_is_active` mask-and-test calls at
+    /// call sites that need the whole mask (e.g. computing a timer-refresh
+    /// keep-mask). The per-id `timer_is_active` predicate remains for sites
+    /// that only test a single id.
+    #[inline(always)]
+    pub fn active_timer_mask(&self) -> u16 {
+        self.timers.active
+    }
+
     #[inline(always)]
     pub fn timer_set(&mut self, timer_id: u32) {
         self.timers.active |= timer_bit(timer_id);
