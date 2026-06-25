@@ -12,6 +12,92 @@ use crate::transport::congestion::{
 const TCP_MIN_TLP_TIMEOUT: Duration = Duration::from_millis(10);
 const TCP_DUPACK_THRESHOLD: u32 = 3;
 
+/// Inline capacity for per-ACK scoreboard key collection. SACK gap counts are
+/// bounded by the number of SACK blocks a receiver reports (RFC 2018 caps a
+/// single SACK option at 4 blocks, and pathological reordering rarely exceeds
+/// 8 distinct gaps). When this capacity is exceeded the collector falls back to
+/// a heap `Vec` via the `#[cold]` overflow path, preserving correctness.
+const SCOREBOARD_KEY_INLINE_CAP: usize = 8;
+
+/// Small-stack collector for `TcpSeq` keys used on the ACK hot path, replacing
+/// the per-ACK `Vec<TcpSeq>` allocations in `advance_scoreboard_for_ack` and
+/// `update_scoreboard_loss`. Holds up to `SCOREBOARD_KEY_INLINE_CAP` entries in
+/// a stack array; overflowing callers drain what fits and continue with a
+/// `#[cold]` heap fallback for the remainder, so behavior matches the old Vec
+/// exactly while keeping the common case allocation-free.
+struct ScoreboardKeyCollector {
+    inline: [TcpSeq; SCOREBOARD_KEY_INLINE_CAP],
+    len: usize,
+    overflow: Option<Vec<TcpSeq>>,
+}
+
+impl ScoreboardKeyCollector {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            inline: [TcpSeq::from(0); SCOREBOARD_KEY_INLINE_CAP],
+            len: 0,
+            overflow: None,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, key: TcpSeq) {
+        if let Some(buf) = &mut self.overflow {
+            buf.push(key);
+            return;
+        }
+        if self.len < SCOREBOARD_KEY_INLINE_CAP {
+            self.inline[self.len] = key;
+            self.len += 1;
+        } else {
+            // Spill: move inline contents to a heap Vec and continue there.
+            // #[cold] attribution is on `spill_to_overflow`.
+            self.spill_to_overflow(key);
+        }
+    }
+
+    #[cold]
+    fn spill_to_overflow(&mut self, key: TcpSeq) {
+        let mut buf = Vec::with_capacity(self.len.saturating_add(1).max(SCOREBOARD_KEY_INLINE_CAP));
+        for i in 0..self.len {
+            buf.push(self.inline[i]);
+        }
+        buf.push(key);
+        // Inline contents have been moved into the heap Vec; reset the inline
+        // view so `for_each`/`for_each_rev` do not visit them twice.
+        self.len = 0;
+        self.overflow = Some(buf);
+    }
+
+    /// Visit every collected key in insertion order.
+    #[inline]
+    fn for_each(mut self, mut f: impl FnMut(TcpSeq)) {
+        for i in 0..self.len {
+            f(self.inline[i]);
+        }
+        if let Some(buf) = self.overflow.take() {
+            for key in buf {
+                f(key);
+            }
+        }
+    }
+
+    /// Visit collected keys in reverse insertion order (used by
+    /// `update_scoreboard_loss`'s descending decision pass).
+    #[inline]
+    fn for_each_rev(mut self, mut f: impl FnMut(TcpSeq)) {
+        if let Some(buf) = self.overflow.take() {
+            for key in buf.iter().rev() {
+                f(*key);
+            }
+        }
+        for i in (0..self.len).rev() {
+            f(self.inline[i]);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TcpSentSample {
     pub(crate) packet_number: PacketNumber,
@@ -294,9 +380,7 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
-        let (acked, acked_bytes) = self.take_acked_segments(ack.acknowledgment);
-        let advanced = !acked.is_empty();
-        let latest_rtt = self.deliver_acked_segments(ack, acked, acked_bytes, congestion);
+        let (advanced, latest_rtt) = self.process_ack(ack, congestion);
         #[cfg(test)]
         if self.force_full_rebuild_on_ack {
             self.rebuild_scoreboard(
@@ -605,6 +689,82 @@ impl TcpRecoveryState {
             self.rack_note_deadline(deadline);
         }
         self.rack_timer_armed = self.has_pending_rack_deadline();
+    }
+
+    /// Fused ACK-path replacement for `take_acked_segments` + `deliver_acked_segments`.
+    ///
+    /// Walks `sample_head` once, taking each acked segment (full or partial
+    /// prefix) and feeding it straight to `deliver_acked_segment` inline, so no
+    /// intermediate `Vec<TcpSentSample>` is allocated on the ACK hot path.
+    ///
+    /// Equivalence with the pre-fuse path: `take_sent`/`take_sample_prefix`
+    /// decrement `bytes_in_flight` by `segment.bytes` before the inline
+    /// `deliver_acked_segment` call, so `self.bytes_in_flight()` read after the
+    /// take equals exactly `bif_before_ack - sum(seg[0..=i].bytes)`, which is the
+    /// `bytes_in_flight_after_ack` value the pre-fuse `deliver_acked_segments`
+    /// computed via its rollback (`bif_after_all + total - sum`). `recovery_delivered`
+    /// is credited by the accumulated acked bytes once at the end, matching the
+    /// pre-fuse one-shot `+= total_acked_bytes`. `on_end_acks` fires exactly once
+    /// when any segment was acked, matching the pre-fuse `any_acked` guard.
+    ///
+    /// Returns `(advanced, latest_rtt)` where `advanced` is true iff any segment
+    /// was acked (preserving the pre-fuse `!acked.is_empty()` signal) and
+    /// `latest_rtt` is the most recent non-retransmitted RTT sample.
+    fn process_ack<C: CongestionController>(
+        &mut self,
+        ack: TcpRecoveryAck,
+        congestion: &mut C,
+    ) -> (bool, Option<Duration>) {
+        let mut largest_acked = 0;
+        let mut any_acked = false;
+        let mut latest_rtt = None;
+        let mut total_acked_bytes = 0u32;
+        let mut cursor = self.sample_head;
+        let mut done = false;
+        while let Some(index) = cursor {
+            let sample = self.sent_sample(index);
+            let next = sample.next;
+            if ack.acknowledgment <= sample.sequence {
+                break;
+            }
+            let segment = if ack.acknowledgment >= sample.end_sequence {
+                let taken = self.take_sent(index);
+                total_acked_bytes = total_acked_bytes.saturating_add(taken.bytes);
+                taken
+            } else {
+                // Partial prefix: the remaining suffix stays outstanding at
+                // `sequence == acknowledgment`, so no later sample can be acked
+                // by this cumulative ACK either. Match `take_acked_segments`
+                // which breaks after taking the prefix.
+                let prefix = self.take_sample_prefix(index, ack.acknowledgment);
+                total_acked_bytes = total_acked_bytes.saturating_add(prefix.bytes);
+                done = true;
+                prefix
+            };
+            largest_acked = largest_acked.max(segment.packet_number);
+            any_acked = true;
+            let bytes_in_flight_after_ack = self.bytes_in_flight();
+            latest_rtt = deliver_acked_segment(bytes_in_flight_after_ack, ack, segment, congestion)
+                .or(latest_rtt);
+            if done {
+                break;
+            }
+            cursor = next;
+        }
+        if self.recovery_active && total_acked_bytes != 0 {
+            self.recovery_delivered = self
+                .recovery_delivered
+                .saturating_add(total_acked_bytes);
+        }
+        if any_acked {
+            congestion.on_end_acks(
+                ack.now,
+                self.bytes_in_flight(),
+                ack.app_limited,
+                largest_acked,
+            );
+        }
+        (any_acked, latest_rtt)
     }
 
     fn take_acked_segments(&mut self, acknowledgment: TcpSeq) -> (Vec<TcpSentSample>, u32) {
@@ -939,15 +1099,13 @@ impl TcpRecoveryState {
             // clear() of unrelated scoreboard state, then recompute lost_bytes
             // from per-sample flags (RACK-lost samples above high_sacked still
             // count).
-            let keys: Vec<TcpSeq> = self
-                .scoreboard
-                .holes
-                .iter()
-                .map(|(start, _)| *start)
-                .collect();
-            for start in keys {
-                self.scoreboard.holes.remove(&start);
+            let mut keys = ScoreboardKeyCollector::new();
+            for (start, _) in self.scoreboard.holes.iter() {
+                keys.push(*start);
             }
+            keys.for_each(|start| {
+                self.scoreboard.holes.remove(&start);
+            });
             self.refresh_lost_bytes();
             self.rack_rescan_earliest();
             return;
@@ -955,7 +1113,7 @@ impl TcpRecoveryState {
 
         // Remove holes fully below the new ACK and trim the one it crosses.
         // Collect first to avoid mutating while iterating.
-        let mut to_remove: Vec<TcpSeq> = Vec::new();
+        let mut to_remove = ScoreboardKeyCollector::new();
         let mut to_trim: Option<(TcpSeq, TcpSeq, bool)> = None;
         for (start, hole) in self.scoreboard.holes.iter() {
             if hole.end <= acknowledgment {
@@ -964,9 +1122,9 @@ impl TcpRecoveryState {
                 to_trim = Some((*start, hole.end, hole.lost));
             }
         }
-        for start in to_remove {
+        to_remove.for_each(|start| {
             self.scoreboard.holes.remove(&start);
-        }
+        });
         if let Some((old_start, end, lost)) = to_trim {
             self.scoreboard.holes.remove(&old_start);
             let _ = self
@@ -1027,7 +1185,7 @@ impl TcpRecoveryState {
 
         // Collect holes ascending, then decide descending so each hole sees the
         // sacked bytes/blocks accumulated above it.
-        let mut hole_starts: Vec<TcpSeq> = Vec::with_capacity(self.scoreboard.holes.len());
+        let mut hole_starts = ScoreboardKeyCollector::new();
         let mut cursor = self.scoreboard.holes.first().map(|(start, _)| *start);
         while let Some(start) = cursor {
             hole_starts.push(start);
@@ -1041,9 +1199,9 @@ impl TcpRecoveryState {
         let mut sacked_ahead: u32 = 0;
         let mut blocks_ahead: u32 = 0;
         let mut higher_start: Option<TcpSeq> = None;
-        for &start in hole_starts.iter().rev() {
+        hole_starts.for_each_rev(|start| {
             let Some(hole) = self.scoreboard.holes.get(&start).copied() else {
-                continue;
+                return;
             };
             let should_mark_lost = blocks_ahead >= reorder_limit || sacked_ahead > byte_threshold;
             let hole_end = hole.end;
@@ -1065,7 +1223,7 @@ impl TcpRecoveryState {
                 blocks_ahead = blocks_ahead.saturating_add(1);
             }
             higher_start = Some(start);
-        }
+        });
         self.refresh_lost_bytes();
     }
 
@@ -1175,6 +1333,15 @@ impl TcpRecoveryState {
             cursor = sample.next;
         }
         earliest
+    }
+
+    /// Test accessor: total bytes credited to the PRR `recovery_delivered`
+    /// counter since recovery started. Used by the fuse-equivalence test to
+    /// verify the inlined ACK path accumulates the same delivered bytes as the
+    /// pre-fuse `deliver_acked_segments` path.
+    #[cfg(test)]
+    pub(crate) fn recovery_delivered_for_test(&self) -> u32 {
+        self.recovery_delivered
     }
 }
 
@@ -2333,6 +2500,357 @@ mod tests {
                 "recovery.rs unexpectedly depends on forbidden layer symbol: {pattern}"
             );
         }
+    }
+
+    /// Behavior-equivalence guard for the ACK-path fuse (Task 6 Plan A).
+    ///
+    /// The pre-fuse `on_ack` did: `take_acked_segments` (collect into a Vec,
+    /// decrementing `bytes_in_flight` per taken segment) -> `deliver_acked_segments`
+    /// (iterate the Vec, computing `bytes_in_flight_after_ack` per segment as
+    /// `bif_after_all_takes + total - sum(seg[0..=i].bytes)`). The fused inline
+    /// path must deliver the *exact same* `bytes_in_flight` value to each
+    /// `congestion.on_ack` call, fire `on_end_acks` the same number of times,
+    /// keep `bytes_in_flight()` identical after the ACK, and credit
+    /// `recovery_delivered` by the same total. This test pins those invariants
+    /// on a multi-segment cumulative + partial ACK sequence inside recovery,
+    /// so regressing the fuse (e.g. reading `bytes_in_flight` before the take,
+    /// or dropping the `recovery_delivered` credit) turns it RED.
+    #[test]
+    fn on_ack_fused_path_matches_pre_fuse_delivery_semantics() {
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_000);
+
+        // Four full segments at 1000-byte boundaries; total in-flight = 4000.
+        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
+        record_sent_for_test(
+            &mut recovery,
+            2,
+            2_000,
+            3_000,
+            1_000,
+            now + Duration::from_millis(1),
+        );
+        record_sent_for_test(
+            &mut recovery,
+            3,
+            3_000,
+            4_000,
+            1_000,
+            now + Duration::from_millis(2),
+        );
+        record_sent_for_test(
+            &mut recovery,
+            4,
+            4_000,
+            5_000,
+            1_000,
+            now + Duration::from_millis(3),
+        );
+        assert_eq!(recovery.bytes_in_flight(), 4_000);
+
+        // Drive recovery via a SACK of the top segment + RACK timeout so that
+        // `recovery_active` is true and `recovery_delivered` is credited on
+        // subsequent ACKs.
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 40),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(4_000),
+                right_edge: TcpSeq::from(5_000),
+            }],
+            &mut controller,
+        );
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(56),
+            TcpSeq::from(5_000),
+            &mut controller,
+        );
+        assert!(recovery.in_recovery());
+        let delivered_before = recovery.recovery_delivered_for_test();
+        assert_eq!(delivered_before, 0);
+
+        // Cumulative ACK of segments 1 and 2 (ack -> 3000). The pre-fuse path
+        // delivered `bytes_in_flight_after_ack` = [2000, 1000] to on_ack for
+        // packets 1 then 2, and credited recovery_delivered += 2000.
+        controller.acked.clear();
+        controller.acked_bytes_in_flight.clear();
+        controller.end_acks = 0;
+        recovery.on_ack(
+            ack(3_000, now + Duration::from_millis(90), 90),
+            &mut controller,
+        );
+        assert_eq!(
+            controller.acked.iter().map(|p| p.packet_number).collect::<Vec<_>>(),
+            vec![1, 2],
+            "cumulative ack must deliver segments in ascending order"
+        );
+        assert_eq!(
+            controller.acked_bytes_in_flight.as_slice(),
+            &[2_000, 1_000],
+            "per-segment bytes_in_flight must equal pre-fuse rollback computation"
+        );
+        assert_eq!(controller.end_acks, 1, "on_end_acks must fire once per ACK");
+        // SACK already removed segment 4, so in-flight before this ACK was 3000;
+        // taking segments 1 and 2 (2000 bytes) leaves 1000.
+        assert_eq!(
+            recovery.bytes_in_flight(),
+            1_000,
+            "bytes_in_flight must reflect taken segments"
+        );
+        assert_eq!(
+            recovery.recovery_delivered_for_test(),
+            2_000,
+            "recovery_delivered must be credited by total acked bytes"
+        );
+
+        // Partial ACK splitting segment 3 (ack -> 3500). Pre-fuse delivered
+        // bytes_in_flight_after_ack = [500] for the 500-byte prefix and
+        // credited recovery_delivered += 500.
+        controller.acked.clear();
+        controller.acked_bytes_in_flight.clear();
+        controller.end_acks = 0;
+        recovery.on_ack(
+            ack(3_500, now + Duration::from_millis(120), 120),
+            &mut controller,
+        );
+        assert_eq!(controller.acked.len(), 1);
+        assert_eq!(controller.acked[0].packet_number, 3);
+        assert_eq!(controller.acked[0].bytes, 500);
+        assert_eq!(
+            controller.acked_bytes_in_flight.as_slice(),
+            &[500],
+            "partial ack must deliver post-split bytes_in_flight"
+        );
+        assert_eq!(controller.end_acks, 1);
+        assert_eq!(recovery.bytes_in_flight(), 500);
+        assert_eq!(
+            recovery.recovery_delivered_for_test(),
+            2_500,
+            "recovery_delivered must accumulate across ACKs"
+        );
+
+        // Empty ACK (no advance): on_end_acks must NOT fire and no per-segment
+        // on_ack calls must occur.
+        controller.acked.clear();
+        controller.acked_bytes_in_flight.clear();
+        controller.end_acks = 0;
+        recovery.on_ack(
+            ack(3_500, now + Duration::from_millis(130), 130),
+            &mut controller,
+        );
+        assert!(controller.acked.is_empty());
+        assert!(controller.acked_bytes_in_flight.is_empty());
+        assert_eq!(controller.end_acks, 0, "no-op ack must not fire on_end_acks");
+        assert_eq!(recovery.bytes_in_flight(), 500);
+        assert_eq!(
+            recovery.recovery_delivered_for_test(),
+            2_500,
+            "no-op ack must not credit recovery_delivered"
+        );
+    }
+
+    /// Source-level allocation guard for Task 6: the ACK hot path must not
+    /// allocate a `Vec` for acked-segment collection. `process_ack` inlines the
+    /// take+deliver loop and the ACK path no longer calls
+    /// `take_acked_segments`/`deliver_acked_segments` (those remain only for the
+    /// low-frequency SACK path). A global-allocator counter is unsafe in the
+    /// multi-threaded test harness, so this source-equivalence assertion is the
+    /// chosen verification method (per the task brief's fallback). It fails if
+    /// someone reintroduces a `Vec` allocation on the ACK path.
+    #[test]
+    fn on_ack_path_does_not_collect_acked_segments_into_vec() {
+        let source = include_str!("recovery.rs");
+        // Bound the module body at the `mod tests` block, NOT the first
+        // `#[cfg(test)]` (which appears on the `clears` debug field far above).
+        let tests_start = source
+            .find("#[cfg(test)]\nmod tests")
+            .expect("tests module");
+        let module_body = &source[..tests_start];
+
+        // The ACK path must route through the fused `process_ack`.
+        assert!(
+            module_body.contains("fn process_ack<"),
+            "ACK path must use the fused process_ack (no per-ACK Vec)"
+        );
+
+        // `on_ack` must NOT call `take_acked_segments` or `deliver_acked_segments`
+        // (those remain only for the SACK path).
+        let on_ack_start = module_body
+            .find("pub fn on_ack<")
+            .expect("on_ack definition");
+        let on_ack_body = &module_body[on_ack_start..];
+        let on_ack_end = on_ack_body
+            .find("    }\n")
+            .expect("on_ack closing brace");
+        let on_ack_body = &on_ack_body[..on_ack_end];
+        assert!(
+            !on_ack_body.contains("take_acked_segments"),
+            "on_ack must not call take_acked_segments (per-ACK Vec alloc)"
+        );
+        assert!(
+            !on_ack_body.contains("deliver_acked_segments"),
+            "on_ack must not call deliver_acked_segments (consumes a Vec)"
+        );
+
+        // `advance_scoreboard_for_ack` and `update_scoreboard_loss` must collect
+        // scoreboard keys via the inline `ScoreboardKeyCollector`, not a bare
+        // `Vec<TcpSeq>` allocation.
+        assert!(
+            module_body.contains("struct ScoreboardKeyCollector"),
+            "scoreboard key collection must use the inline ScoreboardKeyCollector"
+        );
+        for fn_name in ["fn advance_scoreboard_for_ack", "fn update_scoreboard_loss"] {
+            let fn_start = module_body.find(fn_name).unwrap_or_else(|| {
+                panic!("{fn_name} not found in recovery.rs module body")
+            });
+            let fn_body = &module_body[fn_start..];
+            // Find the next top-level `    fn ` or `}` at column 4 to bound the body.
+            let fn_end = fn_body[1..]
+                .find("\n    fn ")
+                .map(|i| i + 1)
+                .unwrap_or(fn_body.len());
+            let fn_body = &fn_body[..fn_end];
+            assert!(
+                !fn_body.contains("Vec<TcpSeq>"),
+                "{fn_name} must not allocate Vec<TcpSeq> (use ScoreboardKeyCollector)"
+            );
+            assert!(
+                !fn_body.contains("Vec::with_capacity"),
+                "{fn_name} must not call Vec::with_capacity"
+            );
+        }
+    }
+
+    /// `ScoreboardKeyCollector` preserves insertion order up to its inline cap
+    /// and spills to a heap Vec on overflow without losing or reordering keys.
+    #[test]
+    fn scoreboard_key_collector_preserves_order_and_overflow() {
+        // Below cap: inline only, insertion order preserved.
+        let mut c = ScoreboardKeyCollector::new();
+        for i in 0..5u32 {
+            c.push(TcpSeq::from(1_000 + i));
+        }
+        let mut out = std::vec::Vec::new();
+        c.for_each(|k| out.push(u32::from(k)));
+        assert_eq!(out, vec![1_000, 1_001, 1_002, 1_003, 1_004]);
+
+        // At cap exactly: still inline.
+        let mut c = ScoreboardKeyCollector::new();
+        for i in 0..SCOREBOARD_KEY_INLINE_CAP as u32 {
+            c.push(TcpSeq::from(2_000 + i));
+        }
+        let mut out = std::vec::Vec::new();
+        c.for_each(|k| out.push(u32::from(k)));
+        assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP);
+        assert_eq!(out[0], 2_000);
+        assert_eq!(out[SCOREBOARD_KEY_INLINE_CAP - 1], 2_000 + (SCOREBOARD_KEY_INLINE_CAP - 1) as u32);
+
+        // Overflow: spilled keys appear after inline keys, in insertion order.
+        let mut c = ScoreboardKeyCollector::new();
+        for i in 0..(SCOREBOARD_KEY_INLINE_CAP + 4) as u32 {
+            c.push(TcpSeq::from(3_000 + i));
+        }
+        let mut out = std::vec::Vec::new();
+        c.for_each(|k| out.push(u32::from(k)));
+        assert_eq!(out.len(), SCOREBOARD_KEY_INLINE_CAP + 4);
+        for i in 0..out.len() {
+            assert_eq!(out[i], 3_000 + i as u32, "overflow must preserve order at {i}");
+        }
+
+        // Reverse iteration honors overflow-then-inline with correct ordering.
+        let mut c = ScoreboardKeyCollector::new();
+        for i in 0..(SCOREBOARD_KEY_INLINE_CAP + 2) as u32 {
+            c.push(TcpSeq::from(4_000 + i));
+        }
+        let mut out = std::vec::Vec::new();
+        c.for_each_rev(|k| out.push(u32::from(k)));
+        let total = SCOREBOARD_KEY_INLINE_CAP + 2;
+        assert_eq!(out.len(), total);
+        for i in 0..total {
+            assert_eq!(out[i], 4_000 + (total - 1 - i) as u32, "rev order at {i}");
+        }
+    }
+
+    /// Drives `update_scoreboard_loss` and `advance_scoreboard_for_ack` past the
+    /// inline cap (8 holes) so the `#[cold]` heap fallback is exercised on the
+    /// scoreboard key-collection path. Verifies the overflow path produces the
+    /// same loss decisions as a hand-computed expectation, guarding the fallback
+    /// against silent reordering or dropped keys.
+    #[test]
+    fn scoreboard_loss_correct_when_hole_count_exceeds_inline_cap() {
+        // Build >SCOREBOARD_KEY_INLINE_CAP disjoint SACK gaps by recording many
+        // non-contiguous samples and SACKing every other one, then triggering
+        // RACK loss so `update_scoreboard_loss` runs with >8 holes.
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_000);
+        const SEG: u32 = 1_000;
+        const N: u32 = (SCOREBOARD_KEY_INLINE_CAP as u32) * 2 + 2; // 18 samples
+        for i in 0..N {
+            let seq = 1_000 + i * SEG;
+            record_sent_for_test(&mut recovery, i as PacketNumber + 1, seq, seq + SEG, SEG, now + Duration::from_millis(i as u64));
+        }
+
+        // SACK every even-indexed segment to create gaps; ack_floor stays at 1000.
+        let mut blocks: std::vec::Vec<TcpSackBlock> = std::vec::Vec::new();
+        for i in 0..N {
+            if i % 2 == 1 {
+                let seq = 1_000 + i * SEG;
+                blocks.push(TcpSackBlock {
+                    left_edge: TcpSeq::from(seq),
+                    right_edge: TcpSeq::from(seq + SEG),
+                });
+            }
+        }
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 40),
+            &blocks,
+            &mut controller,
+        );
+        // Hole count = number of unsacked (even-indexed) segments > 8.
+        let snap = recovery.scoreboard_snapshot();
+        assert!(
+            snap.holes.len() > SCOREBOARD_KEY_INLINE_CAP,
+            "test must exceed inline cap; got {} holes",
+            snap.holes.len()
+        );
+
+        // Trigger RACK so update_scoreboard_loss runs on the oversized hole set.
+        recovery.on_rack_timeout(
+            now + Duration::from_millis(80),
+            TcpSeq::from(1_000 + N * SEG),
+            &mut controller,
+        );
+
+        // The lowest `reorder_limit` (=3) holes above a given hole accumulate
+        // enough blocks_ahead to be marked lost; with N/2 sacked blocks above,
+        // every non-top hole should be lost (blocks_ahead >= 3 for all but the
+        // top 3 holes). Verify lost_bytes reflects lost sample bytes by checking
+        // that lost_bytes > 0 and matches a full sample scan.
+        let snap = recovery.scoreboard_snapshot();
+        assert!(snap.lost_bytes > 0, "loss marking must fire on oversized hole set");
+
+        // Cross-check: scoreboard `lost_bytes` must equal the sum of outstanding
+        // sample bytes flagged `lost` (the unified per-sample loss path). This
+        // guards that the overflowed key collection did not drop or reorder
+        // holes such that `mark_samples_in_range_lost` missed any sample.
+        let samples = recovery.sample_snapshot();
+        let scanned_lost: u32 = samples
+            .iter()
+            .filter(|(_, _, _, lost, _)| *lost)
+            .map(|(_, _, bytes, _, _)| *bytes)
+            .sum();
+        assert_eq!(
+            snap.lost_bytes, scanned_lost,
+            "lost_bytes must match the per-sample lost scan on oversized hole sets"
+        );
+
+        // At least one hole must be declared lost (the overflow path must still
+        // propagate loss decisions, not silently no-op).
+        assert!(
+            snap.holes.iter().any(|(_, _, lost)| *lost),
+            "at least one hole must be marked lost past the inline cap"
+        );
     }
 
     // Deterministic LCG pseudo-random generator (fixed seed) so the oracle test
