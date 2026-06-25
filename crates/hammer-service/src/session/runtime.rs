@@ -1547,6 +1547,7 @@ mod tests {
         assert_eq!(head_enqueue.newest_ooo_len, 0);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");
@@ -1565,6 +1566,7 @@ mod tests {
         assert_eq!(completions.len(), 1);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue still present after one recv completion");
@@ -1652,6 +1654,7 @@ mod tests {
         assert_eq!(earlier_enqueue.newest_ooo_len, 2);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");
@@ -1687,6 +1690,7 @@ mod tests {
         assert_eq!(duplicate_enqueue, SessionRxEnqueue::default());
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");
@@ -1723,6 +1727,7 @@ mod tests {
         assert_eq!(overlap_enqueue.newest_ooo_len, 4);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");
@@ -1778,6 +1783,7 @@ mod tests {
         assert_eq!(overlap_enqueue.newest_ooo_len, 6);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");
@@ -1834,6 +1840,7 @@ mod tests {
         assert_eq!(gap_close_enqueue.newest_ooo_len, 0);
 
         let rx_index = driver
+            .runtime
             .rx_index
             .lookup(&session_id.get())
             .expect("rx queue present");

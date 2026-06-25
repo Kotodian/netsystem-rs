@@ -14,6 +14,8 @@ use super::{
     TcpInputControlPlane, TcpInputNext, TcpQueue, publish_tcp_connection, tcp_worker_state_mut,
     write_session_route_opaque,
 };
+#[cfg(test)]
+use super::{set_tcp_worker_state, tcp_worker_state};
 use crate::session::SessionId;
 use crate::transport::congestion::CongestionController;
 

@@ -181,7 +181,7 @@ fn timer_wheel_fast_hint_is_approximate_and_slot_based() {
 
 #[test]
 fn timer_wheel_without_fast_hint_reports_no_hint() {
-    let wheel = TimerWheel1t1w32::<u32>::new(0);
+    let wheel = TimerWheel1t1w32sl::<u32>::new(0);
 
     assert_eq!(wheel.first_expires_in_ticks(), None);
 }

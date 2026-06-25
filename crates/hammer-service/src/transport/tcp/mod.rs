@@ -1125,7 +1125,8 @@ mod tests {
             assert_eq!(enqueue.delivered_len, 0);
             control.unwrap_or_else(|| {
                 connection.control_segment(
-                    &packet,
+                    packet.local,
+                    packet.remote,
                     hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
                     None,
                     hammer_core::protocol::tcp::TcpCapabilities::default(),
