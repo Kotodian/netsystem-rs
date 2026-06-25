@@ -10,6 +10,12 @@ impl PacketBufferFlags {
     pub const NEXT_PRESENT: Self = Self(1 << 0);
     pub const TOTAL_LENGTH_VALID: Self = Self(1 << 1);
     pub const TRACED: Self = Self(1 << 2);
+    /// Cacheline1 (trace_handle / total_length_not_including_first / opaque2)
+    /// is known to be zeroed. Set by the free fast path and by the full reset
+    /// routines; cleared by any mutator that dirties cacheline1. Lets the
+    /// alloc fast path skip the second cacheline write when the slot was
+    /// cleanly freed.
+    pub const SLOT_CLEAN: Self = Self(1 << 3);
 
     #[inline]
     pub const fn empty() -> Self {

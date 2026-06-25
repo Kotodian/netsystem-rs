@@ -8,3 +8,4 @@ publish.workspace = true
 name = "hammer_infra"
 
 [dependencies]
+crossbeam-utils = { workspace = true }

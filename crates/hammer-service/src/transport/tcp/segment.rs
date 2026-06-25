@@ -1,6 +1,7 @@
 use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 use hammer_adapter::{
     BufferIndex, DataPlaneBuffers, DataPlaneRuntime, IpEcnCodepoint, NetworkOpaque,
 };
@@ -8,13 +9,55 @@ use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
     TcpSegmentHeader, TcpSegmentParseError, TcpSeq, TcpTimestampOption, tcp_options_from_bytes,
-    write_tcp_segment_header,
+    tcp_segment_header_len, write_tcp_segment_header,
 };
-use hammer_infra::vec::Vec;
-
-use crate::net::ip::{IpInputError, IpProtocol, IpVersion, parse_ip_packet_with_chain_len};
 
 const TCP_SEGMENT_OPAQUE_PRESENT: u8 = 1 << 7;
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub(crate) struct TcpWireHeader {
+    source_port: [u8; 2],
+    destination_port: [u8; 2],
+    sequence_number: [u8; 4],
+    acknowledgment_number: [u8; 4],
+    data_offset_reserved_flags: [u8; 2],
+    advertised_window: [u8; 2],
+    checksum: [u8; 2],
+    urgent_pointer: [u8; 2],
+}
+
+impl TcpWireHeader {
+    #[inline(always)]
+    pub(crate) fn header_len(self) -> usize {
+        usize::from(self.data_offset_reserved_flags[0] >> 4) * 4
+    }
+
+    #[inline(always)]
+    pub(crate) fn source_port(self) -> u16 {
+        u16::from_be_bytes(self.source_port)
+    }
+
+    #[inline(always)]
+    pub(crate) fn destination_port(self) -> u16 {
+        u16::from_be_bytes(self.destination_port)
+    }
+
+    #[inline(always)]
+    pub(crate) fn sequence_number(self) -> u32 {
+        u32::from_be_bytes(self.sequence_number)
+    }
+
+    #[inline(always)]
+    pub(crate) fn acknowledgment_number(self) -> u32 {
+        u32::from_be_bytes(self.acknowledgment_number)
+    }
+
+    #[inline(always)]
+    pub(crate) fn advertised_window(self) -> u16 {
+        u16::from_be_bytes(self.advertised_window)
+    }
+}
 
 pub(crate) fn parse_tcp_packet(
     runtime: &DataPlaneRuntime,
@@ -40,50 +83,47 @@ pub(crate) fn parse_tcp_packet(
         let cursor = buffer.packet_cursor();
         let parsed =
             parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first())
-                .map_err(|_| TcpSegmentParseError::InvalidIpHeader)?;
+                .map_err(|_| TcpError::from(TcpSegmentParseError::InvalidIpHeader))?;
         if parsed.protocol != IpProtocol::Tcp || parsed.input_error != IpInputError::None {
-            return Err(TcpSegmentParseError::WrongProtocol.into());
+            return Err(TcpError::from(TcpSegmentParseError::WrongProtocol).into());
         }
         let first_len = current.len().min(parsed.packet_len);
         let packet = current
             .get(..first_len)
-            .ok_or(TcpSegmentParseError::InvalidPacketLength)?;
+            .ok_or(TcpError::from(TcpSegmentParseError::InvalidPacketLength))?;
         let source_ip = source_ip(parsed.version, packet)?;
         let destination_ip = destination_ip(parsed.version, packet)?;
         let transport = packet
             .get(cursor.transport_header_offset()..first_len)
-            .ok_or(TcpSegmentParseError::MissingTransportHeader)?;
-        let segment = etherparse::TcpSlice::from_slice(transport).map_err(tcp_parse_error)?;
-        let parsed_options = tcp_options_from_bytes(segment.options());
+            .ok_or(TcpError::from(TcpSegmentParseError::MissingTransportHeader))?;
+        let segment = parse_tcp_wire_header(transport).map_err(|error| TcpError::from(error))?;
+        let header_len = segment.header_len();
+        let options = transport
+            .get(20..header_len)
+            .ok_or(TcpError::from(TcpSegmentParseError::InvalidSlice))?;
+        let parsed_options = tcp_options_from_bytes(options);
         let payload_offset = cursor
             .transport_header_offset()
-            .checked_add(segment.header_len())
-            .ok_or(TcpSegmentParseError::PayloadOffsetOverflow)?;
+            .checked_add(header_len)
+            .ok_or(TcpError::from(TcpSegmentParseError::PayloadOffsetOverflow))?;
         let payload_len = parsed
             .packet_len
             .checked_sub(payload_offset)
-            .ok_or(TcpSegmentParseError::PayloadOffsetExceedsPacketLength)?;
+            .ok_or(TcpError::from(
+                TcpSegmentParseError::PayloadOffsetExceedsPacketLength,
+            ))?;
         let local = SocketAddr::new(destination_ip, segment.destination_port());
         let remote = SocketAddr::new(source_ip, segment.source_port());
-        let acknowledgment = segment
-            .ack()
+        let flags = tcp_wire_flags(segment);
+        let acknowledgment = flags
+            .contains(TcpSegmentFlags::ACK)
             .then(|| TcpSeq::from(segment.acknowledgment_number()));
-        let mut flags = TcpSegmentFlags::empty();
-        flags.set(TcpSegmentFlags::NS, segment.ns());
-        flags.set(TcpSegmentFlags::FIN, segment.fin());
-        flags.set(TcpSegmentFlags::SYN, segment.syn());
-        flags.set(TcpSegmentFlags::RST, segment.rst());
-        flags.set(TcpSegmentFlags::PSH, segment.psh());
-        flags.set(TcpSegmentFlags::ACK, segment.ack());
-        flags.set(TcpSegmentFlags::URG, segment.urg());
-        flags.set(TcpSegmentFlags::ECE, segment.ece());
-        flags.set(TcpSegmentFlags::CWR, segment.cwr());
         (
             local,
             remote,
             TcpSeq::from(segment.sequence_number()),
             acknowledgment,
-            segment.window_size(),
+            segment.advertised_window(),
             flags,
             parsed_options.capabilities,
             parsed_options.sack_blocks,
@@ -172,21 +212,12 @@ impl TcpSegment {
 
     #[inline]
     pub fn write_header(&self, output: &mut [u8]) -> Result<usize, TcpError> {
-        write_tcp_segment_header(
-            output,
-            TcpSegmentHeader {
-                source_port: self.local_port,
-                destination_port: self.remote_port,
-                sequence_number: self.sequence,
-                acknowledgment_number: self.acknowledgment,
-                flags: self.flags,
-                advertised_window: self.advertised_window,
-                capabilities: self.capabilities,
-                timestamp: self.timestamp,
-                fast_open_cookie: self.fast_open_cookie.as_ref(),
-            },
-            self.sack_blocks(),
-        )
+        write_tcp_segment_header(output, self.header(), self.sack_blocks())
+    }
+
+    #[inline]
+    pub fn header_len(&self) -> usize {
+        tcp_segment_header_len(self.header(), self.sack_blocks())
     }
 
     #[inline]
@@ -200,6 +231,21 @@ impl TcpSegment {
             return None;
         };
         Some(&sack_blocks[..usize::from(self.sack_block_count)])
+    }
+
+    #[inline]
+    fn header(&self) -> TcpSegmentHeader<'_> {
+        TcpSegmentHeader {
+            source_port: self.local_port,
+            destination_port: self.remote_port,
+            sequence_number: self.sequence,
+            acknowledgment_number: self.acknowledgment,
+            flags: self.flags,
+            advertised_window: self.advertised_window,
+            capabilities: self.capabilities,
+            timestamp: self.timestamp,
+            fast_open_cookie: self.fast_open_cookie.as_ref(),
+        }
     }
 
     pub(crate) fn write_to_buffer(
@@ -229,6 +275,7 @@ impl TcpSegment {
         Ok(segment)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_from_buffer_ref(
         buffer: &hammer_adapter::BufferRef<'_>,
     ) -> Result<Self, TcpError> {
@@ -464,13 +511,39 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> Result<IpAddr, TcpError>
 }
 
 #[inline]
-fn tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpError {
-    match error {
-        etherparse::err::tcp::HeaderSliceError::Len(_)
-        | etherparse::err::tcp::HeaderSliceError::Content(
-            etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
-        ) => TcpSegmentParseError::InvalidSegment.into(),
+pub(crate) fn parse_tcp_wire_header(packet: &[u8]) -> Result<TcpWireHeader, TcpSegmentParseError> {
+    if packet.len() < std::mem::size_of::<TcpWireHeader>() {
+        return Err(TcpSegmentParseError::ShortHeader);
     }
+    // SAFETY: `TcpWireHeader` is packed and the length check above guarantees
+    // the bytes are present in the slice.
+    let header_ptr = unsafe { transmute::<_, *const TcpWireHeader>(packet.as_ptr()) };
+    let header = unsafe { header_ptr.read_unaligned() };
+    let header_len = header.header_len();
+    if header_len < std::mem::size_of::<TcpWireHeader>() {
+        return Err(TcpSegmentParseError::BadDataOffset);
+    }
+    if packet.len() < header_len {
+        return Err(TcpSegmentParseError::InvalidSlice);
+    }
+    Ok(header)
+}
+
+#[inline(always)]
+pub(crate) fn tcp_wire_flags(segment: TcpWireHeader) -> TcpSegmentFlags {
+    let first = segment.data_offset_reserved_flags[0];
+    let second = segment.data_offset_reserved_flags[1];
+    let mut flags = TcpSegmentFlags::empty();
+    flags.set(TcpSegmentFlags::NS, first & 0x01 != 0);
+    flags.set(TcpSegmentFlags::FIN, second & 0x01 != 0);
+    flags.set(TcpSegmentFlags::SYN, second & 0x02 != 0);
+    flags.set(TcpSegmentFlags::RST, second & 0x04 != 0);
+    flags.set(TcpSegmentFlags::PSH, second & 0x08 != 0);
+    flags.set(TcpSegmentFlags::ACK, second & 0x10 != 0);
+    flags.set(TcpSegmentFlags::URG, second & 0x20 != 0);
+    flags.set(TcpSegmentFlags::ECE, second & 0x40 != 0);
+    flags.set(TcpSegmentFlags::CWR, second & 0x80 != 0);
+    flags
 }
 
 #[inline]

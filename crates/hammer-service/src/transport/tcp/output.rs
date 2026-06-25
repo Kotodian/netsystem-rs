@@ -138,10 +138,11 @@ fn tcp_output_next_for_index(
     let Ok(segment) = TcpSegment::read_from_buffer(&buffer) else {
         return Ok(drop);
     };
-    let mut header = [0u8; 64];
-    let header_len = segment.write_header(&mut header)?;
-    let header = &header[..header_len];
-    if buffer.prepend(header).is_err() {
+    let header = match buffer.prepend_mut(segment.header_len()) {
+        Ok(header) => header,
+        Err(_) => return Ok(drop),
+    };
+    if segment.write_header(header).is_err() {
         return Ok(drop);
     }
     Ok(lookup)

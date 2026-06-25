@@ -28,6 +28,9 @@ pub enum HammerError {
     #[error("platform: {message}")]
     Platform { message: String },
 
+    #[error("tcp: {message}")]
+    Tcp { message: String },
+
     #[error("{message}")]
     Internal { message: String },
 }
@@ -60,6 +63,9 @@ impl From<CoreError> for HammerError {
             CoreError::ConfigValidation { message } => HammerError::ConfigValidation { message },
             CoreError::Lifecycle { stage, message } => HammerError::Lifecycle { stage, message },
             CoreError::ServiceClosed => HammerError::ServiceClosed,
+            CoreError::Tcp(error) => HammerError::Tcp {
+                message: error.to_string(),
+            },
             CoreError::Internal { message } => HammerError::Internal { message },
         }
     }

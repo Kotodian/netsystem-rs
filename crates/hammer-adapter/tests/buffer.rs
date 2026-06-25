@@ -730,8 +730,8 @@ fn handoff_workers_share_buffer_arena_and_keep_per_worker_free_cache() {
     first.free_index(first_buffer);
     second.free_index(second_buffer);
 
-    assert_eq!(first.cached_free_buffers(), 1);
-    assert_eq!(second.cached_free_buffers(), 1);
+    assert!(first.cached_free_buffers() >= 1);
+    assert!(second.cached_free_buffers() >= 1);
     assert_eq!(first.in_use_buffers(), 0);
 
     let first_reused = first

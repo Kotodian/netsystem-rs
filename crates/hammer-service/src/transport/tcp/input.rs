@@ -24,7 +24,9 @@ use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
     TcpV4ListenerKey, TcpV6ListenerKey,
 };
+use super::segment::{parse_tcp_wire_header, tcp_wire_flags};
 use super::{TcpInputNext, TcpQueue, write_session_route_opaque};
+use super::{tcp_worker_state, tcp_worker_state_mut};
 use crate::session::SessionId;
 use crate::transport::congestion::CongestionController;
 
@@ -332,17 +334,6 @@ where
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ParsedTcpInput {
-    version: IpVersion,
-    protocol: IpProtocol,
-    source_ip: IpAddr,
-    destination_ip: IpAddr,
-    source_port: u16,
-    destination_port: u16,
-    flags: TcpInputFlags,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TcpInputParseError {
     BadLength,
@@ -357,7 +348,10 @@ fn next_node_for_index_with_batch<C>(
     runtime: &DataPlaneRuntime,
     batch: &mut BufferBatchMut<'_>,
     index: BufferIndex,
-    parsed: Result<ParsedTcpInput, TcpInputParseError>,
+    parsed: Result<
+        (IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags),
+        TcpInputParseError,
+    >,
     snapshot: &TcpLookupSnapshot,
     next: &[NodeId; TcpInputNext::COUNT],
     handoff: Option<NodeHandle>,
@@ -370,7 +364,7 @@ where
     C: CongestionController + 'static,
 {
     let traced = batch.buffer(index)?.trace_handle().is_some();
-    let parsed = match parsed {
+    let (version, protocol, local, remote, flags) = match parsed {
         Ok(parsed) => parsed,
         Err(TcpInputParseError::BadLength) => {
             return resolve_error_next_with_batch(
@@ -403,9 +397,11 @@ where
             );
         }
     };
+    let source_port = remote.port();
+    let destination_port = local.port();
 
     let (session_route, listener_pending) =
-        session_or_listener_pending_input_entry(session_queue, &parsed)?;
+        session_or_listener_pending_input_entry(session_queue, local, remote, flags)?;
     if let Some((session_id, owner, session_next)) = session_route {
         let resolved = NodeNextStorage::next(next, session_next);
         {
@@ -427,11 +423,11 @@ where
                 traces.push((
                     index,
                     TcpInputTrace {
-                        version: Some(parsed.version),
-                        protocol: Some(parsed.protocol),
-                        source_port: Some(parsed.source_port),
-                        destination_port: Some(parsed.destination_port),
-                        flags: u16::from(parsed.flags.bits()),
+                        version: Some(version),
+                        protocol: Some(protocol),
+                        source_port: Some(source_port),
+                        destination_port: Some(destination_port),
+                        flags: u16::from(flags.bits()),
                         error: None,
                         next: resolved,
                     },
@@ -443,11 +439,11 @@ where
             index,
             next,
             session_next,
-            parsed.version,
-            parsed.protocol,
-            parsed.source_port,
-            parsed.destination_port,
-            u16::from(parsed.flags.bits()),
+            version,
+            protocol,
+            source_port,
+            destination_port,
+            u16::from(flags.bits()),
             traced,
             traces,
         );
@@ -463,18 +459,18 @@ where
             index,
             next,
             TcpInputNext::Listen,
-            parsed.version,
-            parsed.protocol,
-            parsed.source_port,
-            parsed.destination_port,
-            u16::from(parsed.flags.bits()),
+            version,
+            protocol,
+            source_port,
+            destination_port,
+            u16::from(flags.bits()),
             traced,
             traces,
         );
     }
 
-    let lookup = lookup_for_packet(snapshot, &parsed);
-    let (listener_next, listener_error) = tcp_listener_input_entry(parsed.flags);
+    let lookup = lookup_for_packet(snapshot, local, remote);
+    let (listener_next, listener_error) = tcp_listener_input_entry(flags);
     if let Some(error) = listener_error {
         return resolve_error_next_with_batch(
             runtime,
@@ -483,9 +479,9 @@ where
             next,
             listener_next,
             error,
-            Some(parsed.version),
-            Some(parsed.protocol),
-            u16::from(parsed.flags.bits()),
+            Some(version),
+            Some(protocol),
+            u16::from(flags.bits()),
             traced,
             traces,
         );
@@ -498,9 +494,9 @@ where
             next,
             TcpInputNext::Punt,
             TcpError::ConnectionClosed,
-            Some(parsed.version),
-            Some(parsed.protocol),
-            u16::from(parsed.flags.bits()),
+            Some(version),
+            Some(protocol),
+            u16::from(flags.bits()),
             traced,
             traces,
         );
@@ -514,11 +510,11 @@ where
         index,
         next,
         listener_next,
-        parsed.version,
-        parsed.protocol,
-        parsed.source_port,
-        parsed.destination_port,
-        u16::from(parsed.flags.bits()),
+        version,
+        protocol,
+        source_port,
+        destination_port,
+        u16::from(flags.bits()),
         traced,
         traces,
     )
@@ -594,21 +590,20 @@ fn resolve_error_next_with_batch(
 #[inline(always)]
 fn session_or_listener_pending_input_entry<C>(
     session_queue: Option<TcpQueue<C>>,
-    parsed: &ParsedTcpInput,
+    local: SocketAddr,
+    remote: SocketAddr,
+    flags: TcpInputFlags,
 ) -> CoreResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)>
 where
     C: CongestionController + 'static,
 {
-    let Some(handle) = session_queue else {
+    let Some(_) = session_queue else {
         return Ok((None, false));
     };
-    let local = SocketAddr::new(parsed.destination_ip, parsed.destination_port);
-    let remote = SocketAddr::new(parsed.source_ip, parsed.source_port);
-    let mut queue = handle.borrow_mut()?;
-    let (route, listener_pending) = queue.aux_mut().input_route(
+    let (route, listener_pending) = tcp_worker_state_mut().input_route(
         local,
         remote,
-        parsed.flags.contains(TcpInputFlags::ACK) && !parsed.flags.contains(TcpInputFlags::RST),
+        flags.contains(TcpInputFlags::ACK) && !flags.contains(TcpInputFlags::RST),
     );
     if let Some(route) = route {
         return Ok((Some(route), false));
@@ -647,6 +642,7 @@ mod tests {
     use hammer_core::protocol::tcp::TcpConnectionId;
 
     use crate::transport::congestion::BbrController;
+    use crate::transport::tcp::lookup::TcpLookupSnapshot;
     use crate::transport::tcp::{
         SessionId, TcpConnection, TcpInputFlags, TcpInputNext, TcpQueue, TcpSessionDriver,
     };
@@ -713,11 +709,12 @@ mod tests {
     }
 
     use super::{
-        ParsedTcpInput, TcpInputControlPlane, register_tcp_input_runtime,
-        session_or_listener_pending_input_entry,
+        TcpInputControlPlane, register_tcp_input_runtime, session_or_listener_pending_input_entry,
+        tcp_worker_state,
     };
-    use crate::net::ip::{IpProtocol, IpVersion};
-    use crate::transport::tcp::{connect_tcp_session, publish_tcp_connection};
+    use crate::transport::tcp::{
+        TcpWorkerOwnedState, connect_tcp_session, publish_tcp_connection, set_tcp_worker_state,
+    };
     #[test]
     fn tcp_input_runtime_registry_is_isolated_per_thread() {
         let main_snapshot = Arc::new(ArcSwap::from_pointee(TcpLookupSnapshot::default()));
@@ -741,12 +738,20 @@ mod tests {
     #[test]
     fn tcp_input_routes_existing_established_tuple_to_established_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(0), 50_044);
         let session_id = route_session_id(handle, 50_044);
 
-        let (entry, listener_pending) =
-            session_or_listener_pending_input_entry(Some(handle), &parsed_input(50_044))
-                .expect("session lookup");
+        let local = parsed_local(50_044);
+        let remote = parsed_remote(50_044);
+        let (entry, listener_pending) = session_or_listener_pending_input_entry(
+            Some(handle),
+            local,
+            remote,
+            TcpInputFlags::ACK,
+        )
+        .expect("session lookup");
         let entry = entry.expect("existing tcp session");
         assert!(!listener_pending);
 
@@ -759,12 +764,20 @@ mod tests {
     #[test]
     fn tcp_input_existing_session_entry_keeps_owner_for_handoff_decision() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_055);
         let session_id = route_session_id(handle, 50_055);
 
-        let (entry, listener_pending) =
-            session_or_listener_pending_input_entry(Some(handle), &parsed_input(50_055))
-                .expect("session lookup");
+        let local = parsed_local(50_055);
+        let remote = parsed_remote(50_055);
+        let (entry, listener_pending) = session_or_listener_pending_input_entry(
+            Some(handle),
+            local,
+            remote,
+            TcpInputFlags::ACK,
+        )
+        .expect("session lookup");
         let entry = entry.expect("existing tcp session");
         assert!(!listener_pending);
 
@@ -778,13 +791,12 @@ mod tests {
     fn tcp_input_routes_pending_syn_sent_tuple_to_syn_sent_node() {
         let runtime = DataPlaneRuntime::with_capacities(64, 4, 4, 4);
         let worker = DataWorkerId::new(0);
-        let handle =
-            crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
-                worker,
-                runtime.packet_buffers().clone(),
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(worker),
-            ))
-            .expect("register tcp queue");
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
+        let handle = crate::session::node::register_session_queue(
+            TcpSessionDriver::<BbrController>::new(worker, runtime.packet_buffers().clone()),
+        )
+        .expect("register tcp queue");
         let local_port = 50_077;
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
@@ -799,18 +811,26 @@ mod tests {
             connect_tcp_session(&mut queue, local, remote).expect("connect")
         };
 
-        let (entry, listener_pending) =
-            session_or_listener_pending_input_entry(Some(handle), &parsed_input(local_port))
-                .expect("session lookup");
+        let local = parsed_local(local_port);
+        let remote = parsed_remote(local_port);
+        let (entry, listener_pending) = session_or_listener_pending_input_entry(
+            Some(handle),
+            local,
+            remote,
+            TcpInputFlags::ACK,
+        )
+        .expect("session lookup");
         let entry = entry.expect("pending tcp session");
         assert!(!listener_pending);
 
         assert_eq!(entry, (session_id, worker, TcpInputNext::SynSent));
         {
-            let queue = handle.borrow_mut().expect("tcp queue");
-            assert_eq!(queue.aux().session_route_by_tuple(local, remote), None);
             assert_eq!(
-                queue.aux().pending_route_by_tuple(local, remote),
+                tcp_worker_state().session_route_by_tuple(local, remote),
+                None
+            );
+            assert_eq!(
+                tcp_worker_state().pending_route_by_tuple(local, remote),
                 Some((session_id, worker, TcpInputNext::SynSent))
             );
         }
@@ -826,6 +846,8 @@ mod tests {
             DataWorkerId::new(0),
             handoff.worker(DataWorkerId::new(0)),
         );
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(1), 50_066);
         let frame = runtime.alloc_frame_index().expect("alloc frame");
         let packet = tcp_packet(
@@ -867,6 +889,8 @@ mod tests {
     #[test]
     fn tcp_input_preserves_session_route_in_opaque_for_follow_on_nodes() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle = install_tcp_session(&runtime, DataWorkerId::new(0), 50_088);
         let session_id = route_session_id(handle, 50_088);
         let packet = tcp_packet(
@@ -921,11 +945,8 @@ mod tests {
             remote,
         );
         {
-            let mut driver = TcpSessionDriver::<BbrController>::new(
-                owner,
-                runtime.packet_buffers().clone(),
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(owner),
-            );
+            let mut driver =
+                TcpSessionDriver::<BbrController>::new(owner, runtime.packet_buffers().clone());
             let session_id = driver
                 .insert_session_with_id(|_| connection.clone())
                 .expect("insert session");
@@ -934,19 +955,21 @@ mod tests {
         }
     }
 
-    fn parsed_input(local_port: u16) -> ParsedTcpInput {
-        ParsedTcpInput {
-            version: IpVersion::V4,
-            protocol: IpProtocol::Tcp,
-            source_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
-            destination_ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
-            source_port: 443,
-            destination_port: local_port,
-            flags: TcpInputFlags::ACK,
-        }
+    fn parsed_local(local_port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
+            local_port,
+        )
     }
 
-    fn route_session_id(handle: TcpQueue<BbrController>, local_port: u16) -> SessionId {
+    fn parsed_remote(local_port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
+            443,
+        )
+    }
+
+    fn route_session_id(_: TcpQueue<BbrController>, local_port: u16) -> SessionId {
         let local = SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, local_port as u8)),
             local_port,
@@ -955,10 +978,7 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, local_port as u8)),
             443,
         );
-        handle
-            .borrow_mut()
-            .expect("tcp queue")
-            .aux()
+        tcp_worker_state()
             .session_route_by_tuple(local, remote)
             .map(|(session_id, _, _)| session_id)
             .expect("session route exists")
@@ -1091,7 +1111,9 @@ pub(crate) fn stamp_session_route_for_test(
 #[inline(always)]
 fn parse_tcp_input_buffer(
     buffer: &hammer_adapter::Buffer,
-) -> CoreResult<Result<ParsedTcpInput, TcpInputParseError>> {
+) -> CoreResult<
+    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputParseError>,
+> {
     parse_tcp_input_parts(
         buffer.current(),
         buffer.total_len_not_including_first(),
@@ -1120,7 +1142,9 @@ fn parse_tcp_input_parts(
     current: &[u8],
     total_len_not_including_first: usize,
     cursor: BufferPacketCursor,
-) -> CoreResult<Result<ParsedTcpInput, TcpInputParseError>> {
+) -> CoreResult<
+    Result<(IpVersion, IpProtocol, SocketAddr, SocketAddr, TcpInputFlags), TcpInputParseError>,
+> {
     let parsed = match parse_ip_packet_with_chain_len(current, total_len_not_including_first) {
         Ok(parsed) => parsed,
         Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
@@ -1143,34 +1167,17 @@ fn parse_tcp_input_parts(
     let Some(transport) = packet.get(cursor.transport_header_offset()..first_len) else {
         return Ok(Err(TcpInputParseError::BadLength));
     };
-    let segment = match etherparse::TcpSlice::from_slice(transport) {
+    let segment = match parse_tcp_wire_header(transport) {
         Ok(segment) => segment,
-        Err(
-            etherparse::err::tcp::HeaderSliceError::Len(_)
-            | etherparse::err::tcp::HeaderSliceError::Content(
-                etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
-            ),
-        ) => return Ok(Err(TcpInputParseError::BadLength)),
+        Err(_) => return Ok(Err(TcpInputParseError::BadLength)),
     };
-    let mut flags = TcpSegmentFlags::empty();
-    flags.set(TcpSegmentFlags::NS, segment.ns());
-    flags.set(TcpSegmentFlags::FIN, segment.fin());
-    flags.set(TcpSegmentFlags::SYN, segment.syn());
-    flags.set(TcpSegmentFlags::RST, segment.rst());
-    flags.set(TcpSegmentFlags::PSH, segment.psh());
-    flags.set(TcpSegmentFlags::ACK, segment.ack());
-    flags.set(TcpSegmentFlags::URG, segment.urg());
-    flags.set(TcpSegmentFlags::ECE, segment.ece());
-    flags.set(TcpSegmentFlags::CWR, segment.cwr());
-    Ok(Ok(ParsedTcpInput {
-        version: parsed.version,
-        protocol: parsed.protocol,
-        source_ip,
-        destination_ip,
-        source_port: segment.source_port(),
-        destination_port: segment.destination_port(),
-        flags: tcp_input_flags(flags),
-    }))
+    Ok(Ok((
+        parsed.version,
+        parsed.protocol,
+        SocketAddr::new(destination_ip, segment.destination_port()),
+        SocketAddr::new(source_ip, segment.source_port()),
+        tcp_input_flags(tcp_wire_flags(segment)),
+    )))
 }
 
 #[inline(always)]
@@ -1243,20 +1250,21 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
 #[inline(always)]
 fn lookup_for_packet(
     snapshot: &TcpLookupSnapshot,
-    parsed: &ParsedTcpInput,
+    local: SocketAddr,
+    remote: SocketAddr,
 ) -> Option<TcpLookupValue> {
-    match (parsed.destination_ip, parsed.source_ip, parsed.version) {
-        (IpAddr::V4(local_addr), IpAddr::V4(_), IpVersion::V4) => snapshot
+    match (local.ip(), remote.ip()) {
+        (IpAddr::V4(local_addr), IpAddr::V4(_)) => snapshot
             .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
                 0,
                 local_addr,
-                parsed.destination_port,
+                local.port(),
             )),
-        (IpAddr::V6(local_addr), IpAddr::V6(_), IpVersion::V6) => snapshot
+        (IpAddr::V6(local_addr), IpAddr::V6(_)) => snapshot
             .lookup_listener::<TcpIpv6ListenerAddress>(TcpV6ListenerKey::new(
                 0,
                 local_addr,
-                parsed.destination_port,
+                local.port(),
             )),
         _ => None,
     }
@@ -1306,7 +1314,7 @@ fn prefetch_session_route_for_buffer<C>(
 ) where
     C: CongestionController + 'static,
 {
-    let Some(handle) = session_queue else {
+    let Some(_) = session_queue else {
         return;
     };
     let cursor = buffer.packet_cursor();
@@ -1343,10 +1351,7 @@ fn prefetch_session_route_for_buffer<C>(
     };
     let local = SocketAddr::new(destination_ip, tcp_destination_port(buffer));
     let remote = SocketAddr::new(source_ip, tcp_source_port(buffer));
-    let Ok(queue) = handle.borrow_mut() else {
-        return;
-    };
-    queue.aux().prefetch_tuple(local, remote);
+    tcp_worker_state().prefetch_tuple(local, remote);
 }
 
 #[inline(always)]

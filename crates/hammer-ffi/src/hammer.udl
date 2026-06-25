@@ -29,6 +29,7 @@ interface HammerError {
   ServiceAlreadyStarted();
   Lifecycle(string stage, string message);
   Platform(string message);
+  Tcp(string message);
   Internal(string message);
 };
 

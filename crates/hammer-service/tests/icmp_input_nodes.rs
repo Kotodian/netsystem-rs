@@ -120,7 +120,8 @@ fn icmp_input_dispatches_ipv4_echo_request_by_type() {
         inputs: vec![TraceInputPolicy {
             node: icmp_input,
             count: 1,
-        }],
+        }]
+        .into(),
     });
     runtime.set_trace_control(Some(trace_control.handle()), 2);
     let packet = ipv4_icmp_packet(8, 0, b"echo4");

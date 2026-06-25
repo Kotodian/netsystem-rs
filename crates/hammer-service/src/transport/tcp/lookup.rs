@@ -1,8 +1,11 @@
+use std::cell::Cell;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::{Deref, DerefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossbeam_utils::CachePadded;
 use hammer_adapter::DataWorkerId;
 use hammer_core::protocol::tcp::{
     TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption,
@@ -17,6 +20,26 @@ use crate::transport::congestion::CongestionController;
 use crate::transport::tcp::{TcpConnection, TcpInputNext, TcpState};
 
 pub type TcpLookupId = u32;
+
+thread_local! {
+    static TCP_WORKER_STATE: Cell<*mut TcpWorkerOwnedState> = const { Cell::new(std::ptr::null_mut()) };
+}
+
+pub(crate) fn set_tcp_worker_state(state: &mut TcpWorkerOwnedState) {
+    TCP_WORKER_STATE.with(|cell| cell.set(state as *mut _));
+}
+
+pub(crate) fn tcp_worker_state() -> &'static TcpWorkerOwnedState {
+    let ptr = TCP_WORKER_STATE.with(|cell| cell.get());
+    assert!(!ptr.is_null(), "TCP worker state not initialized");
+    unsafe { &*ptr }
+}
+
+pub(crate) fn tcp_worker_state_mut() -> &'static mut TcpWorkerOwnedState {
+    let ptr = TCP_WORKER_STATE.with(|cell| cell.get());
+    assert!(!ptr.is_null(), "TCP worker state not initialized");
+    unsafe { &mut *ptr }
+}
 
 #[derive(Debug)]
 struct TcpConnectionRouteIndex {
@@ -40,6 +63,7 @@ struct TcpPendingRouteEntry {
     remote: SocketAddr,
     owner: DataWorkerId,
     next: TcpInputNext,
+    capabilities: TcpCapabilities,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +111,7 @@ impl TcpPendingRouteEntry {
         remote: SocketAddr,
         owner: DataWorkerId,
         next: TcpInputNext,
+        capabilities: TcpCapabilities,
     ) -> Self {
         Self {
             session_id,
@@ -94,6 +119,7 @@ impl TcpPendingRouteEntry {
             remote,
             owner,
             next,
+            capabilities,
         }
     }
 
@@ -734,6 +760,7 @@ impl TcpConnectionRouteIndex {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<SessionId> {
         let entry_index = self.connection_slots.lookup(&connection_id.get())?;
@@ -830,8 +857,9 @@ impl TcpPendingRouteIndex {
         remote: SocketAddr,
         owner: DataWorkerId,
         next: TcpInputNext,
+        capabilities: TcpCapabilities,
     ) {
-        let entry = TcpPendingRouteEntry::new(session_id, local, remote, owner, next);
+        let entry = TcpPendingRouteEntry::new(session_id, local, remote, owner, next, capabilities);
         let key = session_id.get();
         if let Some(entry_index) = self.session_slots.lookup(&key) {
             let old_entry = *self
@@ -892,6 +920,17 @@ impl TcpPendingRouteIndex {
     }
 
     #[inline]
+    fn capabilities_by_session(&self, session_id: SessionId) -> Option<TcpCapabilities> {
+        let entry_index = self.session_slots.lookup(&session_id.get())?;
+        Some(
+            self.entries
+                .get(entry_index)
+                .expect("tcp pending route entry index is valid")
+                .capabilities,
+        )
+    }
+
+    #[inline]
     fn prefetch_tuple(&self, local: SocketAddr, remote: SocketAddr) {
         let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
             return;
@@ -933,6 +972,7 @@ impl Clone for TcpPendingRouteIndex {
                 entry.remote,
                 entry.owner,
                 entry.next,
+                entry.capabilities,
             );
         }
         cloned
@@ -940,41 +980,81 @@ impl Clone for TcpPendingRouteIndex {
 }
 
 #[derive(Debug)]
-pub struct TcpWorkerOwnedState {
+pub struct TcpWorkerOwnedStateCacheline0 {
+    #[cfg(test)]
     owner_worker: DataWorkerId,
+    #[cfg(test)]
     listeners: TcpLookupSnapshot,
     connections: TcpConnectionRouteIndex,
     pending: TcpPendingRouteIndex,
+    #[cfg(test)]
+    next_iss: u32,
+}
+
+#[derive(Debug)]
+struct TcpWorkerOwnedStateCacheline1 {
     fast_open_cache: Vec<TcpFastOpenCacheEntry>,
     fast_open_cache_index: FlatHashTable<TransportConnectionKey, usize>,
     fast_open_secrets: Vec<TcpFastOpenSecret>,
     listener_pending: TcpListenerPendingTable,
     listener_cookie_secrets: Vec<TcpFastOpenSecret>,
-    next_iss: u32,
+}
+
+#[derive(Debug)]
+pub struct TcpWorkerOwnedState {
+    cacheline0: CachePadded<TcpWorkerOwnedStateCacheline0>,
+    cacheline1: CachePadded<TcpWorkerOwnedStateCacheline1>,
+}
+
+impl Deref for TcpWorkerOwnedState {
+    type Target = TcpWorkerOwnedStateCacheline0;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.cacheline0
+    }
+}
+
+impl DerefMut for TcpWorkerOwnedState {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cacheline0
+    }
 }
 
 impl TcpWorkerOwnedState {
     #[inline]
     pub(crate) fn new(owner_worker: DataWorkerId) -> Self {
+        #[cfg(not(test))]
+        let _ = owner_worker;
         Self {
-            owner_worker,
-            listeners: TcpLookupSnapshot::empty(),
-            connections: TcpConnectionRouteIndex::empty(),
-            pending: TcpPendingRouteIndex::empty(),
-            fast_open_cache: Vec::new(),
-            fast_open_cache_index: FlatHashTable::new(),
-            fast_open_secrets: Vec::new(),
-            listener_pending: TcpListenerPendingTable::default(),
-            listener_cookie_secrets: Vec::new(),
-            next_iss: 81_000,
+            cacheline0: CachePadded::new(TcpWorkerOwnedStateCacheline0 {
+                #[cfg(test)]
+                owner_worker,
+                #[cfg(test)]
+                listeners: TcpLookupSnapshot::empty(),
+                connections: TcpConnectionRouteIndex::empty(),
+                pending: TcpPendingRouteIndex::empty(),
+                #[cfg(test)]
+                next_iss: 81_000,
+            }),
+            cacheline1: CachePadded::new(TcpWorkerOwnedStateCacheline1 {
+                fast_open_cache: Vec::new(),
+                fast_open_cache_index: FlatHashTable::new(),
+                fast_open_secrets: Vec::new(),
+                listener_pending: TcpListenerPendingTable::default(),
+                listener_cookie_secrets: Vec::new(),
+            }),
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn owner_worker(&self) -> DataWorkerId {
         self.owner_worker
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn insert_listener<A: TcpListenerAddress>(
         &mut self,
@@ -984,10 +1064,11 @@ impl TcpWorkerOwnedState {
     ) where
         TcpLookupSnapshot: TcpListenerLookupAccess<A>,
     {
-        self.listeners
-            .insert_listener::<A>(key, self.value(id, capabilities));
+        let value = self.value(id, capabilities);
+        self.listeners.insert_listener::<A>(key, value);
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn publish_snapshot(&self) -> TcpLookupSnapshot {
         self.listeners.clone()
@@ -1015,8 +1096,10 @@ impl TcpWorkerOwnedState {
         remote: SocketAddr,
         owner: DataWorkerId,
         next: TcpInputNext,
+        capabilities: TcpCapabilities,
     ) {
-        self.pending.upsert(session_id, local, remote, owner, next);
+        self.pending
+            .upsert(session_id, local, remote, owner, next, capabilities);
     }
 
     #[cfg(test)]
@@ -1055,7 +1138,8 @@ impl TcpWorkerOwnedState {
         }
         (
             None,
-            self.listener_pending
+            self.cacheline1
+                .listener_pending
                 .contains(local, remote, listener_pending_epoch()),
         )
     }
@@ -1066,6 +1150,7 @@ impl TcpWorkerOwnedState {
         self.pending.prefetch_tuple(local, remote);
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn session_id_by_connection_id(
         &self,
@@ -1085,6 +1170,14 @@ impl TcpWorkerOwnedState {
     }
 
     #[inline]
+    pub(crate) fn pending_open_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Option<TcpCapabilities> {
+        self.pending.capabilities_by_session(session_id)
+    }
+
+    #[inline]
     pub(crate) fn publish_connection<C>(
         &mut self,
         session_id: SessionId,
@@ -1093,6 +1186,7 @@ impl TcpWorkerOwnedState {
     where
         C: CongestionController + 'static,
     {
+        let pending_capabilities = self.pending.capabilities_by_session(session_id);
         self.forget_session(session_id);
         self.forget_pending_open(session_id);
         match connection.state() {
@@ -1104,6 +1198,7 @@ impl TcpWorkerOwnedState {
                     connection.remote(),
                     connection.owner_worker(),
                     connection.next_node(),
+                    pending_capabilities.unwrap_or_default(),
                 );
                 false
             }
@@ -1121,6 +1216,7 @@ impl TcpWorkerOwnedState {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn next_initial_sequence(&mut self, local: SocketAddr, remote: SocketAddr) -> u32 {
         let mut value = self.next_iss;
@@ -1140,14 +1236,15 @@ impl TcpWorkerOwnedState {
         value.max(1)
     }
 
+    #[cfg(test)]
     pub(crate) fn fast_open_cookie(
         &self,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<(TcpFastOpenCookie, Option<u16>)> {
         let key = TransportConnectionKey::from_socket_addrs(0, local, remote)?;
-        let index = self.fast_open_cache_index.lookup(&key)?;
-        let entry = self.fast_open_cache.get(index)?;
+        let index = self.cacheline1.fast_open_cache_index.lookup(&key)?;
+        let entry = self.cacheline1.fast_open_cache.get(index)?;
         Some((entry.cookie, entry.max_segment_size))
     }
 
@@ -1161,21 +1258,21 @@ impl TcpWorkerOwnedState {
         let Some(key) = TransportConnectionKey::from_socket_addrs(0, local, remote) else {
             return;
         };
-        if let Some(index) = self.fast_open_cache_index.lookup(&key) {
-            if let Some(entry) = self.fast_open_cache.get_mut(index) {
+        if let Some(index) = self.cacheline1.fast_open_cache_index.lookup(&key) {
+            if let Some(entry) = self.cacheline1.fast_open_cache.get_mut(index) {
                 entry.cookie = cookie;
                 entry.max_segment_size = max_segment_size;
             }
             return;
         }
-        self.fast_open_cache.push(TcpFastOpenCacheEntry {
+        self.cacheline1.fast_open_cache.push(TcpFastOpenCacheEntry {
             local,
             remote,
             cookie,
             max_segment_size,
         });
-        self.fast_open_cache_index
-            .insert(key, self.fast_open_cache.len() - 1);
+        let index = self.cacheline1.fast_open_cache.len() - 1;
+        self.cacheline1.fast_open_cache_index.insert(key, index);
     }
 
     pub(crate) fn fast_open_cookie_for_listener(
@@ -1240,7 +1337,7 @@ impl TcpWorkerOwnedState {
         timestamp: Option<TcpTimestampOption>,
         backlog: usize,
     ) -> bool {
-        self.listener_pending.begin(
+        self.cacheline1.listener_pending.begin(
             listener_id,
             local,
             remote,
@@ -1259,13 +1356,15 @@ impl TcpWorkerOwnedState {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> Option<(u32, u16, TcpCapabilities, Option<TcpTimestampOption>)> {
-        self.listener_pending
+        self.cacheline1
+            .listener_pending
             .get(listener_id, local, remote, listener_pending_epoch())
     }
 
     #[cfg(test)]
     pub(crate) fn has_listener_pending(&mut self, local: SocketAddr, remote: SocketAddr) -> bool {
-        self.listener_pending
+        self.cacheline1
+            .listener_pending
             .contains(local, remote, listener_pending_epoch())
     }
 
@@ -1275,7 +1374,9 @@ impl TcpWorkerOwnedState {
         local: SocketAddr,
         remote: SocketAddr,
     ) {
-        self.listener_pending.finish(listener_id, local, remote);
+        self.cacheline1
+            .listener_pending
+            .finish(listener_id, local, remote);
     }
 
     #[cfg(test)]
@@ -1285,12 +1386,14 @@ impl TcpWorkerOwnedState {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> bool {
-        self.listener_pending.has_entry(listener_id, local, remote)
+        self.cacheline1
+            .listener_pending
+            .has_entry(listener_id, local, remote)
     }
 
     #[cfg(test)]
     pub(crate) fn listener_pending_len(&self, listener_id: TcpLookupId) -> usize {
-        self.listener_pending.entry_count(listener_id)
+        self.cacheline1.listener_pending.entry_count(listener_id)
     }
 
     #[cfg(test)]
@@ -1301,7 +1404,8 @@ impl TcpWorkerOwnedState {
         remote: SocketAddr,
         epoch: u32,
     ) -> bool {
-        self.listener_pending
+        self.cacheline1
+            .listener_pending
             .update_created_epoch(listener_id, local, remote, epoch)
     }
 
@@ -1389,48 +1493,54 @@ impl TcpWorkerOwnedState {
 
     fn fast_open_secret(&mut self, listener_id: TcpLookupId, epoch: u32) -> &RandomState {
         prune_cookie_secrets(
-            &mut self.fast_open_secrets,
+            &mut self.cacheline1.fast_open_secrets,
             listener_id,
             epoch,
             TCP_FAST_OPEN_COOKIE_PREVIOUS_EPOCH_WINDOW,
         );
         if let Some(index) = self
+            .cacheline1
             .fast_open_secrets
             .iter()
             .position(|secret| secret.listener_id == listener_id && secret.epoch == epoch)
         {
-            return &self.fast_open_secrets[index].secret;
+            return &self.cacheline1.fast_open_secrets[index].secret;
         }
-        self.fast_open_secrets.push(TcpFastOpenSecret {
+        self.cacheline1.fast_open_secrets.push(TcpFastOpenSecret {
             listener_id,
             epoch,
             secret: RandomState::new(),
         });
-        &self.fast_open_secrets[self.fast_open_secrets.len() - 1].secret
+        &self.cacheline1.fast_open_secrets[self.cacheline1.fast_open_secrets.len() - 1].secret
     }
 
     fn listener_cookie_secret(&mut self, listener_id: TcpLookupId, epoch: u32) -> &RandomState {
         prune_cookie_secrets(
-            &mut self.listener_cookie_secrets,
+            &mut self.cacheline1.listener_cookie_secrets,
             listener_id,
             epoch,
             TCP_LISTENER_COOKIE_PREVIOUS_EPOCH_WINDOW,
         );
         if let Some(index) = self
+            .cacheline1
             .listener_cookie_secrets
             .iter()
             .position(|secret| secret.listener_id == listener_id && secret.epoch == epoch)
         {
-            return &self.listener_cookie_secrets[index].secret;
+            return &self.cacheline1.listener_cookie_secrets[index].secret;
         }
-        self.listener_cookie_secrets.push(TcpFastOpenSecret {
-            listener_id,
-            epoch,
-            secret: RandomState::new(),
-        });
-        &self.listener_cookie_secrets[self.listener_cookie_secrets.len() - 1].secret
+        self.cacheline1
+            .listener_cookie_secrets
+            .push(TcpFastOpenSecret {
+                listener_id,
+                epoch,
+                secret: RandomState::new(),
+            });
+        &self.cacheline1.listener_cookie_secrets[self.cacheline1.listener_cookie_secrets.len() - 1]
+            .secret
     }
 
+    #[cfg(test)]
     #[inline]
     fn value(&self, id: TcpLookupId, capabilities: TcpCapabilities) -> TcpLookupValue {
         TcpLookupValue {
@@ -1667,13 +1777,14 @@ mod tests {
         let cookie_b = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 43);
 
         assert_ne!(cookie_a, cookie_b);
-        assert_eq!(state.fast_open_secrets.len(), 2);
+        assert_eq!(state.cacheline1.fast_open_secrets.len(), 2);
 
         let _ = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 44);
 
-        assert_eq!(state.fast_open_secrets.len(), 2);
+        assert_eq!(state.cacheline1.fast_open_secrets.len(), 2);
         assert!(
             state
+                .cacheline1
                 .fast_open_secrets
                 .iter()
                 .all(|secret| secret.epoch >= 43)
@@ -1688,16 +1799,16 @@ mod tests {
         let cookie_b = state.fast_open_cookie_for_listener_in_epoch(7, local, remote, 43);
 
         state.remember_fast_open_cookie(local, remote, cookie_a, Some(1_440));
-        assert_eq!(state.fast_open_cache.len(), 1);
-        assert_eq!(state.fast_open_cache_index.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index.len(), 1);
         assert_eq!(
             state.fast_open_cookie(local, remote),
             Some((cookie_a, Some(1_440)))
         );
 
         state.remember_fast_open_cookie(local, remote, cookie_b, Some(1_460));
-        assert_eq!(state.fast_open_cache.len(), 1);
-        assert_eq!(state.fast_open_cache_index.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache.len(), 1);
+        assert_eq!(state.cacheline1.fast_open_cache_index.len(), 1);
         assert_eq!(
             state.fast_open_cookie(local, remote),
             Some((cookie_b, Some(1_460)))
@@ -1743,13 +1854,14 @@ mod tests {
         let cookie_b = state.listener_cookie_for_syn_in_epoch(7, local, remote, 100, 43);
 
         assert_ne!(cookie_a, cookie_b);
-        assert_eq!(state.listener_cookie_secrets.len(), 2);
+        assert_eq!(state.cacheline1.listener_cookie_secrets.len(), 2);
 
         let _ = state.listener_cookie_for_syn_in_epoch(7, local, remote, 100, 44);
 
-        assert_eq!(state.listener_cookie_secrets.len(), 2);
+        assert_eq!(state.cacheline1.listener_cookie_secrets.len(), 2);
         assert!(
             state
+                .cacheline1
                 .listener_cookie_secrets
                 .iter()
                 .all(|secret| secret.epoch >= 43)

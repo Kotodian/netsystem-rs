@@ -7,6 +7,7 @@ use hammer_core::error::CoreResult;
 use super::publish_tcp_connection;
 use super::segment::parse_tcp_packet;
 use super::{TcpNodeError, TcpQueue, read_session_id};
+use super::{tcp_worker_state, tcp_worker_state_mut};
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -92,12 +93,15 @@ where
         let session_id =
             read_session_id(runtime, index)?.ok_or(TcpNodeError::SynSentSessionRouteMissing)?;
         let (control, acked_tx_len, established, established_with_payload) = {
+            let local_capabilities = tcp_worker_state()
+                .pending_open_capabilities(session_id)
+                .unwrap_or_default();
             let connection = queue
                 .session_mut(session_id)
                 .ok_or(TcpNodeError::SynSentSessionMissing)?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
-            let control = connection.receive_open_reply(&packet)?;
+            let control = connection.receive_open_reply(&packet, local_capabilities)?;
             let established = connection.state() == crate::transport::tcp::TcpState::Established;
             (
                 control,
@@ -115,7 +119,7 @@ where
             queue.release_tx_up_to(session_id, acked_tx_len as usize)?;
         }
         if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
-            queue.aux_mut().remember_fast_open_cookie(
+            tcp_worker_state_mut().remember_fast_open_cookie(
                 packet.local,
                 packet.remote,
                 cookie,
@@ -180,7 +184,10 @@ mod tests {
     use crate::transport::tcp::input::TcpInputControlPlane;
     use crate::transport::tcp::lookup::TcpLookupSnapshot;
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
-    use crate::transport::tcp::{TcpInputNext, TcpQueue, TcpSessionDriver, connect_tcp_session};
+    use crate::transport::tcp::{
+        TcpInputNext, TcpQueue, TcpSessionDriver, TcpWorkerOwnedState, connect_tcp_session,
+        set_tcp_worker_state,
+    };
 
     use super::*;
 
@@ -270,11 +277,12 @@ mod tests {
     #[test]
     fn valid_syn_ack_emits_final_ack_and_establishes() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle =
             crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
                 DataWorkerId::new(0),
                 runtime.packet_buffers().clone(),
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(DataWorkerId::new(0)),
             ))
             .expect("register queue");
         let (session_id, client_isn) = open_client_session(handle);
@@ -348,11 +356,12 @@ mod tests {
     #[test]
     fn rst_closes_pending_syn_sent_session() {
         let runtime = DataPlaneRuntime::with_capacities(2048, 16, 8, 8);
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
         let handle =
             crate::session::node::register_session_queue(TcpSessionDriver::<BbrController>::new(
                 DataWorkerId::new(0),
                 runtime.packet_buffers().clone(),
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(DataWorkerId::new(0)),
             ))
             .expect("register queue");
         let (session_id, client_isn) = open_client_session(handle);

@@ -5,10 +5,11 @@ use hammer_adapter::{
 use hammer_core::error::CoreResult;
 
 use super::segment::parse_tcp_packet;
+use super::tcp_worker_state_mut;
 use super::{
     TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
     TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpQueue,
-    TcpWorkerOwnedState, read_session_id, refresh_tcp_timers,
+    TcpWorkerOwnedState, read_session_id,
 };
 use crate::session::protocol::SessionQueueControlContext;
 use crate::transport::congestion::CongestionController;
@@ -171,15 +172,18 @@ where
                 .session_mut(session_id)
                 .ok_or(TcpNodeError::EstablishedSessionMissing)?;
             tx_segment = Some(connection.control_segment(
-                &packet,
+                packet.local,
+                packet.remote,
                 hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
                 None,
+                hammer_core::protocol::tcp::TcpCapabilities::default(),
             ));
         }
         let has_pending_tx = queue.app().pending_send_head(session_id).is_some();
-        let connection = queue
-            .session(session_id)
-            .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
+        let connection: *const crate::transport::tcp::TcpConnection<C> =
+            queue
+                .session(session_id)
+                .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
         let mut context = SessionQueueControlContext::new(
             queue.timers_mut() as *mut _,
             queue.ready_mut_ptr(),
@@ -187,22 +191,41 @@ where
             session_id,
             has_pending_tx,
         );
-        refresh_tcp_timers(
-            unsafe { &*connection },
-            &mut context,
-            (1u16 << TCP_TIMER_RETRANSMIT)
-                | (1u16 << TCP_TIMER_RACK)
-                | (1u16 << TCP_TIMER_TLP)
-                | (1u16 << TCP_TIMER_DELAYED_ACK)
-                | (1u16 << TCP_TIMER_PERSIST)
-                | (1u16 << TCP_TIMER_KEEP_ALIVE)
-                | (1u16 << TCP_TIMER_PACING),
-        )?;
+        let now = std::time::Instant::now();
+        let session = session_id.pool_index();
+        let timers = context.timer_wheel();
+        let connection = unsafe { &*connection };
+        for timer_id in 0..crate::transport::tcp::connection::TCP_TIMER_COUNT {
+            if !matches!(
+                timer_id,
+                TCP_TIMER_RETRANSMIT
+                    | TCP_TIMER_RACK
+                    | TCP_TIMER_TLP
+                    | TCP_TIMER_DELAYED_ACK
+                    | TCP_TIMER_PERSIST
+                    | TCP_TIMER_KEEP_ALIVE
+                    | TCP_TIMER_PACING
+            ) {
+                let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
+                continue;
+            }
+            if !connection.timer_is_active(timer_id) {
+                let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
+                continue;
+            }
+            let Some(ticks) = connection.timer_ticks(timer_id, now) else {
+                let _ = timers.cancel_timer(session.slot(), session.generation(), timer_id);
+                continue;
+            };
+            timers
+                .update_timer(session.slot(), session.generation(), timer_id, ticks)
+                .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
+        }
         let connection = queue
             .session(session_id)
             .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
-        let aux = queue.aux_mut() as *mut TcpWorkerOwnedState;
-        if unsafe { (*aux).publish_connection(session_id, &*connection) } {
+        let protocol = tcp_worker_state_mut() as *mut TcpWorkerOwnedState;
+        if unsafe { (*protocol).publish_connection(session_id, &*connection) } {
             let _ = queue.close_session(session_id)?;
         }
         if tx_segment.is_none() {

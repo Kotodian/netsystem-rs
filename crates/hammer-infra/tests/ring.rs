@@ -1,3 +1,4 @@
+use crossbeam_utils::CachePadded;
 use hammer_infra::align::CACHE_LINE;
 use hammer_infra::ring::{
     CompletionDescriptor, IndexedRing, LocalRing, LockFreeRing, LockFreeRingCursors,
@@ -184,9 +185,15 @@ fn lock_free_ring_rejects_non_power_of_two_size() {
 
 #[test]
 fn lock_free_ring_cursors_are_split_by_cacheline() {
-    assert_eq!(std::mem::align_of::<LockFreeRingHeadTail>(), CACHE_LINE);
-    assert_eq!(std::mem::size_of::<LockFreeRingHeadTail>(), CACHE_LINE);
-    assert_eq!(std::mem::align_of::<LockFreeRingCursors>(), CACHE_LINE);
+    assert_eq!(std::mem::size_of::<LockFreeRingHeadTail>(), 8);
+    assert_eq!(
+        std::mem::align_of::<LockFreeRingCursors>(),
+        std::mem::align_of::<CachePadded<LockFreeRingHeadTail>>()
+    );
     assert_eq!(LockFreeRingCursors::PRODUCER_CACHELINE_OFFSET, 0);
-    assert_eq!(LockFreeRingCursors::CONSUMER_CACHELINE_OFFSET, CACHE_LINE);
+    assert_eq!(
+        LockFreeRingCursors::CONSUMER_CACHELINE_OFFSET,
+        std::mem::size_of::<CachePadded<LockFreeRingHeadTail>>()
+    );
+    assert!(LockFreeRingCursors::CONSUMER_CACHELINE_OFFSET >= CACHE_LINE);
 }

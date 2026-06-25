@@ -53,10 +53,9 @@ use crate::transport::tcp::lookup::{
     TcpLookupId, TcpLookupSnapshot, TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
 use crate::transport::tcp::{
-    TcpConnection, TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext,
-    TcpListenNext, TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext,
-    TcpRcvProcessNode, TcpResetNext, TcpResetNode, TcpSessionDriver, TcpSynSentNext,
-    TcpSynSentNode,
+    TcpEstablishedNext, TcpEstablishedNode, TcpInputControlPlane, TcpInputNext, TcpListenNext,
+    TcpListenNode, TcpOutputNext, TcpOutputNode, TcpRcvProcessNext, TcpRcvProcessNode,
+    TcpResetNext, TcpResetNode, TcpSessionDriver, TcpSynSentNext, TcpSynSentNode,
 };
 use hammer_core::protocol::tcp::TcpCapabilities;
 
@@ -923,18 +922,19 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                 )
                 .map_err(HammerError::from)?;
             let session_queue_node = SessionQueueNode::new().map_err(HammerError::from)?;
+            let mut worker_state =
+                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(worker);
+            crate::transport::tcp::lookup::set_tcp_worker_state(&mut worker_state);
             let queue = crate::session::node::register_session_queue(TcpSessionDriver::<
                 BbrController,
             >::new(
                 worker,
                 runtime.packet_buffers().clone(),
-                crate::transport::tcp::lookup::TcpWorkerOwnedState::new(worker),
             ))
             .map_err(HammerError::from)?;
             let session_queue = SessionQueueHandle::<
                 crate::session::runtime::SessionDriverRuntime<
                     crate::transport::tcp::TcpConnection<BbrController>,
-                    crate::transport::tcp::lookup::TcpWorkerOwnedState,
                 >,
             >::new(queue.runtime_data());
             let tcp_output = runtime
@@ -1001,7 +1001,6 @@ fn install_service_packet_graph_on_workers(data_context: &DataRuntimeContext) ->
                     tcp_output.into(),
                     dispatch_registered_session_queue_once_at::<
                         crate::transport::tcp::TcpConnection<BbrController>,
-                        crate::transport::tcp::lookup::TcpWorkerOwnedState,
                     >,
                 )
                 .map_err(HammerError::from)?;

@@ -17,7 +17,9 @@ pub use reset::{
     TcpResetError, TcpResetPacketCursor, tcp_reset_network_header_len,
     tcp_reset_remote_reply_addrs, tcp_reset_reply_from_current_packet,
 };
-pub use segment::{TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header};
+pub use segment::{
+    TcpSegmentHeader, TcpSegmentParseError, tcp_segment_header_len, write_tcp_segment_header,
+};
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

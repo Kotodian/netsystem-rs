@@ -7,7 +7,6 @@ use hammer_adapter::{
     TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::icmp::IcmpErrorMetadata;
 
 use crate::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code};
 use crate::net::ip::{
@@ -503,18 +502,6 @@ fn ip_ecn_from_packet(packet: &[u8], version: IpVersion) -> Option<IpEcnCodepoin
         1 => Some(IpEcnCodepoint::Ect1),
         2 => Some(IpEcnCodepoint::Ect0),
         3 => Some(IpEcnCodepoint::Ce),
-        _ => None,
-    }
-}
-
-#[inline(always)]
-fn icmp_error_metadata_for_input(parsed: &ParsedIpPacket) -> Option<IcmpErrorMetadata> {
-    if parsed.input_target != IpInputTarget::IcmpError {
-        return None;
-    }
-    match (parsed.version, parsed.input_error) {
-        (IpVersion::V4, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::ipv4_time_exceeded()),
-        (IpVersion::V6, IpInputError::TimeExpired) => Some(IcmpErrorMetadata::ipv6_time_exceeded()),
         _ => None,
     }
 }

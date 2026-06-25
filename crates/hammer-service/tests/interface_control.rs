@@ -257,7 +257,8 @@ fn interface_output_dispatches_to_registered_tx_node() {
         inputs: vec![TraceInputPolicy {
             node: output_node,
             count: 1,
-        }],
+        }]
+        .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");

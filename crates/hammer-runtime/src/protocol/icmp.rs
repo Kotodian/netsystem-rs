@@ -1,132 +1,21 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(feature = "probe")]
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-#[cfg(any(feature = "probe", test))]
+use std::net::IpAddr;
+#[cfg(test)]
+use std::net::Ipv4Addr;
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use hammer_adapter::{IcmpReply, ProxyIcmpConn};
+use hammer_adapter::IcmpReply;
+#[cfg(test)]
+use async_trait::async_trait;
+#[cfg(test)]
+use hammer_adapter::ProxyIcmpConn;
+#[cfg(test)]
 use hammer_core::error::{HammerError, HammerResult};
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::net::UdpSocket;
-#[cfg(any(feature = "probe", test))]
+#[cfg(test)]
 use tokio::time::timeout;
 
-use crate::socket_protector::SocketProtector;
-
-#[cfg(feature = "probe")]
-const PROBE_TOKEN_PREFIX: &[u8] = b"hammer-icmp-probe";
-
-#[cfg(feature = "probe")]
-static NEXT_SEQUENCE: AtomicU16 = AtomicU16::new(1);
-#[cfg(feature = "probe")]
-static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
-
-/// ICMP echo conduit backed by unprivileged ping sockets.
-///
-/// `SOCK_DGRAM, IPPROTO_ICMP{,V6}` sockets let the kernel own the outer IP
-/// header and the socket-local ICMP identifier. Callers should not rely on the
-/// identifier they put into an echo request being present in the reply.
-pub(crate) struct IcmpSocketConn {
-    protector: SocketProtector,
-    ipv4: Option<UdpSocket>,
-    ipv6: Option<UdpSocket>,
-}
-
-impl IcmpSocketConn {
-    pub(crate) fn new(protector: SocketProtector) -> Self {
-        Self {
-            protector,
-            ipv4: None,
-            ipv6: None,
-        }
-    }
-
-    fn socket_for(&mut self, destination: IpAddr) -> HammerResult<&UdpSocket> {
-        if destination.is_ipv6() {
-            if self.ipv6.is_none() {
-                self.ipv6 = Some(bind_icmp_socket(
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    &self.protector,
-                )?);
-            }
-            return Ok(self
-                .ipv6
-                .as_ref()
-                .expect("ICMP IPv6 socket just initialized"));
-        }
-        if self.ipv4.is_none() {
-            self.ipv4 = Some(bind_icmp_socket(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                &self.protector,
-            )?);
-        }
-        Ok(self
-            .ipv4
-            .as_ref()
-            .expect("ICMP IPv4 socket just initialized"))
-    }
-}
-
-#[async_trait]
-impl ProxyIcmpConn for IcmpSocketConn {
-    async fn send_echo(&mut self, destination: IpAddr, body: &[u8]) -> HammerResult<()> {
-        let target = SocketAddr::new(destination, 0);
-        self.socket_for(destination)?
-            .send_to(body, target)
-            .await
-            .map_err(|err| HammerError::internal(format!("icmp send: {err}")))?;
-        Ok(())
-    }
-
-    async fn recv_reply(&mut self) -> HammerResult<IcmpReply> {
-        match (self.ipv4.as_mut(), self.ipv6.as_mut()) {
-            (Some(ipv4), Some(ipv6)) => {
-                let mut v4 = vec![0_u8; 64 * 1024];
-                let mut v6 = vec![0_u8; 64 * 1024];
-                tokio::select! {
-                    res = ipv4.recv_from(&mut v4) => icmp_reply_from_recv(res, v4),
-                    res = ipv6.recv_from(&mut v6) => icmp_reply_from_recv(res, v6),
-                }
-            }
-            (Some(ipv4), None) => {
-                let mut buf = vec![0_u8; 64 * 1024];
-                icmp_reply_from_recv(ipv4.recv_from(&mut buf).await, buf)
-            }
-            (None, Some(ipv6)) => {
-                let mut buf = vec![0_u8; 64 * 1024];
-                icmp_reply_from_recv(ipv6.recv_from(&mut buf).await, buf)
-            }
-            (None, None) => Err(HammerError::internal(
-                "icmp recv before any socket is opened",
-            )),
-        }
-    }
-}
-
-#[cfg(feature = "probe")]
-pub(crate) async fn probe_echo(
-    destination: IpAddr,
-    timeout_duration: Duration,
-    protector: SocketProtector,
-) -> HammerResult<Duration> {
-    let mut conn = IcmpSocketConn::new(protector);
-    measure_echo(&mut conn, destination, timeout_duration).await
-}
-
-#[cfg(feature = "probe")]
-async fn measure_echo(
-    conn: &mut dyn ProxyIcmpConn,
-    destination: IpAddr,
-    timeout_duration: Duration,
-) -> HammerResult<Duration> {
-    let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let token = next_probe_token();
-    measure_echo_with_token(conn, destination, sequence, &token, timeout_duration).await
-}
-
-#[cfg(any(feature = "probe", test))]
+#[cfg(test)]
 async fn measure_echo_with_token(
     conn: &mut dyn ProxyIcmpConn,
     destination: IpAddr,
@@ -155,16 +44,7 @@ async fn measure_echo_with_token(
     }
 }
 
-#[cfg(feature = "probe")]
-fn next_probe_token() -> Vec<u8> {
-    let id = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
-    let mut token = Vec::with_capacity(PROBE_TOKEN_PREFIX.len() + 8);
-    token.extend_from_slice(PROBE_TOKEN_PREFIX);
-    token.extend_from_slice(&id.to_be_bytes());
-    token
-}
-
-#[cfg(any(feature = "probe", test))]
+#[cfg(test)]
 fn echo_request_body(destination: IpAddr, sequence: u16, payload: &[u8]) -> Vec<u8> {
     let request_type = if destination.is_ipv6() { 128 } else { 8 };
     let mut body = Vec::with_capacity(8 + payload.len());
@@ -181,7 +61,7 @@ fn echo_request_body(destination: IpAddr, sequence: u16, payload: &[u8]) -> Vec<
     body
 }
 
-#[cfg(any(feature = "probe", test))]
+#[cfg(test)]
 fn echo_reply_matches(
     destination: IpAddr,
     sequence: u16,
@@ -198,44 +78,7 @@ fn echo_reply_matches(
         && &reply.body[8..] == payload
 }
 
-fn bind_icmp_socket(bind_ip: IpAddr, protector: &SocketProtector) -> HammerResult<UdpSocket> {
-    let (domain, protocol) = match bind_ip {
-        IpAddr::V4(_) => (Domain::IPV4, Protocol::ICMPV4),
-        IpAddr::V6(_) => (Domain::IPV6, Protocol::ICMPV6),
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(protocol))
-        .map_err(|err| HammerError::internal(format!("icmp socket {bind_ip}: {err}")))?;
-    if matches!(bind_ip, IpAddr::V6(_)) {
-        socket
-            .set_only_v6(true)
-            .map_err(|err| HammerError::internal(format!("icmp set_only_v6: {err}")))?;
-    }
-    socket
-        .bind(&SocketAddr::new(bind_ip, 0).into())
-        .map_err(|err| HammerError::internal(format!("icmp bind {bind_ip}: {err}")))?;
-    let std_socket: std::net::UdpSocket = socket.into();
-    std_socket
-        .set_nonblocking(true)
-        .map_err(|err| HammerError::internal(format!("icmp set_nonblocking: {err}")))?;
-    let socket = UdpSocket::from_std(std_socket)
-        .map_err(|err| HammerError::internal(format!("icmp from_std: {err}")))?;
-    protector.protect(&socket)?;
-    Ok(socket)
-}
-
-fn icmp_reply_from_recv(
-    result: std::io::Result<(usize, SocketAddr)>,
-    mut buf: Vec<u8>,
-) -> HammerResult<IcmpReply> {
-    let (len, source) = result.map_err(|err| HammerError::internal(format!("icmp recv: {err}")))?;
-    buf.truncate(len);
-    let body = normalize_received_icmp_body(source.ip(), &buf);
-    Ok(IcmpReply {
-        source: source.ip(),
-        body: Bytes::copy_from_slice(body),
-    })
-}
-
+#[cfg(test)]
 fn normalize_received_icmp_body(source: IpAddr, packet: &[u8]) -> &[u8] {
     match source {
         IpAddr::V4(_) => strip_ipv4_header(packet).unwrap_or(packet),
@@ -243,6 +86,7 @@ fn normalize_received_icmp_body(source: IpAddr, packet: &[u8]) -> &[u8] {
     }
 }
 
+#[cfg(test)]
 fn strip_ipv4_header(packet: &[u8]) -> Option<&[u8]> {
     if packet.len() < 20 || packet[0] >> 4 != 4 {
         return None;
@@ -254,6 +98,7 @@ fn strip_ipv4_header(packet: &[u8]) -> Option<&[u8]> {
     Some(&packet[header_len..])
 }
 
+#[cfg(test)]
 fn strip_ipv6_header(packet: &[u8]) -> Option<&[u8]> {
     if packet.len() < 40 || packet[0] >> 4 != 6 || packet[6] != 58 {
         return None;
@@ -261,7 +106,7 @@ fn strip_ipv6_header(packet: &[u8]) -> Option<&[u8]> {
     Some(&packet[40..])
 }
 
-#[cfg(any(feature = "probe", test))]
+#[cfg(test)]
 fn checksum(data: &[u8]) -> u16 {
     let mut sum = 0u32;
     let mut chunks = data.chunks_exact(2);

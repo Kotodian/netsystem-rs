@@ -627,6 +627,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crossbeam-queue",
+ "crossbeam-utils",
  "hammer-core",
  "hammer-infra",
  "ipnet",
@@ -707,6 +708,9 @@ dependencies = [
 [[package]]
 name = "hammer-infra"
 version = "0.1.0"
+dependencies = [
+ "crossbeam-utils",
+]
 
 [[package]]
 name = "hammer-runtime"
@@ -741,6 +745,7 @@ dependencies = [
  "async-trait",
  "bitflags 2.11.1",
  "bytes",
+ "crossbeam-utils",
  "etherparse",
  "hammer-adapter",
  "hammer-component-macros",
@@ -752,6 +757,7 @@ dependencies = [
  "libc",
  "nom 8.0.0",
  "smoltcp",
+ "thiserror",
  "tokio",
  "tracing",
 ]

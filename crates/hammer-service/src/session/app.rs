@@ -1,3 +1,4 @@
+use crossbeam_utils::CachePadded;
 use hammer_adapter::{BufferIndex, DataPlaneBuffers};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::map::FlatHashTable;
@@ -30,41 +31,57 @@ impl SessionAppCloseSubmission {
 }
 
 #[derive(Debug)]
-pub struct SessionAppRuntime {
+struct SessionAppRuntimeHot {
     buffers: DataPlaneBuffers,
-    ring: Option<AppRingHandle>,
-    session_slots: FlatHashTable<u64, SessionId>,
     pending_sends: FlatHashTable<u64, BufferIndex>,
     tx_ready_sessions: SessionReadyQueue,
     ready_sessions: SessionReadyQueue,
+}
+
+#[derive(Debug)]
+struct SessionAppRuntimeControl {
+    ring: Option<AppRingHandle>,
+    session_slots: FlatHashTable<u64, SessionId>,
     drained_closes: hammer_infra::vec::Vec<SessionAppCloseSubmission>,
+}
+
+#[derive(Debug)]
+pub struct SessionAppRuntime {
+    hot: CachePadded<SessionAppRuntimeHot>,
+    control: CachePadded<SessionAppRuntimeControl>,
 }
 
 impl SessionAppRuntime {
     #[inline]
     pub fn new(buffers: DataPlaneBuffers) -> Self {
         Self {
-            buffers,
-            ring: None,
-            session_slots: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
-            pending_sends: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
-            tx_ready_sessions: SessionReadyQueue::new(),
-            ready_sessions: SessionReadyQueue::new(),
-            drained_closes: hammer_infra::vec::Vec::new(),
+            hot: CachePadded::new(SessionAppRuntimeHot {
+                buffers,
+                pending_sends: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
+                tx_ready_sessions: SessionReadyQueue::new(),
+                ready_sessions: SessionReadyQueue::new(),
+            }),
+            control: CachePadded::new(SessionAppRuntimeControl {
+                ring: None,
+                session_slots: FlatHashTable::with_capacity(DEFAULT_APP_SESSION_CAPACITY),
+                drained_closes: hammer_infra::vec::Vec::new(),
+            }),
         }
     }
 
     #[inline]
     pub fn bind_ring(&mut self, session_id: SessionId, op: AppOpId, ring: AppRingHandle) {
-        self.ring.get_or_insert(ring);
-        self.session_slots.insert(op.value(), session_id);
+        self.control.ring.get_or_insert(ring);
+        self.control.session_slots.insert(op.value(), session_id);
     }
 
     #[inline]
     pub fn unbind_ring(&mut self, op: AppOpId) -> Option<AppRingHandle> {
-        self.session_slots.lookup(&op.value())?;
-        self.session_slots.insert(op.value(), UNBOUND_SESSION);
-        self.ring.clone()
+        self.control.session_slots.lookup(&op.value())?;
+        self.control
+            .session_slots
+            .insert(op.value(), UNBOUND_SESSION);
+        self.control.ring.clone()
     }
 
     #[inline]
@@ -75,7 +92,7 @@ impl SessionAppRuntime {
         index: hammer_adapter::BufferIndex,
         fin: bool,
     ) -> CoreResult<bool> {
-        let Some(ring) = self.ring.as_ref() else {
+        let Some(ring) = self.control.ring.as_ref() else {
             buffers.free_index(index);
             return Ok(true);
         };
@@ -84,7 +101,7 @@ impl SessionAppRuntime {
 
     #[inline]
     pub fn complete_closed(&self, op: AppOpId) -> CoreResult<()> {
-        let Some(ring) = self.ring.as_ref() else {
+        let Some(ring) = self.control.ring.as_ref() else {
             return Ok(());
         };
         ring.try_push_completion(AppCqe::closed(None, Some(op)))
@@ -92,14 +109,14 @@ impl SessionAppRuntime {
 
     #[inline]
     pub fn complete_connected(&self, op: AppOpId) -> CoreResult<()> {
-        let Some(ring) = self.ring.as_ref() else {
+        let Some(ring) = self.control.ring.as_ref() else {
             return Ok(());
         };
         ring.try_push_completion(AppCqe::connected(None, op))
     }
 
     pub fn drain_submissions(&mut self) -> CoreResult<()> {
-        let Some(ring) = self.ring.clone() else {
+        let Some(ring) = self.control.ring.clone() else {
             return Ok(());
         };
         while let Some(descriptor) = ring.pop_submission_descriptor() {
@@ -112,7 +129,7 @@ impl SessionAppRuntime {
     pub(crate) fn take_drained_closes(
         &mut self,
     ) -> hammer_infra::vec::Vec<SessionAppCloseSubmission> {
-        self.drained_closes.drain(..).collect()
+        self.control.drained_closes.drain(..).collect()
     }
 
     #[inline]
@@ -122,14 +139,14 @@ impl SessionAppRuntime {
             .copy_send_into_session_chain(&send)
             .expect("session app send copy into session chain");
         send.release();
-        if let Some(existing) = self.pending_sends.lookup(&key) {
+        if let Some(existing) = self.hot.pending_sends.lookup(&key) {
             self.buffers()
                 .append_existing_chain(existing, head)
                 .expect("session app append pending send chain");
         } else {
-            self.pending_sends.insert(key, head);
+            self.hot.pending_sends.insert(key, head);
         }
-        self.tx_ready_sessions.mark_ready(session_id);
+        self.hot.tx_ready_sessions.mark_ready(session_id);
     }
 
     pub(crate) fn release_pending_send_bytes(
@@ -142,6 +159,7 @@ impl SessionAppRuntime {
         }
         let key = session_id.get();
         let head = self
+            .hot
             .pending_sends
             .lookup(&key)
             .ok_or_else(|| CoreError::internal("session app tx chain is missing"))?;
@@ -157,7 +175,7 @@ impl SessionAppRuntime {
         }
         if len == total_len {
             let _ = buffers;
-            self.pending_sends.remove(&key);
+            self.hot.pending_sends.remove(&key);
             self.buffers().free_index(head);
             return Ok(true);
         }
@@ -169,11 +187,11 @@ impl SessionAppRuntime {
     #[inline]
     #[cfg(test)]
     pub(crate) fn has_pending_send(&self, session_id: SessionId) -> bool {
-        self.pending_sends.lookup(&session_id.get()).is_some()
+        self.hot.pending_sends.lookup(&session_id.get()).is_some()
     }
 
     pub(crate) fn pending_send_len(&self, session_id: SessionId) -> CoreResult<Option<usize>> {
-        let Some(head) = self.pending_sends.lookup(&session_id.get()) else {
+        let Some(head) = self.hot.pending_sends.lookup(&session_id.get()) else {
             return Ok(None);
         };
         let buffers = self.buffers();
@@ -186,25 +204,25 @@ impl SessionAppRuntime {
 
     #[inline]
     pub(crate) fn pending_send_head(&self, session_id: SessionId) -> Option<BufferIndex> {
-        self.pending_sends.lookup(&session_id.get())
+        self.hot.pending_sends.lookup(&session_id.get())
     }
 
     #[inline]
     pub(crate) fn free_pending_send(&mut self, session_id: SessionId) {
-        let Some(head) = self.pending_sends.remove(&session_id.get()) else {
+        let Some(head) = self.hot.pending_sends.remove(&session_id.get()) else {
             return;
         };
         self.buffers().free_index(head);
     }
 
     pub(crate) fn take_ready_tx_sessions(&mut self, out: &mut hammer_infra::vec::Vec<SessionId>) {
-        for session_id in self.tx_ready_sessions.take_ready_sessions() {
+        for session_id in self.hot.tx_ready_sessions.take_ready_sessions() {
             out.push(session_id);
         }
     }
 
     pub(crate) fn take_ready_sessions(&mut self, out: &mut hammer_infra::vec::Vec<SessionId>) {
-        for session_id in self.ready_sessions.take_ready_sessions() {
+        for session_id in self.hot.ready_sessions.take_ready_sessions() {
             out.push(session_id);
         }
     }
@@ -217,7 +235,7 @@ impl SessionAppRuntime {
                     let Some(session_id) = self.session_for_op(op) else {
                         return Ok(());
                     };
-                    if let Some(ring) = self.ring.clone() {
+                    if let Some(ring) = self.control.ring.clone() {
                         let send: AppSendData = ring.send_from_data(data).try_into()?;
                         self.push_pending_send(session_id, send);
                     }
@@ -226,14 +244,15 @@ impl SessionAppRuntime {
             AppOpcode::Close => {
                 let op = app_op_from_descriptor(descriptor);
                 if let Some(session_id) = self.session_for_op(op) {
-                    self.drained_closes
+                    self.control
+                        .drained_closes
                         .push(SessionAppCloseSubmission::new(session_id, op));
                 }
             }
             AppOpcode::Recv => {
                 let op = app_op_from_descriptor(descriptor);
                 if let Some(session_id) = self.session_for_op(op) {
-                    self.ready_sessions.mark_ready(session_id);
+                    self.hot.ready_sessions.mark_ready(session_id);
                 }
             }
             AppOpcode::Nop => {}
@@ -243,7 +262,7 @@ impl SessionAppRuntime {
 
     #[inline]
     fn buffers(&self) -> &DataPlaneBuffers {
-        &self.buffers
+        &self.hot.buffers
     }
 
     fn copy_send_into_session_chain(&self, send: &AppSendData) -> CoreResult<BufferIndex> {
@@ -291,7 +310,8 @@ impl SessionAppRuntime {
 
     #[inline]
     fn session_for_op(&self, op: AppOpId) -> Option<SessionId> {
-        self.session_slots
+        self.control
+            .session_slots
             .lookup(&op.value())
             .filter(|session_id| *session_id != UNBOUND_SESSION)
     }
@@ -441,18 +461,16 @@ mod tests {
         let session_id = SessionId::new(1);
 
         app.push_pending_send(session_id, send);
-        assert!(
-            !app.release_pending_send_bytes(session_id, 4)
-                .expect("partial")
-        );
+        assert!(!app
+            .release_pending_send_bytes(session_id, 4)
+            .expect("partial"));
         assert_eq!(
             app.pending_send_len(session_id).expect("pending len"),
             Some(2)
         );
-        assert!(
-            app.release_pending_send_bytes(session_id, 2)
-                .expect("finish")
-        );
+        assert!(app
+            .release_pending_send_bytes(session_id, 2)
+            .expect("finish"));
         assert!(!app.has_pending_send(session_id));
     }
 }

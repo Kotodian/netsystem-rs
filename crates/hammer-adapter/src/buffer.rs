@@ -8,11 +8,11 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
+use crossbeam_utils::CachePadded;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::{
-    align::CacheLine,
     boxed::Slice,
-    prefetch::{prefetch_read_l1, prefetch_write_l1},
+    prefetch::{prefetch_read_l1, prefetch_read_l2, prefetch_write_l1},
     vec::Vec,
 };
 
@@ -31,6 +31,18 @@ pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const CURRENT_CHAIN_IO_SEGMENT_CAPACITY: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
+
+/// Number of free slots moved between the per-thread cache and the arena free
+/// list in a single batch. Batching amortises the `Rc<RefCell>` borrow across
+/// this many alloc/free operations.
+pub const BUFFER_THREAD_CACHE_BATCH: usize = 32;
+/// High-water mark at which the thread cache returns a batch back to the
+/// arena free list, preventing unbounded cache growth and keeping arena free
+/// list non-empty for other consumers.
+pub const BUFFER_THREAD_CACHE_HIGH_WATER: usize = 64;
+/// `in_use` is folded from the lazy `in_use_delta` counter once its absolute
+/// value exceeds this threshold or when the count is read.
+pub const BUFFER_IN_USE_FOLD_THRESHOLD: i32 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferIndex {
@@ -190,8 +202,10 @@ impl Buffer {
     #[inline]
     fn with_slot_capacity(slot_capacity: usize) -> Self {
         let storage = Slice::from_elem(slot_capacity, 0);
+        let mut cacheline0 = PacketBufferCacheline0::default();
+        cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         Self {
-            cacheline0: PacketBufferCacheline0::default(),
+            cacheline0,
             cacheline1: PacketBufferCacheline1::default(),
             storage,
         }
@@ -214,6 +228,7 @@ impl Buffer {
             .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
         self.cacheline0.current_length = current_len;
         self.cacheline0.ref_count = 1;
+        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         self.cacheline1 = PacketBufferCacheline1::default();
         let start = headroom;
         let end = start + bytes.len();
@@ -224,7 +239,48 @@ impl Buffer {
     #[inline]
     fn reset_for_free(&mut self) {
         self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
         self.cacheline1 = PacketBufferCacheline1::default();
+    }
+
+    #[inline]
+    fn reset_empty(&mut self, headroom: usize) -> CoreResult<()> {
+        if headroom > self.storage.len() {
+            return Err(CoreError::internal("buffer headroom exceeds slot capacity"));
+        }
+        self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline0.current_data = i16::try_from(headroom)
+            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        self.cacheline0.ref_count = 1;
+        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
+        self.cacheline1 = PacketBufferCacheline1::default();
+        Ok(())
+    }
+
+    /// Clear only cacheline0 and mark the slot clean, leaving cacheline1 alone.
+    /// Caller must have verified `flags.contains(SLOT_CLEAN)` so cacheline1 is
+    /// already zeroed from the previous free. Returns the headroom/length pair
+    /// the alloc fast path needs.
+    #[inline]
+    fn reset_empty_fast(&mut self, headroom: usize) -> CoreResult<()> {
+        if headroom > self.storage.len() {
+            return Err(CoreError::internal("buffer headroom exceeds slot capacity"));
+        }
+        self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline0.current_data = i16::try_from(headroom)
+            .map_err(|_| CoreError::internal("buffer current_data exceeds i16"))?;
+        self.cacheline0.ref_count = 1;
+        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
+        Ok(())
+    }
+
+    /// Free fast path: only cacheline0 is rewritten (clean-default with
+    /// SLOT_CLEAN set); cacheline1 is left untouched because it is already
+    /// zeroed when SLOT_CLEAN was set on the slot.
+    #[inline]
+    fn reset_for_free_fast(&mut self) {
+        self.cacheline0 = PacketBufferCacheline0::default();
+        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
     }
 
     #[inline]
@@ -244,6 +300,7 @@ impl Buffer {
 
     #[inline]
     pub fn opaque2_mut(&mut self) -> &mut SecondaryOpaque {
+        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
         &mut self.cacheline1.opaque2
     }
 
@@ -294,6 +351,7 @@ impl Buffer {
 
     #[inline]
     pub fn set_trace_handle(&mut self, handle: u32) {
+        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
         self.cacheline1.trace_handle = handle;
     }
 
@@ -301,6 +359,15 @@ impl Buffer {
     pub fn take_trace_handle(&mut self) -> Option<u32> {
         let handle = self.trace_handle();
         self.cacheline1.trace_handle = 0;
+        if handle.is_none() {
+            // trace_handle was already 0; if the rest of cacheline1 is also
+            // zeroed we keep CLEAN, otherwise it was already cleared.
+        } else {
+            // We cannot prove cacheline1 is fully zeroed anymore without a
+            // scan; conservatively drop the clean invariant. A subsequent
+            // free will rebuild it via the slow path.
+            self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
+        }
         handle
     }
 
@@ -388,15 +455,20 @@ impl Buffer {
 
     #[inline]
     pub fn prepend(&mut self, bytes: &[u8]) -> CoreResult<()> {
-        if bytes.len() > self.current_data() {
+        self.prepend_mut(bytes.len())?.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn prepend_mut(&mut self, len: usize) -> CoreResult<&mut [u8]> {
+        let current_data = self.current_data();
+        if len > current_data {
             return Err(CoreError::internal("buffer prepend exceeds headroom"));
         }
-        let start = self.current_data() - bytes.len();
+        let start = current_data - len;
         self.set_current_data(start)?;
-        let end = start + bytes.len();
-        self.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
-        self.set_current_len(self.current_len() + bytes.len())?;
-        Ok(())
+        self.set_current_len(self.current_len() + len)?;
+        Ok(&mut self.storage.as_mut_slice()[start..current_data])
     }
 
     #[inline]
@@ -453,6 +525,7 @@ impl Buffer {
 
     #[inline]
     fn set_total_len_not_including_first(&mut self, len: usize) -> CoreResult<()> {
+        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
         self.cacheline1.total_length_not_including_first = u32::try_from(len)
             .map_err(|_| CoreError::internal("buffer chain tail length exceeds u32"))?;
         Ok(())
@@ -460,7 +533,6 @@ impl Buffer {
 }
 
 #[derive(Debug)]
-#[repr(C, align(64))]
 struct BufferSlot {
     generation: u32,
     allocated: bool,
@@ -471,9 +543,10 @@ struct BufferSlot {
 struct BufferPoolInner {
     pool_id: u64,
     slot_capacity: usize,
-    slots: Vec<CacheLine<BufferSlot>>,
+    slots: Vec<CachePadded<BufferSlot>>,
     free: Vec<u32>,
     in_use: usize,
+    in_use_delta: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -484,6 +557,20 @@ pub struct BufferPoolArena {
 #[derive(Debug, Clone)]
 pub struct BufferThreadCache {
     free: Vec<u32>,
+}
+
+impl BufferThreadCache {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            free: Vec::with_capacity(BUFFER_THREAD_CACHE_HIGH_WATER),
+        }
+    }
+
+    #[inline]
+    pub fn cached_free_len(&self) -> usize {
+        self.free.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -700,13 +787,12 @@ impl DataPlaneBuffers {
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         let mut cache = self.buffers.thread_cache.borrow_mut();
-        let handles = self
+        self
             .buffers
             .arena
             .inner
             .borrow_mut()
-            .free_chain_collect_trace_handles(&mut cache, index);
-        self.finalize_trace_handles(handles);
+            .free_chain_trace(&mut cache, index, |handle| self.trace.finalize(handle));
     }
 
     #[inline]
@@ -969,11 +1055,6 @@ impl DataPlaneBuffers {
         self.buffers.with_current_chain_io_segments(index, f)
     }
 
-    fn finalize_trace_handles(&self, handles: Vec<u32>) {
-        for handle in handles {
-            self.trace.finalize(handle);
-        }
-    }
 }
 
 impl DataPlaneRuntime {
@@ -1448,7 +1529,7 @@ impl BufferPoolArena {
             .collect();
         let slots = (0..slots)
             .map(|_| {
-                CacheLine::new(BufferSlot {
+                CachePadded::new(BufferSlot {
                     generation: 0,
                     allocated: false,
                     buffer: Buffer::with_slot_capacity(slot_capacity),
@@ -1462,6 +1543,7 @@ impl BufferPoolArena {
                 slots,
                 free,
                 in_use: 0,
+                in_use_delta: 0,
             })),
         }
     }
@@ -1469,18 +1551,6 @@ impl BufferPoolArena {
     #[inline]
     pub fn pool_id(&self) -> u64 {
         self.inner.borrow().pool_id
-    }
-}
-
-impl BufferThreadCache {
-    #[inline]
-    fn new() -> Self {
-        Self { free: Vec::new() }
-    }
-
-    #[inline]
-    pub fn cached_free_len(&self) -> usize {
-        self.free.len()
     }
 }
 
@@ -1515,7 +1585,9 @@ impl BufferPool {
 
     #[inline]
     pub fn in_use(&self) -> usize {
-        self.arena.inner.borrow().in_use
+        let mut arena = self.arena.inner.borrow_mut();
+        arena.fold_in_use();
+        arena.in_use
     }
 
     #[inline]
@@ -1535,11 +1607,7 @@ impl BufferPool {
     #[inline]
     pub fn free_index(&self, index: BufferIndex) {
         let mut cache = self.thread_cache.borrow_mut();
-        let _ = self
-            .arena
-            .inner
-            .borrow_mut()
-            .free_chain_collect_trace_handles(&mut cache, index);
+        self.arena.inner.borrow_mut().free_chain(&mut cache, index);
     }
 
     #[inline]
@@ -1567,8 +1635,9 @@ impl BufferPool {
         let mut cache = self.thread_cache.borrow_mut();
         let mut pool = self.arena.inner.borrow_mut();
         for index in frame.drain_indices() {
-            let _ = pool.free_chain_collect_trace_handles(&mut cache, index);
+            pool.free_chain(&mut cache, index);
         }
+        pool.fold_in_use();
     }
 
     #[inline]
@@ -1699,16 +1768,7 @@ impl BufferPool {
     pub fn prepend(&self, index: BufferIndex, bytes: &[u8]) -> CoreResult<()> {
         let mut pool = self.arena.inner.borrow_mut();
         pool.ensure_writable(index)?;
-        let buffer = pool.buffer_mut(index)?;
-        if bytes.len() > buffer.current_data() {
-            return Err(CoreError::internal("buffer prepend exceeds headroom"));
-        }
-        let start = buffer.current_data() - bytes.len();
-        buffer.set_current_data(start)?;
-        let end = start + bytes.len();
-        buffer.storage.as_mut_slice()[start..end].copy_from_slice(bytes);
-        buffer.set_current_len(buffer.current_len() + bytes.len())?;
-        Ok(())
+        pool.buffer_mut(index)?.prepend(bytes)
     }
 
     #[inline]
@@ -2222,13 +2282,8 @@ impl BufferPoolInner {
         if self.slot_capacity == 0 {
             return Err(CoreError::internal("buffer slot capacity must be nonzero"));
         }
-        let index = self.alloc_slot(cache, &[])?;
         let headroom = DEFAULT_PACKET_HEADROOM.min(self.slot_capacity);
-        {
-            let buffer = self.buffer_mut(index)?;
-            buffer.set_current_data(headroom)?;
-        }
-        Ok(index)
+        self.alloc_slot_empty_fast(cache, headroom)
     }
 
     #[inline]
@@ -2244,23 +2299,97 @@ impl BufferPoolInner {
                 self.slot_capacity
             )));
         }
-        let slot = cache
-            .free
-            .pop()
-            .or_else(|| self.free.pop())
-            .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?;
-        let entry = self
-            .slots
-            .get_mut(slot as usize)
-            .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
-        entry.generation = entry.generation.wrapping_add(1).max(1);
-        entry.allocated = true;
-        entry.buffer.reset(bytes)?;
-        self.in_use += 1;
+        self.alloc_slot_with(cache, |buffer| buffer.reset(bytes))
+    }
+
+    #[inline]
+    fn alloc_slot_with(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        reset: impl FnOnce(&mut Buffer) -> CoreResult<()>,
+    ) -> CoreResult<BufferIndex> {
+        let slot = match cache.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.refill_cache_batch(cache);
+                cache
+                    .free
+                    .pop()
+                    .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
+            }
+        };
+        let generation = {
+            let entry = self
+                .slots
+                .get_mut(slot as usize)
+                .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
+            entry.generation = entry.generation.wrapping_add(1).max(1);
+            if let Err(error) = reset(&mut entry.buffer) {
+                entry.allocated = false;
+                cache.free.push(slot);
+                return Err(error);
+            }
+            entry.allocated = true;
+            entry.generation
+        };
+        self.bump_in_use();
+        self.prefetch_next_cached_slot(cache);
         Ok(BufferIndex {
             pool_id: self.pool_id,
             slot,
-            generation: entry.generation,
+            generation,
+        })
+    }
+
+    /// Empty-buffer alloc fast path: only cacheline0 is rewritten (clean-default
+    /// with SLOT_CLEAN set); cacheline1 is left alone when the slot was cleanly
+    /// freed, otherwise the slow path zeros it.
+    #[inline(always)]
+    fn alloc_slot_empty_fast(
+        &mut self,
+        cache: &mut BufferThreadCache,
+        headroom: usize,
+    ) -> CoreResult<BufferIndex> {
+        let slot = match cache.free.pop() {
+            Some(slot) => slot,
+            None => {
+                self.refill_cache_batch(cache);
+                cache
+                    .free
+                    .pop()
+                    .ok_or_else(|| CoreError::internal("buffer pool exhausted"))?
+            }
+        };
+        let generation = {
+            let entry = self
+                .slots
+                .get_mut(slot as usize)
+                .ok_or_else(|| CoreError::internal("buffer slot out of bounds"))?;
+            entry.generation = entry.generation.wrapping_add(1).max(1);
+            let clean = entry
+                .buffer
+                .cacheline0
+                .flags
+                .contains(BufferFlags::SLOT_CLEAN);
+            let reset_result = if clean {
+                entry.buffer.reset_empty_fast(headroom)
+            } else {
+                entry.buffer.reset_empty(headroom)
+            };
+            if let Err(error) = reset_result {
+                entry.allocated = false;
+                cache.free.push(slot);
+                return Err(error);
+            }
+            entry.allocated = true;
+            entry.generation
+        };
+        self.bump_in_use();
+        self.prefetch_next_cached_slot(cache);
+        Ok(BufferIndex {
+            pool_id: self.pool_id,
+            slot,
+            generation,
         })
     }
 
@@ -2350,55 +2479,189 @@ impl BufferPoolInner {
 
     #[inline]
     fn free_chain(&mut self, cache: &mut BufferThreadCache, index: BufferIndex) {
-        let _ = self.free_chain_collect_trace_handles(cache, index);
+        self.free_chain_trace(cache, index, |_| {});
     }
 
     #[inline]
-    fn free_chain_collect_trace_handles(
+    fn free_chain_trace(
         &mut self,
         cache: &mut BufferThreadCache,
         index: BufferIndex,
-    ) -> Vec<u32> {
-        let mut released_trace_handles = Vec::new();
+        mut release_trace: impl FnMut(u32),
+    ) {
         let mut next = Some(index);
         while let Some(index) = next {
             if index.pool_id != self.pool_id {
-                return released_trace_handles;
+                return;
             }
             let slot = index.slot as usize;
-            let Some(entry) = self.slots.get(slot) else {
-                return released_trace_handles;
+            let (next_slot, ref_count, clean, trace_handle) = {
+                let Some(entry) = self.slots.get(slot) else {
+                    return;
+                };
+                if entry.generation != index.generation {
+                    return;
+                }
+                if !entry.allocated {
+                    next = None;
+                    continue;
+                }
+                (
+                    entry.buffer.next_buffer_slot(),
+                    entry.buffer.ref_count(),
+                    entry
+                        .buffer
+                        .cacheline0
+                        .flags
+                        .contains(BufferFlags::SLOT_CLEAN),
+                    entry.buffer.cacheline1.trace_handle,
+                )
             };
-            if entry.generation != index.generation {
-                return released_trace_handles;
-            }
-            if entry.allocated {
-                let next_slot = entry.buffer.next_buffer_slot();
-                let ref_count = entry.buffer.ref_count();
-                if ref_count > 1 {
-                    if let Some(entry) = self.slots.get_mut(slot) {
-                        entry.buffer.cacheline0.ref_count =
-                            entry.buffer.cacheline0.ref_count.saturating_sub(1);
-                    }
-                } else {
-                    let handle = (entry.buffer.cacheline1.trace_handle != 0)
-                        .then_some(entry.buffer.cacheline1.trace_handle);
-                    if let Some(handle) = handle {
-                        released_trace_handles.push(handle);
-                    }
-                    let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
-                    entry.buffer.cacheline1.trace_handle = 0;
-                    entry.allocated = false;
-                    entry.buffer.reset_for_free();
-                    self.in_use = self.in_use.saturating_sub(1);
-                    cache.free.push(index.slot);
+
+            if ref_count > 1 {
+                if let Some(entry) = self.slots.get_mut(slot) {
+                    entry.buffer.cacheline0.ref_count =
+                        entry.buffer.cacheline0.ref_count.saturating_sub(1);
                 }
                 next = next_slot.and_then(|slot| self.index_from_slot(slot));
-            } else {
-                next = None;
+                continue;
+            }
+
+            // Fast path: trace_handle is provably zero when SLOT_CLEAN holds,
+            // so no trace finalisation is needed and cacheline1 is already
+            // zeroed, letting us skip the second cacheline write on free.
+            if clean {
+                {
+                    let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
+                    entry.buffer.reset_for_free_fast();
+                    entry.allocated = false;
+                }
+                self.dec_in_use();
+                self.push_cache_slot(cache, index.slot);
+                if let Some(next_slot) = next_slot {
+                    self.prefetch_chain_next(next_slot);
+                }
+                next = next_slot.and_then(|slot| self.index_from_slot(slot));
+                continue;
+            }
+
+            // Slow path: trace finalisation + full cacheline reset.
+            if trace_handle != 0 {
+                release_trace(trace_handle);
+            }
+            {
+                let entry = self.slots.get_mut(slot).expect("buffer slot remains valid");
+                entry.buffer.cacheline1.trace_handle = 0;
+                entry.allocated = false;
+                entry.buffer.reset_for_free();
+            }
+            self.dec_in_use();
+            self.push_cache_slot(cache, index.slot);
+            next = next_slot.and_then(|slot| self.index_from_slot(slot));
+        }
+    }
+
+    /// Push a freed slot onto the thread cache, returning a batch to the arena
+    /// free list when the cache exceeds the high-water mark so it never grows
+    /// past its preallocated capacity.
+    #[inline]
+    fn push_cache_slot(&mut self, cache: &mut BufferThreadCache, slot: u32) {
+        if cache.free.len() >= BUFFER_THREAD_CACHE_HIGH_WATER {
+            self.return_cache_batch(cache);
+        }
+        cache.free.push(slot);
+    }
+
+    /// Move up to `BUFFER_THREAD_CACHE_BATCH` slots from the arena free list
+    /// into the thread cache. Cold because it only runs when the cache is
+    /// empty, amortising the arena `RefCell` borrow across a batch. The grab
+    /// is capped at half of the arena's currently-free slots so concurrent
+    /// consumers sharing the arena (handoff workers) are not starved.
+    #[cold]
+    #[inline(never)]
+    fn refill_cache_batch(&mut self, cache: &mut BufferThreadCache) {
+        let arena_free = self.free.len();
+        if arena_free == 0 {
+            return;
+        }
+        // Leave at least one slot for any other arena consumer, and never grab
+        // more than half of what is currently free.
+        let max_grab = BUFFER_THREAD_CACHE_BATCH.min(arena_free / 2 + arena_free % 2);
+        let mut moved = 0usize;
+        while moved < max_grab && cache.free.len() < BUFFER_THREAD_CACHE_HIGH_WATER {
+            let Some(slot) = self.free.pop() else {
+                break;
+            };
+            cache.free.push(slot);
+            moved += 1;
+        }
+    }
+
+    /// Move up to `BUFFER_THREAD_CACHE_BATCH` slots from the thread cache back
+    /// to the arena free list when the cache is at/over the high-water mark.
+    #[cold]
+    #[inline(never)]
+    fn return_cache_batch(&mut self, cache: &mut BufferThreadCache) {
+        let mut moved = 0usize;
+        while moved < BUFFER_THREAD_CACHE_BATCH && cache.free.len() > BUFFER_THREAD_CACHE_BATCH {
+            let Some(slot) = cache.free.pop() else {
+                break;
+            };
+            self.free.push(slot);
+            moved += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn bump_in_use(&mut self) {
+        self.in_use_delta += 1;
+        if self.in_use_delta >= BUFFER_IN_USE_FOLD_THRESHOLD {
+            self.fold_in_use();
+        }
+    }
+
+    #[inline(always)]
+    fn dec_in_use(&mut self) {
+        self.in_use_delta -= 1;
+        if self.in_use_delta <= -BUFFER_IN_USE_FOLD_THRESHOLD {
+            self.fold_in_use();
+        }
+    }
+
+    #[inline]
+    fn fold_in_use(&mut self) {
+        if self.in_use_delta == 0 {
+            return;
+        }
+        if self.in_use_delta > 0 {
+            self.in_use = self
+                .in_use
+                .saturating_add(self.in_use_delta as usize);
+        } else {
+            let dec = self.in_use_delta.unsigned_abs() as usize;
+            self.in_use = self.in_use.saturating_sub(dec);
+        }
+        self.in_use_delta = 0;
+    }
+
+    /// Prefetch the next slot the caller is about to pop from the cache so its
+    /// header lands in L2 (and is promoted to L1 by the time it is touched).
+    #[inline]
+    fn prefetch_next_cached_slot(&self, cache: &BufferThreadCache) {
+        if let Some(&next_slot) = cache.free.last() {
+            if let Some(entry) = self.slots.get(next_slot as usize) {
+                prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
             }
         }
-        released_trace_handles
+    }
+
+    /// Prefetch the next buffer header along a chain being freed so the
+    /// generation/ref_count reads hit a warm line.
+    #[inline]
+    fn prefetch_chain_next(&self, slot: u32) {
+        if let Some(entry) = self.slots.get(slot as usize) {
+            prefetch_read_l2(std::ptr::from_ref(&entry.buffer.cacheline0).cast::<u8>());
+        }
     }
 
     #[inline]

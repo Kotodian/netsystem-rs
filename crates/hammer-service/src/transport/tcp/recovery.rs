@@ -131,6 +131,7 @@ pub struct TcpRecoveryState {
     sample_lookup: RbTree<TcpSeq, PoolIndex>,
     sample_head: Option<PoolIndex>,
     sample_tail: Option<PoolIndex>,
+    bytes_in_flight: u32,
     ack_floor: TcpSeq,
     scoreboard: TcpScoreboard,
     rack_timer_armed: bool,
@@ -152,6 +153,7 @@ impl TcpRecoveryState {
             sample_lookup: RbTree::with_capacity(32),
             sample_head: None,
             sample_tail: None,
+            bytes_in_flight: 0,
             ack_floor: 0u32.into(),
             scoreboard: TcpScoreboard::new(),
             rack_timer_armed: false,
@@ -203,6 +205,7 @@ impl TcpRecoveryState {
             self.sample_head = Some(sample_index);
         }
         self.sample_tail = Some(sample_index);
+        self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);
         let replaced = self.sample_lookup.insert(sequence, sample_index);
         debug_assert!(
             replaced.is_none(),
@@ -212,13 +215,11 @@ impl TcpRecoveryState {
     }
 
     pub fn bytes_in_flight(&self) -> u32 {
-        self.sent_samples.iter().fold(0u32, |total, (_, sample)| {
-            total.saturating_add(sample.bytes)
-        })
+        self.bytes_in_flight
     }
 
     pub fn has_unacked_data(&self) -> bool {
-        !self.sent_samples.is_empty()
+        self.bytes_in_flight != 0
     }
 
     #[inline]
@@ -259,9 +260,9 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
-        let acked = self.take_acked_segments(ack.acknowledgment);
+        let (acked, acked_bytes) = self.take_acked_segments(ack.acknowledgment);
         let advanced = !acked.is_empty();
-        let latest_rtt = self.deliver_acked_segments(ack, acked, congestion);
+        let latest_rtt = self.deliver_acked_segments(ack, acked, acked_bytes, congestion);
         self.rebuild_scoreboard(
             ack.acknowledgment,
             self.scoreboard.high_sacked,
@@ -282,13 +283,16 @@ impl TcpRecoveryState {
         congestion: &mut C,
     ) -> Option<Duration> {
         self.ack_floor = ack.acknowledgment;
-        let mut acked = self.take_acked_segments(ack.acknowledgment);
+        let (mut acked, mut acked_bytes) = self.take_acked_segments(ack.acknowledgment);
+        acked.reserve(blocks.len());
         let mut highest_sacked_right = ack.acknowledgment;
         for block in blocks {
             highest_sacked_right = highest_sacked_right.max(block.right_edge);
-            acked.extend(self.take_sacked_segments(*block));
+            let (sacked, sacked_bytes) = self.take_sacked_segments(*block);
+            acked_bytes = acked_bytes.saturating_add(sacked_bytes);
+            acked.extend(sacked);
         }
-        let latest_rtt = self.deliver_acked_segments(ack, acked, congestion);
+        let latest_rtt = self.deliver_acked_segments(ack, acked, acked_bytes, congestion);
         self.rebuild_scoreboard(
             ack.acknowledgment,
             highest_sacked_right,
@@ -475,6 +479,7 @@ impl TcpRecoveryState {
         Some(sample)
     }
 
+    #[cfg(test)]
     pub(crate) fn oldest_unacked_sample(&self) -> Option<TcpSentSample> {
         let index = self.sample_head?;
         Some(self.sent_sample(index))
@@ -501,8 +506,9 @@ impl TcpRecoveryState {
         self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
-    fn take_acked_segments(&mut self, acknowledgment: TcpSeq) -> Vec<TcpSentSample> {
-        let mut acked = Vec::new();
+    fn take_acked_segments(&mut self, acknowledgment: TcpSeq) -> (Vec<TcpSentSample>, u32) {
+        let mut acked = Vec::with_capacity(4);
+        let mut total_bytes = 0u32;
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
@@ -511,18 +517,23 @@ impl TcpRecoveryState {
                 break;
             }
             if acknowledgment >= sample.end_sequence {
-                acked.push(self.take_sent(index));
+                let sample = self.take_sent(index);
+                total_bytes = total_bytes.saturating_add(sample.bytes);
+                acked.push(sample);
             } else {
-                acked.push(self.take_sample_prefix(index, acknowledgment));
+                let sample = self.take_sample_prefix(index, acknowledgment);
+                total_bytes = total_bytes.saturating_add(sample.bytes);
+                acked.push(sample);
                 break;
             }
             cursor = next;
         }
-        acked
+        (acked, total_bytes)
     }
 
-    fn take_sacked_segments(&mut self, block: TcpSackBlock) -> Vec<TcpSentSample> {
-        let mut matched = Vec::new();
+    fn take_sacked_segments(&mut self, block: TcpSackBlock) -> (Vec<TcpSentSample>, u32) {
+        let mut matched = Vec::with_capacity(4);
+        let mut total_bytes = 0u32;
         let left_edge = block.left_edge;
         let right_edge = block.right_edge;
         let mut cursor = self.sample_at_or_after(left_edge, true);
@@ -545,27 +556,29 @@ impl TcpRecoveryState {
             };
             let current = self.sent_sample(current_index);
             if ack_end < current.end_sequence {
-                matched.push(self.take_sample_prefix(current_index, ack_end));
+                let sample = self.take_sample_prefix(current_index, ack_end);
+                total_bytes = total_bytes.saturating_add(sample.bytes);
+                matched.push(sample);
             } else {
-                matched.push(self.take_sent(current_index));
+                let sample = self.take_sent(current_index);
+                total_bytes = total_bytes.saturating_add(sample.bytes);
+                matched.push(sample);
             }
         }
-        matched
+        (matched, total_bytes)
     }
 
     fn deliver_acked_segments<C: CongestionController>(
         &mut self,
         ack: TcpRecoveryAck,
         acked: Vec<TcpSentSample>,
+        total_acked_bytes: u32,
         congestion: &mut C,
     ) -> Option<Duration> {
         let mut largest_acked = 0;
         let mut any_acked = false;
         let mut latest_rtt = None;
         let mut bytes_in_flight_after_ack = self.bytes_in_flight();
-        let total_acked_bytes = acked
-            .iter()
-            .fold(0u32, |total, segment| total.saturating_add(segment.bytes));
         if self.recovery_active && total_acked_bytes != 0 {
             self.recovery_delivered = self.recovery_delivered.saturating_add(total_acked_bytes);
         }
@@ -661,9 +674,12 @@ impl TcpRecoveryState {
         } else {
             self.sample_tail = sample.prev;
         }
-        self.sent_samples
+        let sample = self
+            .sent_samples
             .remove(index)
-            .expect("tcp recovery sample index is valid")
+            .expect("tcp recovery sample index is valid");
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sample.bytes);
+        sample
     }
 
     fn split_sample(&mut self, index: PoolIndex, split_start: TcpSeq) {
@@ -677,6 +693,7 @@ impl TcpRecoveryState {
             current.payload_len = suffix.payload_len;
             current.rack_deadline = sample.rack_deadline;
         }
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(prefix.bytes);
         let _ = self
             .sample_lookup
             .remove(&sample.sequence)
@@ -806,15 +823,6 @@ impl TcpRecoveryState {
                 hole.lost = false;
             }
         }
-    }
-
-    fn hole_bytes_total(&self) -> u32 {
-        self.scoreboard
-            .holes
-            .iter()
-            .fold(0u32, |total, (start, hole)| {
-                total.saturating_add(start.distance_to(hole.end))
-            })
     }
 
     fn should_mark_hole_lost(

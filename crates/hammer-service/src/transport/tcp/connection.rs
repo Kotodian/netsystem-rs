@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
 use super::TcpInputNext;
@@ -7,6 +8,7 @@ use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
 use crate::transport::congestion::CongestionController;
+use crossbeam_utils::CachePadded;
 use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
@@ -61,6 +63,13 @@ impl From<TcpConnectionError> for TcpError {
             }
             TcpConnectionError::PayloadLengthOverflow => TcpError::Dispatch,
         }
+    }
+}
+
+impl From<TcpConnectionError> for CoreError {
+    #[inline]
+    fn from(error: TcpConnectionError) -> Self {
+        TcpError::from(error).into()
     }
 }
 
@@ -193,106 +202,13 @@ impl Default for TcpRetransmitTimeoutState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TcpConnectionOptionState {
-    local_capabilities: TcpCapabilities,
-    remote_capabilities: Option<TcpCapabilities>,
-    negotiated: TcpNegotiatedOptions,
-}
-
-impl TcpConnectionOptionState {
-    #[inline]
-    pub fn new(local_capabilities: TcpCapabilities) -> Self {
-        Self {
-            local_capabilities: normalize_tcp_capabilities(local_capabilities),
-            remote_capabilities: None,
-            negotiated: TcpNegotiatedOptions::default(),
-        }
-    }
-
-    #[inline]
-    pub fn local_capabilities(&self) -> TcpCapabilities {
-        self.local_capabilities
-    }
-
-    #[inline]
-    pub fn remote_capabilities(&self) -> Option<TcpCapabilities> {
-        self.remote_capabilities
-    }
-
-    #[inline]
-    pub fn negotiated_options(&self) -> TcpNegotiatedOptions {
-        self.negotiated
-    }
-
-    #[inline]
-    pub(super) fn set_local_capabilities(
-        &mut self,
-        capabilities: TcpCapabilities,
-    ) -> TcpNegotiatedOptions {
-        self.local_capabilities = normalize_tcp_capabilities(capabilities);
-        self.recalculate_negotiated_options();
-        self.negotiated
-    }
-
-    #[inline]
-    pub(super) fn apply_peer_handshake_capabilities(
-        &mut self,
-        capabilities: TcpCapabilities,
-    ) -> TcpNegotiatedOptions {
-        self.remote_capabilities = Some(normalize_tcp_capabilities(capabilities));
-        self.recalculate_negotiated_options();
-        self.negotiated
-    }
-
-    #[inline]
-    pub fn effective_send_window_scale(&self) -> u8 {
-        tcp_window_scale(self.negotiated.send_window_scale)
-    }
-
-    #[inline]
-    pub fn effective_receive_window_scale(&self) -> u8 {
-        tcp_window_scale(self.negotiated.receive_window_scale)
-    }
-
-    #[inline]
-    pub fn effective_send_window(&self, advertised_window: u32) -> u32 {
-        scaled_window_from_advertised(advertised_window, self.effective_send_window_scale())
-    }
-
-    #[inline]
-    pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
-        advertised_window_from_receive(receive_window, self.effective_receive_window_scale())
-    }
-
-    #[inline]
-    fn recalculate_negotiated_options(&mut self) {
-        self.negotiated = self
-            .remote_capabilities
-            .map(|remote| tcp_negotiate_options(self.local_capabilities, remote))
-            .unwrap_or_default();
-    }
-}
-
-impl Default for TcpConnectionOptionState {
-    #[inline]
-    fn default() -> Self {
-        Self::new(TcpCapabilities::default())
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct TcpConnection<C>
-where
-    C: CongestionController,
-{
+pub struct TcpConnectionCacheline0 {
     state: TcpState,
-    connection_id: Option<TcpConnectionId>,
-    owner_worker: DataWorkerId,
-    local_port: u16,
+    timers: TcpTimerState,
+    pacing_ready: bool,
     local: Option<SocketAddr>,
     remote: SocketAddr,
-    close_reason: Option<TcpCloseReason>,
     iss: TcpSeq,
     irs: TcpSeq,
     snd_una: TcpSeq,
@@ -300,20 +216,57 @@ where
     snd_wnd: u32,
     rcv_nxt: TcpSeq,
     rcv_wnd: u32,
-    options: TcpConnectionOptionState,
-    fast_open_cookie: Option<TcpFastOpenCookie>,
+    negotiated_options: TcpNegotiatedOptions,
+    tx_intent_sequence: Option<TcpSeq>,
+    tx_intent_payload_len: u32,
     fast_open_syn_payload_len: u32,
+}
+
+#[derive(Debug, Clone)]
+struct TcpConnectionCacheline1 {
+    connection_id: Option<TcpConnectionId>,
+    owner_worker: DataWorkerId,
+    close_reason: Option<TcpCloseReason>,
+    local_port: u16,
+    fast_open_cookie: Option<TcpFastOpenCookie>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TcpConnection<C>
+where
+    C: CongestionController,
+{
+    cacheline0: CachePadded<TcpConnectionCacheline0>,
+    cacheline1: CachePadded<TcpConnectionCacheline1>,
     retransmit_timeout: TcpRetransmitTimeoutState,
+    timestamps: TcpTimestampState,
+    keepalive: TcpKeepaliveState,
+    ecn: TcpEcnState,
     congestion: C,
     recovery: TcpRecoveryState,
     sack: TcpSackState,
-    ecn: TcpEcnState,
-    timers: TcpTimerState,
-    timestamps: TcpTimestampState,
-    keepalive: TcpKeepaliveState,
-    pacing_ready: bool,
-    tx_intent_sequence: Option<TcpSeq>,
-    tx_intent_payload_len: u32,
+}
+
+impl<C> Deref for TcpConnection<C>
+where
+    C: CongestionController,
+{
+    type Target = TcpConnectionCacheline0;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.cacheline0
+    }
+}
+
+impl<C> DerefMut for TcpConnection<C>
+where
+    C: CongestionController,
+{
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cacheline0
+    }
 }
 
 impl<C> TcpConnection<C>
@@ -363,140 +316,134 @@ where
         remote: SocketAddr,
     ) -> Self {
         Self {
-            state: TcpState::Closed,
-            connection_id,
-            owner_worker,
-            local_port,
-            local,
-            remote,
-            close_reason: None,
-            iss: TcpSeq::from(0),
-            irs: TcpSeq::from(0),
-            snd_una: TcpSeq::from(0),
-            snd_nxt: TcpSeq::from(0),
-            snd_wnd: DEFAULT_TCP_WINDOW,
-            rcv_nxt: TcpSeq::from(0),
-            rcv_wnd: DEFAULT_TCP_WINDOW,
-            options: TcpConnectionOptionState::default(),
-            fast_open_cookie: None,
-            fast_open_syn_payload_len: 0,
+            cacheline0: CachePadded::new(TcpConnectionCacheline0 {
+                state: TcpState::Closed,
+                timers: TcpTimerState::default(),
+                pacing_ready: false,
+                local,
+                remote,
+                iss: TcpSeq::from(0),
+                irs: TcpSeq::from(0),
+                snd_una: TcpSeq::from(0),
+                snd_nxt: TcpSeq::from(0),
+                snd_wnd: DEFAULT_TCP_WINDOW,
+                rcv_nxt: TcpSeq::from(0),
+                rcv_wnd: DEFAULT_TCP_WINDOW,
+                negotiated_options: TcpNegotiatedOptions::default(),
+                tx_intent_sequence: None,
+                tx_intent_payload_len: 0,
+                fast_open_syn_payload_len: 0,
+            }),
+            cacheline1: CachePadded::new(TcpConnectionCacheline1 {
+                connection_id,
+                owner_worker,
+                close_reason: None,
+                local_port,
+                fast_open_cookie: None,
+            }),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
+            timestamps: TcpTimestampState::default(),
+            keepalive: TcpKeepaliveState::new(Instant::now()),
+            ecn: TcpEcnState::default(),
             congestion: C::new(DEFAULT_TCP_MAX_SEGMENT_SIZE),
             recovery: TcpRecoveryState::new(),
             sack: TcpSackState::default(),
-            ecn: TcpEcnState::default(),
-            timers: TcpTimerState::default(),
-            timestamps: TcpTimestampState::default(),
-            keepalive: TcpKeepaliveState::new(Instant::now()),
-            pacing_ready: false,
-            tx_intent_sequence: None,
-            tx_intent_payload_len: 0,
         }
     }
 
     #[inline]
-    pub const fn state(&self) -> TcpState {
+    pub fn state(&self) -> TcpState {
         self.state
     }
 
     #[inline]
-    pub const fn connection_id(&self) -> Option<TcpConnectionId> {
-        self.connection_id
+    pub fn connection_id(&self) -> Option<TcpConnectionId> {
+        self.cacheline1.connection_id
     }
 
     #[inline]
-    pub const fn owner_worker(&self) -> DataWorkerId {
-        self.owner_worker
+    pub fn owner_worker(&self) -> DataWorkerId {
+        self.cacheline1.owner_worker
     }
 
     #[inline]
-    pub const fn local_port(&self) -> u16 {
-        self.local_port
+    pub fn local_port(&self) -> u16 {
+        self.cacheline1.local_port
     }
 
     #[inline]
-    pub const fn local(&self) -> Option<SocketAddr> {
+    pub fn local(&self) -> Option<SocketAddr> {
         self.local
     }
 
     #[inline]
-    pub const fn remote(&self) -> SocketAddr {
+    pub fn remote(&self) -> SocketAddr {
         self.remote
     }
 
     #[inline]
-    pub const fn iss(&self) -> u32 {
+    pub fn iss(&self) -> u32 {
         self.iss.raw()
     }
 
     #[inline]
-    pub const fn irs(&self) -> u32 {
+    pub fn irs(&self) -> u32 {
         self.irs.raw()
     }
 
     #[inline]
-    pub const fn snd_una(&self) -> u32 {
+    pub fn snd_una(&self) -> u32 {
         self.snd_una.raw()
     }
 
     #[inline]
-    pub const fn snd_nxt(&self) -> u32 {
+    pub fn snd_nxt(&self) -> u32 {
         self.snd_nxt.raw()
     }
 
     #[inline]
-    pub const fn snd_wnd(&self) -> u32 {
+    pub fn snd_wnd(&self) -> u32 {
         self.snd_wnd
     }
 
     #[inline]
-    pub const fn rcv_nxt(&self) -> u32 {
+    pub fn rcv_nxt(&self) -> u32 {
         self.rcv_nxt.raw()
     }
 
     #[inline]
-    pub const fn rcv_wnd(&self) -> u32 {
+    pub fn rcv_wnd(&self) -> u32 {
         self.rcv_wnd
     }
 
     #[inline]
     pub fn close_reason(&self) -> Option<TcpCloseReason> {
-        self.close_reason
-    }
-
-    #[inline]
-    pub fn local_capabilities(&self) -> TcpCapabilities {
-        self.options.local_capabilities()
-    }
-
-    #[inline]
-    pub fn remote_capabilities(&self) -> Option<TcpCapabilities> {
-        self.options.remote_capabilities()
+        self.cacheline1.close_reason
     }
 
     #[inline]
     pub fn negotiated_options(&self) -> TcpNegotiatedOptions {
-        self.options.negotiated_options()
+        self.negotiated_options
     }
 
     #[inline]
     pub fn effective_send_window_scale(&self) -> u8 {
-        self.options.effective_send_window_scale()
+        tcp_window_scale(self.negotiated_options.send_window_scale)
     }
 
     #[inline]
     pub fn effective_receive_window_scale(&self) -> u8 {
-        self.options.effective_receive_window_scale()
+        tcp_window_scale(self.negotiated_options.receive_window_scale)
     }
 
     #[inline]
     pub fn effective_send_window(&self, advertised_window: u32) -> u32 {
-        self.options.effective_send_window(advertised_window)
+        scaled_window_from_advertised(advertised_window, self.effective_send_window_scale())
     }
 
     #[inline]
     pub fn advertised_receive_window(&self, receive_window: u32) -> u16 {
-        self.options.advertised_receive_window(receive_window)
+        advertised_window_from_receive(receive_window, self.effective_receive_window_scale())
     }
 
     #[inline]
@@ -505,8 +452,22 @@ where
     }
 
     #[inline]
+    fn output_capabilities(&self) -> TcpCapabilities {
+        let negotiated = self.negotiated_options();
+        TcpCapabilities {
+            max_segment_size: None,
+            window_scale: None,
+            sack: negotiated.sack,
+            timestamps: negotiated.timestamps,
+            ecn: negotiated.ecn,
+            accurate_ecn: negotiated.accurate_ecn,
+            fast_open: false,
+        }
+    }
+
+    #[inline]
     fn fast_open_cookie(&self) -> Option<TcpFastOpenCookie> {
-        self.fast_open_cookie
+        self.cacheline1.fast_open_cookie
     }
 
     #[inline]
@@ -525,7 +486,7 @@ where
     }
 
     #[inline]
-    pub const fn next_node(&self) -> TcpInputNext {
+    pub fn next_node(&self) -> TcpInputNext {
         match self.state {
             TcpState::Closed => TcpInputNext::Drop,
             TcpState::Listen => TcpInputNext::Listen,
@@ -542,78 +503,45 @@ where
     }
 
     #[inline]
-    pub fn set_local_capabilities(
-        &mut self,
-        capabilities: TcpCapabilities,
-    ) -> TcpNegotiatedOptions {
-        let negotiated = self.options.set_local_capabilities(capabilities);
-        if let Some(max_segment_size) = negotiated.send_max_segment_size.filter(|max| *max != 0) {
-            self.congestion.on_mtu_update(u32::from(max_segment_size));
-        }
-        negotiated
-    }
-
-    #[inline]
-    fn retransmit_timeout_ticks(&self) -> u64 {
-        (self.retransmit_timeout().retransmit_timeout().as_millis() / 10).max(1) as u64
-    }
-
-    #[inline]
-    fn rack_timeout_ticks(&self) -> Option<u64> {
-        self.recovery
-            .rack_timeout(Instant::now())
-            .map(Self::duration_to_timer_ticks)
-    }
-
-    #[inline]
-    fn tlp_timeout_ticks(&self) -> Option<u64> {
-        self.recovery
-            .tlp_timeout(
-                self.retransmit_timeout().smoothed_rtt(),
-                self.retransmit_timeout().retransmit_timeout(),
-            )
-            .map(Self::duration_to_timer_ticks)
-    }
-
-    #[inline]
-    fn duration_to_timer_ticks(duration: Duration) -> u64 {
-        duration.as_millis().div_ceil(10).max(1) as u64
-    }
-
-    #[inline]
-    fn keepalive_ticks(&self) -> u64 {
-        let interval = if self.keepalive.probes_sent == 0 {
-            TCP_KEEPALIVE_IDLE
-        } else {
-            TCP_KEEPALIVE_PROBE_INTERVAL
-        };
-        Self::duration_to_timer_ticks(interval)
-    }
-
-    #[inline]
-    fn pacing_ticks(&self) -> Option<u64> {
-        self.congestion
-            .next_send_delay(self.output_payload_len() as u32)
-            .map(Self::duration_to_timer_ticks)
-    }
-
-    #[inline]
-    pub(crate) fn timer_ticks(&self, timer_id: u32) -> Option<u64> {
+    pub(crate) fn timer_ticks(&self, timer_id: u32, now: Instant) -> Option<u64> {
         if !self.timer_is_active(timer_id) {
             return None;
         }
         match (self.state, timer_id) {
-            (TcpState::SynSent, TCP_TIMER_RETRANSMIT) => Some(self.retransmit_timeout_ticks()),
             (TcpState::Established, TCP_TIMER_RETRANSMIT)
             | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
             | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
-            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT) => Some(self.retransmit_timeout_ticks()),
-            (TcpState::Established, TCP_TIMER_RACK) => self.rack_timeout_ticks(),
-            (TcpState::Established, TCP_TIMER_TLP) => self.tlp_timeout_ticks(),
+            | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
+            | (TcpState::SynSent, TCP_TIMER_RETRANSMIT) => Some(
+                (self.retransmit_timeout().retransmit_timeout().as_millis() / 10).max(1) as u64,
+            ),
+            (TcpState::Established, TCP_TIMER_RACK) => self
+                .recovery
+                .rack_timeout(now)
+                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
+            (TcpState::Established, TCP_TIMER_TLP) => self
+                .recovery
+                .tlp_timeout(
+                    self.retransmit_timeout().smoothed_rtt(),
+                    self.retransmit_timeout().retransmit_timeout(),
+                )
+                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
             (TcpState::Established, TCP_TIMER_DELAYED_ACK) => Some(TCP_DELAYED_ACK_TICKS),
-            (TcpState::Established, TCP_TIMER_PERSIST) => Some(self.retransmit_timeout_ticks()),
-            (TcpState::Established, TCP_TIMER_KEEP_ALIVE) => Some(self.keepalive_ticks()),
-            (TcpState::Established, TCP_TIMER_PACING) => self.pacing_ticks(),
+            (TcpState::Established, TCP_TIMER_PERSIST) => Some(
+                (self.retransmit_timeout().retransmit_timeout().as_millis() / 10).max(1) as u64,
+            ),
+            (TcpState::Established, TCP_TIMER_KEEP_ALIVE) => {
+                let interval = if self.keepalive.probes_sent == 0 {
+                    TCP_KEEPALIVE_IDLE
+                } else {
+                    TCP_KEEPALIVE_PROBE_INTERVAL
+                };
+                Some(interval.as_millis().div_ceil(10).max(1) as u64)
+            }
+            (TcpState::Established, TCP_TIMER_PACING) => self
+                .congestion
+                .next_send_delay(self.output_payload_len() as u32)
+                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
             (TcpState::TimeWait, TCP_TIMER_TIME_WAIT) => Some(TCP_TIME_WAIT_TICKS),
             _ => None,
         }
@@ -801,8 +729,8 @@ where
     }
 
     #[inline]
-    fn next_local_timestamp(&mut self) -> Option<TcpTimestampOption> {
-        if !self.negotiated_options().timestamps && !self.local_capabilities().timestamps {
+    fn next_local_timestamp(&mut self, enabled: bool) -> Option<TcpTimestampOption> {
+        if !enabled {
             return None;
         }
         self.timestamps.last_local = self.local_timestamp_value(Instant::now());
@@ -846,14 +774,20 @@ where
     }
 
     #[inline]
-    pub(crate) fn observe_inbound_timestamp(&mut self, packet: &TcpPacket) -> bool {
-        if packet.flags.contains(TcpSegmentFlags::RST) {
+    pub(crate) fn observe_inbound_timestamp(
+        &mut self,
+        flags: TcpSegmentFlags,
+        timestamp: Option<TcpTimestampOption>,
+        sequence: TcpSeq,
+        payload_len: usize,
+    ) -> bool {
+        if flags.contains(TcpSegmentFlags::RST) {
             return true;
         }
         if !self.negotiated_options().timestamps {
             return true;
         }
-        let Some(timestamp) = packet.timestamp else {
+        let Some(timestamp) = timestamp else {
             return false;
         };
         let now = Instant::now();
@@ -871,13 +805,12 @@ where
                 return false;
             }
         }
-        let sequence = packet.sequence;
-        let sequence_len = packet.payload_len as u32
-            + u32::from(packet.flags.contains(TcpSegmentFlags::SYN))
-            + u32::from(packet.flags.contains(TcpSegmentFlags::FIN));
+        let sequence_len = payload_len as u32
+            + u32::from(flags.contains(TcpSegmentFlags::SYN))
+            + u32::from(flags.contains(TcpSegmentFlags::FIN));
         let segment_end = sequence.advance(sequence_len).raw();
-        if packet.flags.contains(TcpSegmentFlags::SYN)
-            || (self.rcv_nxt >= packet.sequence && TcpSeq::from(segment_end) >= self.rcv_nxt)
+        if flags.contains(TcpSegmentFlags::SYN)
+            || (self.rcv_nxt >= sequence && TcpSeq::from(segment_end) >= self.rcv_nxt)
         {
             self.timestamps.recent_remote = Some(timestamp.tsval);
             self.timestamps.recent_remote_at = Some(now);
@@ -898,9 +831,13 @@ where
     #[inline]
     fn apply_peer_handshake_capabilities(
         &mut self,
+        local_capabilities: TcpCapabilities,
         capabilities: TcpCapabilities,
     ) -> TcpNegotiatedOptions {
-        let negotiated = self.options.apply_peer_handshake_capabilities(capabilities);
+        let local_capabilities = normalize_tcp_capabilities(local_capabilities);
+        let capabilities = normalize_tcp_capabilities(capabilities);
+        self.negotiated_options = tcp_negotiate_options(local_capabilities, capabilities);
+        let negotiated = self.negotiated_options;
         if let Some(max_segment_size) = negotiated.send_max_segment_size.filter(|max| *max != 0) {
             self.congestion.on_mtu_update(u32::from(max_segment_size));
         }
@@ -910,26 +847,34 @@ where
     #[inline]
     pub(crate) fn control_segment(
         &mut self,
-        packet: &TcpPacket,
+        local: SocketAddr,
+        remote: SocketAddr,
         flags: TcpSegmentFlags,
         reset_sequence: Option<u32>,
+        local_capabilities: TcpCapabilities,
     ) -> TcpSegment {
         let flags = self.output_flags(flags);
+        let local_capabilities = normalize_tcp_capabilities(local_capabilities);
+        let capabilities = if flags.contains(TcpSegmentFlags::SYN) {
+            local_capabilities
+        } else {
+            self.output_capabilities()
+        };
         let sack_blocks = self.sack.take_output(
             self.negotiated_options().sack,
             self.negotiated_options().timestamps,
             flags,
         );
         TcpSegment::new(
-            packet.local,
-            packet.remote,
+            local,
+            remote,
             reset_sequence.unwrap_or_else(|| self.output_sequence(flags)),
             self.output_acknowledgment(flags),
             self.advertised_receive_window(self.rcv_wnd),
             flags,
-            self.options.local_capabilities(),
+            capabilities,
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
-            self.next_local_timestamp(),
+            self.next_local_timestamp(capabilities.timestamps),
             flags
                 .contains(TcpSegmentFlags::SYN)
                 .then(|| self.fast_open_cookie())
@@ -978,7 +923,7 @@ where
 
     #[inline]
     pub fn connect_state(&mut self, initial_sequence: u32) {
-        self.close_reason = None;
+        self.cacheline1.close_reason = None;
         self.iss = TcpSeq::from(initial_sequence);
         self.snd_una = self.iss;
         self.snd_nxt = self.iss.advance(1);
@@ -987,43 +932,49 @@ where
     }
 
     pub fn set_fast_open_cookie(&mut self, cookie: Option<TcpFastOpenCookie>) {
-        self.fast_open_cookie = cookie.filter(|cookie| !cookie.is_empty());
+        self.cacheline1.fast_open_cookie = cookie.filter(|cookie| !cookie.is_empty());
     }
 
     pub(crate) fn receive_syn(
         &mut self,
-        packet: &TcpPacket,
+        local: SocketAddr,
+        remote: SocketAddr,
+        flags: TcpSegmentFlags,
+        sequence: TcpSeq,
+        advertised_window: u16,
+        capabilities: TcpCapabilities,
+        timestamp: Option<TcpTimestampOption>,
         accepted_payload_len: usize,
+        local_capabilities: TcpCapabilities,
     ) -> CoreResult<Option<TcpSegment>> {
-        if !packet.flags.contains(TcpSegmentFlags::SYN)
-            || packet
-                .flags
-                .intersects(TcpSegmentFlags::ACK | TcpSegmentFlags::RST)
+        if !flags.contains(TcpSegmentFlags::SYN)
+            || flags.intersects(TcpSegmentFlags::ACK | TcpSegmentFlags::RST)
         {
             return Ok(None);
         }
-        self.apply_peer_handshake_capabilities(packet.capabilities);
-        let _ = self.observe_inbound_timestamp(packet);
+        self.apply_peer_handshake_capabilities(local_capabilities, capabilities);
+        let _ = self.observe_inbound_timestamp(flags, timestamp, sequence, accepted_payload_len);
         if self.iss == TcpSeq::from(0) {
             self.iss = TcpSeq::from(1);
         }
         self.state = TcpState::SynRcvd;
-        self.irs = packet.sequence;
+        self.irs = sequence;
         self.snd_una = self.iss;
         self.snd_nxt = self.iss.advance(1);
-        self.snd_wnd = self.effective_send_window(u32::from(packet.advertised_window));
-        self.rcv_nxt = packet.sequence.advance(1 + accepted_payload_len as u32);
+        self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
+        self.rcv_nxt = sequence.advance(1 + accepted_payload_len as u32);
         let flags = if self.negotiated_options().ecn {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK | TcpSegmentFlags::ECE
         } else {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK
         };
-        Ok(Some(self.control_segment(packet, flags, None)))
+        Ok(Some(self.control_segment(local, remote, flags, None, local_capabilities)))
     }
 
     pub(crate) fn receive_open_reply(
         &mut self,
         packet: &TcpPacket,
+        local_capabilities: TcpCapabilities,
     ) -> CoreResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynSent)?;
 
@@ -1035,9 +986,11 @@ where
                 return Ok(None);
             }
             return Ok(Some(self.control_segment(
-                packet,
+                packet.local,
+                packet.remote,
                 TcpSegmentFlags::RST,
                 Some(acknowledgment.raw()),
+                local_capabilities,
             )));
         }
 
@@ -1045,7 +998,7 @@ where
             if let Some(acknowledgment) = packet.acknowledgment
                 && self.accepts_ack(acknowledgment)
             {
-                self.close_reason = Some(TcpCloseReason::RemoteReset);
+                self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
                 self.state = TcpState::Closed;
                 self.timer_reset(TCP_TIMER_RETRANSMIT);
             }
@@ -1056,8 +1009,13 @@ where
             return Ok(None);
         }
 
-        self.apply_peer_handshake_capabilities(packet.capabilities);
-        if !self.observe_inbound_timestamp(packet) {
+        self.apply_peer_handshake_capabilities(local_capabilities, packet.capabilities);
+        if !self.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ) {
             return Ok(None);
         }
         self.irs = packet.sequence;
@@ -1081,9 +1039,11 @@ where
                 self.rcv_nxt = packet.sequence.advance(1 + packet.payload_len as u32);
             }
             return Ok(Some(self.control_segment(
-                packet,
+                packet.local,
+                packet.remote,
                 TcpSegmentFlags::ACK,
                 None,
+                local_capabilities,
             )));
         }
 
@@ -1093,7 +1053,13 @@ where
         } else {
             TcpSegmentFlags::SYN | TcpSegmentFlags::ACK
         };
-        Ok(Some(self.control_segment(packet, flags, None)))
+        Ok(Some(self.control_segment(
+            packet.local,
+            packet.remote,
+            flags,
+            None,
+            local_capabilities,
+        )))
     }
 
     #[inline]
@@ -1118,11 +1084,16 @@ where
         packet: &TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
         self.ensure_state(TcpState::SynRcvd)?;
-        if !self.observe_inbound_timestamp(packet) {
+        if !self.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ) {
             return Ok(None);
         }
         if packet.flags.contains(TcpSegmentFlags::RST) {
-            self.close_reason = Some(TcpCloseReason::RemoteReset);
+            self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
             self.state = TcpState::Closed;
             return Ok(None);
         }
@@ -1131,9 +1102,11 @@ where
         };
         if !packet.flags.contains(TcpSegmentFlags::ACK) || !self.accepts_ack(acknowledgment) {
             return Ok(Some(self.control_segment(
-                packet,
+                packet.local,
+                packet.remote,
                 TcpSegmentFlags::RST,
                 Some(acknowledgment.raw()),
+                TcpCapabilities::default(),
             )));
         }
         self.apply_ack(acknowledgment, packet.advertised_window);
@@ -1144,7 +1117,13 @@ where
     }
 
     #[inline]
-    pub(crate) fn tx_payload_budget(&self, pending_len: usize, _: Instant) -> usize {
+    pub(crate) fn tx_payload_budget(
+        &self,
+        pending_len: usize,
+        _: Instant,
+        local_capabilities: TcpCapabilities,
+    ) -> usize {
+        let local_capabilities = normalize_tcp_capabilities(local_capabilities);
         if self.tx_intent_sequence.is_some() {
             return pending_len.min(self.tx_intent_payload_len as usize);
         }
@@ -1152,10 +1131,12 @@ where
             return 0;
         }
         if self.state == TcpState::SynSent {
-            if !self.local_capabilities().fast_open || self.fast_open_cookie.is_none() {
+            if !local_capabilities.fast_open || self.cacheline1.fast_open_cookie.is_none() {
                 return 0;
             }
-            return pending_len.min(self.output_payload_len());
+            let syn_payload_len =
+                tcp_effective_output_payload_len(local_capabilities.max_segment_size);
+            return pending_len.min(syn_payload_len);
         }
         if self.state != TcpState::Established {
             return 0;
@@ -1183,12 +1164,17 @@ where
         allowed
     }
 
-    pub(crate) fn tx_segment(&mut self, payload_len: usize) -> CoreResult<TcpSegment> {
+    pub(crate) fn tx_segment(
+        &mut self,
+        payload_len: usize,
+        local_capabilities: TcpCapabilities,
+    ) -> CoreResult<TcpSegment> {
         if self.state == TcpState::SynSent {
             let local = self
                 .local()
                 .ok_or(TcpConnectionError::MissingLocalAddress)?;
-            let flags = if self.options.local_capabilities().ecn {
+            let capabilities = normalize_tcp_capabilities(local_capabilities);
+            let flags = if capabilities.ecn {
                 TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
             } else {
                 TcpSegmentFlags::SYN
@@ -1201,9 +1187,9 @@ where
                 self.rcv_nxt(),
                 self.advertised_receive_window(self.rcv_wnd),
                 flags,
-                self.local_capabilities(),
+                capabilities,
                 None,
-                self.next_local_timestamp(),
+                self.next_local_timestamp(capabilities.timestamps),
                 self.fast_open_cookie(),
                 self.output_ip_ecn(payload_len, self.tx_intent_sequence.is_some()),
                 payload_len,
@@ -1234,9 +1220,9 @@ where
             self.rcv_nxt(),
             self.advertised_receive_window(self.rcv_wnd),
             flags,
-            self.local_capabilities(),
+            self.output_capabilities(),
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
-            self.next_local_timestamp(),
+            self.next_local_timestamp(self.negotiated_options().timestamps),
             None,
             self.output_ip_ecn(payload_len, retransmit),
             payload_len,
@@ -1287,13 +1273,25 @@ where
             let mut timers = 0;
             self.timer_set(TCP_TIMER_RETRANSMIT);
             timers |= timer_bit(TCP_TIMER_RETRANSMIT);
-            if self.rack_timeout_ticks().is_some() {
+            if self
+                .recovery
+                .rack_timeout(now)
+                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
+                .is_some()
+            {
                 self.timer_set(TCP_TIMER_RACK);
                 timers |= timer_bit(TCP_TIMER_RACK);
             } else {
                 self.timer_reset(TCP_TIMER_RACK);
             }
-            if self.tlp_timeout_ticks().is_some() {
+            if self
+                .recovery
+                .tlp_timeout(
+                    self.retransmit_timeout().smoothed_rtt(),
+                    self.retransmit_timeout().retransmit_timeout(),
+                )
+                .is_some()
+            {
                 self.timer_set(TCP_TIMER_TLP);
                 timers |= timer_bit(TCP_TIMER_TLP);
             } else {
@@ -1330,19 +1328,35 @@ where
         let mut timers = 0;
         self.timer_set(TCP_TIMER_RETRANSMIT);
         timers |= timer_bit(TCP_TIMER_RETRANSMIT);
-        if self.rack_timeout_ticks().is_some() {
+        if self
+            .recovery
+            .rack_timeout(now)
+            .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
+            .is_some()
+        {
             self.timer_set(TCP_TIMER_RACK);
             timers |= timer_bit(TCP_TIMER_RACK);
         } else {
             self.timer_reset(TCP_TIMER_RACK);
         }
-        if self.tlp_timeout_ticks().is_some() {
+        if self
+            .recovery
+            .tlp_timeout(
+                self.retransmit_timeout().smoothed_rtt(),
+                self.retransmit_timeout().retransmit_timeout(),
+            )
+            .is_some()
+        {
             self.timer_set(TCP_TIMER_TLP);
             timers |= timer_bit(TCP_TIMER_TLP);
         } else {
             self.timer_reset(TCP_TIMER_TLP);
         }
-        if self.pacing_ticks().is_some() {
+        if self
+            .congestion
+            .next_send_delay(self.output_payload_len() as u32)
+            .is_some()
+        {
             self.timer_set(TCP_TIMER_PACING);
             timers |= timer_bit(TCP_TIMER_PACING);
         } else {
@@ -1359,10 +1373,11 @@ where
         advertised_window: u16,
         sack_blocks: &[TcpSackBlock],
     ) -> u16 {
+        let now = Instant::now();
         let acknowledgment = TcpSeq::from(acknowledgment);
         let _ = self.observe_ack_progress(packet, acknowledgment, sack_blocks);
         self.apply_ack(acknowledgment, advertised_window);
-        self.observe_activity(Instant::now());
+        self.observe_activity(now);
         self.timer_reset(TCP_TIMER_DELAYED_ACK);
         let mut timers = 0;
         if self.recovery.has_unacked_data() {
@@ -1378,19 +1393,35 @@ where
             self.timer_reset(TCP_TIMER_PACING);
         } else {
             self.timer_reset(TCP_TIMER_PERSIST);
-            if self.rack_timeout_ticks().is_some() {
+            if self
+                .recovery
+                .rack_timeout(now)
+                .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
+                .is_some()
+            {
                 self.timer_set(TCP_TIMER_RACK);
                 timers |= timer_bit(TCP_TIMER_RACK);
             } else {
                 self.timer_reset(TCP_TIMER_RACK);
             }
-            if self.tlp_timeout_ticks().is_some() {
+            if self
+                .recovery
+                .tlp_timeout(
+                    self.retransmit_timeout().smoothed_rtt(),
+                    self.retransmit_timeout().retransmit_timeout(),
+                )
+                .is_some()
+            {
                 self.timer_set(TCP_TIMER_TLP);
                 timers |= timer_bit(TCP_TIMER_TLP);
             } else {
                 self.timer_reset(TCP_TIMER_TLP);
             }
-            if self.pacing_ticks().is_some() {
+            if self
+                .congestion
+                .next_send_delay(self.output_payload_len() as u32)
+                .is_some()
+            {
                 self.timer_set(TCP_TIMER_PACING);
                 timers |= timer_bit(TCP_TIMER_PACING);
             } else {
@@ -1405,7 +1436,12 @@ where
         packet: &TcpPacket,
     ) -> CoreResult<(Option<TcpSegment>, u16)> {
         self.ensure_state(TcpState::Established)?;
-        if !self.observe_inbound_timestamp(packet) {
+        if !self.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ) {
             return Ok((None, 0));
         }
         self.observe_activity(Instant::now());
@@ -1428,14 +1464,19 @@ where
         &mut self,
         packet: &TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
-        if !self.observe_inbound_timestamp(packet) {
+        if !self.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ) {
             return Ok(None);
         }
         self.observe_activity(Instant::now());
         self.observe_peer_ecn_feedback(packet);
 
         if packet.flags.contains(TcpSegmentFlags::RST) {
-            self.close_reason = Some(TcpCloseReason::RemoteReset);
+            self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
             self.state = TcpState::Closed;
             return Ok(None);
         }
@@ -1471,9 +1512,11 @@ where
                         TcpState::Closing
                     };
                     return Ok(Some(self.control_segment(
-                        packet,
+                        packet.local,
+                        packet.remote,
                         TcpSegmentFlags::ACK,
                         None,
+                        TcpCapabilities::default(),
                     )));
                 }
                 if let Some(acknowledgment) = packet.acknowledgment
@@ -1491,9 +1534,11 @@ where
                     self.state = TcpState::TimeWait;
                     self.timer_set(TCP_TIMER_TIME_WAIT);
                     return Ok(Some(self.control_segment(
-                        packet,
+                        packet.local,
+                        packet.remote,
                         TcpSegmentFlags::ACK,
                         None,
+                        TcpCapabilities::default(),
                     )));
                 }
                 Ok(None)
@@ -1524,9 +1569,11 @@ where
                 if packet.flags.contains(TcpSegmentFlags::FIN) {
                     self.timer_set(TCP_TIMER_TIME_WAIT);
                     return Ok(Some(self.control_segment(
-                        packet,
+                        packet.local,
+                        packet.remote,
                         TcpSegmentFlags::ACK,
                         None,
+                        TcpCapabilities::default(),
                     )));
                 }
                 Ok(None)
@@ -1594,9 +1641,13 @@ where
     }
 
     #[inline]
-    pub(crate) fn on_tcp_ready(&mut self, has_pending_tx: bool) -> Option<TcpSegment> {
+    pub(crate) fn on_tcp_ready(
+        &mut self,
+        has_pending_tx: bool,
+        local_capabilities: TcpCapabilities,
+    ) -> Option<TcpSegment> {
         if self.state == TcpState::SynSent && !has_pending_tx && !self.recovery.has_unacked_data() {
-            return self.tx_segment(0).ok();
+            return self.tx_segment(0, local_capabilities).ok();
         }
         if self.state == TcpState::Established {
             if self.recovery.has_unacked_data() || has_pending_tx {
@@ -1609,7 +1660,12 @@ where
             } else if self.snd_wnd != 0 || !self.recovery.has_unacked_data() {
                 self.timer_reset(TCP_TIMER_PERSIST);
             }
-            if has_pending_tx && self.pacing_ticks().is_some() {
+            if has_pending_tx
+                && self
+                    .congestion
+                    .next_send_delay(self.output_payload_len() as u32)
+                    .is_some()
+            {
                 self.timer_set(TCP_TIMER_PACING);
             } else {
                 self.timer_reset(TCP_TIMER_PACING);
@@ -1626,7 +1682,7 @@ where
                     self.rcv_nxt(),
                     self.advertised_receive_window(self.rcv_wnd),
                     self.output_flags(TcpSegmentFlags::ACK),
-                    self.local_capabilities(),
+                    self.output_capabilities(),
                     self.sack
                         .take_output(
                             self.negotiated_options().sack,
@@ -1635,7 +1691,7 @@ where
                         )
                         .as_ref()
                         .map(|(blocks, len)| &blocks[..*len]),
-                    self.next_local_timestamp(),
+                    self.next_local_timestamp(self.negotiated_options().timestamps),
                     None,
                     None,
                     0,
@@ -1651,9 +1707,9 @@ where
                     self.rcv_nxt(),
                     self.advertised_receive_window(self.rcv_wnd),
                     TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
-                    self.local_capabilities(),
+                    self.output_capabilities(),
                     None,
-                    self.next_local_timestamp(),
+                    self.next_local_timestamp(self.negotiated_options().timestamps),
                     None,
                     None,
                     0,
@@ -1666,9 +1722,9 @@ where
                 self.rcv_nxt(),
                 self.advertised_receive_window(self.rcv_wnd),
                 TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
-                self.local_capabilities(),
+                self.output_capabilities(),
                 None,
-                self.next_local_timestamp(),
+                self.next_local_timestamp(self.negotiated_options().timestamps),
                 None,
                 None,
                 0,
@@ -1681,13 +1737,13 @@ where
     pub(crate) fn on_session_close(&mut self) {
         match self.state {
             TcpState::Established => {
-                self.close_reason = Some(TcpCloseReason::LocalRequest);
+                self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::FinWait1;
                 self.timer_reset(TCP_TIMER_KEEP_ALIVE);
                 self.timer_reset(TCP_TIMER_PACING);
             }
             TcpState::CloseWait => {
-                self.close_reason = Some(TcpCloseReason::LocalRequest);
+                self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::LastAck;
                 self.timer_reset(TCP_TIMER_KEEP_ALIVE);
                 self.timer_reset(TCP_TIMER_PACING);
@@ -1696,7 +1752,11 @@ where
         }
     }
 
-    pub(crate) fn on_tcp_timer_expiry(&mut self, timer_id: u32) -> Option<TcpSegment> {
+    pub(crate) fn on_tcp_timer_expiry(
+        &mut self,
+        timer_id: u32,
+        local_capabilities: TcpCapabilities,
+    ) -> Option<TcpSegment> {
         if !self.timer_is_supported(timer_id) {
             return None;
         }
@@ -1711,7 +1771,7 @@ where
             _ => return None,
         }
         match timer_id {
-            TCP_TIMER_RETRANSMIT => self.on_retransmit_timer_expiry(),
+            TCP_TIMER_RETRANSMIT => self.on_retransmit_timer_expiry(local_capabilities),
             TCP_TIMER_RACK => self.on_rack_timer_expiry(),
             TCP_TIMER_TLP => self.on_tlp_timer_expiry(),
             TCP_TIMER_DELAYED_ACK => self.on_delayed_ack_timer_expiry(),
@@ -1723,12 +1783,16 @@ where
         }
     }
 
-    fn on_retransmit_timer_expiry(&mut self) -> Option<TcpSegment> {
+    fn on_retransmit_timer_expiry(
+        &mut self,
+        local_capabilities: TcpCapabilities,
+    ) -> Option<TcpSegment> {
         if self.state == TcpState::SynSent {
             self.observe_retransmit_timeout();
             self.timer_set(TCP_TIMER_RETRANSMIT);
             let local = self.local?;
-            let flags = if self.options.local_capabilities().ecn {
+            let capabilities = normalize_tcp_capabilities(local_capabilities);
+            let flags = if capabilities.ecn {
                 TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
             } else {
                 TcpSegmentFlags::SYN
@@ -1740,9 +1804,9 @@ where
                 self.rcv_nxt.raw(),
                 self.advertised_receive_window(self.rcv_wnd),
                 flags,
-                self.options.local_capabilities(),
+                capabilities,
                 None,
-                self.next_local_timestamp(),
+                self.next_local_timestamp(capabilities.timestamps),
                 self.fast_open_cookie(),
                 None,
                 self.fast_open_syn_payload_len as usize,
@@ -1777,9 +1841,9 @@ where
                     self.rcv_nxt.raw(),
                     self.advertised_receive_window(self.rcv_wnd),
                     TcpSegmentFlags::ACK | TcpSegmentFlags::FIN,
-                    self.local_capabilities(),
+                    self.output_capabilities(),
                     None,
-                    self.next_local_timestamp(),
+                    self.next_local_timestamp(self.negotiated_options().timestamps),
                     None,
                     None,
                     0,
@@ -1791,10 +1855,16 @@ where
 
     fn on_rack_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
+        let now = Instant::now();
         self.recovery
-            .on_rack_timeout(Instant::now(), self.snd_nxt, &mut self.congestion);
+            .on_rack_timeout(now, self.snd_nxt, &mut self.congestion);
         let sample = self.recovery.take_rack_retransmit()?;
-        if self.rack_timeout_ticks().is_some() {
+        if self
+            .recovery
+            .rack_timeout(now)
+            .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64)
+            .is_some()
+        {
             self.timer_set(TCP_TIMER_RACK);
         }
         self.recovery.on_retransmit_sent(sample.bytes);
@@ -1807,7 +1877,14 @@ where
     fn on_tlp_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
         let sample = self.recovery.take_tlp_probe()?;
-        if self.tlp_timeout_ticks().is_some() {
+        if self
+            .recovery
+            .tlp_timeout(
+                self.retransmit_timeout().smoothed_rtt(),
+                self.retransmit_timeout().retransmit_timeout(),
+            )
+            .is_some()
+        {
             self.timer_set(TCP_TIMER_TLP);
         }
         if self.recovery.in_recovery() {
@@ -1829,9 +1906,9 @@ where
             self.rcv_nxt(),
             self.advertised_receive_window(self.rcv_wnd),
             self.output_flags(TcpSegmentFlags::ACK),
-            self.local_capabilities(),
+            self.output_capabilities(),
             None,
-            self.next_local_timestamp(),
+            self.next_local_timestamp(self.negotiated_options().timestamps),
             None,
             None,
             0,
@@ -1855,7 +1932,7 @@ where
     }
 
     fn on_time_wait_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.close_reason = Some(TcpCloseReason::LocalRequest);
+        self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
         self.state = TcpState::Closed;
         None
     }
@@ -1863,7 +1940,7 @@ where
     fn on_keepalive_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
         if self.keepalive.probes_sent >= TCP_KEEPALIVE_PROBE_LIMIT {
-            self.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
+            self.cacheline1.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
             self.state = TcpState::Closed;
             self.timer_reset(TCP_TIMER_KEEP_ALIVE);
             return None;
@@ -1878,9 +1955,9 @@ where
             self.rcv_nxt(),
             self.advertised_receive_window(self.rcv_wnd),
             self.output_flags(TcpSegmentFlags::ACK),
-            self.local_capabilities(),
+            self.output_capabilities(),
             None,
-            self.next_local_timestamp(),
+            self.next_local_timestamp(self.negotiated_options().timestamps),
             None,
             None,
             0,
@@ -1889,7 +1966,11 @@ where
 
     fn on_pacing_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
-        if self.pacing_ticks().is_none() {
+        if self
+            .congestion
+            .next_send_delay(self.output_payload_len() as u32)
+            .is_none()
+        {
             return None;
         }
         self.timer_set(TCP_TIMER_PACING);
@@ -1925,7 +2006,19 @@ where
             fast_open_cookie: None,
             ip_ecn: None,
         };
-        let _ = connection.receive_syn(&packet, 0).expect("accept syn");
+        let _ = connection
+            .receive_syn(
+                packet.local,
+                packet.remote,
+                packet.flags,
+                packet.sequence,
+                packet.advertised_window,
+                packet.capabilities,
+                packet.timestamp,
+                0,
+                TcpCapabilities::default(),
+            )
+            .expect("accept syn");
         let final_packet = TcpPacket {
             acknowledgment: Some(connection.snd_nxt().into()),
             flags: TcpSegmentFlags::ACK,
@@ -1949,8 +2042,8 @@ where
     ) -> Self {
         let mut connection =
             Self::established_for_test(connection_id, owner_worker, local_port, local, remote);
-        let _ = connection.set_local_capabilities(local_capabilities);
-        let _ = connection.apply_peer_handshake_capabilities(remote_capabilities);
+        let _ =
+            connection.apply_peer_handshake_capabilities(local_capabilities, remote_capabilities);
         connection
     }
 
@@ -1989,6 +2082,7 @@ where
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn established_for_time_wait_test(
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
@@ -2297,7 +2391,7 @@ mod tests {
     #[test]
     fn tcp_negotiated_options_preserve_accurate_ecn_when_both_peers_support_it() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -2305,16 +2399,8 @@ mod tests {
             ecn: true,
             accurate_ecn: true,
             fast_open: false,
-        });
-        let negotiated = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: true,
-            fast_open: false,
-        });
+        };
+        let negotiated = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
 
         assert!(negotiated.ecn);
         assert!(negotiated.accurate_ecn);
@@ -2331,7 +2417,7 @@ mod tests {
             Some(local),
             remote,
         );
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -2339,11 +2425,11 @@ mod tests {
             ecn: true,
             accurate_ecn: true,
             fast_open: false,
-        });
+        };
         connection.connect_state(100);
 
         let segment = connection
-            .on_tcp_ready(false)
+            .on_tcp_ready(false, local_caps)
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
@@ -2366,7 +2452,7 @@ mod tests {
             Some(local),
             remote,
         );
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2374,17 +2460,16 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: true,
-        });
+        };
         connection.set_fast_open_cookie((&[1, 2, 3, 4][..]).try_into().ok());
         connection.connect_state(100);
         let now = Instant::now();
         let _ = connection
             .commit_payload_tx(5, now)
             .expect("commit syn payload");
-        connection.timer_expire(TCP_TIMER_RETRANSMIT);
 
         let segment = connection
-            .on_tcp_timer_expiry(TCP_TIMER_RETRANSMIT)
+            .on_tcp_timer_expiry(TCP_TIMER_RETRANSMIT, local_caps)
             .expect("retransmit");
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
@@ -2408,15 +2493,6 @@ mod tests {
             Some(local),
             remote,
         );
-        let _ = connection.set_local_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: true,
-        });
         connection.set_fast_open_cookie((&[1, 2, 3, 4][..]).try_into().ok());
         connection.connect_state(1000);
         connection.fast_open_syn_payload_len = 5;
@@ -2434,23 +2510,32 @@ mod tests {
 
         assert!(connection.timer_is_supported(TCP_TIMER_PACING));
         assert!(connection.timer_is_supported(TCP_TIMER_KEEP_ALIVE));
-        assert_eq!(connection.timer_ticks(TCP_TIMER_PACING), None);
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_PACING, Instant::now()),
+            None
+        );
 
-        let _ = connection.on_tcp_ready(true);
+        let _ = connection.on_tcp_ready(true, TcpCapabilities::default());
 
         assert!(connection.timer_is_active(TCP_TIMER_PACING));
-        assert_eq!(connection.timer_ticks(TCP_TIMER_PACING), Some(3));
-        assert_eq!(connection.timer_ticks(TCP_TIMER_KEEP_ALIVE), Some(7_500));
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_PACING, Instant::now()),
+            Some(3)
+        );
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_KEEP_ALIVE, Instant::now()),
+            Some(7_500)
+        );
     }
 
     #[test]
     fn tcp_pacing_timer_expiry_rearms_and_requests_tx_dispatch() {
         let mut connection = established_connection_with_pacing_controller();
 
-        let _ = connection.on_tcp_ready(true);
+        let _ = connection.on_tcp_ready(true, TcpCapabilities::default());
 
         let segment = connection
-            .on_tcp_timer_expiry(TCP_TIMER_PACING)
+            .on_tcp_timer_expiry(TCP_TIMER_PACING, TcpCapabilities::default())
             .expect("pacing expiry should request a tx dispatch");
 
         assert!(connection.timer_is_active(TCP_TIMER_PACING));
@@ -2468,7 +2553,7 @@ mod tests {
 
         for probe in 0..TCP_KEEPALIVE_PROBE_LIMIT {
             let segment = connection
-                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE)
+                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE, TcpCapabilities::default())
                 .expect("keepalive probe");
             let mut header = [0u8; 64];
             let header_len = segment.write_header(&mut header).expect("write header");
@@ -2486,7 +2571,7 @@ mod tests {
 
         assert!(
             connection
-                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE)
+                .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE, TcpCapabilities::default())
                 .is_none()
         );
         assert_eq!(connection.state(), TcpState::Closed);
@@ -2502,7 +2587,9 @@ mod tests {
         let initial_snd_nxt = connection.snd_nxt();
 
         connection.on_session_close();
-        let segment = connection.on_tcp_ready(false).expect("fin");
+        let segment = connection
+            .on_tcp_ready(false, TcpCapabilities::default())
+            .expect("fin");
 
         assert_eq!(connection.state(), TcpState::FinWait1);
         let mut header = [0u8; 64];
@@ -2518,7 +2605,9 @@ mod tests {
     fn tcp_finwait1_ack_of_local_fin_advances_to_finwait2() {
         let mut connection = established_connection();
         connection.on_session_close();
-        let _ = connection.on_tcp_ready(false).expect("fin");
+        let _ = connection
+            .on_tcp_ready(false, TcpCapabilities::default())
+            .expect("fin");
         let packet = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2545,7 +2634,9 @@ mod tests {
     fn tcp_simultaneous_close_moves_to_closing_until_fin_is_acked() {
         let mut connection = established_connection();
         connection.on_session_close();
-        let _ = connection.on_tcp_ready(false).expect("fin");
+        let _ = connection
+            .on_tcp_ready(false, TcpCapabilities::default())
+            .expect("fin");
         let fin = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2590,7 +2681,7 @@ mod tests {
             Some(local),
             remote,
         );
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2598,7 +2689,7 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
+        };
         let packet = TcpPacket {
             local,
             remote,
@@ -2627,7 +2718,17 @@ mod tests {
         };
 
         let segment = connection
-            .receive_syn(&packet, 0)
+            .receive_syn(
+                packet.local,
+                packet.remote,
+                packet.flags,
+                packet.sequence,
+                packet.advertised_window,
+                packet.capabilities,
+                packet.timestamp,
+                0,
+                local_caps,
+            )
             .expect("receive syn")
             .expect("syn ack");
         let mut header = [0u8; 64];
@@ -2644,7 +2745,7 @@ mod tests {
     #[test]
     fn tcp_established_ack_echoes_latest_peer_timestamp() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2652,16 +2753,8 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let packet = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2681,8 +2774,19 @@ mod tests {
             payload_len: 0,
         };
 
-        assert!(connection.observe_inbound_timestamp(&packet));
-        let segment = connection.control_segment(&packet, TcpSegmentFlags::ACK, None);
+        assert!(connection.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ));
+        let segment = connection.control_segment(
+            packet.local,
+            packet.remote,
+            TcpSegmentFlags::ACK,
+            None,
+            local_caps,
+        );
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
@@ -2697,7 +2801,7 @@ mod tests {
     #[test]
     fn tcp_timestamp_is_required_when_negotiated() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2705,16 +2809,8 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let packet = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2731,13 +2827,18 @@ mod tests {
             payload_len: 0,
         };
 
-        assert!(!connection.observe_inbound_timestamp(&packet));
+        assert!(!connection.observe_inbound_timestamp(
+            packet.flags,
+            packet.timestamp,
+            packet.sequence,
+            packet.payload_len,
+        ));
     }
 
     #[test]
     fn tcp_paws_rejects_stale_timestamp() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2745,16 +2846,8 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let first = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2781,14 +2874,24 @@ mod tests {
             ..first.clone()
         };
 
-        assert!(connection.observe_inbound_timestamp(&first));
-        assert!(!connection.observe_inbound_timestamp(&stale));
+        assert!(connection.observe_inbound_timestamp(
+            first.flags,
+            first.timestamp,
+            first.sequence,
+            first.payload_len,
+        ));
+        assert!(!connection.observe_inbound_timestamp(
+            stale.flags,
+            stale.timestamp,
+            stale.sequence,
+            stale.payload_len,
+        ));
     }
 
     #[test]
     fn tcp_paws_accepts_stale_timestamp_after_idle_window() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2796,16 +2899,8 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let first = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2832,20 +2927,30 @@ mod tests {
             ..first.clone()
         };
 
-        assert!(connection.observe_inbound_timestamp(&first));
+        assert!(connection.observe_inbound_timestamp(
+            first.flags,
+            first.timestamp,
+            first.sequence,
+            first.payload_len,
+        ));
         connection.timestamps.recent_remote_at = Some(
             Instant::now()
                 .checked_sub(TCP_PAWS_IDLE + Duration::from_secs(1))
                 .expect("recent remote age"),
         );
-        assert!(connection.observe_inbound_timestamp(&stale));
+        assert!(connection.observe_inbound_timestamp(
+            stale.flags,
+            stale.timestamp,
+            stale.sequence,
+            stale.payload_len,
+        ));
         assert_eq!(connection.timestamps.recent_remote, Some(77));
     }
 
     #[test]
     fn tcp_timestamp_recent_only_moves_when_segment_covers_rcv_nxt() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2853,16 +2958,8 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let in_order = TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -2890,9 +2987,25 @@ mod tests {
             ..in_order.clone()
         };
 
-        assert!(connection.observe_inbound_timestamp(&in_order));
-        assert!(connection.observe_inbound_timestamp(&out_of_order));
-        let segment = connection.control_segment(&in_order, TcpSegmentFlags::ACK, None);
+        assert!(connection.observe_inbound_timestamp(
+            in_order.flags,
+            in_order.timestamp,
+            in_order.sequence,
+            in_order.payload_len,
+        ));
+        assert!(connection.observe_inbound_timestamp(
+            out_of_order.flags,
+            out_of_order.timestamp,
+            out_of_order.sequence,
+            out_of_order.payload_len,
+        ));
+        let segment = connection.control_segment(
+            in_order.local,
+            in_order.remote,
+            TcpSegmentFlags::ACK,
+            None,
+            local_caps,
+        );
         let mut header = [0u8; 64];
         let header_len = segment.write_header(&mut header).expect("write header");
         let parsed =
@@ -2940,7 +3053,7 @@ mod tests {
     #[test]
     fn tcp_timestamp_echo_ack_updates_rto_for_retransmitted_ack() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: Some(1460),
             window_scale: None,
             sack: true,
@@ -2948,22 +3061,14 @@ mod tests {
             ecn: false,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: Some(1460),
-            window_scale: None,
-            sack: true,
-            timestamps: true,
-            ecn: false,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         let now = Instant::now();
         let sequence = connection.snd_nxt();
         let end_sequence = TcpSeq::from(sequence).advance(1).raw();
         connection.snd_nxt = TcpSeq::from(end_sequence);
         let sent = connection
-            .next_local_timestamp()
+            .next_local_timestamp(true)
             .expect("local timestamp for outbound packet");
         connection.recovery.record_sent(
             1,
@@ -3014,8 +3119,7 @@ mod tests {
             accurate_ecn: false,
             fast_open: false,
         };
-        let _ = connection.set_local_capabilities(capabilities);
-        let _ = connection.apply_peer_handshake_capabilities(capabilities);
+        let _ = connection.apply_peer_handshake_capabilities(capabilities, capabilities);
         connection.snd_wnd = 8_000;
         connection.snd_una = TcpSeq::from(1_000);
         connection.snd_nxt = TcpSeq::from(6_000);
@@ -3075,7 +3179,10 @@ mod tests {
         );
         connection.recovery.on_retransmit_sent(1_000);
 
-        assert_eq!(connection.tx_payload_budget(1_000, now), 0);
+        assert_eq!(
+            connection.tx_payload_budget(1_000, now, TcpCapabilities::default()),
+            0
+        );
 
         connection.recovery.on_ack(
             TcpRecoveryAck {
@@ -3088,7 +3195,10 @@ mod tests {
             &mut connection.congestion,
         );
 
-        assert_eq!(connection.tx_payload_budget(1_000, now), 0);
+        assert_eq!(
+            connection.tx_payload_budget(1_000, now, TcpCapabilities::default()),
+            0
+        );
 
         connection.recovery.on_ack(
             TcpRecoveryAck {
@@ -3102,7 +3212,7 @@ mod tests {
         );
 
         assert_eq!(
-            connection.tx_payload_budget(2_000, now),
+            connection.tx_payload_budget(2_000, now, TcpCapabilities::default()),
             connection
                 .recovery
                 .recovery_send_space(
@@ -3116,7 +3226,7 @@ mod tests {
     #[test]
     fn tcp_cwr_clears_pending_ece_echo() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -3124,16 +3234,8 @@ mod tests {
             ecn: true,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
         connection.observe_peer_ecn_feedback(&TcpPacket {
             local: connection.remote(),
             remote: connection.local().expect("local"),
@@ -3173,7 +3275,7 @@ mod tests {
     #[test]
     fn tcp_ack_ece_sets_congestion_feedback_without_enabling_ack_echo() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -3181,16 +3283,8 @@ mod tests {
             ecn: true,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
 
         connection.observe_peer_ecn_feedback(&TcpPacket {
             local: connection.remote(),
@@ -3215,7 +3309,7 @@ mod tests {
     #[test]
     fn tcp_ip_ce_sets_ack_echo_without_marking_congestion_feedback() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -3223,16 +3317,8 @@ mod tests {
             ecn: true,
             accurate_ecn: false,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: false,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
 
         connection.observe_peer_ecn_feedback(&TcpPacket {
             local: connection.remote(),
@@ -3257,7 +3343,7 @@ mod tests {
     #[test]
     fn tcp_accecn_ack_uses_ace_bits_for_ce_feedback() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -3265,16 +3351,8 @@ mod tests {
             ecn: true,
             accurate_ecn: true,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: true,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
 
         connection.observe_peer_ecn_feedback(&TcpPacket {
             local: connection.remote(),
@@ -3300,7 +3378,7 @@ mod tests {
     #[test]
     fn tcp_accecn_ack_updates_pending_feedback_from_peer_ace_delta() {
         let mut connection = established_connection();
-        let _ = connection.set_local_capabilities(TcpCapabilities {
+        let local_caps = TcpCapabilities {
             max_segment_size: None,
             window_scale: None,
             sack: true,
@@ -3308,16 +3386,8 @@ mod tests {
             ecn: true,
             accurate_ecn: true,
             fast_open: false,
-        });
-        let _ = connection.apply_peer_handshake_capabilities(TcpCapabilities {
-            max_segment_size: None,
-            window_scale: None,
-            sack: true,
-            timestamps: false,
-            ecn: true,
-            accurate_ecn: true,
-            fast_open: false,
-        });
+        };
+        let _ = connection.apply_peer_handshake_capabilities(local_caps, local_caps);
 
         connection.observe_peer_ecn_feedback(&TcpPacket {
             local: connection.remote(),

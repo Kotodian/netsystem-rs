@@ -378,7 +378,6 @@ struct FeatureArcEnabled<A: FeatureArcSpec> {
 #[derive(Debug, Clone)]
 struct FeatureArcStep {
     node: NodeId,
-    config: Option<Vec<u8>>,
 }
 
 impl<A: FeatureArcSpec> Default for FeatureArc<A> {
@@ -713,22 +712,20 @@ impl<A: FeatureArcSpec> FeatureArcState<A> {
         let feature_order = self.feature_order.clone();
         let mut chains = HashMap::with_capacity(self.enabled.len());
         for (interface_index, enabled) in &self.enabled {
-            let enabled = enabled
-                .iter()
-                .map(|enabled| (enabled.id, enabled.config.clone()))
-                .collect::<HashMap<_, _>>();
+            let enabled = enabled.iter().map(|enabled| enabled.id).collect::<HashSet<_>>();
             let chain_features = feature_order
                 .iter()
-                .filter_map(|id| enabled.get(id).map(|config| (*id, config.clone())))
+                .copied()
+                .filter(|id| enabled.contains(id))
                 .collect::<Vec<_>>();
             let mut steps = Vec::with_capacity(chain_features.len());
-            for (id, config) in chain_features {
+            for id in chain_features {
                 let node = self
                     .registered
                     .get(&id)
                     .ok_or_else(|| CoreError::internal("feature chain references missing node"))?
                     .node;
-                steps.push(FeatureArcStep { node, config });
+                steps.push(FeatureArcStep { node });
             }
             chains.insert(*interface_index, FeatureArcChain { steps });
         }

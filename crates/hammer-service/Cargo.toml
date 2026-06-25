@@ -29,6 +29,7 @@ endpoint-amneziawg = ["hammer-runtime/endpoint-amneziawg"]
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bitflags = "2.10"
+crossbeam-utils = { workspace = true }
 bytes = { workspace = true, optional = true }
 hammer-core = { path = "../hammer-core" }
 hammer-control = { path = "../hammer-control" }
@@ -43,5 +44,6 @@ tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 libc = { workspace = true, optional = true }
 smoltcp = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]

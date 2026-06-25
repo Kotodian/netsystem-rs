@@ -222,7 +222,8 @@ fn ip_lookup_node_uses_ipv4_mtrie_longest_prefix_match() {
         inputs: vec![TraceInputPolicy {
             node: lookup,
             count: 1,
-        }],
+        }]
+        .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
 
@@ -626,7 +627,8 @@ fn adjacency_rewrite_node_prepends_rewrite_and_sets_egress_interface() {
         inputs: vec![TraceInputPolicy {
             node: rewrite_node,
             count: 1,
-        }],
+        }]
+        .into(),
     });
     runtime.set_trace_control(Some(trace.handle()), 4);
     let frame = runtime.alloc_frame_index().expect("alloc frame");

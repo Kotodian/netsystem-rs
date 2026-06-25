@@ -1,12 +1,96 @@
-use std::net::Ipv6Addr;
-
-use etherparse::TcpSlice;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use std::mem::{size_of, transmute};
+use std::net::Ipv6Addr;
 use thiserror::Error;
 
 use crate::protocol::ip::parse_ip_packet;
 
 use super::{TcpError, TcpSegmentFlags};
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct Ipv4WireHeader {
+    version_ihl: u8,
+    dscp_ecn: u8,
+    total_len: [u8; 2],
+    identification: [u8; 2],
+    flags_fragment: [u8; 2],
+    ttl: u8,
+    protocol: u8,
+    checksum: [u8; 2],
+    source: [u8; 4],
+    destination: [u8; 4],
+}
+
+impl Ipv4WireHeader {
+    #[inline(always)]
+    fn version(self) -> u8 {
+        self.version_ihl >> 4
+    }
+
+    #[inline(always)]
+    fn header_len(self) -> usize {
+        usize::from(self.version_ihl & 0x0f) * 4
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct Ipv6WireHeader {
+    version_traffic_flow: [u8; 4],
+    payload_len: [u8; 2],
+    next_header: u8,
+    hop_limit: u8,
+    source: [u8; 16],
+    destination: [u8; 16],
+}
+
+impl Ipv6WireHeader {
+    #[inline(always)]
+    fn version(self) -> u8 {
+        self.version_traffic_flow[0] >> 4
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct TcpWireHeader {
+    source_port: [u8; 2],
+    destination_port: [u8; 2],
+    sequence_number: [u8; 4],
+    acknowledgment_number: [u8; 4],
+    data_offset_reserved_flags: [u8; 2],
+    advertised_window: [u8; 2],
+    checksum: [u8; 2],
+    urgent_pointer: [u8; 2],
+}
+
+impl TcpWireHeader {
+    #[inline(always)]
+    fn header_len(self) -> usize {
+        usize::from(self.data_offset_reserved_flags[0] >> 4) * 4
+    }
+
+    #[inline(always)]
+    fn source_port(self) -> u16 {
+        u16::from_be_bytes(self.source_port)
+    }
+
+    #[inline(always)]
+    fn destination_port(self) -> u16 {
+        u16::from_be_bytes(self.destination_port)
+    }
+
+    #[inline(always)]
+    fn sequence_number(self) -> u32 {
+        u32::from_be_bytes(self.sequence_number)
+    }
+
+    #[inline(always)]
+    fn acknowledgment_number(self) -> u32 {
+        u32::from_be_bytes(self.acknowledgment_number)
+    }
+}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TcpResetError {
@@ -78,7 +162,7 @@ pub fn tcp_reset_remote_reply_addrs(
         return None;
     }
     let transport = packet.get(parsed.transport_header_offset..parsed.packet_len)?;
-    let segment = TcpSlice::from_slice(transport).ok()?;
+    let segment = read_packed::<TcpWireHeader>(transport, 0)?;
     Some((
         std::net::SocketAddr::new(parsed.destination, segment.destination_port()),
         std::net::SocketAddr::new(parsed.source, segment.source_port()),
@@ -96,8 +180,7 @@ fn parse_reset_source_segment(
         return None;
     }
 
-    let segment =
-        TcpSlice::from_slice(packet.get(cursor.transport_header_offset..available_len)?).ok()?;
+    let segment = read_packed::<TcpWireHeader>(packet, cursor.transport_header_offset)?;
     if cursor.transport_payload_offset
         != cursor
             .transport_header_offset
@@ -108,29 +191,37 @@ fn parse_reset_source_segment(
 
     let payload_len = available_len.checked_sub(cursor.transport_payload_offset)?;
     let sequence_len = payload_len
-        .checked_add(usize::from(segment.syn()))?
-        .checked_add(usize::from(segment.fin()))?;
+        .checked_add(usize::from(
+            tcp_flags_from_header(segment).contains(TcpSegmentFlags::SYN),
+        ))?
+        .checked_add(usize::from(
+            tcp_flags_from_header(segment).contains(TcpSegmentFlags::FIN),
+        ))?;
+    let flags = tcp_flags_from_header(segment);
     Some(ResetSourceSegment {
         source_port: segment.source_port(),
         destination_port: segment.destination_port(),
         sequence_number: segment.sequence_number(),
-        acknowledgment_number: segment.ack().then(|| segment.acknowledgment_number()),
-        flags: tcp_flags_from_slice(&segment),
+        acknowledgment_number: flags
+            .contains(TcpSegmentFlags::ACK)
+            .then(|| segment.acknowledgment_number()),
+        flags,
         sequence_len: u32::try_from(sequence_len).ok()?,
     })
 }
 
-fn tcp_flags_from_slice(segment: &TcpSlice<'_>) -> TcpSegmentFlags {
+fn tcp_flags_from_header(segment: TcpWireHeader) -> TcpSegmentFlags {
     let mut flags = TcpSegmentFlags::empty();
-    flags.set(TcpSegmentFlags::NS, segment.ns());
-    flags.set(TcpSegmentFlags::FIN, segment.fin());
-    flags.set(TcpSegmentFlags::SYN, segment.syn());
-    flags.set(TcpSegmentFlags::RST, segment.rst());
-    flags.set(TcpSegmentFlags::PSH, segment.psh());
-    flags.set(TcpSegmentFlags::ACK, segment.ack());
-    flags.set(TcpSegmentFlags::URG, segment.urg());
-    flags.set(TcpSegmentFlags::ECE, segment.ece());
-    flags.set(TcpSegmentFlags::CWR, segment.cwr());
+    let raw = u16::from_be_bytes(segment.data_offset_reserved_flags);
+    flags.set(TcpSegmentFlags::NS, raw & 0x0100 != 0);
+    flags.set(TcpSegmentFlags::FIN, raw & TcpSegmentFlags::FIN.bits() != 0);
+    flags.set(TcpSegmentFlags::SYN, raw & TcpSegmentFlags::SYN.bits() != 0);
+    flags.set(TcpSegmentFlags::RST, raw & TcpSegmentFlags::RST.bits() != 0);
+    flags.set(TcpSegmentFlags::PSH, raw & TcpSegmentFlags::PSH.bits() != 0);
+    flags.set(TcpSegmentFlags::ACK, raw & TcpSegmentFlags::ACK.bits() != 0);
+    flags.set(TcpSegmentFlags::URG, raw & TcpSegmentFlags::URG.bits() != 0);
+    flags.set(TcpSegmentFlags::ECE, raw & TcpSegmentFlags::ECE.bits() != 0);
+    flags.set(TcpSegmentFlags::CWR, raw & TcpSegmentFlags::CWR.bits() != 0);
     flags
 }
 
@@ -157,7 +248,8 @@ fn synthesize_ipv4_tcp_reset(
     if network_end > available_len || transport_end > available_len {
         return None;
     }
-    if packet.get(cursor.network_header_offset).copied()? >> 4 != 4 {
+    let header = read_packed::<Ipv4WireHeader>(packet, cursor.network_header_offset)?;
+    if header.version() != 4 || header.header_len() < IPV4_HEADER_LEN {
         return None;
     }
 
@@ -166,36 +258,35 @@ fn synthesize_ipv4_tcp_reset(
     let total_len = IPV4_HEADER_LEN + TCP_HEADER_LEN;
     let reset = output.get_mut(..total_len)?;
     reset.fill(0);
+    let mut reply_header = header;
+    reply_header.version_ihl = 0x45;
+    reply_header.total_len = (total_len as u16).to_be_bytes();
+    reply_header.checksum = [0, 0];
+    reply_header.source = header.destination;
+    reply_header.destination = header.source;
+    write_packed(reset, 0, reply_header)?;
 
-    reset[..IPV4_HEADER_LEN].copy_from_slice(
-        &packet[cursor.network_header_offset..cursor.network_header_offset + IPV4_HEADER_LEN],
+    let mut reply_segment = TcpWireHeader {
+        source_port: source.destination_port.to_be_bytes(),
+        destination_port: source.source_port.to_be_bytes(),
+        sequence_number: response_sequence.to_be_bytes(),
+        acknowledgment_number: response_acknowledgment.to_be_bytes(),
+        data_offset_reserved_flags: [0x50, response_flags],
+        advertised_window: [0, 0],
+        checksum: [0, 0],
+        urgent_pointer: [0, 0],
+    };
+    write_packed(reset, IPV4_HEADER_LEN, reply_segment)?;
+    let checksum = ipv4_l4_checksum(
+        reply_header.source,
+        reply_header.destination,
+        6,
+        &reset[20..],
     );
-    reset[0] = 0x45;
-    reset[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    reset[10] = 0;
-    reset[11] = 0;
-    reset[12..16].copy_from_slice(
-        packet.get(cursor.network_header_offset + 16..cursor.network_header_offset + 20)?,
-    );
-    reset[16..20].copy_from_slice(
-        packet.get(cursor.network_header_offset + 12..cursor.network_header_offset + 16)?,
-    );
-
-    reset[20..22].copy_from_slice(&source.destination_port.to_be_bytes());
-    reset[22..24].copy_from_slice(&source.source_port.to_be_bytes());
-    reset[24..28].copy_from_slice(&response_sequence.to_be_bytes());
-    reset[28..32].copy_from_slice(&response_acknowledgment.to_be_bytes());
-    reset[32] = 0x50;
-    reset[33] = response_flags;
-    reset[36] = 0;
-    reset[37] = 0;
-
-    let pseudo_source = reset.get(12..16)?.try_into().ok()?;
-    let pseudo_destination = reset.get(16..20)?.try_into().ok()?;
-    let checksum = ipv4_l4_checksum(pseudo_source, pseudo_destination, 6, &reset[20..]);
-    reset[36..38].copy_from_slice(&checksum.to_be_bytes());
-    let header_checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]);
-    reset[10..12].copy_from_slice(&header_checksum.to_be_bytes());
+    reply_segment.checksum = checksum.to_be_bytes();
+    write_packed(reset, IPV4_HEADER_LEN, reply_segment)?;
+    reply_header.checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]).to_be_bytes();
+    write_packed(reset, 0, reply_header)?;
 
     Some(total_len)
 }
@@ -223,7 +314,8 @@ fn synthesize_ipv6_tcp_reset(
     if network_end > available_len || transport_end > available_len {
         return None;
     }
-    if packet.get(cursor.network_header_offset).copied()? >> 4 != 6 {
+    let header = read_packed::<Ipv6WireHeader>(packet, cursor.network_header_offset)?;
+    if header.version() != 6 {
         return None;
     }
 
@@ -232,32 +324,32 @@ fn synthesize_ipv6_tcp_reset(
     let total_len = IPV6_HEADER_LEN + TCP_HEADER_LEN;
     let reset = output.get_mut(..total_len)?;
     reset.fill(0);
+    let mut reply_header = header;
+    reply_header.version_traffic_flow[0] = 0x60;
+    reply_header.payload_len = (TCP_HEADER_LEN as u16).to_be_bytes();
+    reply_header.source = header.destination;
+    reply_header.destination = header.source;
+    write_packed(reset, 0, reply_header)?;
 
-    reset[..IPV6_HEADER_LEN].copy_from_slice(
-        &packet[cursor.network_header_offset..cursor.network_header_offset + IPV6_HEADER_LEN],
+    let mut reply_segment = TcpWireHeader {
+        source_port: source.destination_port.to_be_bytes(),
+        destination_port: source.source_port.to_be_bytes(),
+        sequence_number: response_sequence.to_be_bytes(),
+        acknowledgment_number: response_acknowledgment.to_be_bytes(),
+        data_offset_reserved_flags: [0x50, response_flags],
+        advertised_window: [0, 0],
+        checksum: [0, 0],
+        urgent_pointer: [0, 0],
+    };
+    write_packed(reset, IPV6_HEADER_LEN, reply_segment)?;
+    let checksum = ipv6_l4_checksum(
+        Ipv6Addr::from(reply_header.source),
+        Ipv6Addr::from(reply_header.destination),
+        6,
+        &reset[40..],
     );
-    reset[0] = 0x60;
-    reset[4..6].copy_from_slice(&(TCP_HEADER_LEN as u16).to_be_bytes());
-    reset[8..24].copy_from_slice(
-        packet.get(cursor.network_header_offset + 24..cursor.network_header_offset + 40)?,
-    );
-    reset[24..40].copy_from_slice(
-        packet.get(cursor.network_header_offset + 8..cursor.network_header_offset + 24)?,
-    );
-
-    reset[40..42].copy_from_slice(&source.destination_port.to_be_bytes());
-    reset[42..44].copy_from_slice(&source.source_port.to_be_bytes());
-    reset[44..48].copy_from_slice(&response_sequence.to_be_bytes());
-    reset[48..52].copy_from_slice(&response_acknowledgment.to_be_bytes());
-    reset[52] = 0x50;
-    reset[53] = response_flags;
-    reset[56] = 0;
-    reset[57] = 0;
-
-    let pseudo_source = Ipv6Addr::from(<[u8; 16]>::try_from(reset.get(8..24)?).ok()?);
-    let pseudo_destination = Ipv6Addr::from(<[u8; 16]>::try_from(reset.get(24..40)?).ok()?);
-    let checksum = ipv6_l4_checksum(pseudo_source, pseudo_destination, 6, &reset[40..]);
-    reset[56..58].copy_from_slice(&checksum.to_be_bytes());
+    reply_segment.checksum = checksum.to_be_bytes();
+    write_packed(reset, IPV6_HEADER_LEN, reply_segment)?;
 
     Some(total_len)
 }
@@ -295,4 +387,27 @@ fn ipv6_l4_checksum(source: Ipv6Addr, destination: Ipv6Addr, protocol: u8, segme
         &[0, 0, 0, protocol],
         segment,
     ])
+}
+
+#[inline(always)]
+fn read_packed<T>(packet: &[u8], offset: usize) -> Option<T>
+where
+    T: Copy,
+{
+    let end = offset.checked_add(size_of::<T>())?;
+    let _ = packet.get(offset..end)?;
+    let ptr = unsafe { transmute::<_, *const T>(packet.as_ptr().add(offset)) };
+    Some(unsafe { ptr.read_unaligned() })
+}
+
+#[inline(always)]
+fn write_packed<T>(packet: &mut [u8], offset: usize, value: T) -> Option<()>
+where
+    T: Copy,
+{
+    let end = offset.checked_add(size_of::<T>())?;
+    let _ = packet.get_mut(offset..end)?;
+    let ptr = unsafe { transmute::<_, *mut T>(packet.as_mut_ptr().add(offset)) };
+    unsafe { ptr.write_unaligned(value) };
+    Some(())
 }

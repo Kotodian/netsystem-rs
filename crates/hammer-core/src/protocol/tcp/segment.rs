@@ -1,3 +1,5 @@
+use std::mem::transmute;
+
 use super::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
 };
@@ -9,6 +11,18 @@ const TCP_OPTION_NOP: u8 = 1;
 const TCP_OPTION_SACK: u8 = 5;
 const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
 const TCP_MAX_SACK_BLOCKS: usize = 4;
+
+#[repr(C, packed)]
+struct TcpWireHeader {
+    source_port: [u8; 2],
+    destination_port: [u8; 2],
+    sequence_number: [u8; 4],
+    acknowledgment_number: [u8; 4],
+    data_offset_reserved_flags: [u8; 2],
+    advertised_window: [u8; 2],
+    checksum: [u8; 2],
+    urgent_pointer: [u8; 2],
+}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TcpSegmentParseError {
@@ -91,25 +105,45 @@ pub fn write_tcp_segment_header(
     header: TcpSegmentHeader<'_>,
     sack_blocks: Option<&[TcpSackBlock]>,
 ) -> Result<usize, TcpError> {
-    let options_len = tcp_options_len(header, sack_blocks);
-    let header_len = TCP_HEADER_MIN_LEN + options_len;
+    let header_len = tcp_segment_header_len(header, sack_blocks);
     if output.len() < header_len {
         return Err(TcpError::Length);
     }
     output[..header_len].fill(0);
-    output[0..2].copy_from_slice(&header.source_port.to_be_bytes());
-    output[2..4].copy_from_slice(&header.destination_port.to_be_bytes());
-    output[4..8].copy_from_slice(&header.sequence_number.to_be_bytes());
-    output[8..12].copy_from_slice(&header.acknowledgment_number.to_be_bytes());
-    output[12] = ((header_len / 4) as u8) << 4;
-    if header.flags.contains(TcpSegmentFlags::NS) {
-        output[12] |= 0x01;
-    }
-    output[13] = (header.flags.bits() & 0xff) as u8;
-    output[14..16].copy_from_slice(&header.advertised_window.to_be_bytes());
+    let wire = tcp_wire_header_mut(output);
+    wire.source_port = header.source_port.to_be_bytes();
+    wire.destination_port = header.destination_port.to_be_bytes();
+    wire.sequence_number = header.sequence_number.to_be_bytes();
+    wire.acknowledgment_number = header.acknowledgment_number.to_be_bytes();
+    wire.data_offset_reserved_flags = tcp_data_offset_flags(header_len, header.flags).to_be_bytes();
+    wire.advertised_window = header.advertised_window.to_be_bytes();
     let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
     write_tcp_options(options, header, sack_blocks);
     Ok(header_len)
+}
+
+#[inline]
+pub fn tcp_segment_header_len(
+    header: TcpSegmentHeader<'_>,
+    sack_blocks: Option<&[TcpSackBlock]>,
+) -> usize {
+    TCP_HEADER_MIN_LEN + tcp_options_len(header, sack_blocks)
+}
+
+#[inline(always)]
+fn tcp_wire_header_mut(output: &mut [u8]) -> &mut TcpWireHeader {
+    // SAFETY: caller guarantees `output` has at least `TCP_HEADER_MIN_LEN`
+    // bytes. `TcpWireHeader` is packed, so alignment is 1.
+    unsafe { &mut *transmute::<_, *mut TcpWireHeader>(output.as_mut_ptr()) }
+}
+
+#[inline(always)]
+fn tcp_data_offset_flags(header_len: usize, flags: TcpSegmentFlags) -> u16 {
+    let mut data_offset_flags = u16::from((header_len / 4) as u8) << 12;
+    if flags.contains(TcpSegmentFlags::NS) {
+        data_offset_flags |= 0x0100;
+    }
+    data_offset_flags | (flags.bits() & 0xff)
 }
 
 fn tcp_options_len(header: TcpSegmentHeader<'_>, sack_blocks: Option<&[TcpSackBlock]>) -> usize {
