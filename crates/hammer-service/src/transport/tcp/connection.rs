@@ -1457,7 +1457,30 @@ where
                 packet.sack_blocks.as_slice(),
             );
         }
+        if let Some(segment) = self.receive_fin_in_established(packet)? {
+            return Ok((Some(segment), timers));
+        }
         Ok((None, timers))
+    }
+
+    fn receive_fin_in_established(
+        &mut self,
+        packet: &TcpPacket,
+    ) -> CoreResult<Option<TcpSegment>> {
+        if packet.flags.contains(TcpSegmentFlags::FIN)
+            && packet.sequence.advance(packet.payload_len as u32) == self.rcv_nxt
+        {
+            self.rcv_nxt = self.rcv_nxt.advance(1);
+            self.state = TcpState::CloseWait;
+            return Ok(Some(self.control_segment(
+                packet.local,
+                packet.remote,
+                TcpSegmentFlags::ACK,
+                None,
+                TcpCapabilities::default(),
+            )));
+        }
+        Ok(None)
     }
 
     pub(crate) fn receive_close_side(

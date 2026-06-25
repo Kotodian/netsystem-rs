@@ -1349,6 +1349,136 @@ mod tests {
             .expect("receive fin ack");
     }
 
+    fn peer_fin_packet(
+        local: SocketAddr,
+        remote: SocketAddr,
+        rcv_nxt: u32,
+        snd_nxt: u32,
+    ) -> TcpPacket {
+        TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: rcv_nxt.into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::FIN | TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        }
+    }
+
+    fn enter_close_wait_for_passive_close_test(
+        driver: &mut SessionDriverRuntime<TcpConnection<BbrController>>,
+        session_id: SessionId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) {
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
+        let connection = driver.session_mut(session_id).expect("connection");
+        let (segment, _) = connection
+            .receive_established(&packet)
+            .expect("receive peer fin");
+        assert!(segment.is_some(), "expected ack segment for in-sequence fin");
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
+    }
+
+    #[test]
+    fn tcp_passive_close_fin_in_established_enters_close_wait_and_acks() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = peer_fin_packet(local, remote, rcv_nxt, snd_nxt);
+        let connection = driver.session_mut(session_id).expect("connection");
+        let (segment, _) = connection
+            .receive_established(&packet)
+            .expect("receive peer fin");
+
+        let segment = segment.expect("ack segment");
+        let mut header = [0u8; 64];
+        let header_len = segment.write_header(&mut header).expect("write header");
+        let parsed = etherparse::TcpSlice::from_slice(&header[..header_len]).expect("parse tcp");
+        assert!(parsed.ack());
+        assert!(!parsed.fin());
+
+        assert_eq!(connection.state(), TcpState::CloseWait);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt.wrapping_add(1));
+    }
+
+    #[test]
+    fn tcp_passive_close_local_close_after_peer_fin_enters_last_ack() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+
+        let connection = driver.session_mut(session_id).expect("connection");
+        connection.on_session_close();
+        assert_eq!(connection.state(), TcpState::LastAck);
+    }
+
+    #[test]
+    fn tcp_passive_close_peer_ack_final_fin_closes() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        enter_close_wait_for_passive_close_test(&mut driver, session_id, local, remote);
+
+        let connection = driver.session_mut(session_id).expect("connection");
+        connection.on_session_close();
+        assert_eq!(connection.state(), TcpState::LastAck);
+
+        let snd_nxt = connection.snd_nxt();
+        let ack_packet = TcpPacket {
+            local: remote,
+            remote: local,
+            sequence: connection.rcv_nxt().into(),
+            acknowledgment: Some(snd_nxt.into()),
+            advertised_window: u16::MAX,
+            flags: TcpSegmentFlags::ACK,
+            capabilities: TcpCapabilities::default(),
+            sack_blocks: hammer_infra::vec::Vec::new(),
+            timestamp: None,
+            fast_open_cookie: None,
+            ip_ecn: None,
+            payload_offset: 0,
+            payload_len: 0,
+        };
+        connection
+            .receive_close_side(&ack_packet)
+            .expect("receive final ack");
+        assert_eq!(connection.state(), TcpState::Closed);
+    }
+
+    #[test]
+    fn tcp_passive_close_out_of_order_fin_does_not_transition() {
+        let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
+
+        let (rcv_nxt, snd_nxt) = {
+            let connection = driver.session(session_id).expect("connection");
+            (connection.rcv_nxt(), connection.snd_nxt())
+        };
+        let packet = peer_fin_packet(local, remote, rcv_nxt.wrapping_add(1), snd_nxt);
+        let connection = driver.session_mut(session_id).expect("connection");
+        let (segment, _) = connection
+            .receive_established(&packet)
+            .expect("receive out-of-order fin");
+
+        assert!(segment.is_none());
+        assert_eq!(connection.state(), TcpState::Established);
+        assert_eq!(connection.rcv_nxt(), rcv_nxt);
+    }
+
     #[test]
     fn tcp_fin_path_enters_time_wait_and_retains_session_until_expiry() {
         let (mut driver, session_id, local, remote) = closing_session_for_test::<BbrController>();
