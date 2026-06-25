@@ -492,6 +492,7 @@ impl TcpRecoveryState {
     ) {
         let mut cursor = self.sample_head;
         let deadline = now + reordering_window;
+        let mut any_marked = false;
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
             if sample.end_sequence < highest_sacked_right
@@ -499,10 +500,13 @@ impl TcpRecoveryState {
                 && sample.rack_deadline.is_none()
             {
                 self.sent_sample_mut(index).rack_deadline = Some(deadline);
+                any_marked = true;
             }
             cursor = sample.next;
         }
-        self.rack_note_deadline(deadline);
+        if any_marked {
+            self.rack_note_deadline(deadline);
+        }
         self.rack_timer_armed = self.has_pending_rack_deadline();
     }
 
@@ -882,10 +886,8 @@ impl TcpRecoveryState {
         if sample.rack_deadline.is_some() || self.sample_is_lost(sample) {
             return;
         }
-        let cleared = sample.rack_deadline;
         let current = self.sent_sample_mut(head);
         current.rack_deadline = None;
-        self.rack_invalidate_cleared(cleared);
         self.mark_hole_lost(sample.sequence);
         self.refresh_lost_bytes();
         self.rack_rescan_earliest();
@@ -1911,6 +1913,67 @@ mod tests {
             (first.sequence, second.sequence),
             (TcpSeq::from(2_000), TcpSeq::from(1_000))
         );
+    }
+
+    #[test]
+    fn mark_rack_candidates_does_not_lower_earliest_when_no_new_sample_marked() {
+        let now = Instant::now();
+        let mut recovery = TcpRecoveryState::new();
+        let mut controller = RecordingController::new(1_000);
+        record_sent_for_test(&mut recovery, 1, 1_000, 2_000, 1_000, now);
+        record_sent_for_test(
+            &mut recovery,
+            2,
+            2_000,
+            3_000,
+            1_000,
+            now + Duration::from_millis(1),
+        );
+
+        // First SACK: rtt=80ms -> reordering_window=20ms -> deadline = (now+30ms)+20ms = now+50ms.
+        // Sample 1 (1k..2k) qualifies (end 2k < high_sacked 3k), gets rack_deadline = now+50ms.
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(30), 80),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
+            }],
+            &mut controller,
+        );
+        let first_earliest = recovery.rack_earliest_full_scan();
+        assert_eq!(
+            recovery
+                .rack_timeout(now + Duration::from_millis(30))
+                .map(|d| d.as_millis()),
+            first_earliest.and_then(|d| {
+                Some(
+                    d.saturating_duration_since(now + Duration::from_millis(30))
+                        .as_millis(),
+                )
+            }),
+        );
+
+        // Second SACK: rtt=10ms -> reordering_window=2ms -> deadline = (now+31ms)+2ms = now+33ms.
+        // Sample 1 already has rack_deadline (is_some()), so the guard skips it -> any_marked=false.
+        // A smaller deadline (33ms < 50ms) must NOT pull earliest down to 33ms (no sample holds it).
+        recovery.on_sack_blocks(
+            ack(1_000, now + Duration::from_millis(31), 10),
+            &[TcpSackBlock {
+                left_edge: TcpSeq::from(2_000),
+                right_edge: TcpSeq::from(3_000),
+            }],
+            &mut controller,
+        );
+
+        // earliest must still reflect sample 1's real deadline (now+50ms), not the phantom now+33ms.
+        let expected = first_earliest
+            .map(|d| d.saturating_duration_since(now + Duration::from_millis(31)));
+        assert_eq!(
+            recovery.rack_timeout(now + Duration::from_millis(31)),
+            expected,
+        );
+        // And it must match the oracle full scan.
+        assert_eq!(recovery.rack_earliest_full_scan(), first_earliest);
     }
 
     #[test]
