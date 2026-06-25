@@ -84,6 +84,8 @@ struct TcpScoreboard {
     high_rxt: TcpSeq,
     lost_bytes: u32,
     reorder: u32,
+    #[cfg(test)]
+    clears: u64,
 }
 
 impl Clone for TcpScoreboard {
@@ -98,6 +100,8 @@ impl Clone for TcpScoreboard {
             high_rxt: self.high_rxt,
             lost_bytes: self.lost_bytes,
             reorder: self.reorder,
+            #[cfg(test)]
+            clears: self.clears,
         }
     }
 }
@@ -111,22 +115,43 @@ impl TcpScoreboard {
             high_rxt: 0u32.into(),
             lost_bytes: 0,
             reorder: TCP_DUPACK_THRESHOLD,
+            #[cfg(test)]
+            clears: 0,
         }
     }
 
     #[inline]
     fn clear(&mut self) {
-        self.holes = RbTree::with_capacity(self.holes.len().max(1));
+        // Preserve a minimum capacity so a subsequent rebuild with more holes
+        // than the previous one does not exhaust the fixed-size node pool.
+        let capacity = self.holes.len().max(32);
+        self.holes = RbTree::with_capacity(capacity);
         self.high_sacked = 0u32.into();
         self.high_rxt = 0u32.into();
         self.lost_bytes = 0;
         self.reorder = TCP_DUPACK_THRESHOLD;
+        #[cfg(test)]
+        {
+            self.clears = self.clears.saturating_add(1);
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct RackDeadlineIndex {
     earliest: Option<Instant>,
+}
+
+/// Test-only snapshot of the scoreboard used by the incremental-vs-full-rebuild
+/// oracle test.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ScoreboardSnapshot {
+    pub holes: std::vec::Vec<(u32, u32, bool)>,
+    pub high_sacked: u32,
+    pub high_rxt: u32,
+    pub lost_bytes: u32,
+    pub clears: u64,
 }
 
 #[derive(Debug)]
@@ -149,6 +174,10 @@ pub struct TcpRecoveryState {
     recovery_retransmitted: u32,
     recovery_new_data: u32,
     recovery_end_sequence: TcpSeq,
+    /// Test-only: when true, `on_ack` uses the full `rebuild_scoreboard`
+    /// (oracle path) instead of the incremental `advance_scoreboard_for_ack`.
+    #[cfg(test)]
+    force_full_rebuild_on_ack: bool,
 }
 
 impl TcpRecoveryState {
@@ -172,7 +201,16 @@ impl TcpRecoveryState {
             recovery_retransmitted: 0,
             recovery_new_data: 0,
             recovery_end_sequence: TcpSeq::from(0),
+            #[cfg(test)]
+            force_full_rebuild_on_ack: false,
         }
+    }
+
+    /// Test-only: force `on_ack` to use the full `rebuild_scoreboard` oracle
+    /// path instead of the incremental ACK path.
+    #[cfg(test)]
+    pub(crate) fn set_full_rebuild_ack_for_test(&mut self, on: bool) {
+        self.force_full_rebuild_on_ack = on;
     }
 
     pub fn next_packet_number(&mut self) -> PacketNumber {
@@ -259,11 +297,18 @@ impl TcpRecoveryState {
         let (acked, acked_bytes) = self.take_acked_segments(ack.acknowledgment);
         let advanced = !acked.is_empty();
         let latest_rtt = self.deliver_acked_segments(ack, acked, acked_bytes, congestion);
-        self.rebuild_scoreboard(
-            ack.acknowledgment,
-            self.scoreboard.high_sacked,
-            congestion.max_datagram_size(),
-        );
+        #[cfg(test)]
+        if self.force_full_rebuild_on_ack {
+            self.rebuild_scoreboard(
+                ack.acknowledgment,
+                self.scoreboard.high_sacked,
+                congestion.max_datagram_size(),
+            );
+        } else {
+            self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
+        }
+        #[cfg(not(test))]
+        self.advance_scoreboard_for_ack(ack.acknowledgment, congestion.max_datagram_size());
         self.maybe_finish_recovery(ack.acknowledgment);
         if self.recovery_active && advanced {
             self.queue_recovery_head(ack.now, ack.reordering_window);
@@ -331,7 +376,6 @@ impl TcpRecoveryState {
             let current = self.sent_sample_mut(sample_index);
             current.rack_deadline = None;
             current.lost = true;
-            self.mark_hole_lost(sample.sequence);
             recovery_started |= !self.recovery_active;
         }
         if recovery_started {
@@ -498,6 +542,43 @@ impl TcpRecoveryState {
     pub(crate) fn oldest_unacked_sample(&self) -> Option<TcpSentSample> {
         let index = self.sample_head?;
         Some(self.sent_sample(index))
+    }
+
+    /// Test accessor: snapshot of the scoreboard holes (start, end, lost) in
+    /// ascending order, plus `high_sacked`, `high_rxt` and `lost_bytes`.
+    #[cfg(test)]
+    pub(crate) fn scoreboard_snapshot(&self) -> ScoreboardSnapshot {
+        let mut holes: std::vec::Vec<(u32, u32, bool)> = std::vec::Vec::new();
+        for (start, hole) in self.scoreboard.holes.iter() {
+            holes.push((u32::from(*start), u32::from(hole.end), hole.lost));
+        }
+        ScoreboardSnapshot {
+            holes,
+            high_sacked: u32::from(self.scoreboard.high_sacked),
+            high_rxt: u32::from(self.scoreboard.high_rxt),
+            lost_bytes: self.scoreboard.lost_bytes,
+            clears: self.scoreboard.clears,
+        }
+    }
+
+    /// Test accessor: every outstanding sample as (sequence, end, bytes, lost,
+    /// retransmitted) in ascending sequence order.
+    #[cfg(test)]
+    pub(crate) fn sample_snapshot(&self) -> std::vec::Vec<(u32, u32, u32, bool, bool)> {
+        let mut out = std::vec::Vec::new();
+        let mut cursor = self.sample_head;
+        while let Some(index) = cursor {
+            let s = self.sent_sample(index);
+            out.push((
+                u32::from(s.sequence),
+                u32::from(s.end_sequence),
+                s.bytes,
+                s.lost,
+                s.retransmitted,
+            ));
+            cursor = s.next;
+        }
+        out
     }
 
     fn mark_rack_candidates(
@@ -787,6 +868,10 @@ impl TcpRecoveryState {
         self.scoreboard.high_sacked = high_sacked.max(acknowledgment);
         self.scoreboard.high_rxt = acknowledgment;
         if self.sample_head.is_none() || self.scoreboard.high_sacked <= acknowledgment {
+            // No SACK-gap holes remain, but RACK-lost samples above high_sacked
+            // still count toward lost_bytes — recompute from per-sample flags
+            // instead of leaving the zero from clear().
+            self.refresh_lost_bytes();
             self.rack_rescan_earliest();
             return;
         }
@@ -828,10 +913,120 @@ impl TcpRecoveryState {
         self.rack_rescan_earliest();
     }
 
+    /// Incremental scoreboard update for an ACK advancing `snd_una`.
+    ///
+    /// Unlike `rebuild_scoreboard`, this does NOT `holes.clear()` and rebuild
+    /// from the sample list. SACK-gap holes above `snd_una` are unchanged; only
+    /// holes that fell below the new cumulative ACK are removed or trimmed. This
+    /// matches the full rebuild because between two SACK ops the only sample
+    /// mutations an ACK causes are removals/shrinks at or below `snd_una`, which
+    /// never create holes above `snd_una` — so trimming at `acknowledgment` is
+    /// equivalent to a full rebuild. SACK ops still call `rebuild_scoreboard`
+    /// (which is where sacked-sample removal creates/merges holes).
+    fn advance_scoreboard_for_ack(
+        &mut self,
+        acknowledgment: TcpSeq,
+        max_datagram_size: u32,
+    ) {
+        self.scoreboard.high_sacked = self.scoreboard.high_sacked.max(acknowledgment);
+        // Match rebuild_scoreboard, which resets high_rxt to the cumulative ACK
+        // on every scoreboard update (take_rack_retransmit raises it again when
+        // it retransmits).
+        self.scoreboard.high_rxt = acknowledgment;
+        if self.sample_head.is_none() || self.scoreboard.high_sacked <= acknowledgment {
+            // No outstanding samples or everything up to high_sacked is now
+            // acknowledged: no SACK-gap holes remain. Drop holes without a full
+            // clear() of unrelated scoreboard state, then recompute lost_bytes
+            // from per-sample flags (RACK-lost samples above high_sacked still
+            // count).
+            let keys: Vec<TcpSeq> = self
+                .scoreboard
+                .holes
+                .iter()
+                .map(|(start, _)| *start)
+                .collect();
+            for start in keys {
+                self.scoreboard.holes.remove(&start);
+            }
+            self.refresh_lost_bytes();
+            self.rack_rescan_earliest();
+            return;
+        }
+
+        // Remove holes fully below the new ACK and trim the one it crosses.
+        // Collect first to avoid mutating while iterating.
+        let mut to_remove: Vec<TcpSeq> = Vec::new();
+        let mut to_trim: Option<(TcpSeq, TcpSeq, bool)> = None;
+        for (start, hole) in self.scoreboard.holes.iter() {
+            if hole.end <= acknowledgment {
+                to_remove.push(*start);
+            } else if *start < acknowledgment {
+                to_trim = Some((*start, hole.end, hole.lost));
+            }
+        }
+        for start in to_remove {
+            self.scoreboard.holes.remove(&start);
+        }
+        if let Some((old_start, end, lost)) = to_trim {
+            self.scoreboard.holes.remove(&old_start);
+            let _ = self
+                .scoreboard
+                .holes
+                .insert(acknowledgment, TcpScoreboardHole { end, lost });
+        }
+
+        // Ensure the leading SACK-gap hole exists. Full rebuild creates a hole
+        // `[ack, min(first_sample.seq, high_sacked))` whenever the lowest
+        // outstanding sample starts above snd_una. The trim above only shrinks
+        // existing holes; it cannot create this leading hole when the previous
+        // scoreboard had none (e.g. the last SACK ran while no samples were
+        // outstanding and early-returned, then a new sample was recorded above
+        // high_sacked). Recreate it from the first sample to match full rebuild.
+        if let Some(head) = self.sample_head {
+            let first = self.sent_sample(head);
+            if first.sequence > acknowledgment && acknowledgment < self.scoreboard.high_sacked {
+                let leading_end = first
+                    .sequence
+                    .min(self.scoreboard.high_sacked);
+                match self.scoreboard.holes.get_mut(&acknowledgment) {
+                    Some(hole) => {
+                        if hole.end < leading_end {
+                            hole.end = leading_end;
+                        }
+                    }
+                    None => {
+                        let _ = self.scoreboard.holes.insert(
+                            acknowledgment,
+                            TcpScoreboardHole {
+                                end: leading_end,
+                                lost: false,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        self.update_scoreboard_loss(max_datagram_size.max(1));
+        self.rack_rescan_earliest();
+    }
+    ///
+    /// Replaces the original O(holes^2) `should_mark_hole_lost` (which rescanned
+    /// all successor holes per hole). A hole is declared lost when enough sacked
+    /// bytes or sacked blocks accumulate in the holes ABOVE it. Walking holes
+    /// descending and accumulating `sacked_ahead` / `blocks_ahead` computes the
+    /// same decision for every hole in one pass.
+    ///
+    /// `sacked_ahead(hi)` = sum of gaps between consecutive holes from hi upward
+    /// (= `sum_{k>i} hk.start - h(k-1).end`); `blocks_ahead(hi)` = number of
+    /// holes above hi. These match the original per-hole successor scan exactly.
     fn update_scoreboard_loss(&mut self, max_datagram_size: u32) {
         let reorder_limit = self.scoreboard.reorder.max(TCP_DUPACK_THRESHOLD);
-        // Collect hole starts to evaluate, then apply, so we never hold a hole
-        // borrow while mutating samples via sent_sample_mut.
+        let mss = max_datagram_size.max(1);
+        let byte_threshold = reorder_limit.saturating_sub(1).saturating_mul(mss);
+
+        // Collect holes ascending, then decide descending so each hole sees the
+        // sacked bytes/blocks accumulated above it.
         let mut hole_starts: Vec<TcpSeq> = Vec::with_capacity(self.scoreboard.holes.len());
         let mut cursor = self.scoreboard.holes.first().map(|(start, _)| *start);
         while let Some(start) = cursor {
@@ -842,14 +1037,20 @@ impl TcpRecoveryState {
                 .successor(&start)
                 .map(|(next_start, _)| *next_start);
         }
-        for start in hole_starts {
-            let should_mark_lost =
-                self.should_mark_hole_lost(start, max_datagram_size, reorder_limit);
-            let Some(hole) = self.scoreboard.holes.get_mut(&start) else {
+
+        let mut sacked_ahead: u32 = 0;
+        let mut blocks_ahead: u32 = 0;
+        let mut higher_start: Option<TcpSeq> = None;
+        for &start in hole_starts.iter().rev() {
+            let Some(hole) = self.scoreboard.holes.get(&start).copied() else {
                 continue;
             };
-            hole.lost = should_mark_lost;
+            let should_mark_lost = blocks_ahead >= reorder_limit || sacked_ahead > byte_threshold;
             let hole_end = hole.end;
+            // Apply the decision without holding the borrow across sample mutation.
+            if let Some(h) = self.scoreboard.holes.get_mut(&start) {
+                h.lost = should_mark_lost;
+            }
             if should_mark_lost {
                 // Unify: a SACK-gap hole declared lost also marks the samples it
                 // covers as lost so the single per-sample retransmit walk in
@@ -857,6 +1058,13 @@ impl TcpRecoveryState {
                 // sample.lost directly in on_rack_timeout / queue_recovery_head.
                 self.mark_samples_in_range_lost(start, hole_end);
             }
+            // Accumulate the gap between this hole and the next-higher hole for
+            // the lower holes still to be decided.
+            if let Some(high_start) = higher_start {
+                sacked_ahead = sacked_ahead.saturating_add(hole_end.distance_to(high_start));
+                blocks_ahead = blocks_ahead.saturating_add(1);
+            }
+            higher_start = Some(start);
         }
         self.refresh_lost_bytes();
     }
@@ -878,47 +1086,6 @@ impl TcpRecoveryState {
         }
     }
 
-    fn should_mark_hole_lost(
-        &self,
-        start: TcpSeq,
-        max_datagram_size: u32,
-        reorder_limit: u32,
-    ) -> bool {
-        let Some(hole) = self.scoreboard.holes.get(&start).copied() else {
-            return false;
-        };
-        let mut sacked = 0u32;
-        let mut blocks = 0u32;
-        let mut previous_end = hole.end;
-        let mut cursor = self
-            .scoreboard
-            .holes
-            .successor(&start)
-            .map(|(next_start, _)| *next_start);
-        while let Some(next_start) = cursor {
-            sacked = sacked.saturating_add(previous_end.distance_to(next_start));
-            blocks = blocks.saturating_add(1);
-            if blocks >= reorder_limit
-                || sacked
-                    > reorder_limit
-                        .saturating_sub(1)
-                        .saturating_mul(max_datagram_size.max(1))
-            {
-                return true;
-            }
-            let Some(next_hole) = self.scoreboard.holes.get(&next_start).copied() else {
-                break;
-            };
-            previous_end = next_hole.end;
-            cursor = self
-                .scoreboard
-                .holes
-                .successor(&next_start)
-                .map(|(after_start, _)| *after_start);
-        }
-        false
-    }
-
     fn queue_recovery_head(&mut self, _: Instant, _: Duration) {
         let Some(head) = self.sample_head else {
             return;
@@ -932,37 +1099,9 @@ impl TcpRecoveryState {
             current.rack_deadline = None;
             current.lost = true;
         }
-        self.mark_hole_lost(sample.sequence);
         self.refresh_lost_bytes();
         self.rack_rescan_earliest();
         self.rack_timer_armed = self.has_pending_rack_deadline();
-    }
-
-    fn hole_covering_or_after(&self, sequence: TcpSeq) -> Option<(TcpSeq, TcpScoreboardHole)> {
-        if let Some((start, hole)) = self.scoreboard.holes.predecessor(&sequence)
-            && hole.end > sequence
-        {
-            return Some((*start, *hole));
-        }
-        if let Some(hole) = self.scoreboard.holes.get(&sequence).copied() {
-            return Some((sequence, hole));
-        }
-        self.scoreboard
-            .holes
-            .successor(&sequence)
-            .map(|(start, hole)| (*start, *hole))
-    }
-
-    fn mark_hole_lost(&mut self, sequence: TcpSeq) {
-        let Some((start, hole)) = self.hole_covering_or_after(sequence) else {
-            return;
-        };
-        if hole.end <= sequence {
-            return;
-        }
-        if let Some(current) = self.scoreboard.holes.get_mut(&start) {
-            current.lost = true;
-        }
     }
 
     fn refresh_lost_bytes(&mut self) {
@@ -1052,6 +1191,10 @@ impl Clone for TcpRecoveryState {
         cloned.recovery_retransmitted = self.recovery_retransmitted;
         cloned.recovery_new_data = self.recovery_new_data;
         cloned.recovery_end_sequence = self.recovery_end_sequence;
+        #[cfg(test)]
+        {
+            cloned.force_full_rebuild_on_ack = self.force_full_rebuild_on_ack;
+        }
         let mut cursor = self.sample_head;
         while let Some(index) = cursor {
             let sample = self.sent_sample(index);
@@ -1217,6 +1360,62 @@ mod tests {
             self.congestion_window = self.congestion_window.max(max_datagram_size);
         }
 
+        fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
+            (pending_bytes != 0).then_some(Duration::ZERO)
+        }
+    }
+
+    /// Congestion controller with fixed `congestion_window` and `max_datagram_size`
+    /// that ignores all callbacks. Used by the incremental-vs-full-rebuild oracle
+    /// test so the two parallel recovery instances see identical congestion
+    /// feedback and diverge only via the scoreboard update path.
+    #[derive(Clone, Debug, Default)]
+    struct FixedController {
+        mtu: u32,
+        congestion_window: u32,
+    }
+
+    impl CongestionController for FixedController {
+        fn new(max_datagram_size: u32) -> Self {
+            Self {
+                mtu: max_datagram_size,
+                congestion_window: max_datagram_size.saturating_mul(8),
+            }
+        }
+        fn metrics(&self) -> crate::transport::congestion::CongestionMetrics {
+            crate::transport::congestion::CongestionMetrics {
+                congestion_window: 0,
+                pacing_rate_bytes_per_second: None,
+                delivered: 0,
+                max_bandwidth_bytes_per_second: 0,
+                min_rtt: None,
+            }
+        }
+        fn max_datagram_size(&self) -> u32 {
+            self.mtu
+        }
+        fn congestion_window(&self) -> u32 {
+            self.congestion_window
+        }
+        fn pacing_rate_bytes_per_second(&self) -> Option<u64> {
+            None
+        }
+        fn delivered(&self) -> u64 {
+            0
+        }
+        fn min_rtt(&self) -> Option<Duration> {
+            None
+        }
+        fn max_bandwidth_bytes_per_second(&self) -> u64 {
+            0
+        }
+        fn on_packet_sent(&mut self, _: PacketNumber, _: u32, _: u32, _: Instant) {}
+        fn on_ack(&mut self, _: Instant, _: AckedPacket, _: RttSample, _: u32) {}
+        fn on_end_acks(&mut self, _: Instant, _: u32, _: bool, _: PacketNumber) {}
+        fn on_loss(&mut self, _: Instant, _: LostPacket, _: bool) {}
+        fn on_mtu_update(&mut self, max_datagram_size: u32) {
+            self.mtu = max_datagram_size;
+        }
         fn next_send_delay(&self, pending_bytes: u32) -> Option<Duration> {
             (pending_bytes != 0).then_some(Duration::ZERO)
         }
@@ -2133,6 +2332,165 @@ mod tests {
                 !module_body.contains(pattern),
                 "recovery.rs unexpectedly depends on forbidden layer symbol: {pattern}"
             );
+        }
+    }
+
+    // Deterministic LCG pseudo-random generator (fixed seed) so the oracle test
+    // is reproducible across runs.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u32(&mut self, bound: u32) -> u32 {
+            // xorshift64*
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            ((x >> 32) as u32) % bound.max(1)
+        }
+    }
+
+    #[test]
+    fn incremental_scoreboard_matches_full_rebuild_on_random_sack_sequences() {
+        // Verifies the incremental ACK scoreboard path produces identical state
+        // to the full per-ACK rebuild oracle on random record/ack/sack/rack
+        // sequences. Two parallel `TcpRecoveryState` instances run the same op
+        // sequence: `live` uses the incremental `advance_scoreboard_for_ack`;
+        // `oracle` forces the full `rebuild_scoreboard` on every ACK. After each
+        // op we compare holes (start/end/lost), high_sacked, high_rxt,
+        // lost_bytes, and every sample's (sequence/end/lost/retransmitted).
+        //
+        // RED before Part A: the `clears <= sack_ops + 1` contract fails because
+        //   the old code calls `TcpScoreboard::clear()` on every ACK.
+        // GREEN after Part A: the incremental path only clears on SACK, and all
+        //   scoreboard + per-sample state matches the full-rebuild oracle.
+        const MSS: u32 = 1_000;
+        const SEG: u32 = 1_000;
+        const MAX_SEGMENTS: u32 = 5;
+        let now = Instant::now();
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+
+        for sequence in 0..400u64 {
+            let mut live = TcpRecoveryState::new();
+            let mut oracle = TcpRecoveryState::new();
+            oracle.set_full_rebuild_ack_for_test(true);
+            let mut live_cc = FixedController::new(MSS);
+            let mut oracle_cc = FixedController::new(MSS);
+            let mut next_seq: u32 = 1_000;
+            let mut cum_ack: u32 = 1_000;
+            let mut sack_ops: u64 = 0;
+            let mut step = 0u64;
+            let steps = 8 + rng.next_u32(14) as u64;
+            while step < steps {
+                step += 1;
+                let op = rng.next_u32(4);
+                match op {
+                    0 => {
+                        if next_seq >= 1_000 + MAX_SEGMENTS * SEG {
+                            continue;
+                        }
+                        let seq = next_seq;
+                        next_seq = next_seq.saturating_add(SEG);
+                        let pn = ((seq / SEG) as u64).max(1) as PacketNumber;
+                        record_sent_for_test(&mut live, pn, seq, seq + SEG, SEG, now + Duration::from_millis(step));
+                        record_sent_for_test(&mut oracle, pn, seq, seq + SEG, SEG, now + Duration::from_millis(step));
+                    }
+                    1 => {
+                        // Cumulative TCP ACK is monotonic non-decreasing: only
+                        // advance it within [cum_ack, next_seq].
+                        let hi = next_seq.max(cum_ack);
+                        let ack_seq = cum_ack + rng.next_u32(hi.saturating_sub(cum_ack).max(1));
+                        cum_ack = ack_seq;
+                        let a = ack(ack_seq, now + Duration::from_millis(50 + step), 40);
+                        live.on_ack(a, &mut live_cc);
+                        oracle.on_ack(a, &mut oracle_cc);
+                    }
+                    2 => {
+                        if next_seq < 2 * SEG {
+                            continue;
+                        }
+                        let hi = next_seq.max(cum_ack);
+                        let ack_seq = cum_ack + rng.next_u32(hi.saturating_sub(cum_ack).max(1));
+                        cum_ack = ack_seq;
+                        let mut blocks: std::vec::Vec<TcpSackBlock> = std::vec::Vec::new();
+                        let nblocks = 1 + rng.next_u32(2) as usize;
+                        for _ in 0..nblocks {
+                            let span = next_seq.saturating_sub(ack_seq).max(1);
+                            let lo = ack_seq + rng.next_u32(span);
+                            let hi = (lo + 1 + rng.next_u32(span)).min(next_seq);
+                            if hi > lo {
+                                blocks.push(TcpSackBlock {
+                                    left_edge: TcpSeq::from(lo),
+                                    right_edge: TcpSeq::from(hi),
+                                });
+                            }
+                        }
+                        if blocks.is_empty() {
+                            continue;
+                        }
+                        sack_ops += 1;
+                        let a = ack(ack_seq, now + Duration::from_millis(50 + step), 40);
+                        live.on_sack_blocks(a, &blocks, &mut live_cc);
+                        oracle.on_sack_blocks(a, &blocks, &mut oracle_cc);
+                    }
+                    _ => {
+                        let t = now + Duration::from_millis(200 + step);
+                        live.on_rack_timeout(t, TcpSeq::from(next_seq), &mut live_cc);
+                        oracle.on_rack_timeout(t, TcpSeq::from(next_seq), &mut oracle_cc);
+                        while live.take_rack_retransmit().is_some() {}
+                        while oracle.take_rack_retransmit().is_some() {}
+                    }
+                }
+
+                let live_snap = live.scoreboard_snapshot();
+                let oracle_snap = oracle.scoreboard_snapshot();
+                let live_samples = live.sample_snapshot();
+                let oracle_samples = oracle.sample_snapshot();
+                // Compare scoreboard state (holes/high_sacked/high_rxt/lost_bytes).
+                // `clears` intentionally differs: the incremental path must clear
+                // less often than the full-rebuild oracle.
+                assert_eq!(
+                    live_snap.holes, oracle_snap.holes,
+                    "seq {sequence} step {step}: holes diverged\n\
+                     live={:?}\noracle={:?}\n\
+                     live_samples={live_samples:?}\noracle_samples={oracle_samples:?}\n\
+                     ack_floor={} high_sacked_live={} high_sacked_oracle={}",
+                    live_snap.holes, oracle_snap.holes,
+                    u32::from(live.ack_floor), live_snap.high_sacked, oracle_snap.high_sacked,
+                );
+                assert_eq!(
+                    live_snap.high_sacked, oracle_snap.high_sacked,
+                    "seq {sequence} step {step}: high_sacked diverged",
+                );
+                assert_eq!(
+                    live_snap.high_rxt, oracle_snap.high_rxt,
+                    "seq {sequence} step {step}: high_rxt diverged",
+                );
+                assert_eq!(
+                    live_snap.lost_bytes, oracle_snap.lost_bytes,
+                    "seq {sequence} step {step}: lost_bytes diverged (live={} oracle={})\n\
+                     live_samples={live_samples:?}\noracle_samples={oracle_samples:?}\n\
+                     live_holes={:?}\noracle_holes={:?}",
+                    live_snap.lost_bytes, oracle_snap.lost_bytes,
+                    live_snap.holes, oracle_snap.holes,
+                );
+                assert_eq!(
+                    live_samples, oracle_samples,
+                    "seq {sequence} step {step}: per-sample state diverged\n\
+                     live={live_samples:?}\noracle={oracle_samples:?}",
+                );
+
+                // Incremental contract: clear() must NOT run on every ACK. SACK
+                // ops may full-rebuild (clear), so allow clears up to sack_ops+1.
+                // Before Part A this fails because every ACK clears.
+                assert!(
+                    live_snap.clears <= sack_ops + 1,
+                    "seq {sequence} step {step}: too many scoreboard clears \
+                     (clears={}, sack_ops={sack_ops}); ACK path must be incremental",
+                    live_snap.clears,
+                );
+            }
+            let _ = sequence;
         }
     }
 }
