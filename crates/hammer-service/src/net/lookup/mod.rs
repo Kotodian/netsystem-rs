@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime,
     ForwardingMetadata, InternalNode, Node, NodeId, NodeProcessFn, NodeRegistration, NodeResult,
-    NodeRuntimeData, NodeVectorDispatch, PacketTrace, SecondaryOpaque, TapEthernetMetadata,
-    TraceFormatter, add_packet_trace, unlikely,
+    NodeRuntimeData, PacketTrace, SecondaryOpaque, TapEthernetMetadata, TraceFormatter,
+    add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult, HammerResult};
 use hammer_core::forwarding::{
@@ -81,7 +81,7 @@ impl IpLookupTrace {
 
 impl PacketTrace for IpLookupTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_u32(out, self.fib_index);
         put_option_dpo_type(out, self.route_dpo_type);
         put_option_u32(out, self.route_dpo_index);
@@ -125,7 +125,7 @@ impl AdjacencyRewriteTrace {
 
 impl PacketTrace for AdjacencyRewriteTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_u32(out, self.dpo_index);
         put_option_u32(out, self.egress_interface);
         put_usize(out, self.rewrite_len);
@@ -468,7 +468,8 @@ impl Node for IpLookupNode {
             Self::process_index_with_batch(&mut batch, &table, first, &mut traces)?
         };
         let mut first_chunk = true;
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
+        hammer_adapter::node_route_frame_cached!(
+            self,
             runtime,
             frame,
             |batch, indices| {
@@ -493,12 +494,12 @@ impl Node for IpLookupNode {
                 }
                 Ok(())
             },
-        )?;
-        for (index, trace) in traces {
-            add_packet_trace!(runtime, index, trace)?;
-        }
-        self.cached_next = cached_next;
-        Ok(result)
+            {
+                for (index, trace) in traces {
+                    add_packet_trace!(runtime, index, trace)?;
+                }
+            }
+        )
     }
 
     #[inline]
@@ -523,7 +524,7 @@ impl InternalNode for IpLookupNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next("ip-lookup-node", 0)
+        NodeRegistration::next(Self::NODE_NAME, 0)
     }
 }
 
@@ -651,13 +652,9 @@ impl Node for AdjacencyRewriteNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| Self::next_for_index(&self.table, runtime, index),
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
+            Self::next_for_index(&self.table, runtime, index)
+        })
     }
 
     #[inline]
@@ -682,7 +679,7 @@ impl InternalNode for AdjacencyRewriteNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next("adjacency-rewrite-node", 0)
+        NodeRegistration::next(Self::NODE_NAME, 0)
     }
 }
 
@@ -764,7 +761,8 @@ fn ip_lookup_process(
         IpLookupNode::process_index_with_batch(&mut batch, &table, first, &mut traces)?
     };
     let mut first_chunk = true;
-    let (result, _) = NodeVectorDispatch::new(Some(first_next)).route_frame(
+    hammer_adapter::node_route_frame_static!(
+        Some(first_next),
         runtime,
         frame,
         |batch, indices| {
@@ -789,11 +787,12 @@ fn ip_lookup_process(
             }
             Ok(())
         },
-    )?;
-    for (index, trace) in traces {
-        add_packet_trace!(runtime, index, trace)?;
-    }
-    Ok(result)
+        {
+            for (index, trace) in traces {
+                add_packet_trace!(runtime, index, trace)?;
+            }
+        }
+    )
 }
 
 fn adjacency_rewrite_process(
@@ -802,10 +801,9 @@ fn adjacency_rewrite_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = adjacency_rewrite_runtime(data)?;
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
         AdjacencyRewriteNode::next_for_index(&state.table, runtime, index)
-    })?;
-    Ok(result)
+    })
 }
 
 #[inline(always)]

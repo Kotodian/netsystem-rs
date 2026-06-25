@@ -5,10 +5,7 @@ use hammer_adapter::{
     NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::{
-    TCP_FLAG_ACK, TCP_FLAG_SYN, TcpConnectionId, TcpControlFlags, TcpPacket, TcpSegmentFlags,
-    TcpSeq,
-};
+use hammer_core::protocol::tcp::{TcpConnectionId, TcpError, TcpPacket, TcpSegmentFlags, TcpSeq};
 use hammer_infra::vec::Vec;
 
 use super::connection::TcpConnection;
@@ -151,9 +148,8 @@ where
     let tcp_output = next[TcpListenNext::Output as usize];
     let tcp_established = next[TcpListenNext::Established as usize];
     let drop_next = next[TcpListenNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_listen_index(
+    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
+        tcp_listen_index(
             runtime,
             index,
             control,
@@ -161,16 +157,8 @@ where
             tcp_output,
             tcp_established,
             &mut next_frames,
-        ) {
-            Ok(()) => Ok(None),
-            Err(_) => {
-                next_frames.enqueue(runtime, drop_next, index)?;
-                Ok(None)
-            }
-        }
-    })?;
-    next_frames.schedule(runtime)?;
-    Ok(NodeResult::drop())
+        )
+    })
 }
 
 fn tcp_listen_index<C>(
@@ -189,7 +177,7 @@ where
     let mut release_input = true;
     let listener = control
         .lookup_listener(packet.local)
-        .ok_or_else(|| CoreError::internal("tcp listener is missing"))?;
+        .ok_or(TcpError::NoListener)?;
     let mut tx_index = None;
     let established_session;
     let result = {
@@ -263,8 +251,10 @@ mod tests {
     };
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{TcpCapabilities, TcpFastOpenCookie};
+    use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
     use hammer_runtime::app::{AppCqeKind, AppOpId, AppSqe};
 
+    use super::*;
     use crate::data_plane::DropNode;
     use crate::transport::congestion::BbrController;
     use crate::transport::tcp::input::TcpInputControlPlane;
@@ -274,11 +264,9 @@ mod tests {
     use crate::transport::tcp::output::{TcpOutputNext, TcpOutputNode};
     use crate::transport::tcp::reply::tcp_control_cursor;
     use crate::transport::tcp::{
-        TcpEstablishedNext, TcpEstablishedNode, TcpInputNext, TcpSessionDriver,
+        TCP_FLAG_ACK, TCP_FLAG_SYN, TcpEstablishedNext, TcpEstablishedNode, TcpInputNext,
+        TcpSessionDriver,
     };
-    use hammer_core::protocol::tcp::synthesize_ipv4_tcp_control;
-
-    use super::*;
 
     const LOCAL_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     const REMOTE_IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 20);
@@ -840,13 +828,20 @@ mod tests {
     }
 
     fn syn_packet_from(remote: SocketAddr, sequence: u32) -> std::vec::Vec<u8> {
-        synthesize_ipv4_tcp_control(
+        tcp_control_packet(
             remote,
             local_addr(),
-            sequence,
-            0,
-            u16::MAX,
-            TcpControlFlags::from_bits(TCP_FLAG_SYN),
+            hammer_core::protocol::tcp::TcpSegmentHeader {
+                source_port: remote.port(),
+                destination_port: local_addr().port(),
+                sequence_number: sequence,
+                acknowledgment_number: 0,
+                flags: TcpSegmentFlags::SYN,
+                advertised_window: u16::MAX,
+                capabilities: TcpCapabilities::default(),
+                timestamp: None,
+                fast_open_cookie: None,
+            },
             &[],
         )
         .expect("syn packet")
@@ -858,9 +853,9 @@ mod tests {
         payload: &[u8],
         cookie: TcpFastOpenCookie,
     ) -> std::vec::Vec<u8> {
-        let mut options = [0u8; 20];
-        let header_len = hammer_core::protocol::tcp::write_tcp_segment_header(
-            &mut options,
+        tcp_control_packet(
+            remote,
+            local_addr(),
             hammer_core::protocol::tcp::TcpSegmentHeader {
                 source_port: remote.port(),
                 destination_port: local_addr().port(),
@@ -875,153 +870,118 @@ mod tests {
                 timestamp: None,
                 fast_open_cookie: Some(&cookie),
             },
-            None,
+            payload,
         )
-        .expect("write tfo header");
-        let tcp_options = &options[20..header_len];
-        let mut packet = synthesize_ipv4_tcp_control(
-            remote,
-            local_addr(),
-            sequence,
-            0,
-            u16::MAX,
-            TcpControlFlags::from_bits(TCP_FLAG_SYN),
-            tcp_options,
-        )
-        .expect("tfo syn");
-        packet.extend_from_slice(payload);
-        let total_len = u16::try_from(packet.len()).expect("packet len");
-        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
-        packet[10] = 0;
-        packet[11] = 0;
-        packet[36] = 0;
-        packet[37] = 0;
-        let source = match remote.ip() {
-            IpAddr::V4(ip) => ip,
-            _ => unreachable!(),
-        };
-        let destination = match local_addr().ip() {
-            IpAddr::V4(ip) => ip,
-            _ => unreachable!(),
-        };
-        let tcp_checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
-        let ip_checksum = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-        packet
+        .expect("tfo syn")
     }
 
     fn ack_packet(acknowledgment: u32) -> std::vec::Vec<u8> {
-        synthesize_ipv4_tcp_control(
+        tcp_control_packet(
             remote_addr(None),
             local_addr(),
-            CLIENT_ISN + 1,
-            acknowledgment,
-            u16::MAX,
-            TcpControlFlags::from_bits(TCP_FLAG_ACK),
+            hammer_core::protocol::tcp::TcpSegmentHeader {
+                source_port: remote_addr(None).port(),
+                destination_port: local_addr().port(),
+                sequence_number: CLIENT_ISN + 1,
+                acknowledgment_number: acknowledgment,
+                flags: TcpSegmentFlags::ACK,
+                advertised_window: u16::MAX,
+                capabilities: TcpCapabilities::default(),
+                timestamp: None,
+                fast_open_cookie: None,
+            },
             &[],
         )
         .expect("ack packet")
     }
 
     fn ack_packet_with_payload(acknowledgment: u32, payload_len: usize) -> std::vec::Vec<u8> {
-        let mut packet = synthesize_ipv4_tcp_control(
+        tcp_control_packet(
             remote_addr(None),
             local_addr(),
-            CLIENT_ISN + 1,
-            acknowledgment,
-            u16::MAX,
-            TcpControlFlags::from_bits(TCP_FLAG_ACK),
-            &[],
+            hammer_core::protocol::tcp::TcpSegmentHeader {
+                source_port: remote_addr(None).port(),
+                destination_port: local_addr().port(),
+                sequence_number: CLIENT_ISN + 1,
+                acknowledgment_number: acknowledgment,
+                flags: TcpSegmentFlags::ACK,
+                advertised_window: u16::MAX,
+                capabilities: TcpCapabilities::default(),
+                timestamp: None,
+                fast_open_cookie: None,
+            },
+            &std::vec![b'x'; payload_len],
         )
-        .expect("ack packet");
-        packet.extend(std::iter::repeat_n(b'x', payload_len));
-        let total_len = u16::try_from(packet.len()).expect("packet len");
-        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
-        packet[10] = 0;
-        packet[11] = 0;
-        packet[36] = 0;
-        packet[37] = 0;
-        let source = match remote_addr(None).ip() {
-            IpAddr::V4(ip) => ip,
-            _ => unreachable!(),
-        };
-        let destination = match local_addr().ip() {
-            IpAddr::V4(ip) => ip,
-            _ => unreachable!(),
-        };
-        let tcp_checksum = ipv4_l4_checksum(source, destination, 6, &packet[20..]);
-        packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
-        let ip_checksum = internet_checksum(&packet[..20]);
-        packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-        packet
+        .expect("ack packet")
     }
 
-    fn ipv4_l4_checksum(
-        source: Ipv4Addr,
-        destination: Ipv4Addr,
-        protocol: u8,
-        segment: &[u8],
-    ) -> u16 {
-        internet_checksum_parts(&[
-            &source.octets(),
-            &destination.octets(),
-            &[0, protocol],
-            &(segment.len() as u16).to_be_bytes(),
-            segment,
-        ])
-    }
-
-    fn internet_checksum(bytes: &[u8]) -> u16 {
-        let mut sum = 0u32;
-        for chunk in bytes.chunks(2) {
-            let word = match chunk {
-                [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
-                [hi] => u16::from_be_bytes([*hi, 0]) as u32,
-                _ => unreachable!(),
-            };
-            sum += word;
-            while sum > 0xffff {
-                sum = (sum & 0xffff) + (sum >> 16);
-            }
-        }
-        !(sum as u16)
-    }
-
-    fn internet_checksum_parts(parts: &[&[u8]]) -> u16 {
-        let mut sum = 0u32;
-        let mut high = None;
-        for part in parts {
-            let mut index = 0usize;
-            if let Some(hi) = high.take() {
-                if let Some(&lo) = part.first() {
-                    sum += u16::from_be_bytes([hi, lo]) as u32;
-                    while sum > 0xffff {
-                        sum = (sum & 0xffff) + (sum >> 16);
-                    }
-                    index = 1;
-                } else {
-                    high = Some(hi);
+    fn tcp_control_packet(
+        local: SocketAddr,
+        remote: SocketAddr,
+        header: hammer_core::protocol::tcp::TcpSegmentHeader<'_>,
+        payload: &[u8],
+    ) -> Result<std::vec::Vec<u8>, TcpError> {
+        let mut tcp = [0u8; 60];
+        let tcp_header_len =
+            hammer_core::protocol::tcp::write_tcp_segment_header(&mut tcp, header, None)?;
+        let tcp_len = tcp_header_len
+            .checked_add(payload.len())
+            .ok_or(TcpError::Dispatch)?;
+        match (local.ip(), remote.ip()) {
+            (IpAddr::V4(local_ip), IpAddr::V4(remote_ip)) => {
+                let packet_len = 20usize.checked_add(tcp_len).ok_or(TcpError::Dispatch)?;
+                let total_len = u16::try_from(packet_len).map_err(|_| TcpError::Length)?;
+                let mut packet = std::vec![0u8; packet_len];
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+                packet[8] = 64;
+                packet[9] = 6;
+                packet[12..16].copy_from_slice(&local_ip.octets());
+                packet[16..20].copy_from_slice(&remote_ip.octets());
+                packet[20..20 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
+                if !payload.is_empty() {
+                    packet[20 + tcp_header_len..20 + tcp_header_len + payload.len()]
+                        .copy_from_slice(payload);
                 }
+                let tcp_checksum = internet_checksum_parts(&[
+                    &local_ip.octets(),
+                    &remote_ip.octets(),
+                    &[0, 6],
+                    &(packet_len as u16 - 20).to_be_bytes(),
+                    &packet[20..],
+                ]);
+                packet[36..38].copy_from_slice(&tcp_checksum.to_be_bytes());
+                let ip_checksum = internet_checksum(&packet[..20]);
+                packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
+                Ok(packet)
             }
-            while index + 1 < part.len() {
-                sum += u16::from_be_bytes([part[index], part[index + 1]]) as u32;
-                while sum > 0xffff {
-                    sum = (sum & 0xffff) + (sum >> 16);
+            (IpAddr::V6(local_ip), IpAddr::V6(remote_ip)) => {
+                let packet_len = 40usize.checked_add(tcp_len).ok_or(TcpError::Dispatch)?;
+                let payload_len = u16::try_from(tcp_len).map_err(|_| TcpError::Length)?;
+                let mut packet = std::vec![0u8; packet_len];
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&payload_len.to_be_bytes());
+                packet[6] = 6;
+                packet[7] = 64;
+                packet[8..24].copy_from_slice(&local_ip.octets());
+                packet[24..40].copy_from_slice(&remote_ip.octets());
+                packet[40..40 + tcp_header_len].copy_from_slice(&tcp[..tcp_header_len]);
+                if !payload.is_empty() {
+                    packet[40 + tcp_header_len..40 + tcp_header_len + payload.len()]
+                        .copy_from_slice(payload);
                 }
-                index += 2;
+                let tcp_checksum = internet_checksum_parts(&[
+                    &local_ip.octets(),
+                    &remote_ip.octets(),
+                    &(tcp_len as u32).to_be_bytes(),
+                    &[0, 0, 0, 6],
+                    &packet[40..],
+                ]);
+                packet[56..58].copy_from_slice(&tcp_checksum.to_be_bytes());
+                Ok(packet)
             }
-            if index < part.len() {
-                high = Some(part[index]);
-            }
+            _ => Err(TcpError::SegmentInvalid),
         }
-        if let Some(hi) = high {
-            sum += u16::from_be_bytes([hi, 0]) as u32;
-            while sum > 0xffff {
-                sum = (sum & 0xffff) + (sum >> 16);
-            }
-        }
-        !(sum as u16)
     }
 
     fn tcp_sequence(packet: &[u8]) -> u32 {

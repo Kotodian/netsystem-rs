@@ -8,6 +8,7 @@ use hammer_core::config::TraceOptions;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::log::Logger;
 use hammer_infra::map::FlatHashTable;
+use hammer_infra::vec::Vec;
 
 use crate::node::NodeId;
 

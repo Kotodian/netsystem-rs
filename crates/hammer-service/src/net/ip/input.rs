@@ -3,8 +3,8 @@ use std::sync::{Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, IpEcnCodepoint,
-    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, TraceFormatter, add_packet_trace, unlikely,
+    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    TraceFormatter, add_packet_trace, unlikely,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -73,7 +73,7 @@ impl IpInputTrace {
 }
 
 impl PacketTrace for IpInputTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_ip_version(out, self.version);
         put_option_ip_protocol(out, self.protocol);
         put_option_ip_input_target(out, self.input_target);
@@ -127,7 +127,8 @@ where
             first_next
         };
         let mut first_chunk = true;
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame(
+        hammer_adapter::node_route_frame_cached!(
+            self,
             runtime,
             frame,
             |batch, indices| {
@@ -157,12 +158,12 @@ where
                     &mut traces,
                 )
             },
-        )?;
-        for (index, trace) in traces {
-            add_packet_trace!(runtime, index, trace)?;
-        }
-        self.cached_next = cached_next;
-        Ok(result)
+            {
+                for (index, trace) in traces {
+                    add_packet_trace!(runtime, index, trace)?;
+                }
+            }
+        )
     }
 
     #[inline]
@@ -218,7 +219,8 @@ where
     };
     let mut last_next = Some(first_next);
     let mut first_chunk = true;
-    let (result, _) = NodeVectorDispatch::new(Some(first_next)).route_frame(
+    hammer_adapter::node_route_frame_static!(
+        Some(first_next),
         runtime,
         frame,
         |batch, indices| {
@@ -248,11 +250,12 @@ where
                 &mut traces,
             )
         },
-    )?;
-    for (index, trace) in traces {
-        add_packet_trace!(runtime, index, trace)?;
-    }
-    Ok(result)
+        {
+            for (index, trace) in traces {
+                add_packet_trace!(runtime, index, trace)?;
+            }
+        }
+    )
 }
 
 fn ip_input_runtimes() -> &'static Mutex<Vec<IpInputRuntime>> {

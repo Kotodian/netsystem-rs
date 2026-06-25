@@ -2,11 +2,11 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 
-use super::segment::parse_tcp_packet;
 use super::publish_tcp_connection;
-use super::{TcpQueue, read_session_id};
+use super::segment::parse_tcp_packet;
+use super::{TcpNodeError, TcpQueue, read_session_id};
 use crate::transport::congestion::CongestionController;
 
 #[hammer_component_macros::node_next]
@@ -68,18 +68,9 @@ where
 {
     let tcp_output = next[TcpSynSentNext::Output as usize];
     let drop_next = next[TcpSynSentNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_syn_sent_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
-            Ok(()) => Ok(None),
-            Err(_) => {
-                next_frames.enqueue(runtime, drop_next, index)?;
-                Ok(None)
-            }
-        }
-    })?;
-    next_frames.schedule(runtime)?;
-    Ok(NodeResult::drop())
+    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
+        tcp_syn_sent_index(runtime, index, session_queue, tcp_output, &mut next_frames)
+    })
 }
 
 fn tcp_syn_sent_index<C>(
@@ -98,12 +89,12 @@ where
     let mut complete_connected = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id = read_session_id(runtime, index)?
-            .ok_or_else(|| CoreError::internal("tcp syn-sent session route is missing"))?;
+        let session_id =
+            read_session_id(runtime, index)?.ok_or(TcpNodeError::SynSentSessionRouteMissing)?;
         let (control, acked_tx_len, established, established_with_payload) = {
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp syn-sent session is missing"))?;
+                .ok_or(TcpNodeError::SynSentSessionMissing)?;
             let previous_snd_una = connection.snd_una();
             let previous_state = connection.state();
             let control = connection.receive_open_reply(&packet)?;

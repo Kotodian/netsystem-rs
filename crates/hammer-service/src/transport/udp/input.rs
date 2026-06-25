@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextStorage, NodeProcessFn,
-    NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, SecondaryOpaque, TraceFormatter,
-    add_packet_trace,
+    NodeResult, NodeRuntimeData, PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::IcmpErrorMetadata;
@@ -76,7 +75,7 @@ impl UdpInputTrace {
 }
 
 impl PacketTrace for UdpInputTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_ip_version(out, self.version);
         put_option_ip_protocol(out, self.protocol);
         put_option_u16(out, self.source_port);
@@ -238,13 +237,9 @@ impl Node for UdpInputNode {
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
         let next = Self::runtime_nexts(runtime)?;
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| next_node_for_index(runtime, index, &snapshot, &next),
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
+            next_node_for_index(runtime, index, &snapshot, &next)
+        })
     }
 
     #[inline]
@@ -300,10 +295,9 @@ fn udp_input_process(
     let state = udp_input_runtime(data)?;
     let snapshot = state.snapshot.load();
     let next = UdpInputNode::runtime_nexts(runtime)?;
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
         next_node_for_index(runtime, index, &snapshot, &next)
-    })?;
-    Ok(result)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

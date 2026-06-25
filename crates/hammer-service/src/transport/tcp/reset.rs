@@ -1,10 +1,11 @@
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId,
-    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    NodeProcessFn, NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
-    tcp_reset_network_header_len, tcp_reset_reply_from_current_packet, TcpResetPacketCursor,
+    TcpError, TcpResetError, TcpResetPacketCursor, tcp_reset_network_header_len,
+    tcp_reset_reply_from_current_packet,
 };
 
 #[hammer_component_macros::node_next]
@@ -28,15 +29,16 @@ impl Node for TcpResetNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        let (result, cached_next) = tcp_reset_process_frame(
-            runtime,
-            frame,
-            next[TcpResetNext::Drop as usize],
-            next[TcpResetNext::Lookup as usize],
-            self.cached_next,
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_process_cached!(
+            self,
+            tcp_reset_process_frame(
+                runtime,
+                frame,
+                next[TcpResetNext::Drop as usize],
+                next[TcpResetNext::Lookup as usize],
+                self.cached_next,
+            )
+        )
     }
 
     #[inline]
@@ -56,14 +58,13 @@ fn tcp_reset_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let next = TcpResetNode::runtime_nexts(runtime)?;
-    let (result, _) = tcp_reset_process_frame(
+    hammer_adapter::node_process_static!(tcp_reset_process_frame(
         runtime,
         frame,
         next[TcpResetNext::Drop as usize],
         next[TcpResetNext::Lookup as usize],
         None,
-    )?;
-    Ok(result)
+    ))
 }
 
 fn tcp_reset_process_frame(
@@ -73,7 +74,8 @@ fn tcp_reset_process_frame(
     lookup_next: NodeId,
     cached_next: Option<NodeId>,
 ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    NodeVectorDispatch::new(cached_next).route_frame(
+    hammer_adapter::node_route_frame_result!(
+        cached_next,
         runtime,
         frame,
         prefetch_tcp_reset,
@@ -87,7 +89,7 @@ fn tcp_reset_process_frame(
                 )?);
             }
             Ok(())
-        },
+        }
     )
 }
 
@@ -106,11 +108,17 @@ fn tcp_reset_next_for_index(
 ) -> CoreResult<NodeId> {
     let packet = runtime.copy_current_chain(index)?;
     let cursor = tcp_reset_packet_cursor(runtime.get_buffer(index)?.packet_cursor());
-    let Some(reply) = tcp_reset_reply_from_current_packet(&packet, cursor) else {
-        return Ok(drop_next);
+    let reply_len = {
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        buffer.truncate_chain(0)?;
+        let writable = buffer.writable_tail_mut();
+        let Some(reply_len) = tcp_reset_reply_from_current_packet(writable, &packet, cursor) else {
+            return Ok(drop_next);
+        };
+        buffer.commit_writable_tail(reply_len)?;
+        reply_len
     };
-    replace_current_chain(runtime, index, &reply.packet)?;
-    refresh_reset_metadata(runtime, index, &reply.packet)?;
+    refresh_reset_metadata(runtime, index, reply_len)?;
     Ok(lookup_next)
 }
 
@@ -126,32 +134,21 @@ fn tcp_reset_packet_cursor(cursor: BufferPacketCursor) -> TcpResetPacketCursor {
     }
 }
 
-#[inline(always)]
-fn replace_current_chain(
-    runtime: &DataPlaneRuntime,
-    index: BufferIndex,
-    packet: &[u8],
-) -> CoreResult<()> {
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.truncate_chain(0)?;
-    buffer.append(packet)
-}
-
 fn refresh_reset_metadata(
     runtime: &DataPlaneRuntime,
     index: BufferIndex,
-    packet: &[u8],
+    packet_len: usize,
 ) -> CoreResult<()> {
     const TCP_HEADER_LEN: usize = 20;
 
-    let network_header_len = tcp_reset_network_header_len(packet)
-        .ok_or_else(|| CoreError::internal("tcp reset reply uses unsupported IP version"))?;
-
     let mut buffer = runtime.get_buffer_mut(index)?;
+    let network_header_len = tcp_reset_network_header_len(buffer.current())
+        .ok_or(TcpResetError::UnsupportedIpVersion)
+        .map_err(TcpError::from)?;
     buffer.clear_node_error();
     buffer.set_packet_cursor(
         BufferPacketCursor::new()
-            .with_packet_len(packet.len())
+            .with_packet_len(packet_len)
             .with_network_header(0, network_header_len)
             .with_transport_header(network_header_len, TCP_HEADER_LEN)
             .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
@@ -233,9 +230,11 @@ mod tests {
             .push_index(index)
             .expect("push index");
 
-        assert!(runtime
-            .schedule_frame(reset, frame)
-            .expect("schedule reset"));
+        assert!(
+            runtime
+                .schedule_frame(reset, frame)
+                .expect("schedule reset")
+        );
         assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
 
         let packet = runtime.copy_current_chain(index).expect("rewritten packet");
@@ -245,11 +244,13 @@ mod tests {
         assert_eq!(cursor.network_header_offset(), 0);
         assert_eq!(cursor.transport_header_offset(), 20);
         assert_eq!(cursor.transport_payload_offset(), 40);
-        assert!(runtime
-            .get_buffer(index)
-            .expect("buffer")
-            .node_error()
-            .is_none());
+        assert!(
+            runtime
+                .get_buffer(index)
+                .expect("buffer")
+                .node_error()
+                .is_none()
+        );
         assert!(reply_tcp.rst());
         assert_eq!(reply_tcp.sequence_number(), 9_000);
     }

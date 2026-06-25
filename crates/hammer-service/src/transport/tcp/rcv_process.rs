@@ -2,16 +2,15 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 
 use crate::transport::congestion::CongestionController;
 
 use super::segment::parse_tcp_packet;
 use super::{
-    publish_tcp_connection, refresh_tcp_timers_for_session,
     TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
-    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpQueue,
-    read_session_id,
+    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TIME_WAIT, TCP_TIMER_TLP, TcpNodeError,
+    TcpQueue, publish_tcp_connection, read_session_id, refresh_tcp_timers_for_session,
 };
 
 #[hammer_component_macros::node_next]
@@ -73,18 +72,9 @@ where
 {
     let tcp_output = next[TcpRcvProcessNext::Output as usize];
     let drop_next = next[TcpRcvProcessNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
-            Ok(()) => Ok(None),
-            Err(_) => {
-                next_frames.enqueue(runtime, drop_next, index)?;
-                Ok(None)
-            }
-        }
-    })?;
-    next_frames.schedule(runtime)?;
-    Ok(NodeResult::drop())
+    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
+        tcp_rcv_process_index(runtime, index, session_queue, tcp_output, &mut next_frames)
+    })
 }
 
 fn tcp_rcv_process_index<C>(
@@ -100,14 +90,14 @@ where
     let packet = parse_tcp_packet(runtime, index)?;
     let mut release_input = true;
     let mut complete_connected = None;
-    let result = {
+    let result: CoreResult<_> = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id = read_session_id(runtime, index)?
-            .ok_or_else(|| CoreError::internal("tcp rcv-process session route is missing"))?;
+        let session_id =
+            read_session_id(runtime, index)?.ok_or(TcpNodeError::RcvProcessSessionRouteMissing)?;
         let (control, ack_advanced, acked_tx_len, established, established_with_payload) = {
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp rcv-process session is missing"))?;
+                .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
             let previous_state = connection.state();
             let previous_snd_una = connection.snd_una();
             let control = connection.receive_close_side(&packet)?;

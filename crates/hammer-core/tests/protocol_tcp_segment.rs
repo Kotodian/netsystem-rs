@@ -142,7 +142,7 @@ fn write_header_for_test(
     flags: TcpSegmentFlags,
     sack_blocks: &[TcpSackBlock],
 ) -> Result<usize, hammer_core::error::CoreError> {
-    write_tcp_segment_header(
+    Ok(write_tcp_segment_header(
         output,
         TcpSegmentHeader {
             source_port: 49_152,
@@ -156,7 +156,7 @@ fn write_header_for_test(
             fast_open_cookie: None,
         },
         Some(sack_blocks),
-    )
+    )?)
 }
 
 fn map_tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpSegmentParseError {

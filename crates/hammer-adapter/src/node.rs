@@ -20,6 +20,147 @@ pub use next::{
     NodeVectorDispatch, default_prefetch_indices,
 };
 
+#[macro_export]
+macro_rules! node_process_cached {
+    ($node:expr, $process:expr $(, $after:block )? ) => {{
+        let (result, cached_next) = $process?;
+        $(
+            $after
+        )?
+        $node.cached_next = cached_next;
+        Ok(result)
+    }};
+}
+
+#[macro_export]
+macro_rules! node_process_static {
+    ($process:expr $(, $after:block )? ) => {{
+        let (result, _) = $process?;
+        $(
+            $after
+        )?
+        Ok(result)
+    }};
+}
+
+#[macro_export]
+macro_rules! node_rewrite_frame {
+    ($runtime:expr, $frame:expr, $drop_next:expr, |$index:ident, $next_frames:ident| $body:expr $(,)?) => {{
+        let mut $next_frames = $crate::node::NodeNextFrames::default();
+        $frame.rewrite_indices_batched(
+            $runtime.preferred_frame_batch_width(),
+            |$index| match $body {
+                Ok(()) => Ok(None),
+                Err(_) => {
+                    $next_frames.enqueue($runtime, $drop_next, $index)?;
+                    Ok(None)
+                }
+            },
+        )?;
+        $next_frames.schedule($runtime)?;
+        Ok($crate::node::NodeResult::drop())
+    }};
+}
+
+#[macro_export]
+macro_rules! node_rewrite_frame_current {
+    (
+        $runtime:expr,
+        $frame:expr,
+        |$next_frames:ident, $current_next:ident| $before:block,
+        |$index:ident, $rewrite_next_frames:ident, $rewrite_current_next:ident| $body:expr
+        $(,)?
+    ) => {{
+        let mut $next_frames = $crate::node::NodeNextFrames::default();
+        let mut $current_next = None;
+        $before
+        $frame.rewrite_indices_batched($runtime.preferred_frame_batch_width(), |$index| $body)?;
+        $next_frames.schedule($runtime)?;
+        if $frame.has_pending()
+            && let Some(node) = $current_next
+        {
+            Ok($crate::node::NodeResult::next_current(node))
+        } else {
+            Ok($crate::node::NodeResult::drop())
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_cached {
+    ($node:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr $(, $after:block )? ) => {{
+        $crate::node_process_cached!(
+            $node,
+            $crate::node::NodeVectorDispatch::new($node.cached_next)
+                .route_frame($runtime, $frame, $prefetch, $route)
+            $(, $after )?
+        )
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_static {
+    ($cached_next:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr $(, $after:block )? ) => {{
+        $crate::node_process_static!(
+            $crate::node::NodeVectorDispatch::new($cached_next)
+                .route_frame($runtime, $frame, $prefetch, $route)
+            $(, $after )?
+        )
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_index_cached {
+    ($node:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
+        $crate::node_process_cached!(
+            $node,
+            $crate::node::NodeVectorDispatch::new($node.cached_next)
+                .route_frame_index($runtime, $frame, $route)
+            $(, $after )?
+        )
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_index_static {
+    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
+        $crate::node_process_static!(
+            $crate::node::NodeVectorDispatch::new($cached_next)
+                .route_frame_index($runtime, $frame, $route)
+            $(, $after )?
+        )
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_result {
+    ($cached_next:expr, $runtime:expr, $frame:expr, $prefetch:expr, $route:expr) => {{
+        $crate::node::NodeVectorDispatch::new($cached_next)
+            .route_frame($runtime, $frame, $prefetch, $route)
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_index_result {
+    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr) => {{
+        $crate::node::NodeVectorDispatch::new($cached_next)
+            .route_frame_index($runtime, $frame, $route)
+    }};
+}
+
+#[macro_export]
+macro_rules! node_route_frame_index_cache_slot {
+    ($cached_next:expr, $runtime:expr, $frame:expr, $route:expr $(, $after:block )? ) => {{
+        let (result, next_cache) =
+            $crate::node_route_frame_index_result!(*$cached_next, $runtime, $frame, $route)?;
+        $(
+            $after
+        )?
+        *$cached_next = next_cache;
+        Ok(result)
+    }};
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(u32);
 

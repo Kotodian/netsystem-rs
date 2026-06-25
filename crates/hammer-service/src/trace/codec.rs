@@ -6,6 +6,7 @@ use hammer_core::protocol::icmp::IcmpErrorFamily;
 use hammer_core::protocol::ip::{
     IpFragmentKey, IpInputError, IpInputTarget, IpProtocol, IpVersion,
 };
+use hammer_infra::vec::Vec;
 
 pub(crate) fn put_bool(out: &mut Vec<u8>, value: bool) {
     out.push(u8::from(value));

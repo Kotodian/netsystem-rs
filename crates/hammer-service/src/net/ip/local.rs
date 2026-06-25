@@ -4,8 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, Node, NodeId, NodeNextStorage,
-    NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
@@ -90,7 +89,7 @@ impl IpLocalTrace {
 }
 
 impl PacketTrace for IpLocalTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_u8(
             out,
             match self.stage {
@@ -490,19 +489,16 @@ fn process_frame(
     feature_arc: Option<&FeatureArcStartHandle>,
     cached_next: &mut Option<NodeId>,
 ) -> CoreResult<NodeResult> {
-    let (result, next_cache) =
-        NodeVectorDispatch::new(*cached_next).route_frame_index(runtime, frame, |index| {
-            Ok(Some(process_index(
-                runtime,
-                index,
-                state,
-                &next,
-                stage,
-                feature_arc,
-            )?))
-        })?;
-    *cached_next = next_cache;
-    Ok(result)
+    hammer_adapter::node_route_frame_index_cache_slot!(cached_next, runtime, frame, |index| {
+        Ok(Some(process_index(
+            runtime,
+            index,
+            state,
+            &next,
+            stage,
+            feature_arc,
+        )?))
+    })
 }
 
 #[inline(always)]

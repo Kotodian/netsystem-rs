@@ -1154,7 +1154,7 @@ impl DataPlaneRuntime {
         };
         let node_name = self.nodes.node_name(node)?;
         let formatter = self.nodes.node_trace_formatter(node)?;
-        let mut payload_bytes = std::vec::Vec::new();
+        let mut payload_bytes = hammer_infra::vec::Vec::new();
         trace.encode_trace(&mut payload_bytes);
         self.buffers
             .trace

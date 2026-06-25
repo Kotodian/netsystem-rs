@@ -1,16 +1,18 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use hammer_core::protocol::tcp::{
-    tcp_reset_network_header_len, tcp_reset_remote_reply_addrs,
-    tcp_reset_reply_from_current_packet, TcpResetPacketCursor,
+    TcpResetPacketCursor, tcp_reset_network_header_len, tcp_reset_remote_reply_addrs,
+    tcp_reset_reply_from_current_packet,
 };
 
 #[test]
 fn core_tcp_reset_ack_segment_replies_with_rst_only() {
     let packet = ipv4_tcp_packet(0x10, 1_000, 9_000, &[]);
-    let reply = tcp_reset_reply_from_current_packet(&packet, ipv4_tcp_cursor(packet.len()))
-        .expect("reply for ack segment");
-    let reply_tcp = etherparse::TcpSlice::from_slice(&reply.packet[20..]).expect("parse reply");
+    let mut reply = [0u8; 60];
+    let reply_len =
+        tcp_reset_reply_from_current_packet(&mut reply, &packet, ipv4_tcp_cursor(packet.len()))
+            .expect("reply for ack segment");
+    let reply_tcp = etherparse::TcpSlice::from_slice(&reply[20..reply_len]).expect("parse reply");
 
     assert!(reply_tcp.rst());
     assert!(!reply_tcp.ack());
@@ -23,9 +25,11 @@ fn core_tcp_reset_ack_segment_replies_with_rst_only() {
 #[test]
 fn core_tcp_reset_non_ack_segment_replies_with_rst_ack_using_sequence_space() {
     let packet = ipv4_tcp_packet(0x02, 1_000, 0, b"hello");
-    let reply = tcp_reset_reply_from_current_packet(&packet, ipv4_tcp_cursor(packet.len()))
-        .expect("reply for syn");
-    let reply_tcp = etherparse::TcpSlice::from_slice(&reply.packet[20..]).expect("parse reply");
+    let mut reply = [0u8; 60];
+    let reply_len =
+        tcp_reset_reply_from_current_packet(&mut reply, &packet, ipv4_tcp_cursor(packet.len()))
+            .expect("reply for syn");
+    let reply_tcp = etherparse::TcpSlice::from_slice(&reply[20..reply_len]).expect("parse reply");
 
     assert!(reply_tcp.rst());
     assert!(reply_tcp.ack());
@@ -36,9 +40,11 @@ fn core_tcp_reset_non_ack_segment_replies_with_rst_ack_using_sequence_space() {
 #[test]
 fn core_tcp_reset_fin_consumes_sequence_space() {
     let packet = ipv4_tcp_packet(0x01, 4_000, 0, b"abc");
-    let reply = tcp_reset_reply_from_current_packet(&packet, ipv4_tcp_cursor(packet.len()))
-        .expect("reply for fin");
-    let reply_tcp = etherparse::TcpSlice::from_slice(&reply.packet[20..]).expect("parse reply");
+    let mut reply = [0u8; 60];
+    let reply_len =
+        tcp_reset_reply_from_current_packet(&mut reply, &packet, ipv4_tcp_cursor(packet.len()))
+            .expect("reply for fin");
+    let reply_tcp = etherparse::TcpSlice::from_slice(&reply[20..reply_len]).expect("parse reply");
 
     assert_eq!(reply_tcp.acknowledgment_number(), 4_004);
 }
@@ -47,7 +53,10 @@ fn core_tcp_reset_fin_consumes_sequence_space() {
 fn core_tcp_reset_drops_existing_rst_segment() {
     let packet = ipv4_tcp_packet(0x14, 1_000, 9_000, &[]);
 
-    assert!(tcp_reset_reply_from_current_packet(&packet, ipv4_tcp_cursor(packet.len())).is_none());
+    assert!(
+        tcp_reset_reply_from_current_packet(&mut [0u8; 60], &packet, ipv4_tcp_cursor(packet.len()))
+            .is_none()
+    );
 }
 
 #[test]

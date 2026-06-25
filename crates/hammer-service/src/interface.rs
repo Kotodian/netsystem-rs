@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, NetworkOpaque, Node, NodeId,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch, PacketTrace,
-    TraceFormatter, add_packet_trace,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, PacketTrace, TraceFormatter,
+    add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::forwarding::AdjacencyRewrite;
@@ -802,7 +802,7 @@ impl InterfaceOutputTrace {
 
 impl PacketTrace for InterfaceOutputTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_u32(out, self.egress_interface);
         put_option_node(out, self.tx_node);
         put_option_u16(out, self.error);
@@ -895,13 +895,9 @@ impl Node for InterfaceOutputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| Self::tx_for_index(&self.output, runtime, index),
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
+            Self::tx_for_index(&self.output, runtime, index)
+        })
     }
 
     #[inline]
@@ -926,7 +922,7 @@ impl InternalNode for InterfaceOutputNode {
     where
         Self: Sized,
     {
-        NodeRegistration::next("interface-output-node", 0)
+        NodeRegistration::next(Self::NODE_NAME, 0)
     }
 }
 
@@ -965,8 +961,7 @@ fn interface_output_process(
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let state = interface_output_runtime(data)?;
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
         InterfaceOutputNode::tx_for_index(&state.output, runtime, index)
-    })?;
-    Ok(result)
+    })
 }

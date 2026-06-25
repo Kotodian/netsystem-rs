@@ -99,7 +99,7 @@ impl IpReassemblyTrace {
 
 impl PacketTrace for IpReassemblyTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_ip_fragment_key(out, self.key);
         put_u8(out, self.action.encode());
         put_u32(out, self.current_worker.slot() as u32);
@@ -261,11 +261,13 @@ impl IpReassemblyRuntime {
         next: [NodeId; IpReassemblyNext::COUNT],
         now: Instant,
     ) -> CoreResult<NodeResult> {
-        let mut next_frames = NodeNextFrames::default();
-        let mut current_next = None;
-        self.failed_keys.clear();
-        frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-            self.process_index(
+        hammer_adapter::node_rewrite_frame_current!(
+            runtime,
+            frame,
+            |next_frames, current_next| {
+                self.failed_keys.clear();
+            },
+            |index, next_frames, current_next| self.process_index(
                 runtime,
                 &mut next_frames,
                 &mut current_next,
@@ -273,15 +275,7 @@ impl IpReassemblyRuntime {
                 index,
                 now,
             )
-        })?;
-        next_frames.schedule(runtime)?;
-        if frame.has_pending()
-            && let Some(node) = current_next
-        {
-            Ok(NodeResult::next_current(node))
-        } else {
-            Ok(NodeResult::drop())
-        }
+        )
     }
 
     #[inline]

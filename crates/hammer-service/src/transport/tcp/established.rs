@@ -2,14 +2,13 @@ use hammer_adapter::{
     BufferFrame, BufferIndex, DataPlaneRuntime, Node, NodeId, NodeNextFrames, NodeProcessFn,
     NodeResult, NodeRuntimeData,
 };
-use hammer_core::error::{CoreError, CoreResult};
+use hammer_core::error::CoreResult;
 
 use super::segment::parse_tcp_packet;
 use super::{
-    refresh_tcp_timers,
     TCP_TIMER_DELAYED_ACK, TCP_TIMER_KEEP_ALIVE, TCP_TIMER_PACING, TCP_TIMER_PERSIST,
-    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpQueue, TcpWorkerOwnedState,
-    read_session_id,
+    TCP_TIMER_RACK, TCP_TIMER_RETRANSMIT, TCP_TIMER_TLP, TcpNodeError, TcpQueue,
+    TcpWorkerOwnedState, read_session_id, refresh_tcp_timers,
 };
 use crate::session::protocol::SessionQueueControlContext;
 use crate::transport::congestion::CongestionController;
@@ -73,18 +72,9 @@ where
 {
     let tcp_output = next[TcpEstablishedNext::Output as usize];
     let drop_next = next[TcpEstablishedNext::Drop as usize];
-    let mut next_frames = NodeNextFrames::default();
-    frame.rewrite_indices_batched(runtime.preferred_frame_batch_width(), |index| {
-        match tcp_established_index(runtime, index, session_queue, tcp_output, &mut next_frames) {
-            Ok(()) => Ok(None),
-            Err(_) => {
-                next_frames.enqueue(runtime, drop_next, index)?;
-                Ok(None)
-            }
-        }
-    })?;
-    next_frames.schedule(runtime)?;
-    Ok(NodeResult::drop())
+    hammer_adapter::node_rewrite_frame!(runtime, frame, drop_next, |index, next_frames| {
+        tcp_established_index(runtime, index, session_queue, tcp_output, &mut next_frames)
+    })
 }
 
 fn tcp_established_index<C>(
@@ -102,8 +92,8 @@ where
     let mut tx_segment = None;
     let result = {
         let mut queue = session_queue.borrow_mut()?;
-        let session_id = read_session_id(runtime, index)?
-            .ok_or_else(|| CoreError::internal("tcp established session route is missing"))?;
+        let session_id =
+            read_session_id(runtime, index)?.ok_or(TcpNodeError::EstablishedSessionRouteMissing)?;
         let (
             control,
             acked_tx_len,
@@ -114,7 +104,7 @@ where
         ) = {
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
             let previous_snd_una = connection.snd_una();
             let (control, _) = connection.receive_established(&packet)?;
             let accept_payload = connection.accept_payload(&packet);
@@ -145,7 +135,7 @@ where
             let enqueue = queue.enqueue_rx(session_id, index, offset, false)?;
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
             connection.receive_payload(
                 accepted_sequence,
                 trim as u32,
@@ -169,7 +159,7 @@ where
         } else if duplicate_payload {
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
             let sequence = packet.sequence;
             let end_sequence = sequence.advance(packet.payload_len as u32);
             connection.observe_duplicate_payload(sequence, end_sequence);
@@ -179,7 +169,7 @@ where
         if immediate_ack {
             let connection = queue
                 .session_mut(session_id)
-                .ok_or_else(|| CoreError::internal("tcp established session is missing"))?;
+                .ok_or(TcpNodeError::EstablishedSessionMissing)?;
             tx_segment = Some(connection.control_segment(
                 &packet,
                 hammer_core::protocol::tcp::TcpSegmentFlags::ACK,
@@ -189,8 +179,7 @@ where
         let has_pending_tx = queue.app().pending_send_head(session_id).is_some();
         let connection = queue
             .session(session_id)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?
-            as *const _;
+            .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
         let mut context = SessionQueueControlContext::new(
             queue.timers_mut() as *mut _,
             queue.ready_mut_ptr(),
@@ -211,8 +200,7 @@ where
         )?;
         let connection = queue
             .session(session_id)
-            .ok_or_else(|| CoreError::internal("tcp established session is missing"))?
-            as *const _;
+            .ok_or(TcpNodeError::EstablishedSessionMissing)? as *const _;
         let aux = queue.aux_mut() as *mut TcpWorkerOwnedState;
         if unsafe { (*aux).publish_connection(session_id, &*connection) } {
             let _ = queue.close_session(session_id)?;

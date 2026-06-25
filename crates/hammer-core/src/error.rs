@@ -19,6 +19,9 @@ pub enum CoreError {
     #[error("service closed")]
     ServiceClosed,
 
+    #[error(transparent)]
+    Tcp(#[from] crate::protocol::tcp::TcpError),
+
     #[error("{message}")]
     Internal { message: String },
 }

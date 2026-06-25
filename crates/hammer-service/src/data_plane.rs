@@ -9,8 +9,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     Buffer, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId, NodeProcessFn,
-    NodeRegistration, NodeResult, NodeVectorDispatch, PacketTrace, TraceFormatter,
-    add_packet_trace,
+    NodeRegistration, NodeResult, PacketTrace, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_runtime::DataPlaneBarrierHandle;
@@ -61,7 +60,7 @@ impl DropTrace {
 
 impl PacketTrace for DropTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_usize(out, self.dropped);
     }
 }
@@ -493,10 +492,9 @@ pub fn next_feature_frame(
     runtime: &DataPlaneRuntime,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        Ok(Some(next_feature_node_for_index(runtime, index)?))
-    })?;
-    Ok(result)
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
+        next_feature_node_for_index(runtime, index)?
+    )))
 }
 
 #[inline(always)]

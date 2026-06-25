@@ -11,11 +11,13 @@ use hammer_adapter::DataWorkerId;
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpFastOpenCookie, TcpNegotiatedOptions,
-    TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq, TcpState, TcpTimestampOption,
+    TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpError, TcpFastOpenCookie,
+    TcpNegotiatedOptions, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq, TcpState,
+    TcpTimestampOption,
 };
 #[cfg(test)]
 use hammer_infra::vec::Vec;
+use thiserror::Error;
 
 const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
@@ -40,6 +42,28 @@ const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(75);
 const TCP_KEEPALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(75);
 const TCP_KEEPALIVE_PROBE_LIMIT: u8 = 8;
 
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+enum TcpConnectionError {
+    #[error("invalid connection")]
+    InvalidState,
+    #[error("invalid connection")]
+    MissingLocalAddress,
+    #[error("dispatch error")]
+    PayloadLengthOverflow,
+}
+
+impl From<TcpConnectionError> for TcpError {
+    #[inline]
+    fn from(error: TcpConnectionError) -> Self {
+        match error {
+            TcpConnectionError::InvalidState | TcpConnectionError::MissingLocalAddress => {
+                TcpError::InvalidConnection
+            }
+            TcpConnectionError::PayloadLengthOverflow => TcpError::Dispatch,
+        }
+    }
+}
+
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     struct TcpPendingSignals: u8 {
@@ -60,16 +84,12 @@ struct TcpEcnState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpTimerState {
     active: u16,
-    pending: u16,
 }
 
 impl Default for TcpTimerState {
     #[inline]
     fn default() -> Self {
-        Self {
-            active: 0,
-            pending: 0,
-        }
+        Self { active: 0 }
     }
 }
 
@@ -95,13 +115,6 @@ impl TcpKeepaliveState {
             probes_sent: 0,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TcpTxIntent {
-    sequence: TcpSeq,
-    payload_len: u32,
-    retransmit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,7 +312,8 @@ where
     timestamps: TcpTimestampState,
     keepalive: TcpKeepaliveState,
     pacing_ready: bool,
-    tx_intent: Option<TcpTxIntent>,
+    tx_intent_sequence: Option<TcpSeq>,
+    tx_intent_payload_len: u32,
 }
 
 impl<C> TcpConnection<C>
@@ -311,6 +325,7 @@ where
         matches!(
             (self.state, timer_id),
             (TcpState::SynSent, TCP_TIMER_RETRANSMIT)
+                | (TcpState::Established, TCP_TIMER_RETRANSMIT)
                 | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
                 | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
                 | (TcpState::LastAck, TCP_TIMER_RETRANSMIT)
@@ -330,35 +345,13 @@ where
     }
 
     #[inline(always)]
-    pub fn timer_is_pending(&self, timer_id: u32) -> bool {
-        timer_mask_contains(self.timers.pending, timer_id)
-    }
-
-    #[inline(always)]
     pub fn timer_set(&mut self, timer_id: u32) {
         self.timers.active |= timer_bit(timer_id);
     }
 
     #[inline]
     pub fn timer_reset(&mut self, timer_id: u32) {
-        let mask = !timer_bit(timer_id);
-        self.timers.active &= mask;
-        self.timers.pending &= mask;
-    }
-
-    #[inline]
-    pub fn timer_expire(&mut self, timer_id: u32) {
         self.timers.active &= !timer_bit(timer_id);
-        self.timers.pending |= timer_bit(timer_id);
-    }
-
-    #[inline]
-    pub fn timer_dispatch_pending(&mut self, timer_id: u32) -> bool {
-        if !self.timer_is_pending(timer_id) {
-            return false;
-        }
-        self.timers.pending &= !timer_bit(timer_id);
-        !self.timer_is_active(timer_id)
     }
 
     #[inline]
@@ -396,7 +389,8 @@ where
             timestamps: TcpTimestampState::default(),
             keepalive: TcpKeepaliveState::new(Instant::now()),
             pacing_ready: false,
-            tx_intent: None,
+            tx_intent_sequence: None,
+            tx_intent_payload_len: 0,
         }
     }
 
@@ -610,7 +604,8 @@ where
         }
         match (self.state, timer_id) {
             (TcpState::SynSent, TCP_TIMER_RETRANSMIT) => Some(self.retransmit_timeout_ticks()),
-            (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
+            (TcpState::Established, TCP_TIMER_RETRANSMIT)
+            | (TcpState::FinWait1, TCP_TIMER_RETRANSMIT)
             | (TcpState::Closing, TCP_TIMER_RETRANSMIT)
             | (TcpState::LastAck, TCP_TIMER_RETRANSMIT) => Some(self.retransmit_timeout_ticks()),
             (TcpState::Established, TCP_TIMER_RACK) => self.rack_timeout_ticks(),
@@ -635,20 +630,19 @@ where
 
     #[inline]
     pub(crate) fn tx_payload_sequence(&self) -> TcpSeq {
-        self.tx_intent
-            .map(|intent| intent.sequence)
-            .unwrap_or_else(|| {
-                if self.state == TcpState::SynSent {
-                    self.iss
-                } else {
-                    self.snd_nxt
-                }
-            })
+        self.tx_intent_sequence.unwrap_or_else(|| {
+            if self.state == TcpState::SynSent {
+                self.iss
+            } else {
+                self.snd_nxt
+            }
+        })
     }
 
     #[inline]
     pub(crate) fn clear_tx_intent(&mut self) {
-        self.tx_intent = None;
+        self.tx_intent_sequence = None;
+        self.tx_intent_payload_len = 0;
     }
 
     #[inline]
@@ -975,9 +969,9 @@ where
     }
 
     #[inline]
-    pub(crate) fn ensure_state(&self, state: TcpState, message: &'static str) -> CoreResult<()> {
+    pub(crate) fn ensure_state(&self, state: TcpState) -> CoreResult<()> {
         if self.state != state {
-            return Err(CoreError::internal(message));
+            return Err(TcpConnectionError::InvalidState.into());
         }
         Ok(())
     }
@@ -1031,7 +1025,7 @@ where
         &mut self,
         packet: &TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
-        self.ensure_state(TcpState::SynSent, "tcp open reply requires syn-sent state")?;
+        self.ensure_state(TcpState::SynSent)?;
 
         if let Some(acknowledgment) = packet.acknowledgment
             && packet.flags.contains(TcpSegmentFlags::ACK)
@@ -1123,7 +1117,7 @@ where
         &mut self,
         packet: &TcpPacket,
     ) -> CoreResult<Option<TcpSegment>> {
-        self.ensure_state(TcpState::SynRcvd, "tcp final ack requires syn-rcvd state")?;
+        self.ensure_state(TcpState::SynRcvd)?;
         if !self.observe_inbound_timestamp(packet) {
             return Ok(None);
         }
@@ -1151,8 +1145,8 @@ where
 
     #[inline]
     pub(crate) fn tx_payload_budget(&self, pending_len: usize, _: Instant) -> usize {
-        if let Some(intent) = self.tx_intent {
-            return pending_len.min(intent.payload_len as usize);
+        if self.tx_intent_sequence.is_some() {
+            return pending_len.min(self.tx_intent_payload_len as usize);
         }
         if pending_len == 0 {
             return 0;
@@ -1191,9 +1185,9 @@ where
 
     pub(crate) fn tx_segment(&mut self, payload_len: usize) -> CoreResult<TcpSegment> {
         if self.state == TcpState::SynSent {
-            let local = self.local().ok_or_else(|| {
-                CoreError::internal("syn-sent tcp connection missing local address")
-            })?;
+            let local = self
+                .local()
+                .ok_or(TcpConnectionError::MissingLocalAddress)?;
             let flags = if self.options.local_capabilities().ecn {
                 TcpSegmentFlags::SYN | TcpSegmentFlags::ECE | TcpSegmentFlags::CWR
             } else {
@@ -1211,17 +1205,14 @@ where
                 None,
                 self.next_local_timestamp(),
                 self.fast_open_cookie(),
-                self.output_ip_ecn(payload_len, self.tx_intent.is_some()),
+                self.output_ip_ecn(payload_len, self.tx_intent_sequence.is_some()),
                 payload_len,
             ));
         }
-        self.ensure_state(
-            TcpState::Established,
-            "tcp tx segment requires established state",
-        )?;
-        let local = self.local().ok_or_else(|| {
-            CoreError::internal("established tcp connection missing local address")
-        })?;
+        self.ensure_state(TcpState::Established)?;
+        let local = self
+            .local()
+            .ok_or(TcpConnectionError::MissingLocalAddress)?;
         let mut flags = self.output_flags(TcpSegmentFlags::ACK | TcpSegmentFlags::PSH);
         if self.ecn.pending_signals.contains(TcpPendingSignals::CWR) {
             flags.insert(TcpSegmentFlags::CWR);
@@ -1233,6 +1224,9 @@ where
             flags,
         );
         let sequence = self.tx_payload_sequence();
+        let retransmit = self
+            .tx_intent_sequence
+            .is_some_and(|sequence| sequence != self.snd_nxt);
         Ok(TcpSegment::new(
             local,
             self.remote(),
@@ -1244,7 +1238,7 @@ where
             sack_blocks.as_ref().map(|(blocks, len)| &blocks[..*len]),
             self.next_local_timestamp(),
             None,
-            self.output_ip_ecn(payload_len, self.tx_intent.is_some()),
+            self.output_ip_ecn(payload_len, retransmit),
             payload_len,
         ))
     }
@@ -1255,12 +1249,12 @@ where
         now: Instant,
     ) -> CoreResult<u16> {
         if self.state == TcpState::SynSent {
-            if self.tx_intent.is_some() {
+            if self.tx_intent_sequence.is_some() {
                 self.clear_tx_intent();
                 return Ok(timer_bit(TCP_TIMER_RETRANSMIT));
             }
             let payload_len = u32::try_from(payload_len)
-                .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+                .map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
             let sequence = self.iss;
             let end_sequence = TcpSeq::from(sequence)
                 .advance(payload_len.saturating_add(1))
@@ -1287,27 +1281,34 @@ where
             self.pacing_ready = false;
             return Ok(0);
         }
-        self.ensure_state(
-            TcpState::Established,
-            "tcp tx commit requires established state",
-        )?;
-        if self.tx_intent.is_some() {
+        self.ensure_state(TcpState::Established)?;
+        if self.tx_intent_sequence.is_some() {
             self.clear_tx_intent();
             let mut timers = 0;
+            self.timer_set(TCP_TIMER_RETRANSMIT);
+            timers |= timer_bit(TCP_TIMER_RETRANSMIT);
             if self.rack_timeout_ticks().is_some() {
+                self.timer_set(TCP_TIMER_RACK);
                 timers |= timer_bit(TCP_TIMER_RACK);
+            } else {
+                self.timer_reset(TCP_TIMER_RACK);
             }
             if self.tlp_timeout_ticks().is_some() {
+                self.timer_set(TCP_TIMER_TLP);
                 timers |= timer_bit(TCP_TIMER_TLP);
+            } else {
+                self.timer_reset(TCP_TIMER_TLP);
             }
             if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
                 self.timer_set(TCP_TIMER_PERSIST);
                 timers |= timer_bit(TCP_TIMER_PERSIST);
+            } else {
+                self.timer_reset(TCP_TIMER_PERSIST);
             }
             return Ok(timers);
         }
-        let payload_len = u32::try_from(payload_len)
-            .map_err(|_| CoreError::internal("tcp payload length exceeds u32"))?;
+        let payload_len =
+            u32::try_from(payload_len).map_err(|_| TcpConnectionError::PayloadLengthOverflow)?;
         let sequence = self.snd_nxt;
         let end_sequence = TcpSeq::from(sequence).advance(payload_len).raw();
         let bytes_in_flight = self.recovery.bytes_in_flight();
@@ -1327,6 +1328,8 @@ where
         self.pacing_ready = false;
         self.observe_activity(now);
         let mut timers = 0;
+        self.timer_set(TCP_TIMER_RETRANSMIT);
+        timers |= timer_bit(TCP_TIMER_RETRANSMIT);
         if self.rack_timeout_ticks().is_some() {
             self.timer_set(TCP_TIMER_RACK);
             timers |= timer_bit(TCP_TIMER_RACK);
@@ -1362,6 +1365,12 @@ where
         self.observe_activity(Instant::now());
         self.timer_reset(TCP_TIMER_DELAYED_ACK);
         let mut timers = 0;
+        if self.recovery.has_unacked_data() {
+            self.timer_set(TCP_TIMER_RETRANSMIT);
+            timers |= timer_bit(TCP_TIMER_RETRANSMIT);
+        } else {
+            self.timer_reset(TCP_TIMER_RETRANSMIT);
+        }
         if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
             self.timer_set(TCP_TIMER_PERSIST);
             self.timer_reset(TCP_TIMER_RACK);
@@ -1395,10 +1404,7 @@ where
         &mut self,
         packet: &TcpPacket,
     ) -> CoreResult<(Option<TcpSegment>, u16)> {
-        self.ensure_state(
-            TcpState::Established,
-            "tcp established receive requires established state",
-        )?;
+        self.ensure_state(TcpState::Established)?;
         if !self.observe_inbound_timestamp(packet) {
             return Ok((None, 0));
         }
@@ -1593,6 +1599,16 @@ where
             return self.tx_segment(0).ok();
         }
         if self.state == TcpState::Established {
+            if self.recovery.has_unacked_data() || has_pending_tx {
+                self.timer_set(TCP_TIMER_RETRANSMIT);
+            } else {
+                self.timer_reset(TCP_TIMER_RETRANSMIT);
+            }
+            if self.snd_wnd == 0 && has_pending_tx {
+                self.timer_set(TCP_TIMER_PERSIST);
+            } else if self.snd_wnd != 0 || !self.recovery.has_unacked_data() {
+                self.timer_reset(TCP_TIMER_PERSIST);
+            }
             if has_pending_tx && self.pacing_ticks().is_some() {
                 self.timer_set(TCP_TIMER_PACING);
             } else {
@@ -1681,9 +1697,10 @@ where
     }
 
     pub(crate) fn on_tcp_timer_expiry(&mut self, timer_id: u32) -> Option<TcpSegment> {
-        if !self.timer_is_supported(timer_id) || !self.timer_dispatch_pending(timer_id) {
+        if !self.timer_is_supported(timer_id) {
             return None;
         }
+        self.timer_reset(timer_id);
         match (self.state, timer_id) {
             (TcpState::SynSent, _)
             | (TcpState::Established, _)
@@ -1732,6 +1749,23 @@ where
             ));
         }
         match self.state {
+            TcpState::Established => {
+                let now = Instant::now();
+                let sample = self.recovery.on_retransmission_timeout(
+                    now,
+                    self.snd_nxt,
+                    &mut self.congestion,
+                )?;
+                self.observe_retransmit_timeout();
+                self.timer_set(TCP_TIMER_RETRANSMIT);
+                self.timer_reset(TCP_TIMER_RACK);
+                self.timer_reset(TCP_TIMER_TLP);
+                self.timer_reset(TCP_TIMER_PACING);
+                self.tx_intent_sequence = Some(sample.sequence);
+                self.tx_intent_payload_len = sample.payload_len;
+                self.pacing_ready = true;
+                None
+            }
             TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck => {
                 self.observe_retransmit_timeout();
                 self.timer_set(TCP_TIMER_RETRANSMIT);
@@ -1756,11 +1790,7 @@ where
     }
 
     fn on_rack_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "rack timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         self.recovery
             .on_rack_timeout(Instant::now(), self.snd_nxt, &mut self.congestion);
         let sample = self.recovery.take_rack_retransmit()?;
@@ -1768,21 +1798,14 @@ where
             self.timer_set(TCP_TIMER_RACK);
         }
         self.recovery.on_retransmit_sent(sample.bytes);
-        self.tx_intent = Some(TcpTxIntent {
-            sequence: sample.sequence,
-            payload_len: sample.payload_len,
-            retransmit: true,
-        });
+        self.tx_intent_sequence = Some(sample.sequence);
+        self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
         None
     }
 
     fn on_tlp_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "tlp timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         let sample = self.recovery.take_tlp_probe()?;
         if self.tlp_timeout_ticks().is_some() {
             self.timer_set(TCP_TIMER_TLP);
@@ -1790,21 +1813,14 @@ where
         if self.recovery.in_recovery() {
             self.recovery.on_retransmit_sent(sample.bytes);
         }
-        self.tx_intent = Some(TcpTxIntent {
-            sequence: sample.sequence,
-            payload_len: sample.payload_len,
-            retransmit: true,
-        });
+        self.tx_intent_sequence = Some(sample.sequence);
+        self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
         None
     }
 
     fn on_delayed_ack_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "delayed ack timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         let local = self.local?;
         Some(TcpSegment::new(
             local,
@@ -1823,34 +1839,19 @@ where
     }
 
     fn on_persist_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "persist timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         if self.snd_wnd != 0 {
             return None;
         }
-        if self.recovery.oldest_unacked_sample().is_none() {
+        if self.tx_intent_sequence.is_some() {
             self.timer_set(TCP_TIMER_PERSIST);
             return None;
         }
         self.timer_set(TCP_TIMER_PERSIST);
-        let local = self.local?;
-        Some(TcpSegment::new(
-            local,
-            self.remote(),
-            self.snd_una().wrapping_sub(1),
-            self.rcv_nxt(),
-            self.advertised_receive_window(self.rcv_wnd),
-            self.output_flags(TcpSegmentFlags::ACK),
-            self.local_capabilities(),
-            None,
-            self.next_local_timestamp(),
-            None,
-            None,
-            0,
-        ))
+        self.tx_intent_sequence = Some(self.snd_una);
+        self.tx_intent_payload_len = 1;
+        self.pacing_ready = true;
+        None
     }
 
     fn on_time_wait_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -1860,11 +1861,7 @@ where
     }
 
     fn on_keepalive_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "keepalive timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         if self.keepalive.probes_sent >= TCP_KEEPALIVE_PROBE_LIMIT {
             self.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
             self.state = TcpState::Closed;
@@ -1891,16 +1888,16 @@ where
     }
 
     fn on_pacing_timer_expiry(&mut self) -> Option<TcpSegment> {
-        self.ensure_state(
-            TcpState::Established,
-            "pacing timer requires established state",
-        )
-        .ok()?;
+        self.ensure_state(TcpState::Established).ok()?;
         if self.pacing_ticks().is_none() {
             return None;
         }
         self.timer_set(TCP_TIMER_PACING);
         self.pacing_ready = true;
+        if self.tx_intent_sequence.is_none() {
+            self.tx_intent_sequence = Some(self.snd_nxt);
+            self.tx_intent_payload_len = self.output_payload_len() as u32;
+        }
         None
     }
 
@@ -2451,7 +2448,6 @@ mod tests {
         let mut connection = established_connection_with_pacing_controller();
 
         let _ = connection.on_tcp_ready(true);
-        connection.timer_expire(TCP_TIMER_PACING);
 
         let segment = connection
             .on_tcp_timer_expiry(TCP_TIMER_PACING)
@@ -2471,7 +2467,6 @@ mod tests {
             .expect("move keepalive activity into the past");
 
         for probe in 0..TCP_KEEPALIVE_PROBE_LIMIT {
-            connection.timer_expire(TCP_TIMER_KEEP_ALIVE);
             let segment = connection
                 .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE)
                 .expect("keepalive probe");
@@ -2489,7 +2484,6 @@ mod tests {
             assert!(connection.timer_is_active(TCP_TIMER_KEEP_ALIVE));
         }
 
-        connection.timer_expire(TCP_TIMER_KEEP_ALIVE);
         assert!(
             connection
                 .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE)

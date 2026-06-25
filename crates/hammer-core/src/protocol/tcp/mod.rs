@@ -3,22 +3,77 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use crate::ds::FlatHashKey;
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use crate::protocol::transport::TransportConnectionKey;
+use thiserror::Error;
 
-pub mod control;
 pub mod options;
 pub mod reset;
 pub mod segment;
 
-pub use control::synthesize_ipv4_tcp_control;
 pub use options::{
-    tcp_capabilities_from_options, tcp_options_from_bytes, ParsedTcpOptions, TcpSackBlock,
-    TcpTimestampOption,
+    ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
+    tcp_options_from_bytes,
 };
 pub use reset::{
-    tcp_reset_network_header_len, tcp_reset_remote_reply_addrs,
-    tcp_reset_reply_from_current_packet, TcpResetPacketCursor, TcpResetReply,
+    TcpResetError, TcpResetPacketCursor, tcp_reset_network_header_len,
+    tcp_reset_remote_reply_addrs, tcp_reset_reply_from_current_packet,
 };
-pub use segment::{write_tcp_segment_header, TcpSegmentHeader, TcpSegmentParseError};
+pub use segment::{TcpSegmentHeader, TcpSegmentParseError, write_tcp_segment_header};
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum TcpError {
+    #[error("wrong worker thread")]
+    WrongThread,
+    #[error("inconsistent ip/tcp lengths")]
+    Length,
+    #[error("no listener for dst port")]
+    NoListener,
+    #[error("lookup drops")]
+    LookupDrops,
+    #[error("dispatch error")]
+    Dispatch,
+    #[error("invalid segments")]
+    SegmentInvalid,
+    #[error("invalid ACK")]
+    AckInvalid,
+    #[error("invalid connection")]
+    InvalidConnection,
+    #[error("connection closed")]
+    ConnectionClosed,
+    #[error("could not parse options")]
+    Options,
+    #[error("PAWS check failed")]
+    Paws,
+    #[error("segment not in receive window")]
+    RcvWnd,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum TcpControlPacketParseError {
+    #[error("tcp control packet is empty")]
+    EmptyPacket,
+    #[error("tcp control packet uses unsupported IP version")]
+    UnsupportedIpVersion,
+    #[error("tcp control packet is too short")]
+    PacketTooShort,
+    #[error("tcp control packet cursor is invalid")]
+    InvalidCursor,
+    #[error("tcp control header length is invalid")]
+    InvalidHeaderLength,
+}
+
+impl From<TcpControlPacketParseError> for TcpError {
+    #[inline]
+    fn from(error: TcpControlPacketParseError) -> Self {
+        match error {
+            TcpControlPacketParseError::EmptyPacket
+            | TcpControlPacketParseError::PacketTooShort
+            | TcpControlPacketParseError::InvalidCursor
+            | TcpControlPacketParseError::InvalidHeaderLength => TcpError::Length,
+            TcpControlPacketParseError::UnsupportedIpVersion => TcpError::SegmentInvalid,
+        }
+    }
+}
 
 pub const TCP_FLAG_FIN: u8 = 0x01;
 pub const TCP_FLAG_SYN: u8 = 0x02;

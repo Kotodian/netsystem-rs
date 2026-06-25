@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use arc_swap::ArcSwap;
 use hammer_adapter::{
     BufferFrame, BufferIndex, BufferPacketCursor, DataPlaneRuntime, InternalNode, NetworkOpaque,
-    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, NodeVectorDispatch,
-    PacketTrace, SecondaryOpaque, TraceFormatter, add_packet_trace,
+    Node, NodeId, NodeNextStorage, NodeProcessFn, NodeResult, NodeRuntimeData, PacketTrace,
+    SecondaryOpaque, TraceFormatter, add_packet_trace,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::icmp::{
@@ -105,7 +105,7 @@ impl IcmpInputTrace {
 }
 
 impl PacketTrace for IcmpInputTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_ip_version(out, self.version);
         match self.icmp_type {
             Some(value) => {
@@ -146,7 +146,7 @@ impl IcmpEchoRequestTrace {
 }
 
 impl PacketTrace for IcmpEchoRequestTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_usize(out, self.generated_len);
         put_option_u16(out, self.error);
         put_node(out, self.next);
@@ -179,7 +179,7 @@ impl IcmpErrorTrace {
 }
 
 impl PacketTrace for IcmpErrorTrace {
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         put_option_icmp_error_family(out, self.family);
         put_option_u32(out, self.ingress_interface);
         crate::trace::codec::put_bool(out, self.local_source_present);
@@ -605,13 +605,9 @@ impl Node for IcmpInputNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let snapshot = self.snapshot.load();
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| Ok(Some(next_node_for_index(runtime, index, &snapshot)?)),
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| Ok(Some(
+            next_node_for_index(runtime, index, &snapshot)?
+        )))
     }
 
     #[inline]
@@ -652,17 +648,9 @@ impl Node for IcmpEchoRequestNode {
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
         let next = Self::runtime_nexts(runtime)?;
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| {
-                Ok(Some(next_node_for_echo_request_index(
-                    runtime, index, next,
-                )?))
-            },
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| Ok(Some(
+            next_node_for_echo_request_index(runtime, index, next)?
+        )))
     }
 
     #[inline]
@@ -712,24 +700,20 @@ fn icmp_input_process(
 ) -> CoreResult<NodeResult> {
     let state = icmp_input_runtime(data)?;
     let snapshot = state.snapshot.load();
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        Ok(Some(next_node_for_index(runtime, index, &snapshot)?))
-    })?;
-    Ok(result)
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
+        next_node_for_index(runtime, index, &snapshot)?
+    )))
 }
 
 fn icmp_echo_request_process(
     runtime: &DataPlaneRuntime,
-    _data: NodeRuntimeData,
+    _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> CoreResult<NodeResult> {
     let next = IcmpEchoRequestNode::runtime_nexts(runtime)?;
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
-        Ok(Some(next_node_for_echo_request_index(
-            runtime, index, next,
-        )?))
-    })?;
-    Ok(result)
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| Ok(Some(
+        next_node_for_echo_request_index(runtime, index, next)?
+    )))
 }
 
 #[hammer_component_macros::node_next]
@@ -770,23 +754,17 @@ impl Node for IcmpErrorNode {
             .source_table
             .as_ref()
             .map(IcmpErrorSourceTableHandle::load);
-        let (result, cached_next) = NodeVectorDispatch::new(self.cached_next).route_frame_index(
-            runtime,
-            frame,
-            |index| {
-                let source_table = source_table
-                    .as_ref()
-                    .map(|source_table| source_table.as_ref());
-                Ok(Some(next_node_for_icmp_error_index(
-                    runtime,
-                    index,
-                    next,
-                    source_table,
-                )?))
-            },
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_route_frame_index_cached!(self, runtime, frame, |index| {
+            let source_table = source_table
+                .as_ref()
+                .map(|source_table| source_table.as_ref());
+            Ok(Some(next_node_for_icmp_error_index(
+                runtime,
+                index,
+                next,
+                source_table,
+            )?))
+        })
     }
 
     #[inline]
@@ -863,7 +841,7 @@ fn icmp_error_process(
         .source_table
         .as_ref()
         .map(IcmpErrorSourceTableHandle::load);
-    let (result, _) = NodeVectorDispatch::new(None).route_frame_index(runtime, frame, |index| {
+    hammer_adapter::node_route_frame_index_static!(None, runtime, frame, |index| {
         let source_table = source_table
             .as_ref()
             .map(|source_table| source_table.as_ref());
@@ -873,8 +851,7 @@ fn icmp_error_process(
             next,
             source_table,
         )?))
-    })?;
-    Ok(result)
+    })
 }
 
 #[inline(always)]

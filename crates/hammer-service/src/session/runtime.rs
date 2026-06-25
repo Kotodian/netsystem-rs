@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use hammer_adapter::{BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData};
+use hammer_adapter::{
+    BufferIndex, DataPlaneBuffers, DataPlaneRuntime, DataWorkerId, NodeRuntimeData,
+};
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_infra::fifo::FifoQueue;
 use hammer_infra::map::FlatHashTable;

@@ -1137,7 +1137,7 @@ impl TunInputTrace {
 
 impl PacketTrace for TunInputTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         out.push(u8::from(self.interface_index.is_some()));
         out.extend_from_slice(&self.interface_index.unwrap_or_default().to_le_bytes());
         out.push(encode_tun_driver_mode(self.mode));
@@ -1166,7 +1166,7 @@ impl TunOutputTrace {
 
 impl PacketTrace for TunOutputTrace {
     #[inline]
-    fn encode_trace(&self, out: &mut std::vec::Vec<u8>) {
+    fn encode_trace(&self, out: &mut hammer_infra::vec::Vec<u8>) {
         out.push(encode_tun_driver_mode(self.mode));
         out.extend_from_slice(&(self.pending as u64).to_le_bytes());
     }

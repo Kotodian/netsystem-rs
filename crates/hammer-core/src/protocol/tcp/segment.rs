@@ -1,7 +1,7 @@
 use super::{
-    TcpCapabilities, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
+    TcpCapabilities, TcpError, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
 };
-use crate::error::{CoreError, CoreResult};
+use thiserror::Error;
 
 const TCP_HEADER_MIN_LEN: usize = 20;
 const TCP_OPTION_EOL: u8 = 0;
@@ -10,11 +10,67 @@ const TCP_OPTION_SACK: u8 = 5;
 const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
 const TCP_MAX_SACK_BLOCKS: usize = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum TcpSegmentParseError {
+    #[error("tcp packet has invalid IP header")]
+    InvalidIpHeader,
+    #[error("packet is not TCP")]
+    WrongProtocol,
+    #[error("tcp packet length is invalid")]
+    InvalidPacketLength,
+    #[error("tcp transport header is missing")]
+    MissingTransportHeader,
+    #[error("tcp payload offset overflow")]
+    PayloadOffsetOverflow,
+    #[error("tcp payload offset exceeds packet length")]
+    PayloadOffsetExceedsPacketLength,
+    #[error("tcp segment intent is missing")]
+    MissingIntent,
+    #[error("missing IPv4 source")]
+    MissingIpv4Source,
+    #[error("missing IPv6 source")]
+    MissingIpv6Source,
+    #[error("invalid IPv6 source length")]
+    InvalidIpv6SourceLength,
+    #[error("missing IPv4 destination")]
+    MissingIpv4Destination,
+    #[error("missing IPv6 destination")]
+    MissingIpv6Destination,
+    #[error("invalid IPv6 destination length")]
+    InvalidIpv6DestinationLength,
+    #[error("tcp segment is invalid")]
+    InvalidSegment,
+    #[error("tcp segment is invalid")]
     ShortHeader,
+    #[error("tcp segment is invalid")]
     BadDataOffset,
+    #[error("tcp segment is invalid")]
     InvalidSlice,
+}
+
+impl From<TcpSegmentParseError> for TcpError {
+    #[inline]
+    fn from(error: TcpSegmentParseError) -> Self {
+        match error {
+            TcpSegmentParseError::WrongProtocol => TcpError::Dispatch,
+            TcpSegmentParseError::MissingIntent => TcpError::Dispatch,
+            TcpSegmentParseError::InvalidIpHeader
+            | TcpSegmentParseError::InvalidPacketLength
+            | TcpSegmentParseError::MissingTransportHeader
+            | TcpSegmentParseError::PayloadOffsetOverflow
+            | TcpSegmentParseError::PayloadOffsetExceedsPacketLength
+            | TcpSegmentParseError::MissingIpv4Source
+            | TcpSegmentParseError::MissingIpv6Source
+            | TcpSegmentParseError::InvalidIpv6SourceLength
+            | TcpSegmentParseError::MissingIpv4Destination
+            | TcpSegmentParseError::MissingIpv6Destination
+            | TcpSegmentParseError::InvalidIpv6DestinationLength
+            | TcpSegmentParseError::InvalidSegment
+            | TcpSegmentParseError::ShortHeader
+            | TcpSegmentParseError::BadDataOffset
+            | TcpSegmentParseError::InvalidSlice => TcpError::SegmentInvalid,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,15 +90,11 @@ pub fn write_tcp_segment_header(
     output: &mut [u8],
     header: TcpSegmentHeader<'_>,
     sack_blocks: Option<&[TcpSackBlock]>,
-) -> CoreResult<usize> {
+) -> Result<usize, TcpError> {
     let options_len = tcp_options_len(header, sack_blocks);
     let header_len = TCP_HEADER_MIN_LEN + options_len;
     if output.len() < header_len {
-        return Err(CoreError::internal(format!(
-            "tcp segment output too small: {} < {}",
-            output.len(),
-            header_len
-        )));
+        return Err(TcpError::Length);
     }
     output[..header_len].fill(0);
     output[0..2].copy_from_slice(&header.source_port.to_be_bytes());

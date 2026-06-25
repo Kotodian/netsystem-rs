@@ -586,7 +586,7 @@ impl NodeVectorDispatch {
         let mut processed = 0usize;
         let width = runtime.preferred_frame_batch_width();
         let result = match width {
-            FrameBatchWidth::Quad => self.route_frame_quad_chunks(
+            FrameBatchWidth::Quad => self.route_frame_quad_main(
                 runtime,
                 frame,
                 &mut cached_next,
@@ -596,7 +596,7 @@ impl NodeVectorDispatch {
                 &mut prefetch_indices,
                 &mut route_chunk,
             ),
-            FrameBatchWidth::Pair => self.route_frame_pair_chunks(
+            FrameBatchWidth::Pair => self.route_frame_pair_main(
                 runtime,
                 frame,
                 &mut cached_next,
@@ -609,7 +609,7 @@ impl NodeVectorDispatch {
         };
 
         if crate::unlikely(result.is_err()) {
-            Self::rollback_current_frame_error(
+            Self::restore_current_frame_error(
                 runtime,
                 frame,
                 processed,
@@ -619,7 +619,7 @@ impl NodeVectorDispatch {
         }
         result?;
 
-        Self::rebuild_current_frame_success(frame, processed, &mut current_frame_indices)?;
+        Self::restore_current_frame_success(frame, processed, &mut current_frame_indices)?;
 
         let result = if frame.has_pending() {
             let node = current_frame_next
@@ -683,7 +683,7 @@ impl NodeVectorDispatch {
         let mut processed = 0usize;
         let width = runtime.preferred_frame_batch_width();
         let result = match width {
-            FrameBatchWidth::Quad => self.route_frame_index_quad_chunks(
+            FrameBatchWidth::Quad => self.route_frame_index_quad_main(
                 runtime,
                 frame,
                 &mut cached_next,
@@ -692,7 +692,7 @@ impl NodeVectorDispatch {
                 &mut processed,
                 &mut route_index,
             ),
-            FrameBatchWidth::Pair => self.route_frame_index_pair_chunks(
+            FrameBatchWidth::Pair => self.route_frame_index_pair_main(
                 runtime,
                 frame,
                 &mut cached_next,
@@ -704,7 +704,7 @@ impl NodeVectorDispatch {
         };
 
         if crate::unlikely(result.is_err()) {
-            Self::rollback_current_frame_error(
+            Self::restore_current_frame_error(
                 runtime,
                 frame,
                 processed,
@@ -714,7 +714,7 @@ impl NodeVectorDispatch {
         }
         result?;
 
-        Self::rebuild_current_frame_success(frame, processed, &mut current_frame_indices)?;
+        Self::restore_current_frame_success(frame, processed, &mut current_frame_indices)?;
 
         let result = if frame.has_pending() {
             let node = current_frame_next
@@ -737,7 +737,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn route_frame_quad_chunks(
+    fn route_frame_quad_main(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
@@ -763,7 +763,7 @@ impl NodeVectorDispatch {
                 indices[read + 2],
                 indices[read + 3],
             ];
-            self.route_indices(
+            self.dispatch_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -774,10 +774,40 @@ impl NodeVectorDispatch {
             )?;
             read += 4;
         }
-        if read + 2 <= len {
+        self.route_frame_pair_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            prefetch_indices,
+            route_chunk,
+        )
+    }
+
+    #[inline(always)]
+    fn route_frame_pair_tail(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        indices: &[BufferIndex],
+        mut read: usize,
+        cached_next: &mut Option<NodeId>,
+        current_frame_next: &mut Option<NodeId>,
+        current_frame_indices: &mut Vec<BufferIndex>,
+        processed: &mut usize,
+        prefetch_indices: &mut impl FnMut(&mut BufferBatchMut<'_>, &[BufferIndex]),
+        route_chunk: &mut impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [Option<NodeId>; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        if read + 2 <= indices.len() {
             Self::prefetch_range(runtime, indices, read + 2, 2, prefetch_indices);
             let chunk = [indices[read], indices[read + 1]];
-            self.route_indices(
+            self.dispatch_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -788,23 +818,20 @@ impl NodeVectorDispatch {
             )?;
             read += 2;
         }
-        if read < len {
-            let chunk = [indices[read]];
-            self.route_indices(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_chunk,
-            )?;
-        }
-        Ok(())
+        self.route_frame_scalar_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            route_chunk,
+        )
     }
 
     #[inline(always)]
-    fn route_frame_index_quad_chunks(
+    fn route_frame_index_quad_main(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
@@ -825,7 +852,7 @@ impl NodeVectorDispatch {
                 indices[read + 2],
                 indices[read + 3],
             ];
-            self.route_index_chunk(
+            self.dispatch_index_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -836,10 +863,34 @@ impl NodeVectorDispatch {
             )?;
             read += 4;
         }
-        if read + 2 <= len {
+        self.route_frame_index_pair_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            route_index,
+        )
+    }
+
+    #[inline(always)]
+    fn route_frame_index_pair_tail(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        indices: &[BufferIndex],
+        mut read: usize,
+        cached_next: &mut Option<NodeId>,
+        current_frame_next: &mut Option<NodeId>,
+        current_frame_indices: &mut Vec<BufferIndex>,
+        processed: &mut usize,
+        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
+    ) -> CoreResult<()> {
+        if read + 2 <= indices.len() {
             Self::prefetch_range(runtime, indices, read + 2, 2, &mut default_prefetch_indices);
             let chunk = [indices[read], indices[read + 1]];
-            self.route_index_chunk(
+            self.dispatch_index_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -850,23 +901,20 @@ impl NodeVectorDispatch {
             )?;
             read += 2;
         }
-        if read < len {
-            let chunk = [indices[read]];
-            self.route_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-        }
-        Ok(())
+        self.route_frame_index_scalar_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            route_index,
+        )
     }
 
     #[inline(always)]
-    fn route_frame_index_pair_chunks(
+    fn route_frame_index_pair_main(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
@@ -877,12 +925,11 @@ impl NodeVectorDispatch {
         route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
     ) -> CoreResult<()> {
         let indices = frame.pending_indices();
-        let len = indices.len();
         let mut read = 0usize;
-        while read + 2 <= len {
+        while read + 2 <= indices.len() {
             Self::prefetch_range(runtime, indices, read + 2, 2, &mut default_prefetch_indices);
             let chunk = [indices[read], indices[read + 1]];
-            self.route_index_chunk(
+            self.dispatch_index_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -893,23 +940,20 @@ impl NodeVectorDispatch {
             )?;
             read += 2;
         }
-        if read < len {
-            let chunk = [indices[read]];
-            self.route_index_chunk(
-                runtime,
-                &chunk,
-                cached_next,
-                current_frame_next,
-                current_frame_indices,
-                processed,
-                route_index,
-            )?;
-        }
-        Ok(())
+        self.route_frame_index_scalar_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            route_index,
+        )
     }
 
     #[inline(always)]
-    fn route_frame_pair_chunks(
+    fn route_frame_pair_main(
         &mut self,
         runtime: &DataPlaneRuntime,
         frame: &BufferFrame,
@@ -925,12 +969,11 @@ impl NodeVectorDispatch {
         ) -> CoreResult<()>,
     ) -> CoreResult<()> {
         let indices = frame.pending_indices();
-        let len = indices.len();
         let mut read = 0usize;
-        while read + 2 <= len {
+        while read + 2 <= indices.len() {
             Self::prefetch_range(runtime, indices, read + 2, 2, prefetch_indices);
             let chunk = [indices[read], indices[read + 1]];
-            self.route_indices(
+            self.dispatch_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -941,9 +984,37 @@ impl NodeVectorDispatch {
             )?;
             read += 2;
         }
-        if read < len {
+        self.route_frame_scalar_tail(
+            runtime,
+            indices,
+            read,
+            cached_next,
+            current_frame_next,
+            current_frame_indices,
+            processed,
+            route_chunk,
+        )
+    }
+
+    #[inline(always)]
+    fn route_frame_scalar_tail(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        indices: &[BufferIndex],
+        read: usize,
+        cached_next: &mut Option<NodeId>,
+        current_frame_next: &mut Option<NodeId>,
+        current_frame_indices: &mut Vec<BufferIndex>,
+        processed: &mut usize,
+        route_chunk: &mut impl FnMut(
+            &mut BufferBatchMut<'_>,
+            &[BufferIndex],
+            &mut [Option<NodeId>; 4],
+        ) -> CoreResult<()>,
+    ) -> CoreResult<()> {
+        if read < indices.len() {
             let chunk = [indices[read]];
-            self.route_indices(
+            self.dispatch_chunk(
                 runtime,
                 &chunk,
                 cached_next,
@@ -957,7 +1028,34 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn route_indices<const N: usize>(
+    fn route_frame_index_scalar_tail(
+        &mut self,
+        runtime: &DataPlaneRuntime,
+        indices: &[BufferIndex],
+        read: usize,
+        cached_next: &mut Option<NodeId>,
+        current_frame_next: &mut Option<NodeId>,
+        current_frame_indices: &mut Vec<BufferIndex>,
+        processed: &mut usize,
+        route_index: &mut impl FnMut(BufferIndex) -> CoreResult<Option<NodeId>>,
+    ) -> CoreResult<()> {
+        if read < indices.len() {
+            let chunk = [indices[read]];
+            self.dispatch_index_chunk(
+                runtime,
+                &chunk,
+                cached_next,
+                current_frame_next,
+                current_frame_indices,
+                processed,
+                route_index,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn dispatch_chunk<const N: usize>(
         &mut self,
         runtime: &DataPlaneRuntime,
         indices: &[BufferIndex; N],
@@ -977,7 +1075,7 @@ impl NodeVectorDispatch {
         drop(batch);
         if let Err(err) = route {
             let committed = Self::committed_prefix_len(&nexts, N);
-            self.flush_next_runs(
+            self.commit_next_runs(
                 runtime,
                 &indices[..committed],
                 &nexts[..committed],
@@ -990,7 +1088,7 @@ impl NodeVectorDispatch {
         }
         Self::validate_active_nexts(&nexts, N)?;
 
-        self.flush_next_runs(
+        self.commit_next_runs(
             runtime,
             indices,
             &nexts[..N],
@@ -1002,7 +1100,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn route_index_chunk<const N: usize>(
+    fn dispatch_index_chunk<const N: usize>(
         &mut self,
         runtime: &DataPlaneRuntime,
         indices: &[BufferIndex; N],
@@ -1017,7 +1115,7 @@ impl NodeVectorDispatch {
             match route_index(indices[offset]) {
                 Ok(next) => nexts[offset] = next,
                 Err(err) => {
-                    self.flush_next_runs(
+                    self.commit_next_runs(
                         runtime,
                         &indices[..offset],
                         &nexts[..offset],
@@ -1030,7 +1128,7 @@ impl NodeVectorDispatch {
                 }
             }
         }
-        self.flush_next_runs(
+        self.commit_next_runs(
             runtime,
             indices,
             &nexts[..N],
@@ -1042,7 +1140,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn flush_next_runs(
+    fn commit_next_runs(
         &mut self,
         runtime: &DataPlaneRuntime,
         indices: &[BufferIndex],
@@ -1064,7 +1162,7 @@ impl NodeVectorDispatch {
                 None
             };
             if offset == indices.len() || next != run_node {
-                self.flush_run(
+                self.commit_next_run(
                     runtime,
                     &indices[run_start..offset],
                     run_node,
@@ -1081,7 +1179,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn flush_run(
+    fn commit_next_run(
         &mut self,
         runtime: &DataPlaneRuntime,
         indices: &[BufferIndex],
@@ -1116,7 +1214,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn rebuild_current_frame_success(
+    fn restore_current_frame_success(
         frame: &mut BufferFrame,
         processed: usize,
         current_frame_indices: &mut Vec<BufferIndex>,
@@ -1135,7 +1233,7 @@ impl NodeVectorDispatch {
     }
 
     #[inline(always)]
-    fn rollback_current_frame_error(
+    fn restore_current_frame_error(
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
         processed: usize,

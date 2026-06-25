@@ -435,6 +435,46 @@ impl TcpRecoveryState {
         Some(*sample)
     }
 
+    pub(crate) fn on_retransmission_timeout<C: CongestionController>(
+        &mut self,
+        now: Instant,
+        snd_nxt: TcpSeq,
+        congestion: &mut C,
+    ) -> Option<TcpSentSample> {
+        let head = self.sample_head?;
+        let sample = self.sent_sample(head);
+        let recovery_prev_window = congestion.congestion_window();
+        congestion.on_loss(
+            now,
+            LostPacket {
+                packet_number: sample.packet_number,
+                bytes: sample.bytes,
+                sent_at: sample.sent_at,
+            },
+            true,
+        );
+        if !self.recovery_active {
+            self.recovery_active = true;
+            self.recovery_prev_window = recovery_prev_window.max(1);
+            self.recovery_window = congestion.congestion_window();
+            self.recovery_delivered = 0;
+            self.recovery_retransmitted = 0;
+            self.recovery_new_data = 0;
+            self.recovery_end_sequence = snd_nxt;
+        } else {
+            self.recovery_window = self.recovery_window.min(congestion.congestion_window());
+            if snd_nxt > self.recovery_end_sequence {
+                self.recovery_end_sequence = snd_nxt;
+            }
+        }
+        let current = self.sent_sample_mut(head);
+        current.retransmitted = true;
+        current.rack_deadline = None;
+        self.rack_timer_armed = false;
+        self.tlp_timer_armed = self.has_unacked_data();
+        Some(sample)
+    }
+
     pub(crate) fn oldest_unacked_sample(&self) -> Option<TcpSentSample> {
         let index = self.sample_head?;
         Some(self.sent_sample(index))

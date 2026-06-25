@@ -2,14 +2,23 @@ use std::net::Ipv6Addr;
 
 use etherparse::TcpSlice;
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use thiserror::Error;
 
 use crate::protocol::ip::parse_ip_packet;
 
-use super::TcpSegmentFlags;
+use super::{TcpError, TcpSegmentFlags};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TcpResetReply {
-    pub packet: std::vec::Vec<u8>,
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum TcpResetError {
+    #[error("tcp reset reply uses unsupported IP version")]
+    UnsupportedIpVersion,
+}
+
+impl From<TcpResetError> for TcpError {
+    #[inline]
+    fn from(_: TcpResetError) -> Self {
+        TcpError::SegmentInvalid
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,9 +42,10 @@ struct ResetSourceSegment {
 }
 
 pub fn tcp_reset_reply_from_current_packet(
+    output: &mut [u8],
     packet: &[u8],
     cursor: TcpResetPacketCursor,
-) -> Option<TcpResetReply> {
+) -> Option<usize> {
     let source = parse_reset_source_segment(packet, cursor)?;
     if source.flags.contains(TcpSegmentFlags::RST) {
         return None;
@@ -45,8 +55,8 @@ pub fn tcp_reset_reply_from_current_packet(
         .copied()
         .map(|byte| byte >> 4)
     {
-        Some(4) => synthesize_ipv4_tcp_reset(packet, cursor, source),
-        Some(6) => synthesize_ipv6_tcp_reset(packet, cursor, source),
+        Some(4) => synthesize_ipv4_tcp_reset(output, packet, cursor, source),
+        Some(6) => synthesize_ipv6_tcp_reset(output, packet, cursor, source),
         _ => None,
     }
 }
@@ -125,10 +135,11 @@ fn tcp_flags_from_slice(segment: &TcpSlice<'_>) -> TcpSegmentFlags {
 }
 
 fn synthesize_ipv4_tcp_reset(
+    output: &mut [u8],
     packet: &[u8],
     cursor: TcpResetPacketCursor,
     source: ResetSourceSegment,
-) -> Option<TcpResetReply> {
+) -> Option<usize> {
     const IPV4_HEADER_LEN: usize = 20;
     const TCP_HEADER_LEN: usize = 20;
 
@@ -153,7 +164,8 @@ fn synthesize_ipv4_tcp_reset(
     let (response_sequence, response_acknowledgment, response_flags) =
         tcp_reset_response_fields(source)?;
     let total_len = IPV4_HEADER_LEN + TCP_HEADER_LEN;
-    let mut reset = vec![0u8; total_len];
+    let reset = output.get_mut(..total_len)?;
+    reset.fill(0);
 
     reset[..IPV4_HEADER_LEN].copy_from_slice(
         &packet[cursor.network_header_offset..cursor.network_header_offset + IPV4_HEADER_LEN],
@@ -185,14 +197,15 @@ fn synthesize_ipv4_tcp_reset(
     let header_checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]);
     reset[10..12].copy_from_slice(&header_checksum.to_be_bytes());
 
-    Some(TcpResetReply { packet: reset })
+    Some(total_len)
 }
 
 fn synthesize_ipv6_tcp_reset(
+    output: &mut [u8],
     packet: &[u8],
     cursor: TcpResetPacketCursor,
     source: ResetSourceSegment,
-) -> Option<TcpResetReply> {
+) -> Option<usize> {
     const IPV6_HEADER_LEN: usize = 40;
     const TCP_HEADER_LEN: usize = 20;
 
@@ -217,7 +230,8 @@ fn synthesize_ipv6_tcp_reset(
     let (response_sequence, response_acknowledgment, response_flags) =
         tcp_reset_response_fields(source)?;
     let total_len = IPV6_HEADER_LEN + TCP_HEADER_LEN;
-    let mut reset = vec![0u8; total_len];
+    let reset = output.get_mut(..total_len)?;
+    reset.fill(0);
 
     reset[..IPV6_HEADER_LEN].copy_from_slice(
         &packet[cursor.network_header_offset..cursor.network_header_offset + IPV6_HEADER_LEN],
@@ -245,7 +259,7 @@ fn synthesize_ipv6_tcp_reset(
     let checksum = ipv6_l4_checksum(pseudo_source, pseudo_destination, 6, &reset[40..]);
     reset[56..58].copy_from_slice(&checksum.to_be_bytes());
 
-    Some(TcpResetReply { packet: reset })
+    Some(total_len)
 }
 
 fn tcp_reset_response_fields(source: ResetSourceSegment) -> Option<(u32, u32, u8)> {

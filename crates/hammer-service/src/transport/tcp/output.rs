@@ -1,6 +1,6 @@
 use hammer_adapter::{
     BufferBatchMut, BufferFrame, BufferIndex, DataPlaneRuntime, InternalNode, Node, NodeId,
-    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData, NodeVectorDispatch,
+    NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
 };
 use hammer_core::error::{CoreError, CoreResult};
 use hammer_core::protocol::tcp::TcpSeq;
@@ -44,15 +44,16 @@ impl Node for TcpOutputNode {
         runtime: &DataPlaneRuntime,
         frame: &mut BufferFrame,
     ) -> CoreResult<NodeResult> {
-        let (result, cached_next) = tcp_output_node_process_frame(
-            runtime,
-            frame,
-            self.next[TcpOutputNext::Lookup as usize],
-            self.next[TcpOutputNext::Drop as usize],
-            self.cached_next,
-        )?;
-        self.cached_next = cached_next;
-        Ok(result)
+        hammer_adapter::node_process_cached!(
+            self,
+            tcp_output_node_process_frame(
+                runtime,
+                frame,
+                self.next[TcpOutputNext::Lookup as usize],
+                self.next[TcpOutputNext::Drop as usize],
+                self.cached_next,
+            )
+        )
     }
 
     #[inline]
@@ -97,14 +98,13 @@ fn tcp_output_node_process(
             .nodes()
             .node_next_slot(current, TcpOutputNext::Lookup as usize)?,
     ];
-    let (result, _) = tcp_output_node_process_frame(
+    hammer_adapter::node_process_static!(tcp_output_node_process_frame(
         runtime,
         frame,
         next[TcpOutputNext::Lookup as usize],
         next[TcpOutputNext::Drop as usize],
         None,
-    )?;
-    Ok(result)
+    ))
 }
 
 fn tcp_output_node_process_frame(
@@ -114,7 +114,8 @@ fn tcp_output_node_process_frame(
     drop: NodeId,
     cached_next: Option<NodeId>,
 ) -> CoreResult<(NodeResult, Option<NodeId>)> {
-    NodeVectorDispatch::new(cached_next).route_frame(
+    hammer_adapter::node_route_frame_result!(
+        cached_next,
         runtime,
         frame,
         prefetch_tcp_output,
@@ -123,7 +124,7 @@ fn tcp_output_node_process_frame(
                 nexts[offset] = Some(tcp_output_next_for_index(batch, index, lookup, drop)?);
             }
             Ok(())
-        },
+        }
     )
 }
 

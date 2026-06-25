@@ -1,28 +1,36 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
 use hammer_adapter::BufferPacketCursor;
-use hammer_core::error::{CoreError, CoreResult};
-pub use hammer_core::protocol::tcp::synthesize_ipv4_tcp_control;
+use hammer_core::protocol::tcp::TcpControlPacketParseError;
 
-pub fn tcp_control_cursor(packet: &[u8]) -> CoreResult<BufferPacketCursor> {
+pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpControlPacketParseError> {
     let Some(version_ihl) = packet.first().copied() else {
-        return Err(CoreError::internal("tcp control packet is empty"));
+        return Err(TcpControlPacketParseError::EmptyPacket);
     };
-    if version_ihl >> 4 != 4 {
-        return Err(CoreError::internal("tcp control packet must be IPv4"));
-    }
-    if packet.len() < 40 {
-        return Err(CoreError::internal("tcp control packet is too short"));
-    }
-    let network_header_len = usize::from(version_ihl & 0x0f) * 4;
-    let packet_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let (network_header_len, packet_len) = match version_ihl >> 4 {
+        4 => {
+            if packet.len() < 40 {
+                return Err(TcpControlPacketParseError::PacketTooShort);
+            }
+            (
+                usize::from(version_ihl & 0x0f) * 4,
+                u16::from_be_bytes([packet[2], packet[3]]) as usize,
+            )
+        }
+        6 => {
+            if packet.len() < 60 {
+                return Err(TcpControlPacketParseError::PacketTooShort);
+            }
+            let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+            (40, 40 + payload_len)
+        }
+        _ => return Err(TcpControlPacketParseError::UnsupportedIpVersion),
+    };
     if packet_len > packet.len() || network_header_len < 20 || network_header_len >= packet_len {
-        return Err(CoreError::internal("tcp control packet cursor is invalid"));
+        return Err(TcpControlPacketParseError::InvalidCursor);
     }
     let tcp_offset = network_header_len;
     let tcp_header_len = usize::from(packet[tcp_offset + 12] >> 4) * 4;
     if tcp_header_len < 20 || tcp_offset + tcp_header_len > packet_len {
-        return Err(CoreError::internal("tcp control header length is invalid"));
+        return Err(TcpControlPacketParseError::InvalidHeaderLength);
     }
     Ok(BufferPacketCursor::new()
         .with_packet_len(packet_len)

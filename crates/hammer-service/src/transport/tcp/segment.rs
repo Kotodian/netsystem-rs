@@ -4,11 +4,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use hammer_adapter::{
     BufferIndex, DataPlaneBuffers, DataPlaneRuntime, IpEcnCodepoint, NetworkOpaque,
 };
-use hammer_core::error::{CoreError, CoreResult};
-use hammer_core::protocol::tcp::write_tcp_segment_header;
+use hammer_core::error::CoreResult;
 use hammer_core::protocol::tcp::{
-    TcpCapabilities, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
-    TcpSegmentHeader, TcpSeq, TcpTimestampOption, tcp_options_from_bytes,
+    TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
+    TcpSegmentHeader, TcpSegmentParseError, TcpSeq, TcpTimestampOption, tcp_options_from_bytes,
+    write_tcp_segment_header,
 };
 use hammer_infra::vec::Vec;
 
@@ -40,29 +40,29 @@ pub(crate) fn parse_tcp_packet(
         let cursor = buffer.packet_cursor();
         let parsed =
             parse_ip_packet_with_chain_len(current, buffer.total_len_not_including_first())
-                .map_err(|_| CoreError::internal("tcp packet has invalid IP header"))?;
+                .map_err(|_| TcpSegmentParseError::InvalidIpHeader)?;
         if parsed.protocol != IpProtocol::Tcp || parsed.input_error != IpInputError::None {
-            return Err(CoreError::internal("packet is not TCP"));
+            return Err(TcpSegmentParseError::WrongProtocol.into());
         }
         let first_len = current.len().min(parsed.packet_len);
         let packet = current
             .get(..first_len)
-            .ok_or_else(|| CoreError::internal("tcp packet length is invalid"))?;
+            .ok_or(TcpSegmentParseError::InvalidPacketLength)?;
         let source_ip = source_ip(parsed.version, packet)?;
         let destination_ip = destination_ip(parsed.version, packet)?;
         let transport = packet
             .get(cursor.transport_header_offset()..first_len)
-            .ok_or_else(|| CoreError::internal("tcp transport header is missing"))?;
+            .ok_or(TcpSegmentParseError::MissingTransportHeader)?;
         let segment = etherparse::TcpSlice::from_slice(transport).map_err(tcp_parse_error)?;
         let parsed_options = tcp_options_from_bytes(segment.options());
         let payload_offset = cursor
             .transport_header_offset()
             .checked_add(segment.header_len())
-            .ok_or_else(|| CoreError::internal("tcp payload offset overflow"))?;
+            .ok_or(TcpSegmentParseError::PayloadOffsetOverflow)?;
         let payload_len = parsed
             .packet_len
             .checked_sub(payload_offset)
-            .ok_or_else(|| CoreError::internal("tcp payload offset exceeds packet length"))?;
+            .ok_or(TcpSegmentParseError::PayloadOffsetExceedsPacketLength)?;
         let local = SocketAddr::new(destination_ip, segment.destination_port());
         let remote = SocketAddr::new(source_ip, segment.source_port());
         let acknowledgment = segment
@@ -171,7 +171,7 @@ impl TcpSegment {
     }
 
     #[inline]
-    pub fn write_header(&self, output: &mut [u8]) -> CoreResult<usize> {
+    pub fn write_header(&self, output: &mut [u8]) -> Result<usize, TcpError> {
         write_tcp_segment_header(
             output,
             TcpSegmentHeader {
@@ -216,7 +216,7 @@ impl TcpSegment {
         Ok(())
     }
 
-    pub(crate) fn read_from_buffer(buffer: &hammer_adapter::Buffer) -> CoreResult<Self> {
+    pub(crate) fn read_from_buffer(buffer: &hammer_adapter::Buffer) -> Result<Self, TcpError> {
         let mut segment: Self = buffer
             .opaque()
             .read::<TcpSegmentHeaderOpaque>()
@@ -229,7 +229,9 @@ impl TcpSegment {
         Ok(segment)
     }
 
-    pub(crate) fn read_from_buffer_ref(buffer: &hammer_adapter::BufferRef<'_>) -> CoreResult<Self> {
+    pub(crate) fn read_from_buffer_ref(
+        buffer: &hammer_adapter::BufferRef<'_>,
+    ) -> Result<Self, TcpError> {
         let mut segment: Self = buffer
             .opaque()
             .read::<TcpSegmentHeaderOpaque>()
@@ -270,13 +272,13 @@ impl TcpSegment {
 }
 
 impl TryFrom<TcpSegmentHeaderOpaque> for TcpSegment {
-    type Error = CoreError;
+    type Error = TcpError;
 
     #[inline]
-    fn try_from(opaque: TcpSegmentHeaderOpaque) -> CoreResult<Self> {
+    fn try_from(opaque: TcpSegmentHeaderOpaque) -> Result<Self, TcpError> {
         let fields = unsafe { opaque.fields };
         if (fields.capabilities & TCP_SEGMENT_OPAQUE_PRESENT) == 0 {
-            return Err(CoreError::internal("tcp segment intent is missing"));
+            return Err(TcpSegmentParseError::MissingIntent.into());
         }
         Ok(Self {
             local_port: fields.local_port,
@@ -415,32 +417,32 @@ union TcpSegmentSackOpaque {
     fields: TcpSegmentSackFields,
 }
 
-fn source_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
+fn source_ip(version: IpVersion, packet: &[u8]) -> Result<IpAddr, TcpError> {
     match version {
         IpVersion::V4 => {
             let source = packet
                 .get(12..16)
-                .ok_or_else(|| CoreError::internal("missing IPv4 source"))?;
+                .ok_or(TcpSegmentParseError::MissingIpv4Source)?;
             Ok(Ipv4Addr::new(source[0], source[1], source[2], source[3]).into())
         }
         IpVersion::V6 => {
             let source = packet
                 .get(8..24)
-                .ok_or_else(|| CoreError::internal("missing IPv6 source"))?;
+                .ok_or(TcpSegmentParseError::MissingIpv6Source)?;
             let bytes: [u8; 16] = source
                 .try_into()
-                .map_err(|_| CoreError::internal("invalid IPv6 source length"))?;
+                .map_err(|_| TcpSegmentParseError::InvalidIpv6SourceLength)?;
             Ok(Ipv6Addr::from(bytes).into())
         }
     }
 }
 
-fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
+fn destination_ip(version: IpVersion, packet: &[u8]) -> Result<IpAddr, TcpError> {
     match version {
         IpVersion::V4 => {
             let destination = packet
                 .get(16..20)
-                .ok_or_else(|| CoreError::internal("missing IPv4 destination"))?;
+                .ok_or(TcpSegmentParseError::MissingIpv4Destination)?;
             Ok(Ipv4Addr::new(
                 destination[0],
                 destination[1],
@@ -452,22 +454,22 @@ fn destination_ip(version: IpVersion, packet: &[u8]) -> CoreResult<IpAddr> {
         IpVersion::V6 => {
             let destination = packet
                 .get(24..40)
-                .ok_or_else(|| CoreError::internal("missing IPv6 destination"))?;
+                .ok_or(TcpSegmentParseError::MissingIpv6Destination)?;
             let bytes: [u8; 16] = destination
                 .try_into()
-                .map_err(|_| CoreError::internal("invalid IPv6 destination length"))?;
+                .map_err(|_| TcpSegmentParseError::InvalidIpv6DestinationLength)?;
             Ok(Ipv6Addr::from(bytes).into())
         }
     }
 }
 
 #[inline]
-fn tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> CoreError {
+fn tcp_parse_error(error: etherparse::err::tcp::HeaderSliceError) -> TcpError {
     match error {
         etherparse::err::tcp::HeaderSliceError::Len(_)
         | etherparse::err::tcp::HeaderSliceError::Content(
             etherparse::err::tcp::HeaderError::DataOffsetTooSmall { .. },
-        ) => CoreError::internal("tcp segment is invalid"),
+        ) => TcpSegmentParseError::InvalidSegment.into(),
     }
 }
 
