@@ -28,7 +28,8 @@ const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
 pub const TCP_INITIAL_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MIN_RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(50);
 pub const TCP_MAX_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(60);
-pub const TCP_TIME_WAIT_TICKS: u64 = 120;
+/// 60s 2MSL TIME_WAIT. iOS VPN may use a shorter value (e.g. 120 ticks = 1.2s) if needed.
+pub const TCP_TIME_WAIT_TICKS: u64 = 6_000;
 const TCP_PAWS_IDLE: Duration = Duration::from_secs(24 * 86_400);
 pub const TCP_TIMER_RETRANSMIT: u32 = 0;
 pub const TCP_TIMER_RACK: u32 = 1;
@@ -40,9 +41,24 @@ pub const TCP_TIMER_TIME_WAIT: u32 = 6;
 pub const TCP_TIMER_PACING: u32 = 7;
 pub const TCP_TIMER_COUNT: u32 = 8;
 const TCP_DELAYED_ACK_TICKS: u64 = 1;
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(75);
-const TCP_KEEPALIVE_PROBE_INTERVAL: Duration = Duration::from_secs(75);
-const TCP_KEEPALIVE_PROBE_LIMIT: u8 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpKeepaliveConfig {
+    idle: Duration,
+    probe_interval: Duration,
+    probe_limit: u8,
+}
+
+impl Default for TcpKeepaliveConfig {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(75),
+            probe_interval: Duration::from_secs(75),
+            probe_limit: 8,
+        }
+    }
+}
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 enum TcpConnectionError {
@@ -114,6 +130,7 @@ struct TcpTimestampState {
 struct TcpKeepaliveState {
     last_activity_at: Instant,
     probes_sent: u8,
+    config: TcpKeepaliveConfig,
 }
 
 impl TcpKeepaliveState {
@@ -122,6 +139,7 @@ impl TcpKeepaliveState {
         Self {
             last_activity_at: now,
             probes_sent: 0,
+            config: TcpKeepaliveConfig::default(),
         }
     }
 }
@@ -230,6 +248,7 @@ struct TcpConnectionCacheline1 {
     close_reason: Option<TcpCloseReason>,
     local_port: u16,
     fast_open_cookie: Option<TcpFastOpenCookie>,
+    persist_attempts: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +361,7 @@ where
                 close_reason: None,
                 local_port,
                 fast_open_cookie: None,
+                persist_attempts: 0,
             }),
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
             timestamps: TcpTimestampState::default(),
@@ -351,6 +371,18 @@ where
             recovery: TcpRecoveryState::new(),
             sack: TcpSackState::default(),
         }
+    }
+
+    /// Chain this after [`TcpConnection::new`] to override the keepalive policy.
+    /// The default policy (75s idle, 75s probe interval, 8 probes, always-on for
+    /// Established) is unchanged; this only paves the way for an opt-in policy.
+    /// Unused in production until the opt-in keepalive plan lands; exercised by
+    /// `tcp_keepalive_config_defaults_match_prior_constants_and_with_keepalive_overrides`.
+    #[inline]
+    #[allow(dead_code)]
+    fn with_keepalive(mut self, config: TcpKeepaliveConfig) -> Self {
+        self.keepalive.config = config;
+        self
     }
 
     #[inline]
@@ -529,14 +561,25 @@ where
                 )
                 .map(|duration| duration.as_millis().div_ceil(10).max(1) as u64),
             (TcpState::Established, TCP_TIMER_DELAYED_ACK) => Some(TCP_DELAYED_ACK_TICKS),
-            (TcpState::Established, TCP_TIMER_PERSIST) => Some(
-                (self.retransmit_timeout().retransmit_timeout().as_millis() / 10).max(1) as u64,
-            ),
+            (TcpState::Established, TCP_TIMER_PERSIST) => {
+                let rto = self.retransmit_timeout().retransmit_timeout();
+                let base_ticks = (rto.as_millis() / 10).max(1) as u64;
+                let shift = u32::from(self.cacheline1.persist_attempts.min(9));
+                let cap_ticks = TCP_MAX_RETRANSMIT_TIMEOUT
+                    .as_millis()
+                    .div_ceil(10)
+                    .max(1) as u64;
+                let ticks = base_ticks
+                    .checked_shl(shift)
+                    .unwrap_or(u64::MAX)
+                    .min(cap_ticks);
+                Some(ticks.max(1))
+            }
             (TcpState::Established, TCP_TIMER_KEEP_ALIVE) => {
                 let interval = if self.keepalive.probes_sent == 0 {
-                    TCP_KEEPALIVE_IDLE
+                    self.keepalive.config.idle
                 } else {
-                    TCP_KEEPALIVE_PROBE_INTERVAL
+                    self.keepalive.config.probe_interval
                 };
                 Some(interval.as_millis().div_ceil(10).max(1) as u64)
             }
@@ -591,6 +634,9 @@ where
             self.snd_una = acknowledgment;
         }
         self.snd_wnd = self.effective_send_window(u32::from(advertised_window));
+        if self.snd_wnd > 0 {
+            self.cacheline1.persist_attempts = 0;
+        }
     }
 
     fn recovery_ack(&self, acknowledgment: TcpSeq) -> TcpRecoveryAck {
@@ -1951,8 +1997,10 @@ where
     fn on_persist_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
         if self.snd_wnd != 0 {
+            self.cacheline1.persist_attempts = 0;
             return None;
         }
+        self.cacheline1.persist_attempts = self.cacheline1.persist_attempts.saturating_add(1);
         if self.tx_intent_sequence.is_some() {
             self.timer_set(TCP_TIMER_PERSIST);
             return None;
@@ -1972,7 +2020,7 @@ where
 
     fn on_keepalive_timer_expiry(&mut self) -> Option<TcpSegment> {
         self.ensure_state(TcpState::Established).ok()?;
-        if self.keepalive.probes_sent >= TCP_KEEPALIVE_PROBE_LIMIT {
+        if self.keepalive.probes_sent >= self.keepalive.config.probe_limit {
             self.cacheline1.close_reason = Some(TcpCloseReason::KeepAliveTimeout);
             self.state = TcpState::Closed;
             self.timer_reset(TCP_TIMER_KEEP_ALIVE);
@@ -2581,10 +2629,10 @@ mod tests {
 
         connection.timer_set(TCP_TIMER_KEEP_ALIVE);
         connection.keepalive.last_activity_at = Instant::now()
-            .checked_sub(TCP_KEEPALIVE_IDLE)
+            .checked_sub(connection.keepalive.config.idle)
             .expect("move keepalive activity into the past");
 
-        for probe in 0..TCP_KEEPALIVE_PROBE_LIMIT {
+        for probe in 0..connection.keepalive.config.probe_limit {
             let segment = connection
                 .on_tcp_timer_expiry(TCP_TIMER_KEEP_ALIVE, TcpCapabilities::default())
                 .expect("keepalive probe");
@@ -2612,6 +2660,33 @@ mod tests {
             connection.close_reason(),
             Some(TcpCloseReason::KeepAliveTimeout)
         );
+    }
+
+    #[test]
+    fn tcp_keepalive_config_defaults_match_prior_constants_and_with_keepalive_overrides() {
+        let default_config = TcpKeepaliveConfig::default();
+        assert_eq!(default_config.idle, Duration::from_secs(75));
+        assert_eq!(default_config.probe_interval, Duration::from_secs(75));
+        assert_eq!(default_config.probe_limit, 8);
+
+        let local: SocketAddr = "192.0.2.10:443".parse().expect("local");
+        let remote: SocketAddr = "198.51.100.20:50001".parse().expect("remote");
+        let connection = TcpConnection::<BbrController>::new(
+            Some(TcpConnectionId::new(1)),
+            DataWorkerId::new(0),
+            local.port(),
+            Some(local),
+            remote,
+        );
+        assert_eq!(connection.keepalive.config, default_config);
+
+        let custom = TcpKeepaliveConfig {
+            idle: Duration::from_secs(30),
+            probe_interval: Duration::from_secs(10),
+            probe_limit: 3,
+        };
+        let customized = connection.with_keepalive(custom);
+        assert_eq!(customized.keepalive.config, custom);
     }
 
     #[test]
@@ -3541,5 +3616,87 @@ mod tests {
             assert_eq!(u64::from(ace_counter(ace_flags(value))), value);
         }
         assert_eq!(ace_delta(6, 1), 3);
+    }
+
+    #[test]
+    fn time_wait_ticks_is_60s() {
+        assert_eq!(TCP_TIME_WAIT_TICKS, 6_000);
+    }
+
+    #[test]
+    fn persist_timer_backoff_doubles_interval_each_attempt() {
+        let now = Instant::now();
+        let mut connection = established_connection();
+
+        // Default RTO for a fresh connection is TCP_INITIAL_RETRANSMIT_TIMEOUT (50ms),
+        // so the persist base interval is 50ms / 10 = 5 ticks.
+        let base_ticks: u64 = (connection
+            .retransmit_timeout()
+            .retransmit_timeout()
+            .as_millis()
+            / 10) as u64;
+        assert_eq!(base_ticks, 5);
+
+        connection.snd_wnd = 0;
+        connection.timer_set(TCP_TIMER_PERSIST);
+
+        // Each persist expiry re-arms the timer and increments persist_attempts, so
+        // the interval read before the N-th arm uses shift=N: base, base*2, base*4.
+        let expected = [base_ticks, base_ticks * 2, base_ticks * 4];
+        for (step, expected_ticks) in expected.iter().enumerate() {
+            assert_eq!(
+                connection.timer_ticks(TCP_TIMER_PERSIST, now),
+                Some(*expected_ticks),
+                "persist interval before arm {step}"
+            );
+            let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
+        }
+
+        // Drive a large RTO so base << 9 exceeds the 60s cap and verify the cap binds.
+        while connection.retransmit_timeout().retransmit_timeout() < TCP_MAX_RETRANSMIT_TIMEOUT {
+            connection.observe_retransmit_timeout();
+        }
+        assert_eq!(
+            connection.retransmit_timeout().retransmit_timeout(),
+            TCP_MAX_RETRANSMIT_TIMEOUT
+        );
+        let maxed_base_ticks: u64 = (TCP_MAX_RETRANSMIT_TIMEOUT.as_millis() / 10) as u64;
+
+        // Reset attempts so the shift starts from 0 with the maxed RTO.
+        connection.snd_wnd = 8_000;
+        let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
+        assert_eq!(connection.timer_ticks(TCP_TIMER_PERSIST, now), None);
+
+        connection.snd_wnd = 0;
+        connection.timer_set(TCP_TIMER_PERSIST);
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_PERSIST, now),
+            Some(maxed_base_ticks)
+        );
+
+        // Climb attempts until the shift cap (9) plus the 60s interval cap both bind.
+        for _ in 0..15 {
+            let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
+        }
+        let capped_ticks: u64 = TCP_MAX_RETRANSMIT_TIMEOUT
+            .as_millis()
+            .div_ceil(10)
+            .max(1) as u64;
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_PERSIST, now),
+            Some(capped_ticks),
+            "persist interval capped at 60s"
+        );
+
+        // Window opening resets the backoff so the next probe uses the base interval.
+        connection.snd_wnd = 8_000;
+        let _ = connection.on_tcp_timer_expiry(TCP_TIMER_PERSIST, TcpCapabilities::default());
+        connection.snd_wnd = 0;
+        connection.timer_set(TCP_TIMER_PERSIST);
+        assert_eq!(
+            connection.timer_ticks(TCP_TIMER_PERSIST, now),
+            Some(maxed_base_ticks),
+            "persist backoff resets when the window opens"
+        );
     }
 }
