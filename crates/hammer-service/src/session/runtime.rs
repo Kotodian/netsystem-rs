@@ -10,9 +10,7 @@ use hammer_infra::map::FlatHashTable;
 use hammer_infra::pool::{Index as PoolIndex, Pool};
 use hammer_infra::rbtree::RbTree;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::app::AppOpId;
-#[cfg(test)]
-use hammer_runtime::app::AppRingHandle;
+use hammer_runtime::app::{AppOpId, AppRingHandle};
 
 use crate::session::{
     SessionAppRuntime, SessionId, SessionQueueHandle, SessionQueueNext, SessionReadyQueue,
@@ -615,7 +613,7 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn bind_session_app_ring(
         &mut self,
         id: SessionId,
@@ -641,7 +639,6 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
-    #[cfg(test)]
     pub(crate) fn app_mut(&mut self) -> &mut SessionAppRuntime {
         &mut self.app_state.app
     }

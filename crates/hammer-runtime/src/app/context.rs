@@ -43,6 +43,16 @@ impl AppContext {
         }
     }
 
+    #[inline]
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    #[inline]
+    pub fn ring_capacity(&self) -> usize {
+        self.ring_capacity
+    }
+
     pub async fn send_on_op(&self, op: AppOpId, send: AppSend) -> HammerResult<()> {
         if self.current_worker_owns_op(op) {
             let ring = self.local_ring_for_op(op)?;
@@ -468,7 +478,7 @@ fn next_app_context_id() -> usize {
 }
 
 #[inline]
-fn worker_app_ring(app_context_id: usize, ring_capacity: usize) -> AppRingHandle {
+pub fn worker_app_ring(app_context_id: usize, ring_capacity: usize) -> AppRingHandle {
     APP_WORKER_RINGS.with(|slot| {
         slot.borrow_mut()
             .get_or_insert(app_context_id as u64, ring_capacity)

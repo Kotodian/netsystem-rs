@@ -151,10 +151,24 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResu
     })
 }
 
-pub fn wire_worker_graph(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<()> {
+pub fn wire_worker_graph(
+    runtime: &DataPlaneRuntime,
+    worker: usize,
+    app_context_id: usize,
+    ring_capacity: usize,
+) -> CoreResult<()> {
     crate::with_congestion!(|C| {
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
+        {
+            let mut driver = queue.borrow_mut()?;
+            driver
+                .app_mut()
+                .set_ring(hammer_runtime::app::worker_app_ring(
+                    app_context_id,
+                    ring_capacity,
+                ));
+        }
         let session_queue = runtime
             .nodes()
             .node_by_name("session-queue")
@@ -641,9 +655,10 @@ mod tests {
     use std::time::Instant;
 
     use hammer_adapter::{
-        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeId, NodeProcessFn,
-        NodeRegistration, NodeResult, NodeRuntimeData,
+        BufferFrame, DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeHandle, NodeId,
+        NodeProcessFn, NodeRegistration, NodeResult, NodeRuntimeData,
     };
+    use hammer_core::config::network::CongestionController as ConfigCongestionController;
     use hammer_core::error::{CoreError, CoreResult};
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,
@@ -792,6 +807,141 @@ mod tests {
         .expect("dispatch tcp session queue");
         output.schedule(runtime).expect("schedule output");
         runtime.run_ready_nodes().expect("run tcp output")
+    }
+
+    #[derive(Clone, Copy)]
+    struct TestIpLookupNode;
+
+    impl Node for TestIpLookupNode {
+        fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> CoreResult<NodeResult> {
+            Ok(NodeResult::drop())
+        }
+
+        fn node_process(&self) -> NodeProcessFn {
+            test_ip_lookup_process
+        }
+    }
+
+    impl InternalNode for TestIpLookupNode {
+        fn node_registration(&self) -> NodeRegistration
+        where
+            Self: Sized,
+        {
+            NodeRegistration::next("ip-lookup", 0)
+        }
+    }
+
+    fn test_ip_lookup_process(
+        _: &DataPlaneRuntime,
+        _: NodeRuntimeData,
+        _: &mut BufferFrame,
+    ) -> CoreResult<NodeResult> {
+        Ok(NodeResult::drop())
+    }
+
+    fn register_test_ip_lookup(runtime: &DataPlaneRuntime, _: usize) -> CoreResult<NodeId> {
+        runtime.nodes().try_register_internal(TestIpLookupNode)
+    }
+
+    #[test]
+    fn session_app_ring_production_bind() {
+        let _ = crate::transport::TRANSPORT_MAIN
+            .get_or_init(|| crate::transport::TransportMain::new(ConfigCongestionController::Bbr));
+        let _ = TCP_MAIN.get_or_init(TcpMain::new);
+
+        let worker = 0;
+        let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
+        set_tcp_worker_state(&mut worker_state);
+        let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8)
+            .with_handoff_node_handle(NodeHandle::new(1));
+        let graph_nodes = [
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("drop", 0),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: crate::data_plane::register_drop,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("ip-lookup", 0),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: register_test_ip_lookup,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("session-queue", 0),
+                kind: hammer_adapter::NodeKind::Driver,
+                init: crate::session::node::register_session_queue_node,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-output", TcpOutputNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: output::register_tcp_output,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-reset", reset::TcpResetNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: reset::register_tcp_reset,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-established", TcpEstablishedNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: established::register_tcp_established,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-rcv-process", TcpRcvProcessNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: rcv_process::register_tcp_rcv_process,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-syn-sent", TcpSynSentNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: syn_sent::register_tcp_syn_sent,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-listen", TcpListenNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: listen::register_tcp_listen,
+            },
+            hammer_adapter::NodeEntry {
+                registration: NodeRegistration::next("tcp-input", TcpInputNext::COUNT),
+                kind: hammer_adapter::NodeKind::Internal,
+                init: register_tcp_input,
+            },
+        ];
+        runtime
+            .init_graph(worker, &graph_nodes)
+            .expect("init service graph");
+
+        let app_context_id = 10_001;
+        let ring_capacity = 8;
+        wire_worker_graph(&runtime, worker, app_context_id, ring_capacity)
+            .expect("wire tcp worker graph");
+
+        let queue_data = ensure_tcp_session_queue::<BbrController>(&runtime, worker)
+            .expect("tcp session queue data");
+        let queue = TcpQueue::<BbrController>::new(queue_data);
+        let op = AppOpId::new(10_002);
+        let app_ring = hammer_runtime::app::worker_app_ring(app_context_id, ring_capacity);
+        let send =
+            app_ring.send_from_data(app_ring.alloc_data_for_bytes(b"hello").expect("app data"));
+        app_ring
+            .try_push_submission(AppSqe::send(None, op, send))
+            .expect("push app send");
+
+        let mut driver = queue.borrow_mut().expect("tcp queue");
+        let session_id = driver.insert_session(established_tcp_connection());
+        let unrelated_ring = AppRingHandle::with_data_area(8, 8, 256, 8).expect("unrelated ring");
+        assert!(driver.bind_session_app_ring(session_id, op, unrelated_ring));
+        driver
+            .app_mut()
+            .drain_submissions()
+            .expect("drain app ring");
+
+        assert_eq!(
+            driver
+                .app()
+                .pending_send_len(session_id)
+                .expect("pending len"),
+            Some(5)
+        );
     }
 
     fn expire_tcp_timers(

@@ -76,6 +76,11 @@ impl SessionAppRuntime {
     }
 
     #[inline]
+    pub fn set_ring(&mut self, ring: AppRingHandle) {
+        self.control.ring.get_or_insert(ring);
+    }
+
+    #[inline]
     pub fn unbind_ring(&mut self, op: AppOpId) -> Option<AppRingHandle> {
         self.control.session_slots.lookup(&op.value())?;
         self.control
