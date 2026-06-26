@@ -374,19 +374,14 @@ impl RuntimeService {
         packet_graph::init_control_planes(&registry)?;
         let listener_state = RuntimeTcpListenerControlState::new()?;
         let handoff_node_handle = NodeHandle::new(worker.handoff.node_handle);
-        let app_context_id = app_context.id();
-        let ring_capacity = app_context.ring_capacity();
+        let worker_app_context = app_context.clone();
         let worker_graph_nodes = data_context.install_on_workers(move |worker, runtime| {
             let runtime = runtime
                 .clone()
                 .with_handoff_node_handle(handoff_node_handle);
             runtime.init_graph(worker, &crate::packet_graph::SERVICE_GRAPH_NODES)?;
-            crate::transport::tcp::wire_worker_graph(
-                &runtime,
-                worker,
-                app_context_id,
-                ring_capacity,
-            )?;
+            let app_ring = worker_app_context.worker_ring();
+            crate::transport::tcp::wire_worker_graph(&runtime, worker, app_ring)?;
             Ok::<_, hammer_core::error::CoreError>(
                 crate::packet_graph::SERVICE_GRAPH_NODES
                     .iter()

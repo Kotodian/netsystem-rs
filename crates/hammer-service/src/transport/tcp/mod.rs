@@ -13,6 +13,8 @@ use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
 use hammer_core::registry::RuntimeRegistry;
 use thiserror::Error;
 
+use hammer_runtime::app::AppRingHandle;
+
 use crate::session::{
     SessionId, SessionQueueHandle, SessionQueueNext,
     node::{SessionQueueNode, SessionQueueOutput},
@@ -154,20 +156,14 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResu
 pub fn wire_worker_graph(
     runtime: &DataPlaneRuntime,
     worker: usize,
-    app_context_id: usize,
-    ring_capacity: usize,
+    app_ring: AppRingHandle,
 ) -> CoreResult<()> {
     crate::with_congestion!(|C| {
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
         {
             let mut driver = queue.borrow_mut()?;
-            driver
-                .app_mut()
-                .set_ring(hammer_runtime::app::worker_app_ring(
-                    app_context_id,
-                    ring_capacity,
-                ));
+            driver.app_mut().set_ring(app_ring.clone());
         }
         let session_queue = runtime
             .nodes()
@@ -910,16 +906,13 @@ mod tests {
             .init_graph(worker, &graph_nodes)
             .expect("init service graph");
 
-        let app_context_id = 10_001;
-        let ring_capacity = 8;
-        wire_worker_graph(&runtime, worker, app_context_id, ring_capacity)
-            .expect("wire tcp worker graph");
+        let app_ring = AppRingHandle::new(8, 8);
+        wire_worker_graph(&runtime, worker, app_ring.clone()).expect("wire tcp worker graph");
 
         let queue_data = ensure_tcp_session_queue::<BbrController>(&runtime, worker)
             .expect("tcp session queue data");
         let queue = TcpQueue::<BbrController>::new(queue_data);
         let op = AppOpId::new(10_002);
-        let app_ring = hammer_runtime::app::worker_app_ring(app_context_id, ring_capacity);
         let send =
             app_ring.send_from_data(app_ring.alloc_data_for_bytes(b"hello").expect("app data"));
         app_ring
