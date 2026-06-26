@@ -22,6 +22,7 @@ const CLOSED_OWNER_WORKER: usize = usize::MAX;
 thread_local! {
     static APP_WORKER_RINGS: RefCell<AppWorkerRingRegistry> =
         RefCell::new(AppWorkerRingRegistry::new());
+    static CURRENT_APP_CONTEXT: RefCell<Option<AppContext>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone)]
@@ -478,6 +479,16 @@ fn worker_app_ring(app_context_id: usize, ring_capacity: usize) -> AppRingHandle
         slot.borrow_mut()
             .get_or_insert(app_context_id as u64, ring_capacity)
     })
+}
+
+#[inline]
+pub fn set_current_app_context(ctx: AppContext) {
+    CURRENT_APP_CONTEXT.with(|slot| *slot.borrow_mut() = Some(ctx));
+}
+
+#[inline]
+pub fn current_app_context() -> Option<AppContext> {
+    CURRENT_APP_CONTEXT.with(|slot| slot.borrow().clone())
 }
 
 struct AppWorkerRingRegistry {

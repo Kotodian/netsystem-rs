@@ -13,8 +13,6 @@ use hammer_core::protocol::tcp::{TcpControlPacketParseError, TcpError};
 use hammer_core::registry::RuntimeRegistry;
 use thiserror::Error;
 
-use hammer_runtime::app::AppRingHandle;
-
 use crate::session::{
     SessionId, SessionQueueHandle, SessionQueueNext,
     node::{SessionQueueNode, SessionQueueOutput},
@@ -153,18 +151,10 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime, worker: usize) -> CoreResu
     })
 }
 
-pub fn wire_worker_graph(
-    runtime: &DataPlaneRuntime,
-    worker: usize,
-    app_ring: AppRingHandle,
-) -> CoreResult<()> {
+pub fn wire_worker_graph(runtime: &DataPlaneRuntime, worker: usize) -> CoreResult<()> {
     crate::with_congestion!(|C| {
         let queue_data = ensure_tcp_session_queue::<C>(runtime, worker)?;
         let queue = TcpQueue::<C>::new(queue_data);
-        {
-            let mut driver = queue.borrow_mut()?;
-            driver.app_mut().set_ring(app_ring.clone());
-        }
         let session_queue = runtime
             .nodes()
             .node_by_name("session-queue")
@@ -659,7 +649,8 @@ mod tests {
     use hammer_core::protocol::tcp::{
         TcpCapabilities, TcpConnectionId, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq,
     };
-    use hammer_runtime::app::{AppOpId, AppRingHandle, AppSendData, AppSqe};
+    use hammer_runtime::app::{AppContext, AppOpId, AppRingHandle, AppSendData, AppSqe};
+    use hammer_runtime::spawn::DataRuntime;
 
     use super::*;
     use crate::session::SessionId;
@@ -848,6 +839,11 @@ mod tests {
         let worker = 0;
         let mut worker_state = TcpWorkerOwnedState::new(DataWorkerId::new(0));
         set_tcp_worker_state(&mut worker_state);
+        let data_runtime =
+            DataRuntime::new(1, "session-app-ring-production-bind-test", 512 * 1024, 2)
+                .expect("data runtime");
+        let app_context = AppContext::with_ring_capacity(data_runtime.context(), 8);
+        hammer_runtime::app::set_current_app_context(app_context.clone());
         let runtime = DataPlaneRuntime::with_capacities(2048, 32, 8, 8)
             .with_handoff_node_handle(NodeHandle::new(1));
         let graph_nodes = [
@@ -906,8 +902,8 @@ mod tests {
             .init_graph(worker, &graph_nodes)
             .expect("init service graph");
 
-        let app_ring = AppRingHandle::new(8, 8);
-        wire_worker_graph(&runtime, worker, app_ring.clone()).expect("wire tcp worker graph");
+        let app_ring = app_context.worker_ring();
+        wire_worker_graph(&runtime, worker).expect("wire tcp worker graph");
 
         let queue_data = ensure_tcp_session_queue::<BbrController>(&runtime, worker)
             .expect("tcp session queue data");

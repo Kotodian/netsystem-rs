@@ -517,7 +517,10 @@ where
 impl<S> SessionDriverRuntime<S> {
     #[inline]
     pub(crate) fn new(worker: DataWorkerId, buffers: DataPlaneBuffers) -> Self {
-        let app = SessionAppRuntime::new(buffers.clone());
+        let mut app = SessionAppRuntime::new(buffers.clone());
+        if let Some(app_context) = hammer_runtime::app::current_app_context() {
+            app.set_ring(app_context.worker_ring());
+        }
         Self {
             runtime: CachePadded::new(SessionDriverRuntimeCore {
                 sessions: WorkerSessionRuntime::new(worker),
@@ -639,6 +642,7 @@ impl<S> SessionDriverRuntime<S> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn app_mut(&mut self) -> &mut SessionAppRuntime {
         &mut self.app_state.app
     }
