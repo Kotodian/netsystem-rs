@@ -9,3 +9,4 @@ name = "hammer_infra"
 
 [dependencies]
 crossbeam-utils = { workspace = true }
+libc = { workspace = true }

@@ -828,6 +828,7 @@ name = "hammer-infra"
 version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
+ "libc",
 ]
 
 [[package]]
