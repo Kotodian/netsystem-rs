@@ -26,26 +26,18 @@ impl fmt::Display for SvmFifoError {
 
 impl std::error::Error for SvmFifoError {}
 
-#[repr(C)]
-pub struct SvmFifoCursors {
-    head: CachePadded<AtomicU32>,
-    tail: CachePadded<AtomicU32>,
-}
-
-impl SvmFifoCursors {
-    const fn new() -> Self {
-        Self {
-            head: CachePadded::new(AtomicU32::new(0)),
-            tail: CachePadded::new(AtomicU32::new(0)),
-        }
-    }
-}
-
 pub struct SvmFifo {
     mask: u32,
     capacity: u32,
-    cursors: SvmFifoCursors,
-    want_notification: AtomicBool,
+    // SPSC: producer owns `tail`, consumer owns `head`. Each gets its own
+    // cache line so concurrent producer/consumer traffic doesn't bounce.
+    head: CachePadded<AtomicU32>,
+    tail: CachePadded<AtomicU32>,
+    // Padded away from `data` (Slice metadata): the producer CAS in
+    // `should_signal` and the consumer store in `want_notification` would
+    // otherwise share a line with the `Slice` {ptr,len,cap} both sides load
+    // on every enqueue/peek.
+    want_notification: CachePadded<AtomicBool>,
     data: Slice<u8>,
 }
 
@@ -58,8 +50,9 @@ impl SvmFifo {
         Ok(Self {
             mask: capacity - 1,
             capacity,
-            cursors: SvmFifoCursors::new(),
-            want_notification: AtomicBool::new(false),
+            head: CachePadded::new(AtomicU32::new(0)),
+            tail: CachePadded::new(AtomicU32::new(0)),
+            want_notification: CachePadded::new(AtomicBool::new(false)),
             data: Slice::from_elem(capacity as usize, 0u8),
         })
     }
@@ -71,15 +64,15 @@ impl SvmFifo {
 
     #[inline]
     pub fn max_dequeue(&self) -> usize {
-        let head = self.cursors.head.load(Ordering::Relaxed);
-        let tail = self.cursors.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         tail.wrapping_sub(head) as usize
     }
 
     #[inline]
     pub fn max_enqueue(&self) -> usize {
-        let head = self.cursors.head.load(Ordering::Acquire);
-        let tail = self.cursors.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
         let used = tail.wrapping_sub(head);
         (self.capacity - used) as usize
     }
@@ -94,9 +87,10 @@ impl SvmFifo {
         self.max_enqueue() == 0
     }
 
+    #[inline]
     pub fn enqueue(&self, src: &[u8]) -> usize {
-        let head = self.cursors.head.load(Ordering::Acquire);
-        let tail = self.cursors.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
         let used = tail.wrapping_sub(head);
         let free = self.capacity - used;
         let to_write = src.len().min(free as usize);
@@ -129,15 +123,15 @@ impl SvmFifo {
             }
         }
 
-        self.cursors
-            .tail
+        self.tail
             .store(tail.wrapping_add(to_write as u32), Ordering::Release);
         to_write
     }
 
+    #[inline]
     pub fn peek(&self, offset: usize, len: usize, dst: &mut [u8]) -> usize {
-        let head = self.cursors.head.load(Ordering::Relaxed);
-        let tail = self.cursors.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         let available = tail.wrapping_sub(head) as usize;
         if offset >= available {
             return 0;
@@ -172,16 +166,16 @@ impl SvmFifo {
         to_copy
     }
 
+    #[inline]
     pub fn dequeue_drop(&self, len: usize) -> usize {
-        let head = self.cursors.head.load(Ordering::Relaxed);
-        let tail = self.cursors.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         let available = tail.wrapping_sub(head) as usize;
         let to_drop = len.min(available);
         if to_drop == 0 {
             return 0;
         }
-        self.cursors
-            .head
+        self.head
             .store(head.wrapping_add(to_drop as u32), Ordering::Release);
         to_drop
     }
@@ -196,13 +190,14 @@ impl SvmFifo {
         self.want_notification.store(false, Ordering::Release);
     }
 
+    #[inline]
     pub fn should_signal(&self, wrote: usize) -> bool {
         if wrote == 0 {
             return false;
         }
-        let tail = self.cursors.tail.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
         let tail_before = tail.wrapping_sub(wrote as u32);
-        let head = self.cursors.head.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
         if head != tail_before {
             return false;
         }
@@ -226,8 +221,8 @@ impl SvmFifo {
     }
 
     pub fn clear(&self) {
-        self.cursors.head.store(0, Ordering::Relaxed);
-        self.cursors.tail.store(0, Ordering::Relaxed);
+        self.head.store(0, Ordering::Relaxed);
+        self.tail.store(0, Ordering::Relaxed);
         self.want_notification.store(false, Ordering::Relaxed);
     }
 }
@@ -355,15 +350,11 @@ mod tests {
 
         let consumer = thread::spawn(move || {
             let mut received = Vec::with_capacity(N);
+            let mut buf = [0u8; 256];
             while received.len() < N {
-                let available = consumer_fifo.max_dequeue();
-                if available == 0 {
-                    thread::yield_now();
-                    continue;
-                }
-                let mut buf = vec![0u8; available.min(256)];
                 let peeked = consumer_fifo.peek(0, buf.len(), &mut buf);
                 if peeked == 0 {
+                    thread::yield_now();
                     continue;
                 }
                 received.extend_from_slice(&buf[..peeked]);
