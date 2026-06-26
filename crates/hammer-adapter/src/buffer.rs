@@ -18,7 +18,7 @@ use hammer_infra::{
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HandoffIndices};
 use crate::instruction_set::{DataPlaneInstructionSet, FrameBatchWidth};
-use crate::node::{NodeHandle, NodeId, NodeNext, NodeRuntime};
+use crate::node::{NodeEntry, NodeHandle, NodeId, NodeNext, NodeRuntime};
 use crate::packet_buffer::NetworkOpaque;
 use crate::packet_buffer::{
     PACKET_BUFFER_INVALID_INDEX, PacketBufferCacheline0, PacketBufferCacheline1, PacketBufferFlags,
@@ -619,6 +619,7 @@ pub struct DataPlaneRuntime {
     nodes: NodeRuntime,
     current_node: Rc<Cell<Option<NodeId>>>,
     handoff: Option<DataPlaneHandoffWorker>,
+    handoff_node_handle: Option<NodeHandle>,
 }
 
 impl Clone for DataPlaneRuntime {
@@ -628,6 +629,7 @@ impl Clone for DataPlaneRuntime {
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),
             handoff: self.handoff.clone(),
+            handoff_node_handle: self.handoff_node_handle,
         }
     }
 }
@@ -1142,6 +1144,7 @@ impl DataPlaneRuntime {
             nodes: NodeRuntime::default(),
             current_node: Rc::new(Cell::new(None)),
             handoff: None,
+            handoff_node_handle: None,
         }
     }
 
@@ -1155,6 +1158,18 @@ impl DataPlaneRuntime {
         runtime.buffers = runtime.buffers.with_handoff(handoff.clone());
         runtime.handoff = Some(handoff);
         runtime
+    }
+
+    #[inline]
+    pub fn with_handoff_node_handle(mut self, handle: NodeHandle) -> Self {
+        self.handoff_node_handle = Some(handle);
+        self
+    }
+
+    #[inline]
+    pub fn handoff_node_handle(&self) -> CoreResult<NodeHandle> {
+        self.handoff_node_handle
+            .ok_or_else(|| CoreError::internal("data plane handoff node handle is not configured"))
     }
 
     #[inline]
@@ -1183,6 +1198,21 @@ impl DataPlaneRuntime {
     #[inline]
     pub fn nodes(&self) -> &NodeRuntime {
         &self.nodes
+    }
+
+    /// Initialize a packet graph: walk `entries`, call each `init`, then resolve
+    /// named next-node edges. VPP `vlib_register_all_static_nodes` +
+    /// `vlib_node_main_init`. Per-worker `worker` index is forwarded to each node.
+    pub fn init_graph(&self, worker: usize, entries: &[NodeEntry]) -> CoreResult<()> {
+        for entry in entries {
+            (entry.init)(self, worker).map_err(|err| {
+                CoreError::internal(format!(
+                    "init graph node `{}`: {err}",
+                    entry.registration.name().unwrap_or("?")
+                ))
+            })?;
+        }
+        self.nodes.resolve_named_next_nodes()
     }
 
     #[inline]

@@ -427,7 +427,7 @@ impl NodeRegistration {
     }
 
     #[inline]
-    fn name(self) -> Option<&'static str> {
+    pub fn name(self) -> Option<&'static str> {
         match self {
             Self::Plain => None,
             Self::Next { name, .. } | Self::Sibling { name, .. } => Some(name),
