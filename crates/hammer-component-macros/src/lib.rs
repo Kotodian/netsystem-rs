@@ -1096,6 +1096,7 @@ enum GraphRegisterKind {
     Driver,
     Handoff,
     TcpInput,
+    IpLookup,
 }
 
 struct GraphNodeArgs {
@@ -1132,11 +1133,12 @@ impl Parse for GraphNodeArgs {
                         "driver" => GraphRegisterKind::Driver,
                         "handoff" => GraphRegisterKind::Handoff,
                         "tcp_input" => GraphRegisterKind::TcpInput,
+                        "ip_lookup" => GraphRegisterKind::IpLookup,
                         other => {
                             return Err(Error::new(
                                 kind.span(),
                                 format!(
-                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, `handoff`, or `tcp_input`"
+                                    "unknown graph register kind `{other}`; expected `internal`, `driver`, `handoff`, `tcp_input`, or `ip_lookup`"
                                 ),
                             ));
                         }
@@ -1218,6 +1220,7 @@ fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKi
         GraphRegisterKind::Handoff => GraphRegisterKind::Handoff,
         GraphRegisterKind::Driver => GraphRegisterKind::Driver,
         GraphRegisterKind::TcpInput => GraphRegisterKind::TcpInput,
+        GraphRegisterKind::IpLookup => GraphRegisterKind::IpLookup,
         GraphRegisterKind::Internal => node_role_from_item(item)
             .map(|role| match role {
                 NodeRole::Internal => GraphRegisterKind::Internal,
@@ -1230,9 +1233,10 @@ fn effective_register_kind(args: &GraphNodeArgs, item: &Item) -> GraphRegisterKi
 fn graph_node_kind_expr(register: GraphRegisterKind) -> TokenStream2 {
     match register {
         GraphRegisterKind::Driver => quote!(::hammer_adapter::NodeKind::Driver),
-        GraphRegisterKind::Internal | GraphRegisterKind::Handoff | GraphRegisterKind::TcpInput => {
-            quote!(::hammer_adapter::NodeKind::Internal)
-        }
+        GraphRegisterKind::Internal
+        | GraphRegisterKind::Handoff
+        | GraphRegisterKind::TcpInput
+        | GraphRegisterKind::IpLookup => quote!(::hammer_adapter::NodeKind::Internal),
     }
 }
 
@@ -1243,6 +1247,9 @@ fn graph_register_body(
 ) -> TokenStream2 {
     // `register = tcp_input` is only meaningful for congestion-typed graph nodes.
     match (next, register) {
+        (_, GraphRegisterKind::IpLookup) => quote! {
+            crate::net::lookup::register_ip_lookup_graph_node(runtime, worker)
+        },
         (Some(next), GraphRegisterKind::Internal | GraphRegisterKind::TcpInput) => quote! {
             runtime.nodes().try_register_internal_with_next_names(
                 #ident::new([::hammer_adapter::NodeId::new(0); #next::COUNT]),
@@ -1314,12 +1321,9 @@ pub fn graph_node(args: TokenStream, input: TokenStream) -> TokenStream {
     let ident = match item {
         Item::Struct(ref item) => item.ident.clone(),
         _ => {
-            return Error::new(
-                item.span(),
-                "`graph_node` can only be attached to a struct",
-            )
-            .to_compile_error()
-            .into();
+            return Error::new(item.span(), "`graph_node` can only be attached to a struct")
+                .to_compile_error()
+                .into();
         }
     };
     expand_graph_node(args, &ident, item)
@@ -1462,7 +1466,9 @@ mod tests {
             "#,
         )
         .expect("parse enum");
-        let expanded = expand_node_next(item).expect("expand node_next").to_string();
+        let expanded = expand_node_next(item)
+            .expect("expand node_next")
+            .to_string();
 
         assert!(
             expanded.contains(r#""custom-node""#),

@@ -10,8 +10,8 @@ use hammer_adapter::{
     NodeRuntimeData, PacketTrace, SecondaryOpaque, TapEthernetMetadata, TraceFormatter,
     add_packet_trace, unlikely,
 };
-use hammer_core::config::RouteAction;
-use hammer_core::error::{CoreError, CoreResult, HammerResult};
+use hammer_core::config::{Config, Route, RouteAction};
+use hammer_core::error::{CoreError, CoreResult, HammerError, HammerResult};
 use hammer_core::forwarding::{
     Adjacency as CoreAdjacency, DpoId as CoreDpoId, FibEntry as CoreFibEntry,
     FibLookupResult as CoreFibLookupResult, FibTable as CoreFibTable,
@@ -25,6 +25,7 @@ use hammer_core::protocol::icmp::IcmpErrorMetadata;
 use hammer_core::protocol::ip::{
     IpProtocol, IpVersion, ParsedIpPacket, parse_ip_packet_with_chain_len,
 };
+use hammer_core::registry::RuntimeRegistry;
 use hammer_runtime::{ControlThreadHandle, DataPlaneBarrierHandle};
 
 use crate::data_plane::set_index_node_error_code;
@@ -277,15 +278,32 @@ impl IpLookupControlPlane {
     }
 }
 
-pub(crate) fn assemble_ip_lookup_node(
-    runtime: &hammer_adapter::NodeRuntime,
-    _worker_id: usize,
-    _: &(),
-) -> CoreResult<NodeId> {
-    let drop = crate::packet_graph::graph_node(runtime, "drop")?;
-    let mut builder = FibTableBuilder::new(drop);
-    crate::packet_graph::with_boot(|boot| {
-        for route in boot.routes.iter() {
+/// IP-lookup subsystem control-plane main (VPP `ip_main_t`).
+///
+/// Owns the static routes read from config. The FIB table itself is built
+/// per-worker at registration time, because the `drop` next-node id is only
+/// known once the `drop` node has registered (resolved by name at that point).
+pub struct IpMain {
+    routes: Arc<[Route]>,
+}
+
+impl IpMain {
+    pub fn new(routes: Arc<[Route]>) -> Self {
+        Self { routes }
+    }
+
+    /// Build and register this worker's `IpLookupNode`.
+    ///
+    /// `drop` is resolved by name from the already-registered `drop` node.
+    /// `IpLookupNode` is not congestion-typed, so this is plain (no
+    /// `with_congestion!`).
+    pub fn register_node(&self, rt: &DataPlaneRuntime) -> CoreResult<NodeId> {
+        let drop = rt
+            .nodes()
+            .node_by_name("drop")
+            .ok_or_else(|| CoreError::internal("drop node not registered"))?;
+        let mut builder = FibTableBuilder::new(drop);
+        for route in self.routes.iter() {
             if let RouteAction::Drop = route
                 .action()
                 .map_err(|err| CoreError::internal(err.to_string()))?
@@ -293,14 +311,40 @@ pub(crate) fn assemble_ip_lookup_node(
                 builder.add_drop_route(route.prefix);
             }
         }
-        runtime.try_register_internal(IpLookupControlPlane::new(builder.build()).node())
-    })
+        let node = IpLookupControlPlane::new(builder.build()).node();
+        rt.nodes().try_register_internal(node)
+    }
 }
 
-#[hammer_component_macros::graph_node(
-    graph = service,
-    assemble = crate::net::lookup::assemble_ip_lookup_node,
-)]
+pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
+
+pub fn init(reg: &RuntimeRegistry) -> HammerResult<()> {
+    let config = reg.require::<Config>()?;
+    let routes = Arc::from(config.network.route.clone().into_boxed_slice());
+    IP_MAIN
+        .set(IpMain::new(routes))
+        .map_err(|_| HammerError::internal("ip main already initialized"))?;
+    Ok(())
+}
+
+#[linkme::distributed_slice(crate::packet_graph::CONTROL_INITS)]
+fn init_ip(reg: &RuntimeRegistry) -> HammerResult<()> {
+    init(reg)
+}
+
+/// Free-fn entry point emitted by the `#[graph_node]` macro for
+/// `register = ip_lookup` nodes. Routes to `IP_MAIN`.
+pub fn register_ip_lookup_graph_node(
+    runtime: &DataPlaneRuntime,
+    _worker: usize,
+) -> CoreResult<NodeId> {
+    IP_MAIN
+        .get()
+        .ok_or_else(|| CoreError::internal("ip main not initialized"))?
+        .register_node(runtime)
+}
+
+#[hammer_component_macros::graph_node(graph = service, register = ip_lookup)]
 #[hammer_component_macros::node]
 pub struct IpLookupNode {
     #[node(default = register_ip_lookup_runtime(table.clone()))]
